@@ -106,7 +106,6 @@ fn compile_instance(
         crate::plan::build::build_instance(metadata, &rewritten, target.clone(), Some(index))
             .map_err(|err| at_index(err, group, index))?;
     plan.passes = crate::plan::pass::run_all(&mut plan)?;
-    crate::plan::passes::tile::lower(&mut plan);
     Ok(plan)
 }
 

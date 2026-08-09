@@ -252,6 +252,27 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
         }
         let experts = gate_up.len() as i64;
 
+        // The loop's probe is `experts.{n}.gate_proj.weight_packed`, so a
+        // checkpoint missing exactly that one name does not look like a
+        // hole — it looks like the END of the bank, and the loop stops
+        // there. Every other missing part is refused by name above; this
+        // one would silently stack a SHORTER slab.
+        //
+        // Nothing downstream catches it. The manifest measures the
+        // ROUTER, `[num_experts, hidden]`, and a checkpoint with a whole
+        // expert missing still carries a full-width router — so the row
+        // matches, the load succeeds, and the grouped GEMM indexes a slab
+        // with fewer experts than the router emits indices for. Experts
+        // are not sharded here (only `inter` is, through `local_extent`),
+        // so the row's count is the count this slab must have.
+        if experts != i64::from(b.shape().n_experts) {
+            return fail(format!(
+                "kimi expert stack: layer {layer} stacked {experts} experts but the \
+                 row states {}; the router emits indices this slab has no rows for",
+                b.shape().n_experts
+            ));
+        }
+
         // Both forms stay resident, so a model whose slabs do not fit is
         // better off with only the packed one: the W4A16 GEMVs are slower
         // per token but they are not a fallback, they are the path that wins
@@ -307,4 +328,513 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::LoadShape;
+    use crate::encoding::Encoding as StoredEncoding;
+    use crate::shared::policy::Policy;
+    use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
+    use model_loader::contract::{ModelContract, Visibility};
+    use model_loader::plan::StorageTarget;
+    use model_loader::types::{FileId, TensorId};
+
+    /// `h` is the LOGICAL hidden width; the packed tensor stores it as
+    /// `h / 8`, because eight 4-bit codes ride in one `i32` word. Both
+    /// it and `INTER` are multiples of 32, which is the group the pass
+    /// requires and which the refusal tests below deliberately break.
+    const HIDDEN: i64 = 64;
+    const INTER: i64 = 32;
+    const CODES: i64 = 8;
+    const GROUP: i64 = 32;
+    const EXPERTS: u32 = 3;
+
+    fn i32e() -> Encoding {
+        Encoding::Raw(DType::I32)
+    }
+
+    fn bf16() -> Encoding {
+        Encoding::Raw(DType::BF16)
+    }
+
+    fn tensor(id: u32, name: &str, shape: Vec<i64>, encoding: Encoding) -> RawTensor {
+        RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 0,
+            shape,
+            encoding,
+        }
+    }
+
+    /// One layer of W4A16 experts, exactly as kimi ships them: a packed
+    /// `i32` weight and a BF16 `weight_scale` for each of gate, up and
+    /// down.
+    fn experts(count: u32) -> Vec<RawTensor> {
+        let mut out = Vec::new();
+        let mut id = 1u32;
+        for e in 0..count {
+            let ep = format!("model.layers.0.mlp.experts.{e}.");
+            for member in ["gate_proj", "up_proj"] {
+                out.push(tensor(
+                    id,
+                    &format!("{ep}{member}.weight_packed"),
+                    vec![INTER, HIDDEN / CODES],
+                    i32e(),
+                ));
+                id += 1;
+                out.push(tensor(
+                    id,
+                    &format!("{ep}{member}.weight_scale"),
+                    vec![INTER, HIDDEN / GROUP],
+                    bf16(),
+                ));
+                id += 1;
+            }
+            out.push(tensor(
+                id,
+                &format!("{ep}down_proj.weight_packed"),
+                vec![HIDDEN, INTER / CODES],
+                i32e(),
+            ));
+            id += 1;
+            out.push(tensor(
+                id,
+                &format!("{ep}down_proj.weight_scale"),
+                vec![HIDDEN, INTER / GROUP],
+                bf16(),
+            ));
+            id += 1;
+        }
+        out
+    }
+
+    fn build(tensors: &[RawTensor], f: impl FnOnce(&mut Builder<'_>)) -> ModelContract {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: tensors.to_vec(),
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let encoding = StoredEncoding::dense();
+        let policy = Policy::default();
+        let mut b = Builder::new(
+            &meta,
+            "kimi-test",
+            LoadShape::mixture(1, 128, EXPERTS, false),
+            &encoding,
+            &target,
+            &policy,
+        );
+        f(&mut b);
+        b.publish_remaining().expect("publish");
+        b.finish().expect("finish")
+    }
+
+    /// Run the stacker with a budget large enough that it never declines.
+    fn stack(tensors: &[RawTensor]) -> ModelContract {
+        build(tensors, |b| {
+            bf16_expert_stacks(b, 4u64 << 30).expect("the pass does not refuse");
+        })
+    }
+
+    fn refusal(tensors: &[RawTensor]) -> String {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: tensors.to_vec(),
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let encoding = StoredEncoding::dense();
+        let policy = Policy::default();
+        let mut b = Builder::new(
+            &meta,
+            "kimi-test",
+            LoadShape::mixture(1, 128, EXPERTS, false),
+            &encoding,
+            &target,
+            &policy,
+        );
+        match bf16_expert_stacks(&mut b, 4u64 << 30) {
+            Err(Error::Contract(why)) => why,
+            other => panic!("expected a contract refusal, got {other:?}"),
+        }
+    }
+
+    fn find<'a>(
+        c: &'a ModelContract,
+        name: &str,
+    ) -> Option<&'a model_loader::contract::TensorContract> {
+        c.tensors.iter().find(|t| t.name == name)
+    }
+
+    const GU: &str = "model.layers.0.mlp.experts.gate_up.weight";
+    const DN: &str = "model.layers.0.mlp.experts.down.weight";
+    const GU_S: &str = "model.layers.0.mlp.experts.gate_up.scale";
+    const DN_S: &str = "model.layers.0.mlp.experts.down.scale";
+
+    /// The shape of what the fused grouped GEMM reads.
+    ///
+    /// Three experts fold into one `[E, 2*inter, hidden]` slab and one
+    /// `[E, hidden, inter]`. The declared extents are what the driver
+    /// allocates and strides by, so a slab whose declaration disagrees
+    /// with its own contents is not a load error -- it is a GEMM reading
+    /// the wrong rows.
+    #[test]
+    fn the_stacked_slabs_are_declared_at_the_extents_the_gemm_strides_by() {
+        let c = stack(&experts(EXPERTS));
+        let gu = find(&c, GU).expect("a gate_up slab");
+        let dn = find(&c, DN).expect("a down slab");
+        assert_eq!(gu.shape, Some(vec![EXPERTS as i64, 2 * INTER, HIDDEN]));
+        assert_eq!(dn.shape, Some(vec![EXPERTS as i64, HIDDEN, INTER]));
+        assert_eq!(gu.encoding, bf16(), "the slab is dequantized, not packed");
+        assert_eq!(dn.encoding, bf16());
+    }
+
+    /// The factors are DEFINED and then hidden.
+    ///
+    /// `scale_per_block` takes its factors by output NAME, so the scale
+    /// has to be a declared tensor rather than a companion the lowering
+    /// guesses from a suffix. Left `Public` it would sit in the
+    /// persistent arena for the process's lifetime and appear in the
+    /// driver's bind table under a name nothing ever asks for -- the
+    /// slab is already dequantized, so no kernel reads these again.
+    ///
+    /// `Visibility` is the only thing that separates the two outcomes:
+    /// both declare the same BF16 encoding at the same extents.
+    #[test]
+    fn the_factors_the_slab_consumed_are_declared_and_then_hidden() {
+        let c = stack(&experts(EXPERTS));
+        for name in [GU_S, DN_S] {
+            let s = find(&c, name).unwrap_or_else(|| panic!("{name} is declared"));
+            assert_eq!(
+                s.visibility,
+                Visibility::Internal,
+                "{name} survives into the driver's bind table"
+            );
+        }
+        for name in [GU, DN] {
+            assert_eq!(
+                find(&c, name).expect("a slab").visibility,
+                Visibility::Public,
+                "{name} is what the GEMM binds"
+            );
+        }
+    }
+
+    /// A model whose slabs do not fit publishes NONE of them.
+    ///
+    /// The BF16 slabs are additive on top of the packed W4A16 experts,
+    /// which the per-step GEMV path still reads. Over budget, the packed
+    /// path is not a fallback -- it is the path that wins below the
+    /// crossover -- so declining is a choice and not a failure, and it
+    /// must leave the checkpoint whole rather than half-stacked.
+    #[test]
+    fn a_model_whose_slabs_do_not_fit_the_budget_publishes_no_slab_at_all() {
+        let ck = experts(EXPERTS);
+        let c = build(&ck, |b| {
+            bf16_expert_stacks(b, 1).expect("declining is not refusing");
+        });
+        for name in [GU, DN, GU_S, DN_S] {
+            assert!(
+                find(&c, name).is_none(),
+                "{name} was published against a budget of one byte"
+            );
+        }
+        assert!(
+            find(&c, "model.layers.0.mlp.experts.0.gate_proj.weight_packed").is_some(),
+            "the packed experts must survive the decline -- they are the \
+             path that runs when the slabs do not"
+        );
+    }
+
+    /// The budget is the WHOLE MODEL's, not one layer's.
+    ///
+    /// Multiplied by `layers` so the answer cannot come out different
+    /// for different layers of one model: a per-layer test would stack
+    /// the early layers and decline the late ones, which is the
+    /// half-stacked checkpoint the decline exists to avoid.
+    #[test]
+    fn the_budget_is_measured_against_every_layer_and_not_just_this_one() {
+        let ck = experts(EXPERTS);
+        let one_layer = u64::from(EXPERTS) * 3 * (INTER as u64) * (HIDDEN as u64) * 2;
+        let c = build(&ck, |b| {
+            bf16_expert_stacks(b, one_layer).expect("declining is not refusing");
+        });
+        assert!(
+            find(&c, GU).is_some(),
+            "one layer's worth of slab fits a budget of exactly that"
+        );
+
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: ck.clone(),
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let encoding = StoredEncoding::dense();
+        let policy = Policy::default();
+        let mut b = Builder::new(
+            &meta,
+            "kimi-test",
+            // The SAME single layer of tensors, in a model that says it
+            // has four. Nothing else changes.
+            LoadShape::mixture(4, 128, EXPERTS, false),
+            &encoding,
+            &target,
+            &policy,
+        );
+        bf16_expert_stacks(&mut b, one_layer).expect("declining is not refusing");
+        b.publish_remaining().expect("publish");
+        assert!(
+            find(&b.finish().expect("finish"), GU).is_none(),
+            "four layers of the same slab do not fit one layer's budget"
+        );
+    }
+
+    /// A dense layer has no expert names, and the loop must pass over it.
+    ///
+    /// Kimi's leading layers are dense. The pass probes for expert zero
+    /// rather than reading `first_k_dense_replace`, so a checkpoint with
+    /// no experts anywhere must simply produce nothing -- not a refusal
+    /// naming a tensor a dense layer was never going to ship.
+    #[test]
+    fn a_layer_with_no_experts_is_passed_over_rather_than_refused() {
+        let dense = vec![tensor(
+            1,
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![INTER, HIDDEN],
+            bf16(),
+        )];
+        let c = stack(&dense);
+        assert!(find(&c, GU).is_none() && find(&c, DN).is_none());
+    }
+
+    /// An expert missing one of its six parts is refused BY NAME.
+    ///
+    /// Stated for all six, because the lookup is a loop over six names
+    /// and a fixture that removes one exercises one iteration. A hole
+    /// that got past here would stack a slab with a leg missing, and
+    /// `concat` would build it at whatever extents the survivors imply.
+    #[test]
+    fn an_expert_missing_any_of_its_six_parts_is_refused_and_named() {
+        for (member, part) in [
+            ("gate_proj", "weight_scale"),
+            ("up_proj", "weight_packed"),
+            ("up_proj", "weight_scale"),
+            ("down_proj", "weight_packed"),
+            ("down_proj", "weight_scale"),
+        ] {
+            let mut ck = experts(EXPERTS);
+            let gone = format!("model.layers.0.mlp.experts.1.{member}.{part}");
+            ck.retain(|t| t.name != gone);
+            let why = refusal(&ck);
+            assert!(
+                why.contains("missing a weight or scale") && why.contains("experts.1."),
+                "a missing {member}.{part}: {why}"
+            );
+        }
+    }
+
+    /// The SIXTH name is the loop's own probe, and it fails differently.
+    ///
+    /// `experts.{n}.gate_proj.weight_packed` is what the loop tests to
+    /// decide whether expert `n` exists, so removing it does not look
+    /// like a hole -- it looks like the end of the bank. The loop stops
+    /// and stacks a SHORTER slab.
+    ///
+    /// Nothing downstream would have caught it. The manifest measures
+    /// the ROUTER, `[num_experts, hidden]`, and a checkpoint missing a
+    /// whole expert still carries a full-width router, so the row still
+    /// matches and the load still succeeds. The grouped GEMM would then
+    /// index a slab with fewer rows than the router emits indices for.
+    /// The count check exists for this one name.
+    #[test]
+    fn an_expert_missing_the_very_name_the_loop_probes_is_caught_by_the_count() {
+        let mut ck = experts(EXPERTS);
+        ck.retain(|t| {
+            !t.name
+                .starts_with("model.layers.0.mlp.experts.1.gate_proj.weight_packed")
+        });
+        let why = refusal(&ck);
+        assert!(
+            why.contains("stacked 1 experts") && why.contains("router emits indices"),
+            "the bank stopped at expert 1 and nothing said so: {why}"
+        );
+    }
+
+    /// A bank LONGER than the row states is refused too.
+    ///
+    /// The check is an equality and not a floor: a slab with more rows
+    /// than the router can address is a different checkpoint from the
+    /// one this row identifies, and stacking it would bind extra
+    /// resident weight nothing routes to.
+    #[test]
+    fn a_bank_longer_than_the_row_states_is_refused_as_well() {
+        let why = refusal(&experts(EXPERTS + 1));
+        assert!(
+            why.contains(&format!("stacked {} experts", EXPERTS + 1)),
+            "{why}"
+        );
+    }
+
+    /// A checkpoint packed some other way is LEFT ALONE, not refused.
+    ///
+    /// Stacking a differently-encoded expert would hand the GEMM
+    /// garbage, and rewriting it is not this pass's job -- so the whole
+    /// checkpoint stays packed and the W4A16 path runs off it as before.
+    /// A refusal here would fail a load that has a perfectly good path.
+    #[test]
+    fn experts_encoded_some_other_way_leave_the_whole_checkpoint_alone() {
+        for (member, part, wrong) in [
+            ("gate_proj", "weight_packed", bf16()),
+            ("up_proj", "weight_packed", bf16()),
+            ("down_proj", "weight_packed", bf16()),
+            ("gate_proj", "weight_scale", i32e()),
+            ("up_proj", "weight_scale", i32e()),
+            ("down_proj", "weight_scale", i32e()),
+        ] {
+            let mut ck = experts(EXPERTS);
+            let target = format!("model.layers.0.mlp.experts.1.{member}.{part}");
+            for t in &mut ck {
+                if t.name == target {
+                    t.encoding = wrong.clone();
+                }
+            }
+            let c = stack(&ck);
+            assert!(
+                find(&c, GU).is_none(),
+                "a {part} of the wrong type on {member} still stacked a slab"
+            );
+        }
+    }
+
+    /// Both expert dims must be a multiple of the 32-code group.
+    ///
+    /// The scale slab is declared at `hidden / 32` and `inter / 32`. A
+    /// width that does not divide truncates, and the declared factor
+    /// count then covers fewer codes than the slab holds.
+    #[test]
+    fn an_expert_whose_dims_do_not_divide_the_group_is_refused() {
+        let mut ck = experts(EXPERTS);
+        for t in &mut ck {
+            if t.name.ends_with("experts.1.gate_proj.weight_packed") {
+                // 3 words is 24 codes -- not a multiple of 32.
+                t.shape = vec![INTER, 3];
+            }
+        }
+        let why = refusal(&ck);
+        assert!(why.contains("multiple of 32"), "{why}");
+
+        let mut ck = experts(EXPERTS);
+        for t in &mut ck {
+            if t.name.ends_with("experts.1.gate_proj.weight_packed") {
+                t.shape = vec![INTER + 1, HIDDEN / CODES];
+            }
+        }
+        let why = refusal(&ck);
+        assert!(why.contains("multiple of 32"), "an odd inter: {why}");
+    }
+
+    /// A rank-1 expert weight is refused before anything indexes it.
+    ///
+    /// The pass reads `shape[0]` and `shape[1]` immediately after, so a
+    /// rank that got past here is a panic and not a bad slab.
+    #[test]
+    fn a_rank_1_expert_weight_is_refused() {
+        for member in ["gate_proj", "down_proj"] {
+            let mut ck = experts(EXPERTS);
+            for t in &mut ck {
+                if t.name
+                    .ends_with(&format!("experts.1.{member}.weight_packed"))
+                {
+                    t.shape = vec![INTER];
+                }
+            }
+            let why = refusal(&ck);
+            assert!(why.contains("rank-2"), "a rank-1 {member}: {why}");
+        }
+    }
+
+    /// Siblings that disagree on shape are refused, naming the sibling.
+    ///
+    /// Every leg is declared `[1, ..]` and concatenated over axis 0, so
+    /// the stack's extents come from the FIRST expert. A sibling of a
+    /// different width would be concatenated at the first one's
+    /// declaration.
+    #[test]
+    fn an_expert_that_disagrees_with_its_siblings_on_shape_is_refused() {
+        for (member, shape) in [
+            ("gate_proj", vec![INTER * 2, HIDDEN / CODES]),
+            ("gate_proj", vec![INTER, HIDDEN * 2 / CODES]),
+        ] {
+            let mut ck = experts(EXPERTS);
+            for t in &mut ck {
+                if t.name
+                    .ends_with(&format!("experts.1.{member}.weight_packed"))
+                {
+                    t.shape = shape.clone();
+                }
+            }
+            let why = refusal(&ck);
+            assert!(
+                why.contains("disagrees with its siblings") && why.contains("experts.1."),
+                "{why}"
+            );
+        }
+    }
+
+    /// The author itself runs the pass, and under kimi's source prefix.
+    ///
+    /// Every test above calls `bf16_expert_stacks` directly, so deleting
+    /// its call from `author_kimi` would be invisible to all of them.
+    /// The prefix matters as much as the call: kimi's checkpoint names
+    /// are under `language_model.`, and the pass probes through
+    /// `source_name`, so a pass that ran without the prefix would find
+    /// no experts and silently stack nothing.
+    #[test]
+    fn the_author_itself_stacks_and_does_it_under_kimis_prefix() {
+        let prefixed: Vec<RawTensor> = experts(EXPERTS)
+            .into_iter()
+            .map(|mut t| {
+                t.name = format!("language_model.{}", t.name);
+                t
+            })
+            .collect();
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: prefixed,
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let encoding = StoredEncoding::dense();
+        let policy = Policy::default();
+        let mut b = Builder::new(
+            &meta,
+            "kimi-test",
+            LoadShape::mixture(1, 128, EXPERTS, false),
+            &encoding,
+            &target,
+            &policy,
+        );
+        author_kimi(&mut b).expect("the author does not refuse");
+        let c = b.finish().expect("finish");
+        assert!(
+            find(&c, GU).is_some() && find(&c, DN).is_some(),
+            "the author published no slab, so either it does not run the \
+             pass or it does not set the prefix the pass probes through"
+        );
+    }
 }

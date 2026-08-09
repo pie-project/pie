@@ -29,8 +29,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use model_loader::error::Error;
-use model_loader::executor::cuda::CudaArena;
 use model_loader::executor::Execution;
+use model_loader::executor::cuda::CudaArena;
 use model_loader::executor::sink::TensorSink;
 use model_loader::plan::LoadPlan;
 use model_loader::plan::spans::{Span, publish_spans};
@@ -97,7 +97,10 @@ pub fn stage_plan_weights(
     // be allocated first and written straight through.
     let published = publish_spans(plan);
 
-    let arena_len = usize::try_from(plan.memory.persistent_bytes)
+    // The resident tensors AND the scratch behind them: a plan whose device
+    // runs its own load-time transforms stages their operands in the arena,
+    // so `persistent_bytes` alone is short by exactly that region.
+    let arena_len = usize::try_from(plan.memory.arena_bytes())
         .map_err(|_| Error::Contract("arena does not fit the address space".into()))?
         .max(1);
     // The plan's own budget bounds the largest single write, which is what the

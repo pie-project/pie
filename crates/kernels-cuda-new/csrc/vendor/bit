@@ -1,0 +1,31 @@
+// `bit` for NVRTC -- `std::bit_cast`, and nothing else.
+//
+// `flashinfer/fp16.h` is the software fp32<->fp16 conversion FlashInfer uses when the
+// prefill kernel reduces QK products in half precision (`FP16_QK_REDUCTION_SUPPORTED`).
+// Every line of it is `constexpr` and device-callable, and it moves bits between `float`
+// and `uint32_t` eleven times with `std::bit_cast`. That is device code, so the header
+// that declares `bit_cast` is carried rather than guarded -- guarding it would delete the
+// conversion, not the host part of it.
+//
+// `__builtin_bit_cast` is an NVRTC intrinsic (measured: it compiles, and it is constexpr
+// in a device context), so the shim is one function. The rest of `<bit>` -- `popcount`,
+// `bit_width`, `byteswap`, the endian enum -- is absent because the closure names none of
+// it; a header set is text carried in the binary, and text nobody includes is weight.
+//
+// This file is PIE's, not the C++ standard library's and not FlashInfer's.
+
+#ifndef PIE_VENDOR_BIT_
+#define PIE_VENDOR_BIT_
+
+namespace std {
+
+/// Reinterprets the object representation of `from` as a `To`, as the standard's
+/// `std::bit_cast` does -- the well-defined spelling of the union trick, and constexpr.
+template <typename To, typename From>
+constexpr To bit_cast(const From& from) noexcept {
+  return __builtin_bit_cast(To, from);
+}
+
+}  // namespace std
+
+#endif  // PIE_VENDOR_BIT_

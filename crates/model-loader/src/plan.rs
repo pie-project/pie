@@ -59,10 +59,11 @@ pub fn compile(
     let rewritten =
         crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
     let mut plan = build::build(metadata, &rewritten, target.clone())?;
+    // The pipeline ends with `lower-backend-tiling`, so a plan is never
+    // observable in a state where its tiling, fusion and kernel fields are
+    // still placeholders — and the validators after it get to see what it
+    // decided.
     plan.passes = pass::run_all(&mut plan)?;
-    // Runs last, so a plan is never observable in a state where its tiling and
-    // fusion fields are still placeholders.
-    passes::tile::lower(&mut plan);
     // Compiled from the *unrewritten* contract, because `groups` is not what
     // the row-shard rewrite looks at; each group is rewritten on its own inside
     // `group::compile_all`, where the sub-contract it applies to exists.
@@ -77,10 +78,42 @@ pub fn compiler_version() -> u64 {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
     pub persistent_bytes: u64,
+    /// Device bytes the arena reserves BEYOND the resident tensors, for the
+    /// operands of transforms the device runs itself.
+    ///
+    /// The arena used to be defined as "the resident tensors, laid out", so
+    /// anything that was not a resident tensor was host memory by
+    /// construction — which is why no transform reading a file or an
+    /// intermediate could ever have its operands on the device, and why every
+    /// load-time kernel in this tree was unreachable
+    /// (`.wiki/fix/loader.md` §3.3).
+    ///
+    /// Bounded by the transform, not by the model: staging buffers are reused
+    /// across a schedule that runs one instruction at a time, so this is the
+    /// largest single staged operand and not their sum.
+    #[serde(default)]
+    pub scratch_bytes: u64,
     pub temporary_peak_bytes: u64,
     pub transform_scratch_peak_bytes: u64,
     pub checkpoint_read_bytes: u64,
     pub device_write_bytes: u64,
+}
+
+impl MemoryPlan {
+    /// What the caller has to allocate.
+    ///
+    /// The resident tensors and the staging region behind them, which is one
+    /// number because they are one allocation: every offset in the plan —
+    /// `persistent_offset`, `scratch_offset`, `BulkExtentWrite::dest_offset` —
+    /// is measured from the same base.
+    ///
+    /// A method rather than a wider `persistent_bytes`, because that field
+    /// answers a question three call sites still ask on its own: how much of
+    /// the arena holds tensors that outlive the load.
+    #[must_use]
+    pub fn arena_bytes(&self) -> u64 {
+        self.persistent_bytes.saturating_add(self.scratch_bytes)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,10 +223,64 @@ impl Default for StorageTarget {
 pub struct BufferDecl {
     pub id: BufferId,
     pub tensor: Option<TensorId>,
+    /// What this buffer's bytes ARE: the shape and encoding of the thing it
+    /// holds, stated on the buffer itself.
+    ///
+    /// This used to be reachable only through [`tensor`](Self::tensor), and
+    /// that indirection was the loader's largest silent defect. `tensor` says
+    /// "this buffer IS that declared tensor", which an intermediate is not:
+    /// the decoded operand a re-encode reads is nobody's tensor, so it had no
+    /// type, so the compiler could not pick a kernel for a transform reading
+    /// it and the executor could not even run one — `contract: buffer 2 has no
+    /// tensor type` was a `Cast` of an internal tensor failing outright, on
+    /// the host as well as the device (`.wiki/fix/loader.md` §3.3).
+    ///
+    /// The builder always had the answer. Every buffer is allocated from a
+    /// [`TensorDecl`], `declared` or not; all that was missing was writing the
+    /// type down when the buffer was not going to be bound by name.
+    ///
+    /// `tensor` stays, and stays `Option`, for the two things it actually
+    /// means: what to publish this buffer as, and which declaration to
+    /// finalize. Typing no longer asks it.
+    pub ty: crate::contract::TensorType,
     pub bytes: u64,
     pub alignment: u32,
     pub temporary: bool,
     pub persistent_offset: Option<u64>,
+    /// Where this buffer sits in the arena's SCRATCH region, if it is
+    /// staging.
+    ///
+    /// Separate from [`persistent_offset`](Self::persistent_offset) because
+    /// the two answer different questions, and three passes depend on the
+    /// difference. `persistent_offset` means "this is a resident tensor, laid
+    /// out" — [`spans::publish_spans`] publishes exactly those, and
+    /// `rewrite::extent_write_as_bulk` turns exactly those writes into
+    /// arena-absolute `BulkExtentWrite`s that `hoist_bulk_extent_writes` then
+    /// moves to the front of the schedule. A staging buffer must be neither:
+    /// it is not a tensor anyone names, and its write must stay where the
+    /// transform that reads it is, because scratch is REUSED and a hoisted
+    /// write would land in a slot another transform is still reading.
+    ///
+    /// Both are arena offsets, so anything asking merely "where is this
+    /// buffer" asks [`arena_offset`](Self::arena_offset) and gets one answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_offset: Option<u64>,
+}
+
+impl BufferDecl {
+    /// Where this buffer lives in the arena, resident or staging, or `None`
+    /// for a host-owned one.
+    #[must_use]
+    pub fn arena_offset(&self) -> Option<u64> {
+        self.persistent_offset.or(self.scratch_offset)
+    }
+
+    /// The dtype one element reads as — the logical one for a quantized
+    /// encoding, which is what a transform over it sees.
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.ty.encoding.dtype()
+    }
 }
 
 /// A file the plan reads from.

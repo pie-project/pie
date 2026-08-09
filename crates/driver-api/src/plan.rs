@@ -338,12 +338,21 @@ pub struct ProgramRegistration {
     /// The program itself, in the shape a driver executes it.
     #[serde(default)]
     pub launch: LaunchPackage,
-    /// The canonical PTIR container, for the in-workspace reference driver
-    /// only.
+    /// The canonical PTIR container. **Written, and no longer read.**
     ///
-    /// `driver-dummy` is a Rust crate that links the compiler's own IR and
-    /// interpreter, so it cannot drift from them the way a hand-written C++
-    /// mirror can. It is the one consumer that still wants PTIR.
+    /// It existed for the in-workspace reference driver: `driver-dummy` was
+    /// a Rust crate that linked the compiler's own IR and interpreter, so it
+    /// could not drift from them the way a hand-written C++ mirror can, and
+    /// it was the one consumer that still wanted PTIR. That crate is
+    /// deleted, and nothing else asks for this field — `engine` fills it at
+    /// two sites and every remaining backend takes [`LaunchPackage`]
+    /// instead.
+    ///
+    /// It is kept rather than removed in the same change that removed its
+    /// consumer, because the two are separable and only one of them was
+    /// asked for: a field nothing reads costs a clone per program
+    /// registration, which is worth measuring before deciding, and PTIR is
+    /// the shape a future in-workspace interpreter would want back.
     ///
     /// This is deliberately **not** part of the C ABI: [`PieProgramDesc`] has
     /// no counterpart field, so a native driver cannot see PTIR even by

@@ -27,8 +27,47 @@
 //! already carried, next to a dozen the launch read off it correctly.
 //! That is what this test is for: not to judge the value, but to notice
 //! when a name stops being connected to the thing that states it.
+//!
+//! It stopped noticing anything at all for a while. `Source::Ctx` moved
+//! to `kernels-cuda-new`, and into a `src/table/` the scan's `read_dir`
+//! did not descend into, so `ctx_names()` returned nothing and the test
+//! agreed with every literal in the launch. Only the `> 15` floor said
+//! so. A scan is a claim about a directory, and a claim about a
+//! directory expires when the code moves.
 
 use std::collections::BTreeSet;
+
+/// Names that a CATALOG ROW varies, kept literal because that row has
+/// no text to dispatch.
+///
+/// This is a DEBT, not an argument, and the two must not share a list:
+/// [`CONSTANT_BY_ARGUMENT`] means "no checkpoint varies it", and an
+/// entry that is merely unreachable makes a weaker claim which reads
+/// like the stronger one. The distinction is the whole safety margin —
+/// `moe_routed_scaling: 1.0` in the header above was also "safe" right
+/// up until a routed text arrived.
+///
+/// Each entry names the generation that varies it and the fact whose
+/// UNREAD status is the premise, so the excuse EXPIRES BY ITSELF: the
+/// day someone writes that text, the fact leaves
+/// `model/tests/facts_are_read.rs`'s `DECLARED_BUT_UNREAD` and
+/// [`the_deferred_names_are_still_out_of_reach`] fails here.
+const VARIED_BY_A_ROW_WITH_NO_TEXT: &[(&str, &str, &str, &str)] = &[(
+    "rope_interleaved",
+    "kimi_k2",
+    "rope_yarn_original",
+    "read only by `rope_yarn_original`, whose one dispatching caller is \
+     gpt-oss, whose rope is the half-split HF writes as `rotate_half`. \
+     kimi-k2 is the second caller and it DOES vary this, measured \
+     against the modeling code `moonshotai/Kimi-K2-Instruct` publishes \
+     rather than assumed from the shared kernel name: its `rotate_half` \
+     is the ordinary half-split, but `apply_rotary_pos_emb` first does \
+     `q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)` on \
+     both `q_pe` and `k_pe` — a DE-INTERLEAVE — so with respect to the \
+     tensor as stored the ladder is interleaved and gpt-oss's is not. \
+     A literal here would rotate every K2 position against the wrong \
+     pair. It cannot today: no MLA text reads `rope_yarn_original`.",
+)];
 
 /// The names a literal is the right answer for, and why.
 ///
@@ -57,15 +96,6 @@ const CONSTANT_BY_ARGUMENT: &[(&str, &str)] = &[
          ever wrong and nothing needs freezing. Decode and Prefill are \
          what remain and both advance. A false here would need a class \
          to come back.",
-    ),
-    (
-        "rope_interleaved",
-        "read only by `rope_yarn_original`, whose one caller is gpt-oss, \
-         whose rope is the half-split HF writes as `rotate_half`. \
-         UNMEASURED for a second caller: kimi-k2 declares \
-         `rope_yarn_original` and `facts_are_read` already records that \
-         its text never reads it, so nothing reaches this kernel with an \
-         interleaved ladder today.",
     ),
     (
         "wna16_group_size",
@@ -120,15 +150,46 @@ fn read(rel: &str) -> String {
 /// model, so a literal in one is the same defect as a literal in the
 /// other. Reading only half of a struct-literal audit is how the half
 /// gets read twice.
-fn ctx_names() -> BTreeSet<String> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels-cuda/src");
-    let mut out = BTreeSet::new();
-    for e in std::fs::read_dir(&dir).expect("kernels-cuda/src").flatten() {
-        let p = e.path();
-        if p.extension().is_none_or(|x| x != "rs") {
-            continue;
+/// `src` with every `//` tail removed.
+fn strip_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every `.rs` under `dir`, at any depth.
+fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            out.push(path);
         }
-        let s = std::fs::read_to_string(&p).expect("read");
+    }
+}
+
+fn ctx_names() -> BTreeSet<String> {
+    // The rows moved: `kernels-cuda`'s flat per-domain modules are
+    // `kernels-cuda-new/src/table/` now, and that crate authors them. Read
+    // the tree rather than one directory's entries, so the next move empties
+    // no scan silently — the count assert below is the backstop, and it is
+    // only a backstop if the walk is the thing that would have to be wrong.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels-cuda-new/src");
+    let mut files = Vec::new();
+    rust_sources(&dir, &mut files);
+    let mut out = BTreeSet::new();
+    for p in files {
+        // Comments off first. The walk reaches `families/`, which ARGUES
+        // about sources in prose — `ssm.rs` says a `Source::Gdn("group_size")`
+        // "would have made it a coincidence" — and a scan over raw text reads
+        // the road not taken as a name the launch owes a field for.
+        let source = strip_line_comments(&std::fs::read_to_string(&p).expect("read"));
+        let s = source.as_str();
         for tag in [
             "Source::Ctx(\"",
             "Source::CtxNonZero(\"",
@@ -138,7 +199,7 @@ fn ctx_names() -> BTreeSet<String> {
             "Source::Gdn(\"",
             "Source::GdnSlab(\"",
         ] {
-            let mut rest = s.as_str();
+            let mut rest = s;
             while let Some(i) = rest.find(tag) {
                 rest = &rest[i + tag.len()..];
                 let Some(j) = rest.find('"') else { break };
@@ -160,7 +221,13 @@ fn ctx_names() -> BTreeSet<String> {
 #[test]
 fn every_context_scalar_is_read_off_the_model_or_argued_for() {
     let launch = read("src/fire/launch.rs");
-    let argued: BTreeSet<&str> = CONSTANT_BY_ARGUMENT.iter().map(|(n, _)| *n).collect();
+    // Both lists excuse a literal; they differ in what they claim, not
+    // in what they permit.
+    let argued: BTreeSet<&str> = CONSTANT_BY_ARGUMENT
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(VARIED_BY_A_ROW_WITH_NO_TEXT.iter().map(|(n, ..)| *n))
+        .collect();
 
     let mut unstated = BTreeSet::new();
     let mut unlocated = BTreeSet::new();
@@ -202,7 +269,10 @@ fn every_context_scalar_is_read_off_the_model_or_argued_for() {
          invents them:\n  {}\n\nEither read the field off `model.deployment` \
          — which is where `eps`, `vocab`, `moe_norm_topk` and the rest of \
          this struct come from — or add the name to \
-         `CONSTANT_BY_ARGUMENT` with the reason no checkpoint varies it.",
+         `CONSTANT_BY_ARGUMENT` with the reason no checkpoint varies it, \
+         or, if one DOES and merely cannot dispatch yet, to \
+         `VARIED_BY_A_ROW_WITH_NO_TEXT` with the row and the fact that \
+         holds it back.",
         unstated.into_iter().collect::<Vec<_>>().join("\n  "),
     );
 }
@@ -218,12 +288,54 @@ fn nothing_is_argued_for_that_no_kernel_reads() {
     let stale: Vec<&str> = CONSTANT_BY_ARGUMENT
         .iter()
         .map(|(n, _)| *n)
+        .chain(VARIED_BY_A_ROW_WITH_NO_TEXT.iter().map(|(n, ..)| *n))
         .filter(|n| !names.contains(*n))
         .collect();
     assert!(
         stale.is_empty(),
         "no kernel reads these any more: {stale:?}"
     );
+}
+
+/// A deferred literal stops being excused the day its row gets a text.
+///
+/// The premise is not restated here, it is READ: `model`'s own
+/// `facts_are_read` keeps `DECLARED_BUT_UNREAD`, the list of per-backend
+/// facts a family declares and no text consumes. While `kimi_k2`'s
+/// `rope_yarn_original` sits on it, nothing dispatches the kernel that
+/// reads `rope_interleaved` with a K2 ladder. Writing that text means
+/// deleting the entry there, which fails this test HERE — which is the
+/// point, because the person writing an MLA rope pass is exactly the
+/// person who must decide what `rope_interleaved` is.
+///
+/// The four excuses this crate's siblings deleted last week all named a
+/// future reader their own layering ruled out, so they could never
+/// expire. This one names a line someone has to delete to finish the
+/// work it defers.
+#[test]
+fn the_deferred_names_are_still_out_of_reach() {
+    let unread = read("../model/tests/facts_are_read.rs");
+    let table = unread
+        .find("DECLARED_BUT_UNREAD")
+        .map(|i| &unread[i..])
+        .expect("`model` still keeps a `DECLARED_BUT_UNREAD` list");
+
+    for (name, family, fact, _) in VARIED_BY_A_ROW_WITH_NO_TEXT {
+        let entry = table
+            .find(&format!("(\"{family}\""))
+            .map(|i| &table[i..])
+            .and_then(|e| e.find("])").map(|j| &e[..j]));
+        assert!(
+            entry.is_some_and(|e| e.contains(&format!("\"{fact}\""))),
+            "`{name}` is a literal in `fire::launch` because {family} \
+             cannot dispatch the kernel that reads it, and the proof of \
+             that was `{fact}` sitting in `DECLARED_BUT_UNREAD`. It is \
+             not there now. Either a text reads it — in which case fill \
+             `{name}` off the model, because that text's checkpoint \
+             varies it — or the fact was deleted, in which case say so \
+             here.",
+        );
+    }
 }
 
 /// Names that are METHODS on the context, not fields of a literal.

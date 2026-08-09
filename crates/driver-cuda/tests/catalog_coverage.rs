@@ -55,7 +55,7 @@ const NOT_YET_SERVABLE: &[&str] = &[
     "gemma-4-26b-a4b",
     // ── THE MLA LINEAGE ─────────────────────────────────────────────
     //
-    // All four state `KvStyle::Mla` or `KvStyle::Dsv4`, and this build
+    // All four state `KvStyle::Mla` or `KvStyle::CompressedPlane`, and this build
     // provisions neither store: a compressed KV plane and a positional
     // one do not fit the k/v pair the pager allocates.
     //
@@ -259,7 +259,11 @@ const UNSERVABLE_GQA: &[&str] = &[
 
 #[test]
 fn every_deployable_row_is_servable_by_this_builds_decode_or_is_stated() {
-    use model::shared::llama_like::project::DECODE_GQA_GROUPS;
+    // MOVED. The list was `model`'s while the servable set was a fact about
+    // the model text; it is `driver_cuda::serve`'s now, because what a driver
+    // can serve is a fact about the driver. `project.rs:734` says so in the
+    // comment it left behind.
+    use driver_cuda::serve::DECODE_GQA_GROUPS;
 
     let stated: BTreeSet<&str> = UNSERVABLE_GQA.iter().copied().collect();
     let mut refused: BTreeSet<&str> = BTreeSet::new();
@@ -307,7 +311,11 @@ fn every_deployable_row_is_servable_by_this_builds_decode_or_is_stated() {
 /// the list and pass, having stopped asking.
 #[test]
 fn the_instantiated_set_is_the_one_the_kernels_were_built_for() {
-    use model::shared::llama_like::project::DECODE_GQA_GROUPS;
+    // MOVED. The list was `model`'s while the servable set was a fact about
+    // the model text; it is `driver_cuda::serve`'s now, because what a driver
+    // can serve is a fact about the driver. `project.rs:734` says so in the
+    // comment it left behind.
+    use driver_cuda::serve::DECODE_GQA_GROUPS;
     assert_eq!(
         DECODE_GQA_GROUPS,
         &[1, 2, 3, 4, 8],

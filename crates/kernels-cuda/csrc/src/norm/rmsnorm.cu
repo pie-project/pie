@@ -1,490 +1,25 @@
+// The kernels live in the header; this file is the entry points that still
+// launch them ahead of time, plus the one host predicate -- `rmsnorm_vec8_ok`
+// -- that decides between a scalar kernel and its vectorised twin.
+//
+// That predicate is why most of this file survives. It reads pointer
+// ALIGNMENT, and no `LaunchRule` can see an address, so the launchers pick
+// the vectorised path and the JIT rows in `kernels_cuda_new::families::norm`
+// fire the scalar one. `rmsnorm.cuh` records which four kernels the rows name
+// and why the other eight are unreachable from a row.
+#include "pie_device.cuh"
+#include "norm/rmsnorm.cuh"
 #include "norm/rmsnorm.hpp"
 
 #include <type_traits>
 #include "quant/dequant_wna16.hpp"
 
-#include <cuda_bf16.h>
 #include <cstdint>
 #include <cstdlib>
 
 namespace pie_cuda_driver::kernels::norm {
 
 namespace {
-
-// Block reduction that reproduces the shared-memory tree
-// `for (off = BLOCK/2; off; off >>= 1) buf[t] += buf[t+off]` **exactly**, but
-// runs the last five levels on warp shuffles. Those levels only ever touch
-// threads 0..31, so the pairing is identical and the fp32 rounding is
-// unchanged -- what goes away is five block-wide barriers, which at decode
-// (one block per token, eight blocks on 148 SMs) were a third of the kernel.
-template <int BLOCK>
-__device__ __forceinline__ float block_reduce_sum_exact(float local, float* buf)
-{
-    static_assert(BLOCK >= 32 && (BLOCK & (BLOCK - 1)) == 0,
-                  "block_reduce_sum_exact needs a power-of-two BLOCK >= 32");
-    const int tid = threadIdx.x;
-    buf[tid] = local;
-    __syncthreads();
-#pragma unroll
-    for (int off = BLOCK / 2; off >= 32; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-    if (tid < 32) {
-        float v = buf[tid];
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffffu, v, off);
-        }
-        if (tid == 0) buf[0] = v;
-    }
-    __syncthreads();
-    return buf[0];
-}
-
-// One block per row. `BLOCK` threads cooperate on the L2-norm reduction;
-// each thread handles `hidden / BLOCK` elements. We always launch with
-// BLOCK == 256, so the per-thread chunk is small even for hidden=8192.
-//
-// `WEIGHT_PLUS_ONE = true` selects Gemma's `(1 + w) * x_hat` convention.
-template <int BLOCK, bool WEIGHT_PLUS_ONE>
-__global__ void rmsnorm_bf16_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ y,
-    int hidden,
-    int x_row_stride,
-    int y_row_stride,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const __nv_bfloat16* xr = x + static_cast<long long>(row) * x_row_stride;
-    __nv_bfloat16* yr = y + static_cast<long long>(row) * y_row_stride;
-
-    // L2 norm across the row, accumulated in fp32.
-    float local = 0.f;
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float v = __bfloat162float(xr[i]);
-        local += v * v;
-    }
-
-    // Block-wide reduction via shared memory. CUB would be cleaner, but this
-    // avoids a heavy header for the M1.2.2 build.
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
-
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float xv = __bfloat162float(xr[i]);
-        float wv = __bfloat162float(weight[i]);
-        if constexpr (WEIGHT_PLUS_ONE) wv += 1.f;
-        yr[i] = __float2bfloat16(xv * inv_rms * wv);
-    }
-}
-
-// Same math as `rmsnorm_bf16_kernel`, but each thread owns 8 contiguous bf16
-// (one 16-byte load) instead of one. At decode `num_rows` is 1, so the kernel
-// is a single block on a 148-SM GPU and its cost is entirely the length of the
-// per-thread dependent load chain: at hidden=7168 the scalar form walked 28
-// loads per thread, twice. Vectorized it is 4 (BLOCK=512), and measured device
-// time drops ~7x (3.48 -> 2.38 us against a 2.20 us empty-launch floor).
-//
-// Requires hidden % 8 == 0 and 16-byte-aligned rows; the launcher falls back to
-// the scalar kernel otherwise.
-template <int BLOCK, bool WEIGHT_PLUS_ONE, bool EMIT_FP16 = false>
-__global__ void rmsnorm_bf16_vec8_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ y,
-    // Optional fp16 copy of the same result. The MXFP4 decode GEMV reads fp16,
-    // and the only thing between it and this store was a kernel that read the
-    // bf16 back and wrote it again -- a few tens of KB, so essentially all
-    // launch. Compile-time flag, so the bf16-only instantiation is unchanged.
-    __half* __restrict__ y_fp16,
-    int hidden,
-    int x_row_stride,
-    int y_row_stride,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int nvec = hidden / 8;
-
-    const float4* xr =
-        reinterpret_cast<const float4*>(x + static_cast<long long>(row) * x_row_stride);
-    float4* yr =
-        reinterpret_cast<float4*>(y + static_cast<long long>(row) * y_row_stride);
-    const float4* wr = reinterpret_cast<const float4*>(weight);
-
-    float local = 0.f;
-    for (int i = tid; i < nvec; i += BLOCK) {
-        float4 v = xr[i];
-        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&v);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 f = __bfloat1622float2(h[j]);
-            local += f.x * f.x + f.y * f.y;
-        }
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
-
-    for (int i = tid; i < nvec; i += BLOCK) {
-        float4 v = xr[i];
-        float4 g = wr[i];
-        float4 o;
-        const __nv_bfloat162* hv = reinterpret_cast<const __nv_bfloat162*>(&v);
-        const __nv_bfloat162* hg = reinterpret_cast<const __nv_bfloat162*>(&g);
-        __nv_bfloat162* ho = reinterpret_cast<__nv_bfloat162*>(&o);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 a = __bfloat1622float2(hv[j]);
-            float2 b = __bfloat1622float2(hg[j]);
-            if constexpr (WEIGHT_PLUS_ONE) { b.x += 1.f; b.y += 1.f; }
-            ho[j] = __floats2bfloat162_rn(a.x * inv_rms * b.x,
-                                          a.y * inv_rms * b.y);
-        }
-        yr[i] = o;
-        if constexpr (EMIT_FP16) {
-            // Rounded from the bf16 that was just stored, not from the fp32
-            // behind it, so this is exactly what the cast kernel produced.
-            const __nv_bfloat16* ob =
-                reinterpret_cast<const __nv_bfloat16*>(&o);
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                y_fp16[i * 8 + j] = __float2half(__bfloat162float(ob[j]));
-            }
-        }
-    }
-}
-
-// float4 form of the fused residual-add + pre-norm. Deliberately a copy of
-// `rmsnorm_bf16_vec8_kernel`'s structure -- same VBLOCK, same per-vector
-// accumulation order, same `block_reduce_sum_exact` -- with the residual add
-// folded into the first pass, rounded to bf16 exactly where
-// `residual_add_bf16_kernel` rounds it. Anything else and the sum associates
-// differently and the pair stops being bit-exact.
-template <int BLOCK>
-__global__ void residual_add_rmsnorm_bf16_vec8_kernel(
-    __nv_bfloat16* __restrict__ hidden,
-    const __nv_bfloat16* __restrict__ residual,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int nvec = hidden_size / 8;
-    const long long base = static_cast<long long>(row) * hidden_size;
-
-    float4* hr = reinterpret_cast<float4*>(hidden + base);
-    const float4* rr = reinterpret_cast<const float4*>(residual + base);
-    float4* nr = reinterpret_cast<float4*>(norm_out + base);
-    const float4* wr = reinterpret_cast<const float4*>(weight);
-
-    float local = 0.f;
-    for (int i = tid; i < nvec; i += BLOCK) {
-        float4 hv = hr[i];
-        float4 rv = rr[i];
-        __nv_bfloat162* hh = reinterpret_cast<__nv_bfloat162*>(&hv);
-        const __nv_bfloat162* rh = reinterpret_cast<const __nv_bfloat162*>(&rv);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 a = __bfloat1622float2(hh[j]);
-            const float2 b = __bfloat1622float2(rh[j]);
-            hh[j] = __floats2bfloat162_rn(a.x + b.x, a.y + b.y);
-            const float2 f = __bfloat1622float2(hh[j]);
-            local += f.x * f.x + f.y * f.y;
-        }
-        hr[i] = hv;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-
-    for (int i = tid; i < nvec; i += BLOCK) {
-        float4 v = hr[i];
-        float4 g = wr[i];
-        float4 o;
-        const __nv_bfloat162* hv = reinterpret_cast<const __nv_bfloat162*>(&v);
-        const __nv_bfloat162* hg = reinterpret_cast<const __nv_bfloat162*>(&g);
-        __nv_bfloat162* ho = reinterpret_cast<__nv_bfloat162*>(&o);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 a = __bfloat1622float2(hv[j]);
-            const float2 b = __bfloat1622float2(hg[j]);
-            ho[j] = __floats2bfloat162_rn(a.x * inv_rms * b.x,
-                                          a.y * inv_rms * b.y);
-        }
-        nr[i] = o;
-    }
-}
-
-template <int BLOCK>
-__global__ void residual_add_rmsnorm_bf16_kernel(
-    __nv_bfloat16* __restrict__ hidden,
-    const __nv_bfloat16* __restrict__ residual,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    __nv_bfloat16* hr = hidden + row * hidden_size;
-    const __nv_bfloat16* rr = residual + row * hidden_size;
-    __nv_bfloat16* nr = norm_out + row * hidden_size;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float sum = __bfloat162float(hr[i]) + __bfloat162float(rr[i]);
-        const __nv_bfloat16 rounded = __float2bfloat16(sum);
-        hr[i] = rounded;
-        const float v = __bfloat162float(rounded);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float xv = __bfloat162float(hr[i]);
-        const float wv = __bfloat162float(weight[i]);
-        nr[i] = __float2bfloat16(xv * inv_rms * wv);
-    }
-}
-
-template <int BLOCK>
-__global__ void residual_add_scale_rmsnorm_bf16_kernel(
-    __nv_bfloat16* __restrict__ hidden,
-    const __nv_bfloat16* __restrict__ residual,
-    float scale,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    __nv_bfloat16* hr = hidden + row * hidden_size;
-    const __nv_bfloat16* rr = residual + row * hidden_size;
-    __nv_bfloat16* nr = norm_out + row * hidden_size;
-    const float scale_rounded = __bfloat162float(__float2bfloat16(scale));
-
-    float local = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float sum = __bfloat162float(hr[i]) + __bfloat162float(rr[i]);
-        const __nv_bfloat16 rounded_sum = __float2bfloat16(sum);
-        const __nv_bfloat16 scaled =
-            __float2bfloat16(__bfloat162float(rounded_sum) * scale_rounded);
-        hr[i] = scaled;
-        const float v = __bfloat162float(scaled);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float xv = __bfloat162float(hr[i]);
-        const float wv = __bfloat162float(weight[i]);
-        nr[i] = __float2bfloat16(xv * inv_rms * wv);
-    }
-}
-
-template <int BLOCK>
-__global__ void rmsnorm_residual_add_bf16_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ hidden,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const __nv_bfloat16* xr = x + row * hidden_size;
-    __nv_bfloat16* hr = hidden + row * hidden_size;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float v = __bfloat162float(xr[i]);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const __nv_bfloat16 norm = __float2bfloat16(
-            __bfloat162float(xr[i]) * inv_rms *
-            __bfloat162float(weight[i]));
-        hr[i] = __float2bfloat16(
-            __bfloat162float(hr[i]) + __bfloat162float(norm));
-    }
-}
-
-// Vectorized twin of the kernel below: float4 loads (8 bf16) instead of
-// scalars. The scalar form walks the row THREE times, once per pass, so at
-// hidden 2816 with BLOCK=512 each thread does ~6 dependent loads per pass;
-// vectorized it is under one. The plain norm's own note records ~7x from
-// exactly this change, and this kernel measured 10.79 us/call in
-// gemma-4-26B's decode -- 8% of the step -- against 2.51 for the vectorized
-// plain norm.
-//
-// Per-element arithmetic and the bf16 rounding points are identical to the
-// scalar form; only the ORDER of the two sum reductions differs (8 values
-// accumulate per thread before the block reduce), which is the same trade
-// rmsnorm_bf16_vec8_kernel already makes. Requires hidden % 8 == 0 and
-// 16-byte-aligned rows -- the launcher checks with rmsnorm_vec8_ok.
-template <int BLOCK>
-__global__ void rmsnorm_rasr_vec8_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ hidden,
-    float scale,
-    const __nv_bfloat16* __restrict__ next_weight,
-    __nv_bfloat16* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int vecs = hidden_size / 8;
-    const float4* xr = reinterpret_cast<const float4*>(x + (long long)row * hidden_size);
-    const float4* wv = reinterpret_cast<const float4*>(weight);
-    const float4* nwv = reinterpret_cast<const float4*>(next_weight);
-    float4* hr = reinterpret_cast<float4*>(hidden + (long long)row * hidden_size);
-    float4* nr = reinterpret_cast<float4*>(norm_out + (long long)row * hidden_size);
-
-    float local = 0.f;
-    for (int i = tid; i < vecs; i += BLOCK) {
-        const float4 v = xr[i];
-        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const float f = __bfloat162float(b[j]);
-            local += f * f;
-        }
-    }
-    __shared__ float buf[BLOCK];
-    const float s0 = block_reduce_sum_exact<BLOCK>(local, buf);
-    const float inv_rms = rsqrtf(s0 / static_cast<float>(hidden_size) + eps);
-    const float scale_rounded = __bfloat162float(__float2bfloat16(scale));
-
-    float local_next = 0.f;
-    for (int i = tid; i < vecs; i += BLOCK) {
-        const float4 xv4 = xr[i];
-        const float4 wv4 = wv[i];
-        float4 hv4 = hr[i];
-        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv4);
-        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv4);
-        __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hv4);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const __nv_bfloat16 norm = __float2bfloat16(
-                __bfloat162float(xb[j]) * inv_rms * __bfloat162float(wb[j]));
-            const float sum = __bfloat162float(hb[j]) + __bfloat162float(norm);
-            const __nv_bfloat16 rounded = __float2bfloat16(sum);
-            const __nv_bfloat16 scaled = __float2bfloat16(
-                __bfloat162float(rounded) * scale_rounded);
-            hb[j] = scaled;
-            const float f = __bfloat162float(scaled);
-            local_next += f * f;
-        }
-        hr[i] = hv4;
-    }
-    __shared__ float buf2[BLOCK];
-    const float s1 = block_reduce_sum_exact<BLOCK>(local_next, buf2);
-    const float inv_next = rsqrtf(s1 / static_cast<float>(hidden_size) + eps);
-
-    for (int i = tid; i < vecs; i += BLOCK) {
-        const float4 hv4 = hr[i];
-        const float4 nw4 = nwv[i];
-        const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&hv4);
-        const __nv_bfloat16* nb = reinterpret_cast<const __nv_bfloat16*>(&nw4);
-        float4 out4;
-        __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&out4);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            ob[j] = __float2bfloat16(
-                __bfloat162float(hb[j]) * inv_next * __bfloat162float(nb[j]));
-        }
-        nr[i] = out4;
-    }
-}
-
-template <int BLOCK>
-__global__ void rmsnorm_residual_add_scale_rmsnorm_bf16_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ hidden,
-    float scale,
-    const __nv_bfloat16* __restrict__ next_weight,
-    __nv_bfloat16* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const __nv_bfloat16* xr = x + row * hidden_size;
-    __nv_bfloat16* hr = hidden + row * hidden_size;
-    __nv_bfloat16* nr = norm_out + row * hidden_size;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float v = __bfloat162float(xr[i]);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-    const float scale_rounded = __bfloat162float(__float2bfloat16(scale));
-    float local_next = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const __nv_bfloat16 norm = __float2bfloat16(
-            __bfloat162float(xr[i]) * inv_rms *
-            __bfloat162float(weight[i]));
-        const float sum = __bfloat162float(hr[i]) + __bfloat162float(norm);
-        const __nv_bfloat16 rounded_sum = __float2bfloat16(sum);
-        const __nv_bfloat16 scaled =
-            __float2bfloat16(__bfloat162float(rounded_sum) * scale_rounded);
-        hr[i] = scaled;
-        const float v = __bfloat162float(scaled);
-        local_next += v * v;
-    }
-
-    __shared__ float buf_next[BLOCK];
-    const float buf_next_sum = block_reduce_sum_exact<BLOCK>(local_next, buf_next);
-
-    const float inv_next =
-        rsqrtf(buf_next_sum / static_cast<float>(hidden_size) + eps);
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        nr[i] = __float2bfloat16(
-            __bfloat162float(hr[i]) * inv_next *
-            __bfloat162float(next_weight[i]));
-    }
-}
 
 // True when every row of a [num_rows, hidden] bf16 view starts on a 16-byte
 // boundary and is a whole number of 8-element vectors.
@@ -512,6 +47,10 @@ void rmsnorm_bf16(
 // wants fp16 -- the MXFP4 decode GEMV. Falls back to the plain launcher plus a
 // cast when the vectorised path does not apply, so the caller never has to ask
 // whether its shape qualifies.
+//
+// That fallback is a SECOND launch (`quant::bf16_to_fp16`), which is why no
+// row names this entry point: a row is one kernel, and this one is two
+// whenever the rows are unaligned.
 void rmsnorm_bf16_with_fp16(
     const void* x, const void* weight, void* y, void* y_fp16,
     int num_rows, int hidden, float eps, cudaStream_t stream)
@@ -523,19 +62,18 @@ void rmsnorm_bf16_with_fp16(
     if (!rmsnorm_vec8_ok(x, y, weight, hidden, hidden, hidden)) {
         rmsnorm_bf16(x, weight, y, num_rows, hidden, eps, stream);
         kernels::quant::bf16_to_fp16(y, y_fp16,
-                            static_cast<std::size_t>(num_rows) * hidden,
+                            static_cast<device::usize>(num_rows) * hidden,
                             stream);
         return;
     }
     constexpr int VBLOCK = 512;
     dim3 grid(num_rows);
-    rmsnorm_bf16_vec8_kernel<VBLOCK, /*WEIGHT_PLUS_ONE=*/false,
-                             /*EMIT_FP16=*/true>
+    device::rmsnorm_vec8<VBLOCK, /*WEIGHT_PLUS_ONE=*/false, /*EMIT_FP16=*/true>
         <<<grid, VBLOCK, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x),
-            static_cast<const __nv_bfloat16*>(weight),
-            static_cast<__nv_bfloat16*>(y),
-            static_cast<__half*>(y_fp16),
+            static_cast<const device::bf16*>(x),
+            static_cast<const device::bf16*>(weight),
+            static_cast<device::bf16*>(y),
+            static_cast<device::f16*>(y_fp16),
             hidden, hidden, hidden, eps);
 }
 
@@ -548,19 +86,19 @@ void rmsnorm_strided_bf16(
     dim3 grid(num_rows);
     if (rmsnorm_vec8_ok(x, y, weight, hidden, x_row_stride, y_row_stride)) {
         constexpr int VBLOCK = 512;
-        rmsnorm_bf16_vec8_kernel<VBLOCK, /*WEIGHT_PLUS_ONE=*/false>
+        device::rmsnorm_vec8<VBLOCK, /*WEIGHT_PLUS_ONE=*/false>
             <<<grid, VBLOCK, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<__nv_bfloat16*>(y), nullptr,
+                static_cast<const device::bf16*>(x),
+                static_cast<const device::bf16*>(weight),
+                static_cast<device::bf16*>(y), nullptr,
                 hidden, x_row_stride, y_row_stride, eps);
         return;
     }
     dim3 block(BLOCK);
-    rmsnorm_bf16_kernel<BLOCK, /*WEIGHT_PLUS_ONE=*/false><<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x),
-        static_cast<const __nv_bfloat16*>(weight),
-        static_cast<__nv_bfloat16*>(y),
+    device::rmsnorm<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<const device::bf16*>(x),
+        static_cast<const device::bf16*>(weight),
+        static_cast<device::bf16*>(y),
         hidden, x_row_stride, y_row_stride, eps);
 }
 
@@ -580,20 +118,20 @@ void residual_add_rmsnorm_bf16(
                         hidden_size, hidden_size) &&
         (reinterpret_cast<std::uintptr_t>(residual) % 16) == 0) {
         constexpr int VBLOCK = 512;
-        residual_add_rmsnorm_bf16_vec8_kernel<VBLOCK><<<grid, VBLOCK, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(hidden),
-            static_cast<const __nv_bfloat16*>(residual),
-            static_cast<const __nv_bfloat16*>(weight),
-            static_cast<__nv_bfloat16*>(norm_out),
+        device::residual_add_rmsnorm_vec8<VBLOCK><<<grid, VBLOCK, 0, stream>>>(
+            static_cast<device::bf16*>(hidden),
+            static_cast<const device::bf16*>(residual),
+            static_cast<const device::bf16*>(weight),
+            static_cast<device::bf16*>(norm_out),
             hidden_size, eps);
         return;
     }
     dim3 block(BLOCK);
-    residual_add_rmsnorm_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(hidden),
-        static_cast<const __nv_bfloat16*>(residual),
-        static_cast<const __nv_bfloat16*>(weight),
-        static_cast<__nv_bfloat16*>(norm_out),
+    device::residual_add_rmsnorm<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<device::bf16*>(hidden),
+        static_cast<const device::bf16*>(residual),
+        static_cast<const device::bf16*>(weight),
+        static_cast<device::bf16*>(norm_out),
         hidden_size, eps);
 }
 
@@ -611,13 +149,14 @@ void residual_add_scale_rmsnorm_bf16(
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
     dim3 block(BLOCK);
-    residual_add_scale_rmsnorm_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(hidden),
-        static_cast<const __nv_bfloat16*>(residual),
-        scale,
-        static_cast<const __nv_bfloat16*>(next_weight),
-        static_cast<__nv_bfloat16*>(norm_out),
-        hidden_size, eps);
+    device::residual_add_scale_rmsnorm<device::bf16, BLOCK>
+        <<<grid, block, 0, stream>>>(
+            static_cast<device::bf16*>(hidden),
+            static_cast<const device::bf16*>(residual),
+            scale,
+            static_cast<const device::bf16*>(next_weight),
+            static_cast<device::bf16*>(norm_out),
+            hidden_size, eps);
 }
 
 void rmsnorm_residual_add_bf16(
@@ -632,10 +171,10 @@ void rmsnorm_residual_add_bf16(
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
     dim3 block(BLOCK);
-    rmsnorm_residual_add_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x),
-        static_cast<const __nv_bfloat16*>(weight),
-        static_cast<__nv_bfloat16*>(hidden),
+    device::rmsnorm_residual_add<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<const device::bf16*>(x),
+        static_cast<const device::bf16*>(weight),
+        static_cast<device::bf16*>(hidden),
         hidden_size, eps);
 }
 
@@ -682,33 +221,33 @@ void rmsnorm_residual_add_scale_rmsnorm_bf16(
     if (vec_ok) {
         if (hidden_size >= 2560) {
             constexpr int kB = 512;
-            rmsnorm_rasr_vec8_kernel<kB><<<grid, kB, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<__nv_bfloat16*>(hidden), scale,
-                static_cast<const __nv_bfloat16*>(next_weight),
-                static_cast<__nv_bfloat16*>(norm_out), hidden_size, eps);
+            device::rmsnorm_rasr_vec8<kB><<<grid, kB, 0, stream>>>(
+                static_cast<const device::bf16*>(x),
+                static_cast<const device::bf16*>(weight),
+                static_cast<device::bf16*>(hidden), scale,
+                static_cast<const device::bf16*>(next_weight),
+                static_cast<device::bf16*>(norm_out), hidden_size, eps);
             return;
         }
         constexpr int kB = 256;
-        rmsnorm_rasr_vec8_kernel<kB><<<grid, kB, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x),
-            static_cast<const __nv_bfloat16*>(weight),
-            static_cast<__nv_bfloat16*>(hidden), scale,
-            static_cast<const __nv_bfloat16*>(next_weight),
-            static_cast<__nv_bfloat16*>(norm_out), hidden_size, eps);
+        device::rmsnorm_rasr_vec8<kB><<<grid, kB, 0, stream>>>(
+            static_cast<const device::bf16*>(x),
+            static_cast<const device::bf16*>(weight),
+            static_cast<device::bf16*>(hidden), scale,
+            static_cast<const device::bf16*>(next_weight),
+            static_cast<device::bf16*>(norm_out), hidden_size, eps);
         return;
     }
     constexpr int BLOCK = 512;
     dim3 block(BLOCK);
-    rmsnorm_residual_add_scale_rmsnorm_bf16_kernel<BLOCK>
+    device::rmsnorm_residual_add_scale_rmsnorm<device::bf16, BLOCK>
         <<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x),
-            static_cast<const __nv_bfloat16*>(weight),
-            static_cast<__nv_bfloat16*>(hidden),
+            static_cast<const device::bf16*>(x),
+            static_cast<const device::bf16*>(weight),
+            static_cast<device::bf16*>(hidden),
             scale,
-            static_cast<const __nv_bfloat16*>(next_weight),
-            static_cast<__nv_bfloat16*>(norm_out),
+            static_cast<const device::bf16*>(next_weight),
+            static_cast<device::bf16*>(norm_out),
             hidden_size, eps);
 }
 
@@ -720,54 +259,21 @@ void rmsnorm_gemma_bf16(
     dim3 grid(num_rows);
     if (rmsnorm_vec8_ok(x, y, weight, hidden, hidden, hidden)) {
         constexpr int VBLOCK = 512;
-        rmsnorm_bf16_vec8_kernel<VBLOCK, /*WEIGHT_PLUS_ONE=*/true>
+        device::rmsnorm_vec8<VBLOCK, /*WEIGHT_PLUS_ONE=*/true>
             <<<grid, VBLOCK, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<__nv_bfloat16*>(y), nullptr,
+                static_cast<const device::bf16*>(x),
+                static_cast<const device::bf16*>(weight),
+                static_cast<device::bf16*>(y), nullptr,
                 hidden, hidden, hidden, eps);
         return;
     }
     dim3 block(BLOCK);
-    rmsnorm_bf16_kernel<BLOCK, /*WEIGHT_PLUS_ONE=*/true><<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x),
-        static_cast<const __nv_bfloat16*>(weight),
-        static_cast<__nv_bfloat16*>(y),
+    device::rmsnorm_gemma<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<const device::bf16*>(x),
+        static_cast<const device::bf16*>(weight),
+        static_cast<device::bf16*>(y),
         hidden, hidden, hidden, eps);
 }
-
-namespace {
-
-// No-weight variant. Mirrors the templated kernel above but skips the
-// gamma multiplication entirely — `y = x * rsqrt(var + eps)`.
-template <int BLOCK>
-__global__ void rmsnorm_no_scale_bf16_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    __nv_bfloat16*       __restrict__ y,
-    int hidden, float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const __nv_bfloat16* xr = x + row * hidden;
-    __nv_bfloat16*       yr = y + row * hidden;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float v = __bfloat162float(xr[i]);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
-
-    for (int i = tid; i < hidden; i += BLOCK) {
-        yr[i] = __float2bfloat16(__bfloat162float(xr[i]) * inv_rms);
-    }
-}
-
-}  // namespace
 
 void rmsnorm_no_scale_bf16(
     const void* x, void* y,
@@ -776,98 +282,11 @@ void rmsnorm_no_scale_bf16(
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
     dim3 block(BLOCK);
-    rmsnorm_no_scale_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x),
-        static_cast<__nv_bfloat16*>(y),
+    device::rmsnorm_no_scale<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<const device::bf16*>(x),
+        static_cast<device::bf16*>(y),
         hidden, eps);
 }
-
-namespace {
-
-// y = weight * (x * rsqrt(mean(x^2) + eps)) * silu(gate). One block per
-// row; both the variance reduction and the writeback are vectorized
-// the same way as the plain RMSNorm kernel.
-//
-// `weight` is fp32 — Qwen3.5 ships RMSNormGated weights in fp32 alongside
-// bf16 activations.
-template <int BLOCK>
-__global__ void rmsnorm_gated_bf16_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ gate,
-    const float*         __restrict__ weight,
-    __nv_bfloat16*       __restrict__ y,
-    int hidden, float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const __nv_bfloat16* xr = x    + row * hidden;
-    const __nv_bfloat16* gr = gate + row * hidden;
-    __nv_bfloat16*       yr = y    + row * hidden;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float v = __bfloat162float(xr[i]);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
-
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float xv = __bfloat162float(xr[i]) * inv_rms;
-        const float wv = weight[i];
-        const float gv = __bfloat162float(gr[i]);
-        // silu(z) = z / (1 + exp(-z)) = z * sigmoid(z).
-        const float sg = gv / (1.f + __expf(-gv));
-        yr[i] = __float2bfloat16(wv * xv * sg);
-    }
-}
-
-// Same as rmsnorm_gated_bf16_kernel but x is fp32 (e.g. came straight
-// from the GDN recurrent step which outputs fp32). Fuses the separate
-// fp32→bf16 conversion that pie's qwen3.5 forward used to emit as its
-// own kernel launch before calling rmsnorm_gated_bf16. Per-row HBM
-// traffic drops from 12*hidden bytes (4-byte x read + 2-byte x write +
-// 4-byte x read + 2-byte gate read + 2-byte y write) to 8*hidden bytes
-// (4-byte x read + 2-byte gate read + 2-byte y write) — eliminates one
-// full pass over the fp32→bf16 intermediate buffer.
-template <int BLOCK>
-__global__ void rmsnorm_gated_fp32_in_bf16_kernel(
-    const float*         __restrict__ x,        // fp32 input
-    const __nv_bfloat16* __restrict__ gate,
-    const float*         __restrict__ weight,
-    __nv_bfloat16*       __restrict__ y,
-    int hidden, float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const float*         xr = x    + row * hidden;
-    const __nv_bfloat16* gr = gate + row * hidden;
-    __nv_bfloat16*       yr = y    + row * hidden;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float v = xr[i];
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
-
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float xv = xr[i] * inv_rms;
-        const float wv = weight[i];
-        const float gv = __bfloat162float(gr[i]);
-        const float sg = gv / (1.f + __expf(-gv));
-        yr[i] = __float2bfloat16(wv * xv * sg);
-    }
-}
-
-}  // namespace
 
 void rmsnorm_gated_fp32_in_bf16(
     const void* x, const void* gate, const void* weight, void* y,
@@ -876,11 +295,11 @@ void rmsnorm_gated_fp32_in_bf16(
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
     dim3 block(BLOCK);
-    rmsnorm_gated_fp32_in_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
+    device::rmsnorm_gated_f32_in<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
         static_cast<const float*>(x),
-        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const device::bf16*>(gate),
         static_cast<const float*>(weight),
-        static_cast<__nv_bfloat16*>(y),
+        static_cast<device::bf16*>(y),
         hidden, eps);
 }
 
@@ -891,11 +310,11 @@ void rmsnorm_gated_bf16(
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
     dim3 block(BLOCK);
-    rmsnorm_gated_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x),
-        static_cast<const __nv_bfloat16*>(gate),
+    device::rmsnorm_gated<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<const device::bf16*>(x),
+        static_cast<const device::bf16*>(gate),
         static_cast<const float*>(weight),
-        static_cast<__nv_bfloat16*>(y),
+        static_cast<device::bf16*>(y),
         hidden, eps);
 }
 
@@ -904,6 +323,10 @@ void rmsnorm_gated_bf16(
 // both how many threads sit idle (hidden 2816 is 352 vec8 vectors, so 160 of
 // 512 threads do nothing) and how deep the block reduction is (9 rounds at
 // 512 vs 7 at 128). Shapes for the sweep come from the models' configs.
+//
+// The block width is an ARGUMENT here, which is the other reason no row names
+// this: a `LaunchRule` states one geometry, and a sweep is a caller asking for
+// five.
 bool rmsnorm_bf16_tuned(
     const void* x, const void* weight, void* y, int num_rows, int hidden,
     float eps, int vblock, cudaStream_t stream)
@@ -912,11 +335,11 @@ bool rmsnorm_bf16_tuned(
     const dim3 grid(static_cast<unsigned>(num_rows));
     auto go = [&](auto V) {
         constexpr int VB = decltype(V)::value;
-        rmsnorm_bf16_vec8_kernel<VB, /*WEIGHT_PLUS_ONE=*/false>
+        device::rmsnorm_vec8<VB, /*WEIGHT_PLUS_ONE=*/false>
             <<<grid, VB, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<__nv_bfloat16*>(y), nullptr,
+                static_cast<const device::bf16*>(x),
+                static_cast<const device::bf16*>(weight),
+                static_cast<device::bf16*>(y), nullptr,
                 hidden, /*x_row_stride=*/hidden, /*y_row_stride=*/hidden, eps);
     };
 #define PIE_RMS_CASE(V) \
@@ -950,12 +373,12 @@ bool rmsnorm_rasr_tuned(
         const int b = -block;
         auto gov = [&](auto B) {
             constexpr int kB = decltype(B)::value;
-            rmsnorm_rasr_vec8_kernel<kB><<<grid, kB, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<__nv_bfloat16*>(hidden), scale,
-                static_cast<const __nv_bfloat16*>(next_weight),
-                static_cast<__nv_bfloat16*>(norm_out), hidden_size, eps);
+            device::rmsnorm_rasr_vec8<kB><<<grid, kB, 0, stream>>>(
+                static_cast<const device::bf16*>(x),
+                static_cast<const device::bf16*>(weight),
+                static_cast<device::bf16*>(hidden), scale,
+                static_cast<const device::bf16*>(next_weight),
+                static_cast<device::bf16*>(norm_out), hidden_size, eps);
         };
         if (!vec_ok) return false;
         if (b == 128) { gov(std::integral_constant<int,128>{}); return true; }
@@ -966,13 +389,13 @@ bool rmsnorm_rasr_tuned(
     }
     auto go = [&](auto B) {
         constexpr int kB = decltype(B)::value;
-        rmsnorm_residual_add_scale_rmsnorm_bf16_kernel<kB>
+        device::rmsnorm_residual_add_scale_rmsnorm<device::bf16, kB>
             <<<grid, kB, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<__nv_bfloat16*>(hidden), scale,
-                static_cast<const __nv_bfloat16*>(next_weight),
-                static_cast<__nv_bfloat16*>(norm_out), hidden_size, eps);
+                static_cast<const device::bf16*>(x),
+                static_cast<const device::bf16*>(weight),
+                static_cast<device::bf16*>(hidden), scale,
+                static_cast<const device::bf16*>(next_weight),
+                static_cast<device::bf16*>(norm_out), hidden_size, eps);
     };
 #define PIE_RASR_CASE(B) \
     if (block == (B)) { go(std::integral_constant<int, B>{}); return true; }

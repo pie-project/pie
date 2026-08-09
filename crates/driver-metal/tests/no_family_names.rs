@@ -147,8 +147,13 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // The same, for a control-path refusal that names where the real
         // check lives.
         ("serve/control.rs", 1),
-        // A `#[deprecated]` note pointing at what replaced it.
-        ("lowering/resolve.rs", 2),
+        // `lowering/resolve.rs` left the same way. Its two were a
+        // `#[deprecated]` note pointing at what replaced it, on a shim whose
+        // whole map has since moved to `model::shared::weight_names::Names`
+        // — beside the HuggingFace map that module already owned, and for
+        // the reason its doc gives: "the map between them belongs here and
+        // not in a driver." What is left in this crate is the resolver, which
+        // spells nothing.
         // `model/rope.rs` and `loader/plan.rs` were here for "a TEST's name
         // and a test fixture's `model_type` string", which the count no
         // longer sees. Their entries are gone rather than zeroed: a file
@@ -158,7 +163,7 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // `batch/geometry.rs` held `DecodeGeometry::gemma`, a bool named for
         // the family whose norm convention it selected, and then held the
         // ladder that filled it. Both are gone, and what is left is three
-        // lines that are not a dispatch at all: a `RopeScaling::Llama3` match
+        // lines that are not a dispatch at all: a `RopeScaling::Piecewise` match
         // arm — an enum variant `model::deployment` states, so reading it is
         // reading the ROW rather than deciding what the model is — and two
         // lines of the refusal that fires when a checkpoint asks for a YaRN
@@ -167,13 +172,19 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // llama-3's piecewise table" knows what to do next, and one that
         // reads "unsupported rope scaling" does not.
         //
-        // Budgeted at what those three are rather than left unlisted. The
-        // comment here used to claim the file spent ZERO — written when
-        // `PREFIXES` did not exist and the count could not see a match arm —
-        // and an unlisted file that scores is a red build with no argument
-        // attached to it, which is the failure mode this table's `unlisted`
-        // assertion exists to force into the open.
-        ("batch/geometry.rs", 3),
+        // Budgeted at what those are rather than left unlisted. The comment
+        // here used to claim the file spent ZERO — written when `PREFIXES`
+        // did not exist and the count could not see a match arm — and an
+        // unlisted file that scores is a red build with no argument attached
+        // to it, which is the failure mode this table's `unlisted` assertion
+        // exists to force into the open.
+        //
+        // THREE BECAME TWO when `RopeScaling::Llama3` was renamed to
+        // `RopeScaling::Piecewise` in `model::deployment`: the match arm was
+        // a family name this file had no way to spend differently, because
+        // the vocabulary it matched on carried the lineage. The two left are
+        // the refusal's own sentence, which is deliberate.
+        ("batch/geometry.rs", 2),
         // The kernel ABI's family-prefixed kind names. Absent from this
         // table until `PREFIXES` was added, because every one of its
         // mentions is an abbreviation: it names no family in full. 62 of

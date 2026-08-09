@@ -27,7 +27,14 @@ workspace = true
 # The launch ABI's owned types (`LaunchPackage` and its members) and the
 # `PIE_*` constants. The C++ interpreter carried its own mirror of these
 # structs; adopting the Rust types directly is what keeps one source of truth.
-driver-api = { path = "../driver-api" }
+#
+# `default-features = false` drops the `rpc` feature, which this crate never
+# names -- there is no `tarpc` in `src/`, and the cross-node transport is a
+# different layer. It matters to a dependent rather than to this crate:
+# `driver-vulkan` is required to be pure Rust and proves it by asking the
+# resolver, and `rpc` reaches `js-sys` and `wasm-bindgen-shared` through
+# tokio. Feature unification still turns it on for anyone who wants it.
+driver-api = { path = "../driver-api", default-features = false }
 
 # The op table, dtypes, intrinsic ids, the port registry and the canonical RNG
 # contract. `eval_op`'s numerics are a contract, not an implementation, and

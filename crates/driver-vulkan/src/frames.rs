@@ -1,0 +1,681 @@
+//! A frame from the engine, turned into fires.
+//!
+//! # The two allocators, and which one wins here
+//!
+//! This driver has a page allocator of its own -- [`crate::pages::Book`] --
+//! and it is the right one for a server built on this crate alone. It is the
+//! WRONG one for the engine, whose scheduler already owns eviction, prefix
+//! sharing and the copy plans that move pages between conversations, and
+//! which hands a driver a `kv_page_indices` CSR naming physical pages it
+//! chose.
+//!
+//! Two allocators handing out page 7 is not an error anyone sees: attention
+//! reads another conversation's keys and the model answers fluently. So this
+//! path does not touch the book, and [`crate::turns::Serving::over`] exists
+//! so that it does not have to.
+//!
+//! # What a frame is
+//!
+//! A roster of instances, a union page translation, one admission number, and
+//! a list of steps in execution order. A step is a `LaunchPlan`: token ids,
+//! per-request positions, the page CSR, and which rows read out. Everything
+//! this driver needs to build a [`Request`] is in that plan, which is why the
+//! conversion below is arithmetic and not a lookup.
+
+use driver_api::{FrameSubmission, LaunchPlan};
+
+use crate::resources::Request;
+use crate::turns::{Step, Unstepped};
+
+/// What a frame did.
+///
+/// The engine's three answers, and they are three because the caller's next
+/// move differs completely: [`Self::Exhausted`] means try again after
+/// evicting, [`Self::Impossible`] means never, and no amount of waiting
+/// changes it.
+#[derive(Debug)]
+pub enum Launched {
+    /// It ran. One [`Step`] per step of the frame, in execution order.
+    Ran(Vec<Step>),
+    /// The pool cannot hold this frame TODAY. Evict and re-post.
+    Exhausted,
+    /// The pool cannot hold this frame at any occupancy.
+    ///
+    /// Distinct from [`Self::Exhausted`] because a scheduler that waited on
+    /// this would wait forever, and one that dropped an `Exhausted` frame
+    /// would drop work it had correctly admitted.
+    Impossible,
+}
+
+/// Why a frame could not be served at all.
+#[derive(Debug)]
+pub enum Unlaunched {
+    /// A step's own CSRs do not describe a servable fire.
+    ///
+    /// Checked BEFORE anything is staged, which is the rule this crate keeps
+    /// everywhere: decide, then move.
+    Malformed(String),
+    /// A step ran into the layer below.
+    Unstepped(Unstepped),
+    /// The frame names a verb this driver does not serve.
+    Unserved(&'static str),
+}
+
+impl std::fmt::Display for Unlaunched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(why) => write!(f, "this frame is not servable: {why}"),
+            Self::Unstepped(e) => write!(f, "a step of this frame did not run: {e:?}"),
+            Self::Unserved(what) => write!(f, "this driver does not serve {what}"),
+        }
+    }
+}
+
+impl std::error::Error for Unlaunched {}
+
+/// The pages a frame names, as a count the pool must cover.
+///
+/// The highest page NAMED and not the count required, because a frame's pages
+/// are physical indices the scheduler picked anywhere in the pool: a frame
+/// needing two pages can name page 900. `driver-metal`'s `launch` derives the
+/// same number the same way, and for the same reason -- the trim task only
+/// ever unmaps, so a pool left at a trimmed size refuses a page the scheduler
+/// was right to hand out.
+///
+/// `u32::MAX` is the translation's hole and is skipped; a maximum over it
+/// would size the pool for four billion pages.
+#[must_use]
+pub fn pages_named(frame: &FrameSubmission) -> u32 {
+    frame
+        .kv_translation
+        .iter()
+        .copied()
+        .filter(|&p| p != u32::MAX)
+        .max()
+        .map_or(0, |p| p.saturating_add(1))
+        .max(frame.required_kv_pages)
+}
+
+/// Every plan feature this driver does NOT implement, and whether the plan
+/// asks for it.
+///
+/// # Why a refusal and not a silence
+///
+/// This is the class of bug the whole crate is built against. A driver that
+/// ignores `max_layers` runs the full depth and answers fluently; one that
+/// ignores `hook_page_mask` reads the pages the scheduler substituted AWAY
+/// from and answers fluently; one that ignores `image_pixels` answers a
+/// prompt whose picture was silently dropped, fluently. None of those is a
+/// crash, a NaN or a validation error -- they are wrong text, and wrong text
+/// is indistinguishable from right text without an oracle.
+///
+/// So each one is named. The engine may hand this driver a plan it cannot
+/// serve, and the honest answer is which field, in the field's own name, at
+/// admission -- before anything is written to a cache the scheduler would
+/// then have to un-write.
+///
+/// `sampling_indices` is deliberately absent: [`crate::turns::Serving::over`]
+/// forces every row to sample and says why there, so a sampling table is
+/// OVERWRITTEN rather than ignored, and the rows the caller wanted are
+/// recoverable from `Step::readout_of`.
+///
+/// `single_token_mode` is absent too: it is a hint about the shape of a fire
+/// this driver already derives from `qo_indptr`, and honouring it is not a
+/// behaviour, it is an optimisation.
+#[must_use]
+pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
+    // Order is the order the fields appear in `LaunchPlan`, so that a field
+    // added there and not here is visible as a gap in this list rather than
+    // as an answer nobody checked.
+    if !plan.rs_slot_ids.is_empty() || !plan.rs_buffer_slot_ids.is_empty() {
+        return Some("recurrent state: no model this driver serves holds any");
+    }
+    if plan.has_user_mask || !plan.masks.is_empty() {
+        return Some(
+            "a user mask: attention here is causal, and a plan's mask \
+                     would be dropped rather than applied",
+        );
+    }
+    if plan.max_layers.is_some() {
+        return Some(
+            "`max_layers`: a layer truncation this driver would run \
+                     past, at full depth, fluently",
+        );
+    }
+    if plan.hook_page_mask {
+        return Some(
+            "`hook_page_mask`: page substitution written by a hook \
+                     stage, which this driver does not run",
+        );
+    }
+    if plan.dense_device_mask {
+        return Some(
+            "`dense_device_mask`: a per-cell mask resolved from a \
+                     channel, which this driver does not resolve",
+        );
+    }
+    if !plan.image_pixels.is_empty() || !plan.image_indptr.is_empty() {
+        return Some("images: this driver serves text-only models");
+    }
+    if !plan.audio_features.is_empty() || !plan.audio_indptr.is_empty() {
+        return Some("audio: this driver serves text-only models");
+    }
+    if !plan.embed_rows.is_empty() || !plan.embed_indptr.is_empty() {
+        return Some("pre-embedded rows: this driver embeds from token ids");
+    }
+    None
+}
+
+/// A program pass that faulted: the instance, and what it said.
+pub type Fault = (u64, String);
+
+/// Fire every program this step's roster names, each over its own rows of the
+/// step's distribution.
+///
+/// # Why this exists
+///
+/// The channel plane was registration-only. A frame could bind an instance,
+/// the driver would launch the model rows, and the program -- the sampler --
+/// never ran, so the engine read an unadvanced ring and the fire's answer
+/// went nowhere. `crate::programs`' module doc used to end by saying exactly
+/// that. This is the verb that closes it.
+///
+/// # Why it is here and not in [`crate::shell::Shell`]
+///
+/// The registry is not the shell's. It is alive from the driver's `create`
+/// rather than from its `load_model`, because nothing in the channel plane is
+/// about a model -- see [`crate::programs`]. So the loop lives here, where it
+/// is pure host code a test can run with no device at all, and the caller
+/// holds the two halves.
+///
+/// # Rows, and the mistake this avoids
+///
+/// [`crate::turns::Serving::over`] forces every ROW to sample, so
+/// `step.logits` holds one distribution per token in FIRE order, and
+/// `step.readout_of[r]` says which of those rows is request `r`'s answer.
+/// The interpreter reads its inputs from `base_row = 0` and cannot be told
+/// otherwise, so a member's rows are GATHERED into a fresh buffer rather than
+/// passed as a range into the whole read-out. Passing the whole read-out is
+/// the defect `driver-metal` shipped and fixed: every member sampled the
+/// FIRST request's distribution and returned its token -- one fire, N
+/// requests, one answer repeated, nothing faulted, and invisible to any
+/// single-request test.
+///
+/// # Why a fault is not an error
+///
+/// It poisons the ONE instance that faulted. Failing the frame would take
+/// down every other request batched with it for a fault that is one
+/// program's, and those requests ran. Faults are appended for the caller to
+/// report. A blocked pass is not an error either, for a different reason:
+/// readiness is the program's own gate, and missing it means the pass did not
+/// happen and changed nothing, so the caller re-posts.
+///
+/// # Errors
+///
+/// [`Unlaunched::Malformed`] for a roster row naming no instance of this
+/// frame -- a frame built against a registry the scheduler did not have --
+/// for a request whose read-out row does not exist, and for an instance the
+/// registry does not hold.
+pub fn run_programs(
+    programs: &mut crate::programs::Programs,
+    instance_ids: &[u64],
+    sub: &driver_api::StepSubmission,
+    step: &Step,
+    faults: &mut Vec<Fault>,
+) -> Result<(), Unlaunched> {
+    let vocab = step.logits.vocab;
+    for (member, &row) in sub.roster_rows.iter().enumerate() {
+        let id = *instance_ids.get(row as usize).ok_or_else(|| {
+            Unlaunched::Malformed(format!(
+                "roster row {row} is outside this frame's {} instances",
+                instance_ids.len()
+            ))
+        })?;
+        // Composed-against, or composed against a ring that has since moved.
+        // A ticket is the only check that can tell those apart: see
+        // [`tickets_for`].
+        match tickets_for(sub, member).map_or(Ok(driver::Readiness::Ready), |tickets| {
+            programs
+                .ready(id, &tickets)
+                .map_err(|e| Unlaunched::Malformed(format!("{e}")))
+        })? {
+            driver::Readiness::Ready => {}
+            // Early, and not wrong. The producer has not run, the consumer has
+            // not drained, or another fire moved the ring: the member is
+            // skipped, nothing about it changes, and the scheduler re-posts.
+            driver::Readiness::Retry { .. } => continue,
+            // Never runnable: a poisoned or closed ring. One instance's
+            // problem, so it is a fault beside the others rather than the
+            // whole frame's failure -- and a fault a waiter can see, since
+            // the ring already carries the word the pipeline reads.
+            driver::Readiness::Failed { channel, reason } => {
+                faults.push((id, format!("channel {channel:?}: {reason:?}")));
+                continue;
+            }
+            // The frame's tables do not describe the instance they name.
+            other => {
+                return Err(Unlaunched::Malformed(format!(
+                    "instance {id} was posted with tickets that do not fit it: {other:?}"
+                )));
+            }
+        }
+        let (lo, hi) = member_requests(&sub.program_row_indptr, member, step.readout_of.len());
+        let mut values = Vec::with_capacity((hi - lo) * vocab);
+        for r in lo..hi {
+            let at = step.readout_of[r];
+            let one = step.logits.row(at).ok_or_else(|| {
+                Unlaunched::Malformed(format!(
+                    "request {r} reads row {at} of a read-out of {} rows",
+                    step.logits.rows
+                ))
+            })?;
+            values.extend_from_slice(one);
+        }
+        // An empty span is the device-geometry placeholder -- a member that
+        // owns no read-out row -- and it fires with NO forward rather than
+        // with row zero's, which is the same distinction `PassInputs::none`
+        // exists to make.
+        let inputs = if values.is_empty() {
+            driver::PassInputs::none()
+        } else {
+            driver::PassInputs {
+                logits: Some(&values),
+                rows: (hi - lo) as u32,
+                vocab: vocab as u32,
+                mtp_draft_row: None,
+            }
+        };
+        match programs.fire(id, &inputs) {
+            Ok(driver::StepOutcome::Committed | driver::StepOutcome::Blocked(_)) => {}
+            Ok(driver::StepOutcome::Faulted(why)) => faults.push((id, why)),
+            Err(e) => return Err(Unlaunched::Malformed(format!("{e}"))),
+        }
+    }
+    Ok(())
+}
+
+/// The head and tail this member's composer pinned, or `None` for a member it
+/// pinned nothing for.
+///
+/// # Why the absent case is `None` and not a defaulted table
+///
+/// `channel_ticket_indptr` partitions `channel_expected_head` and
+/// `channel_expected_tail` by member, and a frame that pins nothing states
+/// none of the three. Filling that in with unpinned entries looks like the
+/// permissive answer and is the opposite: [`driver::check`] answers
+/// `Reason::Unpinned` -- a RETRY -- for any fire that puts without a pinned
+/// tail, so a defaulted table would park every putting program forever, which
+/// reads as a hang rather than as a refusal.
+///
+/// `None` therefore means "the composer made no decision here, so there is
+/// nothing to check that it still holds", and the member fires on the
+/// interpreter's own readiness gate alone -- which is what this driver did
+/// before tickets were honoured at all, and what `driver-metal`'s host path
+/// still does.
+fn tickets_for(sub: &driver_api::StepSubmission, member: usize) -> Option<Vec<driver::Ticket>> {
+    let (lo, hi) = match (
+        sub.channel_ticket_indptr.get(member),
+        sub.channel_ticket_indptr.get(member + 1),
+    ) {
+        (Some(&s), Some(&e)) if e > s => (s as usize, e as usize),
+        _ => return None,
+    };
+    Some(
+        (lo..hi)
+            .map(|t| driver::Ticket {
+                expected_head: sub
+                    .channel_expected_head
+                    .get(t)
+                    .copied()
+                    .unwrap_or(driver::NO_TICKET),
+                expected_tail: sub
+                    .channel_expected_tail
+                    .get(t)
+                    .copied()
+                    .unwrap_or(driver::NO_TICKET),
+            })
+            .collect(),
+    )
+}
+
+/// Which of a step's requests belong to batch member `member`.
+///
+/// # Why a member is not a request
+///
+/// A frame's roster is one entry per PROGRAM instance and a step's fire is
+/// one distribution per REQUEST, and the two are not the same list: a
+/// speculative member owns several read-out rows, and a member whose geometry
+/// the device resolves owns an empty placeholder. `program_row_indptr` is the
+/// frame's own attribution CSR and says which is which -- member `p` owns wire
+/// request rows `[indptr[p], indptr[p + 1])`.
+///
+/// This is worth a named function and a test because getting it wrong is
+/// invisible. `driver-metal` handed every member the WHOLE read-out, and the
+/// interpreter's `base_row` is 0, so in a frame of three requests all three
+/// programs sampled the FIRST request's distribution and returned its token.
+/// One fire, three answers, all the same, nothing faulted -- and no
+/// single-request test can see it.
+///
+/// An absent or unusable CSR gives the whole read-out to the member, which is
+/// the single-member case and the behaviour `driver-metal` falls back to for
+/// the same shape.
+#[must_use]
+pub fn member_requests(
+    program_row_indptr: &[u32],
+    member: usize,
+    requests: usize,
+) -> (usize, usize) {
+    match (
+        program_row_indptr.get(member),
+        program_row_indptr.get(member + 1),
+    ) {
+        (Some(&s), Some(&e)) if e >= s && e as usize <= requests => (s as usize, e as usize),
+        _ => (0, requests),
+    }
+}
+
+/// One step's requests, in the plan's own request order.
+///
+/// # The conversion
+///
+/// A request is `qo_indptr[r]..qo_indptr[r + 1]` rows of the batch, its pages
+/// are `kv_page_indices[kv_page_indptr[r]..kv_page_indptr[r + 1]]`, and its
+/// positions are the plan's `position_ids` for those rows -- which are
+/// per-request already, which is what makes the page arithmetic in
+/// [`Request`] a division.
+///
+/// # Why `sampling_indices` is dropped
+///
+/// [`crate::turns::Serving::over`] forces every row to sample, for the arena
+/// reason recorded there, and rewrites the sampling table to the identity to
+/// match. A `samples` here would be overwritten one line later, so stating it
+/// would be a lie in the record rather than a value anyone reads. The rows a
+/// caller wanted are recoverable from `Step::readout_of` plus the plan.
+///
+/// # Errors
+///
+/// [`Unlaunched::Malformed`] naming the single CSR that does not close.
+pub fn requests_of(plan: &LaunchPlan) -> Result<Vec<Request>, Unlaunched> {
+    let rows = plan.qo_indptr.len().saturating_sub(1);
+    if rows == 0 {
+        return Err(Unlaunched::Malformed(
+            "qo_indptr has no requests in it".to_string(),
+        ));
+    }
+    if plan.kv_page_indptr.len() != rows + 1 {
+        return Err(Unlaunched::Malformed(format!(
+            "qo_indptr describes {rows} requests and kv_page_indptr describes {}",
+            plan.kv_page_indptr.len().saturating_sub(1)
+        )));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let (lo, hi) = (plan.qo_indptr[r] as usize, plan.qo_indptr[r + 1] as usize);
+        // Ascending and in range, checked rather than assumed: a descending
+        // pair slices backwards and panics, and a `hi` past the end takes
+        // whatever follows the vector's own data as positions.
+        if lo > hi || hi > plan.position_ids.len() {
+            return Err(Unlaunched::Malformed(format!(
+                "request {r} spans rows {lo}..{hi} of {} positions",
+                plan.position_ids.len()
+            )));
+        }
+        let (plo, phi) = (
+            plan.kv_page_indptr[r] as usize,
+            plan.kv_page_indptr[r + 1] as usize,
+        );
+        if plo > phi || phi > plan.kv_page_indices.len() {
+            return Err(Unlaunched::Malformed(format!(
+                "request {r} spans pages {plo}..{phi} of {} page indices",
+                plan.kv_page_indices.len()
+            )));
+        }
+        if lo == hi {
+            // A request contributing no rows is not expressible below --
+            // `Request::rows` would be empty and `Frame::of` would seriate
+            // nothing for it -- and silently dropping it would renumber every
+            // later request's readout. Refused by name instead.
+            return Err(Unlaunched::Malformed(format!(
+                "request {r} contributes no rows, so its readout has no answer to be"
+            )));
+        }
+        out.push(Request::of(
+            plan.position_ids[lo..hi].to_vec(),
+            plan.kv_page_indices[plo..phi].to_vec(),
+        ));
+    }
+    Ok(out)
+}
+
+/// One step's tokens, split per request the same way.
+///
+/// Separate from [`requests_of`] because a request states WHERE its rows go
+/// and a token states what is in one; the split is by the same CSR, and
+/// keeping them apart is what let the placement be tested without a page.
+///
+/// # Errors
+///
+/// [`Unlaunched::Malformed`] if the token vector is shorter than the row
+/// span, which would otherwise feed a conversation whatever followed it.
+pub fn tokens_of(plan: &LaunchPlan) -> Result<Vec<Vec<u32>>, Unlaunched> {
+    let rows = plan.qo_indptr.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let (lo, hi) = (plan.qo_indptr[r] as usize, plan.qo_indptr[r + 1] as usize);
+        if lo > hi || hi > plan.token_ids.len() {
+            return Err(Unlaunched::Malformed(format!(
+                "request {r} spans rows {lo}..{hi} of {} token ids",
+                plan.token_ids.len()
+            )));
+        }
+        out.push(plan.token_ids[lo..hi].to_vec());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(qo: &[u32], toks: &[u32], pos: &[u32], pidx: &[u32], pptr: &[u32]) -> LaunchPlan {
+        LaunchPlan {
+            token_ids: toks.to_vec(),
+            position_ids: pos.to_vec(),
+            kv_page_indices: pidx.to_vec(),
+            kv_page_indptr: pptr.to_vec(),
+            qo_indptr: qo.to_vec(),
+            ..LaunchPlan::default()
+        }
+    }
+
+    /// Two requests of different lengths are split at the CSR's boundaries.
+    ///
+    /// # Why this is the test that matters
+    ///
+    /// Every field here is a slice of a shared vector, and an off-by-one in
+    /// any of the four bounds produces a servable fire that answers the wrong
+    /// conversation: request 1 reading request 0's last position appends its
+    /// key over a token that already exists, and the model stays fluent.
+    #[test]
+    fn a_frame_s_csr_splits_into_the_requests_it_describes() {
+        // Request 0: rows 0..3 (a prefill of three), pages 4 and 9.
+        // Request 1: row 3 (a decode), page 2.
+        let p = plan(
+            &[0, 3, 4],
+            &[100, 101, 102, 200],
+            &[0, 1, 2, 7],
+            &[4, 9, 2],
+            &[0, 2, 3],
+        );
+        let requests = requests_of(&p).expect("a well-formed plan");
+        let tokens = tokens_of(&p).expect("a well-formed plan");
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].positions,
+            vec![0, 1, 2],
+            "request 0's positions are not its own three rows"
+        );
+        assert_eq!(
+            requests[0].pages,
+            vec![4, 9],
+            "request 0 was given pages that are not the ones its CSR names"
+        );
+        assert_eq!(
+            requests[1].positions,
+            vec![7],
+            "request 1's decode is at position 7, and a slice from the wrong \
+             end of the CSR gives it request 0's"
+        );
+        assert_eq!(requests[1].pages, vec![2]);
+        assert_eq!(tokens, vec![vec![100, 101, 102], vec![200]]);
+    }
+
+    /// A CSR that does not close is refused, rather than sliced.
+    #[test]
+    fn a_csr_that_runs_past_its_own_data_is_refused() {
+        // `qo_indptr` claims four rows and there are three positions.
+        let p = plan(&[0, 4], &[1, 2, 3], &[0, 1, 2], &[0], &[0, 1]);
+        requests_of(&p).expect_err("four rows of three positions");
+
+        // A page span past the page indices.
+        let p = plan(&[0, 1], &[1], &[0], &[3], &[0, 5]);
+        requests_of(&p).expect_err("five pages out of one");
+
+        // Two CSRs describing different numbers of requests.
+        let p = plan(&[0, 1, 2], &[1, 2], &[0, 0], &[3], &[0, 1]);
+        requests_of(&p).expect_err("two requests and one page span");
+
+        // A request that contributes no rows.
+        let p = plan(&[0, 0, 1], &[1], &[0], &[3, 4], &[0, 1, 2]);
+        requests_of(&p).expect_err("request 0 has no rows");
+    }
+
+    /// The pool must cover the highest page a frame NAMES, not its count.
+    ///
+    /// A frame needing two pages can name page 900, because the scheduler
+    /// picks physical indices anywhere in the pool. Sizing to the count sends
+    /// a fire at a page the pool does not have.
+    #[test]
+    fn a_frame_is_sized_by_the_pages_it_names() {
+        let frame = FrameSubmission {
+            instance_ids: vec![1],
+            kv_translation: vec![900, u32::MAX, 12],
+            kv_translation_indptr: vec![0, 3],
+            required_kv_pages: 2,
+            steps: Vec::new(),
+        };
+        assert_eq!(
+            pages_named(&frame),
+            901,
+            "the pool was sized from the page COUNT, so the fire addresses a \
+             page the pool does not have"
+        );
+
+        // ...and the hole is skipped rather than maximised over.
+        let frame = FrameSubmission {
+            kv_translation: vec![u32::MAX],
+            kv_translation_indptr: vec![0, 1],
+            required_kv_pages: 3,
+            ..frame
+        };
+        assert_eq!(
+            pages_named(&frame),
+            3,
+            "u32::MAX is the translation's hole, and a pool sized from it \
+             would want sixteen terabytes a layer"
+        );
+    }
+
+    /// Every field `unserved_in` names actually refuses, and a plain plan
+    /// does not.
+    ///
+    /// # Why a table and not eight tests
+    ///
+    /// Because the property is the PARTITION: what this driver ignores must
+    /// be exactly what it refuses. A field added to `LaunchPlan` and served
+    /// nowhere is invisible to any test that names fields one at a time --
+    /// this at least keeps the ones already known in one place, next to the
+    /// list they are checked against.
+    ///
+    /// The baseline assertion is the load-bearing half. A `unserved_in` that
+    /// refused everything would pass every case below except that one, and a
+    /// driver that refused every frame is a driver that serves nothing.
+    #[test]
+    fn a_plan_naming_what_this_driver_cannot_do_is_refused_by_that_name() {
+        let base = plan(&[0, 1], &[100], &[0], &[4], &[0, 1]);
+        assert!(
+            unserved_in(&base).is_none(),
+            "a plain text decode is refused, so this driver serves nothing"
+        );
+
+        let cases: Vec<(&str, LaunchPlan)> = vec![
+            (
+                "recurrent state",
+                LaunchPlan {
+                    rs_slot_ids: vec![0],
+                    ..base.clone()
+                },
+            ),
+            (
+                "a user mask",
+                LaunchPlan {
+                    has_user_mask: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "`max_layers`",
+                LaunchPlan {
+                    max_layers: Some(4),
+                    ..base.clone()
+                },
+            ),
+            (
+                "`hook_page_mask`",
+                LaunchPlan {
+                    hook_page_mask: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "`dense_device_mask`",
+                LaunchPlan {
+                    dense_device_mask: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "images",
+                LaunchPlan {
+                    image_pixels: vec![7],
+                    ..base.clone()
+                },
+            ),
+            (
+                "audio",
+                LaunchPlan {
+                    audio_features: vec![7],
+                    ..base.clone()
+                },
+            ),
+            (
+                "pre-embedded rows",
+                LaunchPlan {
+                    embed_rows: vec![7],
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (name, p) in &cases {
+            let why =
+                unserved_in(p).unwrap_or_else(|| panic!("{name} is ignored rather than refused"));
+            assert!(
+                why.contains(name),
+                "{name} is refused, but the refusal says {why:?} instead, which \
+                 leaves the caller to guess which field it was"
+            );
+        }
+    }
+}

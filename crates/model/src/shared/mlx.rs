@@ -606,7 +606,373 @@ pub fn author_mlx_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{already_lowered, routed_expert_member};
+    use super::{
+        Builder, DType, Encoding, Error, RawTensor, RenameRule, already_lowered, author_mlx_file,
+        layer_member, routed_expert_member,
+    };
+    use crate::catalog::LoadShape;
+    use crate::encoding::Encoding as StoredEncoding;
+    use crate::shared::policy::{Policy, RuntimeQuant};
+    use model_loader::checkpoint::CheckpointMetadata;
+    use model_loader::contract::ModelContract;
+    use model_loader::plan::StorageTarget;
+    use model_loader::types::{BackendKind, FileId, TensorId};
+
+    const HIDDEN: i64 = 64;
+    const ROWS: i64 = 32;
+
+    fn tensor(t: &mut Vec<RawTensor>, name: &str, shape: Vec<i64>, encoding: Encoding) {
+        let elements: i64 = shape.iter().product();
+        t.push(RawTensor {
+            id: TensorId(u32::try_from(t.len()).expect("a small fixture")),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: u64::try_from(elements).unwrap_or(0),
+            shape,
+            encoding,
+        });
+    }
+
+    /// A rename that answers for anything ending in `.weight`, so a test can
+    /// pick what the LOOP does without also testing a family's table.
+    fn passthrough(_b: &Builder<'_>, name: &str) -> Result<Option<String>, Error> {
+        Ok(Some(name.to_string()))
+    }
+
+    fn run(
+        tensors: Vec<RawTensor>,
+        quant: RuntimeQuant,
+        rename: RenameRule<'_>,
+    ) -> Result<ModelContract, Error> {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors,
+        };
+        // 4 bits over groups of 32: the width `push_mlx_affine_declared`
+        // would otherwise assume, stated so the fixture is not resting on
+        // the fallback the encoding's own doc calls expensive.
+        let enc = StoredEncoding {
+            method: "affine".to_string(),
+            bits: 4,
+            group_size: 32,
+        };
+        let target = StorageTarget::for_backend(BackendKind::Metal, 0, 1);
+        let policy = Policy {
+            runtime_quant: quant,
+            ..Policy::default()
+        };
+        let shape = LoadShape {
+            layers: 1,
+            head_dim: 0,
+            n_experts: 0,
+            mamba_groups: 0,
+            kv_shared_layers: 0,
+            tied_embeddings: true,
+        };
+        let mut b = Builder::new(&meta, "mlx-test", shape, &enc, &target, &policy);
+        author_mlx_file(&mut b, "Test", rename)?;
+        b.finish()
+    }
+
+    fn refusal(tensors: Vec<RawTensor>, quant: RuntimeQuant, rename: RenameRule<'_>) -> String {
+        match run(tensors, quant, rename) {
+            Ok(_) => panic!("expected a refusal"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// One quantized projection: the affine-U4 triplet Metal binds.
+    fn affine_triplet() -> Vec<RawTensor> {
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.self_attn.q_proj.weight",
+            vec![ROWS, HIDDEN / 8],
+            Encoding::Raw(DType::U32),
+        );
+        tensor(
+            &mut t,
+            "layers.0.self_attn.q_proj.scales",
+            vec![ROWS, HIDDEN / 32],
+            Encoding::Raw(DType::BF16),
+        );
+        tensor(
+            &mut t,
+            "layers.0.self_attn.q_proj.biases",
+            vec![ROWS, HIDDEN / 32],
+            Encoding::Raw(DType::BF16),
+        );
+        t
+    }
+
+    fn names(c: &ModelContract) -> Vec<&str> {
+        c.tensors.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    // ── The refusal that replaced a message from inside the loader ───────
+
+    /// An unquantized checkpoint with no `--quant int4` is refused HERE,
+    /// where the checkpoint is still in view. The Metal binder asks every
+    /// projection for `.scales` unconditionally, so without this the load
+    /// authored cleanly and then died on `unstaged weight embed_tokens.scales`
+    /// -- a sentence about an internal staging table, from which nothing
+    /// about the actual problem is recoverable.
+    #[test]
+    fn an_unquantized_checkpoint_is_refused_before_the_binder_sees_it() {
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.self_attn.q_proj.weight",
+            vec![ROWS, HIDDEN],
+            Encoding::Raw(DType::BF16),
+        );
+        let m = refusal(t, RuntimeQuant::None, &passthrough);
+        assert!(m.contains("needs quantized weights"), "{m}");
+        // The refusal has to carry the way OUT, not just the diagnosis:
+        // both remedies are named.
+        assert!(m.contains("--quant int4"), "{m}");
+        assert!(m.contains("4bit"), "{m}");
+        assert!(m.contains("Test"), "the refusal names the schema: {m}");
+    }
+
+    /// The same checkpoint under `--quant int4` is accepted, because the
+    /// floats are encoded below. The guard reads a REQUEST, not a file
+    /// property, and that is the whole reason it is two conditions.
+    #[test]
+    fn the_same_checkpoint_loads_when_the_weights_will_be_encoded() {
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.self_attn.q_proj.weight",
+            vec![ROWS, HIDDEN],
+            Encoding::Raw(DType::BF16),
+        );
+        let c = run(t, RuntimeQuant::Int4, &passthrough).expect("int4 encodes the floats");
+        assert!(names(&c).contains(&"layers.0.self_attn.q_proj.weight"));
+    }
+
+    /// One `.scales` anywhere is enough to pass the gate. Stated because
+    /// the check is an `any`, not a per-tensor rule -- a partly quantized
+    /// checkpoint gets through here and is caught tensor by tensor below.
+    #[test]
+    fn a_single_scales_tensor_anywhere_satisfies_the_gate() {
+        let c = run(affine_triplet(), RuntimeQuant::None, &passthrough).expect("a quantized file");
+        assert!(names(&c).contains(&"layers.0.self_attn.q_proj.weight"));
+    }
+
+    // ── What the loop does with each kind of tensor ──────────────────────
+
+    /// A packed U32 weight whose companions are missing is refused rather
+    /// than pushed direct. Metal would bind the U32 bytes as if they were
+    /// the weight -- there is no shape check that would notice, since a
+    /// packed `[rows, cols/8]` is a perfectly ordinary tensor.
+    #[test]
+    fn a_packed_weight_missing_its_scales_is_refused() {
+        let mut t = affine_triplet();
+        t.retain(|r| r.name != "layers.0.self_attn.q_proj.scales");
+        // A second projection keeps its scales, so the file is still
+        // "quantized" as the gate above measures it -- an `any`, not a
+        // per-tensor rule. Without this decoy the gate fires first and the
+        // test asserts nothing about the loop.
+        tensor(
+            &mut t,
+            "layers.0.mlp.down_proj.scales",
+            vec![ROWS, 2],
+            Encoding::Raw(DType::BF16),
+        );
+        let m = refusal(t, RuntimeQuant::None, &passthrough);
+        assert!(m.contains("missing scales or biases"), "{m}");
+        assert!(
+            m.contains("q_proj.weight"),
+            "the refusal names the tensor: {m}"
+        );
+    }
+
+    /// And the biases half. Separate test because the two are one `let
+    /// else` over a tuple, and a fixture damaging only one of them
+    /// exercises only one probe.
+    #[test]
+    fn a_packed_weight_missing_its_biases_is_refused() {
+        let mut t = affine_triplet();
+        t.retain(|r| !r.name.ends_with(".biases"));
+        // The gate above passes -- `.scales` is still present -- so this
+        // really is the loop's own refusal and not the unquantized one.
+        let m = refusal(t, RuntimeQuant::None, &passthrough);
+        assert!(m.contains("missing scales or biases"), "{m}");
+    }
+
+    /// An F32 weight under `--quant int4` is CAST before it is encoded,
+    /// and the cast lands in its own tensor rather than nesting inside the
+    /// encode: `Cast` needs a kernel, so it has to leave a buffer behind
+    /// for the encode to read. The intermediate is marked internal, which
+    /// is what keeps it out of the runtime namespace.
+    #[test]
+    fn a_float32_weight_is_widened_through_a_named_intermediate() {
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.mlp.down_proj.weight",
+            vec![ROWS, HIDDEN],
+            Encoding::Raw(DType::F32),
+        );
+        let c = run(t, RuntimeQuant::Int4, &passthrough).expect("int4 encodes the floats");
+        let widened = c
+            .tensors
+            .iter()
+            .find(|x| x.name == "layers.0.mlp.down_proj.weight.bf16")
+            .expect("the cast leaves a buffer behind");
+        assert_eq!(widened.encoding, Encoding::Raw(DType::BF16));
+        assert_eq!(
+            widened.visibility,
+            model_loader::contract::Visibility::Internal
+        );
+        // Declaring the F32 source AS bf16 would satisfy every line above
+        // and read every element wrong, so the node itself is the assertion.
+        assert!(
+            matches!(&widened.expr, model_loader::contract::Expr::Cast { .. }),
+            "the intermediate converts rather than relabels: {:?}",
+            widened.expr
+        );
+    }
+
+    /// A BF16 weight takes the same path with no cast at all -- there is
+    /// nothing to widen. Pinned against the F32 case because the two
+    /// differ only in whether the intermediate exists.
+    #[test]
+    fn a_bfloat16_weight_is_encoded_with_no_intermediate() {
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.mlp.down_proj.weight",
+            vec![ROWS, HIDDEN],
+            Encoding::Raw(DType::BF16),
+        );
+        let c = run(t, RuntimeQuant::Int4, &passthrough).expect("int4 encodes the floats");
+        assert!(!names(&c).contains(&"layers.0.mlp.down_proj.weight.bf16"));
+        assert!(names(&c).contains(&"layers.0.mlp.down_proj.weight"));
+    }
+
+    /// A 2-D `.weight` of a dtype the encoder cannot read is pushed
+    /// straight through instead of encoded. It still COUNTS as declared --
+    /// the `continue` skips the encode, not the tally -- which is what
+    /// keeps a checkpoint of only such tensors from hitting the
+    /// "no decoder tensors" refusal below.
+    #[test]
+    fn a_weight_the_encoder_cannot_read_is_pushed_through_and_still_counts() {
+        // The ONLY tensor in the file, so that "it still counts" is what
+        // the assertion rests on: with the tally skipped, `declared` stays
+        // zero and the empty-contract refusal below fires instead.
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.mlp.down_proj.weight",
+            vec![ROWS, HIDDEN],
+            Encoding::Raw(DType::U8),
+        );
+        let c =
+            run(t, RuntimeQuant::Int4, &passthrough).expect("an unencodable weight is not fatal");
+        assert_eq!(names(&c), vec!["layers.0.mlp.down_proj.weight"]);
+    }
+
+    /// A 1-D tensor -- a norm -- is never encoded, whatever was requested.
+    /// The rank condition is what separates a projection from a scale
+    /// vector, and both end in `.weight`.
+    #[test]
+    fn a_one_dimensional_weight_is_never_encoded() {
+        // Under int4, so the encode branch is LIVE and the rank is the only
+        // thing keeping the norm out of it. At `RuntimeQuant::None` the
+        // branch is dead and this test would assert nothing -- it did, and
+        // a control deleting the rank check was silent.
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.input_layernorm.weight",
+            vec![HIDDEN],
+            Encoding::Raw(DType::BF16),
+        );
+        let c = run(t, RuntimeQuant::Int4, &passthrough).expect("a norm needs no quantization");
+        let norm = c
+            .tensors
+            .iter()
+            .find(|x| x.name == "layers.0.input_layernorm.weight")
+            .expect("the norm");
+        assert_eq!(norm.encoding, Encoding::Raw(DType::BF16));
+    }
+
+    /// A rename that answers `None` for everything leaves the loop with
+    /// nothing declared, and THAT is refused. Without it the Metal load
+    /// would produce an empty contract and the driver would report every
+    /// tensor missing, one at a time, instead of the one fact that
+    /// explains all of them.
+    #[test]
+    fn a_schema_that_recognizes_nothing_is_refused_rather_than_left_empty() {
+        fn nothing(_b: &Builder<'_>, _name: &str) -> Result<Option<String>, Error> {
+            Ok(None)
+        }
+        let m = refusal(affine_triplet(), RuntimeQuant::None, &nothing);
+        assert!(m.contains("found no decoder tensors"), "{m}");
+        assert!(m.contains("Test"), "the refusal names the schema: {m}");
+    }
+
+    /// A rename's own refusal is propagated, not swallowed into the
+    /// "found no decoder tensors" one. The `?` is the difference between a
+    /// family naming the tensor it could not place and the loop reporting
+    /// that the family placed nothing.
+    #[test]
+    fn a_rename_that_refuses_is_reported_by_its_own_words() {
+        fn refuse(_b: &Builder<'_>, name: &str) -> Result<Option<String>, Error> {
+            super::fail(format!("the schema will not have '{name}'"))
+        }
+        let m = refusal(affine_triplet(), RuntimeQuant::None, &refuse);
+        assert!(m.contains("will not have"), "{m}");
+        assert!(!m.contains("found no decoder tensors"), "{m}");
+    }
+
+    // ── The layer index every Metal schema splits off ────────────────────
+
+    /// The three refusals of `layer_member` say three different things,
+    /// and the difference is the whole point: a reader told "no declared
+    /// mapping" goes looking for a table entry, and a reader told
+    /// "malformed" does not.
+    #[test]
+    fn the_three_layer_index_refusals_are_told_apart() {
+        let unmapped = layer_member("blocks.0.attn", "Test", "raw")
+            .expect_err("not under layers.")
+            .to_string();
+        assert!(
+            unmapped.contains("no declared mapping or skip"),
+            "{unmapped}"
+        );
+
+        let no_dot = layer_member("layers.0", "Test", "raw")
+            .expect_err("no member after the index")
+            .to_string();
+        assert!(no_dot.contains("is malformed"), "{no_dot}");
+
+        let not_a_number = layer_member("layers.first.attn", "Test", "raw")
+            .expect_err("an index that is not digits")
+            .to_string();
+        assert!(
+            not_a_number.contains("invalid layer index"),
+            "{not_a_number}"
+        );
+
+        let empty = layer_member("layers..attn", "Test", "raw")
+            .expect_err("an empty index")
+            .to_string();
+        assert!(empty.contains("invalid layer index"), "{empty}");
+    }
+
+    /// The member is everything after the FIRST dot, dots included -- a
+    /// projection is `self_attn.q_proj.weight`, not `self_attn`.
+    #[test]
+    fn the_member_keeps_every_dot_after_the_index() {
+        let (layer, member) =
+            layer_member("layers.31.self_attn.q_proj.weight", "Test", "raw").expect("a projection");
+        assert_eq!(layer, "31");
+        assert_eq!(member, "self_attn.q_proj.weight");
+    }
 
     /// `f(f(x)) == f(x)`, checked on the names the four Metal schemas emit.
     ///

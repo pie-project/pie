@@ -18,9 +18,21 @@
 /// what a bound launch is bound TO.
 pub mod abi;
 
-/// Tier A: a device entry point loaded from a cubin, its arguments
-/// marshalled from the row, and `cuLaunchKernel`. No host launcher.
+/// Tier A: a kernel loaded from a cubin, its arguments marshalled from the
+/// row, and `cuLaunchKernel`. No host launcher.
 pub mod device;
+
+/// Tier A: the `__global__` templates, compiled at run time and instantiated
+/// by the names the rows state. No entry points either.
+pub mod nvrtc;
+
+/// Stage B: the device headers an `#include` resolves against, carried in the
+/// binary rather than found on a path.
+pub mod headers;
+
+/// Stage C: firing a row through the unit it was compiled into at run time,
+/// instead of through the generated shim.
+pub mod jit;
 
 /// Tier A: the arithmetic a stated [`kernels::LaunchRule`] names — what
 /// the C++ launchers computed inside `<<<>>>`.
@@ -275,32 +287,62 @@ impl DispatchPlan {
                 }
             }
         }
-        // nemotron's mamba block wires values ACROSS statements: the
-        // dt/dA prep and the scan consume the SPLIT's raw `dt` and the
-        // PARAMS prep's fp32 tables, none of which their own statements
-        // carry (the C++ hand pass routes them through its workspace).
-        // Collect them per layer so the arms read a slot.
-        let mut mamba_aux: std::collections::BTreeMap<u16, [Option<Arg>; 6]> =
+        // CROSS-STATEMENT WIRING, read off the kernel rows.
+        //
+        // Some blocks wire values ACROSS statements: nemotron's mamba scan
+        // consumes the split's raw `dt` and the params prep's fp32 tables,
+        // none of which its own statement carries (the C++ hand pass routed
+        // them through its workspace). Both ends of that wiring are now
+        // STATED — `KernelSig::publishes_aux` says which output fills which
+        // slot, `Source::Aux(i)` says which slot an operand reads — so this
+        // collects publishers into per-layer slots and knows no kernel by
+        // name. What stood here matched four literal symbols, which made
+        // this crate the only place that knew how one architecture's block
+        // is put together.
+        let sig_of = |launch: &Launch| -> Option<&'static kernels::KernelSig> {
+            kernels::sig_in(
+                kernels_cuda_new::table::KERNELS,
+                &lowered.kernels[launch.kernel as usize],
+            )
+        };
+        // Widest slot any row publishes or reads, so the vector is sized by
+        // the table rather than by a constant this file would have to keep
+        // in step with it.
+        let aux_width = lowered
+            .launches
+            .iter()
+            .filter_map(sig_of)
+            .flat_map(|s| {
+                s.publishes_aux
+                    .iter()
+                    .map(|&(slot, _)| slot)
+                    .chain(s.operands.iter().filter_map(|o| match o.source {
+                        kernels::Source::Aux(i) => Some(i),
+                        _ => None,
+                    }))
+            })
+            .max()
+            .map_or(0, |m| usize::from(m) + 1);
+        let mut aux: std::collections::BTreeMap<u16, Vec<Option<Arg>>> =
             std::collections::BTreeMap::new();
         for launch in &lowered.launches {
+            let Some(sig) = sig_of(launch) else { continue };
+            if sig.publishes_aux.is_empty() {
+                continue;
+            }
             let op = &plan.ops[launch.op as usize];
-            let layer = launch.layers.start;
-            match lowered.kernels[launch.kernel as usize].as_str() {
-                "ssm::nemotron_mamba_split_bf16" if op.outputs.len() == 3 => {
-                    mamba_aux.entry(layer).or_default()[0] = Some(out_arg(op.outputs[2]));
+            let slots = aux
+                .entry(launch.layers.start)
+                .or_insert_with(|| vec![None; aux_width]);
+            for &(slot, out_ix) in sig.publishes_aux {
+                // Out of range is a trace that does not fit this kernel; the
+                // arity guard reports it, and publishing nothing keeps the
+                // `all slots filled` test below the one that decides.
+                if let Some(&v) = op.outputs.get(usize::from(out_ix))
+                    && let Some(cell) = slots.get_mut(usize::from(slot))
+                {
+                    *cell = Some(out_arg(v));
                 }
-                "ssm::nemotron_prepare_mamba_params" if op.outputs.len() == 3 => {
-                    let e = mamba_aux.entry(layer).or_default();
-                    for (i, &v) in op.outputs.iter().enumerate() {
-                        e[1 + i] = Some(out_arg(v));
-                    }
-                }
-                "ssm::nemotron_prepare_mamba_dt_da" if op.outputs.len() == 2 => {
-                    let e = mamba_aux.entry(layer).or_default();
-                    e[4] = Some(out_arg(op.outputs[0]));
-                    e[5] = Some(out_arg(op.outputs[1]));
-                }
-                _ => {}
             }
         }
         // The LoRA correction's qkv_in: the statement carries only its
@@ -353,11 +395,10 @@ impl DispatchPlan {
                     .or_insert_with(|| out_arg(op.outputs[0]));
             }
         }
-        let mamba_aux_of = |layer: u16| -> Vec<Arg> {
-            mamba_aux
-                .get(&layer)
+        let aux_of = |layer: u16| -> Vec<Arg> {
+            aux.get(&layer)
                 .map(|slots| slots.iter().filter_map(Clone::clone).collect::<Vec<_>>())
-                .filter(|v: &Vec<Arg>| v.len() == 6)
+                .filter(|v: &Vec<Arg>| v.len() == aux_width)
                 .unwrap_or_default()
         };
         let specs = lowered
@@ -418,11 +459,14 @@ impl DispatchPlan {
                 if let OpKind::Rope { partial, .. } = op.kind {
                     spec.rope_partial = partial;
                 }
-                if matches!(
-                    lowered.kernels[launch.kernel as usize].as_str(),
-                    "ssm::nemotron_prepare_mamba_dt_da" | "ssm::nemotron_mamba_ssm_batched_bf16"
-                ) {
-                    spec.aux = mamba_aux_of(launch.layers.start);
+                // A consumer is a row that READS an aux slot, which is what
+                // `Source::Aux` says. No kernel is named here.
+                if sig_of(launch).is_some_and(|s| {
+                    s.operands
+                        .iter()
+                        .any(|o| matches!(o.source, kernels::Source::Aux(_)))
+                }) {
+                    spec.aux = aux_of(launch.layers.start);
                 }
                 if matches!(
                     lowered.kernels[launch.kernel as usize].as_str(),
@@ -669,6 +713,38 @@ impl Drop for PrefillPlan {
 /// `rows`, per-operand widths from the args. What remains is the
 /// deployment's constants — the same values the C++ arms read off their
 /// facts structs — and the per-fire handles.
+///
+/// # The integer fields here are `i32` by convention, not by necessity
+///
+/// A table states an operand's extent as `Div(Width(i), CtxNonZero(f))` and
+/// `emit_rust_dispatch` renders it by CONCATENATION — `width_of(b, i)`, which
+/// is always `i32`, over `ctx.<f>` — because the emitter *"does not know the
+/// field's TYPE"* (`kernels_cuda_new::abi`'s own words, and the reason
+/// [`IsSet`] exists rather than a `!= 0`). There is no coercing `Source`
+/// variant: the vocabulary is `Lit / Width / Mul / Div / IfPresent / Ctx /
+/// CtxNonZero`.
+///
+/// For a while that made an UNWRITTEN RULE — every integer field a table
+/// could divide by had to be `i32` here — and it broke exactly the way an
+/// unwritten cross-crate rule breaks. `ple_dim` was widened to `u32` to keep
+/// a field shorthand compiling against a `Deployment` that had widened too,
+/// and the next table row that divided by it stopped the crate from building
+/// with `cannot divide i32 by u32` — in a generated file, on a line no one
+/// wrote, three hundred arms away from the change. Two readers diagnosed it
+/// as a bad table row; the row was correct.
+///
+/// THE RULE IS GONE. `kernels_cuda_new::abi::rust_arith_of` narrows a
+/// driver-declared field to the grammar's `i32` before composing it, which is
+/// the same rule `cast_for` always applied to a whole operand — *"a row
+/// declares `I32` and gets an i32, whatever the width of the thing it named"*
+/// — now applied at every depth rather than only the top. `score_window` was
+/// already `u32` and already worked; the asymmetry WAS the bug.
+/// `a_declared_field_under_an_operator_is_narrowed_first` holds it over every
+/// table, and widening `ple_dim` back to `u32` was measured to compile.
+///
+/// So `i32` here is a local choice — it matches `head_dim`, `altup_streams`
+/// and the rest, and a divisor reads better signed — and a future field may
+/// be whatever the driver finds honest.
 #[cfg(feature = "bridge")]
 #[derive(Debug, Clone)]
 pub struct DispatchCtx {
@@ -722,6 +798,12 @@ pub struct DispatchCtx {
     /// gemma-4's per-layer embedding width (`ple_dim`) — what the PLE
     /// relay transpose divides its flat `[N, layers*dim]` row by. Zero
     /// on families without a PLE.
+    ///
+    /// `i32` to match `head_dim` and the rest, not because it must be:
+    /// two table rows divide a width by it, and the emitter narrows a
+    /// declared field before composing it. See the struct's own doc.
+    /// `Deployment::ple_dim` is `u32` — that is the model side's call, and
+    /// the narrowing is one `try_from` at the literal that joins them.
     pub ple_dim: i32,
     /// The scalar constants `norm::scalar_mul_bf16` launches name in
     /// their `scale.<name>` weight slot — `sqrt(hidden)` on the
@@ -756,6 +838,37 @@ pub struct DispatchCtx {
     pub situ_linear_beta: f32,
     /// The WNA16 experts' quantisation group size.
     pub wna16_group_size: i32,
+    /// The fire's ROUTED-EXPERT FANOUT: how many experts each token is
+    /// dispatched to, agreed across every routed launch in the fire, or `0`
+    /// when the fire has none or they disagree.
+    ///
+    /// # Why the fire and not the statement
+    ///
+    /// It is a GEOMETRY axis — [`kernels_cuda_new::Dims::experts_per_token`]
+    /// — and a grid is opened before an operand is read, so a rule that needs
+    /// it needs it as a fact about the run. `dequant_fp4.cu:56` opens
+    /// `dim3 grid(num_tokens * top_k, ..)`, `dequant_wna16.cu` the same: the
+    /// fanout MULTIPLIES the row axis, so getting it wrong is not a wrong
+    /// scalar in a correct grid, it is the wrong number of blocks.
+    ///
+    /// # Why it is derived from the lowered plan and not from `Geometry`
+    ///
+    /// `model::deployment::Geometry` does not state it — it states hidden,
+    /// heads, head width, intermediates and vocab — and this crate does not
+    /// own that type. What the fire DOES hold is its own lowered launches,
+    /// and the mixture statements state the fanout as a wire param at a
+    /// position `dsl` fixes per statement kind. So the value is read from
+    /// there, ONCE, at the single construction site, keyed on the kernel
+    /// SYMBOL rather than on a bare index — see `fire::launch`'s
+    /// `fire_experts_per_token`, whose doc argues why the symbol key is what
+    /// makes the wrong reading unspellable.
+    ///
+    /// # Zero is absence
+    ///
+    /// A fire with no routed statement, or one whose routed statements
+    /// disagree about the fanout, gets `0`, and every rule that reads it
+    /// answers `Ungeometric::Empty`. A refusal is not a fallback.
+    pub experts_per_token: i32,
     /// gemma3n's AltUp rank-K residual: the stream count `K` and the
     /// ACTIVE stream's index (`cfg.altup_active_idx`). The launches that
     /// address `[K, tokens, hidden]` values state a zero width — a
@@ -1184,6 +1297,180 @@ fn dispatch_generated<R: Resolver>(
 
     fn width_over(b: &BoundLaunch<'_>, i: usize, by: i32) -> i32 {
         width_of(b, i) / by.max(1)
+    }
+
+    /// The ten axes a JIT'd row's [`kernels::LaunchRule`] is evaluated
+    /// over, for a fire this driver is in the middle of.
+    ///
+    /// # Why the driver fills this and the emitter does not
+    ///
+    /// Four of the ten are the STATEMENT's and six are the FIRE's, and
+    /// the split is not a convenience. `rows` and the two widths come off
+    /// the launch's own rectangle and operands, which is what the
+    /// generated arm can see; heads, head width, rotary channels and
+    /// expert counts describe the MODEL, and the driver holds them on
+    /// [`DispatchCtx`] because the C++ arms read exactly these off their
+    /// facts structs. Emitting them per arm would put a driver's struct
+    /// layout inside the crate that describes kernels, three hundred
+    /// times, and a field renamed on one side would be a generated file
+    /// that no longer compiles rather than a call site that moves.
+    ///
+    /// The fourth statement-side axis is `stated_head_dim`, which is the
+    /// only one of the ten whose ZERO is a value: see the comment on the
+    /// two head widths below.
+    ///
+    /// `driver-metal` reached the same shape from the other end: its
+    /// `lowering::dispatch::Geometry` is *"the fire-invariant half of
+    /// `Dims` ... handed in by the caller that already knows it. The
+    /// driver does not derive them: deriving a head count from a buffer
+    /// size is exactly the 'model definition inside the driver'"* that
+    /// its own geometry work is retiring for. This is that structure with
+    /// `DispatchCtx` playing `Geometry`, which it already was.
+    ///
+    /// # The one the driver cannot answer, and what happens instead
+    ///
+    /// `n_experts` is **zero**, and that is a refusal rather than a
+    /// default. This driver has no fire-wide expert COUNT to give:
+    /// `model::deployment::Geometry` states eight numbers and that is
+    /// not one of them, and the mixture statements carry it as a WIRE
+    /// PARAM (`dsl`'s `router_topk` packs `[n_experts,
+    /// experts_per_token]`), which is a fact about one statement at one
+    /// position and not a fact about the fire. Reading `spec.params[0]`
+    /// here would be inventing a value — the same slot is `window_left`
+    /// on every attention dispatch — so the zero stands and
+    /// `LaunchRule::RouterSort` answers `Ungeometric::Empty` for it,
+    /// which refuses the fire rather than launching a counting sort with
+    /// no counters. A router row is therefore not routable yet, and that
+    /// is the honest state.
+    ///
+    /// # `experts_per_token` is now answered, and by the fire
+    ///
+    /// [`DispatchCtx::experts_per_token`] carries it, derived once at the
+    /// one construction site in `fire::launch` from the LOWERED PLAN'S OWN
+    /// routed launches — keyed on the KERNEL SYMBOL, whose parameter layout
+    /// `dsl` states, and required to AGREE across the whole fire.
+    ///
+    /// Keying on the symbol is what makes the wrong reading unspellable
+    /// rather than merely unwritten: the derivation never sees an
+    /// unqualified index, so it cannot read `window_left` out of an
+    /// attention dispatch's `params[0]` the way an index-keyed rule would.
+    /// A fire whose routed statements disagree, or that has none, gets
+    /// zero, which every reading rule refuses. The derivation is one
+    /// function with the symbol table beside it and its own doc argues the
+    /// point at greater length.
+    ///
+    /// `rotary_dims` is supplied and read by no CUDA rule — the partial
+    /// rotation is a different kernel, launched over a flat per-token
+    /// grid, so the extent reaches it as an operand. It is filled anyway,
+    /// from the three places a width is stated, because the alternative
+    /// is a field that is zero for no reason anyone can look up.
+    fn jit_dims(
+        b: &BoundLaunch<'_>,
+        spec: &LaunchSpec,
+        ctx: &DispatchCtx,
+        attn: Option<&AttnCtx>,
+        rows: i32,
+        width: i32,
+        in_width: i32,
+    ) -> kernels_cuda_new::Dims {
+        // `max(0) as u32` on every extent, matching what the arm used to
+        // spell inline: a negative width is an operand the run does not
+        // hold, and zero is the value every rule that reads it refuses.
+        #[allow(clippy::cast_sign_loss)]
+        let extent = |v: i32| v.max(0) as u32;
+        kernels_cuda_new::Dims {
+            rows: extent(rows),
+            width: extent(width),
+            in_width: extent(in_width),
+            q_heads: extent(ctx.num_q_heads),
+            kv_heads: extent(ctx.num_kv_heads),
+            // THE STATEMENT'S HEAD WIDTH WINS. `spec.per_head_dim` is
+            // `RmsnormPerHead`'s reading — the launch's rows are token
+            // rows and the kernel's are `tokens * (width / head_dim)` of
+            // `head_dim` — and it is per statement because gemma-4's two
+            // layer kinds disagree about it. A grid that took the count
+            // from the fire and the width from nowhere would be
+            // describing neither layer, which is the defect
+            // `driver-metal`'s `stated_head.unwrap_or(geometry.head_dim)`
+            // records having had.
+            head_dim: spec.per_head_dim.unwrap_or_else(|| extent(ctx.head_dim)),
+            // AND THE STATEMENT'S ABSENCE IS ITS OWN ANSWER. `unwrap_or(0)`
+            // — no fallback, and the missing fallback is the point.
+            //
+            // `head_dim` above answers "how wide is a head here", which
+            // every head-shaped rule asks and which the fire can answer
+            // when the statement did not. `stated_head_dim` answers "did
+            // the statement name a per-head width at all", which only
+            // `LaunchRule::RowsPerHead` asks and which the fire cannot
+            // answer at all: `spec.per_head_dim` is `None` for every
+            // `OpKind` but `RmsnormPerHead`, and folding that `None` into
+            // the fire's attention head width — as the line above must,
+            // for its own readers — erases exactly the distinction the
+            // rule is.
+            //
+            // `table/norm.rs:36` has always had it, because the operand
+            // side reads the `Option` directly:
+            //
+            //     hidden <- IfPresent(PerHeadDim, PerHeadDim, Width(In(0)))
+            //
+            // The geometry side could not, so `rmsnorm.cu`'s five
+            // launchers had no statable rule. With a filler here a plain
+            // `Rmsnorm` of 2048 channels under 128-wide heads would take
+            // the present arm and open `rows * 16` blocks, each norming a
+            // whole row's width from a sixteenth of a row's offset —
+            // `2048 % 128 == 0`, so nothing would refuse.
+            //
+            // This is a SECOND quantity and not a revision of the first:
+            // the comment above still holds, and both fields are filled
+            // from `spec.per_head_dim` because both are readings of what
+            // the statement said. They differ only where it said nothing.
+            stated_head_dim: spec.per_head_dim.unwrap_or(0),
+            rotary_dims: rotary_width(ctx, spec, b.layers.start as usize).unwrap_or(0),
+            // See the doc above: absent, not zero-as-a-value.
+            n_experts: 0,
+            experts_per_token: extent(ctx.experts_per_token),
+            // AND THIS ONE IS NOW REACHABLE. It was not, and the reason was
+            // structural rather than arithmetic: this is a nested `fn` inside
+            // `dispatch_generated` and therefore captures nothing, and its
+            // call sites are emitted by `kernels_cuda_new::abi` with a fixed
+            // argument list. `dispatch_generated` HAD the attention context
+            // all along — it takes `attn: Option<&AttnCtx>` for the operand
+            // side — so closing it was widening the emitted list by one
+            // argument, which `abi::emit_rust_dispatch` now does.
+            //
+            // `AttnCtx::num_requests` is the CSR's `R`, the same number
+            // `table/attn.rs` reads as `Source::Attn("num_requests")` for
+            // half a dozen rows, so the geometry side and the operand side
+            // now read one field rather than one field and a zero.
+            //
+            // A fire with NO attention context leaves it zero, which is
+            // ABSENCE and which `LaunchRule::PagedScores` refuses. That is
+            // the whole of the fallback: `map_or(0, ..)` and no `unwrap_or`
+            // reaching for `rows`.
+            //
+            // Filling it from `rows` instead is the failure mode
+            // `Dims::requests` documents and it has not been adopted: on a
+            // prefill those are different numbers and
+            // `attention_naive_paged.cu:200` spells BOTH in one `dim3`, so a
+            // 4-request 512-token fire would launch 512 by 512 by heads where
+            // the launcher launches 4 by 512 by heads — 128x the blocks,
+            // every extra one indexing `qo_indptr` past its end. A zero
+            // refuses; a plausible wrong number does not. The fire test in
+            // `tests/launch_rules.rs` uses exactly that substitution as its
+            // negative control.
+            requests: attn.map_or(0, |a| extent(a.num_requests)),
+            // AND THIS ONE IS FILLED. `DispatchCtx` carries the AltUp rank
+            // outright — `table/norm.rs`'s AltUp rows already read it as
+            // `Source::Ctx("altup_streams")` — so `LaunchRule::AltUpStreams`
+            // is served here rather than refused, and it is the only one of
+            // the round's eight new rules that is.
+            //
+            // A fire with no AltUp block leaves it zero, which is ABSENCE and
+            // which that rule refuses. Nothing else reads it: it is a
+            // residual-stream rank and not a head count, and `Dims`
+            // deliberately does not let the two be confused.
+            altup_streams: extent(ctx.altup_streams),
+        }
     }
 
     /// `Source::CtxNonZero`'s test: a family zeroes a context field to

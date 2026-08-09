@@ -6,9 +6,11 @@
 //! * [`contract`] — a row to the author that writes its load contract.
 //! * [`instruct`] — a row to the chat template that formats for it.
 //! * `<generation>::forward` — the forward pass, written in
-//!   `model-compiler`'s tracing eDSL. Behind the non-default `forward`
-//!   feature, because `pie model convert` wants the first two and not a
-//!   tracer.
+//!   `model-compiler`'s tracing eDSL. UNGATED, like the rest of the
+//!   crate's shape vocabulary: it used to sit behind a non-default
+//!   `forward` feature on the argument that `pie model convert` wants
+//!   the first two and not a tracer, and every consumer in the tree
+//!   turned it on anyway while `model-compiler` stayed non-optional.
 //!
 //! The first two are ASPECTS OF A ROW and the third is not: a forward pass is
 //! reached by a driver naming a family's text directly, not by a row. That

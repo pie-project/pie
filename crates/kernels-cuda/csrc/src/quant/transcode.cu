@@ -32,14 +32,14 @@ void dispatch_source(TranscodeSource src, const TranscodeParams& p,
         const int scale_cols =
             (p.cols + p.src_group_size - 1) / p.src_group_size;
         const transcode::DecodeFp8E4m3PerGroup dec{
-            reinterpret_cast<const __nv_fp8_storage_t*>(p.src),
+            reinterpret_cast<const device::u8*>(p.src),
             p.src_scale, p.cols, scale_cols, p.src_group_size};
         launch_kernel<GROUP>(dec, enc, p.rows, p.cols, stream);
         return;
     }
     case TranscodeSource::Bf16: {
         const transcode::DecodeBf16 dec{
-            reinterpret_cast<const __nv_bfloat16*>(p.src), p.cols};
+            reinterpret_cast<const device::bf16*>(p.src), p.cols};
         launch_kernel<GROUP>(dec, enc, p.rows, p.cols, stream);
         return;
     }

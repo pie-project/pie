@@ -74,9 +74,16 @@ impl Checkpoint {
     }
 
     fn finish(self, name: &str) -> CheckpointMetadata {
+        // The byte length is part of the name, not just the family. A family
+        // may have more than one fixture -- deepseek-v4 needs a wider expert
+        // to be splittable at all -- and two different checkpoints under one
+        // path race: each rewrites the file the other's plan was compiled
+        // against, and the loser fails on a byte count rather than on
+        // anything to do with what it was testing.
         let path = std::env::temp_dir().join(format!(
-            "pie_model_family_{}_{}.safetensors",
+            "pie_model_family_{}_{}_{}.safetensors",
             name,
+            self.offset,
             std::process::id()
         ));
         if std::fs::metadata(&path).map(|meta| meta.len()).ok() != Some(self.offset) {
@@ -187,7 +194,6 @@ impl Variant for Fixture {
         (self.author)(b)
     }
 
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         _class: model_compiler::trace::FireClass,
@@ -1000,7 +1006,14 @@ fn kimi_checkpoint() -> CheckpointMetadata {
 
 static KIMI_K2_CUDA: Fixture = Fixture {
     id: "kimi-k2-fixture",
-    shape: LoadShape::dense(1, 0, true),
+    // A MIXTURE, and it always was: `kimi_checkpoint()` below ships two
+    // routed experts and a router of `[2, hidden]`. This said `dense`,
+    // whose `n_experts` is zero, and went on passing because nothing in
+    // the authoring path read the count -- the expert loop probes for
+    // names and stops when it runs out. The kimi stacker now checks what
+    // it stacked against what the row states, and a row stating zero is
+    // the only thing in this file that disagrees with its own checkpoint.
+    shape: LoadShape::mixture(1, 0, 2, true),
     author: model::kimi_k2::contract::author_kimi,
 };
 
@@ -1081,7 +1094,18 @@ fn kimi_k3_cuda() {
 // ── deepseek_v4: E8M0 block scales, expert stacks and groups ────────
 
 fn deepseek_v4_checkpoint() -> CheckpointMetadata {
-    let (hidden, intermediate) = (64, 32);
+    deepseek_v4_checkpoint_with(32)
+}
+
+/// The same checkpoint with the expert intermediate dim stated.
+///
+/// It is a parameter because MXFP4 sets a floor on how far an expert can be
+/// split: the packed nibbles are grouped 32 at a time and each group shares
+/// one E8M0 exponent, so a rank holding fewer than 32 columns holds part of a
+/// group and cannot dequantize it. The TP-1 fixture's 32 is therefore exactly
+/// unsplittable, and the two-rank goldens need 64.
+fn deepseek_v4_checkpoint_with(intermediate: i64) -> CheckpointMetadata {
+    let hidden = 64;
     let mut ck = Checkpoint::new();
     ck.push("embed_tokens.weight", &[128, hidden], bf16());
     // The bare `layers.` spelling this family ships.
@@ -1124,7 +1148,12 @@ fn deepseek_v4_checkpoint() -> CheckpointMetadata {
 
 static DEEPSEEK_V4_CUDA: Fixture = Fixture {
     id: "deepseek-v4-fixture",
-    shape: LoadShape::dense(1, 0, true),
+    // A MIXTURE, for the same reason `KIMI_K2_CUDA` above is one:
+    // `deepseek_v4_checkpoint()` ships two routed experts. This said
+    // `dense`, whose `n_experts` is zero, and passed because neither
+    // expert pass read the count -- both probe for names and stop when
+    // they run out.
+    shape: LoadShape::mixture(1, 0, 2, true),
     author: model::deepseek_v4::contract::author_deepseek_v4,
 };
 
@@ -1152,6 +1181,53 @@ fn deepseek_v4_streamed_cuda() {
         &DEEPSEEK_V4_CUDA,
         &StoredEncoding::dense(),
         &target(0, 1),
+        &policy,
+    );
+}
+
+/// The same two lowerings on rank 1 of a two-rank world.
+///
+/// This family is the only one with its own tensor-parallel shard-axis rule
+/// -- `dsv4_shard_axis`, which cuts `w1`/`w3` on their out dim and `w2` on its
+/// in dim so that every rank computes a partial expert output an all-reduce
+/// combines. Five families here carry a `target(1, 2)` golden and this one did
+/// not, so the rule the file exists for was the one rule no plan ever compiled
+/// under TP: at world size 1 every `shard` node is the identity and an axis
+/// written the wrong way round costs nothing.
+///
+/// The declared shapes do not catch it either, because a contract states its
+/// shape beside its expression rather than deriving it. Only compiling the
+/// plan and verifying it against the contract asks whether the two agree.
+#[test]
+fn deepseek_v4_eager_cuda_tp2() {
+    check(
+        "deepseek_v4_eager_cuda_tp2",
+        &deepseek_v4_checkpoint_with(64),
+        &DEEPSEEK_V4_CUDA,
+        &StoredEncoding::dense(),
+        &target(1, 2),
+        &Policy::default(),
+    );
+}
+
+/// The streamed groups under TP, for the same reason.
+///
+/// A group's plan is a whole plan, so the shard nodes inside the template run
+/// on the page-in path once per instance -- and the template is compiled from
+/// instance 0 alone, which makes a wrong axis there wrong for every expert of
+/// every layer at once.
+#[test]
+fn deepseek_v4_streamed_cuda_tp2() {
+    let policy = Policy {
+        stream_routed_experts: true,
+        ..Policy::default()
+    };
+    check(
+        "deepseek_v4_streamed_cuda_tp2",
+        &deepseek_v4_checkpoint_with(64),
+        &DEEPSEEK_V4_CUDA,
+        &StoredEncoding::dense(),
+        &target(1, 2),
         &policy,
     );
 }

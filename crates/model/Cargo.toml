@@ -23,74 +23,15 @@ path = "src/lib.rs"
 # could not reach a GPU.
 #
 # A TEST THAT CANNOT BUILD REPORTS NOTHING, and nothing reads as fine.
-# The minimum is what each one actually needs, found by building each
-# against each aspect rather than by reading imports -- the one target
-# that wanted `contract` and not `forward` was `registry_agreement`, and
-# it is deleted: it existed to hold three tables to each other, and the
-# catalog collapsed the three into one row, so there is no agreement left
-# to check. `catalog_differential` took its place and needs both aspects,
-# because a row's answer to "what deploys" is the thing being checked.
-
-[[test]]
-name = "arena_soundness"
-required-features = ["forward"]
-
-[[test]]
-name = "golden_plans"
-required-features = ["forward"]
-
-[[test]]
-name = "kernels_table"
-required-features = ["forward"]
-
-[[test]]
-name = "lowering"
-required-features = ["forward"]
-
-[[test]]
-name = "lowering_cost"
-required-features = ["forward"]
-
-[[test]]
-name = "regions_surface"
-required-features = ["forward"]
-
-[[test]]
-name = "tp_quantized_spec"
-required-features = ["forward"]
-
-# The refactor's safety net. `forward` because the thing it checks is the
-# row's answer to "what deploys"; without it the file's `#![cfg]` empties
-# the target and a green run means nothing was compared.
-[[test]]
-name = "catalog_differential"
-required-features = ["forward"]
-
-# A property ABOUT two generations, which neither of them owns. It used to
-# live inside both as two halves that named each other across a sibling
-# edge; `forward` because an advertised ceiling is a row's deployment.
-[[test]]
-name = "neighbouring_generations"
-required-features = ["forward"]
-
-# The guard that replaces `driver-metal`'s deleted `LLAMA_LIKE` string
-# table: every row either traces a Metal text or refuses Metal in words.
-# `forward` because a text is the thing being asked for.
-[[test]]
-name = "catalog_backends"
-required-features = ["forward"]
-
-[[test]]
-name = "facts_are_read"
-required-features = ["forward"]
-
-[[test]]
-name = "plan_has_two_ends"
-required-features = ["forward"]
-
-[[test]]
-name = "one_shape_one_place"
-required-features = ["forward"]
+#
+# THIRTEEN of these stanzas are gone with the `forward` feature (see
+# `[features]`), because a target cannot require a feature that no longer
+# exists. The three that remain need `contract`, which is real: `engine`
+# links this crate without it.
+#
+# The lesson the deleted stanzas taught is worth keeping even though they
+# are: the minimum is what each target actually needs, found by BUILDING
+# each against each aspect rather than by reading its imports.
 
 [[test]]
 name = "family_contracts"
@@ -129,11 +70,20 @@ chat = ["dep:tokenizer", "dep:anyhow", "dep:serde_json", "dep:image"]
 # that still opens a file, and it rides with `contract` because the only
 # thing that asks it is an authoring pass deciding how to store a weight.
 contract = ["dep:model-loader", "dep:serde_json", "dep:anyhow"]
-# The forward aspect: a model's forward pass, written in `model-compiler`'s
-# tracing eDSL, and the `#[repr(C)]` boundary a driver traces it across. NOT
-# default -- `pie model convert` reads a chat template and a load contract and
-# must not drag the tracer in behind them.
-forward = []
+# THE `forward` FEATURE IS GONE. It gated a generation's forward text on the
+# argument that `pie model convert` "must not drag the tracer in behind"
+# a chat template and a load contract. Nothing in this tree did that: all six
+# consumers -- `engine`, `worker`, both `driver-metal` targets and both
+# `driver-cuda` targets -- enabled it, and `model-compiler` is a NON-OPTIONAL
+# dependency besides (see its entry below for why), so the weight it was
+# protecting against was linked either way.
+#
+# What it cost was not nothing. It put `#[cfg]` on `Variant::trace`, which
+# made THE TRAIT'S METHOD SET depend on a feature; it needed a
+# `required-features` stanza per test target; and it gated `catalog::arches()`,
+# which calls no gated code at all -- a gate documenting a dependency that did
+# not exist. `chat` and `contract` stay, because those two are load-bearing:
+# `engine` builds without `contract` and both drivers build without `chat`.
 # ONE ROW THAT IS NOT A MODEL, for tests that need real bytes on disk.
 #
 # The closed set's cost, paid where it lands hardest: identity is a manifest

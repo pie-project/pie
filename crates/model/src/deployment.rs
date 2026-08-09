@@ -137,8 +137,15 @@ pub enum KvStyle {
         /// The rope head dim carried beside it.
         qk_rope_head_dim: u32,
     },
-    /// DeepSeek-V4's per-layer compression ratios.
-    Dsv4 {
+    /// A per-layer COMPRESSED KV plane, stated as one compression ratio
+    /// per layer.
+    ///
+    /// Named for the shape and not for the generation that introduced it.
+    /// This was `Dsv4`, which put a checkpoint generation into a vocabulary
+    /// whose own doc says "nothing in it is a string naming a family" — and
+    /// a driver matching on it had to spell that generation to ask a
+    /// question about a KV layout.
+    CompressedPlane {
         /// One ratio per layer; `None` for an uncompressed layer.
         ratios: Vec<i32>,
     },
@@ -162,7 +169,34 @@ impl KvStyle {
     pub fn has_a_store_in_this_build(&self) -> bool {
         match self {
             Self::Paged => true,
-            Self::Mla { .. } | Self::Dsv4 { .. } => false,
+            Self::Mla { .. } | Self::CompressedPlane { .. } => false,
+        }
+    }
+
+    /// The refusal a build with no store for this style owes its caller,
+    /// or `None` when one exists.
+    ///
+    /// Beside the predicate because it answers the same question, and the
+    /// reason both are here is the reason the predicate is: the sentence
+    /// was written FOUR times — once per MLA family, in four cosmetic
+    /// variations of "this build provisions no store" — and four
+    /// spellings of one refusal is four places for one of them to go
+    /// stale. It is keyed on the STYLE and not on the family because the
+    /// missing store is a property of the shape: a compressed KV plane
+    /// has nowhere to live regardless of which vendor shipped it.
+    #[must_use]
+    pub fn store_refusal(&self) -> Option<Refusal> {
+        match self {
+            Self::Paged => None,
+            Self::Mla { .. } => Some(Refusal::Unsupported(
+                "this build provisions no MLA latent store; a compressed KV \
+                 plane and a positional one do not fit the k/v pair the pager \
+                 allocates",
+            )),
+            Self::CompressedPlane { .. } => Some(Refusal::Unsupported(
+                "this build provisions no compressed KV plane store; the row's \
+                 per-layer compressed entries have nowhere to live",
+            )),
         }
     }
 }
@@ -325,6 +359,50 @@ pub struct Geometry {
     pub vocab: u32,
 }
 
+/// The attention head dims a build INSTANTIATES.
+///
+/// `kernels.def`'s `PIE_ATTN_HEAD_DIM` rows on the CUDA side, and the
+/// same four points on the Metal side — `kernels-metal`'s
+/// `sdpa_paged_decode` axis declares `d_64`, `d_128`, `d_256` and
+/// `d_512`. It is a property of the BINARY, not of any checkpoint, which
+/// is why no row states it.
+///
+/// # Why it lives HERE
+///
+/// It lived in `shared::llama_like::project` because llama-like wrote it
+/// down first, and four families that are not llama-like — gemma-2,
+/// gemma-3, gemma-3n and qwen-3.5 — reached into that module for it. A
+/// table about the binary filed under one model family is the shape
+/// `shared`'s own rule forbids: what belongs there is *about models in
+/// general*, and this is not about models at all.
+///
+/// Beside [`Geometry`] because [`Geometry::head_dim_alloc`] is the
+/// CONSUMER's half of this same question. One file answers "what width
+/// does a head actually run at", from both ends, so a producer that pads
+/// and a consumer that allocates cannot disagree — which they did:
+/// `driver-metal` allocated `head_dim_alloc()` (128 for phi-3, with a
+/// comment naming phi-3) while the Metal text named
+/// `sdpa_paged_decode_bfloat16_d_96`, a kernel no build declares.
+pub const ATTN_HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
+
+/// Smallest instantiated head dim that can hold `head_dim`, or
+/// `head_dim` itself when none can — the caller then surfaces the
+/// dispatch error rather than silently mis-sizing.
+///
+/// The result is never less than `head_dim`: the filter is `d >=
+/// head_dim` and the fallback is `head_dim`. Callers used to `.max()` it
+/// anyway, in four places, which is what a contract a function cannot
+/// state looks like from the outside.
+#[must_use]
+pub fn round_up_attn_head_dim(head_dim: u32) -> u32 {
+    ATTN_HEAD_DIMS
+        .iter()
+        .copied()
+        .filter(|&d| d >= head_dim)
+        .min()
+        .unwrap_or(head_dim)
+}
+
 impl Geometry {
     /// The zeros that go with [`Deployment::empty`].
     ///
@@ -411,14 +489,19 @@ impl Geometry {
 /// Mistral, Phi and OLMo-2 row means.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RopeScaling {
-    /// Llama-3's piecewise rescaling (`rope_type: "llama3"`).
+    /// A piecewise rescaling by wavelength band (`rope_type: "llama3"`).
     ///
     /// Wavelengths shorter than the high-frequency cut pass through
     /// untouched, those longer than the low-frequency cut are divided by
     /// `factor`, and the band between them interpolates. The two cuts
     /// are expressed as divisors of `original_max_position`, which is
     /// why they are factors and not lengths.
-    Llama3 {
+    ///
+    /// Named for the method, not the lineage that published it first: the
+    /// `rope_type` string stays `"llama3"` because that is what the config
+    /// format says, but a driver deriving the ladder is doing piecewise
+    /// interpolation and nothing more.
+    Piecewise {
         /// The divisor applied to the low-frequency end.
         factor: f32,
         /// Divisor of `original_max_position` giving the wavelength
@@ -529,7 +612,22 @@ pub struct Deployment {
     /// [`Gemma2AttnFacts::attn_logit_softcap`]: crate::gemma_2::spec::Gemma2AttnFacts::attn_logit_softcap
     pub attn_logit_softcap: f32,
     /// Per-layer-embedding width, `0` for a stack without one.
-    pub ple_dim: i32,
+    ///
+    /// UNSIGNED, and it was `i32` — which cost a refusal. Every producer
+    /// holds a `u32` (`gemma_4::spec`'s `ple_dim`, `gemma_3n`'s
+    /// `ple_width`) and reached this field through
+    /// `i32::try_from(..).unwrap_or(0)`, so a width that did not fit
+    /// became `0` — and `0` is this field's word for "this stack has no
+    /// per-layer embeddings". A gemma-3n served with its PLE path
+    /// silently switched off is finite, plausible and wrong, which is
+    /// the failure class `norm_unit_offset` two fields down exists to
+    /// describe.
+    ///
+    /// Nothing ever produced a negative value, so the sign bought
+    /// nothing and the conversion that reached it lost a refusal.
+    /// Contrast [`LayerAttention::window`], where `-1` is load-bearing
+    /// and the signedness is earned.
+    pub ple_dim: u32,
     /// Where the norm sits — read by anything that needs to name the
     /// projection input, which today is the adapter staging.
     pub norm: NormPlacement,
@@ -568,13 +666,6 @@ pub struct Deployment {
     /// a checkpoint contains nothing to ask about, and `has_tensor` answers
     /// no for a stack that does this and for a stack that does not.
     pub v_norm: bool,
-    /// Whether V is read out of the K projection instead of its own.
-    ///
-    /// gemma-4's `attention_k_eq_v`. MEASURED rather than assumed from
-    /// the flag's name: those layers ship no `v_proj` at all, so a
-    /// driver that binds one gets `UnknownWeight` and a driver that
-    /// projects one gets a tensor the checkpoint never trained.
-    pub k_eq_v: bool,
     /// Which gate this stack's MLP applies. See [`MlpGate`].
     pub mlp_gate: MlpGate,
     /// Whether the router renormalizes over the SELECTED experts.
@@ -812,7 +903,6 @@ impl Deployment {
             norm: NormPlacement::Pre,
             norm_unit_offset: false,
             v_norm: false,
-            k_eq_v: false,
             mlp_gate: MlpGate::Silu,
             scales: BTreeMap::new(),
             advertised: Advertised::default(),
@@ -946,6 +1036,220 @@ impl Deployment {
 
 #[cfg(test)]
 mod tests {
+
+    /// Two towers that compare unequal must also PRINT unequal.
+    ///
+    /// `Debug` is the only way one of these reaches a human -- there is no
+    /// `Display`, and nothing formats them but a diagnostic. The two tests
+    /// above are exactly that: they say "these rows ship different encoders"
+    /// and then print both. If `Debug` omitted a field, two towers differing
+    /// only in that field would render identically, and the failure would read
+    /// as a contradiction -- an assertion that two things differ, beside two
+    /// lines that are the same.
+    ///
+    /// So the property is stated over every field, one at a time: perturb one
+    /// number and both the comparison and the rendering must notice. That is
+    /// also the only thing that exercises a derived `Debug` at all, since
+    /// `assert_eq!` formats only when it fails.
+    #[test]
+    fn a_tower_that_differs_in_one_field_prints_differently() {
+        let v = VisionTower {
+            layers: 27,
+            hidden: 1152,
+            heads: 16,
+            intermediate: 4304,
+            pooling_kernel: 4,
+            norm_eps: 1e-6,
+            rope_theta: 100.0,
+        };
+        let vision: [(&str, VisionTower); 7] = [
+            ("layers", VisionTower { layers: 28, ..v }),
+            ("hidden", VisionTower { hidden: 768, ..v }),
+            ("heads", VisionTower { heads: 12, ..v }),
+            (
+                "intermediate",
+                VisionTower {
+                    intermediate: 3072,
+                    ..v
+                },
+            ),
+            (
+                "pooling_kernel",
+                VisionTower {
+                    pooling_kernel: 2,
+                    ..v
+                },
+            ),
+            (
+                "norm_eps",
+                VisionTower {
+                    norm_eps: 1e-5,
+                    ..v
+                },
+            ),
+            (
+                "rope_theta",
+                VisionTower {
+                    rope_theta: 10_000.0,
+                    ..v
+                },
+            ),
+        ];
+        for (field, other) in vision {
+            assert_ne!(v, other, "changing {field} did not change the tower");
+            assert_ne!(
+                format!("{v:?}"),
+                format!("{other:?}"),
+                "two vision towers differing in {field} print identically, so a \
+                 diagnostic naming the difference cannot show it"
+            );
+        }
+
+        let a = AudioTower {
+            layers: 12,
+            hidden: 1536,
+            heads: 8,
+            conv_kernel: 5,
+            feature_size: 128,
+            subsample_channels_0: 128,
+            subsample_channels_1: 32,
+            output_dims: 1536,
+            chunk_size: 12,
+            context_left: 13,
+            context_right: 0,
+            logit_cap: 50.0,
+            residual_weight: 0.5,
+            norm_eps: 1e-6,
+        };
+        let audio: [(&str, AudioTower); 14] = [
+            ("layers", AudioTower { layers: 13, ..a }),
+            ("hidden", AudioTower { hidden: 768, ..a }),
+            ("heads", AudioTower { heads: 4, ..a }),
+            (
+                "conv_kernel",
+                AudioTower {
+                    conv_kernel: 3,
+                    ..a
+                },
+            ),
+            (
+                "feature_size",
+                AudioTower {
+                    feature_size: 80,
+                    ..a
+                },
+            ),
+            (
+                "subsample_channels_0",
+                AudioTower {
+                    subsample_channels_0: 64,
+                    ..a
+                },
+            ),
+            (
+                "subsample_channels_1",
+                AudioTower {
+                    subsample_channels_1: 64,
+                    ..a
+                },
+            ),
+            (
+                "output_dims",
+                AudioTower {
+                    output_dims: 2048,
+                    ..a
+                },
+            ),
+            ("chunk_size", AudioTower { chunk_size: 6, ..a }),
+            (
+                "context_left",
+                AudioTower {
+                    context_left: 7,
+                    ..a
+                },
+            ),
+            (
+                "context_right",
+                AudioTower {
+                    context_right: 1,
+                    ..a
+                },
+            ),
+            (
+                "logit_cap",
+                AudioTower {
+                    logit_cap: 30.0,
+                    ..a
+                },
+            ),
+            (
+                "residual_weight",
+                AudioTower {
+                    residual_weight: 1.0,
+                    ..a
+                },
+            ),
+            (
+                "norm_eps",
+                AudioTower {
+                    norm_eps: 1e-5,
+                    ..a
+                },
+            ),
+        ];
+        for (field, other) in audio {
+            assert_ne!(a, other, "changing {field} did not change the tower");
+            assert_ne!(
+                format!("{a:?}"),
+                format!("{other:?}"),
+                "two audio towers differing in {field} print identically"
+            );
+        }
+
+        // And what a guest matches on. `Advertised` derives `Default`, which
+        // nothing else in this file reaches: it is what an unstated row would
+        // advertise, and the empty label is the point -- a program matching on
+        // it matches nothing rather than matching a family by accident.
+        let d = Advertised::default();
+        assert_eq!(d.arch, "");
+        assert_eq!(d.max_model_len, 0);
+        assert!(!d.media_encode);
+        let advertised: [(&str, Advertised); 3] = [
+            (
+                "arch",
+                Advertised {
+                    arch: "gemma4",
+                    ..d.clone()
+                },
+            ),
+            (
+                "max_model_len",
+                Advertised {
+                    max_model_len: 8192,
+                    ..d.clone()
+                },
+            ),
+            (
+                "media_encode",
+                Advertised {
+                    media_encode: true,
+                    ..d.clone()
+                },
+            ),
+        ];
+        for (field, other) in advertised {
+            assert_ne!(
+                d, other,
+                "changing {field} did not change what is advertised"
+            );
+            assert_ne!(
+                format!("{d:?}"),
+                format!("{other:?}"),
+                "two rows differing in {field} advertise the same printed thing"
+            );
+        }
+    }
+
     use super::*;
 
     fn layer(head_dim: u32) -> LayerAttention {
@@ -990,7 +1294,6 @@ mod tests {
             norm: NormPlacement::Pre,
             norm_unit_offset: false,
             v_norm: false,
-            k_eq_v: false,
             mlp_gate: MlpGate::Silu,
             scales: BTreeMap::new(),
             advertised: Advertised::default(),
@@ -1079,6 +1382,134 @@ mod tests {
         );
     }
 
+    /// The layout every deployable row in this build uses answers NOTHING.
+    ///
+    /// [`KvStyle::store_refusal`] is asked of a row before the pager is
+    /// sized, and the two refusing arms are walked by
+    /// `tests/advertised_matches_what_is_shipped.rs` -- five of the six
+    /// rows that cannot deploy here are refused by exactly this call.
+    /// The arm that lets a load PROCEED was never taken in a test, which
+    /// is the arm 53 of the 59 rows depend on: a `Some` here stops the
+    /// load, so a paged layout that ever answered one would ground the
+    /// entire build while every existing test still passed.
+    #[test]
+    fn the_paged_layout_is_the_one_that_refuses_nothing() {
+        assert!(
+            KvStyle::Paged.store_refusal().is_none(),
+            "the pager allocates a k/v pair and a paged layout is that pair, \
+             so a refusal here refuses every dense row in the catalog"
+        );
+    }
+
+    /// Both refusals name the store they cannot provision.
+    ///
+    /// A `Refusal` is carried across the FFI as TEXT -- `driver-cuda`
+    /// turns it into `Error::Unsupported { what: e.to_string() }` -- so
+    /// the sentence is the whole diagnosis a user gets. Two layouts that
+    /// refuse with the same words leave the reader unable to tell a
+    /// missing MLA store from a missing compressed plane.
+    #[test]
+    fn the_two_refusing_layouts_do_not_refuse_with_the_same_sentence() {
+        let mla = KvStyle::Mla {
+            kv_lora_rank: 512,
+            qk_rope_head_dim: 64,
+        };
+        let plane = KvStyle::CompressedPlane {
+            ratios: vec![8, 8, 8],
+        };
+        let say = |k: &KvStyle| k.store_refusal().expect("refuses").to_string();
+        let (a, b) = (say(&mla), say(&plane));
+        assert!(a.contains("MLA latent store"), "{a}");
+        assert!(b.contains("compressed KV plane"), "{b}");
+        assert_ne!(a, b, "two different missing stores, one sentence");
+    }
+
+    /// The variant no row in this build can produce.
+    ///
+    /// `Refusal` has two arms and `driver-cuda` maps them to two
+    /// DIFFERENT errors: `Unsupported` becomes `Error::Unsupported`, a
+    /// statement about the build, and `Malformed` becomes
+    /// `Error::invalid("deployment", ..)`, a statement about the
+    /// checkpoint. Nothing in this crate constructs the second one --
+    /// `crates/model/src/csm/project.rs` even asserts a deployment is
+    /// NOT `Malformed`, which is a claim that cannot fail today.
+    ///
+    /// The variant is kept, not deleted: a checkpoint that contradicts
+    /// its own declared type is a real category and the driver already
+    /// routes it away from the build's own limits. What was missing is
+    /// that its sentence had never been formatted, so the message a user
+    /// would see the first time a row does produce one was unread text.
+    #[test]
+    fn the_refusal_arm_no_row_reaches_still_says_something_a_reader_can_use() {
+        let malformed = Refusal::Malformed("a stack of 0 layers").to_string();
+        let unsupported = Refusal::Unsupported("a stack of 0 layers").to_string();
+        assert!(
+            malformed.contains("contradicts its own type"),
+            "the checkpoint is at fault and the sentence must say so: {malformed}"
+        );
+        assert!(
+            unsupported.contains("this build cannot serve"),
+            "the build is at fault and the sentence must say so: {unsupported}"
+        );
+        assert_ne!(
+            malformed, unsupported,
+            "the same detail under two arms must not read identically -- the \
+             arms exist so a user can tell 'fix your checkpoint' from 'this \
+             binary was not built for it'"
+        );
+    }
+
+    /// `full_attention_shape` answers only when the two shapes DIFFER.
+    ///
+    /// The driver's `global_*` fields mean the full layers' shape
+    /// specifically, and a `Some` makes the driver size its pages twice.
+    /// A uniform stack that answered `Some` would have it allocate a
+    /// second geometry identical to the first.
+    ///
+    /// The empty case is guarded TWICE and this test cannot tell which
+    /// guard held: `first()?` and the `find(..)?` below it both answer
+    /// `None` on a stack with no layers, so removing the first one is an
+    /// equivalent mutation. It is stated here anyway because `None` is
+    /// the answer, not because this test pins the reason.
+    #[test]
+    fn a_stack_whose_windowed_and_full_layers_agree_states_no_second_shape() {
+        assert_eq!(
+            stack(&[]).full_attention_shape(),
+            None,
+            "no layers, no shape"
+        );
+        assert_eq!(
+            stack(&[128, 128]).full_attention_shape(),
+            None,
+            "one shape stated twice is not two shapes"
+        );
+
+        let mut d = stack(&[128, 128]);
+        d.attention[0].window = 512;
+        d.attention[0].head_dim = 64;
+        d.attention[1].rotary_dim = 32;
+        assert_eq!(
+            d.full_attention_shape(),
+            Some((128, 1, 32)),
+            "the UNWINDOWED layer's shape is the one a page is sized by"
+        );
+    }
+
+    /// Every layer windowed means there is no full layer to describe.
+    #[test]
+    fn a_stack_with_no_full_layer_at_all_states_no_second_shape() {
+        let mut d = stack(&[128, 64]);
+        for a in &mut d.attention {
+            a.window = 512;
+        }
+        assert_eq!(
+            d.full_attention_shape(),
+            None,
+            "two shapes but neither reads the whole context, so neither is \
+             the one the driver's `global_*` fields mean"
+        );
+    }
+
     /// Qwen2.5-1.5B: twelve over two.
     #[test]
     fn the_other_live_example_is_refused_the_same_way() {
@@ -1151,6 +1582,117 @@ mod tests {
         d.shape.q_heads = 8;
         d.shape.kv_heads = 8;
         assert!(d.servable_by(&[]).is_err());
+    }
+
+    /// A stack with no layers is a stack no build can serve, which is
+    /// the whole of what `empty()` is for: it is the value a projection
+    /// that refused hands back, and every question asked of it has to
+    /// answer without a first layer to read.
+    #[test]
+    fn the_empty_stack_answers_every_question_and_is_served_by_nobody() {
+        let e = Deployment::empty();
+        assert_eq!(e.decode_head_dims(), None);
+        assert_eq!(e.full_attention_shape(), None);
+        assert!(!e.shares_kv());
+        assert!(e.windows().is_empty());
+        assert!(e.theta_by_layer().is_empty());
+        assert!(e.rotary_by_layer().is_empty());
+        assert!(
+            e.servable_by(&[1, 2, 4, 8]).is_err(),
+            "zero kv heads is a fractional group, not a servable one"
+        );
+        assert!(
+            !e.norm_topk_prob,
+            "the routing convention no real row wants: `empty()` exists to be \
+             refused, and a driver that served off it would route on \
+             unnormalized weights"
+        );
+    }
+
+    /// gemma-4's accessor, and the reason it is keyed on the WINDOW
+    /// rather than on "the shape that differs": a page is sized per
+    /// layer, and the layer that reads the whole context is the one
+    /// that has to be right.
+    #[test]
+    fn the_full_layers_shape_is_reported_only_when_it_differs() {
+        // Every layer unwindowed and identical: one shape serves.
+        assert_eq!(stack(&[128, 128]).full_attention_shape(), None);
+
+        // A windowed layer 0 beside an unwindowed layer 1 of the same
+        // shape is still one shape.
+        let mut same = stack(&[128, 128]);
+        same.attention[0].window = 512;
+        assert_eq!(same.full_attention_shape(), None);
+
+        // Now the full layer is shaped differently, which is gemma-4.
+        let mut differs = stack(&[128, 256]);
+        differs.attention[0].window = 512;
+        differs.attention[1].rotary_dim = 64;
+        assert_eq!(differs.full_attention_shape(), Some((256, 1, 64)));
+
+        // Differing only in kv heads counts too — a page is sized by
+        // both, and reporting only on head_dim would bill the wrong
+        // width.
+        let mut kv_only = stack(&[128, 128]);
+        kv_only.attention[0].window = 512;
+        kv_only.attention[1].kv_heads = 4;
+        assert_eq!(kv_only.full_attention_shape(), Some((128, 4, 0)));
+
+        // A stack with no unwindowed layer has no full layer to report.
+        let mut all_windowed = stack(&[128, 256]);
+        for a in &mut all_windowed.attention {
+            a.window = 512;
+        }
+        assert_eq!(all_windowed.full_attention_shape(), None);
+    }
+
+    /// The three per-layer tables do not share an elision rule, and the
+    /// difference is not an oversight.
+    ///
+    /// `windows` is always full length: a window of `-1` is as much a
+    /// binding as `512`, and the fire path indexes it. `theta_by_layer`
+    /// elides on UNIFORMITY. `rotary_by_layer` elides on the SENTINEL —
+    /// `0` means "rotate the whole head", so a stack where every layer
+    /// states a partial width of 64 gets a full table even though the
+    /// values agree.
+    #[test]
+    fn the_per_layer_tables_elide_by_three_different_rules() {
+        let uniform = stack(&[128, 128]);
+        assert_eq!(
+            uniform.windows(),
+            vec![-1, -1],
+            "a full-length table even when every layer agrees"
+        );
+        assert!(uniform.theta_by_layer().is_empty());
+        assert!(uniform.rotary_by_layer().is_empty());
+
+        let mut partial = stack(&[128, 128]);
+        for a in &mut partial.attention {
+            a.rotary_dim = 64;
+        }
+        assert_eq!(
+            partial.rotary_by_layer(),
+            vec![64, 64],
+            "uniform but not the sentinel, so the table is stated"
+        );
+
+        let mut one_full = stack(&[128, 128]);
+        one_full.attention[0].rotary_dim = 64;
+        assert_eq!(one_full.rotary_by_layer(), vec![64, 0]);
+    }
+
+    /// The capability question, asked of every style this enum has.
+    #[test]
+    fn only_the_paged_style_has_a_store_in_this_build() {
+        assert!(KvStyle::Paged.has_a_store_in_this_build());
+        assert!(
+            !KvStyle::Mla {
+                kv_lora_rank: 512,
+                qk_rope_head_dim: 64,
+            }
+            .has_a_store_in_this_build()
+        );
+        assert!(!KvStyle::CompressedPlane { ratios: vec![4, 4] }.has_a_store_in_this_build());
     }
 }
 

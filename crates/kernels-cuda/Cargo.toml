@@ -3,7 +3,7 @@ name = "kernels-cuda"
 version = "0.4.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "CUDA kernel implementations and the signature table that declares them: one .cu and one table row per kernel, in the same directory."
+description = "CUDA's ahead-of-time archive: csrc/ built by CMake, and the extern \"C\" shim generated from the kernel signature table."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
@@ -31,6 +31,22 @@ native = ["dep:cmake", "dep:cc"]
 [dependencies]
 kernels = { path = "../kernels" }
 
+# The ROWS, which this crate used to own and now reads.
+#
+# The edge ran the other way until the migration seam closed:
+# `kernels-cuda-new` took its table from here, because while both paths must
+# run a symbol has to have exactly ONE contract. That argument never said
+# which crate should hold the file. The JIT crate is the table's only
+# remaining AUTHOR -- a row there states a `LaunchRule` and an instantiation,
+# which is the whole kernel -- while this crate only reads rows to emit C, so
+# the rows went there and this became the re-export. Reversing it in two steps
+# was not available: the second edge is a cycle until the first is gone.
+#
+# `default-features = false` so no `cudarc`, no CUDA version feature, and no
+# GPU: the tables and the device sources are data, and this is the same edge
+# `model-compiler` takes through here on every trace.
+kernels-cuda-new = { path = "../kernels-cuda-new", default-features = false }
+
 [build-dependencies]
 cmake = { version = "0.1", optional = true }
 # Compiles the generated `shim.cpp` into `libpie_launch_shim.a`. The shim is
@@ -38,8 +54,25 @@ cmake = { version = "0.1", optional = true }
 # the crate that owns the launchers it forwards into — otherwise every crate
 # that wants to call a kernel builds its own copy and a binary linking two of
 # them fails on duplicate definitions.
+#
+# BUILT here, LINKED by the caller: `build.rs` runs `cc` with
+# `cargo_metadata(false)` and publishes the archive's directory as
+# `launch_shim` instead, because a `-l` emitted here reaches no dependent's
+# link line. `shim()`'s doc has the measurement; it is the same split
+# `libpie_kernels_cuda.a` has always had.
 cc = { version = "1", optional = true }
-# `build.rs` reads this crate's own tables through `#[path]`, because a build
-# script cannot depend on the crate it builds. The modules it pulls in import
-# nothing but `kernels`, which is what makes that possible.
+# The ROWS, the DEVICE ROWS, and — since this round — the EMITTERS.
+#
+# `build.rs` still reaches `src/abi.rs` through `#[path]`, because a build
+# script cannot depend on the crate it builds. What that file contains is now
+# one `pub use kernels_cuda_new::abi::*`, so the include resolves to the moved
+# emitters in both compilations — and it only does so while this crate appears
+# in `[dependencies]` AND here. These two entries mirror each other for that
+# reason and must keep doing so; the older, longer version of this rule
+# ("`abi.rs` may name `kernels` and `kernels_cuda_new`, never `crate::`")
+# governed 2,200 lines of emitter and now governs one line of re-export.
+#
+# `kernels` stays because `native::tables()` types itself on
+# `kernels::KernelSig` directly.
 kernels = { path = "../kernels" }
+kernels-cuda-new = { path = "../kernels-cuda-new", default-features = false }

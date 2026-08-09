@@ -345,12 +345,97 @@
 //! 704 of 704 disagreeing, because the remaining gap is a naming convention;
 //! [`names`] closes it.
 //!
-//! A sampler. [`turns::Serving::step`] drives fire after fire and
-//! [`serve::logits`] names where the distribution is, but nothing chooses a
-//! token from it. That is deliberate and matches `driver-metal`: sampling is
-//! policy -- temperature, top-p, penalties, a grammar -- and a driver that
-//! held one would be a driver a server had to argue with. The seam is the
-//! `Logits` a step returns.
+//! A sampler OF ITS OWN. [`turns::Serving::step`] drives fire after fire and
+//! [`serve::logits`] names where the distribution is, but no code in this
+//! crate chooses a token from it. That is deliberate and matches
+//! `driver-metal`: sampling is policy -- temperature, top-p, penalties, a
+//! grammar -- and a driver that held one would be a driver a server had to
+//! argue with.
+//!
+//! What it does do is RUN the sampler the engine sent. A sampler on this
+//! plane is a PTIR program, and [`frames::run_programs`] fires each of a
+//! frame's instances over its own request's distribution, which is how the
+//! answer reaches the channel the engine reads. The distinction is between
+//! holding a policy and executing one.
+//!
+//! # The channel plane costs nothing, once its edge is narrowed
+//!
+//! Five of the engine's fourteen verbs are registration -- programs, channels,
+//! instances, and closing the last two -- and none of them touches a device.
+//! [`programs`] serves all five, and nearly all of its body is the conversion
+//! between the ABI's records and the `driver` crate's, which already owns the
+//! plane for the CUDA and Metal shells. The sixth verb is FIRING an instance,
+//! which is that crate's reference interpreter run on the host over the rows
+//! of the read-out that instance owns -- see [`frames::run_programs`] for why
+//! "its own rows" is the load-bearing half of that sentence.
+//!
+//! Taking that crate as a dependency nearly broke the rule this driver is
+//! built to keep. `driver` names no `tarpc` anywhere in `src/`, but its edge
+//! took `driver-api`'s DEFAULT features, and `rpc` reaches `js-sys` and
+//! `wasm-bindgen-shared` through tokio -- two crates `tests/pure.rs` refuses.
+//! This crate's own edge to `driver-api` had already been narrowed for exactly
+//! that reason; the new one had not, so the guard caught a closure widening
+//! that no code in this crate could see. `driver`'s edge is
+//! `default-features = false` now, which is a fact about a crate that never
+//! wanted the feature rather than a concession made for this one.
+//!
+//! # What a frame may name, and what is refused by name
+//!
+//! A `LaunchPlan` carries far more than this driver implements. Eight of its
+//! features are refused at admission rather than dropped -- recurrent state,
+//! a user mask, `max_layers`, `hook_page_mask`, `dense_device_mask`, images,
+//! audio and pre-embedded rows -- and [`frames::unserved_in`] is the list.
+//!
+//! The reason each one is refused rather than ignored is that none of them
+//! fails loudly when dropped. A frame whose `max_layers` is ignored runs the
+//! full depth; one whose `hook_page_mask` is ignored reads the pages the
+//! scheduler substituted away from; one whose `image_pixels` are ignored
+//! answers a prompt whose picture vanished. Every one of those answers is
+//! finite, fluent and wrong, which is exactly the class of failure no
+//! validation layer and no assertion catches.
+//!
+//! # Two page allocators, and the one a frame uses
+//!
+//! [`pages::Book`] is this driver's own allocator and the right one for a
+//! server built on this crate alone. The ENGINE has its own -- it runs
+//! eviction, prefix sharing and the copy plans -- and hands down a
+//! `kv_page_indices` CSR naming physical pages it chose. Two allocators
+//! handing out page 7 is not an error anybody sees: attention reads another
+//! conversation's keys and the model stays fluent.
+//!
+//! So [`shell::Shell::launch`] does not touch the book at all. [`frames`]
+//! splits a frame's CSRs into this driver's [`resources::Request`]s and
+//! [`turns::Serving::over`] fires them, which is [`turns::Serving::step`]
+//! minus the growth. Measured on a real qwen3: one conversation served both
+//! ways, BIT FOR BIT the same distribution, with a control proving the
+//! frame's pages are what attention actually reads.
+//!
+//! Two findings came out of that measurement:
+//!
+//!   - **A single-request frame cannot see a per-request page CSR.** With one
+//!     request, its span IS the whole page list, so a conversion that ignored
+//!     `kv_page_indptr` entirely passed every assertion. The device test fires
+//!     a TWO-request frame for that reason, and the mutation is then caught by
+//!     `Frame::of`'s aliasing check rather than by a number.
+//!   - **`Pool::resize` could kill the process.** Its staging buffer is a
+//!     plain `vec![0u8; bytes]`, and a `Vec` that cannot be allocated aborts
+//!     rather than returning. Mutating `launch`'s admission to admit
+//!     everything asked for seventy terabytes a layer and the test binary died
+//!     with SIGABRT. The admission check is still where a scheduler gets its
+//!     answer; `resize` now asks with `try_reserve_exact` first, because a
+//!     pool a caller's arithmetic slip can kill is not one a server can be
+//!     built on.
+//!
+//! What [`programs`] runs is a program's HOST stages, and it runs them when
+//! the composer's decision still holds. [`programs::Programs::fire`] is
+//! `driver`'s reference pass and [`frames::run_programs`] is the loop the
+//! engine seam drives it from, each member first checked against the ring
+//! words the scheduler pinned when it composed the batch -- so a fire that
+//! arrives after another moved the ring is skipped and re-posted rather than
+//! answering into somebody else's cell. What is still NOT run is any program
+//! stage on the DEVICE: this driver advertises no codegen backend, holds the
+//! emitted kernels a registration carries, and runs the stages the
+//! interpreter can. That is the shape `driver-metal` serves too.
 
 // The manifest deliberately does not take the workspace lint table, because it
 // forbids `unsafe_code` and every `ash` entry point is unsafe. The rest of that
@@ -377,6 +462,11 @@ pub mod dispatch;
 // `facts::PAGE_SIZE` and `facts::BACKEND` -- which an engine reads to CHOOSE a
 // backend, before it has one -- do not require Vulkan to be present.
 pub mod facts;
+// The engine's frame, split into this driver's requests. Gated with the rest
+// of the serving half because `Request` and `Step` are, though the split
+// itself is arithmetic over CSRs and its tests need no device.
+#[cfg(feature = "native")]
+pub mod frames;
 pub mod geometry;
 pub mod lowering;
 // Strings and a static table, so it is ungated: a caller that only wants to
@@ -389,6 +479,10 @@ pub mod names;
 pub mod pages;
 #[cfg(feature = "native")]
 pub mod resources;
+// Ungated on purpose: the channel plane needs no device, which is the whole
+// argument for the `driver` crate existing, and gating it would make the
+// no-default-features build unable to state a verb it can serve in full.
+pub mod programs;
 pub mod rope;
 #[cfg(feature = "native")]
 pub mod serve;

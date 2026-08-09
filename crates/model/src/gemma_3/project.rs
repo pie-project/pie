@@ -24,7 +24,6 @@
 //! the numbers are not derived from a config, they ARE the model.
 
 // Only the texts name a backend, and only they are gated.
-#[cfg(feature = "forward")]
 use crate::catalog::{Backend, Deployed, MetalBinding};
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
@@ -156,7 +155,7 @@ pub fn manifest(f: &LlamaLikeFacts) -> Manifest {
 /// the wrong one five times in six.
 #[must_use]
 pub fn deployment(f: &LlamaLikeFacts, s: &Schedule, norm_eps: f32) -> Deployment {
-    let head_dim = family::round_up_attn_head_dim(f.head_dim).max(f.head_dim);
+    let head_dim = crate::deployment::round_up_attn_head_dim(f.head_dim);
     let sm_scale = 1.0 / (s.query_pre_attn_scalar as f32).sqrt();
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
@@ -182,7 +181,7 @@ pub fn deployment(f: &LlamaLikeFacts, s: &Schedule, norm_eps: f32) -> Deployment
             q_heads: f.q_heads,
             kv_heads: f.kv_heads,
             head_dim: f.head_dim,
-            head_dim_kernel: family::round_up_attn_head_dim(f.head_dim),
+            head_dim_kernel: crate::deployment::round_up_attn_head_dim(f.head_dim),
             intermediate: f.intermediate,
             // Dense: gemma-3 publishes no expert block, and the field means
             // ONE expert's width rather than the stack's.
@@ -216,7 +215,6 @@ pub fn deployment(f: &LlamaLikeFacts, s: &Schedule, norm_eps: f32) -> Deployment
         // gemma-3 carries the per-head q/k norm and NO V norm: the two
         // are separate facts, and this row is where that is said.
         v_norm: false,
-        k_eq_v: false,
         // Dense: no router reads this.
         norm_topk_prob: true,
         // No router of this family states a scaling factor.
@@ -256,7 +254,6 @@ pub fn deployment(f: &LlamaLikeFacts, s: &Schedule, norm_eps: f32) -> Deployment
 /// None. Whether this build has a Metal text at all is [`trace`]'s
 /// question, and it is answered by the backend rather than by a value
 /// here.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_facts(
     f: &LlamaLikeFacts,
@@ -367,7 +364,6 @@ pub fn metal_facts(
 ///
 /// The family's — [`Refusal::Unsupported`](crate::deployment::Refusal)
 /// carrying [`family::NO_METAL_SHARD`] for a sharded Metal load.
-#[cfg(feature = "forward")]
 pub fn trace(
     f: &LlamaLikeFacts,
     s: &Schedule,
@@ -635,7 +631,6 @@ mod tests {
 
     /// A binding to exercise the Metal projection with. The values are
     /// `mlx-community`'s usual 4-bit publication of a gemma-3.
-    #[cfg(feature = "forward")]
     fn binding() -> MetalBinding {
         MetalBinding {
             quant_group: 64,
@@ -644,6 +639,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         }
     }
 
@@ -655,7 +651,6 @@ mod tests {
     /// that stated one width here would attend 1024 tokens on the layer
     /// trained to see everything, or the whole context on five layers
     /// that were not — and both read as a working model.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_metal_text_gets_the_schedule_per_layer_and_not_broadcast() {
         let f = shape();
@@ -693,7 +688,6 @@ mod tests {
     /// row's answer. The scale is the sharpest: no tensor states
     /// `query_pre_attn_scalar`, so the derivation used the head dim and
     /// was wrong for the one published row where they differ.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_gemma_differences_are_the_rows_and_not_a_tensor_probe() {
         use crate::shared::llama_like::forward::facts::Activation;
@@ -727,7 +721,6 @@ mod tests {
 
     /// The binding half is the family's, unchanged — gemma-3 overrides
     /// what gemma-3 IS and nothing about how its bytes arrived.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_binding_half_is_still_the_familys() {
         let f = shape();
@@ -771,7 +764,6 @@ mod tests {
     /// directions: `LLAMA_LIKE` listed `gpt_oss`, which no publication of
     /// reaches a Metal device here, and did not list `gemma3`, whose text
     /// it models.
-    #[cfg(feature = "forward")]
     #[test]
     fn gemma_3_answers_a_metal_load_with_a_metal_text() {
         use model_compiler::trace::FireClass;
@@ -801,7 +793,6 @@ mod tests {
     /// the ground is the family's: `LlamaLikeMetalFacts` carries no
     /// shard width, so the same trace would state the whole model's
     /// projections against one rank's slice of the weights.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_sharded_metal_load_is_refused_with_the_familys_sentence() {
         use crate::deployment::Refusal;

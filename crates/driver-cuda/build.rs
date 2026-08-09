@@ -13,16 +13,46 @@
 //! * `rust_dispatch.rs` — `emit_rust_dispatch` over the same tables, the
 //!   statement-keyed `match` the binder includes.
 //!
-//! The C shim that DEFINES those symbols is `kernels-cuda`'s, generated and
-//! compiled by its `native` feature — which `bridge` turns on. A definition
-//! may exist once, so the crate that owns the launchers owns the entry points
-//! forwarding into them; this crate was only ever the first caller.
+//! Both emitters are `kernels_cuda_new::abi`'s, and that is a recent change
+//! with a measurable point. They were `kernels_cuda::abi`'s while the archive
+//! owned the rows, so THIS SCRIPT depended on a crate that runs CMake and
+//! nvcc to obtain a function from rows to text. It does not any more: the
+//! emitters read `kernels_cuda_new::table` and `kernels_cuda_new::device`,
+//! neither needs a toolkit, and `kernels-cuda` is off this crate's
+//! `[build-dependencies]` entirely. What is left of the edge to that crate is
+//! the archive twice — `bridge = ["kernels-cuda/native"]` and the
+//! dev-dependency — which is what it should be.
 //!
-//! The link directives for the archive live HERE, and the order is
+//! The C shim that DEFINES those symbols is still built by `kernels-cuda`,
+//! from the same `emit_c_shim`, under its `native` feature — which `bridge`
+//! turns on. A definition may exist once, so the crate that owns the
+//! launchers owns the entry points forwarding into them; this crate was only
+//! ever the first caller.
+//!
+//! The link directives for BOTH archives live HERE, and the order is
 //! load-bearing: a static archive is scanned once, in place, so the shim that
 //! references the launchers must precede `pie_kernels_cuda` on the link line.
-//! `kernels-cuda` emits the shim's directive, and cargo puts a dependency's
-//! ahead of its dependent's; ours follow.
+//!
+//! That sentence used to end *"`kernels-cuda` emits the shim's directive, and
+//! cargo puts a dependency's ahead of its dependent's; ours follow."* It was
+//! false, it was the whole defect, and the correction is the rule this script
+//! now follows for both: **the crate that references a symbol names the
+//! archive that defines it.** Cargo hands a build script's `-l` to its own
+//! package's lib and nowhere else; a `-l` crosses a crate boundary only in
+//! rustc's metadata, and only for a crate rustc LOADED. `kernels_cuda` is not
+//! one — nothing has named `kernels_cuda::` since §21.8 — so its `-l` and the
+//! `+bundle`d archive inside its rlib both went nowhere, while the identical
+//! `static=pie_kernels_cuda` below has always worked because `driver_cuda`
+//! is loaded by everything that links it.
+//!
+//! # The third thing this script decides: which rows do not go that way
+//!
+//! A row named by `kernels_cuda_new::device::JIT_DISPATCHED` has no shim
+//! entry — `emit_c_shim` skips it — and its generated arm calls
+//! `bind::jit::fire`, which forwards to `kernels-cuda-new`. So this script is
+//! where the two halves of that decision are read together, and
+//! [`bridge::routed_rows_are_hosted`] is where the agreement between them is
+//! checked while it is still a build error.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -36,24 +66,30 @@ mod bridge {
     use std::path::{Path, PathBuf};
 
     /// Every family table, in the crate's own concatenation order.
-    fn tables() -> Vec<&'static [kernels_cuda::KernelSig]> {
+    ///
+    /// Named one by one rather than taken from `table::TABLES`, and that is
+    /// the same choice `kernels_cuda::KERNELS`'s re-export made for the same
+    /// reason: a family that appeared silently would be in the concatenation
+    /// and absent from every reader that walks the modules. This is one of
+    /// those readers.
+    fn tables() -> Vec<&'static [kernels_cuda_new::KernelSig]> {
         vec![
-            kernels_cuda::attn::KERNELS,
-            kernels_cuda::rope::KERNELS,
-            kernels_cuda::norm::KERNELS,
-            kernels_cuda::mlp::KERNELS,
-            kernels_cuda::gemm::KERNELS,
-            kernels_cuda::moe::KERNELS,
-            kernels_cuda::ssm::KERNELS,
-            kernels_cuda::quant::KERNELS,
-            kernels_cuda::layout::KERNELS,
-            kernels_cuda::sample::KERNELS,
-            kernels_cuda::adapter::KERNELS,
+            kernels_cuda_new::table::attn::KERNELS,
+            kernels_cuda_new::table::rope::KERNELS,
+            kernels_cuda_new::table::norm::KERNELS,
+            kernels_cuda_new::table::mlp::KERNELS,
+            kernels_cuda_new::table::gemm::KERNELS,
+            kernels_cuda_new::table::moe::KERNELS,
+            kernels_cuda_new::table::ssm::KERNELS,
+            kernels_cuda_new::table::quant::KERNELS,
+            kernels_cuda_new::table::layout::KERNELS,
+            kernels_cuda_new::table::sample::KERNELS,
+            kernels_cuda_new::table::adapter::KERNELS,
             // The second table: launchers the driver fires with no DSL
             // statement (envelope tier, QKV split, mask packers, cell
             // moves). Same rows, same proof, outside the DSL-surface
-            // equality — see `kernels_cuda::driver_internal`.
-            kernels_cuda::driver_internal::DRIVER_KERNELS,
+            // equality — see `kernels_cuda_new::table::driver_internal`.
+            kernels_cuda_new::table::driver_internal::DRIVER_KERNELS,
         ]
     }
 
@@ -64,12 +100,215 @@ mod bridge {
             .unwrap_or_else(|| PathBuf::from("/usr/local/cuda"))
     }
 
+    /// Every routed symbol is one `kernels-cuda-new` will compile — checked
+    /// here, where it is a build error.
+    ///
+    /// # Why this gate exists, and what it is guarding against
+    ///
+    /// The routed set is `kernels_cuda_new::device::JIT_DISPATCHED` and it is
+    /// read by TWO emitters: `emit_c_shim` skips those rows, so the
+    /// `pie_k_*` entry is not emitted, and `emit_rust_dispatch` sends them to
+    /// `bind::jit::fire`, which forwards to `kernels_cuda_new::fire`. One list
+    /// feeding both is what makes a row reversible — shorten it and the shim
+    /// entry comes back with the arm that calls it — and it is also what makes
+    /// a routed row's absence from the JIT crate unrecoverable: the shim entry
+    /// is gone, so there is nothing to fall back to and the fire would be
+    /// refused at run time as `Error::Unknown`, on a device, in a model text,
+    /// once per launch.
+    ///
+    /// Layer 2 of `kernels-cuda-new` answers "does some unit host this" from
+    /// the table alone — no cudarc, no device, no toolkit — which is exactly
+    /// what lets the question be asked here instead. `unit::unit_of` is the
+    /// ungated spelling; `kernels_cuda_new::hosts` is the same predicate
+    /// behind that crate's `_cuda` gate, and its own doc calls it *"what a
+    /// dispatcher asks before it emits an arm"*. This is that dispatcher, and
+    /// this is where it emits the arm.
+    ///
+    /// A second list, local to this driver, was considered and rejected. Two
+    /// lists that can disagree have two failure modes and both are silent
+    /// until late: a symbol routed here but absent from `JIT_DISPATCHED` still
+    /// has a shim entry, so one row gets two live implementations and each
+    /// test passes on whichever half it exercises (`new-horizon.md` §10.10's
+    /// worst case); a symbol in `JIT_DISPATCHED` but absent here loses its
+    /// shim entry and links against a `pie_k_*` nothing defines.
+    fn routed_rows_are_hosted(jit: &[&'static kernels_cuda_new::device::DeviceKernel]) {
+        let orphans: Vec<&str> = jit
+            .iter()
+            .map(|row| row.sig.symbol)
+            .filter(|symbol| kernels_cuda_new::unit::unit_of(symbol).is_none())
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "these symbols are routed to the JIT (kernels_cuda_new::device::JIT_DISPATCHED) \
+             and no kernels-cuda-new unit hosts them, so their shim entry is not emitted and \
+             nothing would fire them: {}. Either add the row to a unit in that crate, or take \
+             the symbol off JIT_DISPATCHED to put it back on the ahead-of-time path.",
+            orphans.join(", ")
+        );
+    }
+
+    /// Every entry point the generated text can reach is one the archive this
+    /// script names actually defines — checked here, where it is a build
+    /// error.
+    ///
+    /// # The sibling of [`routed_rows_are_hosted`], for the rows that go the
+    /// other way
+    ///
+    /// That gate reads the ROUTED direction: a symbol on `JIT_DISPATCHED` must
+    /// be hosted by some `kernels-cuda-new` unit, because its shim entry is
+    /// deliberately not emitted and nothing else would fire it. This one reads
+    /// the UNROUTED direction, which had no gate at all: a symbol the dispatch
+    /// calls, or the bindings declare, must be one the shim defines. The two
+    /// together say that every row is reachable exactly once, by exactly one
+    /// path, and neither weakens the other — they are read from the same
+    /// `jit` list, which is the property `routed_rows_are_hosted`'s doc calls
+    /// *"one list feeding both is what makes a row reversible"*.
+    ///
+    /// It is two assertions because the two halves fail differently.
+    ///
+    /// **Calls must be defined.** This is the one that would have caught
+    /// §21.11: in the arrangement that failed, this script named no shim
+    /// archive at all, so there was nothing to resolve against and the
+    /// `expect` above is already a build error. It also catches a stale
+    /// archive and a row whose shim entry vanished under an edit.
+    ///
+    /// **Declarations that are not defined must be JIT rows.**
+    /// `emit_rust_bindings` writes an `unsafe extern "C"` block for every
+    /// stated row — 219 today — while `emit_c_shim` skips the routed ones, so
+    /// the archive holds 212 and **seven declarations have no definition**.
+    /// That is correct and must stay narrow: those seven are exactly the rows
+    /// `bind::jit::fire` serves. Nothing calls them today, and a hand-written
+    /// arm that did would compile — the declaration is right there — and fail
+    /// at LINK, in one feature combination, with the symbol list this whole
+    /// section is about. The assertion pins the difference to the `jit` list,
+    /// so a row leaving the shim for any OTHER reason is a build error the
+    /// hour it happens.
+    ///
+    /// Reading the archive's own symbol index rather than shelling out to
+    /// `nm`: the index lists defined externals and nothing else, it is eight
+    /// lines of format, and a build script that needs binutils on PATH to
+    /// check an invariant is one that silently stops checking on a machine
+    /// without it.
+    fn every_call_resolves_in_the_shim(
+        archive: &Path,
+        dispatch: &str,
+        bindings: &str,
+        jit: &[&'static kernels_cuda_new::device::DeviceKernel],
+    ) {
+        let defined = archive_defines(archive);
+        let named = |text: &str| -> Vec<String> {
+            let mut out: Vec<String> = text
+                .match_indices("pie_k_")
+                .map(|(i, _)| {
+                    text[i..]
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        };
+
+        let missing: Vec<String> = named(dispatch)
+            .into_iter()
+            .filter(|s| !defined.contains(s))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`rust_dispatch.rs` calls {} entry point(s) that {} does not define: {}. \
+             The dispatch and the shim are generated from ONE table by one pair of \
+             emitters, so this is not a disagreement between them -- it is the archive \
+             being older than the rows, or a row that lost its shim entry without \
+             losing its arm.",
+            missing.len(),
+            archive.display(),
+            missing.join(", ")
+        );
+
+        // A declaration with no definition is only legitimate for a routed
+        // row. `entry_name` is the same function both emitters spell the
+        // symbol with, so this compares like with like rather than
+        // re-deriving the mangling here.
+        let routed: Vec<String> = jit
+            .iter()
+            .map(|d| kernels_cuda_new::abi::entry_name(d.sig.symbol))
+            .collect();
+        let stray: Vec<String> = named(bindings)
+            .into_iter()
+            .filter(|s| !defined.contains(s) && !routed.contains(s))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "`launch_bindings.rs` declares {} entry point(s) that neither the shim defines \
+             nor JIT_DISPATCHED explains: {}. A declaration like that compiles and fails at \
+             link, which is how new-horizon.md §21.11 spent an afternoon.",
+            stray.len(),
+            stray.join(", ")
+        );
+    }
+
+    /// The defined external symbols in a `!<arch>` archive, from its own
+    /// symbol index.
+    ///
+    /// GNU `ar` writes the index as the first member, named `/` (or `/SYM64/`
+    /// with 64-bit offsets): a big-endian count, that many offsets, then that
+    /// many NUL-terminated names. Both `ar` and `llvm-ar` write one, and a
+    /// missing one is a hard error rather than an empty set — a check that
+    /// quietly passes because it read nothing is worse than no check.
+    fn archive_defines(path: &Path) -> Vec<String> {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(
+            bytes.starts_with(b"!<arch>\n"),
+            "{} is not an ar archive",
+            path.display()
+        );
+        let header = &bytes[8..];
+        assert!(header.len() > 60, "{} is truncated", path.display());
+        let name = String::from_utf8_lossy(&header[..16])
+            .trim_end()
+            .to_string();
+        let size: usize = String::from_utf8_lossy(&header[48..58])
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: bad member size: {e}", path.display()));
+        let (word, is64) = match name.as_str() {
+            "/" => (4usize, false),
+            "/SYM64/" => (8usize, true),
+            other => panic!(
+                "{}'s first member is {other:?}, not a symbol index. The shim archive is \
+                 built by `cc` through `ar`, which always writes one; without it this check \
+                 would pass by reading nothing.",
+                path.display()
+            ),
+        };
+        let data = &header[60..60 + size];
+        let count = if is64 {
+            u64::from_be_bytes(data[..8].try_into().unwrap()) as usize
+        } else {
+            u32::from_be_bytes(data[..4].try_into().unwrap()) as usize
+        };
+        let mut out = Vec::with_capacity(count);
+        let mut at = word * (count + 1);
+        for _ in 0..count {
+            let end = data[at..]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or_else(|| panic!("{}: unterminated name in symbol index", path.display()));
+            out.push(String::from_utf8_lossy(&data[at..at + end]).into_owned());
+            at += end + 1;
+        }
+        out
+    }
+
     pub fn build() {
         let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
         let tables = tables();
 
-        let bindings = kernels_cuda::abi::emit_rust_bindings(&tables);
-        std::fs::write(out_dir.join("launch_bindings.rs"), bindings).expect("write bindings");
+        let bindings = kernels_cuda_new::abi::emit_rust_bindings(&tables);
+        std::fs::write(out_dir.join("launch_bindings.rs"), &bindings).expect("write bindings");
 
         // The DISPATCH, from the same rows. `emit_rust_dispatch` is the
         // sibling of the C++ `emit_dispatch` the declared executor
@@ -77,8 +316,15 @@ mod bridge {
         // is generated here for the reason the bindings are: a second
         // hand-written switch over a table that already knows the answer
         // is the duplication this whole arc removes.
-        let dispatch = kernels_cuda::abi::emit_rust_dispatch(&tables);
-        std::fs::write(out_dir.join("rust_dispatch.rs"), dispatch).expect("write dispatch");
+        // THE ROWS THAT GO THE OTHER WAY. A symbol with a `DeviceKernel`
+        // is compiled by NVRTC at run time and fired from Rust, so its arm
+        // calls `bind::jit::fire` instead of a `pie_k_*` entry -- which is
+        // what leaves its `.cu` launcher with no consumer.
+        let jit: Vec<&'static kernels_cuda_new::device::DeviceKernel> =
+            kernels_cuda_new::device::jit_dispatched();
+        routed_rows_are_hosted(&jit);
+        let dispatch = kernels_cuda_new::abi::emit_rust_dispatch(&tables, &jit);
+        std::fs::write(out_dir.join("rust_dispatch.rs"), &dispatch).expect("write dispatch");
 
         println!("cargo:rerun-if-env-changed=CUDA_HOME");
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
@@ -109,6 +355,49 @@ mod bridge {
             .include(&cuda_include)
             .file(&supergraph)
             .compile("pie_supergraph");
+
+        // THE SHIM, which is what `rust_dispatch.rs` above actually calls.
+        //
+        // `kernels-cuda` COMPILES `libpie_launch_shim.a` (one definition, in
+        // the crate that owns the launchers it forwards into) and does not
+        // link it, exactly as it compiles `libpie_kernels_cuda.a` and does not
+        // link that. Both `-l`s are ours because we are what references them,
+        // and this one is FIRST because the shim's bodies call the launchers:
+        // a static archive is scanned in place, so the caller precedes the
+        // callee.
+        //
+        // This is a fix, not a tidy-up. Until this round the shim's directive
+        // was `cc`'s default `cargo:rustc-link-lib=static=pie_launch_shim`
+        // over in `kernels-cuda`, and nothing linked it: cargo hands a build
+        // script's `-l` only to its own package's lib, `static=` defaults to
+        // `+bundle` so rustc puts the objects inside `libkernels_cuda.rlib`
+        // rather than re-emitting a `-l`, and since §21.8 no crate names
+        // `kernels_cuda::` — so rustc never loads that `--extern` and its rlib
+        // is not among the 118 on our link line. Every `pie_k_*` this
+        // dispatch calls was undefined; `rust-lld`'s `--error-limit=20` is the
+        // only reason it read as seven.
+        //
+        // The directory comes through `kernels-cuda`'s `links` key rather than
+        // from cargo's implicit `-L` propagation. That propagation is real and
+        // did work, but an archive this crate NAMES is one it should be able
+        // to point at.
+        let shim_dir = PathBuf::from(std::env::var_os("DEP_PIE_KERNELS_CUDA_LAUNCH_SHIM").expect(
+            "`bridge` is on but kernels-cuda published no `launch_shim` path. That key \
+                 is printed by its `shim()` under the `native` feature, which `bridge` \
+                 turns on — so this means the two features have come apart.",
+        ));
+        let shim_archive = shim_dir.join("libpie_launch_shim.a");
+        assert!(
+            shim_archive.is_file(),
+            "kernels-cuda published {shim_dir:?} as the launch shim's directory and there is \
+             no libpie_launch_shim.a in it. `rust_dispatch.rs` calls `pie_k_*` entry points \
+             that only that archive defines, so linking would fail one test target at a time \
+             with a symbol list instead of failing here with a reason."
+        );
+        println!("cargo:rerun-if-changed={}", shim_archive.display());
+        every_call_resolves_in_the_shim(&shim_archive, &dispatch, &bindings, &jit);
+        println!("cargo:rustc-link-search=native={}", shim_dir.display());
+        println!("cargo:rustc-link-lib=static=pie_launch_shim");
 
         // The kernels archive the shim forwards into. Search paths come from
         // `kernels-cuda`'s own build script (the `native` feature this

@@ -52,7 +52,7 @@
 //! layers and a `wire()` at eight would otherwise disagree about
 //! everything for no reason. The question is about SPELLINGS.
 
-#![cfg(all(feature = "forward", feature = "contract"))]
+#![cfg(feature = "contract")]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -334,12 +334,19 @@ fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
 /// nothing can resolve, which is a fire away from `UnknownWeight`. Sorted
 /// within a family so the diff when one leaves is one line.
 ///
-/// `gpt_oss` is the row that bites TODAY and the reason this list is a
-/// test rather than a note: it is the only family here with both a
-/// `FACTS_ROWS` entry in the CUDA shell and a Prefill arm, so a gpt-oss
-/// checkpoint LOADS, reports itself healthy, and dies at its first fire.
-/// The other eight are not yet reachable for other reasons, so their debt
-/// is owed and not yet due.
+/// `gpt_oss` WAS the row that bit, and is the reason this list is a test
+/// rather than a note: it was the only family with both a `FACTS_ROWS`
+/// entry in the CUDA shell and a Prefill arm, so a gpt-oss checkpoint
+/// LOADED, reported itself healthy, and died at its first fire. It is
+/// wired now, and its line is kept empty rather than deleted because an
+/// empty line is the record that the debt was paid.
+///
+/// FIVE families are wired end to end and SIX still owe. The six are not
+/// yet reachable for other reasons, so their debt is owed and not due --
+/// which is a different thing from safe, and the difference is what the
+/// gpt-oss line is here to remember. `the_header_counts_what_the_list_
+/// holds` keeps those two numbers honest, because a count in prose is
+/// the first thing to rot when a builder lands.
 #[rustfmt::skip]
 const NOT_YET_WIRED: &[(&str, &[&str])] = &[
     // The three families `wire()` has builders for, and the only three
@@ -426,6 +433,28 @@ const NOT_YET_WIRED: &[(&str, &[&str])] = &[
         "layer.*.router_bias",
     ]),
 ];
+
+/// The header's two numbers are the list's two numbers.
+///
+/// The sentence above used to read "`gpt_oss` is the row that bites
+/// TODAY ... the other eight are not yet reachable", with the gpt-oss
+/// entry ten lines below it saying "Wired now". Both halves stale, in
+/// opposite directions, in one paragraph: the example had been fixed and
+/// the count had never been recounted. A number in prose beside a list
+/// is a second reading of that list, so it gets held to it.
+#[test]
+fn the_header_counts_what_the_list_holds() {
+    let wired = NOT_YET_WIRED.iter().filter(|(_, w)| w.is_empty()).count();
+    let owing = NOT_YET_WIRED.len() - wired;
+    assert_eq!(
+        (wired, owing),
+        (5, 6),
+        "the list now holds {wired} wired and {owing} owing; the doc on \
+         `NOT_YET_WIRED` says FIVE and SIX. A family whose list emptied \
+         is a builder landing — say so in both places, or the next \
+         reader believes the older one."
+    );
+}
 
 /// Every weight a family's decode plan names is one `wire()` can emit, or
 /// is written down.

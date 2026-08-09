@@ -268,7 +268,6 @@ pub fn deployment(
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         // The only family whose CUDA text names `topk_sigmoid_bias`,
         // which is the kernel that reads this off the launch context.
         norm_topk_prob: f.moe.norm_topk_prob,
@@ -358,7 +357,6 @@ pub const NO_METAL: &str = "nemotron-h has no Metal text in this build: its forw
      this row";
 
 /// Trace this row's CUDA text for one fire class.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &NemotronHFacts,

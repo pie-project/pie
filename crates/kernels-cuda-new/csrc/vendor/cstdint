@@ -1,0 +1,92 @@
+//===-- cstdint - the six integer widths FlashInfer counts in ------------===//
+//
+// `uint32_t` and its five relatives, and the two `*_C` literal macros
+// `fp16.h` spells its constants with. This is what `#include <cstdint>`
+// resolves to when the compiler is NVRTC and the include path is a header set
+// carried in the binary rather than a directory on a disk.
+//
+// # Why this is not a guard
+//
+// Every other host header in FlashInfer's attention closure -- `<iostream>`,
+// `<sstream>`, `<vector>`, `<cuda_runtime.h>` and eighteen more -- is reached
+// only by host code, so the vendored copy guards the directive with
+// `#ifndef __CUDACC_RTC__` and the names go away with the code that wanted
+// them. `<cstdint>` is different, and the difference was measured rather than
+// assumed: `uint32_t` appears **2512 times** in the closure, `uint8_t` 194,
+// `int64_t` 127, `uint16_t` 47, `int32_t` 37, `uint64_t` 11 -- overwhelmingly
+// in `__device__` templates and `__global__` kernels. Guarding the include
+// away leaves every one of them undefined.
+//
+// And NVRTC supplies none of them. Measured on this box (L40S, NVRTC 13.0),
+// with the real `cuda_fp16.h` / `cuda_bf16.h` / `cuda_fp8.h` / `cuda_fp4.h`
+// in the header set:
+//
+// ```text
+// __global__ void probe(unsigned* p) { uint32_t x = 1; *p = x; }
+//   -> error: identifier "uint32_t" is undefined
+// ```
+//
+// NVRTC's built-in preamble has `size_t`, `ptrdiff_t`, `nullptr_t`, `assert`,
+// `printf`, `memcpy` and the `f`-suffixed math functions. It has no
+// fixed-width types, no `INT32_MAX`, no `FLT_MAX`, and no `std::` anything.
+// So this file exists, and it is the whole of `<cstdint>` this closure uses.
+//
+// # The name is the trick, as it is for the CCCL shims
+//
+// NVRTC resolves an `#include` by matching the directive's LITERAL spelling
+// against `includeNames[]`, so an entry named `cstdint` answers
+// `#include <cstdint>` from source we do not own, leaving that source
+// unmodified. `csrc/src/cooperative_groups.h` makes the same argument at
+// greater length; this is the same rule applied to the C++ standard library
+// instead of to CCCL.
+//
+// # What is deliberately NOT here
+//
+// The macros. `INT32_MAX`, `SIZE_MAX`, `INTMAX_C` and the rest of
+// `<stdint.h>`'s constant surface are absent because the closure does not name
+// one of them -- a grep over all 28 files found `UINT32_C` and `UINT16_C` and
+// nothing else. A shim that grew to the standard's surface would be a second
+// set of promises about integer formats to disagree with the first, and the
+// disagreement would be silent.
+//
+// `std::uint32_t`. A real `<cstdint>` puts the names in `std` and then drags
+// them into the global namespace; FlashInfer spells them unqualified at all
+// 2928 sites, so the `std` half would be dead text.
+
+#ifndef PIE_NVRTC_CSTDINT_
+#define PIE_NVRTC_CSTDINT_
+
+// NVRTC's preamble already declares `size_t` and `ptrdiff_t`; naming them
+// again here would be a redefinition, not a courtesy.
+typedef signed char int8_t;
+typedef short int16_t;
+typedef int int32_t;
+typedef long long int64_t;
+
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+
+// The two pointer-width integers. `uintptr_t` reaches device code through
+// `FLASHINFER_CHECK_ALIGNMENT` and through the `reinterpret_cast<uintptr_t>`
+// that `cp_async.cuh` and `permuted_smem.cuh` use to turn a shared-memory
+// address into the 32-bit form `cp.async` wants; 64-bit is the only device
+// ABI this crate targets.
+//
+// `long long` and not `long`, which is not a style choice: CCCL's own
+// `cuda/std/cstdint` declares these two in the GLOBAL namespace under
+// `__CUDACC_RTC__`, as `int64_t`/`uint64_t`, and a header set that carries
+// both files gets *"invalid redeclaration of type name `intptr_t`"* if the
+// two spellings pick different underlying types. Same width, same ABI, one
+// declaration.
+typedef int64_t intptr_t;
+typedef uint64_t uintptr_t;
+
+// `fp16.h` writes its IEEE constants as `UINT32_C(0x77800000)`. The suffix
+// has to make the literal the width the typedef above is, which on this ABI
+// is `unsigned int` and `unsigned short` promoted -- so `U` and nothing more.
+#define UINT16_C(value) value##U
+#define UINT32_C(value) value##U
+
+#endif  // PIE_NVRTC_CSTDINT_

@@ -18,12 +18,11 @@ test = false
 doctest = false
 
 [features]
-# Forwarded to the composition root, which is what selects the driver. Building
-# this crate without one of these gets the dummy fallback, which is what the
-# handful of no-GPU diagnostics here run against.
+# Forwarded to the composition root, which is what selects the driver. There
+# is no fallback: the dummy driver these no-GPU diagnostics used to run
+# against is deleted, so a build with neither feature reaches no device.
 default = []
 driver-cuda = ["pie/driver-cuda"]
-driver-dummy = ["pie/driver-dummy"]
 
 [dev-dependencies]
 # The composition root. These tests boot the same `run_standalone` a `pie

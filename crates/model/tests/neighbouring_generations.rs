@@ -36,7 +36,6 @@
 //! `true`. A cross-generation claim that does not read the other
 //! generation is not checking anything, and the only place it CAN read
 //! it is here.
-#![cfg(feature = "forward")]
 
 use model::catalog::{Deployed, Variant};
 

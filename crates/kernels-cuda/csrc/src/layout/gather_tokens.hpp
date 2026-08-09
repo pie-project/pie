@@ -19,18 +19,23 @@
 
 namespace pie_cuda_driver::kernels::layout {
 
-// One entry of the gather plan (mirrors the runtime `GatherOp`, but over
-// PHYSICAL page ids — the host resolves slot id → page id before launch).
-// Copies `len` tokens from token offset `src_off` of page `src_page` to offset
-// `dst_off` of page `dst_page`. `src_off + len <= page_size` and the dst span
-// stays within one page (guaranteed by `compact`'s per-page split).
-struct GatherTokenOp {
-    std::uint32_t src_page;
-    std::uint32_t src_off;
-    std::uint32_t dst_page;
-    std::uint32_t dst_off;
-    std::uint32_t len;
-};
+// `GatherTokenOp` is DEFINED in `layout/gather_tokens.cuh`, beside the two
+// `__global__`s that read it -- a kernel parameter type has to be visible to
+// whatever compiles the kernel, and NVRTC cannot open this file: it ships
+// neither `<cstdint>` nor `<cuda_runtime.h>`, and the `stdlib_probe` measured
+// zero of thirty-one standard headers answering.
+//
+// So this file forward-declares and does not restate. It is compiled by a
+// PLAIN host C++ compiler -- `build.rs` generates `shim.cpp`, which includes
+// every family header and knows nothing of `__global__` -- so it may not
+// include the device header, and an incomplete type is all a `const
+// GatherTokenOp*` parameter needs. A second definition spelled
+// `std::uint32_t` would be the same struct until someone reordered a field,
+// and then every op in the plan would be read wrong by one half of the tree.
+namespace device {
+struct GatherTokenOp;
+}
+using device::GatherTokenOp;
 
 // Pack the plan `ops` densely for ONE layer's paged K/V (bf16, NHD). `k_pages`
 // and `v_pages` are `[num_pages, page_size, num_kv_heads, head_dim]` bf16 (as

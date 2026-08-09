@@ -87,10 +87,18 @@ fn no_two_rows_claim_the_same_entrypoint() {
 /// Change it here when a kernel is added, deliberately — and when you do, say
 /// in the same diff whether Metal grew one too, because a number that moves on
 /// one side alone is exactly the fact this assertion exists to surface.
+///
+/// 99/480 became 100/481 with `add_bias`, and Metal grew the same row in the
+/// same diff. It was written here first — the Qwen-2 biases are a Vulkan
+/// wrong-answer this driver could measure against a CPU oracle — and closing
+/// it on the Metal side too was the only honest option: the shared text can
+/// name an op only if some Metal kernel implements it, so leaving Metal short
+/// would have meant an exception list on the parity tests below, which is
+/// precisely how the next real divergence gets waved through.
 #[test]
-fn the_table_is_ninety_nine_kernels_over_four_hundred_and_eighty_entrypoints() {
-    assert_eq!(kernels_vulkan::KERNELS.len(), 99);
-    assert_eq!(kernels_vulkan::entrypoints().len(), 480);
+fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints() {
+    assert_eq!(kernels_vulkan::KERNELS.len(), 100);
+    assert_eq!(kernels_vulkan::entrypoints().len(), 481);
 }
 
 /// The parity with `kernels-metal` above, actually compared rather than
@@ -604,15 +612,15 @@ fn every_row_asks_for_the_same_operands_kernels_metal_does() {
         ours.len()
     );
 
-    // 56 of the 99 rows are unstated by design, so 43 is the whole of what
+    // 56 of the 100 rows are unstated by design, so 44 is the whole of what
     // there is to compare and a threshold below it would let the scrape rot
     // silently. Asserting the exact number would just be a second copy of the
-    // count `the_table_is_ninety_nine_kernels...` already owns.
+    // count `the_table_is_one_hundred_kernels...` already owns.
     let stated = theirs.values().filter(|(_, ops)| !ops.is_empty()).count();
     assert!(
-        stated >= 43,
+        stated >= 44,
         "only {stated} kernels-metal rows scraped with any operands at all; \
-         43 rows state operands, so the scrape has stopped reading some"
+         44 rows state operands, so the scrape has stopped reading some"
     );
 
     let mut wrong: Vec<String> = Vec::new();

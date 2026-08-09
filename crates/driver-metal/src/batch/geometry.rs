@@ -271,12 +271,6 @@ pub struct DecodeGeometry {
     pub experts_per_token: u32,
     /// One routed expert's FFN width.
     pub moe_intermediate: u32,
-    /// The bank stays in the checkpoint's MXFP4 rather than being
-    /// re-quantized at load. It changes what is *bound* — MXFP4 has block
-    /// exponents and no zero point, so there is no `.biases` to bind —
-    /// which is why a codec belongs in the geometry and not only in a
-    /// kernel name. Solved from the staged tensors, never assumed.
-    pub mxfp4_experts: bool,
     /// The dense FFN every routed member runs beside the bank, under a
     /// one-scalar-per-token sigmoid gate. Zero only for a routing that has
     /// none.
@@ -328,7 +322,6 @@ impl Default for DecodeGeometry {
             n_experts: 0,
             experts_per_token: 0,
             moe_intermediate: 0,
-            mxfp4_experts: false,
             shared_intermediate: 0,
             full_attn_interval: 4,
         }
@@ -438,11 +431,23 @@ fn positive(v: i32) -> Option<u32> {
 /// numbers travel as `DriverCapabilities` and the pool's own counts,
 /// which is where a scheduler already reads them.
 ///
-/// Two fields DO remain unfilled — `alt_quant` and `mxfp4_experts`,
-/// which are solved from the staged tensors rather than from any
-/// statement, and are not solved yet. `geometry_is_stated` names them
-/// and says so, so the gap is a sentence somebody wrote rather than a
-/// default somebody inherited.
+/// ONE field remains unfilled — `alt_quant` — and it is not a gap for
+/// want of an answer: `LoadPlan::affine_points` solves it and
+/// `serve/load.rs` refuses a checkpoint that arrives at two points by
+/// name. Filling the field would need a SECOND kernel set to be worth
+/// anything, and `binding::observed` builds one. `geometry_is_stated`
+/// names it and says so, so the gap is a sentence somebody wrote rather
+/// than a default somebody inherited.
+///
+/// `mxfp4_experts` used to sit beside it, and it was the same slip
+/// `alt_quant`'s doc was: it claimed to be "solved from the staged
+/// tensors" from a struct **whose constructor is never handed them**.
+/// The three arguments below are a deployment, a load shape and an
+/// affine point; no tensor reaches here. The fact was already solved on
+/// the other side of that line — `Loaded::mxfp4` reads the load plan,
+/// `binding::observed` turns it into `MetalBinding::moe_mxfp4`, and the
+/// text reads THAT to emit `WeightRepr::Mxfp4Marlin`. Two names for one
+/// question, one of which could never answer it. The field is gone.
 ///
 /// # Why three arguments and not one
 ///
@@ -591,7 +596,7 @@ pub fn geometry_from_deployment(
     // loaded and died at its first fire.
     match d.kv {
         KvStyle::Paged => {}
-        KvStyle::Mla { .. } | KvStyle::Dsv4 { .. } => {
+        KvStyle::Mla { .. } | KvStyle::CompressedPlane { .. } => {
             return refuse(
                 "this row needs a LATENT KV pool and this driver provisions \
                  paged K/V pages only; the absorbed projections have no metal \
@@ -929,7 +934,7 @@ pub fn geometry_from_deployment(
     // exists to make unrepresentable. The row states it now.
     let (rope_freq_factor, rope_low_freq_factor, rope_high_freq_factor, rope_original_max_position) =
         match d.rope_scaling {
-            Some(RopeScaling::Llama3 {
+            Some(RopeScaling::Piecewise {
                 factor,
                 low_freq_factor,
                 high_freq_factor,
@@ -1056,7 +1061,6 @@ mod tests {
         Deployment {
             layers,
             norm_eps: 1e-5,
-            k_eq_v: false,
             mlp_gate: model::deployment::MlpGate::Silu,
             // A dense fixture: no router, so nothing reads it. It is on
             // the deployment for `driver-cuda`'s launch, which is the
@@ -1245,7 +1249,7 @@ mod tests {
         assert!(why(&d, shape(4)).contains("LATENT KV pool"));
 
         let mut d = dense(4);
-        d.kv = KvStyle::Dsv4 {
+        d.kv = KvStyle::CompressedPlane {
             ratios: vec![-1, 2, 2, 2],
         };
         assert!(why(&d, shape(4)).contains("LATENT KV pool"));
@@ -1688,7 +1692,7 @@ mod tests {
     #[test]
     fn a_llama3_rescaled_ladder_reaches_the_geometry_whole() {
         let mut d = dense(4);
-        d.rope_scaling = Some(RopeScaling::Llama3 {
+        d.rope_scaling = Some(RopeScaling::Piecewise {
             factor: 32.0,
             low_freq_factor: 1.0,
             high_freq_factor: 4.0,

@@ -485,7 +485,6 @@ endif()
 # ownership, so it did not survive the split.
 set(PIE_CUDA_GRAPH_KERNEL_SOURCES
   src/norm/altup.cu
-  src/norm/altup_aux.cu
   src/attn/attn_sink.cu
   src/attn/dsa_indexer.cu
   src/attn/dsv4_compress.cu
@@ -496,7 +495,6 @@ set(PIE_CUDA_GRAPH_KERNEL_SOURCES
   src/attn/mla_paged.cu
   src/ssm/nemotron_h.cu
   src/attn/page_compact.cu
-  src/norm/scalar_mul.cu
   src/attn/softcap.cu
   src/attn/attention_mla.cu
   src/ssm/flashinfer_mamba.cu)
@@ -655,6 +653,73 @@ target_include_directories(pie_kernels_cuda
 
 set_target_properties(pie_kernels_cuda PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
+
+# ---- where the device headers went -----------------------------------------
+#
+# Every `__global__` these translation units compile is a template in a
+# `.cuh`, and the `.cuh` files are not here any more: fifty-seven of them
+# moved to `crates/kernels-cuda-new/csrc/src`, the JIT crate, which reads
+# them into thirty-eight NVRTC units and roughly a hundred and forty rows
+# and is now by far their larger consumer. The `.cu` and `.hpp` files stayed
+# -- a translation unit is what this file compiles and a host interface is
+# what g++ compiles, and neither is text a JIT header set may carry. It is a
+# MOVE: there is still exactly one definition of every kernel in the tree,
+# which `tests/sources.rs::no_global_is_defined_twice` fails the build over.
+#
+# The path is spelled relative to THIS file rather than taken from cargo,
+# and that is not a shortcut. It was written when a cargo dependency could
+# not have carried it at all: `kernels-cuda-new` depended on THIS crate for
+# the signature table, so an edge the other way was a cycle, and `links`
+# metadata is a dependency wearing different clothes and would have been the
+# same cycle. The tables have since moved and the edge inverted -- this
+# crate now depends on `kernels-cuda-new` and re-exports its rows -- so the
+# direction is no longer the objection. What is left is the objection that
+# was always the stronger one:
+#
+#   * `kernels-cuda-new` deliberately has no `links` key. Its `src/lib.rs`
+#     explains the absence as the design: the crate builds nothing native
+#     and so has no native artifact to be unique about, and `links` is how
+#     cargo makes that uniqueness enforceable. No `links`, no `DEP_*`, and
+#     `DEP_*` is the only channel a dependency has for telling a build
+#     script where its files are. The edge exists and still says nothing.
+#   * Giving it a `links` key to open that channel would mean claiming a
+#     native artifact this crate does not have, so that a CMake file could
+#     learn a path it can already compute.
+#
+# An include directory is a filesystem fact. Both crates live in `crates/`,
+# this file's own directory fixes the rest, and nothing cargo could say
+# would be more stable than that.
+set(PIE_JIT_DEVICE_HEADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../kernels-cuda-new/csrc/src")
+if(NOT EXISTS "${PIE_JIT_DEVICE_HEADERS}/pie_device.cuh")
+  message(FATAL_ERROR
+    "the kernel headers are not at ${PIE_JIT_DEVICE_HEADERS}. Every .cu here "
+    "includes at least the prelude, so this fails now with one message "
+    "instead of once per translation unit with a resolver's.")
+endif()
+
+# `-iquote`, not an include directory, and this one is measured: nvcc 13.0.88
+# with `-I ${PIE_JIT_DEVICE_HEADERS}` resolves the seventeen
+# `#include <cuda_bf16.h>` directives under `src/` to that tree's SHIM of the
+# same name -- eighteen names written against the f16x2 instructions so that
+# NVRTC, which bundles no device headers before 13.3, has something to answer
+# with. The shims wear NVIDIA's filenames on purpose (`new-horizon.md` §13.4:
+# a shim impersonates exactly when its includer is upstream source we do not
+# own), and an `-I` puts the impersonation ahead of the real toolkit header.
+#
+# `-iquote` says the narrow thing that is actually wanted: this directory
+# answers `#include "..."` -- our own spellings, `pie_device.cuh`,
+# `attn/kv_paged.cuh` -- and is never searched for `#include <...>`, so no
+# shim can shadow a vendor header no matter what is added to it later. nvcc
+# rejects the flag itself and forwards it with `-Xcompiler`, which reaches
+# the preprocessor pass that resolves both the host and the device halves of
+# a `.cu`.
+#
+# CUDA only. A `.hpp` here includes no `.cuh` and should not start: device
+# text in a host translation unit is a layering mistake, and a build that
+# quietly resolved it would be how the mistake survives review.
+target_compile_options(pie_kernels_cuda PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-iquote,${PIE_JIT_DEVICE_HEADERS}>)
 
 # ---- FlashInfer generated CUTLASS MoE (vendored) ---------------------------
 # Pre-generated FlashInfer CUTLASS grouped-GEMM MoE launchers, vendored under

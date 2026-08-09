@@ -126,7 +126,10 @@ pub fn stage_plan_weights(
     // the chains and this did not, which is the argument for the walk living
     // in the loader: one answer, or two that differ.
     let published = publish_spans(plan);
-    let arena_len = plan.memory.persistent_bytes;
+    // The resident tensors AND the scratch behind them: a plan whose device
+    // runs its own load-time transforms stages their operands in the arena,
+    // so `persistent_bytes` alone is short by exactly that region.
+    let arena_len = plan.memory.arena_bytes();
     fits_on_this_gpu(&crate::device::memory::Memory::probe(context), arena_len)?;
 
     // The tensors that are NOT in the arena, collected as they finalize. A

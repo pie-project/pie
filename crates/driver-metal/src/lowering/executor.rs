@@ -211,6 +211,20 @@ pub enum BindRefusal {
     UnknownWeight(String),
     /// The trace names a seam value the resolver does not bind.
     UnknownNamed(ValueId),
+    /// The kernel's row names the statement's `want`-th weight and the
+    /// statement carries `held`.
+    ///
+    /// The row and the weight list are written in two crates — `kernels-*`
+    /// states the ABI, the text's DSL site states the names — so this is the
+    /// one operand refusal that is a disagreement between them rather than a
+    /// checkpoint missing a tensor. Binding zero here is what let
+    /// `mxfp4_qmv_routed_bias` read an additive bias off a null pointer.
+    UnstatedWeight {
+        /// The weight index the row asked for.
+        want: u32,
+        /// How many weight names the statement carries.
+        held: usize,
+    },
 }
 
 /// The marker a constant rides the weight-name slot under.

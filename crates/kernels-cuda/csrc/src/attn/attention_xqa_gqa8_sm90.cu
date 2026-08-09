@@ -1,3 +1,7 @@
+// The scalar layer and the fixed-width integer names, out of the prelude:
+// NVRTC has no CUDA device headers, and this file is meant to compile
+// under both it and nvcc.
+#include "pie_device.cuh"
 #include "attn/attention_xqa.hpp"
 
 #include <algorithm>
@@ -5,7 +9,6 @@
 #include <cstdint>
 #include <stdexcept>
 
-#include <cuda_bf16.h>
 
 #include "cuda_check.hpp"
 
@@ -18,7 +21,7 @@
 #define USE_INPUT_KV 0
 #define USE_CUSTOM_BARRIER 1
 #define INPUT_FP16 0
-#define DTYPE __nv_bfloat16
+#define DTYPE device::bf16
 #define CACHE_ELEM_ENUM 0
 #define TOKENS_PER_PAGE 32
 #define HEAD_ELEMS 128
@@ -81,7 +84,7 @@ int current_device_sm_count() {
 }  // namespace
 
 void xqa_decode_bf16_gqa8_sm90_warmup_current_device() {
-    std::uint32_t size = 0;
+    device::u32 size = 0;
     CUDA_CHECK(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
     CUDA_CHECK(cudaFuncSetAttribute(
         kernel_mha,
@@ -109,9 +112,9 @@ void launch_attention_xqa_decode_bf16_gqa8_sm90(
     void* k_pages,
     void* v_pages,
     void* o,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
+    const device::u32* kv_page_indices_d,
+    const device::u32* kv_page_indptr_d,
+    const device::u32* kv_last_page_lens_d,
     int num_requests,
     int num_q_heads,
     int num_kv_heads,
@@ -188,14 +191,14 @@ void launch_attention_xqa_decode_bf16_gqa8_sm90_prepared(
     const int page_bucket = kernels::attn::xqa_decode_page_bucket(max_pages_per_seq);
     const std::size_t page_table_bytes =
         static_cast<std::size_t>(num_requests) * page_bucket *
-        sizeof(std::int32_t);
+        sizeof(device::i32);
     const std::size_t seq_lens_bytes =
-        static_cast<std::size_t>(num_requests) * sizeof(std::uint32_t);
+        static_cast<std::size_t>(num_requests) * sizeof(device::u32);
     std::uintptr_t base =
         reinterpret_cast<std::uintptr_t>(workspace.float_buffer);
-    std::uintptr_t p_page_table = align_up_ptr(base, alignof(std::int32_t));
+    std::uintptr_t p_page_table = align_up_ptr(base, alignof(device::i32));
     std::uintptr_t p_seq_lens =
-        align_up_ptr(p_page_table + page_table_bytes, alignof(std::uint32_t));
+        align_up_ptr(p_page_table + page_table_bytes, alignof(device::u32));
     std::uintptr_t p_scratch =
         align_up_ptr(p_seq_lens + seq_lens_bytes, kSemaphoreAlignment);
     const std::uintptr_t end =
@@ -205,34 +208,34 @@ void launch_attention_xqa_decode_bf16_gqa8_sm90_prepared(
         throw std::runtime_error("xqa gqa8 sm90 decode: attention workspace too small");
     }
 
-    auto* page_table = reinterpret_cast<std::int32_t*>(p_page_table);
-    auto* seq_lens = reinterpret_cast<std::uint32_t*>(p_seq_lens);
+    auto* page_table = reinterpret_cast<device::i32*>(p_page_table);
+    auto* seq_lens = reinterpret_cast<device::u32*>(p_seq_lens);
     void* scratch = reinterpret_cast<void*>(p_scratch);
 
     const int semaphore_count = num_requests * num_kv_heads;
-    if (static_cast<std::size_t>(semaphore_count) * sizeof(std::uint32_t) >
+    if (static_cast<std::size_t>(semaphore_count) * sizeof(device::u32) >
         workspace.int_bytes) {
         throw std::runtime_error("xqa gqa8 sm90 decode: semaphore workspace too small");
     }
     auto* semaphores =
-        reinterpret_cast<std::uint32_t*>(workspace.int_buffer);
+        reinterpret_cast<device::u32*>(workspace.int_buffer);
     CUDA_CHECK(cudaMemsetAsync(
         semaphores, 0,
-        static_cast<std::size_t>(semaphore_count) * sizeof(std::uint32_t),
+        static_cast<std::size_t>(semaphore_count) * sizeof(device::u32),
         stream));
 
     const float q_scale = 1.0f;
     const float kv_scale = 1.0f;
-    const std::uint64_t kv_stride_head =
-        static_cast<std::uint64_t>(head_dim);
-    const std::uint64_t kv_stride_token =
-        static_cast<std::uint64_t>(num_kv_heads) * head_dim;
-    const std::uint64_t kv_stride_page =
-        static_cast<std::uint64_t>(page_size) * num_kv_heads * head_dim;
+    const device::u64 kv_stride_head =
+        static_cast<device::u64>(head_dim);
+    const device::u64 kv_stride_token =
+        static_cast<device::u64>(num_kv_heads) * head_dim;
+    const device::u64 kv_stride_page =
+        static_cast<device::u64>(page_size) * num_kv_heads * head_dim;
 
     launchHopperF8MHAFlashInfer_xqa_gqa8_sm90_bf16_p32_h128(
-        static_cast<std::uint32_t>(current_device_sm_count()),
-        static_cast<std::uint32_t>(num_kv_heads),
+        static_cast<device::u32>(current_device_sm_count()),
+        static_cast<device::u32>(num_kv_heads),
         /*slidingWinSize=*/0,
         q_scale,
         /*qScalePtr=*/nullptr,
@@ -242,9 +245,9 @@ void launch_attention_xqa_decode_bf16_gqa8_sm90_prepared(
         reinterpret_cast<GMemCacheHead*>(k_pages),
         reinterpret_cast<GMemCacheHead*>(v_pages),
         reinterpret_cast<KVCachePageIndex const*>(page_table),
-        static_cast<std::uint32_t>(page_bucket * page_size),
+        static_cast<device::u32>(page_bucket * page_size),
         seq_lens,
-        static_cast<std::uint32_t>(num_requests),
+        static_cast<device::u32>(num_requests),
         kv_scale,
         /*kvScalePtr=*/nullptr,
         semaphores,

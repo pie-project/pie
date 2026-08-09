@@ -92,6 +92,23 @@ fn texts() -> Vec<(String, Lowered)> {
     geometric().into_iter().map(|(n, l, _)| (n, l)).collect()
 }
 
+/// `LlamaLikeMetalFacts::synthetic()` with the one line this backend answers
+/// differently.
+///
+/// `synthetic()` is `driver-metal`'s answer sheet -- its own doc says so --
+/// and on `add_bias` the two backends genuinely disagree: that driver's binder
+/// does not resolve `Source::OutWidth`, which is where `norm::add_bias` reads
+/// its row pitch, and this one's does. Stating it here rather than in each
+/// text means qwen2.5's plans carry the three bias launches a layer that the
+/// checkpoint has always shipped, so everything in this file that walks a real
+/// plan walks them too.
+fn vulkan_facts() -> LlamaLikeMetalFacts {
+    LlamaLikeMetalFacts {
+        add_bias: true,
+        ..LlamaLikeMetalFacts::synthetic()
+    }
+}
+
 /// The same texts, each with the model geometry its plans were built from.
 ///
 /// Split out because most of this file never needs it and one test does. A
@@ -101,11 +118,7 @@ fn texts() -> Vec<(String, Lowered)> {
 fn geometric() -> Vec<(String, Lowered, driver_vulkan::dispatch::Geometry)> {
     let mut out = Vec::new();
     for (name, facts, metal) in [
-        (
-            "qwen3_0_6b",
-            LlamaLikeFacts::qwen3_0_6b(),
-            LlamaLikeMetalFacts::synthetic(),
-        ),
+        ("qwen3_0_6b", LlamaLikeFacts::qwen3_0_6b(), vulkan_facts()),
         (
             "gpt_oss_20b",
             LlamaLikeFacts::gpt_oss_20b(),
@@ -114,23 +127,19 @@ fn geometric() -> Vec<(String, Lowered, driver_vulkan::dispatch::Geometry)> {
         (
             "qwen3_30b_a3b",
             LlamaLikeFacts::qwen3_30b_a3b(),
-            LlamaLikeMetalFacts::synthetic(),
+            vulkan_facts(),
         ),
         (
             "qwen2_5_1_5b",
             LlamaLikeFacts::qwen2_5_1_5b(),
-            LlamaLikeMetalFacts::synthetic(),
+            vulkan_facts(),
         ),
         (
             "mistral_7b_v03",
             LlamaLikeFacts::mistral_7b_v03(),
-            LlamaLikeMetalFacts::synthetic(),
+            vulkan_facts(),
         ),
-        (
-            "olmo2_1b",
-            LlamaLikeFacts::olmo2_1b(),
-            LlamaLikeMetalFacts::synthetic(),
-        ),
+        ("olmo2_1b", LlamaLikeFacts::olmo2_1b(), vulkan_facts()),
     ] {
         for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 64)] {
             if let Some(low) = lowered(&facts, &metal, class, rows) {
@@ -244,6 +253,22 @@ enum Reaches {
     /// the driver's own: the paged KV cache, its page table, the routing
     /// scratch. The number is how many.
     DriverSupplies(u32),
+    /// Every descriptor is the plan's, but some of the module's push scalars
+    /// are not: the ROW derives them from the operands' shapes. The number is
+    /// how many words.
+    ///
+    /// `norm::add_bias` is the case that forced the category, and it is worth
+    /// separating from [`Self::DriverSupplies`] because what is missing is a
+    /// different kind of thing. A paged attention is short of a RESOURCE only
+    /// this driver has; a bias is short of a NUMBER the plan already implies
+    /// -- the row width of its own output. `Source::OutWidth` is how the row
+    /// says where to read it, and `binding::scalars` is what reads it, so
+    /// nothing outside the plan is needed to fire this kernel.
+    ///
+    /// Which is exactly why the two must not share a bucket: this file's
+    /// count of `DriverSupplies` is "what a Vulkan executor still owes", and
+    /// a row that derives its own scalar owes nothing.
+    RowDerives(u32),
 }
 
 /// Every symbol the reachable texts launch, and how it must be called.
@@ -259,6 +284,12 @@ const REACHES: &[(&str, Reaches)] = &[
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_4", Reaches::Push),
     ("affine_qmv_fast_residual_bfloat16_gs_64_b_4", Reaches::Push),
+    // Two slots, both stated -- the value it biases in place and the bias --
+    // and ONE scalar the statement does not carry. An `AddBias` states no
+    // params at all, because a bias vector's length is the projection's width
+    // and the trace already said that when it sized the output. The row reads
+    // it back with `Source::OutWidth(0)`.
+    ("add_bias_bfloat16", Reaches::RowDerives(1)),
     ("residual_add_bfloat16", Reaches::Push),
     ("silu_mul_bfloat16", Reaches::Push),
     ("combine_sorted", Reaches::Buffer),
@@ -271,6 +302,12 @@ const REACHES: &[(&str, Reaches)] = &[
     // It was DriverSupplies(1) until the hole was measured, which is the whole
     // argument for measuring holes.
     ("affine_qmv_routed_bfloat16_gs_64_b_4", Reaches::Push),
+    // The same routed shape one plane heavier. `dsl::metal::routed_qmv` sends
+    // an MXFP4 expert bank here rather than to the unbiased symbol, because
+    // that bank publishes one additive term per output row beside its packed
+    // weight; the module reads it at a slot of its own, and the statement
+    // names it, so the reach is still complete.
+    ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", Reaches::Push),
     (
         "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
         Reaches::DriverSupplies(1),
@@ -384,6 +421,20 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
             let symbol = &low.kernels[launch.kernel as usize];
             let args = launch.args.end - launch.args.start;
             let params = launch.params.end - launch.params.start;
+            // An IN-PLACE row binds one buffer for two of the plan's args:
+            // the trace states the value and the result separately, because a
+            // tape whose statements did not produce values could not say what
+            // the next one reads, and the row then says they are the same
+            // allocation. `norm::add_bias` is the only one here, and without
+            // this it classifies as a kernel binding one FEWER descriptor
+            // than the plan states -- which is true and is not what is
+            // interesting about it.
+            let args = args
+                - u32::try_from(
+                    kernels::sig_in(kernels_vulkan::KERNELS, symbol)
+                        .map_or(0, |sig| sig.in_place.len()),
+                )
+                .expect("a row states few aliases");
             let Ok(code) = std::fs::read(dir.join(format!("{symbol}.spv"))) else {
                 continue;
             };
@@ -403,6 +454,13 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
                 Reaches::Push
             } else if args + 1 == real && d.block_bytes.iter().any(|b| *b == Some(params * 4)) {
                 Reaches::Buffer
+            } else if args == real && d.push_offsets.len() as u32 > params {
+                // Every descriptor accounted for and some scalars still
+                // missing: the row derives them. Asked AFTER the two complete
+                // forms and BEFORE `DriverSupplies`, because `saturating_sub`
+                // would otherwise report this as a driver owing zero
+                // resources, which is true and says nothing.
+                Reaches::RowDerives(d.push_offsets.len() as u32 - params)
             } else {
                 Reaches::DriverSupplies(real.saturating_sub(args))
             };
@@ -461,7 +519,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
 ///
 /// A weight and a seam value are not the plan's to place, so this stands in
 /// for the driver's tables with placeholders sized generously. Every arena
-/// operand, though -- 14324 of them across six texts in both fire classes --
+/// operand, though -- 14948 of them across six texts in both fire classes --
 /// goes through the real arithmetic: `rows × width × bytes` from the plan,
 /// checked against the plan's arena and then against 256-byte addressing.
 ///
@@ -548,7 +606,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // Stated so that a plan which stops producing arena operands -- or starts
     // producing far fewer -- cannot make the zero above true by emptiness.
     assert_eq!(
-        arena_operands, 14324,
+        arena_operands, 14948,
         "the texts produced a different number of arena operands than when this \
          was measured, so the zero above is about a different plan"
     );
@@ -559,7 +617,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // end of the arena is refused nowhere and is the exact defect
     // `tests/device.rs` shows corrupting a neighbour. Both change this sum.
     assert_eq!(
-        total, 2_322_057_920,
+        total, 2_368_916_160,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -711,7 +769,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     // Both shapes have to actually occur, or a rule that never fires is
     // passing for the same reason an absent one would.
     assert!(pushed > 0 && blocked > 0, "push={pushed} block={blocked}");
-    // Five, not seven -- and the two that fall out are the useful part.
+    // Six, not eight -- and the two that fall out are the useful part.
     //
     // `affine_qmv_routed` states five scalars and its module's push block
     // holds exactly five; `embed_gather_mb_4bit` states one and holds one.
@@ -720,10 +778,20 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     // one thing does not make a kernel short of the other, and treating
     // "binds more than the plan names" as one bucket would have hidden that.
     //
-    // The remaining five are short of both, which is what a paged KV cache
-    // and its page table look like from here: the driver owns the resource,
-    // so it also owns the numbers describing it.
+    // Five of the remaining six are short of both, which is what a paged KV
+    // cache and its page table look like from here: the driver owns the
+    // resource, so it also owns the numbers describing it. The sixth is short
+    // of a scalar alone, and its own note below says why that is a different
+    // thing entirely.
     let want: std::collections::BTreeSet<String> = [
+        // The sixth, and the odd one out: `add_bias` is short of a scalar and
+        // short of NOTHING ELSE. Its two descriptors are both the plan's, and
+        // the one word its module reads is the row width of its own output --
+        // which the statement does not carry, because an `AddBias` states no
+        // params at all. `Source::OutWidth(0)` is how the row says where to
+        // read it and `binding::scalars` is what reads it, so this symbol
+        // fires today; the five below still owe a Vulkan executor a resource.
+        "add_bias_bfloat16",
         "kv_append_paged_bfloat16",
         "neox_mb_bfloat16",
         "row_gather_bfloat16",
@@ -737,13 +805,13 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
         owed, want,
         "a different set of launches has scalars this crate cannot place"
     );
-    // Every one of them is also short of descriptors. The reverse does not
-    // hold, which is the finding above.
+    // Every one of them is also short of descriptors, EXCEPT the one that is
+    // short of a derived number instead. The reverse does not hold, which is
+    // the finding above.
     for symbol in &owed {
         assert!(
-            REACHES
-                .iter()
-                .any(|(n, r)| n == symbol && matches!(r, Reaches::DriverSupplies(_))),
+            REACHES.iter().any(|(n, r)| n == symbol
+                && matches!(r, Reaches::DriverSupplies(_) | Reaches::RowDerives(_))),
             "`{symbol}` has scalars this crate cannot place and yet its module \
              binds nothing the plan does not name, which leaves the refusal \
              unexplained"
@@ -760,7 +828,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// a set of built modules and an arena, how many of its rectangles can be
 /// recorded?
 ///
-/// All 6272, across SIX texts in both fire classes. It began at 3180 of 3992
+/// All 6584, across SIX texts in both fire classes. It began at 3180 of 3992
 /// over three texts, and the 812 that refused were six symbols short of
 /// something nobody had built; each one leaving that list was a defect in
 /// this crate rather than a gap in a plan, and the list is now empty.
@@ -839,6 +907,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     let mut split_rectangles = 0u32;
     let mut rotary_overridden = 0u32;
     let mut pool_numbers = 0u32;
+    let mut derived_widths = 0u32;
     let mut head_overridden = 0u32;
     let mut heads_overridden = 0u32;
 
@@ -1043,6 +1112,55 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                         );
                     }
 
+                    // THE ROW'S DERIVED WIDTH REACHES THE SHADER, for the
+                    // same reason the pool's numbers are checked above and
+                    // with the same shape of check. `Source::OutWidth(0)` is
+                    // a number NOTHING in the statement carries -- an
+                    // `AddBias` states no params at all -- so if
+                    // `binding::scalars` read the wrong output, or dropped
+                    // the source and left the run short, the module would get
+                    // a zero and every lane would return before writing.
+                    //
+                    // That failure is silent in the direction that matters:
+                    // a bias never added is a projection missing a small
+                    // constant, which stays fluent. So the width is asserted
+                    // to be IN the bytes, and it is the width the plan states
+                    // for the launch's own output rather than a constant this
+                    // test knows.
+                    if sig
+                        .operands
+                        .iter()
+                        .any(|o| matches!(o.source, kernels::Source::OutWidth(_)))
+                    {
+                        derived_widths += 1;
+                        let store = Sentinels(driver_vulkan::device::Buffer::placeholder(GENEROUS));
+                        let got =
+                            driver_vulkan::binding::scalars(sig, &low, launch, &declared, &store)
+                                .expect("the row's scalars place");
+                        let bytes = match got {
+                            driver_vulkan::binding::Params::Push(ref b) => b.clone(),
+                            driver_vulkan::binding::Params::Block { ref bytes, .. } => {
+                                bytes.clone()
+                            }
+                            driver_vulkan::binding::Params::None => Vec::new(),
+                        };
+                        let width = low.args[launch.args.start as usize..launch.args.end as usize]
+                            .iter()
+                            .filter_map(|a| match a {
+                                model_compiler::lower::Arg::Arena { width, .. }
+                                | model_compiler::lower::Arg::Named { width, .. } => Some(*width),
+                                model_compiler::lower::Arg::Weight(_) => None,
+                            })
+                            .next_back()
+                            .expect("a widthed operand");
+                        assert!(
+                            width > 0 && bytes.windows(4).any(|w| w == width.to_le_bytes()),
+                            "{text}: `{symbol}` names its output's width and \
+                             {width} is not in the {} bytes it hands the shader",
+                            bytes.len()
+                        );
+                    }
+
                     // Counting rows that STATE a head shape does not witness
                     // `dims_of` USING it, and the difference is not academic:
                     // deleting either override left this whole file green,
@@ -1160,10 +1278,10 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     }
 
     assert_eq!(
-        launches, 6272,
+        launches, 6584,
         "a different number of rectangles is lowered"
     );
-    assert_eq!(planned, 6272, "a different number of rectangles records");
+    assert_eq!(planned, 6584, "a different number of rectangles records");
 
     // Nothing is refused, so nothing is named. Every rectangle all six
     // texts state, in both fire classes, becomes a dispatch.
@@ -1257,6 +1375,20 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         pool_numbers, 704,
         "a different number of rectangles names one of the pool's numbers"
     );
+    // Two texts, three biases a layer, both fire classes: qwen2.5's 28
+    // layers make 168 and gpt-oss's 24 make 144. Pinned rather than asserted
+    // as non-zero, because the failure this witnesses is a bias that is not
+    // added, and a text that quietly stopped stating one would leave the
+    // check above passing over nothing.
+    //
+    // Was qwen2.5 alone until gpt-oss started stating its attention biases
+    // too, and the 144 that arrived needed nothing here: an `AddBias` states
+    // no scalars whatever states it, so the row deriving the width was
+    // already the whole of it.
+    assert_eq!(
+        derived_widths, 312,
+        "a different number of rectangles names a width the row derives"
+    );
     // ZERO, and asserted as zero because that is the fact `dims_of`'s
     // `in_width` note rests on: no text here reaches `split_qkv`, so nothing
     // consumes `in_width` and replacing it with a constant is invisible. A
@@ -1286,7 +1418,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // `dims_of`'s statement override changes no other assertion in this file
     // and changes this one, which is the whole reason it is stated.
     assert_eq!(
-        workgroups, 35_458_690,
+        workgroups, 35_504_450,
         "the plans dispatch a different amount of work"
     );
     // The third dimension was 1 across every text until the paged decodes

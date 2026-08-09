@@ -1,3 +1,4 @@
+add_bias_bfloat16
 affine_encode_u4_bf16
 affine_encode_u4_f32
 affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_16

@@ -96,6 +96,22 @@ pub const fn build_kernels(quant_group: u32, quant_bits: u32, moe_mxfp4: bool) -
         fuse_residual_gemv: true,
         paged_multi_batch: true,
         qmm_multi_batch: true,
+        // TRUE, and it is a statement about this binary rather than about
+        // the Qwen-2 family. It was false for as long as the thing it named
+        // was missing: `norm/add_bias.metal` was written, but the row hands
+        // the bias its OUTPUT width and `lowering::dispatch`'s scalar layout
+        // had no arm for `Source::OutWidth` -- it fell through `_ => continue`
+        // and emitted no slot at all, so the kernel's `width` argument would
+        // have been whatever the encoder last left at that index.
+        //
+        // `derived` is that arm, and `every_scalar_source_the_table_names_is
+        // _one_this_binder_resolves` is why the next such source cannot go
+        // quiet the same way. With it the seven Qwen-2.5 rows this catalog
+        // serves on Metal state their q/k/v biases and launch them, which is
+        // the difference `driver-vulkan`'s numpy oracle measured: `[88204,
+        // 6100, 41777, 2930]` with the biases against `[5937, 1560, 16925,
+        // 43715]` without.
+        add_bias: true,
     }
 }
 

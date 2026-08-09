@@ -62,6 +62,14 @@ pub mod probe;
 #[cfg(feature = "contract")]
 pub mod weight_names;
 
+/// The tensor names a multimodal TOWER publishes, in launcher order.
+///
+/// The encoder half of what [`weight_names`] does for the decoder, and here
+/// for the same reason: a tower's tensors are the checkpoint's to name and a
+/// launcher's to consume, so no backend should be spelling them.
+#[cfg(feature = "contract")]
+pub mod tower_names;
+
 // ── General vocabulary: the chat aspect ──────────────────────────────
 
 /// Incremental decoding: bytes out of tokens, for a streaming turn.

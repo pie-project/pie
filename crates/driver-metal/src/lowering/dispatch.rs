@@ -356,8 +356,14 @@ pub fn plan_one<'a, S: Resolver>(
         op: launch.op,
         why,
     })?;
-    let args = reorder(sig, &bound.args, lowered, launch, resolver);
-    let (param_slots, params) = param_layout(sig, args.len(), lowered, launch, resolver);
+    let args = reorder(sig, &bound.args, lowered, launch, resolver).map_err(|why| {
+        Undispatchable::Unbound {
+            symbol: symbol.clone(),
+            op: launch.op,
+            why,
+        }
+    })?;
+    let (param_slots, params) = param_layout(sig, &args, lowered, launch, resolver);
     Ok(Dispatch {
         symbol: bound.kernel,
         params,
@@ -414,20 +420,46 @@ pub fn plan<'a, S: Resolver>(
 /// A row that states no operands is returned unchanged — bound positionally,
 /// which is what every row got before any of them stated anything.
 ///
-/// A [`Source`] the row leaves `Unbound`, or one naming an operand the
-/// statement does not have, contributes a **zero slot**: an operand that
-/// addresses nothing, which is the same honest answer `resolve_arg` gives a
-/// `scale.` marker. It is not silently skipped, because a skipped slot shifts
-/// every operand after it.
+/// A [`Source`] the row leaves `Unbound` contributes a **zero slot**: an
+/// operand that addresses nothing, which is the same honest answer
+/// `resolve_arg` gives a `scale.` marker. It is not silently skipped, because
+/// a skipped slot shifts every operand after it.
+///
+/// # Why a missing WEIGHT is not that
+///
+/// This paragraph used to cover a second case in the same breath — "or one
+/// naming an operand the statement does not have" — and the two are opposite
+/// claims. `Unbound` is the row saying *nothing goes here*, and a zero slot is
+/// what it asked for. `Weight(2)` against a statement holding two weights is
+/// the row saying *the third weight goes here* and being wrong; answering it
+/// with an address of zero hands the kernel a pointer it was told to read.
+///
+/// It is not hypothetical. `mxfp4_qmv_routed_bias` reads an additive bias per
+/// output row and its row named `Weight(3)` for it, which the only weight list
+/// that symbol can be given never reaches. The launch bound zero, the kernel
+/// added `bias_row[out_row + row]` off a null pointer to every expert logit,
+/// and nothing in the path said a word. So the reading here is now: a row
+/// naming a weight the statement does not have is [`Undispatchable`], by name
+/// and at plan time.
+///
+/// The input and output cases stay a zero slot deliberately. Those indices are
+/// positions in a statement's own argument list, which the trace builds and
+/// the row follows, and a row that over-reads them is caught by the arity
+/// checks in `kernels`. A weight index is a claim about a NAME LIST the text
+/// builds separately, which is exactly the seam that had no check.
+///
+/// # Errors
+///
+/// [`Undispatchable::Unbound`] carrying [`BindRefusal::UnstatedWeight`].
 fn reorder<S: Resolver>(
     sig: &'static KernelSig,
     bound: &[BoundArg],
     lowered: &Lowered,
     launch: &Launch,
     resolver: &mut S,
-) -> Vec<BoundArg> {
+) -> Result<Vec<BoundArg>, BindRefusal> {
     if sig.operands.is_empty() {
-        return bound.to_vec();
+        return Ok(bound.to_vec());
     }
     let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
     let widthed: Vec<usize> = args
@@ -485,39 +517,49 @@ fn reorder<S: Resolver>(
     let layer = launch.layers.start;
     sig.operands
         .iter()
-        .map(|operand| match operand.source {
-            kernels::Source::In(i) => pick(bound, ins.get(i as usize)),
-            kernels::Source::Out(i) => pick(bound, outs.get(i as usize)),
-            kernels::Source::Weight(i) => pick(bound, weights.get(i as usize)),
-            // The KV cache is STATE, not an operand: no traced value stands
-            // for it, so the pointer comes from the driver's own pool through
-            // the resolver rather than from the statement's args.
-            kernels::Source::KvKeys => resolver
-                .kv(layer, false)
-                .map_or(nothing, |slice| BoundArg { slice, width: 0 }),
-            kernels::Source::KvValues => resolver
-                .kv(layer, true)
-                .map_or(nothing, |slice| BoundArg { slice, width: 0 }),
-            // The fire's own tables. The row names which; this forwards the
-            // name and never reads what it means.
-            kernels::Source::TokenIds => fire(resolver, FireTable::TokenIds),
-            kernels::Source::Positions => fire(resolver, FireTable::Positions),
-            kernels::Source::RequestOfToken => fire(resolver, FireTable::RequestOfToken),
-            kernels::Source::KvPageIndices => fire(resolver, FireTable::KvPageIndices),
-            kernels::Source::KvPageIndptr => fire(resolver, FireTable::KvPageIndptr),
-            kernels::Source::KvWritePage => fire(resolver, FireTable::KvWritePage),
-            kernels::Source::KvWriteOffset => fire(resolver, FireTable::KvWriteOffset),
-            kernels::Source::RopeFrequencies => fire(resolver, FireTable::RopeFrequencies),
-            kernels::Source::SamplingIndices => fire(resolver, FireTable::SamplingIndices),
-            kernels::Source::AttentionMask => fire(resolver, FireTable::AttentionMask),
-            kernels::Source::AttentionMaskEnabled => {
-                fire(resolver, FireTable::AttentionMaskEnabled)
-            }
-            // A scalar does not come out of the operand list at all — it rides
-            // `Dispatch::params`, bound at the slot the row placed it — so its
-            // slot here addresses nothing and the encoder's binding is what
-            // the kernel reads.
-            _ => nothing,
+        .map(|operand| {
+            Ok(match operand.source {
+                kernels::Source::In(i) => pick(bound, ins.get(i as usize)),
+                kernels::Source::Out(i) => pick(bound, outs.get(i as usize)),
+                kernels::Source::Weight(i) => {
+                    let Some(at) = weights.get(i as usize) else {
+                        return Err(BindRefusal::UnstatedWeight {
+                            want: u32::from(i),
+                            held: weights.len(),
+                        });
+                    };
+                    pick(bound, Some(at))
+                }
+                // The KV cache is STATE, not an operand: no traced value stands
+                // for it, so the pointer comes from the driver's own pool through
+                // the resolver rather than from the statement's args.
+                kernels::Source::KvKeys => resolver
+                    .kv(layer, false)
+                    .map_or(nothing, |slice| BoundArg { slice, width: 0 }),
+                kernels::Source::KvValues => resolver
+                    .kv(layer, true)
+                    .map_or(nothing, |slice| BoundArg { slice, width: 0 }),
+                // The fire's own tables. The row names which; this forwards the
+                // name and never reads what it means.
+                kernels::Source::TokenIds => fire(resolver, FireTable::TokenIds),
+                kernels::Source::Positions => fire(resolver, FireTable::Positions),
+                kernels::Source::RequestOfToken => fire(resolver, FireTable::RequestOfToken),
+                kernels::Source::KvPageIndices => fire(resolver, FireTable::KvPageIndices),
+                kernels::Source::KvPageIndptr => fire(resolver, FireTable::KvPageIndptr),
+                kernels::Source::KvWritePage => fire(resolver, FireTable::KvWritePage),
+                kernels::Source::KvWriteOffset => fire(resolver, FireTable::KvWriteOffset),
+                kernels::Source::RopeFrequencies => fire(resolver, FireTable::RopeFrequencies),
+                kernels::Source::SamplingIndices => fire(resolver, FireTable::SamplingIndices),
+                kernels::Source::AttentionMask => fire(resolver, FireTable::AttentionMask),
+                kernels::Source::AttentionMaskEnabled => {
+                    fire(resolver, FireTable::AttentionMaskEnabled)
+                }
+                // A scalar does not come out of the operand list at all — it rides
+                // `Dispatch::params`, bound at the slot the row placed it — so its
+                // slot here addresses nothing and the encoder's binding is what
+                // the kernel reads.
+                _ => nothing,
+            })
         })
         .collect()
 }
@@ -534,11 +576,12 @@ fn reorder<S: Resolver>(
 /// than wherever the previous four-byte extent happened to end.
 fn param_layout<S: Resolver>(
     sig: &'static KernelSig,
-    operands: usize,
+    args: &[BoundArg],
     lowered: &Lowered,
     launch: &Launch,
     resolver: &mut S,
 ) -> (Vec<ParamSlot>, Vec<u32>) {
+    let operands = args.len();
     let mut params: Vec<u32> =
         lowered.params[launch.params.start as usize..launch.params.end as usize].to_vec();
     if sig.operands.is_empty() {
@@ -590,6 +633,22 @@ fn param_layout<S: Resolver>(
                 },
                 false,
             )
+        } else if let Some(width) = derived(sig, args, operand.source) {
+            // A width the STATEMENT already carries. `norm::add_bias` takes
+            // one and states nothing: a bias vector's length is the
+            // projection's width, so the row derives it rather than asking a
+            // text to repeat a number the trace holds.
+            //
+            // This arm did not exist, and the `_ => continue` below swallowed
+            // the source — no slot, so the kernel's `width` was whatever the
+            // encoder had left at that index. `LlamaLikeMetalFacts::add_bias`
+            // named the gap in those words and defaulted itself off, which is
+            // why the Qwen-2 family has been served on Metal with no q/k/v
+            // biases at all: `driver-vulkan`'s numpy oracle measured the two
+            // answers and the driver matched the one without them.
+            params.push(width);
+            let i = u8::try_from(params.len() - 1).unwrap_or(u8::MAX);
+            (Some(i), 4, false)
         } else {
             match operand.source {
                 kernels::Source::Param(i) | kernels::Source::ParamF32(i) => match operand.ty {
@@ -612,6 +671,34 @@ fn param_layout<S: Resolver>(
         at += bytes;
     }
     (out, params)
+}
+
+/// A scalar the row DERIVES from an operand this launch already bound.
+///
+/// The row names an operand by role — `OutWidth(0)` is "the row width of my
+/// first result" — and the answer is that operand's own stated width, in
+/// elements. Nothing here recomputes it: `reorder` has already placed every
+/// operand at the slot its row asked for, so this looks the operand up the
+/// same way the kernel will and reads the width off it.
+///
+/// `None` for a source that is not derived, and for one whose operand the row
+/// does not state — a row naming `OutWidth(1)` with one result is a row
+/// disagreeing with itself, and `every_scalar_source_the_table_names_is_one_
+/// this_binder_resolves` is what says so.
+fn derived(sig: &'static KernelSig, args: &[BoundArg], source: kernels::Source) -> Option<u32> {
+    let width = |want: kernels::Source| {
+        sig.operands
+            .iter()
+            .position(|o| o.source == want)
+            .and_then(|slot| args.get(slot))
+            .map(|a| a.width)
+            .filter(|w| *w > 0)
+    };
+    match source {
+        kernels::Source::OutWidth(i) => width(kernels::Source::Out(i)),
+        kernels::Source::InWidth(i) => width(kernels::Source::In(i)),
+        _ => None,
+    }
 }
 
 /// One of the fire's tables, or a region addressing nothing.
@@ -701,6 +788,102 @@ pub fn table_width(dispatches: &[Dispatch<'_>]) -> usize {
         .max()
         .unwrap_or(1)
         .max(1)
+}
+
+/// Every source any row of this table names is one some half of this binder
+/// resolves.
+///
+/// # Why this is the instrument and not a style check
+///
+/// Both halves of the binder end in a catch-all that is SILENT. `reorder`'s
+/// `_ => nothing` binds address 0, length 0; `param_layout`'s `_ => continue`
+/// emits no slot at all, so the kernel reads that argument at an index nobody
+/// wrote. Neither refuses. The row is right, the kernel is right, the plan
+/// binds, the fire launches, and one operand is garbage.
+///
+/// `Source::OutWidth` sat in exactly that hole. `norm::add_bias` was written
+/// for all three backends so that a Qwen-2 would stop being served without its
+/// q/k/v projection biases, and on Metal the row stayed unreachable: the
+/// capability flag `LlamaLikeMetalFacts::add_bias` defaulted itself off and
+/// explained, in prose, that this binder had no arm for the source. A comment
+/// is not a check. This is.
+///
+/// The claim is over the TABLE and not over the texts, deliberately — a row
+/// nothing launches yet is precisely the row whose source goes unnoticed until
+/// the day something launches it.
+#[cfg(test)]
+#[test]
+fn every_source_the_table_names_is_one_this_binder_resolves() {
+    use kernels::Source as S;
+    // Split the way the binder is split, because the two halves fail
+    // differently and a source has to be claimed by the right one: an operand
+    // `reorder` misses is a null pointer, and a scalar `param_layout` misses
+    // is an unwritten index.
+    let by_reorder = |s: &S| {
+        matches!(
+            s,
+            // The one source whose correct answer IS a null: a row saying
+            // `Unbound` has said, in the table, that this slot addresses
+            // nothing -- `mxfp4_qmv_routed_bias`'s `biases` is the ABI's
+            // zero-point plane that an MXFP4 bank does not have. It is
+            // listed here rather than falling through so that "stated as
+            // empty" and "nobody thought about it" stop sharing a code path.
+            S::Unbound
+                | S::In(_)
+                | S::Out(_)
+                | S::Weight(_)
+                | S::KvKeys
+                | S::KvValues
+                | S::TokenIds
+                | S::Positions
+                | S::RequestOfToken
+                | S::KvPageIndices
+                | S::KvPageIndptr
+                | S::KvWritePage
+                | S::KvWriteOffset
+                | S::RopeFrequencies
+                | S::SamplingIndices
+                | S::AttentionMask
+                | S::AttentionMaskEnabled
+        )
+    };
+    let by_params = |s: &S| {
+        matches!(
+            s,
+            S::Param(_)
+                | S::ParamF32(_)
+                | S::KvHeadStride
+                | S::KvSeqStride
+                | S::KvPageSize
+                | S::RequestCount
+                // The `derived` arm. Asked by discriminant rather than by
+                // calling it, because `derived` answers `None` both for "no
+                // arm" and for "this plan has no such operand", and only the
+                // first is a hole.
+                | S::OutWidth(_)
+                | S::InWidth(_)
+        )
+    };
+    let mut orphans = Vec::new();
+    for sig in table() {
+        for operand in sig.operands {
+            // A packed field is appended whole by the layout's first branch,
+            // whatever it names.
+            if operand.ty == kernels::Ty::InPacked
+                || by_reorder(&operand.source)
+                || by_params(&operand.source)
+            {
+                continue;
+            }
+            orphans.push((sig.name, operand.name, format!("{:?}", operand.source)));
+        }
+    }
+    assert!(
+        orphans.is_empty(),
+        "these slots name a source this binder drops on the floor -- each is \
+         either a null pointer or an argument read at an index nobody wrote, \
+         and neither refuses: {orphans:#?}"
+    );
 }
 
 #[cfg(test)]

@@ -135,6 +135,13 @@ const SHARED: &[&str] = &[
     "shared/moe.rs",
     "shared/policy.rs",
     "shared/probe.rs",
+    // `tower_names.rs` is `weight_names.rs`'s encoder half and lands on the
+    // opposite side of this list from it, which is worth a sentence because
+    // the two are siblings. `weight_names` names families on purpose — each
+    // family's walk recognises itself by a tensor only it ships. A TOWER's
+    // slot list does not: it is an ordered `const void**` layout, the order
+    // IS the ABI, and no entry in it asks which family is being staged.
+    "shared/tower_names.rs",
 ];
 /// Files that name families ON PURPOSE, with the reason each does.
 const NOT_SHARED: &[(&str, &str)] = &[
@@ -177,7 +184,10 @@ const NOT_SHARED: &[(&str, &str)] = &[
     // is what makes `shared/` the legitimate home rather than a sibling edge.
     (
         "shared/chatml.rs",
-        "ChatML, which qwen3 wrote first and five generations parameterize",
+        "ChatML, which qwen3 wrote first and qwen3, qwen3.5, nemotron-h \
+         and glm-5 parameterize. NAMED rather than counted: the sentence \
+         said `five generations` and there are four, and a wrong count \
+         is invisible in a way a wrong name is not",
     ),
     (
         "shared/gemma_chat.rs",

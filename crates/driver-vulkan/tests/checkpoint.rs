@@ -76,7 +76,7 @@
 //! One checkpoint cannot tell a CONVERSION from a table that happens to spell
 //! one model's names, so a second was added: `mlx-community/Qwen2.5-1.5B-`
 //! `Instruct-4bit`, a different generation with a different role set (no
-//! qk-norm), a different width, and 648 bound weights against qwen3's 704.
+//! qk-norm), a different width, and 732 bound weights against qwen3's 704.
 //! `PIE_CHECKPOINT` takes a colon-separated list, each snapshot names its own
 //! fixture by its embed width, and running the same two comparisons over both
 //! leaves nothing over on either. Feeding the SAME snapshot twice is refused,
@@ -91,26 +91,32 @@
 //! returns zero, silently -- so the guess that was safe for one model reads
 //! past the end of 84 buffers for the other, and says nothing.
 //!
-//! # A finding about the Metal text, not about this driver
+//! # A finding about the Metal text, and its repair
 //!
 //! Qwen2.5 has attention biases: `LlamaLikeFacts::qwen2_5_1_5b` states
 //! `qkv_bias: true`, the semantic text and the CUDA text both add
 //! `{q,k,v}_proj.bias` to the raw projections, and the checkpoint ships all 84
-//! of them. **The Metal text ignores the fact entirely** -- measured: the
-//! lowered qwen2.5 decode plan binds 648 weights and not one of them is a
-//! bias, and its kernel set is the same nine `affine_qmv`/`rms`/`rope`/`sdpa`
+//! of them. **The Metal text ignored the fact entirely** -- measured here: the
+//! lowered qwen2.5 decode plan bound 648 weights and not one of them was a
+//! bias, and its kernel set was the same nine `affine_qmv`/`rms`/`rope`/`sdpa`
 //! points a qwen3 decode uses.
 //!
 //! "Slightly wrong, silently" turned out to be generously put.
-//! `tests/device.rs` serves this checkpoint on the card and it does not
+//! `tests/device.rs` served this checkpoint on the card and it did not
 //! continue a pattern it was shown; a numpy forward of the same weights
-//! continues the pattern WITH the biases and reproduces the card's wrong
+//! continues the pattern WITH the biases and reproduced the card's wrong
 //! answer exactly without them.
 //!
-//! That is `crates/model`'s text and `driver-metal`'s contract as much as this
-//! driver's, and it is recorded rather than worked around: this crate cannot
-//! bind a weight no plan asks for, and inventing the names here would mean a
-//! driver deciding what a model computes.
+//! That was `crates/model`'s text and `driver-metal`'s contract as much as
+//! this driver's, and it was recorded rather than worked around: this crate
+//! cannot bind a weight no plan asks for, and inventing the names here would
+//! mean a driver deciding what a model computes.
+//!
+//! The text now states them, which is why the number above is 732 and not
+//! 648: 84 more weights, three a layer over 28 layers, each one an `AddBias`
+//! this crate binds through the same path as everything else. The count is
+//! kept as an equality for the same reason it was worth measuring -- a text
+//! that stops stating them again moves it back.
 //!
 //! # Why it skips rather than fails without a checkpoint
 //!
@@ -290,8 +296,8 @@ const FIXTURES: &[Fixture] = &[
         id: "qwen2.5-1.5b",
         facts: model::shared::llama_like::forward::facts::LlamaLikeFacts::qwen2_5_1_5b,
         embed: &[151_936, 192],
-        bound: 648,
-        total: 868_432_896,
+        bound: 732,
+        total: 868_547_584,
         embed_bytes: 116_686_848,
         over: 87,
     },

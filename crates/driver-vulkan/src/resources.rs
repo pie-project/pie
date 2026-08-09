@@ -516,6 +516,46 @@ impl Pool {
         })
     }
 
+    /// The largest page count this pool could ever be grown to.
+    ///
+    /// # What it is for, and the only thing it is for
+    ///
+    /// Telling a demand that can never be met apart from one that cannot be
+    /// met now. A scheduler that waits on the first waits forever; one that
+    /// drops the second drops work it had correctly admitted.
+    /// [`crate::shell::Shell::launch`] is the one caller, and it answers
+    /// `Impossible` above this number and grows below it.
+    ///
+    /// # Why the halving
+    ///
+    /// [`Self::resize`] takes every new buffer BEFORE it frees an old one --
+    /// deliberately, so a failed growth leaves the pool intact -- so the peak
+    /// a growth needs is both sizes at once. A ceiling that ignored that
+    /// would admit a frame the resize then refuses, with nothing changed and
+    /// the scheduler none the wiser about why.
+    ///
+    /// # What it is not
+    ///
+    /// A promise. The heap is shared with this model's weights, with every
+    /// other process on the device, and with whatever the allocator has
+    /// fragmented, so a growth under this number can still fail. Too generous
+    /// is the safe direction: it turns a permanent refusal into a retried one
+    /// rather than the reverse.
+    #[must_use]
+    pub fn ceiling(&self, device: &Device) -> u32 {
+        // Both KV halves, every layer.
+        let per_page = (self.shape.page_size as u64)
+            .saturating_mul(self.shape.row())
+            .saturating_mul(self.shape.bytes as u64)
+            .saturating_mul(self.shape.layers as u64)
+            .saturating_mul(2);
+        if per_page == 0 {
+            return u32::MAX;
+        }
+        let held = per_page.saturating_mul(u64::from(self.shape.pages));
+        u32::try_from(device.budget().saturating_add(held) / per_page / 2).unwrap_or(u32::MAX)
+    }
+
     /// Grow or shrink the cache to `pages`, keeping what the pages that
     /// survive hold.
     ///
@@ -568,6 +608,26 @@ impl Pool {
         )
         .unwrap_or(usize::MAX);
         let bytes = usize::try_from(grown.layer_bytes()).unwrap_or(usize::MAX);
+        // ASKED FOR, before it is taken. The staging buffer below is a plain
+        // `vec![0u8; bytes]`, and a `Vec` that cannot be allocated ABORTS the
+        // process -- it does not return. Found by mutating `Shell::launch`'s
+        // admission check to admit everything: the frame asked for two billion
+        // pages, this line asked the allocator for seventy terabytes, and the
+        // test binary died with SIGABRT instead of reporting a refusal.
+        //
+        // The admission check is still the right place to answer a scheduler,
+        // and it is still there. This is the second line of defence, because a
+        // pool that can be killed by an arithmetic slip in a caller is not one
+        // a server can be built on.
+        {
+            let mut probe: Vec<u8> = Vec::new();
+            probe.try_reserve_exact(bytes).map_err(|_| {
+                Failed::Vulkan(format!(
+                    "a cache of {pages} pages wants {bytes} bytes a layer, which \
+                     this host cannot stage"
+                ))
+            })?;
+        }
 
         let mut fresh = Vec::with_capacity(self.keys.len() + self.values.len());
         for old in self.keys.iter().chain(&self.values) {

@@ -702,9 +702,20 @@ pub fn audio_delimiters(arch: &str) -> (&'static str, &'static str) {
 
 /// Audio soft tokens for `n_frames` log-mel frames: two stride-2 Conv2d
 /// (k3, s2, p1) along the time axis. `floor((n + 2 - 3) / 2) + 1` applied
-/// twice. Mirrors the driver's `gemma4_audio_subsampled_len` exactly.
+/// twice. Mirrors the driver's audio subsampling exactly.
+///
+/// Total at zero. `(n + 2 - 3) / 2 + 1` is the integer conv-output formula
+/// written the way it reads in the reference, and on `u32` it underflows for
+/// exactly one input: `n = 0`. That input is reachable -- [`audio::gemma_logmel`]
+/// returns zero frames for any clip shorter than one analysis window, about
+/// 20 ms at 16 kHz -- so a debug build panics and a release build wraps to
+/// `u32::MAX` and asks the host to reserve two billion soft tokens. The engine's
+/// caller happens to reject zero frames on the line above, but that guard is in
+/// another crate and this function is `pub`. In real arithmetic the answer is
+/// `floor((0 + 2 - 3) / 2) + 1 = 0`, so answering 0 is not a special case; it is
+/// the formula, evaluated where `u32` cannot follow.
 pub fn gemma_audio_token_count(n_frames: u32) -> u32 {
-    let conv = |n: u32| (n + 2 - 3) / 2 + 1;
+    let conv = |n: u32| if n == 0 { 0 } else { (n + 2 - 3) / 2 + 1 };
     conv(conv(n_frames))
 }
 
@@ -1171,7 +1182,6 @@ mod tests {
     /// is asserted to be a label some row hands out, so a generation
     /// that renames itself fails here rather than quietly leaving the
     /// table.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_text_only_family_has_no_vision_front_end() {
         let advertised = crate::catalog::arches();
@@ -1196,7 +1206,6 @@ mod tests {
     ///
     /// The other half of the same guard: making the match exact is only
     /// correct if it still admits the labels it is supposed to admit.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_two_multimodal_families_still_reach_their_front_ends() {
         let advertised = crate::catalog::arches();
@@ -2113,5 +2122,298 @@ mod tests {
             mel.iter().all(|&v| (v - floor).abs() < 1e-6),
             "silence should be ln(mel_floor) in every band"
         );
+    }
+
+    // ── Regions the coverage sweep found with no caller ────────────────────
+
+    /// `smart_resize` scaling UP, and the asymmetry that makes it correct.
+    ///
+    /// The two rescale branches are not mirror images and a tidy-up that made
+    /// them symmetric would be wrong in both directions:
+    ///
+    /// * The `max_pixels` branch FLOORS and then clamps `.max(factor)`.
+    ///   Flooring can land on zero for a thin strip, and a zero extent is not
+    ///   an image, so the clamp is load-bearing.
+    /// * The `min_pixels` branch CEILS and does not clamp. Ceiling a positive
+    ///   number by a multiple of `factor` cannot produce less than `factor`,
+    ///   so a clamp there would be dead code -- and flooring instead would
+    ///   land BELOW `min_pixels`, which is the one thing this branch exists
+    ///   to prevent.
+    ///
+    /// Not asserted, because it cannot be: the `.max(factor)` on the INITIAL
+    /// rounding is unobservable for any config with a nonzero `min_pixels`. A
+    /// side that rounds to zero makes the area zero, zero is below the floor,
+    /// and the rescale branch then overwrites both sides. It is redundant with
+    /// the shipped bounds and load-bearing only if someone sets
+    /// `min_pixels: 0`.
+    ///
+    /// Stated as areas rather than sides, because the postcondition is about
+    /// area and the sides are just how it is reached.
+    #[test]
+    fn a_thumbnail_is_scaled_up_to_the_minimum_area_and_a_mural_down_to_the_maximum() {
+        let cfg = QwenVisionConfig::default();
+        let factor = cfg.factor();
+
+        // Far below min_pixels, and deliberately NOT square: 8x8 scales up to
+        // exactly 256 on both sides, a whole multiple of the factor, where
+        // flooring and ceiling agree and the choice between them is invisible.
+        // 10x8 does not divide evenly, and flooring there lands under the
+        // floor this branch exists to enforce.
+        let (h, w) = cfg.smart_resize(10, 8);
+        assert!(
+            h * w >= cfg.min_pixels,
+            "scaled up to {h}x{w} = {} px, under the {} px floor",
+            h * w,
+            cfg.min_pixels
+        );
+        assert_eq!(
+            (h % factor, w % factor),
+            (0, 0),
+            "{h}x{w} is not a whole number of tiles"
+        );
+
+        // Over max_pixels, and not evenly divisible by the rescale, so the
+        // difference between flooring and ceiling is visible: ceiling both
+        // sides here lands back OVER the ceiling this branch exists to
+        // enforce.
+        let (h, w) = cfg.smart_resize(7000, 9000);
+        assert!(
+            h * w <= cfg.max_pixels,
+            "scaled down to {h}x{w} = {} px, over the {} px ceiling",
+            h * w,
+            cfg.max_pixels
+        );
+        assert_eq!(
+            (h % factor, w % factor),
+            (0, 0),
+            "{h}x{w} is not a whole number of tiles"
+        );
+
+        // An extreme aspect ratio is the case the `.max(factor)` clamp exists
+        // for: dividing the short side by beta takes it below one tile, and
+        // flooring a sub-tile side gives ZERO -- an extent no image has. Here
+        // the clamp deliberately WINS over the area bound, because a zero side
+        // is not a smaller image, it is not an image.
+        let (h, w) = cfg.smart_resize(1_000_000, 40);
+        assert!(
+            w >= factor && h >= factor,
+            "{h}x{w}: a side collapsed below one {factor}px tile"
+        );
+        assert_eq!(
+            (h % factor, w % factor),
+            (0, 0),
+            "{h}x{w} is not a whole number of tiles"
+        );
+    }
+
+    /// A GIF frame's timestamp is when it STARTS, not when it ends.
+    ///
+    /// The accumulator is read into the output before the frame's own delay is
+    /// added to it, so frame 0 is at t=0 and frame k carries the sum of the
+    /// delays of frames 0..k-1. Moving the `+=` above the `push` -- which
+    /// reads like an ordinary tidy-up, since the two statements otherwise
+    /// commute -- shifts every timestamp forward by one frame and makes the
+    /// first frame appear at a time the clip has not reached yet. A caller
+    /// seeking to t=0 would get frame 1.
+    ///
+    /// Delays are unequal on purpose: with a uniform delay a shifted sequence
+    /// and a correct one differ only in the last element, so the mistake would
+    /// still be caught but for the wrong reason.
+    #[test]
+    fn gif_frame_timestamps_are_start_times_and_accumulate_prior_delays() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, RgbaImage};
+
+        let delays_ms = [100u32, 200, 50];
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut buf);
+            enc.set_repeat(Repeat::Infinite).expect("set repeat");
+            for (i, ms) in delays_ms.iter().enumerate() {
+                let px = 40 + i as u8 * 40;
+                let img = RgbaImage::from_pixel(4, 4, image::Rgba([px, px, px, 255]));
+                enc.encode_frame(Frame::from_parts(
+                    img,
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(*ms, 1),
+                ))
+                .expect("encode frame");
+            }
+        }
+
+        let frames = decode_gif_frames(&buf).expect("decode the gif just encoded");
+        assert_eq!(frames.len(), delays_ms.len(), "lost or gained a frame");
+
+        // Start times: 0, then 0.1, then 0.1+0.2. NOT 0.1, 0.3, 0.35.
+        let expected = [0.0f32, 0.100, 0.300];
+        for (i, ((_, t), want)) in frames.iter().zip(expected).enumerate() {
+            assert!(
+                (t - want).abs() < 0.02,
+                "frame {i} starts at {t}s, expected {want}s (a one-frame shift means the \
+                 delay is being added before the timestamp is recorded)"
+            );
+        }
+        // Every frame decoded to the size it was written at.
+        for (img, _) in &frames {
+            assert_eq!((img.width(), img.height()), (4, 4));
+        }
+    }
+
+    /// Undecodable bytes are refused rather than yielding an empty timeline.
+    #[test]
+    fn bytes_that_are_not_a_gif_are_refused() {
+        let e = decode_gif_frames(b"not a gif at all").expect_err("accepted non-gif bytes");
+        assert!(e.contains("gif"), "unhelpful refusal: {e}");
+    }
+
+    /// The delimiter tables are an ABI: the host encodes these strings with
+    /// the model's own tokenizer and surfaces them as `image.prefix-tokens` /
+    /// `audio.prefix-tokens`, so a wrong string becomes ordinary text in the
+    /// prompt rather than an error.
+    ///
+    /// Gemma-4's empty pair is the entry worth pinning. It looks like an
+    /// omission next to Qwen's, and the obvious "fix" is to fill it in with
+    /// `<start_of_image>` -- which the chat template ALREADY emits, so filling
+    /// it in emits the marker twice and desynchronises the image rows from the
+    /// placeholder span. Empty is the verified answer, not a gap.
+    #[test]
+    fn the_delimiter_tables_answer_every_arch_and_gemma_4s_answer_is_deliberately_empty() {
+        assert_eq!(
+            vision_delimiters(VisionArch::Qwen36),
+            ("<|vision_start|>", "<|vision_end|>")
+        );
+        assert_eq!(vision_delimiters(VisionArch::Gemma4), ("", ""));
+
+        // Audio keys off the arch NAME, and answers only where a front-end
+        // exists -- the same predicate the host checks before it calls.
+        for arch in ["gemma4", "gemma4_text"] {
+            let d = audio_delimiters(arch);
+            assert_eq!(
+                audio_arch_supported(arch),
+                d != ("", ""),
+                "arch {arch:?} disagrees with audio_arch_supported: got {d:?}"
+            );
+        }
+        assert_eq!(audio_delimiters("qwen3_vl"), ("", ""));
+        assert_eq!(audio_delimiters("no-such-arch"), ("", ""));
+    }
+
+    /// A clip too short to fill one analysis window yields zero frames, and
+    /// the soft-token count of zero frames is zero.
+    ///
+    /// The framing needs `frame + 1` samples after a `frame / 2` semicausal
+    /// pad, so anything under ~20 ms at 16 kHz produces no frames at all. That
+    /// number then reaches `gemma_audio_token_count`, whose two convolutions
+    /// compute `(n + 2 - 3) / 2 + 1` -- an expression that on `u32` is fine
+    /// for every n except the one this path produces.
+    #[test]
+    fn a_clip_shorter_than_one_window_yields_no_frames_and_no_soft_tokens() {
+        let (mel, n) = audio::gemma_logmel(&[0.0f32; 16]);
+        assert_eq!((mel.len(), n), (0, 0), "16 samples is not a full window");
+
+        assert_eq!(
+            gemma_audio_token_count(0),
+            0,
+            "zero frames must cost zero soft tokens"
+        );
+        // The neighbours are unmoved. n=3 is the useful one: a single conv
+        // gives 2 and the required pair gives 1, so it catches a lost stage.
+        assert_eq!(gemma_audio_token_count(1), 1);
+        assert_eq!(gemma_audio_token_count(2), 1);
+        assert_eq!(gemma_audio_token_count(3), 1, "only one conv stage ran");
+        assert_eq!(gemma_audio_token_count(5), 2);
+    }
+
+    /// The two malformed-container refusals, and the order they are asked in.
+    ///
+    /// `data` is checked before `channels`, so a file carrying neither chunk
+    /// is refused for the missing data rather than the missing format. The
+    /// `fmt`-only and `data`-only cases therefore produce DIFFERENT messages,
+    /// and swapping the two checks silently swaps them.
+    #[test]
+    fn a_wav_missing_either_chunk_is_refused_by_the_chunk_it_is_missing() {
+        let riff = |chunks: &[u8]| {
+            let mut w = Vec::new();
+            w.extend_from_slice(b"RIFF");
+            w.extend_from_slice(&(4 + chunks.len() as u32).to_le_bytes());
+            w.extend_from_slice(b"WAVE");
+            w.extend_from_slice(chunks);
+            w
+        };
+
+        // A data chunk with no fmt chunk: decodes as far as the sample loop
+        // and then has no idea how wide a sample is.
+        let mut data_only = Vec::new();
+        data_only.extend_from_slice(b"data");
+        data_only.extend_from_slice(&4u32.to_le_bytes());
+        data_only.extend_from_slice(&[0u8; 4]);
+        let e = audio::decode_wav(&riff(&data_only)).expect_err("accepted a WAV with no fmt");
+        assert!(
+            e.contains("fmt"),
+            "wrong refusal for a missing fmt chunk: {e}"
+        );
+
+        // A fmt chunk with no data chunk.
+        let full = wav(1, 16, 1, 16_000, &[0u8; 4]);
+        let cut = full.len() - 12; // drop the whole `data` chunk incl. header
+        let e = audio::decode_wav(&full[..cut]).expect_err("accepted a WAV with no data");
+        assert!(
+            e.contains("data"),
+            "wrong refusal for a missing data chunk: {e}"
+        );
+
+        // Not a RIFF/WAVE container at all.
+        assert!(audio::decode_wav(b"ID3\x04\x00\x00\x00").is_err());
+
+        // Neither chunk: the two checks are in a fixed order and the data one
+        // is asked first, so this names the data chunk. Swapping the checks is
+        // invisible on either single-chunk case above and visible only here.
+        let e = audio::decode_wav(&riff(&[])).expect_err("accepted an empty container");
+        assert!(
+            e.contains("data"),
+            "an empty container should be refused for its missing data chunk first: {e}"
+        );
+    }
+
+    /// The whole audio pipeline end to end, on a clip that needs resampling.
+    ///
+    /// `process_wav_bytes` is the only entry point the host calls, and it is
+    /// the composition of three steps that are each tested alone. What is only
+    /// visible here is that the rate travels from the container's `fmt` chunk
+    /// into the resampler: 8 kHz in must become the SAME number of frames as
+    /// the equivalent 16 kHz clip of the same DURATION, not of the same sample
+    /// count. Dropping the resample step, or reading the rate off the wrong
+    /// offset, halves or doubles the frame count while everything still
+    /// decodes without complaint.
+    #[test]
+    fn the_wav_pipeline_carries_the_container_rate_into_the_resampler() {
+        // 0.5 s at 8 kHz = 4000 samples.
+        let pcm8k: Vec<u8> = (0..4000)
+            .flat_map(|i| ((i as i16).wrapping_mul(37)).to_le_bytes())
+            .collect();
+        let (mel, frames_8k) =
+            audio::process_wav_bytes(&wav(1, 16, 1, 8_000, &pcm8k)).expect("8 kHz clip");
+        assert_eq!(mel.len(), frames_8k * 128, "mel is not n_frames x n_mels");
+
+        // The same half second already at 16 kHz = 8000 samples.
+        let pcm16k: Vec<u8> = (0..8000)
+            .flat_map(|i| ((i as i16).wrapping_mul(37)).to_le_bytes())
+            .collect();
+        let (_, frames_16k) =
+            audio::process_wav_bytes(&wav(1, 16, 1, 16_000, &pcm16k)).expect("16 kHz clip");
+
+        assert_eq!(
+            frames_8k, frames_16k,
+            "the same half second gave {frames_8k} frames at 8 kHz and {frames_16k} at 16 kHz \
+             -- the container's rate is not reaching the resampler"
+        );
+        assert!(
+            frames_8k > 40,
+            "half a second should be ~50 frames, got {frames_8k}"
+        );
+
+        // A malformed container fails the pipeline rather than the front-end.
+        assert!(audio::process_wav_bytes(b"RIFF").is_err());
     }
 }

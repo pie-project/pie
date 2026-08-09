@@ -20,10 +20,7 @@
 
 use std::sync::Arc;
 
-use ::driver_api::{
-    PIE_MEMORY_DOMAIN_CUDA_DEVICE, PIE_MEMORY_DOMAIN_HOST_PINNED, PieKvMoveCell, PiePoolRange,
-    PieStateCopyRange,
-};
+use ::driver_api::{PIE_MEMORY_DOMAIN_HOST_PINNED, PieKvMoveCell, PiePoolRange, PieStateCopyRange};
 use anyhow::Result;
 
 use crate::driver::{
@@ -249,7 +246,7 @@ pub(crate) async fn copy_d2h(
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
         .copy_kv(KvCopyPlan {
-            src_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+            src_domain: super::device_domain(driver_idx),
             src_device_ordinal: 0,
             dst_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
             dst_device_ordinal: 0,
@@ -266,7 +263,7 @@ pub(crate) fn copy_d2h_tracked(
     cpu_pages: &[u32],
 ) -> Result<super::ControlCompletion> {
     scheduler_handle(driver_idx)?.copy_kv_tracked(KvCopyPlan {
-        src_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_domain: super::device_domain(driver_idx),
         src_device_ordinal: 0,
         dst_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
         dst_device_ordinal: 0,
@@ -285,7 +282,7 @@ pub(crate) async fn copy_h2d(
         .copy_kv(KvCopyPlan {
             src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
             src_device_ordinal: 0,
-            dst_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+            dst_domain: super::device_domain(driver_idx),
             dst_device_ordinal: 0,
             src_page_ids: cpu_pages.to_vec(),
             dst_page_ids: gpu_phys_ids.to_vec(),
@@ -302,7 +299,7 @@ pub(crate) fn copy_h2d_tracked(
     scheduler_handle(driver_idx)?.copy_kv_tracked(KvCopyPlan {
         src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
         src_device_ordinal: 0,
-        dst_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: super::device_domain(driver_idx),
         dst_device_ordinal: 0,
         src_page_ids: cpu_pages.to_vec(),
         dst_page_ids: gpu_phys_ids.to_vec(),
@@ -317,9 +314,9 @@ pub(crate) async fn copy_d2d(
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
         .copy_kv(KvCopyPlan {
-            src_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+            src_domain: super::device_domain(driver_idx),
             src_device_ordinal: 0,
-            dst_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+            dst_domain: super::device_domain(driver_idx),
             dst_device_ordinal: 0,
             src_page_ids: src_phys_ids.to_vec(),
             dst_page_ids: dst_phys_ids.to_vec(),
@@ -352,9 +349,9 @@ pub(crate) async fn copy_kv_cells(
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
         .copy_kv(KvCopyPlan {
-            src_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+            src_domain: super::device_domain(driver_idx),
             src_device_ordinal: 0,
-            dst_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+            dst_domain: super::device_domain(driver_idx),
             dst_device_ordinal: 0,
             src_page_ids: Vec::new(),
             dst_page_ids: Vec::new(),

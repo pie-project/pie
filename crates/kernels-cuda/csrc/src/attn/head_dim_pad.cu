@@ -1,47 +1,21 @@
+// The host launchers, and nothing else. Both `__global__`s live in
+// `attn/head_dim_pad.cuh` -- ONE definition, read by nvcc here and by NVRTC
+// from the same text at run time.
+//
+// Neither has a row: the grid is per-head and `LaunchRule::PerHead` is not
+// evaluated by this backend yet. `attn/head_dim_pad.cuh` says why, and why
+// approximating it with a ported rule was refused.
+#include "attn/head_dim_pad.cuh"
 #include "attn/head_dim_pad.hpp"
 
-#include <cuda_bf16.h>
 
 namespace pie_cuda_driver::kernels::attn {
 
 namespace {
 
-constexpr int BLOCK = 128;
+using bf16 = ::pie_cuda_driver::kernels::device::bf16;
 
-__global__ void pad_head_dim_bf16_kernel(
-    const __nv_bfloat16* __restrict__ packed,
-    __nv_bfloat16*       __restrict__ padded,
-    int num_heads, int head_dim, int head_dim_padded)
-{
-    // Each block handles one (token, head). Threads stride over the
-    // padded extent so every thread executes a single bf16 store
-    // (either a copy from `packed` or a zero) — no divergence.
-    const int n = blockIdx.y;
-    const int h = blockIdx.x;
-    const __nv_bfloat16* in =
-        packed + (static_cast<long long>(n) * num_heads + h) * head_dim;
-    __nv_bfloat16* out =
-        padded + (static_cast<long long>(n) * num_heads + h) * head_dim_padded;
-    for (int d = threadIdx.x; d < head_dim_padded; d += BLOCK) {
-        out[d] = (d < head_dim) ? in[d] : __float2bfloat16(0.f);
-    }
-}
-
-__global__ void strip_head_dim_bf16_kernel(
-    const __nv_bfloat16* __restrict__ padded,
-    __nv_bfloat16*       __restrict__ packed,
-    int num_heads, int head_dim, int head_dim_padded)
-{
-    const int n = blockIdx.y;
-    const int h = blockIdx.x;
-    const __nv_bfloat16* in =
-        padded + (static_cast<long long>(n) * num_heads + h) * head_dim_padded;
-    __nv_bfloat16* out =
-        packed + (static_cast<long long>(n) * num_heads + h) * head_dim;
-    for (int d = threadIdx.x; d < head_dim; d += BLOCK) {
-        out[d] = in[d];
-    }
-}
+constexpr int BLOCK = device::kPadBlock;
 
 }  // namespace
 
@@ -53,9 +27,9 @@ void pad_head_dim_bf16(
     if (num_tokens <= 0 || num_heads <= 0) return;
     dim3 grid(num_heads, num_tokens);
     dim3 block(BLOCK);
-    pad_head_dim_bf16_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(packed),
-        static_cast<__nv_bfloat16*>(padded),
+    device::pad_head_dim<bf16><<<grid, block, 0, stream>>>(
+        static_cast<const bf16*>(packed),
+        static_cast<bf16*>(padded),
         num_heads, head_dim, head_dim_padded);
 }
 
@@ -67,9 +41,9 @@ void strip_head_dim_bf16(
     if (num_tokens <= 0 || num_heads <= 0) return;
     dim3 grid(num_heads, num_tokens);
     dim3 block(BLOCK);
-    strip_head_dim_bf16_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(padded),
-        static_cast<__nv_bfloat16*>(packed),
+    device::strip_head_dim<bf16><<<grid, block, 0, stream>>>(
+        static_cast<const bf16*>(padded),
+        static_cast<bf16*>(packed),
         num_heads, head_dim, head_dim_padded);
 }
 

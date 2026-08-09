@@ -1135,10 +1135,12 @@ impl Builder<'_> {
         self.program.buffers.push(BufferDecl {
             id: buffer,
             tensor: declared.then_some(decl.id),
+            ty: crate::contract::TensorType::new(decl.shape.clone(), decl.encoding.clone()),
             bytes,
             alignment: decl.alignment,
             temporary,
             persistent_offset: None,
+            scratch_offset: None,
         });
         if declared {
             self.declare(decl.clone());
@@ -1158,10 +1160,12 @@ impl Builder<'_> {
         self.program.buffers.push(BufferDecl {
             id: buffer,
             tensor: declared.then_some(decl.id),
+            ty: crate::contract::TensorType::new(decl.shape.clone(), decl.encoding.clone()),
             bytes: 0,
             alignment: decl.alignment,
             temporary: false,
             persistent_offset: None,
+            scratch_offset: None,
         });
         if declared {
             self.declare(decl.clone());
@@ -1176,6 +1180,27 @@ impl Builder<'_> {
     /// [`Builder::promote_buffer`] cannot give it: the type, so a kernel can
     /// read the buffer, but not the persistence, because nothing binds it.
     fn attach_type(&mut self, buffer: BufferId, decl: &TensorDecl) -> Result<()> {
+        self.claim(buffer, decl)?;
+        self.declare(decl.clone());
+        Ok(())
+    }
+
+    fn promote_buffer(&mut self, buffer: BufferId, decl: &TensorDecl) -> Result<()> {
+        self.claim(buffer, decl)?.temporary = false;
+        self.declare(decl.clone());
+        Ok(())
+    }
+
+    /// Record that `buffer` IS `decl`, and restate its type from the
+    /// declaration.
+    ///
+    /// The buffer already carries a type — every allocation is made from a
+    /// [`TensorDecl`] — so this is not filling a hole; it is the naming
+    /// authority having the last word, and the byte check is what keeps that
+    /// from being a rename of bytes that are a different shape.
+    fn claim(&mut self, buffer: BufferId, decl: &TensorDecl) -> Result<&mut BufferDecl> {
+        let bytes = encoding_nbytes(&decl.shape, &decl.encoding)
+            .or_overflow(format!("'{}' byte size", decl.name))?;
         let existing = self
             .program
             .buffers
@@ -1190,30 +1215,16 @@ impl Builder<'_> {
                 buffer.0, existing_id.0, decl.id.0
             )));
         }
-        existing.tensor = Some(decl.id);
-        self.declare(decl.clone());
-        Ok(())
-    }
-
-    fn promote_buffer(&mut self, buffer: BufferId, decl: &TensorDecl) -> Result<()> {
-        let existing = self
-            .program
-            .buffers
-            .get_mut(buffer.0 as usize)
-            .filter(|candidate| candidate.id == buffer)
-            .ok_or_else(|| Error::Internal(format!("buffer {} does not exist", buffer.0)))?;
-        if let Some(existing_id) = existing.tensor
-            && existing_id != decl.id
-        {
+        // A view owns no bytes of its own, so its zero is not a disagreement.
+        if existing.bytes != 0 && existing.bytes != bytes {
             return Err(Error::Contract(format!(
-                "buffer {} already belongs to tensor {}, cannot promote to {}",
-                buffer.0, existing_id.0, decl.id.0
+                "buffer {} holds {} bytes, which is not the {bytes} '{}' declares",
+                buffer.0, existing.bytes, decl.name
             )));
         }
         existing.tensor = Some(decl.id);
-        existing.temporary = false;
-        self.declare(decl.clone());
-        Ok(())
+        existing.ty = crate::contract::TensorType::new(decl.shape.clone(), decl.encoding.clone());
+        Ok(existing)
     }
 
     /// Publish a tensor declaration, replacing an earlier one under the same id.

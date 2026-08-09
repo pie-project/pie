@@ -194,6 +194,16 @@ pub struct MetalBinding {
     pub paged_multi_batch: bool,
     /// Whether this build's quantised matmul takes more than one row.
     pub qmm_multi_batch: bool,
+    /// Whether this build can launch `norm::add_bias`, and so whether the
+    /// text may state the Qwen-2 family's q/k/v projection biases.
+    ///
+    /// See [`LlamaLikeMetalFacts::add_bias`], which this becomes: whether the
+    /// biases exist is the ROW's `qkv_bias`, and this is the other half of the
+    /// question -- the half that is about this build.
+    ///
+    /// [`LlamaLikeMetalFacts::add_bias`]:
+    ///     crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts::add_bias
+    pub add_bias: bool,
 }
 
 /// Which driver is asking for the text.
@@ -348,7 +358,6 @@ pub trait Variant: Sync + Send + 'static {
     ///
     /// [`Refusal::Unsupported`](crate::deployment::Refusal) when this
     /// build has no text for the row, or none for the backend asking.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -391,6 +400,37 @@ pub fn catalog() -> &'static [&'static dyn Variant] {
 /// (`tests/sibling_isolation.rs`) applied to the catalog — and this is
 /// the one place they are gathered.
 type Rows = fn() -> &'static [&'static dyn Variant];
+
+/// A generation's `rows()`, which is the same four lines everywhere.
+///
+/// Nineteen generations wrote this function and all nineteen bodies
+/// hashed to one value — the flattening of a `const VARIANTS: &[T]` into
+/// the `&[&dyn Variant]` this table gathers. There is nothing in it a
+/// generation could get right or wrong, which is the test for whether a
+/// repetition is knowledge: `manifest()` differs everywhere and belongs
+/// to each family, and this differed nowhere.
+///
+/// It stays a per-generation `rows()` rather than becoming a blanket
+/// impl, because [`GENERATIONS`] gathers FUNCTIONS and a generation
+/// owning its own door is the isolation rule applied to the catalog.
+/// What is removed is the copy, not the ownership.
+#[macro_export]
+macro_rules! rows_of {
+    ($row:ty) => {
+        /// This generation's contribution to [`crate::catalog::catalog`].
+        #[must_use]
+        pub fn rows() -> &'static [&'static dyn $crate::catalog::Variant] {
+            static ROWS: std::sync::OnceLock<Vec<&'static dyn $crate::catalog::Variant>> =
+                std::sync::OnceLock::new();
+            ROWS.get_or_init(|| {
+                VARIANTS
+                    .iter()
+                    .map(|v| v as &'static dyn $crate::catalog::Variant)
+                    .collect()
+            })
+        }
+    };
+}
 
 const GENERATIONS: &[Rows] = &[
     crate::llama_3::rows,
@@ -452,7 +492,6 @@ pub fn ids() -> Vec<&'static str> {
 /// Rows whose [`Variant::deployment`] refuses are SKIPPED rather than
 /// panicking: a row this build cannot serve advertises nothing, which is
 /// the truthful answer for a label list.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn arches() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = catalog()
@@ -771,7 +810,8 @@ mod tests {
             if gathered.contains(&format!("crate::{m}::rows")) {
                 assert!(
                     !stated.contains_key(m),
-                    "{m} is in GENERATIONS and also listed as having no rows —                      delete the line, it left by gaining rows"
+                    "{m} is in GENERATIONS and also listed as having no rows — \
+                     delete the line, it left by gaining rows"
                 );
             } else {
                 rowless.push(*m);
@@ -1014,7 +1054,6 @@ mod tests {
     /// `gemma4forconditionalgeneration` — the second is the exact
     /// string the deleted `arch_stem` produced when its strip list was
     /// one entry short.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_family_label_is_coarser_than_an_id() {
         let arches = arches();
@@ -1046,7 +1085,6 @@ mod tests {
     /// `max_model_len` rides along because it fails the same way and
     /// worse: zero is not dropped anywhere, it is ADVERTISED, and a
     /// guest program that asks how much context it has is told none.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_servable_row_advertises_a_label_and_a_ceiling() {
         let mut silent = Vec::new();
@@ -1076,7 +1114,6 @@ mod tests {
     /// happily and die at its first fire, which is the failure
     /// `unbuilt_kv_store()` existed to paper over and this design
     /// removes rather than papers.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_row_that_cannot_deploy_cannot_trace_either() {
         use model_compiler::trace::FireClass;

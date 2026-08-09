@@ -759,3 +759,192 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
         "one extent everywhere means the statement's scalar was not read"
     );
 }
+
+/// The routed MXFP4 leg binds the bias its ONE symbol reads.
+///
+/// `dsl::metal::routed_qmv` has a single instantiation for an MXFP4 bank —
+/// `mxfp4_qmv_routed_bias`, group 32, 4 bits — and it is a BIASED one: the
+/// template is `qmv_routed_bias`, `BIASED` is on, and the kernel adds
+/// `bias_row[out_row + row]` from `buffer(7)` to every output it writes.
+///
+/// That buffer had nothing in it. The row named `Weight(3)` for it, after
+/// giving `Weight(2)` to the codec's zero-point plane, and MXFP4 has no
+/// zero-point plane: `MatW::scale_names` yields `.scales` alone, so the
+/// statement's weight list was two names long and neither index existed.
+/// `reorder` answered both with an address of zero and the launch went ahead.
+///
+/// Nothing had ever run it. No catalog row states `moe_mxfp4`, so the only
+/// checkpoint whose experts are MXFP4 — gpt-oss — refuses on Metal before it
+/// reaches a text, and the one symbol that always reads a bias is the one
+/// symbol nobody had fired.
+///
+/// # What this holds, and how each half fails
+///
+/// The slot the row leaves unbound must address nothing and the slot it
+/// sources must address something. Re-sourcing `biases` pushes `bias` back to
+/// an index the list never reaches, which is now `BindRefusal::UnstatedWeight`
+/// and shows up here as a refusal; dropping `routed_qmv`'s `.bias` name does
+/// the same. Sourcing the unread slot from somewhere shows up as the first
+/// assertion.
+#[test]
+fn the_mxfp4_expert_bank_reads_a_bias_and_is_handed_one() {
+    let plan = llama_like_metal(
+        &LlamaLikeFacts::gpt_oss_20b(),
+        &LlamaLikeMetalFacts::gpt_oss_20b(),
+        FireClass::Decode,
+    );
+    let low = lower(
+        &plan,
+        &[Row {
+            samples: true,
+            ..Row::default()
+        }],
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the routed MXFP4 text lowers");
+
+    let facts = LlamaLikeFacts::gpt_oss_20b();
+    let geometry = Geometry {
+        q_heads: facts.q_heads,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        rotary_dims: facts.head_dim,
+        n_experts: facts.n_experts,
+        experts_per_token: facts.experts_per_token,
+    };
+    let frame = frame(&low);
+    let table = driver_metal::lowering::dispatch::table();
+
+    // The symbol carries its instantiation point, which is the OTHER half of
+    // the same omission: the arm returned a bare `mxfp4_qmv_routed_bias` and
+    // `quant/qmv.metal` exports only the pointed name, so the fire died at
+    // pipeline construction with "exports no such entry point".
+    let mut seen = 0usize;
+    for launch in &low.launches {
+        let symbol = &low.kernels[launch.kernel as usize];
+        if symbol != "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4" {
+            continue;
+        }
+        seen += 1;
+        let sig = kernels::sig_in(table, symbol).expect("the MXFP4 routed row");
+        let mut store = Sentinels;
+        let d = plan_one(&low, launch, table, frame, geometry, &mut store)
+            .expect("the routed MXFP4 leg plans");
+        for (slot, operand) in sig.operands.iter().enumerate() {
+            let bound = d.args[slot].slice;
+            // `biases` is in the ABI because a row is positional, and unread
+            // because the codec has no such plane. `bias` is read per output
+            // row. Naming them off the row rather than by index, so that a
+            // row reordered upstream is still being asked the right question.
+            match operand.name {
+                "biases" => assert_eq!(
+                    bound.bytes, 0,
+                    "the zero-point slot MXFP4 does not have addresses {bound:?}"
+                ),
+                "bias" => assert!(
+                    bound.bytes > 0,
+                    "the additive bias the kernel reads addresses nothing"
+                ),
+                _ => {}
+            }
+        }
+    }
+    // Three legs per layer, twenty-four layers: a decode that dispatched none
+    // of them would pass every assertion above.
+    assert_eq!(seen, 3 * 24, "the routed MXFP4 legs the text states");
+}
+
+/// The bias add gets a `width` slot, and the width is the projection's.
+///
+/// # Why a plan-level test and not only a device one
+///
+/// `norm::add_bias` states its row pitch as `Source::OutWidth(0)` — the row
+/// DERIVES the number from the operand it biases rather than making a text
+/// repeat it. `param_layout`'s source match had no arm for that and ended in
+/// `_ => continue`, so the slot was never emitted at all: the kernel's
+/// `const constant int& width [[buffer(2)]]` would have read whatever the
+/// encoder last left at index 2.
+///
+/// That is a silent failure at every level above it. The plan is well-formed,
+/// the pipeline compiles, the fire runs, and the arithmetic is wrong — which
+/// is why `LlamaLikeMetalFacts::add_bias` defaulted itself off and said so in
+/// prose for as long as the arm was missing, and why seven Qwen-2.5 rows have
+/// been served on Metal without their q/k/v projection biases.
+///
+/// The assertion is on the WIDTHS and not merely on the slot's existence: an
+/// arm that emitted a slot holding zero would satisfy "there is a slot" and
+/// still multiply every row index by nothing.
+#[test]
+fn the_bias_add_is_handed_the_width_it_derives() {
+    let facts = LlamaLikeFacts {
+        qkv_bias: true,
+        // qwen-2 has no q/k norm. Left on, a norm would sit between the
+        // projection and the bias and this would prove nothing about either.
+        qk_norm: model::shared::llama_like::spec::QkNorm::Off,
+        ..LlamaLikeFacts::qwen3_0_6b()
+    };
+    let metal = LlamaLikeMetalFacts {
+        add_bias: true,
+        ..LlamaLikeMetalFacts::synthetic()
+    };
+    let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
+    let low = lower(
+        &plan,
+        &[Row {
+            samples: true,
+            ..Row::default()
+        }],
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the metal text lowers");
+    let frame = frame(&low);
+    let mut store = Sentinels;
+
+    let g = geometry();
+    // What the three projections are worth per row, which is what the three
+    // biases must each be handed.
+    let widths = [
+        g.q_heads * g.head_dim,
+        g.kv_heads * g.head_dim,
+        g.kv_heads * g.head_dim,
+    ];
+    let mut seen = Vec::new();
+    for launch in &low.launches {
+        let d = plan_one(&low, launch, kernels_metal::KERNELS, frame, g, &mut store)
+            .expect("every launch of this text plans");
+        if !d.symbol.starts_with("add_bias") {
+            continue;
+        }
+        let slot = d
+            .param_slots
+            .iter()
+            .find(|s| s.slot == 2)
+            .unwrap_or_else(|| panic!("`{}` binds no scalar at buffer 2", d.symbol));
+        assert!(!slot.packed, "the row places `width` itself");
+        let value = slot
+            .value
+            .and_then(|i| d.params.get(usize::from(i)))
+            .copied()
+            .expect("the slot points at a staged scalar");
+        seen.push(value);
+    }
+    assert_eq!(
+        seen.len(),
+        3 * facts.layers as usize,
+        "one bias per projection per layer"
+    );
+    // In text order, and the text states q, k, v.
+    for (i, got) in seen.iter().enumerate() {
+        assert_eq!(
+            *got,
+            widths[i % 3],
+            "the {}th bias of layer {} takes the wrong row pitch",
+            i % 3,
+            i / 3
+        );
+    }
+}

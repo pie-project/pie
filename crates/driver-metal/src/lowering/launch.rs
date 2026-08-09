@@ -145,6 +145,27 @@ pub enum Ungeometric {
         /// Elements per head.
         head_dim: u32,
     },
+    /// The rule is real and this backend has no kernel it describes.
+    ///
+    /// Distinct from [`Ungeometric::Unstated`], which is a table that has not
+    /// been filled in. This is a table that has been filled in for a DIFFERENT
+    /// backend: `LaunchRule` is `kernels`', both drivers evaluate it, and CUDA
+    /// added five variants for kernels that exist only there — a gated-delta
+    /// recurrent scan, a channel-major causal convolution, a sparse indexer's
+    /// score pass.
+    ///
+    /// Returning a geometry for one of those would be the defect this whole
+    /// module is arranged against: `driver-cuda`'s own `launch.rs` refuses
+    /// `Rule::Qmv` for the mirror-image reason — *"this backend has no
+    /// affine-quantized matvec `<<<>>>` at all"* — and the honest answer in
+    /// both directions is that a driver refuses what it cannot state.
+    ///
+    /// The day Metal grows one of these kernels, its arm replaces this one and
+    /// the arithmetic comes from the Metal shader's own dispatch, never from
+    /// translating CUDA's: `dispatchThreads` takes a total thread count and
+    /// `cuLaunchKernel` takes a block count, so the same rule produces numbers
+    /// that differ by a factor of the threadgroup width.
+    Unported(Rule),
 }
 
 /// The launch a rule produces for `dims`.
@@ -211,6 +232,84 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
         Rule::RouterSort => shapes::route_sort(dims.n_experts),
         Rule::RouteRows => shapes::route_rows(dims.width, rows),
         Rule::RoutedQmv => shapes::routed_qmv(dims.width, dims.experts_per_token, rows),
+        // The CUDA-only shapes, now TWENTY-ONE. Listed by name rather than
+        // caught by a wildcard, so that a variant added to `LaunchRule`
+        // tomorrow is a compile error here — which is the property
+        // `LaunchRule::ALL` and `a_rule_that_ignores_its_rows_has_to_say_so`
+        // exist to keep, and the reason `RouterLane`'s row-axis defect
+        // survived once was a list someone had to remember to extend.
+        //
+        // The list grew from five to twelve when the CUDA side ported eight
+        // more launchers, from twelve to twenty when it ported eight again,
+        // and to twenty-one for `RoutedQmvQuad`. It working exactly as
+        // intended is why this file needed editing each time: the agent that
+        // added the first eight left the build RED and reported the seven
+        // arms rather than reaching for a `_ =>`, the second round did the
+        // same and added these, and this arm was added the same way — the
+        // build broke here and the arm was written, not worked around.
+        //
+        // `RoutedQmv` is NOT here — Metal ports it, above. `RoutedQmvTransposed`
+        // IS, and the pair is the sharpest illustration of why each variant is
+        // named: the two differ only in which axis carries the routed slot
+        // count, Metal's `shapes::routed_qmv` states one of them, and a
+        // wildcard would have silently given the other the same threadgroup
+        // grid with its axes swapped.
+        //
+        // `RoutedQmvQuad` is a THIRD member of that family and is here for a
+        // reason neither of the others has. Its axes are `RoutedQmv`'s and its
+        // threadgroup would be too, but it reads its width differently: the
+        // two MXFP4 statements that state it declare `[Tokens, k,
+        // intermediate]`, so the first output's row width is `k *
+        // intermediate` and the rule divides the fanout out before it slabs.
+        // `shapes::routed_qmv` does not, because its own statements declare
+        // the collapsed `[Tokens, intermediate]`. Handing this rule to it
+        // would open `k` times too many threadgroups along the width, every
+        // one past the first computing a row index off the end of the
+        // intermediate — a wrong grid that dispatches, which is exactly what
+        // the wildcard ban is for. Metal ports it the day a Metal MXFP4 MoE
+        // decode kernel exists to check the tile against; there is none.
+        //
+        // Seven of the twenty-one are shapes Metal has no analogue for rather
+        // than merely no port: `Tile16` is a 16x16 threadgroup over a 2-D
+        // grid, `AxialRope` is the first rule with `grid.z > 1`,
+        // `WarpTiledScan`, `PagedScores` and `AltUpStreams` have three grid
+        // axes, and `WarpPackedHeads` counts its grid in WARPS — a unit Metal
+        // spells as a SIMD group whose width is not fixed by the API. A Metal
+        // port would have to decide how a threadgroup maps onto them, which is
+        // a design question and not a translation.
+        //
+        // `PagedScores` and `PagedScoresDecode` additionally state DYNAMIC
+        // shared memory sized on a head width, and `Dims` here has no field
+        // this side reads for it; `setThreadgroupMemoryLength` is the Metal
+        // spelling and no rule in this file calls it.
+        rule @ (Rule::RecurrentScan
+        | Rule::PerRow
+        | Rule::PerChannel
+        | Rule::ElementwiseIn
+        | Rule::RowScores
+        | Rule::RowsPerHead
+        | Rule::RowsFlat
+        | Rule::Slab
+        | Rule::Tile16
+        | Rule::AxialRope
+        | Rule::WarpTiledScan
+        | Rule::PerRowNarrow
+        | Rule::PagedScores
+        | Rule::PagedScoresDecode
+        | Rule::MlaPrepare
+        | Rule::RowsPackedHeads
+        | Rule::RowsPackedHeadsNarrow
+        | Rule::WarpPackedHeads
+        | Rule::RoutedQmvTransposed
+        | Rule::RoutedQmvQuad
+        | Rule::AltUpStreams
+        // The three CUDA launcher shapes: a grid over the request count, and
+        // the two literal one-block launches whose widths are a fact about a
+        // CUDA warp. Nothing in this file is a serial walk, and `Dims` has no
+        // request count.
+        | Rule::PerRequest
+        | Rule::Single
+        | Rule::SingleWarp) => return Err(Ungeometric::Unported(rule)),
     })
 }
 

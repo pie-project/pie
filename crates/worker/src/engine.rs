@@ -404,9 +404,6 @@ fn model_identity(
             hasher.update(options.mxfp4_moe.as_bytes());
             hasher.update(options.weight_dtype.as_bytes());
         }
-        config::DriverKind::Dummy => {
-            hasher.update(&user_cfg.model.driver.random_seed.to_le_bytes());
-        }
         config::DriverKind::Metal => {}
     }
     Ok(driver_api::ModelIdentity {
@@ -1003,6 +1000,15 @@ async fn assemble_distributed<C: ControlLink>(
     reason = "nine independent inputs to one driver launch; a struct here \
               would be a parameter list with a name"
 )]
+#[cfg_attr(
+    not(any(feature = "driver-cuda", feature = "driver-metal")),
+    allow(
+        unused_variables,
+        unreachable_code,
+        reason = "with no `driver-*` feature `DriverOptions` is uninhabited, so \
+                  every path that takes one diverges"
+    )
+)]
 fn create_driver_group(
     m: &config::ModelConfig,
     group_idx: usize,
@@ -1152,7 +1158,7 @@ mod tests {
     fn startup_banner_render_includes_public_startup_fields_only() {
         let banner = StartupBanner {
             model: "default (Qwen/Qwen3-0.6B)".to_string(),
-            driver: "dummy".to_string(),
+            driver: "metal".to_string(),
             device: "cpu".to_string(),
         };
 
@@ -1270,55 +1276,4 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    #[test]
-    fn component_identity_ignores_kv_capacity_but_covers_weight_semantics() {
-        let config = crate::config::Config::parse(
-            r#"
-            [model]
-            name = "test"
-            model = "local"
-
-            [driver]
-            type = "dummy"
-            device = ["cpu"]
-            vocab_size = 32
-            arch_name = "dummy"
-            "#,
-        )
-        .unwrap();
-        let driver =
-            ::engine::driver::DummyDriver::new(driver_dummy::DummyDriverOptions::default());
-        let full_caps = driver.capabilities().clone();
-        let mut encode_caps = full_caps.clone();
-        encode_caps.total_pages = 0;
-        encode_caps.kv_page_size = 0;
-        encode_caps.kv_handle = None;
-        let artifact = [7; 32];
-        let full = model_identity(
-            &config,
-            &full_caps,
-            &artifact,
-            driver_api::ModelComponent::Full,
-        )
-        .unwrap();
-        let encode = model_identity(
-            &config,
-            &encode_caps,
-            &artifact,
-            driver_api::ModelComponent::Encode,
-        )
-        .unwrap();
-        assert_eq!(full.hash, encode.hash);
-        assert_ne!(full.component, encode.component);
-
-        encode_caps.activation_dtype = "f16".to_string();
-        let incompatible = model_identity(
-            &config,
-            &encode_caps,
-            &artifact,
-            driver_api::ModelComponent::Encode,
-        )
-        .unwrap();
-        assert_ne!(encode.hash, incompatible.hash);
-    }
 }

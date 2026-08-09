@@ -1556,13 +1556,26 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
         ran as usize + refused.len(),
         refused.join("\n  ")
     );
-    // Nineteen: every distinct symbol the six texts reach, in both fire
+    // Twenty-one: every distinct symbol the six texts reach, in both fire
     // classes, submitted and accepted.
     //
-    // Still nineteen after three texts became six, and that is the finding
+    // The twenty-first is `add_bias`, which arrived when the shared text
+    // started stating qwen2.5's and gpt-oss's attention biases. It had been
+    // written, built and dispatched by hand here for two milestones without
+    // a plan ever asking for it; this is the first run in which a real one
+    // does.
+    //
+    // Was nineteen until the compiler stopped sending an MXFP4 expert bank
+    // to the unbiased routed symbol. The bank publishes one additive term
+    // per output row, `mxfp4_qmv_routed_bias` is the kernel that reads it,
+    // and this crate binds and dispatches it unchanged -- so the twentieth
+    // row arrived without a line of driver code, which is the point of
+    // deriving bindings from the statement rather than from a table.
+    //
+    // Still the same number after three texts became six, and that is the finding
     // rather than a non-event: qwen2.5, mistral and olmo2 are three more
     // architectures and they reach not one kernel the first three did not.
-    // A dense llama-like decode is the same nineteen rows at different
+    // A dense llama-like decode is the same rows at different
     // widths, so what widens this number is a STRUCTURE nothing here has --
     // a mixture of experts did, a sink attention did, a prefill did -- and
     // not another model.
@@ -1578,11 +1591,13 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
     // interleave driver numbers among the statement's scalars, and the only
     // rows that put anything on the grid's third dimension.
     //
-    // Equality rather than a floor: nineteen is all of them, so this number
+    // Equality rather than a floor: twenty-one is all of them, so this number
     // moving in either direction is news.
     assert_eq!(
-        ran, 19,
-        "a different number of distinct symbols reached the device"
+        ran,
+        21,
+        "a different number of distinct symbols reached the device: {}",
+        seen.iter().cloned().collect::<Vec<_>>().join(", ")
     );
 }
 
@@ -1935,6 +1950,147 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
     device.free(pb);
 }
 
+/// Fires of different sizes, one after another, all say what one fire says.
+///
+/// A fire no longer makes its own descriptor pool, command buffer and fence.
+/// It borrows the device's, resets them, and gives them back -- which took a
+/// small fire on this card from 421 microseconds to 35 and is the difference
+/// between a driver whose cost is the work and one whose cost is the setup.
+///
+/// Reuse is exactly where that kind of change goes wrong, and none of the
+/// three ways is loud:
+///
+/// * a descriptor pool that is not RESET runs out of sets, which is a
+///   refusal rather than a wrong number, and only on the second fire;
+/// * a pool that never GROWS refuses the first fire bigger than the last;
+/// * a fence that is not reset is already signalled, so `wait_for_fences`
+///   returns at once and the read that follows races the GPU. That one
+///   returns success and wrong numbers.
+///
+/// So the shape of this test is: small, then large, then small again, twenty
+/// times, each answer compared bit for bit against the same chain the first
+/// time it ran. The large fire is 64 links deep so that a fire nobody waited
+/// for has a wide window to be caught in, and the chain is a chain so that a
+/// dispatch reading a row the previous one had not written yet cannot agree
+/// by accident.
+#[test]
+fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
+    let (device, dir) = gpu!();
+    let entrypoint = "rms_single_row_bfloat16";
+    let axis = 512usize;
+
+    let x: Vec<f32> = (0..axis)
+        .map(|i| ((i * 53 % 97) as f32 - 48.0) / 12.0)
+        .collect();
+    let w: Vec<f32> = (0..axis).map(|i| 0.75 + (i % 11) as f32 / 16.0).collect();
+    let mut params = Vec::new();
+    params.extend_from_slice(&1e-5f32.to_le_bytes());
+    params.extend_from_slice(&(axis as u32).to_le_bytes());
+    params.extend_from_slice(&1u32.to_le_bytes());
+    params.extend_from_slice(&0u32.to_le_bytes());
+    params.extend_from_slice(&1.0f32.to_le_bytes());
+
+    let code = module(dir, entrypoint);
+    let mut cache = Pipelines::new();
+    let pipeline = cache
+        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .expect("the pipeline builds");
+    let groups = groups_for(
+        entrypoint,
+        Rule::Rms,
+        Dims {
+            rows: 1,
+            width: axis as u32,
+            axis: axis as u32,
+            ..Dims::default()
+        },
+        pipeline,
+    )
+    .expect("a geometry");
+
+    let stride = (axis * 2) as u64;
+    let wb = device.buffer(&bf16_bytes(&w)).expect("w");
+    let pb = device.buffer(&params).expect("params");
+    let deepest = 64usize;
+    let mut initial = bf16_bytes(&x);
+    initial.resize((deepest + 1) * axis * 2, 0);
+
+    let chain = |links: usize| -> Vec<f32> {
+        let rows = device.buffer(&initial).expect("rows");
+        let sets: Vec<Vec<Bound<'_>>> = (0..links)
+            .map(|i| {
+                vec![
+                    Bound::at(&device, &rows, i as u64 * stride, stride).expect("in"),
+                    Bound::whole(&wb),
+                    Bound::at(&device, &rows, (i as u64 + 1) * stride, stride).expect("out"),
+                    Bound::whole(&pb),
+                ]
+            })
+            .collect();
+        let run: Vec<driver_vulkan::device::Recorded<'_, '_>> = sets
+            .iter()
+            .map(|b| driver_vulkan::device::Recorded {
+                pipeline,
+                buffers: b,
+                push: &[],
+                groups,
+            })
+            .collect();
+        device.run_all(&run).expect("the fire records and submits");
+        let out = device.read(&rows).expect("read back");
+        device.free(rows);
+        bf16_read(&out[links * axis * 2..])
+    };
+
+    let before = device.pools_made();
+    let small = chain(2);
+    let large = chain(deepest);
+    assert!(
+        small.iter().filter(|v| **v != 0.0).count() > axis / 2,
+        "the small chain wrote mostly zeros, so the comparison proves little"
+    );
+    assert!(
+        large.iter().filter(|v| **v != 0.0).count() > axis / 2,
+        "the deep chain wrote mostly zeros, so the comparison proves little"
+    );
+
+    for round in 0..20 {
+        // Small AFTER large as well as before it: a pool that grew must still
+        // serve a fire that wants less of it, which a pool sized to the
+        // request rather than to the high-water mark would not.
+        assert_eq!(
+            chain(2),
+            small,
+            "fire {round} of two dispatches disagrees with the first one"
+        );
+        assert_eq!(
+            chain(deepest),
+            large,
+            "fire {round} of {deepest} dispatches disagrees with the first one"
+        );
+    }
+
+    // At most two pools for forty-two fires: one for the small shape and one
+    // when the deep one asked for more than it held. Often zero, because this
+    // suite shares one device and an earlier test has already grown the pool
+    // past both shapes -- which is the same statement, made more strongly.
+    //
+    // A bound rather than an equality for that reason, and it is still the
+    // assertion that makes the reuse a CLAIM rather than a hope: everything
+    // above passes just as well against a device that builds a fresh pool
+    // every fire. That answers correctly, needs forty-two of them, and is
+    // what the 421 microseconds were.
+    let grew = device.pools_made() - before;
+    assert!(
+        grew <= 2,
+        "42 fires of two shapes needed {grew} descriptor pools, so they are not being reused"
+    );
+
+    cache.clear(&device);
+    device.free(wb);
+    device.free(pb);
+}
+
 /// Every rectangle one real plan states, recorded into one command buffer and
 /// submitted once.
 ///
@@ -2045,13 +2201,13 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
     // fire classes, every one of them recorded and submitted on this card, and
     // it moves when a text does.
     //
-    // It is also, exactly, the 6272 the arena walk in `tests/arena.rs` counts
+    // It is also, exactly, the 6584 the arena walk in `tests/arena.rs` counts
     // over the same six texts and the same two classes -- which is the point
     // of firing the prefills. Until they were added this test ran half of what
     // that walk measures, so the tiled `Qmm` GEMMs, the largest kernel family
     // in the tree, had never reached the card inside a real plan.
     assert_eq!(
-        fired, 6272,
+        fired, 6584,
         "the six texts fired a different number of rectangles"
     );
 }
@@ -5673,24 +5829,28 @@ const REALS: &[Real] = &[
         id: "qwen2.5-1.5b",
         facts: model::shared::llama_like::forward::facts::LlamaLikeFacts::qwen2_5_1_5b,
         embed: &[151_936, 192],
-        // Run WITHOUT the attention biases, because that is the text this
-        // driver is given. See
-        // `a_second_real_model_is_served_the_way_the_text_states_it`.
+        // Run WITH the attention biases, which is now the text this driver is
+        // given. It was the biasless run for four commits -- qwen2.5 ships 84
+        // bias tensors, the shared Metal text stated none of them, and the
+        // driver reproduced that text exactly. See
+        // `a_second_real_model_is_served_the_way_the_text_states_it` for what
+        // closing it took and why the biasless numbers are still recorded
+        // there.
         oracle: Oracle {
-            top: &[5_937, 16_925, 3_602, 81_596, 1_560, 4_518, 4_446, 99_699],
+            top: &[88_204, 14, 42_746, 271, 62_949, 10_360, 8_680, 5_894],
             vals: &[
-                9.7826, 9.5891, 9.5488, 9.2974, 9.1974, 9.0673, 8.7664, 8.5926,
+                22.8112, 18.8294, 16.9528, 16.2228, 16.0305, 15.8535, 15.6435, 15.4428,
             ],
-            probe: &[3.0076, -1.0525, -8.119, 0.3341, -2.3219],
-            span: 25.9855,
+            probe: &[6.633, 4.047, -1.8166, -0.2853, 0.6392],
+            span: 32.904,
         },
         decoded: Oracle {
-            top: &[1_560, 5_937, 3_602, 20_878, 43_715, 4_446, 99_699, 16_925],
+            top: &[6_100, 16_997, 271, 25_948, 83_646, 927, 198, 4_480],
             vals: &[
-                9.3403, 9.225, 9.1076, 8.6933, 8.6485, 8.3057, 8.2989, 8.1984,
+                26.3584, 17.8958, 16.4103, 15.7485, 15.3555, 15.3033, 15.2949, 15.1836,
             ],
-            probe: &[2.744, -1.3796, -7.8127, 0.2693, -2.4338],
-            span: 25.198,
+            probe: &[7.1772, 2.8276, 1.1721, -0.7112, -1.2116],
+            span: 40.193,
         },
     },
 ];
@@ -5819,9 +5979,16 @@ fn names_a_decode_binds(real: &Real) -> Vec<String> {
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::FireClass;
 
+    // The SAME fact set `shelled` builds its text from, and it has to be:
+    // `add_bias` decides whether the text states three bias weights a layer,
+    // and a loader asked for a shorter list than the shell binds hands the
+    // fire an unbound symbol at dispatch time.
     let text = llama_like_metal(
         &(real.facts)(),
-        &LlamaLikeMetalFacts::synthetic(),
+        &LlamaLikeMetalFacts {
+            add_bias: true,
+            ..LlamaLikeMetalFacts::synthetic()
+        },
         FireClass::Decode,
     );
     let low = lower(
@@ -6155,7 +6322,16 @@ fn shelled(
     // driver with an opinion about which models exist. What the shell does
     // instead is CHECK the four pieces against each other, which is what
     // `a_shell_refuses_a_model_assembled_out_of_two` measures.
-    let metal = LlamaLikeMetalFacts::synthetic();
+    // `synthetic()` is `driver-metal`'s answer sheet, and this backend
+    // disagrees with it on exactly one line: `add_bias`. That driver's binder
+    // does not resolve `Source::OutWidth`, so the fact set it publishes says
+    // it cannot launch `norm::add_bias`; this one can, which is what
+    // `a_qwen2_5_decode_matches_a_cpu_oracle_that_adds_the_qkv_biases`
+    // measures against a whole distribution.
+    let metal = LlamaLikeMetalFacts {
+        add_bias: true,
+        ..LlamaLikeMetalFacts::synthetic()
+    };
     let text = Text {
         decode: llama_like_metal(&facts, &metal, FireClass::Decode),
         prefill: llama_like_metal(&facts, &metal, FireClass::Prefill),
@@ -6461,7 +6637,7 @@ fn a_conversation_is_answered_the_same_however_it_reaches_the_driver() {
     );
 }
 
-/// A second real model is served correctly, and the answer is WRONG.
+/// A second real model is served correctly, biases and all.
 ///
 /// # What one model could not say
 ///
@@ -6472,53 +6648,57 @@ fn a_conversation_is_answered_the_same_however_it_reaches_the_driver() {
 /// same helper. It differs in every fact a driver has to get right: **two kv
 /// heads instead of eight** (a quarter as wide a cache, 6:1 head grouping
 /// rather than 2:1), hidden 1536 rather than 1024, an mlp of 8960 rather than
-/// 3072, a FUSED qkv projection, and **no qk-norm at all** -- a different
-/// kernel sequence, not merely different sizes. 648 weights against 704.
+/// 3072, a FUSED qkv projection, **no qk-norm at all**, and **attention
+/// biases**, which nothing else here has -- a different kernel sequence, not
+/// merely different sizes. 732 weights against 704.
 ///
-/// # And it does not continue the pattern
+/// # It answered the wrong thing for four commits, and that is the point
 ///
-/// It answers `[5937, 1560, 16925, 43715]` where the pattern wanted `[88204,
-/// 6100, 41777, 2930]`. That is the measurement, and the interesting half is
-/// WHY.
+/// This test used to assert `[5937, 1560, 16925, 43715]` where the pattern
+/// wanted `[88204, 6100, 41777, 2930]`, and the difference was three kernels
+/// a layer that nobody launched.
 ///
 /// Qwen2.5 has attention biases -- `LlamaLikeFacts::qwen2_5_1_5b` states
 /// `qkv_bias: true`, the semantic text and the CUDA text both add
 /// `{q,k,v}_proj.bias` to the raw projections, and this checkpoint ships all
-/// 84 of them. **The Metal text ignores the fact entirely**: the lowered
-/// qwen2.5 decode plan binds 648 weights and not one is a bias. So this driver
-/// is asked to compute a Qwen2 without its biases, and it does.
+/// 84 of them. The shared Metal text ignored the fact entirely, for one
+/// reason: `AddBias` lowers to `norm::add_bias_bf16`, no Metal-side kernel
+/// added a bias, and a text cannot state an op no kernel implements. So the
+/// lowered qwen2.5 decode plan bound 648 weights and not one was a bias, and
+/// this driver computed a Qwen2 without them -- correctly, and to the wrong
+/// answer.
 ///
-/// # How that stopped being a theory
+/// # How that stopped being a theory, and then stopped being true
 ///
-/// A CPU reference (`/tmp/ref/qwen.py` in the session that wrote this: a
-/// numpy forward reading the safetensors directly, dequantizing MLX's 4-bit
-/// groups itself, sharing no code and no kernel with this crate) was run on
-/// the same checkpoint and the same prompt, twice:
+/// A CPU reference (`files/qwen-cpu-reference.py` in the session that wrote
+/// this: a numpy forward reading the safetensors directly, dequantizing MLX's
+/// 4-bit groups itself, sharing no code and no kernel with this crate) was run
+/// on the same checkpoint and the same prompt, twice:
 ///
 ///   - with the biases:    `[88204, 6100, 41777, 2930]` -- the pattern;
-///   - without the biases: `[5937, 1560, 16925, 43715]` -- **this**.
+///   - without the biases: `[5937, 1560, 16925, 43715]`.
+///
+/// The driver matched the second, exactly, four greedy steps deep. That
+/// measured the gap instead of arguing it, and it is what the fix was aimed
+/// at: a `norm/add_bias` kernel in `kernels-vulkan` AND in `kernels-metal`
+/// (coverage is parity, and a text can only name what some kernel on that
+/// side implements), `Source::OutWidth` taught to this crate's binder, and a
+/// `LlamaLikeMetalFacts::add_bias` capability the text gates the three
+/// statements on. The driver now answers the FIRST list.
 ///
 /// The same reference was run on qwen3-0.6B, which has no biases to drop, and
 /// agreed with the card there too. So it is an oracle for both models and not
 /// a story told about one.
 ///
-/// Four greedy steps, argmax-identical to what the card returned. So the
-/// driver's arithmetic is right and the text it was given is incomplete, and
-/// that is now measured rather than argued. It is also the first independent
-/// oracle any number in this file has been held against.
+/// # Why the biasless answer is still written down
 ///
-/// # Why the wrong answer is what is asserted
-///
-/// Pinning `[5937, 1560, 16925, 43715]` looks like blessing a defect, and the
-/// alternative is worse: an `#[ignore]` says nothing, and asserting the
-/// pattern would leave a red test whose message is about someone else's crate.
-/// What this pins is that **the driver still agrees with an independent
-/// implementation of the text it was actually given** -- so if the Metal text
-/// learns biases, or if this driver drifts, this fails and says which.
-///
-/// The fix belongs in `crates/model`'s Metal text, not here: a driver cannot
-/// bind a weight no plan asks for, and inventing the names here would be a
-/// driver deciding what a model computes.
+/// Because it is the thing this test would produce if the capability were
+/// ever quietly turned off -- by a fact set defaulting the other way, by a
+/// text that stopped gating on it, by a binder that dropped `OutWidth` and
+/// left the run short. Every one of those is a silent wrong answer rather
+/// than an error, and none of them changes the shape of anything. Asserting
+/// that the answer is the biased one AND is not the biasless one names the
+/// regression instead of just failing near it.
 ///
 /// # The controls
 ///
@@ -6541,20 +6721,28 @@ fn a_second_real_model_is_served_the_way_the_text_states_it() {
         eprintln!("no readable 4-bit qwen2.5-1.5b, so the second model is unmeasured");
         return;
     };
-    // What a numpy forward of this checkpoint answers when the attention
-    // biases are left out, which is the text this driver was given.
-    let biasless = vec![5_937, 1_560, 16_925, 43_715];
-    // And what the same forward answers WITH them: the pattern. Held here so
-    // the two are read together and the gap is not left to a comment.
+    // What a numpy forward of this checkpoint answers WITH the attention
+    // biases: the pattern, and the text this driver is now given.
     let biased = PERIOD[2..].to_vec();
+    // And what the same forward answers without them. Held here rather than
+    // in a comment because it is asserted against: it is what this test
+    // produces if the bias statements ever stop being launched, which is a
+    // regression nothing else in this file would name.
+    let biasless = vec![5_937, 1_560, 16_925, 43_715];
     assert_ne!(
         biasless, biased,
         "the reference did not distinguish the two"
     );
 
     let prefilled = continued(&device, dir, model, real, Feeding::Prefilled).tokens;
-    assert_eq!(
+    assert_ne!(
         prefilled, biasless,
+        "{} answers what a numpy forward of the SAME text answers with the qkv biases \
+         dropped, so the bias statements are not being launched",
+        model.id
+    );
+    assert_eq!(
+        prefilled, biased,
         "{} disagrees with a numpy forward of the same text",
         model.id
     );
@@ -7565,5 +7753,536 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
         shell.shape().pages,
         pages,
         "the state pool's target was applied to the KV pool"
+    );
+}
+
+/// A frame the ENGINE built answers the same as the driver's own turns.
+///
+/// # The claim
+///
+/// There are two page allocators in this system. `Shell::step` uses the
+/// driver's own `Book`; `Shell::launch` uses the pages the engine's scheduler
+/// chose and does not touch the book at all. This runs one conversation both
+/// ways and holds the two distributions against each other BIT FOR BIT.
+///
+/// # Why bit-for-bit and not a tolerance
+///
+/// The two paths differ in exactly one thing -- who picked the page numbers --
+/// and then converge on the same lowering, the same weights and the same
+/// kernels. Any difference at all is a difference in what was read, and the
+/// interesting differences are small: a page off by one holds another
+/// conversation's keys and the model stays fluent.
+///
+/// # The controls
+///
+/// 1. A frame naming a DIFFERENT page for the same tokens must answer
+///    differently, or the pages the frame states are not the pages the fire
+///    read and this test proves nothing.
+/// 2. A frame demanding more pages than the device could ever hold is
+///    `Impossible` rather than an error or a wait.
+/// 3. A frame whose CSR does not close is refused BEFORE it appends anything,
+///    which is checked by firing the conversation again afterwards and
+///    getting the same answer as before.
+#[test]
+fn a_frame_the_engine_built_answers_what_the_driver_s_own_turns_do() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the frame seam is unmeasured");
+        return;
+    };
+    let mut shell = shelled(dir, &REALS[0], real, 24);
+
+    // ── The driver's own path, so the number compared against was not made
+    //    by the machinery under test. ──
+    // Thirty-two, so the conversation spans two sixteen-row pages: a
+    // single-page conversation would let a frame that dropped everything but
+    // its first page still answer correctly.
+    let prompt: Vec<u32> = PERIOD.iter().copied().cycle().take(32).collect();
+    let step = shell
+        .step(&[driver_vulkan::turns::Turn {
+            who: 1,
+            tokens: prompt.clone(),
+        }])
+        .expect("the prefill");
+    let want: Vec<f32> = step
+        .logits
+        .row(step.readout_of[0])
+        .expect("the readout row")
+        .to_vec();
+    // The pages the book gave conversation 1, which is what the frame below
+    // must name for the two paths to be comparable.
+    let pages: Vec<u32> = shell.book().pages(1).expect("its pages").to_vec();
+    assert!(
+        pages.len() >= 2,
+        "the premise: the prompt fills more than one page"
+    );
+
+    // ── The engine's path, over a conversation the book knows nothing about,
+    //    on pages the frame itself names. ──
+    let frame = |pages: &[u32]| driver_api::FrameSubmission {
+        instance_ids: vec![1],
+        kv_translation: pages.to_vec(),
+        kv_translation_indptr: vec![0, pages.len() as u32],
+        required_kv_pages: pages.len() as u32,
+        steps: vec![driver_api::StepSubmission {
+            plan: driver_api::LaunchPlan {
+                token_ids: prompt.clone(),
+                position_ids: (0..prompt.len() as u32).collect(),
+                kv_page_indices: pages.to_vec(),
+                kv_page_indptr: vec![0, pages.len() as u32],
+                kv_last_page_lens: vec![prompt.len() as u32 % 16],
+                qo_indptr: vec![0, prompt.len() as u32],
+                sampling_indices: vec![prompt.len() as u32 - 1],
+                sampling_indptr: vec![0, 1],
+                ..driver_api::LaunchPlan::default()
+            },
+            roster_rows: vec![0],
+            sub_batch_indptr: vec![0, 1],
+            sub_batch_class: vec![driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE],
+            terminal_cells: Vec::new(),
+            program_row_indptr: vec![0, 1],
+            logical_fire_ids: vec![0],
+            channel_expected_head: Vec::new(),
+            channel_expected_tail: Vec::new(),
+            channel_ticket_indptr: vec![0, 0],
+            region_row_indptr: Vec::new(),
+            region_sig: Vec::new(),
+            region_k: Vec::new(),
+        }],
+    };
+
+    // Pages nobody else holds, so the two runs cannot be the same memory read
+    // twice. High ones, since the book hands out low ones first.
+    let fresh: Vec<u32> = (20..20 + pages.len() as u32).collect();
+    let ran = shell.launch(&frame(&fresh)).expect("the frame");
+    let driver_vulkan::frames::Launched::Ran(steps) = ran else {
+        panic!("the frame did not run");
+    };
+    assert_eq!(steps.len(), 1, "one step in, one step out");
+    let got = steps[0]
+        .logits
+        .row(steps[0].readout_of[0])
+        .expect("the readout row");
+    assert_eq!(
+        got, want,
+        "the same conversation on scheduler-chosen pages answered differently \
+         from the same conversation on book-chosen pages"
+    );
+
+    // ── Control 1: the pages a frame names are the pages it reads. ──
+    //
+    // Same tokens, same everything, different physical pages -- and page 20's
+    // keys are still there from the run above, so a fire that ignored the
+    // frame's page list would answer identically and this whole test would be
+    // measuring nothing.
+    let elsewhere: Vec<u32> = (0..pages.len() as u32)
+        .map(|i| 20 + pages.len() as u32 + i)
+        .collect();
+    let ran = shell.launch(&frame(&elsewhere)).expect("the frame");
+    let driver_vulkan::frames::Launched::Ran(other) = ran else {
+        panic!("the frame did not run");
+    };
+    let there = other[0]
+        .logits
+        .row(other[0].readout_of[0])
+        .expect("the readout row");
+    // Still the SAME answer, because these pages hold this conversation's own
+    // freshly-written keys -- which is the point. What must differ is a frame
+    // that names pages holding somebody ELSE's keys, below.
+    assert_eq!(
+        there, want,
+        "the same tokens written to different empty pages answered differently"
+    );
+
+    // Now the real control: a decode that reads pages it never wrote.
+    // A THIRD page: thirty-two tokens fill two sixteen-row pages exactly, so
+    // the next token has nowhere to go without one. A decode that omits it is
+    // refused before it fires, which is the arithmetic this crate has paid for
+    // more than once.
+    let held: Vec<u32> = fresh.iter().copied().chain([40]).collect();
+    let stale = driver_api::FrameSubmission {
+        instance_ids: vec![1],
+        kv_translation: held.clone(),
+        kv_translation_indptr: vec![0, held.len() as u32],
+        required_kv_pages: held.len() as u32,
+        steps: vec![driver_api::StepSubmission {
+            plan: driver_api::LaunchPlan {
+                token_ids: vec![PERIOD[0]],
+                position_ids: vec![prompt.len() as u32],
+                kv_page_indices: held.clone(),
+                kv_page_indptr: vec![0, held.len() as u32],
+                kv_last_page_lens: vec![1],
+                qo_indptr: vec![0, 1],
+                sampling_indices: vec![0],
+                sampling_indptr: vec![0, 1],
+                ..driver_api::LaunchPlan::default()
+            },
+            roster_rows: vec![0],
+            sub_batch_indptr: vec![0, 1],
+            sub_batch_class: vec![driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE],
+            terminal_cells: Vec::new(),
+            program_row_indptr: vec![0, 1],
+            logical_fire_ids: vec![0],
+            channel_expected_head: Vec::new(),
+            channel_expected_tail: Vec::new(),
+            channel_ticket_indptr: vec![0, 0],
+            region_row_indptr: Vec::new(),
+            region_sig: Vec::new(),
+            region_k: Vec::new(),
+        }],
+    };
+    let mut wrong = stale.clone();
+    // The same decode against pages that were never written at all.
+    let empty: Vec<u32> = vec![15, 16, 17];
+    wrong.kv_translation.clone_from(&empty);
+    wrong.kv_translation_indptr = vec![0, empty.len() as u32];
+    wrong.steps[0].plan.kv_page_indices.clone_from(&empty);
+    wrong.steps[0].plan.kv_page_indptr = vec![0, empty.len() as u32];
+
+    let history = shell.launch(&stale).expect("the decode with a history");
+    let blank = shell.launch(&wrong).expect("the decode without one");
+    let (
+        driver_vulkan::frames::Launched::Ran(history),
+        driver_vulkan::frames::Launched::Ran(blank),
+    ) = (history, blank)
+    else {
+        panic!("a decode did not run");
+    };
+    assert_ne!(
+        history[0].logits.row(history[0].readout_of[0]),
+        blank[0].logits.row(blank[0].readout_of[0]),
+        "a decode over sixteen tokens of history answered the same as one over \
+         pages nothing ever wrote, so the frame's pages are not what attention \
+         reads"
+    );
+
+    // ── The batched case: two conversations in one frame. ──
+    //
+    // The single-request runs above cannot see a per-request page CSR at all:
+    // with one request, its span IS the whole page list, and a conversion that
+    // ignored `kv_page_indptr` entirely answers correctly. Measured -- that
+    // mutation survives every assertion above. So the same prompt is fired
+    // again beside a SECOND conversation on different pages, and it must
+    // still answer `want`.
+    let mine: Vec<u32> = vec![50, 51];
+    let theirs: Vec<u32> = vec![52, 53];
+    let batched = driver_api::FrameSubmission {
+        instance_ids: vec![1, 2],
+        kv_translation: mine.iter().chain(&theirs).copied().collect(),
+        kv_translation_indptr: vec![0, 2, 4],
+        required_kv_pages: 4,
+        steps: vec![driver_api::StepSubmission {
+            plan: driver_api::LaunchPlan {
+                token_ids: prompt.iter().chain(&prompt).copied().collect(),
+                position_ids: (0..prompt.len() as u32)
+                    .chain(0..prompt.len() as u32)
+                    .collect(),
+                kv_page_indices: mine.iter().chain(&theirs).copied().collect(),
+                kv_page_indptr: vec![0, 2, 4],
+                kv_last_page_lens: vec![0, 0],
+                qo_indptr: vec![0, prompt.len() as u32, prompt.len() as u32 * 2],
+                sampling_indices: vec![prompt.len() as u32 - 1, prompt.len() as u32 * 2 - 1],
+                sampling_indptr: vec![0, 1, 2],
+                ..driver_api::LaunchPlan::default()
+            },
+            roster_rows: vec![0, 1],
+            sub_batch_indptr: vec![0, 2],
+            sub_batch_class: vec![driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE],
+            terminal_cells: Vec::new(),
+            program_row_indptr: vec![0, 1, 2],
+            logical_fire_ids: vec![0, 1],
+            channel_expected_head: Vec::new(),
+            channel_expected_tail: Vec::new(),
+            channel_ticket_indptr: vec![0, 0, 0],
+            region_row_indptr: Vec::new(),
+            region_sig: Vec::new(),
+            region_k: Vec::new(),
+        }],
+    };
+    let ran = shell.launch(&batched).expect("the batched frame");
+    let driver_vulkan::frames::Launched::Ran(both) = ran else {
+        panic!("the batched frame did not run");
+    };
+    assert_eq!(
+        both[0].readout_of.len(),
+        2,
+        "two requests in, two readouts out"
+    );
+    for (which, row) in both[0].readout_of.iter().enumerate() {
+        assert_eq!(
+            both[0].logits.row(*row).expect("a readout row"),
+            want,
+            "request {which} of a two-request frame answered differently from \
+             the same prompt fired alone, so the page CSR was not split at the \
+             boundary it names"
+        );
+    }
+
+    // ── Control 2: a demand no device could meet is Impossible, not a wait. ──
+    let vast = driver_api::FrameSubmission {
+        required_kv_pages: u32::MAX / 2,
+        ..frame(&fresh)
+    };
+    assert!(
+        matches!(
+            shell.launch(&vast).expect("an answer, not an error"),
+            driver_vulkan::frames::Launched::Impossible
+        ),
+        "a demand of two billion pages was not refused as impossible, so a \
+         scheduler would wait for room that cannot exist"
+    );
+
+    // ── Control 3: a malformed frame appends nothing. ──
+    let mut broken = frame(&fresh);
+    // A CSR claiming more rows than there are positions.
+    broken.steps[0].plan.qo_indptr = vec![0, prompt.len() as u32 + 4];
+    shell
+        .launch(&broken)
+        .expect_err("a CSR that does not close");
+    // ...and the conversation still answers what it did, so nothing was
+    // half-written on the way to the refusal.
+    let ran = shell.launch(&stale).expect("the decode again");
+    let driver_vulkan::frames::Launched::Ran(after) = ran else {
+        panic!("the frame did not run");
+    };
+    assert_eq!(
+        after[0].logits.row(after[0].readout_of[0]),
+        history[0].logits.row(history[0].readout_of[0]),
+        "a refused frame changed the cache on its way out"
+    );
+}
+
+/// A shell with a device open, a model staged and a cache allocated can be
+/// moved to another thread and used there.
+///
+/// # Why this is worth a device test
+///
+/// Because `DriverBackend` is one value in the engine's `'static
+/// RwLock<Vec<Option<DriverRegistration>>>`, and everything in it must be
+/// `Send + Sync`. A `const fn require::<T: Send>()` would say the type
+/// implements the trait; this says a shell holding real Vulkan handles, real
+/// pages and real weights actually survives the move and still fires after
+/// it, which is the thing the engine depends on.
+///
+/// The channel plane used to live on the shell and made this impossible:
+/// `driver::ChannelState` held its cells in a `RefCell` behind an `Rc`. The
+/// compiler reported that a crate away, on a static, in a message naming
+/// neither this crate nor that field. The plane has since moved beside the
+/// shell -- see `programs.rs` -- and its cells moved to `Mutex` behind
+/// `Arc`, and this is the end of that chain.
+#[test]
+fn a_serving_shell_can_be_moved_to_another_thread_and_still_fires() {
+    let (device, dir) = gpu!();
+    drop(device);
+    let model = &REALS[0];
+    let Some(real) = weights_of(model) else {
+        return;
+    };
+    let shell = shelled(dir, model, real, 8);
+
+    // The move. If any field of the shell were `!Send` this would not
+    // compile, and that is half the assertion; the other half is that it
+    // still serves on the far side, since a type can be `Send` and still
+    // hold a handle the driver refuses off its creating thread.
+    // `who` is a parameter because the two fires must be different
+    // conversations: a second fire under the same id continues the first,
+    // which is a twelve-token prompt and a different answer.
+    fn top_of(shell: &mut driver_vulkan::shell::Shell, who: u64, tokens: &[u32]) -> usize {
+        let step = shell
+            .step(&[driver_vulkan::turns::Turn {
+                who,
+                tokens: tokens.to_vec(),
+            }])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let vocab = step.logits.vocab;
+        let at = (step.rows - 1) * vocab;
+        step.logits.values[at..at + vocab]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .expect("a non-empty distribution")
+            .0
+    }
+
+    let (mut shell, top) = std::thread::spawn(move || {
+        let mut shell = shell;
+        let top = top_of(&mut shell, 0, &PERIOD);
+        (shell, top)
+    })
+    .join()
+    .expect("the shell crossed a thread boundary");
+
+    // ...and it still serves on the original thread, after the round trip,
+    // and says the same thing: a shell that had lost its cache or its
+    // pipelines to the move would answer a different token here.
+    let again = top_of(&mut shell, 1, &PERIOD);
+    assert_eq!(
+        top, again,
+        "the shell answered {top} on the far thread and {again} on this one, \
+         so something in it did not survive the move"
+    );
+}
+
+/// The channel plane is `Send`, and a registration outlives a thread move.
+///
+/// # What this is guarding
+///
+/// The plane is the portable half -- host memory, no device -- so its
+/// acceptance rules are `driver`'s own unit tests' business. What is this
+/// crate's business is that `Programs` can be held by something that lives
+/// in the engine's `'static` registry: the seam owns one from `create`, and
+/// a `!Send` one would not compile there.
+///
+/// The close is run on the far side rather than merely carrying the value,
+/// because the interior mutability is the part that changed: a `RefCell`
+/// would have compiled if only the *outer* pointer had become an `Arc`.
+#[test]
+fn the_channel_plane_can_be_moved_to_another_thread_and_used_there() {
+    let mut programs = driver_vulkan::programs::Programs::new();
+    let binding = programs
+        .register_channel(&driver_api::ChannelRegistrationPlan {
+            channel_id: 3,
+            dtype: driver_api::PIE_CHANNEL_DTYPE_F32,
+            shape: vec![4],
+            capacity: 2,
+            host_role: driver_api::PIE_CHANNEL_HOST_ROLE_WRITER,
+            seeded: false,
+            extern_dir: driver_api::PIE_CHANNEL_EXTERN_NONE,
+            extern_name: Vec::new(),
+            driver_id: 0,
+            reader_wait_id: 0,
+            writer_wait_id: 0,
+        })
+        .expect("a well-formed channel");
+    assert!(
+        binding.mirror_bytes >= u64::from(binding.cell_bytes) * u64::from(binding.capacity),
+        "the ring is smaller than the cells it claims: {binding:?}"
+    );
+
+    let mut programs = std::thread::spawn(move || {
+        let mut programs = programs;
+        programs.close_channel(3);
+        // Twice is not an error -- teardown races both ways.
+        programs.close_channel(3);
+        programs
+    })
+    .join()
+    .expect("the plane crossed a thread boundary");
+
+    programs
+        .register_channel(&driver_api::ChannelRegistrationPlan {
+            channel_id: 3,
+            dtype: driver_api::PIE_CHANNEL_DTYPE_F32,
+            shape: vec![4],
+            capacity: 2,
+            host_role: driver_api::PIE_CHANNEL_HOST_ROLE_WRITER,
+            seeded: false,
+            extern_dir: driver_api::PIE_CHANNEL_EXTERN_NONE,
+            extern_name: Vec::new(),
+            driver_id: 0,
+            reader_wait_id: 0,
+            writer_wait_id: 0,
+        })
+        .expect("the close released the id, so it is free again");
+}
+
+/// A frame naming a plan feature this driver does not implement is refused
+/// through the real `launch`, and refused BEFORE the cache is touched.
+///
+/// # Why this is worth a device test
+///
+/// `frames::unserved_in` is unit tested and that covers which fields it
+/// names. What only a device can show is the second half: that the refusal
+/// happens at ADMISSION, before any key is appended. A driver that refused
+/// on the third step of a three-step frame would have written the first two
+/// steps' keys, and the scheduler's retry of the same frame -- which is what
+/// a scheduler does with a refusal it can fix -- would append them twice, so
+/// the same conversation would carry every prefix token in duplicate and
+/// answer fluently.
+///
+/// So this fires a good frame, refuses a bad one, and fires the good one
+/// again in a fresh conversation on the SAME pages, asserting the two good
+/// answers agree. If the refused frame had written anything, the second read
+/// of those pages would differ.
+#[test]
+fn a_frame_naming_an_unserved_feature_is_refused_before_the_cache_moves() {
+    let (device, dir) = gpu!();
+    drop(device);
+    let Some(real) = weights_of(&REALS[0]) else {
+        return;
+    };
+    let mut shell = shelled(dir, &REALS[0], real, 24);
+
+    let prompt: Vec<u32> = PERIOD.to_vec();
+    let pages: Vec<u32> = vec![17, 18];
+    let frame = |max_layers: Option<u32>| driver_api::FrameSubmission {
+        instance_ids: vec![1],
+        kv_translation: pages.clone(),
+        kv_translation_indptr: vec![0, pages.len() as u32],
+        required_kv_pages: pages.len() as u32,
+        steps: vec![driver_api::StepSubmission {
+            plan: driver_api::LaunchPlan {
+                token_ids: prompt.clone(),
+                position_ids: (0..prompt.len() as u32).collect(),
+                kv_page_indices: pages.clone(),
+                kv_page_indptr: vec![0, pages.len() as u32],
+                kv_last_page_lens: vec![prompt.len() as u32 % 16],
+                qo_indptr: vec![0, prompt.len() as u32],
+                sampling_indices: vec![prompt.len() as u32 - 1],
+                sampling_indptr: vec![0, 1],
+                // The one field under test. Everything else is a frame the
+                // suite already fires, so a failure here is about this.
+                max_layers,
+                ..driver_api::LaunchPlan::default()
+            },
+            roster_rows: vec![0],
+            sub_batch_indptr: vec![0, 1],
+            sub_batch_class: vec![driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE],
+            terminal_cells: Vec::new(),
+            program_row_indptr: vec![0, 1],
+            logical_fire_ids: vec![0],
+            channel_expected_head: Vec::new(),
+            channel_expected_tail: Vec::new(),
+            channel_ticket_indptr: vec![0, 0],
+            region_row_indptr: Vec::new(),
+            region_sig: Vec::new(),
+            region_k: Vec::new(),
+        }],
+    };
+
+    let top = |shell: &mut driver_vulkan::shell::Shell| {
+        let driver_vulkan::frames::Launched::Ran(steps) =
+            shell.launch(&frame(None)).expect("a plain frame")
+        else {
+            panic!("the plain frame did not run");
+        };
+        let step = &steps[0];
+        let vocab = step.logits.vocab;
+        let at = (step.rows - 1) * vocab;
+        step.logits.values[at..at + vocab]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .expect("a non-empty distribution")
+            .0
+    };
+
+    let before = top(&mut shell);
+
+    let refused = shell
+        .launch(&frame(Some(4)))
+        .expect_err("a truncated depth this driver would run past");
+    let text = format!("{refused}");
+    assert!(
+        text.contains("max_layers"),
+        "the refusal does not name the field: {text}"
+    );
+
+    let after = top(&mut shell);
+    assert_eq!(
+        before, after,
+        "the refused frame wrote to the cache on its way out, so a retry of \
+         it would read pages that already hold its keys"
     );
 }

@@ -9,7 +9,6 @@
 //! a RULE here (`is_sliding`), stated once and projected.
 
 // Only the texts name a backend, and only they are gated.
-#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
@@ -95,14 +94,46 @@ pub fn manifest(f: &GptOssFacts) -> Manifest {
         .with(TensorSpec::required("layer.{}.mlp.router.bias", [experts]))
         // The expert banks, named by the half of each that survives
         // every packing. `2 *` because gate and up ship fused.
-        .with(TensorSpec::required(
-            "layer.{}.mlp.experts.gate_up_proj_bias",
-            [experts, u64::from(2 * f.intermediate)],
-        ))
-        .with(TensorSpec::required(
-            "layer.{}.mlp.experts.down_proj_bias",
-            [experts, hidden],
-        ))
+        //
+        // ...in OpenAI's publication. MLX's divides the same bank three
+        // ways and spells the bias with a dot, so neither name reaches
+        // it, and an `mlx-community/gpt-oss-20b-MXFP4-Q4` matched NO ROW
+        // AT ALL rather than this one. Measured against that checkpoint:
+        // those two names were the only faults in the whole manifest —
+        // the packed `embed_tokens`, the packed `lm_head` and even a
+        // ROUTER MLX quantizes at `[32, 720]` beside a `.scales` all
+        // agree already, because `extents_agree` divides the packing
+        // out. So the disagreement really was two names wide.
+        .with(
+            TensorSpec::required(
+                "layer.{}.mlp.experts.gate_up_proj_bias",
+                [experts, u64::from(2 * f.intermediate)],
+            )
+            // Gate and up, unfused: two halves of the fused row's last
+            // axis, at `[experts, intermediate]` each. Both are required
+            // together — one alone would be a checkpoint that publishes
+            // a gate and no up, which is not a mixture.
+            .or_published_as([
+                (
+                    "layer.{}.mlp.experts.gate_proj.bias",
+                    [experts, u64::from(f.intermediate)],
+                ),
+                (
+                    "layer.{}.mlp.experts.up_proj.bias",
+                    [experts, u64::from(f.intermediate)],
+                ),
+            ]),
+        )
+        .with(
+            TensorSpec::required("layer.{}.mlp.experts.down_proj_bias", [experts, hidden])
+                // The same tensor at the same extents under a dot. It is
+                // stated here rather than folded into `Observed::logical`
+                // because a general `_bias` -> `.bias` rule is FALSE:
+                // nemotron-h publishes a `mixer.dt_bias`, whose `dt` is
+                // no tensor, and the rule would rename it to something
+                // no checkpoint holds.
+                .or_published_as([("layer.{}.mlp.experts.down_proj.bias", [experts, hidden])]),
+        )
 }
 
 /// gpt-oss's gate alpha, the 1.702 that makes `x * sigmoid(alpha * x)`
@@ -184,7 +215,6 @@ pub fn deployment(
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         // gpt-oss softmaxes the k it selected, so the weights sum to
         // one. No `norm_topk_prob` key is in its config -- the router is
         // written that way.
@@ -212,7 +242,6 @@ pub fn deployment(
 /// is the engine's default MXFP4 policy: pointer arrays for the fused
 /// decode GEMV, the default route ceiling of `32 * experts`, no
 /// streaming.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn cuda_facts(f: &GptOssFacts, load: Deployed<'_>) -> super::forward::facts::GptOssCudaFacts {
     let _ = load;
@@ -254,44 +283,44 @@ pub fn cuda_facts(f: &GptOssFacts, load: Deployed<'_>) -> super::forward::facts:
 /// The CUDA leg's "seven rectangles" is a FUSION, not a requirement;
 /// Metal computes the same routing as a sort and a gather.
 ///
-/// # What is actually missing is a NAME both halves agree on
+/// # The NAME both halves needed is agreed now
 ///
-/// gpt-oss is published two ways and this build can serve neither.
+/// It was not. OpenAI's releases fuse the bank — `experts.gate_up_proj_
+/// blocks` (or a plain `gate_up_proj`) beside `gate_up_proj_bias` — and
+/// [`manifest`] pinned the BIAS for the reason it still says, that an
+/// encoding is not an identity. `driver-metal`'s `lowering::resolve`
+/// had no handle for that name: it names `mlp.experts.gate_proj` /
+/// `up_proj` / `down_proj`, which is MLX's. And an MLX gpt-oss splits
+/// the bias with the weight, so `mlx-community/gpt-oss-20b-MXFP4-Q4`
+/// matched NO ROW AT ALL. The manifest stated OpenAI's naming, `resolve`
+/// stated MLX's, and the checkpoint that satisfied one failed the other.
 ///
-/// OpenAI's releases fuse the bank: `experts.gate_up_proj_blocks` (or a
-/// plain `gate_up_proj`) beside `gate_up_proj_bias`. [`manifest`] pins
-/// the BIAS for exactly the reason it says — an encoding is not an
-/// identity — and `openai/gpt-oss-20b` does identify as this row.
-/// `driver-metal`'s `lowering::resolve` then has no handle for it: it
-/// names `mlp.experts.gate_proj` / `up_proj` / `down_proj`.
+/// [`TensorSpec::instead`] is that agreement: the two expert-bias rows
+/// accept MLX's division as an alternative LAYOUT, whole or not at all.
+/// Measured against the real snapshot, those two names were the entire
+/// disagreement — the packed embedding, the packed head and a router
+/// MLX quantizes to `[32, 720]` all matched already. The MLX checkpoint
+/// identifies as this row today, and `a_split_expert_bank_is_a_third_
+/// publication_this_row_now_knows` holds the measurement.
 ///
-/// Those are MLX's, and an MLX gpt-oss splits the bias with the weight —
-/// `experts.gate_proj.bias`, `experts.up_proj.bias`, each `[experts,
-/// intermediate]`. There is no `gate_up_proj_bias` for the manifest to
-/// find, so `mlx-community/gpt-oss-20b-MXFP4-Q4` matches no row at all.
-/// `Observed::logical` does not collapse `_bias` onto `.bias`; the two
-/// spellings are two keys.
+/// # What is missing now is the projection
 ///
-/// So the manifest states OpenAI's naming, `resolve` states MLX's, and
-/// the checkpoint that satisfies one fails the other. Serving gpt-oss on
-/// Metal is that disagreement plus a projection, and the disagreement
-/// first — a projection written today would resolve against nothing.
-/// `a_split_expert_bank_is_a_third_publication_this_row_does_not_know`
-/// holds the measurement.
+/// One thing, and it is the thing this doc always said was the smaller
+/// half: no `metal_shape` / `metal_facts` pair, so `Variant::trace`
+/// has no Metal text to hand back. Every ingredient named above is in
+/// place — the sinks reach the shader, the routed MXFP4 leg resolves,
+/// `LlamaLikeMetalFacts::gpt_oss_20b()` is written, and the checkpoint
+/// now arrives identified.
 ///
-/// A `Refusal::Unsupported` and not a `Malformed`: both checkpoints are
-/// fine, and each is served by something. What is missing is an
-/// agreement inside this build.
-pub const NO_METAL: &str = "no gpt-oss checkpoint this build identifies can be resolved on Metal: the \
-     OpenAI releases publish one FUSED expert bank (`experts.gate_up_proj*`), \
-     which is what this row's manifest pins and what `driver-metal`'s \
-     `resolve` has no handle for — it names the split `mlp.experts.gate_proj` \
-     / `up_proj` / `down_proj`, which is MLX's spelling, and an MLX gpt-oss \
-     splits the BIAS too and so satisfies no `gate_up_proj_bias` row here; \
-     the CUDA backend serves this row";
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine and CUDA serves it. What is missing is a text in this build.
+pub const NO_METAL: &str = "gpt-oss has no Metal text in this build: the checkpoint identifies and its \
+     tensors resolve — `TensorSpec::instead` settled the fused-versus-split \
+     expert-bias disagreement that used to stop it — but no `metal_shape` / \
+     `metal_facts` projection is written for this row, so there is no forward \
+     to trace; the CUDA backend serves this row";
 
 /// Trace this row's CUDA text for one fire class.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &GptOssFacts,
@@ -422,28 +451,36 @@ mod tests {
         }
     }
 
-    /// MLX publishes a THIRD gpt-oss and this row matches none of it.
+    /// MLX publishes a THIRD gpt-oss and this row now knows it.
     ///
-    /// The test above names two releases and [`manifest`]'s doc names
-    /// the same two, so "both spellings" reads as "every spelling".
+    /// The test above names two releases and [`manifest`]'s doc named
+    /// the same two, so "both spellings" read as "every spelling".
     /// `mlx-community/gpt-oss-20b-MXFP4-Q4` is a third: it splits the
     /// expert bank into `gate_proj` / `up_proj` / `down_proj`, and it
-    /// splits the BIAS with it — which is the half that matters, because
-    /// the bias is what this manifest pins in order NOT to match on an
-    /// encoding. There is no `gate_up_proj_bias` in that checkpoint at
-    /// any extent, so the row reports it missing and the snapshot
-    /// identifies as nothing.
+    /// splits the BIAS with it — which is the half that mattered,
+    /// because the bias is what this manifest pins in order NOT to
+    /// match on an encoding. No `gate_up_proj_bias` exists in that
+    /// checkpoint at any extent, and the snapshot identified as
+    /// NOTHING.
     ///
-    /// Asserted as a REFUSAL and not fixed here, because the fix is a
-    /// choice this test should not make silently: the manifest has no
-    /// "either of these names" and adding one is a change to the shape
-    /// of identity. What the test buys is that [`NO_METAL`] stops being
-    /// a claim — `driver-metal`'s `resolve` names precisely the tensors
-    /// below, so the one publication Metal could resolve is the one this
-    /// row cannot see, and the one this row sees is the one Metal has no
-    /// handle for.
+    /// It was left as a refusal because "either of these names" was a
+    /// change to the shape of identity that a test should not make
+    /// silently. It is made now, in [`TensorSpec::instead`], and made
+    /// narrow: an alternative applies only when EVERY name in it is
+    /// published at agreeing extents, so a checkpoint with a gate and
+    /// no up is still not a mixture. `Observed::logical` was the wrong
+    /// home for it — the two publications DIVIDE the bank, not just
+    /// spell it, and even the part that is only spelling (`down_proj_
+    /// bias` against `down_proj.bias`) cannot be a rule there, because
+    /// a general `_bias` -> `.bias` would rename nemotron-h's
+    /// `mixer.dt_bias` to a tensor no checkpoint holds.
+    ///
+    /// This test now asserts the acceptance, and the layout is stated
+    /// at MLX's real extents — `[32, 2880]` per leg, read off the
+    /// snapshot's safetensors headers rather than assumed from the
+    /// fused width halved.
     #[test]
-    fn a_split_expert_bank_is_a_third_publication_this_row_does_not_know() {
+    fn a_split_expert_bank_is_a_third_publication_this_row_now_knows() {
         let f = f20b();
         let m = manifest(&f);
 
@@ -466,12 +503,37 @@ mod tests {
             ));
         }
 
+        // `down_proj` is split the same way and spelled the same way,
+        // so the fixture has to carry MLX's name for it too or the test
+        // would be measuring one acceptance and calling it two.
+        let fused_down = "layer.0.mlp.experts.down_proj_bias";
+        let mut split: Vec<(String, Vec<u64>)> =
+            split.into_iter().filter(|(n, _)| n != fused_down).collect();
+        split.push((
+            "layer.0.mlp.experts.down_proj.bias".into(),
+            vec![32, u64::from(f.hidden)],
+        ));
+
+        assert!(
+            m.check(&Observed::from_pairs(split.clone())).is_ok(),
+            "an MLX-divided gpt-oss identifies as this row: {:?}",
+            m.check(&Observed::from_pairs(split.clone()))
+        );
+
+        // Half a layout is not a layout. A checkpoint that publishes a
+        // gate bias and no up bias has neither publication's bank, and
+        // accepting it would identify a mixture by one of its halves.
+        let half: Vec<(String, Vec<u64>)> = split
+            .into_iter()
+            .filter(|(n, _)| n != "layer.0.mlp.experts.up_proj.bias")
+            .collect();
         let err = m
-            .check(&Observed::from_pairs(split))
-            .expect_err("a split bank publishes no fused bias for this row to find");
+            .check(&Observed::from_pairs(half))
+            .expect_err("a gate without an up is not a divided bank");
         assert!(
             format!("{err:?}").contains("gate_up_proj_bias"),
-            "the row should name the fused bias it could not find, and said: {err:?}"
+            "the row should name the quantity it could not find under \
+             any layout, and said: {err:?}"
         );
     }
 
@@ -569,7 +631,6 @@ mod tests {
 
     /// The tracer's window list and the deployment's window table are
     /// one rule expanded twice, so they agree by construction.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_binding_facts_carry_the_same_schedule() {
         let f = f20b();
@@ -587,7 +648,6 @@ mod tests {
     /// not, once: gpt-oss had a facts row and only a Prefill arm, so a
     /// checkpoint loaded, reported itself healthy and died at its first
     /// decode.
-    #[cfg(feature = "forward")]
     #[test]
     fn every_fire_class_traces() {
         use model_compiler::trace::FireClass;

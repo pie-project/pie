@@ -130,8 +130,13 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
     let want: BTreeSet<&str> = [
         // Reads `DEP_PIE_KERNELS_VULKAN_SPV_DIR`. No compiler, no C.
         "driver-vulkan",
-        // nvcc, behind `native`, which nothing here turns on.
-        "kernels-cuda",
+        // The CUDA table crate `model-compiler` reads its rows from. Its
+        // script writes RUST into `OUT_DIR` -- one typed function per row --
+        // and declares no `links`, because unlike `kernels-cuda` it builds no
+        // archive. It replaced `kernels-cuda` in this closure when
+        // `model-compiler` moved to the new tables; the swap is why this list
+        // is compared as a SET and not counted.
+        "kernels-cuda-new",
         // The Metal shader build, behind `native`, and macOS-only besides.
         "kernels-metal",
         // glslc over the shader tree, behind `native`. This crate depends on

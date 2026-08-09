@@ -146,7 +146,6 @@ fn options_struct(driver: DriverKind) -> &'static str {
     match driver {
         DriverKind::CudaNative => "CudaNativeDriverOptions",
         DriverKind::Metal => "MetalDriverOptions",
-        DriverKind::Dummy => "DummyDriverOptions",
     }
 }
 
@@ -263,7 +262,6 @@ fn default_values(driver: DriverKind) -> toml::Value {
     let options = match driver {
         DriverKind::CudaNative => defaults_of::<crate::config::CudaNativeDriverOptions>(&empty),
         DriverKind::Metal => defaults_of::<crate::config::MetalDriverOptions>(&empty),
-        DriverKind::Dummy => defaults_of::<crate::config::DummyDriverOptions>(&empty),
     };
     if let (Some(options), Some(driver_table)) = (
         options,
@@ -302,7 +300,7 @@ mod tests {
         // has a blind spot -- which is how a parse that quietly broke would
         // otherwise present itself.
         let listed: std::collections::BTreeSet<String> =
-            keys(DriverKind::Dummy).into_iter().collect();
+            keys(DriverKind::Metal).into_iter().collect();
 
         fn collect(value: &toml::Value, prefix: &str, out: &mut Vec<String>) {
             let Some(table) = value.as_table() else {
@@ -319,7 +317,7 @@ mod tests {
             }
         }
         let mut serialized = Vec::new();
-        collect(&default_values(DriverKind::Dummy), "", &mut serialized);
+        collect(&default_values(DriverKind::Metal), "", &mut serialized);
 
         let missing: Vec<String> = serialized
             .iter()

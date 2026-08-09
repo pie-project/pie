@@ -2274,6 +2274,35 @@ pub mod metal {
         or_regions(out, x)
     }
 
+    /// `norm/add_bias.metal::add_bias_bfloat16` — the Qwen-2 family's q/k/v
+    /// projection biases, in place over the projection.
+    ///
+    /// One statement, and the value it produces is the value it was given:
+    /// the row declares `in_place = &[(0, 0)]`, so a driver binds one
+    /// allocation for both. The trace still names a result, the way
+    /// [`residual_add`] does, because a tape whose statements did not produce
+    /// values could not say what the next one reads.
+    ///
+    /// The width the kernel needs is the OUTPUT's row width, which the row
+    /// reads with `Source::OutWidth(0)` rather than taking as a stated scalar
+    /// — a bias vector's length is the projection's width, and the trace
+    /// already said that when it sized the value.
+    ///
+    /// [`residual_add`]: metal::residual_add
+    pub fn add_bias(x: &Val, w: &MatW) -> Val {
+        let shape = same_shape(x);
+        let out = record(
+            &x.t,
+            w.layer,
+            "add_bias_bfloat16",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            region_out(&x.t, shape),
+        );
+        or_regions(out, x)
+    }
+
     /// `residual_add.metal::residual_add_bfloat16` — the explicit
     /// landing, for the deployments and positions where no epilogue fold
     /// exists.
@@ -3083,8 +3112,23 @@ pub mod metal {
             // symbol, and `quantized_qmv.metal` exports exactly one:
             // `mxfp4_qmv_routed_bias`, at group 32 and 4 bits, which is the
             // only shape MXFP4 has. There is no unbiased twin, which is why
-            // this arm ignores `biased`.
-            WeightRepr::Mxfp4Marlin => "mxfp4_qmv_routed_bias".to_string(),
+            // this arm ignores `biased` -- and, since the name is not
+            // decoration, why it must be HANDED one. See below.
+            //
+            // The point is spelled out because the arm KNEW it and did not
+            // write it: this returned the bare symbol, and a bare symbol is
+            // not an entry point. `quant/qmv.metal` exports exactly
+            // `mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4`, so the fire failed
+            // at pipeline construction with "exports no such entry point".
+            //
+            // The two numbers are literal here and derived on the affine arm
+            // for a reason that is not laziness. Affine's group and bits are
+            // the CHECKPOINT's -- its `quantization` block picks 64/4 or
+            // 128/8 -- so `affine_point` reads them off the repr. MXFP4's are
+            // the FORMAT's: E2M1 mantissas are four bits and an E8M0 block
+            // exponent covers thirty-two of them, and a checkpoint claiming
+            // any other pair would not be MXFP4.
+            WeightRepr::Mxfp4Marlin => "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4".to_string(),
             repr => {
                 let point = affine_point(repr, bits);
                 if biased {
@@ -3095,12 +3139,32 @@ pub mod metal {
             }
         };
         let sym = sym.as_str();
+        // WHETHER the chosen symbol reads an additive bias, which is not the
+        // same question as `biased`: the affine pair has both instantiations
+        // and honours the caller, MXFP4 has only the biased one and reads a
+        // bias whatever was asked for.
+        //
+        // It decides the WEIGHT LIST, and that is why it has to be asked here.
+        // `qmv_routed_bias`'s twelfth parameter is `const device T* bias
+        // [[buffer(7)]]`, read per output row under `BIASED`, and it is a
+        // different tensor from the codec's zero-point plane at `buffer(2)` --
+        // one value per row against one per group. Handing the row only
+        // `quant_weights` left the kernel's `bias` naming a weight the
+        // statement does not have, which `driver-metal` bound as an address of
+        // zero and the kernel added to every logit.
+        //
+        // Nothing caught it because no catalog row states `moe_mxfp4`, so the
+        // one symbol that always reads a bias is the one nothing had run.
+        let mut weights = quant_weights(w);
+        if matches!(w.repr, WeightRepr::Mxfp4Marlin) || biased {
+            weights.push(format!("{}.bias", w.name));
+        }
         let in_w = in_width(x);
         with_params(
             &x.t,
             w.layer,
             sym,
-            quant_weights(w),
+            weights,
             None,
             vec![in_w, w.width, 0, in_w, experts_per_token],
             vec![x.id, expert_ids.id],
@@ -3371,41 +3435,6 @@ pub mod cuda {
         .expect("the norm+rope produces its value")
     }
 
-    /// `kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin`: the
-    /// fused decode QKV epilogue, over a device-carried window.
-    pub fn qkv_decode_fused_devwin(packed: &Val, l: u32, q_width: u32) -> Val {
-        record(
-            &packed.t,
-            Some(l),
-            "attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![packed.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
-        )
-        .expect("the fused epilogue produces its value")
-    }
-
-    /// `kernels::attn::write_kv_to_pages_bf16_devwin`: the page write, over
-    /// a device-carried window.
-    pub fn write_kv_to_pages_devwin(k: &Val, v: &Val, l: u32) {
-        record(
-            &k.t,
-            Some(l),
-            "attn::write_kv_to_pages_bf16_devwin",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![k.id, v.id],
-            None,
-        );
-    }
-
     /// `kernels::attn::write_kv_explicit_bf16_devwin`: the explicit-slot
     /// write, over a device-carried window.
     pub fn write_kv_explicit_devwin(k: &Val, v: &Val, l: u32) {
@@ -3615,20 +3644,6 @@ pub mod cuda {
         .expect("the scan produces its value")
     }
 
-    /// `kernels::gemm::act_x_wt_bf16_cublas`: the plain cuBLAS GEMM, named.
-    pub fn gemm_cublas(act: &Val, w: &str, n: u32) -> Val {
-        record(
-            &act.t,
-            act.layer,
-            "gemm::act_x_wt_bf16_cublas",
-            vec![w.to_string()],
-            None,
-            vec![act.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(n)]), DType::BF16)),
-        )
-        .expect("the gemm produces its value")
-    }
-
     /// `kernels::gemm::act_x_wt_bf16_out_fp32`: the same, accumulating to fp32.
     pub fn gemm_out_fp32(act: &Val, w: &str, n: u32) -> Val {
         record(
@@ -3704,21 +3719,6 @@ pub mod cuda {
             Some((Shape(vec![Dim::Tokens, Dim::Const(n)]), DType::BF16)),
         )
         .expect("the gemm produces its value")
-    }
-
-    /// `kernels::mlp::sigmoid_scalar_gate_add_bf16`: add `x` onto `out`,
-    /// each row scaled by its own sigmoid gate.
-    pub fn sigmoid_scalar_gate_add(out: &Val, x: &Val, gate: &Val, hidden: u32) -> Val {
-        record(
-            &out.t,
-            out.layer,
-            "mlp::sigmoid_scalar_gate_add_bf16",
-            vec![],
-            None,
-            vec![out.id, x.id, gate.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the gated add produces its value")
     }
 
     /// `kernels::layout::split_bf16_rows`: split `[N, l+r]` into `[N, l]` and
@@ -3849,116 +3849,6 @@ pub mod cuda {
         .expect("the copy produces its value")
     }
 
-    // ── qwen3_5: the single-request GDN entries ────────────────────
-    //
-    // The unbatched twins of the `_batched` forms above: a legacy parity
-    // entrypoint and a single-request fast path. Same recurrence, one
-    // request, so they are not `whole` for the reason the batched ones are
-    // not -- their `B` is the batch, not a window into one.
-
-    /// `kernels::ssm::recurrent_gated_delta_step`: one decode step,
-    /// single request.
-    pub fn gdn_step_single(q: &Val, l: u32, heads: u32, v_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "ssm::recurrent_gated_delta_step",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Requests, Dim::Const(heads), Dim::Const(v_dim)]),
-                DType::F32,
-            )),
-        )
-        .expect("the step produces its value")
-    }
-
-    /// The same, with the state kept in bf16.
-    ///
-    /// A precision BINDING, not a variant: which one a deployment uses is a
-    /// load-time fact, exactly as the `_batched` pair above states it.
-    pub fn gdn_step_single_state_bf16(q: &Val, l: u32, heads: u32, v_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "ssm::recurrent_gated_delta_step_state_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Requests, Dim::Const(heads), Dim::Const(v_dim)]),
-                DType::F32,
-            )),
-        )
-        .expect("the step produces its value")
-    }
-
-    /// `kernels::ssm::chunk_gated_delta_prefill`: the chunked prefill,
-    /// single request.
-    pub fn gdn_prefill_single(q: &Val, l: u32, heads: u32, v_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "ssm::chunk_gated_delta_prefill",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(v_dim)]),
-                DType::F32,
-            )),
-        )
-        .expect("the prefill produces its value")
-    }
-
-    /// The same, with the state kept in bf16.
-    pub fn gdn_prefill_single_state_bf16(q: &Val, l: u32, heads: u32, v_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "ssm::chunk_gated_delta_prefill_state_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(v_dim)]),
-                DType::F32,
-            )),
-        )
-        .expect("the prefill produces its value")
-    }
-
-    /// `kernels::ssm::causal_conv1d_prefill_bf16`: the prefill conv,
-    /// single request.
-    pub fn causal_conv1d_prefill_single(x: &Val, weight: &str, l: u32, channels: u32) -> Val {
-        record(
-            &x.t,
-            Some(l),
-            "ssm::causal_conv1d_prefill_bf16",
-            vec![weight.to_string()],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![x.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(channels)]), DType::BF16)),
-        )
-        .expect("the conv produces its value")
-    }
-
     // ── qwen3_5: the rest ──────────────────────────────────────────
 
     /// `kernels::norm::rmsnorm_gated_bf16`: the gated RMS norm, in its own
@@ -4023,39 +3913,6 @@ pub mod cuda {
             Some((Shape(vec![aligned, Dim::Const(width)]), DType::BF16)),
         )
         .expect("the gemm produces its value")
-    }
-
-    /// `kernels::mlp::chunked_swiglu_strided_bf16`: chunked swiglu over
-    /// strided rows.
-    pub fn chunked_swiglu_strided(x: &Val, intermediate: u32) -> Val {
-        record(
-            &x.t,
-            x.layer,
-            "mlp::chunked_swiglu_strided_bf16",
-            vec![],
-            None,
-            vec![x.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the activation produces its value")
-    }
-
-    /// `kernels::mlp::sigmoid_scalar_gate_strided_add_bf16`: the shared
-    /// expert's sigmoid-gated add, into a strided destination.
-    pub fn sigmoid_scalar_gate_strided_add(x: &Val, y: &Val, gate: &Val, width: u32) -> Val {
-        record(
-            &x.t,
-            x.layer,
-            "mlp::sigmoid_scalar_gate_strided_add_bf16",
-            vec![],
-            None,
-            vec![x.id, y.id, gate.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the gated add produces its value")
     }
 
     /// `kernels::layout::concat_bf16_rows`: join two row-aligned tensors
@@ -4243,34 +4100,6 @@ pub mod cuda {
         .expect("the norm+rope produces its value")
     }
 
-    /// `kernels::layout::split_gate_up_bf16`: split a packed `[N, 2·I]` bank.
-    ///
-    /// By HALVES, unlike [`Self::deinterleave_rows`], which splits by parity.
-    /// Same shape, different layout, and the checkpoint decides which.
-    pub fn split_gate_up(packed: &Val, intermediate: u32) -> (Val, Val) {
-        let outs = record_many(
-            &packed.t,
-            packed.layer,
-            "layout::split_gate_up_bf16",
-            vec![],
-            vec![packed.id],
-            vec![
-                (
-                    Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                    DType::BF16,
-                ),
-                (
-                    Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                    DType::BF16,
-                ),
-            ],
-        );
-        let mut it = outs.into_iter();
-        let gate = it.next().expect("the split states two outputs");
-        let up = it.next().expect("the split states two outputs");
-        (gate, up)
-    }
-
     /// `kernels::quant::scale_rows_bf16`: scale each row by its own factor.
     pub fn scale_rows(x: &Val, scale: &Val, width: u32) -> Val {
         record(
@@ -4314,46 +4143,6 @@ pub mod cuda {
         .expect("the scale produces its value")
     }
 
-    /// `kernels::norm::residual_add_scale_rmsnorm_bf16`: residual add, a
-    /// scalar scale, and the next pre-norm, fused.
-    ///
-    /// gemma-4's end-of-layer shape. The scale sits BETWEEN the add and the
-    /// norm, which is why it is not [`Self::residual_add_rmsnorm`] with an
-    /// extra multiply somewhere.
-    pub fn residual_add_scale_rmsnorm(x: &Val, residual: &Val, weight: &str, hidden: u32) -> Val {
-        record(
-            &x.t,
-            x.layer,
-            "norm::residual_add_scale_rmsnorm_bf16",
-            vec![weight.to_string()],
-            None,
-            vec![x.id, residual.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the fused norm produces its value")
-    }
-
-    /// `kernels::attn::dispatch_attention_flashinfer_prefill_sm90_bf16`: the FA3
-    /// prefill, on Hopper.
-    pub fn flashinfer_prefill_sm90(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "attn::dispatch_attention_flashinfer_prefill_sm90_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the attention produces its value")
-    }
-
     // ── mixtral / gpt-oss: the MXFP4 MoE path ──────────────────────
     //
     // gpt-oss ships its experts as MXFP4 -- 4-bit values with an E8M0
@@ -4363,21 +4152,6 @@ pub mod cuda {
     // no token extent at all. They are stated because they are launches the
     // fire performs, and a reader tracing where an operand came from should
     // find them on the tape.
-
-    /// `kernels::norm::add_bias_bf16_strided`: add a bias row into a strided
-    /// destination.
-    pub fn add_bias_strided(x: &Val, bias: &str, width: u32) -> Val {
-        record(
-            &x.t,
-            x.layer,
-            "norm::add_bias_bf16_strided",
-            vec![bias.to_string()],
-            None,
-            vec![x.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the bias add produces its value")
-    }
 
     /// `kernels::moe::add_moe_route_bias_bf16`: add each route's EXPERT
     /// bias, indexed by that route's expert.
@@ -4521,21 +4295,6 @@ pub mod cuda {
         (o0, o1, o2)
     }
 
-    /// `kernels::mlp::gpt_oss_glu_strided_bf16`: gpt-oss's clamped GLU,
-    /// reading and writing strided.
-    pub fn gpt_oss_glu_strided(gate: &Val, up: &Val, width: u32) -> Val {
-        record(
-            &gate.t,
-            gate.layer,
-            "mlp::gpt_oss_glu_strided_bf16",
-            vec![],
-            None,
-            vec![gate.id, up.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the activation produces its value")
-    }
-
     /// `kernels::norm::rmsnorm_bf16_with_fp16`: the norm, published in both
     /// bf16 and fp16.
     ///
@@ -4625,37 +4384,6 @@ pub mod cuda {
         .expect("the transpose produces its value")
     }
 
-    /// `kernels::quant::mxfp4_moe_gate_up_decode_grouped_bf16`: the gate and
-    /// up projections for every route, grouped by expert.
-    pub fn mxfp4_moe_gate_up_decode_grouped(
-        act: &Val,
-        sorted_route_ids: &Val,
-        counts: &Val,
-        intermediate: u32,
-    ) -> (Val, Val) {
-        let outs = record_many(
-            &act.t,
-            act.layer,
-            "quant::mxfp4_moe_gate_up_decode_grouped_bf16",
-            vec![],
-            vec![act.id, sorted_route_ids.id, counts.id],
-            vec![
-                (
-                    Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                    DType::BF16,
-                ),
-                (
-                    Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                    DType::BF16,
-                ),
-            ],
-        );
-        let mut it = outs.into_iter();
-        let gate = it.next().expect("the projection states two outputs");
-        let up = it.next().expect("the projection states two outputs");
-        (gate, up)
-    }
-
     /// `marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16`: the Marlin W4A16
     /// grouped MoE GEMM.
     ///
@@ -4672,27 +4400,6 @@ pub mod cuda {
             Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
         )
         .expect("the gemm produces its value")
-    }
-
-    /// `kernels::attn::dispatch_attention_flashinfer_decode_bf16`: the bf16-typed
-    /// decode dispatch.
-    pub fn flashinfer_decode_bf16(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "attn::dispatch_attention_flashinfer_decode_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the attention produces its value")
     }
 
     // ── deepseek_v4: hyper-connections ─────────────────────────────
@@ -5112,43 +4819,6 @@ pub mod cuda {
         .expect("the rope produces its value")
     }
 
-    /// `kernels::attn::write_kv_to_pages_bf16`: the bf16-typed page write.
-    pub fn write_kv_to_pages_bf16(k: &Val, v: &Val, l: u32) {
-        record(
-            &k.t,
-            Some(l),
-            "attn::write_kv_to_pages_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![k.id, v.id],
-            None,
-        );
-    }
-
-    /// `kernels::attn::attention_naive_paged_bf16`: the bf16-typed naive paged
-    /// attention.
-    pub fn attention_naive_paged_bf16(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "attn::attention_naive_paged_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the attention produces its value")
-    }
-
     /// Which shape a quantized weight's SCALE has.
     ///
     /// Three fp8 forms, and the difference is not a tuning knob: one scale
@@ -5322,30 +4992,6 @@ pub mod cuda {
         .expect("the scan produces its value")
     }
 
-    /// `kernels::ssm::causal_conv1d_update_bf16`: the decode-step conv,
-    /// reading and advancing the per-request conv window.
-    ///
-    /// `whole`: it advances a slot's state in place, so a row window would
-    /// advance the wrong ones.
-    pub fn causal_conv1d_update(x: &Val, weight: &str, bias: &str, l: u32, channels: u32) -> Val {
-        record(
-            &x.t,
-            Some(l),
-            "ssm::causal_conv1d_update_bf16",
-            vec![weight.to_string(), bias.to_string()],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![x.id],
-            Some((
-                Shape(vec![Dim::Requests, Dim::Const(channels)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the conv produces its value")
-    }
-
     /// `kernels::ssm::zamba_rmsnorm_gated_bf16`: the grouped, gated output
     /// norm mamba's block ends with.
     pub fn zamba_rmsnorm_gated(x: &Val, gate: &Val, weight: &str, hidden: u32) -> Val {
@@ -5447,21 +5093,6 @@ pub mod cuda {
             vec![topk_idx.id, topk_w.id, x.id],
             None,
         );
-    }
-
-    /// `kernels::moe::token_batched_weighted_sum_aligned_bf16`: combine the
-    /// aligned expert outputs back per token.
-    pub fn token_batched_weighted_sum_aligned(aligned_out: &Val, topk_w: &Val, hidden: u32) -> Val {
-        record(
-            &aligned_out.t,
-            aligned_out.layer,
-            "moe::token_batched_weighted_sum_aligned_bf16",
-            vec![],
-            None,
-            vec![aligned_out.id, topk_w.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the combine produces its value")
     }
 
     // ── KDA: Kimi Delta Attention ──────────────────────────────────
@@ -5713,27 +5344,6 @@ pub mod cuda {
     }
 
     // ── tensor-parallel shapes ─────────────────────────────────────
-
-    /// `kernels::layout::embed_bf16_vocab_shard`: gather from a vocab-SHARDED
-    /// embedding table.
-    ///
-    /// Under tensor parallelism the table is split along the vocabulary, so a
-    /// rank holds `[local_vocab, hidden]` starting at `vocab_offset` and
-    /// writes zeros for tokens outside its shard; the all-reduce that follows
-    /// makes the row whole. Row-shaped, so not `whole` — the shard is a
-    /// property of the WEIGHT, not of the row range.
-    pub fn embed_vocab_shard(t: &Trace, weight: &str, hidden: u32) -> Val {
-        record(
-            t,
-            None,
-            "layout::embed_bf16_vocab_shard",
-            vec![weight.to_string()],
-            None,
-            vec![],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the gather produces its value")
-    }
 
     /// `kernels::norm::residual_add_rmsnorm_bf16`: the residual add and the
     /// next block's pre-norm, fused.
@@ -6249,37 +5859,6 @@ pub mod cuda {
                     Dim::Const(heads),
                     Dim::Const(kv_lora_rank),
                 ]),
-                DType::BF16,
-            )),
-        )
-        .expect("the attention produces its value")
-    }
-
-    /// `kernels::attn::attention_flashinfer_prefill_custom`: the custom-mask
-    /// prefill in its PLAN-FREE form.
-    ///
-    /// The counterpart of [`Self::flashinfer_prefill_planless`]'s reasoning:
-    /// it takes the indptr arrays and the mask directly and builds its
-    /// R-shaped plan on the way in, so it owes its caller no prepare and
-    /// cannot be handed a row window. `whole`, and `FireWide` for the same
-    /// reason XQA is.
-    ///
-    /// gemma-3n binds this rather than the planned `flashinfer_custom` above,
-    /// which is a deployment fact and therefore something a declaration
-    /// states.
-    pub fn flashinfer_prefill_custom_planless(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "attn::attention_flashinfer_prefill_custom",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads * head_dim)]),
                 DType::BF16,
             )),
         )
@@ -7157,8 +6736,8 @@ pub mod cuda {
     /// dots `norm_x` with the `[1, H]` gate row, sigmoids the scalar, and
     /// accumulates `shared` into the stream.
     ///
-    /// The general form is a `[Tokens, 1]` GEMM followed by
-    /// `kernels::mlp::sigmoid_scalar_gate_add_bf16`; this fused form runs when
+    /// The general form is a `[Tokens, 1]` GEMM followed by a scalar-gated
+    /// add; this fused form runs when
     /// the gate weight is bound unquantized and `N` is within the decode
     /// fast path's bound (1024). Every fire this text covers is under
     /// `cutlass_max_rows` (<= 512), so within the declaration's own row

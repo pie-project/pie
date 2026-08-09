@@ -33,7 +33,6 @@ pub mod contract;
 /// Written in `model-compiler`'s tracing eDSL: ordinary Rust that runs at
 /// model-load time with the checkpoint's facts in hand and records what one
 /// pass computes. The traced form is what a driver executes.
-#[cfg(feature = "forward")]
 pub mod forward;
 
 /// What a Nemotron-H checkpoint IS — ungated, because a row is written
@@ -43,12 +42,12 @@ pub mod spec;
 /// What those numbers imply: a manifest, a deployment, a trace.
 pub mod project;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::{Advertised, Deployment, Refusal};
@@ -76,16 +75,6 @@ const NORM_EPS: f32 = 1e-5;
 /// from a default in a parser three crates away is a number nobody can
 /// find.
 const ROPE_THETA: f32 = 10_000.0;
-
-/// The head dim a CUDA build instantiates for this generation.
-///
-/// 128, which is `attention_head_dim` unchanged — a width the attention
-/// kernels are built at, so nothing is padded. It is stated by the row
-/// because it is a fact about the BINARY rather than about the
-/// checkpoint: the same weights on a build with a different
-/// instantiation set want a different number, and the checkpoint's own
-/// `head_dim` — which a tensor-parallel split reads — never moves.
-const HEAD_DIM_KERNEL: u32 = 128;
 
 /// One Nemotron-H checkpoint.
 ///
@@ -131,15 +120,7 @@ pub const VARIANTS: &[NemotronH] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&NemotronH` to
-/// `&dyn Variant`; the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(NemotronH);
 
 impl Variant for NemotronH {
     fn id(&self) -> &'static str {
@@ -179,8 +160,18 @@ impl Variant for NemotronH {
     /// Never, for this generation — both of its legs are traced.
     fn deployment(&self, load: Deployed<'_>) -> Result<Deployment, Refusal> {
         let _ = load;
-        let mut deployment =
-            project::deployment(&self.shape, ROPE_THETA, NORM_EPS, HEAD_DIM_KERNEL);
+        let mut deployment = project::deployment(
+            &self.shape,
+            ROPE_THETA,
+            NORM_EPS,
+            // ASKED of the table, not restated. This was a
+            // `HEAD_DIM_KERNEL: u32 = 128` whose own doc called it "a
+            // fact about the BINARY" -- which is exactly what
+            // `ATTN_HEAD_DIMS` is, so a second copy of one of its
+            // rows is a fourth place for the instantiation set to be
+            // written down and go stale.
+            crate::deployment::round_up_attn_head_dim(self.shape.attn.head_dim),
+        );
         deployment.advertised = Advertised {
             arch: ARCH,
             max_model_len: self.max_model_len,
@@ -210,7 +201,6 @@ impl Variant for NemotronH {
     ///
     /// Never: both legs of this hybrid are traced, and the dense MLP
     /// path is the one the guard in [`forward`] restored.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -249,12 +239,7 @@ impl Variant for NemotronH {
 #[cfg(test)]
 mod tests {
     use super::spec::NemotronLayerKind;
-    use super::{
-        ARCH, Deployed, HEAD_DIM_KERNEL, NORM_EPS, NemotronH, ROPE_THETA, VARIANTS, Variant, rows,
-    };
-    // Only the refusal's test names the projection's constant.
-    #[cfg(feature = "forward")]
-    use super::project;
+    use super::{ARCH, Deployed, NORM_EPS, NemotronH, ROPE_THETA, VARIANTS, Variant, rows};
     use crate::manifest::{Observed, Presence};
 
     fn row(id: &str) -> &'static NemotronH {
@@ -320,7 +305,10 @@ mod tests {
             assert_eq!(d.layers, v.shape.layers());
             assert_eq!(d.attention.len() as u32, v.shape.layers());
             assert_eq!(d.norm_eps, NORM_EPS);
-            assert_eq!(d.shape.head_dim_kernel, HEAD_DIM_KERNEL);
+            assert_eq!(
+                d.shape.head_dim_kernel,
+                crate::deployment::round_up_attn_head_dim(v.shape.attn.head_dim)
+            );
             assert!(d.attention.iter().all(|a| a.rope_theta == ROPE_THETA));
             assert_eq!(d.advertised.arch, ARCH);
             assert_eq!(d.advertised.max_model_len, 8192);
@@ -476,7 +464,6 @@ mod tests {
     /// so every one of them would have traced a router over zero
     /// experts. Tracing all three rows here is what holds the repair:
     /// the dense path is now the one the published stacks take.
-    #[cfg(feature = "forward")]
     #[test]
     fn every_row_traces_both_fire_classes_through_its_dense_mlp() {
         use model_compiler::trace::FireClass;
@@ -538,7 +525,6 @@ mod tests {
     /// The comparison is against [`project::NO_METAL`] itself and not a
     /// paraphrase, so the sentence a caller is shown is the sentence
     /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -552,6 +538,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {
@@ -561,7 +548,7 @@ mod tests {
                     .expect_err("this build has no Metal text for this generation");
                 assert_eq!(
                     err,
-                    Refusal::Unsupported(project::NO_METAL),
+                    Refusal::Unsupported(super::project::NO_METAL),
                     "`{}` refused a Metal load with a sentence that is not the \
                      one the row states",
                     v.id

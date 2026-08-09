@@ -1,4 +1,22 @@
+//===-- gather_tokens.cu - the compaction launchers ------------------===//
+//
+// Three host functions and not one `__global__`: the device text is in
+// `layout/gather_tokens.cuh`, which the host header includes, so the archive
+// and the JIT header set hold the SAME definitions rather than two that
+// drift.
+//
+//===----------------------------------------------------------------------===//
+
+// The scalar layer and the fixed-width integer names, out of the prelude.
+#include "pie_device.cuh"
+
+// The launcher declarations, and the forward declaration of `GatherTokenOp`
+// the host shim compiles against.
 #include "layout/gather_tokens.hpp"
+
+// The `__global__`s these launchers fire, and the definition of
+// `GatherTokenOp`. ONE definition of each, in the file NVRTC can also read.
+#include "layout/gather_tokens.cuh"
 
 #include <cstdint>
 #include <stdexcept>
@@ -7,80 +25,32 @@ namespace pie_cuda_driver::kernels::layout {
 
 namespace {
 
-// int4-vectorized copy (8 bf16 / 16 B per element): one block per (op, layer),
-// grid-stride over the op's contiguous span for K and V. Used when every span
-// base + length is 8-bf16-aligned (`token_stride % 8 == 0`), which holds for
-// head_dim ∈ {64,128,256,512}.
-__global__ void gather_tokens_i4_kernel(
-    int4* __restrict__ k,
-    int4* __restrict__ v,
-    const GatherTokenOp* __restrict__ ops,
-    std::int64_t token_stride_i4,
-    std::int64_t page_stride_i4,
-    std::int64_t layer_stride_i4)
-{
-    const GatherTokenOp o = ops[blockIdx.x];
-    const std::int64_t layer_off = static_cast<std::int64_t>(blockIdx.z) * layer_stride_i4;
-    const std::int64_t span = static_cast<std::int64_t>(o.len) * token_stride_i4;
-    const std::int64_t sbase = layer_off +
-        static_cast<std::int64_t>(o.src_page) * page_stride_i4 +
-        static_cast<std::int64_t>(o.src_off) * token_stride_i4;
-    const std::int64_t dbase = layer_off +
-        static_cast<std::int64_t>(o.dst_page) * page_stride_i4 +
-        static_cast<std::int64_t>(o.dst_off) * token_stride_i4;
-    for (std::int64_t i = threadIdx.x; i < span; i += blockDim.x) {
-        k[dbase + i] = k[sbase + i];
-        v[dbase + i] = v[sbase + i];
-    }
-}
-
-// Scalar bf16 fallback for a non-8-aligned token stride.
-__global__ void gather_tokens_u16_kernel(
-    std::uint16_t* __restrict__ k,
-    std::uint16_t* __restrict__ v,
-    const GatherTokenOp* __restrict__ ops,
-    std::int64_t token_stride,
-    std::int64_t page_stride,
-    std::int64_t layer_stride)
-{
-    const GatherTokenOp o = ops[blockIdx.x];
-    const std::int64_t layer_off = static_cast<std::int64_t>(blockIdx.z) * layer_stride;
-    const std::int64_t span = static_cast<std::int64_t>(o.len) * token_stride;
-    const std::int64_t sbase = layer_off +
-        static_cast<std::int64_t>(o.src_page) * page_stride +
-        static_cast<std::int64_t>(o.src_off) * token_stride;
-    const std::int64_t dbase = layer_off +
-        static_cast<std::int64_t>(o.dst_page) * page_stride +
-        static_cast<std::int64_t>(o.dst_off) * token_stride;
-    for (std::int64_t i = threadIdx.x; i < span; i += blockDim.x) {
-        k[dbase + i] = k[sbase + i];
-        v[dbase + i] = v[sbase + i];
-    }
-}
-
+// Picks the vectorised copy when both strides are 8-bf16 aligned. A HOST
+// test on a stride, which is why neither kernel is a row: no `Source`
+// produces "is this pointer's row stride a multiple of eight".
 void launch(
-    std::uint16_t* k_pages, std::uint16_t* v_pages,
+    device::u16* k_pages, device::u16* v_pages,
     const GatherTokenOp* ops, int num_ops,
-    int num_layers, std::int64_t layer_stride_elems,
+    int num_layers, device::i64 layer_stride_elems,
     int page_size, int num_kv_heads, int head_dim,
     cudaStream_t stream)
 {
     if (num_ops <= 0 || num_layers <= 0) return;
-    const std::int64_t token_stride =
-        static_cast<std::int64_t>(num_kv_heads) * head_dim;
-    const std::int64_t page_stride = token_stride * page_size;
+    const device::i64 token_stride =
+        static_cast<device::i64>(num_kv_heads) * head_dim;
+    const device::i64 page_stride = token_stride * page_size;
     const int threads = 256;
     const dim3 grid(static_cast<unsigned>(num_ops), 1u,
                     static_cast<unsigned>(num_layers));
 
     if (token_stride % 8 == 0 && layer_stride_elems % 8 == 0) {
-        gather_tokens_i4_kernel<<<grid, threads, 0, stream>>>(
+        device::gather_i4<<<grid, threads, 0, stream>>>(
             reinterpret_cast<int4*>(k_pages),
             reinterpret_cast<int4*>(v_pages),
             ops,
             token_stride / 8, page_stride / 8, layer_stride_elems / 8);
     } else {
-        gather_tokens_u16_kernel<<<grid, threads, 0, stream>>>(
+        device::gather_u16<<<grid, threads, 0, stream>>>(
             k_pages, v_pages, ops,
             token_stride, page_stride, layer_stride_elems);
     }
@@ -89,7 +59,7 @@ void launch(
 }  // namespace
 
 void launch_gather_tokens_bf16(
-    std::uint16_t* k_pages, std::uint16_t* v_pages,
+    device::u16* k_pages, device::u16* v_pages,
     const GatherTokenOp* ops, int num_ops,
     int page_size, int num_kv_heads, int head_dim,
     cudaStream_t stream)
@@ -99,9 +69,9 @@ void launch_gather_tokens_bf16(
 }
 
 void launch_gather_tokens_bf16_layers(
-    std::uint16_t* k_pages, std::uint16_t* v_pages,
+    device::u16* k_pages, device::u16* v_pages,
     const GatherTokenOp* ops, int num_ops,
-    int num_layers, std::int64_t layer_stride_elems,
+    int num_layers, device::i64 layer_stride_elems,
     int page_size, int num_kv_heads, int head_dim,
     cudaStream_t stream)
 {

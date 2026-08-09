@@ -337,4 +337,335 @@ mod tests {
         assert_eq!(e, LoadPlanError::Unidentified(u.clone()));
         assert_eq!(e.to_string(), u.to_string());
     }
+
+    /// A row reached by being HANDED OVER rather than identified, so it
+    /// can sit outside the catalog with no checkpoint matching it by
+    /// accident.
+    ///
+    /// It exists because the interesting half of `compile_load_plan_for`
+    /// is what happens AFTER identification, and every real row makes
+    /// getting there a question about that family's shapes instead of
+    /// about this module.
+    struct HandedOver {
+        author:
+            fn(&mut crate::shared::builder::Builder<'_>) -> Result<(), model_loader::error::Error>,
+    }
+
+    impl Variant for HandedOver {
+        fn id(&self) -> &'static str {
+            "handed-over"
+        }
+        fn manifest(&self) -> crate::manifest::Manifest {
+            crate::manifest::Manifest::new(1)
+        }
+        fn load_shape(&self) -> catalog::LoadShape {
+            catalog::LoadShape::dense(1, 64, true)
+        }
+        fn deployment(
+            &self,
+            _load: catalog::Deployed<'_>,
+        ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
+            Err(crate::deployment::Refusal::Unsupported(
+                "a boot fixture states an author, and is never served",
+            ))
+        }
+        fn author(
+            &self,
+            b: &mut crate::shared::builder::Builder<'_>,
+        ) -> Result<(), model_loader::error::Error> {
+            (self.author)(b)
+        }
+        fn trace(
+            &self,
+            _class: model_compiler::trace::FireClass,
+            _load: catalog::Deployed<'_>,
+        ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+            Err(crate::deployment::Refusal::Unsupported(
+                "a boot fixture has no forward text",
+            ))
+        }
+        /// The one method with no honest answer, and the one this
+        /// fixture may therefore refuse.
+        ///
+        /// `chat` is total — that is the repair for `instruct::create`'s
+        /// `_ =>` arm — so no row in the catalog may do this. A stand-in
+        /// would have to name a real family, which is a fact about that
+        /// family sitting in this module, and `common_is_thin` refuses
+        /// it for the same reason a reader would.
+        #[cfg(feature = "chat")]
+        fn chat(
+            &self,
+            _tokenizer: std::sync::Arc<tokenizer::Tokenizer>,
+        ) -> std::sync::Arc<dyn crate::instruct::Instruct> {
+            unreachable!("a boot fixture states an author, and is never formatted for")
+        }
+    }
+
+    /// One file holding one tensor, at a size a plan can be held to.
+    fn one_tensor_checkpoint(path: &str, bytes: u64) -> CheckpointMetadata {
+        use model_loader::checkpoint::{CheckpointFile, RawTensor};
+        use model_loader::types::{DType, Encoding as TensorEncoding, FileId, TensorId};
+        CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: path.to_string(),
+                size_bytes: bytes,
+                format: model_loader::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: "model.norm.weight".to_string(),
+                file_id: FileId(0),
+                file_offset: 0,
+                span_bytes: bytes,
+                shape: vec![i64::try_from(bytes).unwrap_or(0) / 2],
+                encoding: TensorEncoding::Raw(DType::BF16),
+            }],
+        }
+    }
+
+    fn publish_everything(
+        b: &mut crate::shared::builder::Builder<'_>,
+    ) -> Result<(), model_loader::error::Error> {
+        b.publish_remaining()
+    }
+
+    /// A directory of this process's own, removed on the way out.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("pie-boot-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch directory");
+            Self(dir)
+        }
+        fn write(&self, name: &str, bytes: u64) {
+            std::fs::write(
+                self.0.join(name),
+                vec![0u8; usize::try_from(bytes).unwrap_or(0)],
+            )
+            .expect("a scratch file");
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The whole path, end to end: policy, author, compile, file check.
+    #[test]
+    fn a_row_that_authors_and_a_file_that_is_there_produces_a_plan() {
+        let scratch = Scratch::new("ok");
+        scratch.write("weights.safetensors", 128);
+        let (plan, moe) = compile_load_plan_for(
+            &scratch.0,
+            &one_tensor_checkpoint("weights.safetensors", 128),
+            &StorageTarget::default(),
+            &HandedOver {
+                author: publish_everything,
+            },
+            &Encoding::dense(),
+            Binding::HF_FUSED,
+        )
+        .expect("the file the plan declares is on disk at the size it declares");
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(
+            moe,
+            Mxfp4MoePolicy::RoutedDecode,
+            "a dense row asked `Auto` resolves to the routed path"
+        );
+    }
+
+    /// The stat happens AFTER the plan exists, which is the reason this
+    /// module does it at all: it is not "what is here" but "is what I
+    /// just promised still true".
+    #[test]
+    fn a_plan_whose_file_is_absent_is_refused_after_it_compiles() {
+        let scratch = Scratch::new("absent");
+        let err = compile_load_plan_for(
+            &scratch.0,
+            &one_tensor_checkpoint("weights.safetensors", 128),
+            &StorageTarget::default(),
+            &HandedOver {
+                author: publish_everything,
+            },
+            &Encoding::dense(),
+            Binding::HF_FUSED,
+        )
+        .expect_err("nothing was written");
+        assert!(matches!(err, LoadPlanError::Compile(_)));
+        assert!(
+            err.to_string().contains("weights.safetensors"),
+            "the refusal names the file it could not find: {err}"
+        );
+    }
+
+    /// A file of the wrong SIZE is the one this check exists for: the
+    /// name being right is what makes a truncated download look like a
+    /// working snapshot.
+    #[test]
+    fn a_plan_whose_file_is_the_wrong_size_is_refused() {
+        let scratch = Scratch::new("short");
+        scratch.write("weights.safetensors", 64);
+        let err = compile_load_plan_for(
+            &scratch.0,
+            &one_tensor_checkpoint("weights.safetensors", 128),
+            &StorageTarget::default(),
+            &HandedOver {
+                author: publish_everything,
+            },
+            &Encoding::dense(),
+            Binding::HF_FUSED,
+        )
+        .expect_err("64 is not 128");
+        assert!(matches!(err, LoadPlanError::Compile(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("64") && message.contains("128"),
+            "the refusal states both sizes, because either alone is unactionable: {message}"
+        );
+    }
+
+    /// An author that refuses stops the walk there, and its words reach
+    /// the caller rather than a wrapper's.
+    #[test]
+    fn an_author_that_refuses_is_the_error_the_caller_sees() {
+        fn refuse(
+            _: &mut crate::shared::builder::Builder<'_>,
+        ) -> Result<(), model_loader::error::Error> {
+            crate::shared::builder::fail("this row will not author today")
+        }
+        let scratch = Scratch::new("refuse");
+        scratch.write("weights.safetensors", 128);
+        let err = compile_load_plan_for(
+            &scratch.0,
+            &one_tensor_checkpoint("weights.safetensors", 128),
+            &StorageTarget::default(),
+            &HandedOver { author: refuse },
+            &Encoding::dense(),
+            Binding::HF_FUSED,
+        )
+        .expect_err("the author refused");
+        // The author's own words survive; what is added is the stage,
+        // which is what tells an operator whether to look at their
+        // checkpoint or at the plan.
+        assert_eq!(
+            err,
+            LoadPlanError::Compile("contract: this row will not author today".to_string())
+        );
+    }
+
+    /// A checkpoint with the three attention projections a fused GEMM
+    /// joins, so the driver's second field is observable in the output
+    /// rather than read off the policy struct.
+    fn attention_checkpoint(path: &str) -> CheckpointMetadata {
+        use model_loader::checkpoint::{CheckpointFile, RawTensor};
+        use model_loader::types::{
+            CheckpointFormat, DType, Encoding as TensorEncoding, FileId, TensorId,
+        };
+        const HIDDEN: i64 = 64;
+        const SPAN: u64 = (HIDDEN * HIDDEN * 2) as u64;
+        let names = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+        ];
+        CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: path.to_string(),
+                size_bytes: SPAN * names.len() as u64,
+                format: CheckpointFormat::Safetensors,
+            }],
+            tensors: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| RawTensor {
+                    id: TensorId(u32::try_from(index).expect("three tensors")),
+                    name: (*name).to_string(),
+                    file_id: FileId(0),
+                    file_offset: SPAN * index as u64,
+                    span_bytes: SPAN,
+                    shape: vec![HIDDEN, HIDDEN],
+                    encoding: TensorEncoding::Raw(DType::BF16),
+                })
+                .collect(),
+        }
+    }
+
+    /// The policy this module states is the one the author reads, and the
+    /// driver contributes exactly two fields of it.
+    ///
+    /// The other six are the reason this module exists: two drivers each
+    /// carried a copy of this block, and a field added to `Policy` would
+    /// get a considered value on the copy its author was looking at and a
+    /// `Default` on the other.
+    ///
+    /// The two the driver DOES name are checked in the contract rather
+    /// than read off the struct, because a policy field that reaches no
+    /// author is not a policy.
+    #[test]
+    fn the_driver_names_two_fields_and_this_module_names_the_rest() {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<(Naming, RuntimeQuant, Mxfp4MoeRequest, bool)>> =
+            Mutex::new(Vec::new());
+        fn observe(
+            b: &mut crate::shared::builder::Builder<'_>,
+        ) -> Result<(), model_loader::error::Error> {
+            SEEN.lock().expect("no test poisons this").push((
+                b.naming(),
+                b.runtime_quant(),
+                b.mxfp4_moe_request(),
+                b.stream_routed_experts(),
+            ));
+            b.dense_fused_projection_joins()?;
+            b.publish_remaining()
+        }
+
+        let scratch = Scratch::new("policy");
+        let metadata = attention_checkpoint("weights.safetensors");
+        scratch.write("weights.safetensors", metadata.files[0].size_bytes);
+        let mut fused_names = Vec::new();
+        for binding in [Binding::HF_FUSED, Binding::MLX_IN_PLACE] {
+            let (plan, _) = compile_load_plan_for(
+                &scratch.0,
+                &metadata,
+                &StorageTarget::default(),
+                &HandedOver { author: observe },
+                &Encoding::dense(),
+                binding,
+            )
+            .expect("the fixture authors");
+            fused_names.push(
+                plan.tensors
+                    .iter()
+                    .any(|t| t.name.contains("qkv_proj.fused")),
+            );
+        }
+
+        assert_eq!(
+            fused_names,
+            vec![true, false],
+            "`Projections::Fused` joins the three attention projections and \
+             `InPlace` leaves them as stored"
+        );
+
+        let seen = SEEN.lock().expect("no test poisons this").clone();
+        assert_eq!(seen.len(), 2, "both bindings reached the author");
+        for (index, binding) in [Binding::HF_FUSED, Binding::MLX_IN_PLACE]
+            .iter()
+            .enumerate()
+        {
+            let (naming, quant, moe, streaming) = seen[index];
+            // The driver's own answer.
+            assert_eq!(naming, binding.naming);
+            // And the ones no driver may vary, which is the whole point.
+            assert_eq!(quant, RuntimeQuant::None);
+            assert_eq!(moe, Mxfp4MoeRequest::Auto);
+            assert!(!streaming);
+        }
+    }
 }

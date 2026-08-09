@@ -586,6 +586,42 @@ fn a_row_that_states_its_operands_agrees_with_its_shader() {
 /// is read anyway — on this backend, whatever the last dispatch left there. So
 /// this counts them, and the count is the last measurable distance between the
 /// executor and a fire worth checking against a checkpoint.
+/// The slots a row leaves unbound on purpose, with the argument for each.
+///
+/// `(symbol, buffer, operand)`. A row is POSITIONAL, so a slot the kernel
+/// declares and nothing fills has to be listed rather than dropped — dropping
+/// it shifts every operand after it. What this table adds is WHY, per slot,
+/// and the test holds the set exactly: a new hole fails, and so does an
+/// argument whose slot has since been filled.
+const DELIBERATE: &[(&str, usize, &str)] = &[
+    // SEVEN buffers of a shared ring ABI `kv_append_paged` declares and does
+    // not read. Nothing fills them because nothing should.
+    ("kv_append_paged_bfloat16", 4, "ring_4"),
+    ("kv_append_paged_bfloat16", 6, "ring_6"),
+    ("kv_append_paged_bfloat16", 7, "ring_7"),
+    ("kv_append_paged_bfloat16", 8, "ring_8"),
+    ("kv_append_paged_bfloat16", 9, "ring_9"),
+    ("kv_append_paged_bfloat16", 11, "ring_11"),
+    ("kv_append_paged_bfloat16", 15, "ring_15"),
+    // A slot the OTHER instantiation of the same kernel fills. `sinks` is
+    // `LlamaLikeMetalFacts::attn_sinks`'s, and no text in `texts()` sets it;
+    // `bias` is `affine_qmv_routed_bias`'s; `per_expert_scale` is
+    // `router_topk_scaled`'s.
+    ("sdpa_paged_decode_bfloat16_d_128", 16, "sinks"),
+    ("affine_qmv_routed_bfloat16_gs_64_b_4", 7, "bias"),
+    ("router_topk_bfloat16", 4, "per_expert_scale"),
+    // The one hole that is a property of a CODEC rather than of a sibling
+    // instantiation. `biases` is the affine zero-point plane, and MXFP4 has
+    // none: its scales are E8M0 block exponents with nothing to subtract.
+    // The kernel takes the pointer and ignores it, which is why the slot may
+    // be empty — and why it may not be SOURCED. It was, from `Weight(2)`,
+    // copied index-for-index off the affine row, and that pushed the additive
+    // bias this symbol does read to a `Weight(3)` the codec's weight list
+    // never reaches. See `model_dispatch::the_mxfp4_expert_bank_reads_a_bias_
+    // and_is_handed_one`.
+    ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", 2, "biases"),
+];
+
 #[test]
 fn every_slot_a_row_names_is_a_slot_a_statement_fills() {
     let mut holes: Vec<String> = Vec::new();
@@ -615,28 +651,42 @@ fn every_slot_a_row_names_is_a_slot_a_statement_fills() {
         holes.len(),
         holes.join("\n")
     );
-    // TEN, measured 2026-08-11, and every one is named:
+    // Every one is NAMED rather than counted.
     //
-    //   kv_append_paged: SEVEN buffers of a shared ring ABI the kernel
-    //     declares and does not read (4, 6-9, 11, 15). A row is positional so
-    //     they are listed; nothing fills them because nothing should.
-    //   sdpa_paged_decode: `sinks`, which gpt-oss reads and `llama_like` has
-    //     none of. The slot waits for a text that has them.
-    //   affine_qmv_routed: `bias`, which `affine_qmv_routed_bias` is the
-    //     symbol for. Same shape as `sinks` — a slot the OTHER instantiation
-    //     of this kernel fills.
-    //   router_topk: `per_expert_scale`, likewise `router_topk_scaled`'s.
-    //
-    // So every remaining hole is DELIBERATE — a declared-but-unread ABI and a
-    // feature this family lacks — rather than a value the text forgot. That is
-    // a different thing from the fourteen this started at, and the number
-    // should be read as "slots waiting on another family", not as debt.
+    // This used to assert `holes.len() <= 10` against a paragraph listing
+    // which ten. A count is the weaker claim by exactly the amount that
+    // matters: it passes when a deliberate hole is filled and an accidental
+    // one opens in the same run, and it says nothing about WHICH slot the
+    // eleventh is. The paragraph was already doing the real work; this makes
+    // it the assertion.
+    let deliberate: BTreeSet<String> = DELIBERATE
+        .iter()
+        .map(|(symbol, slot, name)| format!("  {symbol}: buffer {slot} (`{name}`)"))
+        .collect();
+    let found: BTreeSet<String> = holes.iter().cloned().collect();
+    let opened: Vec<&String> = found.difference(&deliberate).collect();
+    let closed: Vec<&String> = deliberate.difference(&found).collect();
     assert!(
-        holes.len() <= 10,
-        "{} slots no statement fills, which is more than the ten that are \
-         deliberate. A slot nobody fills is read anyway.\n{}",
-        holes.len(),
-        holes.join("\n")
+        opened.is_empty(),
+        "{} slot(s) no statement fills and no argument covers. A slot nobody \
+         fills is read anyway.\n{}",
+        opened.len(),
+        opened
+            .iter()
+            .map(|h| h.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        closed.is_empty(),
+        "{} slot(s) are argued for below and no row leaves them unbound. An \
+         excuse outliving its subject is how the next one gets believed.\n{}",
+        closed.len(),
+        closed
+            .iter()
+            .map(|h| h.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 

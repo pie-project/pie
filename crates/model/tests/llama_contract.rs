@@ -207,7 +207,6 @@ impl Variant for LlamaFixture {
         model::shared::llama_like::contract::author_llama_like(b)
     }
 
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         _class: model_compiler::trace::FireClass,

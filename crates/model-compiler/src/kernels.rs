@@ -22,7 +22,7 @@ use crate::trace::{ForwardPlan, OpKind};
 // surface. `Cap` and `Prepare` are named by model texts and by the tests
 // below; `KernelSig` is what `trace` and `emit_cuda` hold a reference to.
 pub use kernels::{Cap, KernelSig, Prepare};
-pub use kernels_cuda::KERNELS;
+pub use kernels_cuda_new::table::KERNELS;
 pub use kernels_metal::KERNELS as KERNELS_METAL;
 
 /// Which backend's kernels a lowered trace states.

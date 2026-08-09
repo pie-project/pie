@@ -26,22 +26,6 @@ use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::Dsv4Facts;
 
-/// Does this build provision the KV store a deployment asks for?
-///
-/// A property of the BINARY, not of any checkpoint — which is why it is
-/// stated here beside the projection rather than carried on a row. This
-/// is where `unbuilt_kv_store()` went: that method existed because a
-/// generation could hold a `FACTS_ROWS` row, load happily, report itself
-/// healthy and die at its first fire inside a walk. It answered with a
-/// STRING (`"the DSv4 compressed cache"`), and `deployment_of` then
-/// decided which store the string meant by asking whether it contained
-/// `"compress"` — so the answer to "can this binary serve this model"
-/// was a substring search over a sentence written for a human.
-#[must_use]
-pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    kv.has_a_store_in_this_build()
-}
-
 /// This row's tensors.
 ///
 /// # Where every name below comes from
@@ -172,7 +156,7 @@ pub fn manifest(f: &Dsv4Facts, tied_embeddings: bool) -> Manifest {
 /// A projection, and every value in it was already in the row. What the
 /// derivation this replaces did instead was re-read a resident
 /// `config.json` — and for this generation it did not even reach the
-/// numbers: it chose `KvStyle::Dsv4` by asking whether a family's
+/// numbers: it chose `KvStyle::CompressedPlane` by asking whether a family's
 /// `unbuilt_kv_store()` sentence contained the substring `"compress"`,
 /// and then filled the ratios with `Vec::new()`.
 ///
@@ -190,13 +174,9 @@ pub fn manifest(f: &Dsv4Facts, tied_embeddings: bool) -> Manifest {
 /// the honest answer rather than a load that dies at its first fire.
 pub fn deployment(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Result<Deployment, Refusal> {
     let planned = plan(f, rope_theta, norm_eps);
-    if kv_store_is_built(&planned.kv) {
-        Ok(planned)
-    } else {
-        Err(Refusal::Unsupported(
-            "this build provisions no compressed KV store; the row's pooled \
-             block entries have nowhere to live",
-        ))
+    match planned.kv.store_refusal() {
+        Some(no_store) => Err(no_store),
+        None => Ok(planned),
     }
 }
 
@@ -205,7 +185,7 @@ pub fn deployment(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Result<Deplo
 ///
 /// Separate from [`deployment`] so the two statements stay separable —
 /// "what this model needs" is the row's, "what this binary provides" is
-/// [`kv_store_is_built`]'s, and collapsing them is how a capability
+/// [`KvStyle::has_a_store_in_this_build`]'s, and collapsing them is how a capability
 /// question turns back into a family name.
 #[must_use]
 fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
@@ -286,7 +266,7 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // compressing layer that have to survive across fires, was
         // charged at zero bytes per token and came out of whatever the
         // KV pool did not use.
-        kv: KvStyle::Dsv4 {
+        kv: KvStyle::CompressedPlane {
             ratios: f.ratios.to_vec(),
         },
         // No recurrence: the compressed history is a CACHE keyed by
@@ -308,7 +288,6 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         // The row's own, not a class default -- see `Dsv4MoeFacts`.
         norm_topk_prob: f.moe.norm_topk_prob,
         routed_scaling: f.moe.routed_scaling,
@@ -374,7 +353,6 @@ pub const NO_METAL: &str = "deepseek-v4 has no Metal text in this build: its for
 /// input. Both fire classes trace — the compressed pass needs the block
 /// boundaries a fire's positions imply, and that is a per-TOKEN fact
 /// either class can state.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Dsv4Facts,
@@ -419,15 +397,21 @@ mod tests {
     /// the only shape a driver here provisions.
     #[test]
     fn only_the_paged_store_is_built() {
-        assert!(kv_store_is_built(&KvStyle::Paged));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 {
-            ratios: vec![1, 2, 4]
-        }));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: Vec::new() }));
-        assert!(!kv_store_is_built(&KvStyle::Mla {
-            kv_lora_rank: 512,
-            qk_rope_head_dim: 64
-        }));
+        assert!(KvStyle::Paged.has_a_store_in_this_build());
+        assert!(
+            !KvStyle::CompressedPlane {
+                ratios: vec![1, 2, 4]
+            }
+            .has_a_store_in_this_build()
+        );
+        assert!(!KvStyle::CompressedPlane { ratios: Vec::new() }.has_a_store_in_this_build());
+        assert!(
+            !KvStyle::Mla {
+                kv_lora_rank: 512,
+                qk_rope_head_dim: 64
+            }
+            .has_a_store_in_this_build()
+        );
     }
 
     /// The two ends of the stack, which every row in the catalog states
@@ -731,13 +715,13 @@ mod tests {
     }
 
     /// The compression schedule reaches the driver, which is the whole
-    /// repair: `KvStyle::Dsv4 { ratios: Vec::new() }` charged a V4's
+    /// repair: `KvStyle::CompressedPlane { ratios: Vec::new() }` charged a V4's
     /// compressor cache at nothing per token.
     #[test]
     fn the_kv_style_carries_the_schedule_the_row_states() {
         let d = plan(&f(), 10_000.0, 1e-5);
         match &d.kv {
-            KvStyle::Dsv4 { ratios } => {
+            KvStyle::CompressedPlane { ratios } => {
                 assert_eq!(ratios.as_slice(), &[1, 2, 4]);
                 assert!(
                     !ratios.is_empty(),
@@ -816,7 +800,6 @@ mod tests {
     /// Both fire classes trace, and they are different texts: the
     /// compressed pass reads its block boundaries from the positions a
     /// fire brings, and a decode's are not a prefill's.
-    #[cfg(feature = "forward")]
     #[test]
     fn both_fire_classes_have_a_text() {
         use model_compiler::trace::FireClass;

@@ -57,7 +57,7 @@
 //! out-of-range index (a caller bug) exactly where the C++ does.
 
 use driver_cuda::dtype::DType;
-use driver_cuda::layout::dsv4_geometry::{compress_bytes_per_token, compressor_coff};
+use driver_cuda::layout::compressed_plane_geometry::{compress_bytes_per_token, compressor_coff};
 use driver_cuda::layout::mla_geometry::MlaGeometry;
 use driver_cuda::layout::profile_key::{KEY_FIELDS, ProfileKey, StoredField};
 use driver_cuda::layout::recurrent_layout::{RecurrentShape, RecurrentStateLayout};

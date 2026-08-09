@@ -31,7 +31,6 @@
 //!
 //! The driver keeps no version of this. Reconciling two answers was
 //! only ever necessary because there were two.
-#![cfg(feature = "forward")]
 
 use model::catalog::{Deployed, catalog};
 use model::deployment::MlpGate;

@@ -29,12 +29,12 @@
 #[cfg(feature = "chat")]
 pub mod chat;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -304,12 +304,7 @@ pub const VARIANTS: &[Qwen2] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Qwen2);
 
 impl Qwen2 {
     /// The scalars this row states, read ONCE.
@@ -405,7 +400,6 @@ impl Variant for Qwen2 {
     /// same kind of thing), and a knob a checkpoint does not carry is
     /// not a fact about the checkpoint — so the ladder here is the plain
     /// geometric one at `rope_theta`.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -742,7 +736,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "forward")]
     #[test]
     fn every_row_traces_both_fire_classes() {
         use model_compiler::trace::FireClass;

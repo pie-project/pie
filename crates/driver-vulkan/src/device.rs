@@ -48,6 +48,7 @@ use kernels_vulkan::Capability;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Why there is no device to run on.
 ///
@@ -269,6 +270,170 @@ pub struct Device {
     /// feature the device has and the driver did not turn on is a feature a
     /// module may not declare a capability for.
     tiers: Vec<Capability>,
+    /// The objects a fire needs and does not need a new one of.
+    ///
+    /// Behind a lock because [`Self::run_all`] takes `&self` -- the driver
+    /// holds one device and fires from it -- and because a command pool and a
+    /// queue are externally synchronised objects. The lock is not a
+    /// concession: it is the same serialisation the queue already imposed.
+    scratch: Mutex<Scratch>,
+}
+
+/// What one fire allocates, kept between fires.
+///
+/// Measured on an RTX 4090, in microseconds per fire, made and destroyed each
+/// time against reused, over 300 fires after a warm-up:
+///
+/// | dispatches per fire | fresh | reused |
+/// | --- | --- | --- |
+/// | 1 | 421 | 35 |
+/// | 8 | 407 | 64 |
+/// | 64 | 582 | 220 |
+///
+/// The dispatches are a 256-wide RMS norm, which is microseconds of work, so
+/// the first column is very nearly the cost of creating and destroying a
+/// descriptor pool, a command buffer and a fence -- and it barely moves
+/// between one dispatch and eight, which is what a fixed cost looks like. A
+/// driver that decodes one token pays it once per fire, for every layer of
+/// every step.
+///
+/// Nothing here is a cache with a policy. The command buffer and the fence
+/// are one object each, reset before use. The descriptor pool GROWS -- when a
+/// fire wants more sets or more descriptors than the pool was built for, the
+/// pool is destroyed and a bigger one takes its place -- so a steady state
+/// stops allocating entirely, and a fire that is bigger than every fire
+/// before it pays once.
+struct Scratch {
+    /// Reset, not freed, at the start of every fire.
+    pool: vk::DescriptorPool,
+    /// How many sets this pool was built to hold.
+    sets: u32,
+    /// How many storage descriptors this pool was built to hold.
+    descriptors: u32,
+    /// One primary buffer, reset before each recording.
+    cmd: vk::CommandBuffer,
+    /// One fence, reset before each submit.
+    fence: vk::Fence,
+    /// How many descriptor pools this device has made, ever.
+    ///
+    /// Kept for [`Device::pools_made`], which is what lets a test state that
+    /// a steady state stops allocating. Without it, growing the pool to the
+    /// high-water mark and rebuilding it for every fire are indistinguishable
+    /// -- both answer correctly, and only one of them is the point.
+    made: u32,
+}
+
+impl Scratch {
+    /// Make the objects a fire reuses.
+    ///
+    /// The pool starts empty -- zero sets, zero descriptors -- because the
+    /// first fire's size is the only honest guess and it has not happened
+    /// yet. `for_run` grows it.
+    ///
+    /// # Safety
+    ///
+    /// `pool` must be a command pool of `device` created with
+    /// `RESET_COMMAND_BUFFER`, and the caller owns destroying the result with
+    /// [`Self::destroy`] before `device` goes.
+    unsafe fn new(device: &ash::Device, pool: vk::CommandPool) -> Result<Self, vk::Result> {
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }?[0];
+        let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+            Ok(f) => f,
+            Err(e) => {
+                unsafe { device.free_command_buffers(pool, &[cmd]) };
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            pool: vk::DescriptorPool::null(),
+            sets: 0,
+            descriptors: 0,
+            cmd,
+            fence,
+            made: 0,
+        })
+    }
+
+    /// A descriptor pool this fire fits in, emptied of the last fire's sets.
+    ///
+    /// Grown to what is asked and never shrunk. A driver's fires are the same
+    /// few shapes over and over, so the pool reaches the largest of them and
+    /// then stops being an allocation at all; shrinking would turn a steady
+    /// state back into churn to save memory measured in kilobytes.
+    ///
+    /// # Safety
+    ///
+    /// No command buffer using a set from this pool may still be executing.
+    /// The single fence [`Device::run_all`] waits on before returning is what
+    /// makes that true here.
+    unsafe fn for_run(
+        &mut self,
+        device: &ash::Device,
+        sets: u32,
+        descriptors: u32,
+    ) -> Result<vk::DescriptorPool, vk::Result> {
+        if self.pool != vk::DescriptorPool::null()
+            && sets <= self.sets
+            && descriptors <= self.descriptors
+        {
+            // Resetting frees every set at once, which is why the sets are
+            // not tracked individually: there is nothing to free them from.
+            unsafe {
+                device.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty())
+            }?;
+            return Ok(self.pool);
+        }
+        // The high-water mark rather than the request, in both dimensions.
+        // For one pipeline the two agree -- sets and descriptors climb
+        // together -- so no test here can tell them apart, and this is a
+        // deliberate survivor: it costs a comparison and stops a fire that is
+        // wide in sets and narrow in descriptors from shrinking the pool out
+        // from under the next fire that is the other way round.
+        let want_sets = sets.max(self.sets).max(1);
+        let want_descriptors = descriptors.max(self.descriptors).max(1);
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(want_descriptors)];
+        let fresh = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(want_sets)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }?;
+        if self.pool != vk::DescriptorPool::null() {
+            unsafe { device.destroy_descriptor_pool(self.pool, None) };
+        }
+        self.pool = fresh;
+        self.made += 1;
+        self.sets = want_sets;
+        self.descriptors = want_descriptors;
+        Ok(fresh)
+    }
+
+    /// Give everything back.
+    ///
+    /// # Safety
+    ///
+    /// `pool` must be the command pool the buffer came from, and no
+    /// submission may still be in flight.
+    unsafe fn destroy(&self, device: &ash::Device, pool: vk::CommandPool) {
+        unsafe {
+            if self.pool != vk::DescriptorPool::null() {
+                device.destroy_descriptor_pool(self.pool, None);
+            }
+            device.destroy_fence(self.fence, None);
+            device.free_command_buffers(pool, &[self.cmd]);
+        }
+    }
 }
 
 impl Device {
@@ -537,6 +702,21 @@ impl Device {
             }
         };
 
+        // The command buffer and the fence a fire reuses, made once here so
+        // that no fire has to. A failure at this point is a device that
+        // cannot record at all, which is the same class of failure as not
+        // having a queue.
+        let scratch = match unsafe { Scratch::new(&device, pool) } {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe {
+                    device.destroy_command_pool(pool, None);
+                    device.destroy_device(None);
+                }
+                bail!("cannot prepare a recording on {name}: {e}")
+            }
+        };
+
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         Ok(Self {
             entry,
@@ -555,7 +735,21 @@ impl Device {
             ),
             validated,
             tiers,
+            scratch: Mutex::new(scratch),
         })
+    }
+
+    /// How many descriptor pools the fires on this device have needed.
+    ///
+    /// One per fire would mean the pool is not being reused; a number that
+    /// stops climbing means it is. Public so a test can say which of those
+    /// is happening, since both compute the right answer.
+    #[must_use]
+    pub fn pools_made(&self) -> u32 {
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .made
     }
 
     /// What the device calls itself.
@@ -652,6 +846,35 @@ impl Device {
                         .property_flags
                         .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
             })
+    }
+
+    /// The largest heap this driver could allocate a buffer out of, in bytes.
+    ///
+    /// Every buffer here is host-visible and coherent (see [`Self::buffer`]),
+    /// so the answer is the largest heap backing a HOST_VISIBLE type and not
+    /// the largest heap on the part -- on a discrete card those differ by the
+    /// whole of VRAM, and the wrong one turns an allocation that will never
+    /// succeed into one a caller waits for.
+    ///
+    /// An upper bound and not a promise: the heap is shared with the weights,
+    /// with every other process on the device, and with whatever the
+    /// allocator has fragmented. It is used for one thing -- telling a
+    /// scheduler that a demand can never be met apart from one that cannot be
+    /// met NOW -- and for that, a bound that is too generous merely turns a
+    /// permanent refusal into a retried one.
+    #[must_use]
+    pub fn budget(&self) -> u64 {
+        let types = &self.memory.memory_types[..self.memory.memory_type_count as usize];
+        types
+            .iter()
+            .filter(|t| {
+                t.property_flags
+                    .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            })
+            .filter_map(|t| self.memory.memory_heaps.get(t.heap_index as usize))
+            .map(|h| h.size)
+            .max()
+            .unwrap_or(0)
     }
 
     /// A host-visible storage buffer holding `bytes`.
@@ -854,232 +1077,25 @@ impl Device {
         push: &[u8],
         groups: [u32; 3],
     ) -> Result<(), Failed> {
-        // One per slot in the layout, less the module's HOLES.
-        //
-        // Two different things make a layout wider than the bindings a module
-        // decorates, and they pull opposite ways:
-        //
-        // * a hole, where `glslc` dropped a binding in the MIDDLE of the set.
-        //   `affine_qmv_routed` has seven slots and one hole, and a real
-        //   lowering states exactly six operands for it. Demanding seven
-        //   would mean demanding a buffer for a binding no shader reads and
-        //   the plan does not name -- the caller would have to invent one.
-        //
-        // * a caller whose row lists MORE buffers than the module decorates,
-        //   which happens for eleven entrypoints and is legal.
-        //   `layer_scalar_mul_bfloat16` lists four against a module of three,
-        //   and `Pipelines::get` widens the layout to four so the call is not
-        //   refused for being right.
-        //
-        // Subtracting holes from the layout answers both: four for the
-        // second, six for the first. Counting only the decorated bindings
-        // answered the first and broke the second, which is how the two were
-        // found to be different questions.
-        let real = pipeline.bindings as usize - pipeline.declared.holes();
-        if buffers.len() != real {
-            return Err(Failed::Bindings {
-                module: real as u32,
-                bound: buffers.len(),
-            });
-        }
-        // Both directions. A short push leaves the shader reading bytes nothing
-        // wrote, which is the previous dispatch's block and reads as a
-        // plausible number.
-        if push.len() != pipeline.push as usize {
-            return Err(Failed::Push {
-                range: pipeline.push,
-                given: push.len(),
-            });
-        }
-        if groups.contains(&0) {
-            // Legal Vulkan, and always a defect: it runs nothing, returns
-            // success, and leaves the output holding whatever it was born with.
-            return Err(Failed::Vulkan(format!(
-                "a dispatch of {groups:?} workgroups would run nothing and report success"
-            )));
-        }
-        // Only the bindings whose block has a fixed size, which is the 39
-        // PARAMETER blocks. A tensor binding ends in a runtime array and its
-        // extent is the call's to decide, so there is nothing here to check it
-        // against and nothing is claimed.
-        // Zipped against the decorated bindings rather than counted from zero:
-        // `block_bytes` is indexed by BINDING NUMBER, and past a hole the
-        // caller's nth buffer is not binding n.
-        for (binding, bound) in slots(pipeline).zip(buffers) {
-            let Some(Some(needs)) = pipeline.declared.block_bytes.get(binding) else {
-                continue;
-            };
-            if bound.len < u64::from(*needs) {
-                return Err(Failed::Short {
-                    binding: binding as u32,
-                    needs: *needs,
-                    given: bound.len,
-                });
-            }
-        }
-
-        unsafe {
-            let sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(pipeline.bindings.max(1))];
-            let pool = self
-                .device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&sizes),
-                    None,
-                )
-                .map_err(|e| Failed::Vulkan(format!("descriptor pool: {e}")))?;
-
-            let answer = self.record(pipeline, buffers, push, groups, pool);
-            self.device.destroy_descriptor_pool(pool, None);
-            answer
-        }
-    }
-
-    /// The body of [`Self::run`], with the descriptor pool already made.
-    unsafe fn record(
-        &self,
-        pipeline: &Pipeline,
-        buffers: &[Bound<'_>],
-        push: &[u8],
-        groups: [u32; 3],
-        pool: vk::DescriptorPool,
-    ) -> Result<(), Failed> {
-        let device = &self.device;
-        let layouts = [pipeline.set_layout];
-        let sets = unsafe {
-            device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(pool)
-                    .set_layouts(&layouts),
-            )
-        }
-        .map_err(|e| Failed::Vulkan(format!("descriptor set: {e}")))?;
-        let set = sets[0];
-
-        let infos: Vec<_> = buffers
-            .iter()
-            .map(|b| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(b.buffer.handle)
-                    .offset(b.offset)
-                    // The range, never `WHOLE_SIZE`. `WHOLE_SIZE` means "to the
-                    // end of the buffer", so a sub-range written that way binds
-                    // its own start and everything after it, and a shader that
-                    // runs one row too far reads the NEXT tensor instead of
-                    // faulting. The extent is the half of an operand that makes
-                    // the overrun visible, and discarding it here would discard
-                    // it at the only point where the device could act on it.
-                    .range(b.len)
-            })
-            .collect();
-        // Only the bindings the module actually decorates.
-        //
-        // 165 of this tree's 665 modules leave a hole -- 358 of them in all --
-        // because `glslc` drops the declaration of a buffer a variant never
-        // reads, and `kv_append_paged` holes 10 and 11 on purpose to keep
-        // Metal's ring-ABI slots. A hole is free on Metal, where an argument
-        // index nothing is set at is one the shader does not read; the
-        // question here was whether Vulkan agrees, since the SET still needs
-        // a slot at every number up to the highest.
-        //
-        // It does, and the specification says so in the VUID this would
-        // otherwise trip: descriptors "must be valid IF THEY ARE ACCESSED".
-        // Measured under GPU-assisted validation rather than assumed --
-        // dispatching with both holes of a 7-binding module unwritten
-        // succeeds and the layer stays silent, while leaving a decorated one
-        // unwritten reports VUID-vkCmdDispatch-None-08114 by name.
-        //
-        // Skipping them is not merely allowed, it is the only thing this
-        // driver can do: a hole has no operand in the plan, so there is no
-        // buffer to put there and inventing one would bind an unrelated
-        // tensor to a slot on the theory that nothing reads it.
-        let writes: Vec<_> = slots(pipeline)
-            .zip(&infos)
-            .map(|(i, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            })
-            .collect();
-        if !writes.is_empty() {
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
-        }
-
-        let buffers_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmds = unsafe { device.allocate_command_buffers(&buffers_info) }
-            .map_err(|e| Failed::Vulkan(format!("command buffer: {e}")))?;
-        let cmd = cmds[0];
-
-        let result = (|| -> Result<(), Failed> {
-            unsafe {
-                device
-                    .begin_command_buffer(
-                        cmd,
-                        &vk::CommandBufferBeginInfo::default()
-                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                    )
-                    .map_err(|e| Failed::Vulkan(format!("begin: {e}")))?;
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
-                device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pipeline.layout,
-                    0,
-                    &[set],
-                    &[],
-                );
-                if !push.is_empty() {
-                    device.cmd_push_constants(
-                        cmd,
-                        pipeline.layout,
-                        vk::ShaderStageFlags::COMPUTE,
-                        0,
-                        push,
-                    );
-                }
-                device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
-                device
-                    .end_command_buffer(cmd)
-                    .map_err(|e| Failed::Vulkan(format!("end: {e}")))?;
-
-                let fence = device
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
-                    .map_err(|e| Failed::Vulkan(format!("fence: {e}")))?;
-                let cmd_bufs = [cmd];
-                let submits = [vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
-                let submitted = device
-                    .queue_submit(self.queue, &submits, fence)
-                    .map_err(|e| Failed::Vulkan(format!("submit: {e}")));
-                // A generous timeout, not an infinite one: a wait with no
-                // deadline on a hung device is a test run that never returns
-                // and reports nothing.
-                let waited = submitted.and_then(|()| {
-                    device
-                        .wait_for_fences(&[fence], true, 10_000_000_000)
-                        .map_err(|e| Failed::Vulkan(format!("wait: {e}")))
-                });
-                device.destroy_fence(fence, None);
-                waited
-            }
-        })();
-
-        unsafe { device.free_command_buffers(self.pool, &[cmd]) };
-        result
+        // A run of one, rather than a second path that records a dispatch.
+        // The two used to be written out separately, and the separate one
+        // kept its own descriptor pool, command buffer and fence per call --
+        // so every improvement to a fire had to be made twice or silently
+        // was not.
+        self.run_all(&[Recorded {
+            pipeline,
+            buffers,
+            push,
+            groups,
+        }])
+        .map_err(|(_, e)| e)
     }
 
     /// Record a run of dispatches into one command buffer and submit once.
     ///
     /// [`Self::run`] is one dispatch, one command buffer, one submit and one
     /// fence wait, which is right for a test and wrong for a fire: a real
-    /// plan states thousands of rectangles -- six texts here state 6272 --
+    /// plan states thousands of rectangles -- six texts here state 6584 --
     /// and one round trip to the queue per rectangle is most
     /// of the time a small model spends.
     ///
@@ -1106,28 +1122,49 @@ impl Device {
         if run.is_empty() {
             return Ok(());
         }
-        unsafe {
-            let sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(run.iter().map(|r| r.pipeline.bindings).sum::<u32>().max(1))];
-            let pool = self
-                .device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(run.len() as u32)
-                        .pool_sizes(&sizes),
-                    None,
-                )
-                .map_err(|e| (0, Failed::Vulkan(format!("descriptor pool: {e}"))))?;
-            let answer = self.record_all(run, pool);
-            self.device.destroy_descriptor_pool(pool, None);
-            answer
-        }
+        // A poisoned lock means a fire panicked mid-recording. The objects
+        // behind it are handles, not state a panic can leave half written --
+        // and the alternative is a device that answers nothing forever -- so
+        // the next fire takes them anyway.
+        let mut scratch = self
+            .scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let descriptors = run.iter().map(|r| r.pipeline.bindings).sum::<u32>();
+        // Safe because the previous fire waited on `scratch.fence` before it
+        // returned, so no command buffer holding one of these sets is still
+        // running.
+        let pool = unsafe { scratch.for_run(&self.device, run.len() as u32, descriptors) }
+            .map_err(|e| (0, Failed::Vulkan(format!("descriptor pool: {e}"))))?;
+        // Safe because `pool` came from `scratch` a line ago and the
+        // recording is the only user of either until it returns.
+        unsafe { self.record_all(run, pool, &scratch) }
     }
 
     /// Everything [`Self::run`] refuses a dispatch for, without recording it.
     fn check(&self, one: &Recorded<'_, '_>) -> Result<(), Failed> {
         let pipeline = one.pipeline;
+        // One per slot in the layout, less the module's HOLES.
+        //
+        // Two different things make a layout wider than the bindings a module
+        // decorates, and they pull opposite ways:
+        //
+        // * a hole, where `glslc` dropped a binding in the MIDDLE of the set.
+        //   `affine_qmv_routed` has seven slots and one hole, and a real
+        //   lowering states exactly six operands for it. Demanding seven
+        //   would mean demanding a buffer for a binding no shader reads and
+        //   the plan does not name -- the caller would have to invent one.
+        //
+        // * a caller whose row lists MORE buffers than the module decorates,
+        //   which happens for eleven entrypoints and is legal.
+        //   `layer_scalar_mul_bfloat16` lists four against a module of three,
+        //   and `Pipelines::get` widens the layout to four so the call is not
+        //   refused for being right.
+        //
+        // Subtracting holes from the layout answers both: four for the
+        // second, six for the first. Counting only the decorated bindings
+        // answered the first and broke the second, which is how the two were
+        // found to be different questions.
         let real = pipeline.bindings as usize - pipeline.declared.holes();
         if one.buffers.len() != real {
             return Err(Failed::Bindings {
@@ -1135,6 +1172,9 @@ impl Device {
                 bound: one.buffers.len(),
             });
         }
+        // Both directions. A short push leaves the shader reading bytes nothing
+        // wrote, which is the previous dispatch's block and reads as a
+        // plausible number.
         if one.push.len() != pipeline.push as usize {
             return Err(Failed::Push {
                 range: pipeline.push,
@@ -1166,6 +1206,7 @@ impl Device {
         &self,
         run: &[Recorded<'_, '_>],
         pool: vk::DescriptorPool,
+        scratch: &Scratch,
     ) -> Result<(), (usize, Failed)> {
         let device = &self.device;
         // Every set allocated and written BEFORE any recording. A descriptor
@@ -1192,9 +1233,40 @@ impl Device {
                     vk::DescriptorBufferInfo::default()
                         .buffer(b.buffer.handle)
                         .offset(b.offset)
+                        // The range, never `WHOLE_SIZE`. `WHOLE_SIZE` means
+                        // "to the end of the buffer", so a sub-range written
+                        // that way binds its own start and everything after
+                        // it, and a shader that runs one row too far reads
+                        // the NEXT tensor instead of faulting. The extent is
+                        // the half of an operand that makes the overrun
+                        // visible, and discarding it here would discard it at
+                        // the only point where the device could act on it.
                         .range(b.len)
                 })
                 .collect();
+            // Only the bindings the module actually decorates.
+            //
+            // 165 of this tree's 665 modules leave a hole -- 358 of them in
+            // all -- because `glslc` drops the declaration of a buffer a
+            // variant never reads, and `kv_append_paged` holes 10 and 11 on
+            // purpose to keep Metal's ring-ABI slots. A hole is free on
+            // Metal, where an argument index nothing is set at is one the
+            // shader does not read; the question here was whether Vulkan
+            // agrees, since the SET still needs a slot at every number up to
+            // the highest.
+            //
+            // It does, and the specification says so in the VUID this would
+            // otherwise trip: descriptors "must be valid IF THEY ARE
+            // ACCESSED". Measured under GPU-assisted validation rather than
+            // assumed -- dispatching with both holes of a 7-binding module
+            // unwritten succeeds and the layer stays silent, while leaving a
+            // decorated one unwritten reports VUID-vkCmdDispatch-None-08114
+            // by name.
+            //
+            // Skipping them is not merely allowed, it is the only thing this
+            // driver can do: a hole has no operand in the plan, so there is
+            // no buffer to put there and inventing one would bind an
+            // unrelated tensor to a slot on the theory that nothing reads it.
             let writes: Vec<_> = slots(one.pipeline)
                 .zip(&infos)
                 .map(|(i, info)| {
@@ -1211,16 +1283,13 @@ impl Device {
             sets.push(set);
         }
 
-        let cmds = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(self.pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| (0, Failed::Vulkan(format!("command buffer: {e}"))))?;
-        let cmd = cmds[0];
+        // Reset rather than allocated. `begin_command_buffer` on a buffer in
+        // the executable state is an implicit reset, but only for a pool made
+        // with `RESET_COMMAND_BUFFER`, and saying it here is what ties this
+        // code to that flag rather than to a memory of it.
+        let cmd = scratch.cmd;
+        unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
+            .map_err(|e| (0, Failed::Vulkan(format!("command buffer: {e}"))))?;
 
         let result = (|| -> Result<(), Failed> {
             unsafe {
@@ -1282,25 +1351,27 @@ impl Device {
                     .end_command_buffer(cmd)
                     .map_err(|e| Failed::Vulkan(format!("end: {e}")))?;
 
-                let fence = device
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                // The fire's own fence, unsignalled again. Reset HERE and
+                // not after the wait, so that a fire which fails between the
+                // reset and the submit leaves it in the state the next fire
+                // resets anyway rather than in one that would hang it.
+                let fence = scratch.fence;
+                device
+                    .reset_fences(&[fence])
                     .map_err(|e| Failed::Vulkan(format!("fence: {e}")))?;
                 let cmd_bufs = [cmd];
                 let submits = [vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
                 let submitted = device
                     .queue_submit(self.queue, &submits, fence)
                     .map_err(|e| Failed::Vulkan(format!("submit: {e}")));
-                let waited = submitted.and_then(|()| {
+                submitted.and_then(|()| {
                     device
                         .wait_for_fences(&[fence], true, 10_000_000_000)
                         .map_err(|e| Failed::Vulkan(format!("wait: {e}")))
-                });
-                device.destroy_fence(fence, None);
-                waited
+                })
             }
         })();
 
-        unsafe { device.free_command_buffers(self.pool, &[cmd]) };
         result.map_err(|e| (0, e))
     }
 }
@@ -1330,6 +1401,10 @@ impl Drop for Device {
             // undefined, and the layer reports it as a use-after-free with no
             // obvious connection to the test that caused it.
             let _ = self.device.device_wait_idle();
+            self.scratch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .destroy(&self.device, self.pool);
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
             if let Some((debug, m)) = self.messenger.take() {

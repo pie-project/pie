@@ -1,37 +1,30 @@
+// The kernel lives in `norm/elementwise.cuh` -- this file is the one entry
+// point that still launches it ahead of time, and nothing else.
+//
+// It used to carry its own `residual_add_bf16_kernel`, a second copy of
+// `device::residual_add<T>` with the same four lines of arithmetic. Two
+// copies that agree today are two kernels that drift, and each is right for
+// whichever half of the tree its tests exercise: the JIT rows fired the
+// template, this file fired the copy, and nothing compared them. The copy is
+// gone; the launcher spells the instantiation.
+#include "pie_device.cuh"
+#include "norm/elementwise.cuh"
 #include "norm/residual_add.hpp"
 
-#include <cuda_bf16.h>
 
 namespace pie_cuda_driver::kernels::norm {
 
-namespace {
-
-constexpr int BLOCK = 256;
-
-__global__ void residual_add_bf16_kernel(
-    __nv_bfloat16* __restrict__ y,
-    const __nv_bfloat16* __restrict__ x,
-    std::size_t n)
-{
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    const float a = __bfloat162float(y[i]);
-    const float b = __bfloat162float(x[i]);
-    y[i] = __float2bfloat16(a + b);
-}
-
-}  // namespace
-
 void residual_add_bf16(
     void* y, const void* x,
-    std::size_t n,
+    device::usize n,
     cudaStream_t stream)
 {
     if (n == 0) return;
+    constexpr int BLOCK = 256;
     const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    residual_add_bf16_kernel<<<blocks, BLOCK, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(y),
-        static_cast<const __nv_bfloat16*>(x),
+    device::residual_add<device::bf16><<<blocks, BLOCK, 0, stream>>>(
+        static_cast<device::bf16*>(y),
+        static_cast<const device::bf16*>(x),
         n);
 }
 

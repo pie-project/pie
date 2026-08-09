@@ -25,8 +25,6 @@
 //! backbone. What they may not do is skip the seam, and the assertions
 //! below are written to say exactly that.
 
-#![cfg(feature = "forward")]
-
 use model_compiler::trace::{FireClass, ForwardPlan, OpKind};
 
 /// Every family this crate can trace for CUDA, by name and plan.

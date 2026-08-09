@@ -2102,4 +2102,797 @@ mod tests {
         assert_eq!(c.tensors.len(), 1, "only the prefixed tensor is bound");
         assert_eq!(c.tensors[0].name, "layers.0.mlp.down_proj.weight");
     }
+
+    // ── the three refusals nothing had ever produced ──────────────────
+
+    fn tp(tp_size: u32) -> StorageTarget {
+        StorageTarget {
+            preferred_alignment: 256,
+            tp_size,
+            ..StorageTarget::default()
+        }
+    }
+
+    /// A rank cannot hold part of an attention head.
+    ///
+    /// The loader asks whether `tp_size` divides the ROW COUNT, which is
+    /// the weaker question: 6 heads of 128 is 768 rows, and 4 divides 768
+    /// while it does not divide 6. Only this builder knows `head_dim`, so
+    /// the sharper question has to be asked here or not at all — and a
+    /// rank given 192 rows would hold one and a half heads, which no
+    /// attention kernel can read.
+    #[test]
+    fn a_head_count_the_world_does_not_divide_is_refused_here_not_by_row_count() {
+        let meta = checkpoint(&[(
+            "model.layers.0.self_attn.q_proj.weight",
+            vec![768, 128],
+            Encoding::Raw(DType::BF16),
+        )]);
+        let target = tp(4);
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(
+            &meta,
+            "test-row",
+            LoadShape::dense(1, 128, false),
+            &enc,
+            &target,
+            &policy,
+        );
+        b.shard_axis_fn(|_| Ok(Some(0)));
+        let err = b
+            .publish_remaining()
+            .expect_err("6 heads do not divide 4 ways");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("6 head(s) of 128") && msg.contains("tp_size 4 does not"),
+            "the refusal names the arithmetic: {msg}"
+        );
+        // And the loader's own question passes: 768 rows over 4 ranks is
+        // 192 each. That is why this check has to exist here, where
+        // `head_dim` is known, rather than there.
+        let (rows, world, head_dim) = (768_i64, 4_i64, 128_i64);
+        assert_eq!(rows % world, 0, "the row count divides");
+        assert_ne!((rows / head_dim) % world, 0, "the head count does not");
+    }
+
+    /// Four ways a projection is not this rule's business, and each
+    /// leaves by a different door.
+    ///
+    /// The last two are the ones that made a control lie: a fused bank
+    /// whose rows are not a multiple of `head_dim` exits at the NAME
+    /// check long before reaching the shape escape it appears to
+    /// exercise, so the escape needs a name that IS in the list. And a
+    /// projection this rank does not split by row has no head boundary
+    /// to respect, however its head count divides.
+    #[test]
+    fn a_projection_this_rule_has_no_business_with_is_passed_through() {
+        for (case, name, rows, axis) in [
+            (
+                "8 heads over 4 ranks divides",
+                "model.layers.0.self_attn.q_proj.weight",
+                1024_i64,
+                Some(0),
+            ),
+            (
+                "an output projection is not in the list",
+                "model.layers.0.self_attn.o_proj.weight",
+                768,
+                Some(0),
+            ),
+            (
+                "nor is a fused bank",
+                "model.layers.0.self_attn.qkv_proj.weight",
+                768,
+                Some(0),
+            ),
+            (
+                "a listed projection whose rows are not whole heads",
+                "model.layers.0.self_attn.q_proj.weight",
+                750,
+                Some(0),
+            ),
+            (
+                "column-parallel, so no row is cut",
+                "model.layers.0.self_attn.q_proj.weight",
+                768,
+                Some(1),
+            ),
+            (
+                "replicated, so nothing is cut at all",
+                "model.layers.0.self_attn.q_proj.weight",
+                768,
+                None,
+            ),
+        ] {
+            let meta = checkpoint(&[(name, vec![rows, 128], Encoding::Raw(DType::BF16))]);
+            let target = tp(4);
+            let policy = Policy::default();
+            let enc = StoredEncoding::dense();
+            let mut b = Builder::new(
+                &meta,
+                "test-row",
+                LoadShape::dense(1, 128, false),
+                &enc,
+                &target,
+                &policy,
+            );
+            match axis {
+                Some(0) => b.shard_axis_fn(|_| Ok(Some(0))),
+                Some(_) => b.shard_axis_fn(|_| Ok(Some(1))),
+                None => b.shard_axis_fn(|_| Ok(None)),
+            }
+            assert!(b.publish_remaining().is_ok(), "{case}");
+        }
+    }
+
+    /// Encode-scoped loading and tensor parallelism do not compose.
+    ///
+    /// The towers are not sharded, so a family that scopes its bind to
+    /// them has nothing to say about which rank holds what. Refused when
+    /// the scope is asked for rather than at the first tensor.
+    #[test]
+    fn an_encode_scope_across_ranks_is_refused_when_it_is_asked_for() {
+        for (case, component, tp_size, ok) in [
+            (
+                "the towers alone across four ranks",
+                Component::Encode,
+                4,
+                false,
+            ),
+            ("the towers alone on one", Component::Encode, 1, true),
+            ("the whole model across four", Component::Full, 4, true),
+        ] {
+            let meta = empty_checkpoint();
+            let target = tp(tp_size);
+            let policy = Policy {
+                component,
+                ..Policy::default()
+            };
+            let enc = StoredEncoding::dense();
+            let mut b = Builder::new(
+                &meta,
+                "test-row",
+                LoadShape::dense(1, 128, false),
+                &enc,
+                &target,
+                &policy,
+            );
+            assert_eq!(b.allow_encode_scope().is_ok(), ok, "{case}");
+            if !ok {
+                let msg = b.allow_encode_scope().unwrap_err().to_string();
+                assert!(msg.contains("does not support tensor parallelism"), "{msg}");
+            }
+        }
+    }
+
+    /// A companion scale splits exactly like the weight it scales, and
+    /// the question is asked about the WEIGHT before the family's own
+    /// rule sees the scale's name.
+    ///
+    /// Two steps, because a family's rule may key on either spelling:
+    /// `foo.weight_scale` asks about `foo.weight` first and falls back to
+    /// `foo`. Without this a family that supplied its own `shard_axis_fn`
+    /// would have to remember every companion suffix, and forgetting one
+    /// splits a scale differently from the tensor it scales.
+    #[test]
+    fn a_companion_scale_is_asked_about_under_the_weights_name() {
+        fn only_the_weight(name: &str) -> Result<Option<u8>, Error> {
+            Ok(if name == "block.weight" {
+                Some(1)
+            } else {
+                None
+            })
+        }
+        fn only_the_base(name: &str) -> Result<Option<u8>, Error> {
+            Ok(if name == "block" { Some(1) } else { None })
+        }
+        let meta = empty_checkpoint();
+        let target = tp(2);
+        let policy = Policy::default();
+        for (case, f) in [
+            (
+                "the family keys on `block.weight`",
+                only_the_weight as fn(&str) -> _,
+            ),
+            ("the family keys on `block`", only_the_base as fn(&str) -> _),
+        ] {
+            let enc = StoredEncoding::dense();
+            let mut b = Builder::new(
+                &meta,
+                "test-row",
+                LoadShape::dense(1, 128, false),
+                &enc,
+                &target,
+                &policy,
+            );
+            b.shard_axis_fn(f);
+            for suffix in [
+                ".weight_scale_inv",
+                ".weight_scale",
+                ".weight_packed",
+                ".scale",
+            ] {
+                assert_eq!(
+                    b.shard_axis(&format!("block{suffix}")).expect("no refusal"),
+                    Some(1),
+                    "{case}: block{suffix} follows what it scales"
+                );
+            }
+            assert_eq!(
+                b.shard_axis("elsewhere.weight_scale").expect("no refusal"),
+                None,
+                "{case}: a scale whose weight replicates replicates too"
+            );
+        }
+    }
+
+    /// At one rank there is nothing to ask, and the family's rule is not
+    /// consulted at all — which is why a rule that panics on an unknown
+    /// name is still safe single-GPU.
+    #[test]
+    fn a_single_rank_never_asks_the_familys_rule() {
+        fn never(_: &str) -> Result<Option<u8>, Error> {
+            unreachable!("a single rank has nothing to split")
+        }
+        let meta = empty_checkpoint();
+        let target = tp(1);
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(
+            &meta,
+            "test-row",
+            LoadShape::dense(1, 128, false),
+            &enc,
+            &target,
+            &policy,
+        );
+        b.shard_axis_fn(never);
+        assert_eq!(b.shard_axis("anything.weight").expect("no refusal"), None);
+    }
+
+    /// The embedding table and the head, which are asked about before
+    /// the family's rule and answered by the two knobs.
+    #[test]
+    fn the_table_and_the_head_are_answered_before_the_familys_rule() {
+        fn column(_: &str) -> Result<Option<u8>, Error> {
+            Ok(Some(1))
+        }
+        let meta = empty_checkpoint();
+        let target = tp(2);
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(
+            &meta,
+            "test-row",
+            LoadShape::dense(1, 128, false),
+            &enc,
+            &target,
+            &policy,
+        );
+        b.shard_axis_fn(column);
+        assert_eq!(
+            b.shard_axis("model.embed_tokens.weight").expect("ok"),
+            Some(1),
+            "unasked, the family's rule answers"
+        );
+        b.shard_embed_tokens();
+        b.replicate_lm_head();
+        assert_eq!(
+            b.shard_axis("model.embed_tokens.weight").expect("ok"),
+            Some(0),
+            "row-parallel to save per-rank memory, not column"
+        );
+        assert_eq!(
+            b.shard_axis("model.lm_head.weight").expect("ok"),
+            None,
+            "replicated, so every rank can produce whole logits"
+        );
+    }
+
+    /// A checkpoint whose experts are already fused, with the byte spans
+    /// stated rather than derived.
+    ///
+    /// `span_bytes` is what the fusion budget reads, and a fixture that had to
+    /// actually be that large could not be built.
+    fn fused_experts(shape: Vec<i64>, span_bytes: u64) -> CheckpointMetadata {
+        CheckpointMetadata {
+            files: Vec::new(),
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                file_id: model_loader::types::FileId(0),
+                file_offset: 0,
+                span_bytes,
+                shape,
+                encoding: Encoding::Raw(DType::BF16),
+            }],
+        }
+    }
+
+    fn moe_slices(
+        meta: &CheckpointMetadata,
+        tp_size: u32,
+        gate_second: bool,
+    ) -> Result<ModelContract, Error> {
+        let target = tp(tp_size);
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(
+            meta,
+            "test-row",
+            LoadShape::dense(1, 128, false),
+            &enc,
+            &target,
+            &policy,
+        );
+        b.fused_moe_gate_up_tp_slices(gate_second)?;
+        b.publish_remaining()?;
+        b.finish()
+    }
+
+    /// `gate_second` republishes each expert as `[up|gate]`, and it is the one
+    /// reason this pass runs without sharding at all.
+    ///
+    /// The checkpoint stores `[gate|up]`; flashinfer's CUTLASS MoE reads
+    /// fc1's output the other way round. Swapping the two bands is a pure
+    /// reordering -- same tensor, same shape, same bytes -- so nothing
+    /// downstream can tell it happened, and a model built with the halves the
+    /// wrong way round applies its gate to the up projection and its up to the
+    /// gate. That silu-gated product is still finite and still the right
+    /// shape, so the model generates fluent nonsense rather than failing.
+    ///
+    /// The shape is asserted to be UNCHANGED on purpose: a reordering that
+    /// altered the extents would be caught by everything, which is exactly why
+    /// one that does not is worth a test.
+    #[test]
+    fn gate_second_reorders_the_two_bands_without_sharding_or_resizing_anything() {
+        let meta = fused_experts(vec![4, 2 * 64, 32], 4 * 128 * 32 * 2);
+        let name = "model.layers.0.mlp.experts.gate_up_proj";
+
+        let c = moe_slices(&meta, 1, true).expect("world of one");
+        let t = c
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} was not published"));
+
+        // The whole expression, because the ORDER is the entire content of
+        // this pass and an order is only visible against the offsets. `up` is
+        // the band at [I, 2I) and it has to come first.
+        assert_eq!(
+            t.expr,
+            Expr::concat(
+                1,
+                vec![
+                    Expr::src(name).slice(1, 64, 64),
+                    Expr::src(name).slice(1, 0, 64),
+                ]
+            ),
+            "gate_second did not publish [up|gate]"
+        );
+
+        // And the extents are untouched: a reordering that resized something
+        // would be caught by everything, which is why one that does not is
+        // worth stating.
+        assert_eq!(t.shape.clone().expect("a declared shape"), vec![4, 128, 32]);
+    }
+
+    /// Without `gate_second`, a world of one has nothing to do.
+    ///
+    /// The early return is not an optimisation: at `tp_size == 1` the two
+    /// bands are `[0, I)` and `[I, 2I)` of a tensor that is already exactly
+    /// those two bands concatenated, so re-publishing it would replace a
+    /// direct read with a slice-slice-concat that computes the identity. The
+    /// tensor should come out untouched, by the ordinary dense path.
+    #[test]
+    fn an_unsharded_checkpoint_in_the_checkpoints_own_order_is_left_alone() {
+        let meta = fused_experts(vec![4, 128, 32], 4 * 128 * 32 * 2);
+        let name = "model.layers.0.mlp.experts.gate_up_proj";
+        let c = moe_slices(&meta, 1, false).expect("world of one");
+        let t = c
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .expect("published");
+        assert_eq!(
+            t.expr,
+            Expr::src(name),
+            "the identity was rebuilt as a concat"
+        );
+    }
+
+    /// Under TP the halves are sharded INDEPENDENTLY and re-joined, so each
+    /// rank's gate and up stay adjacent within its own expert.
+    ///
+    /// Sharding the fused tensor as one band would give rank 0 the whole gate
+    /// and rank 1 the whole up -- each rank holding a complete half of an
+    /// operator it needs both halves of. The rejoin is what makes the local
+    /// tensor a smaller version of the same thing rather than a piece of a
+    /// different one.
+    #[test]
+    fn each_rank_keeps_its_own_gate_beside_its_own_up() {
+        let meta = fused_experts(vec![4, 2 * 64, 32], 4 * 128 * 32 * 2);
+        let name = "model.layers.0.mlp.experts.gate_up_proj";
+        let c = moe_slices(&meta, 2, false).expect("two ranks");
+        let t = c
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .expect("published");
+
+        // Each band is sliced out FIRST and sharded SECOND, then the two
+        // local halves are concatenated back together on the band axis.
+        // Sharding the fused tensor as one band instead would give rank 0 the
+        // whole gate and rank 1 the whole up -- each rank holding a complete
+        // half of an operator it needs both halves of.
+        assert_eq!(
+            t.expr,
+            Expr::concat(
+                1,
+                vec![
+                    Expr::src(name).slice(1, 0, 64).shard(1),
+                    Expr::src(name).slice(1, 64, 64).shard(1),
+                ]
+            ),
+            "the two bands are not sharded independently and rejoined"
+        );
+        assert_eq!(
+            t.shape.clone().expect("a declared shape"),
+            vec![4, 2 * 32, 32],
+            "a rank of two should hold half of each band, not one whole band"
+        );
+    }
+
+    /// Three shapes and one encoding this pass declines, each by its own door.
+    #[test]
+    fn a_fused_expert_tensor_this_pass_cannot_split_is_declined_or_refused() {
+        let name = "model.layers.0.mlp.experts.gate_up_proj";
+
+        // Rank 2 is not an expert grid: there is no expert axis to keep.
+        let meta = fused_experts(vec![128, 32], 128 * 32 * 2);
+        let c = moe_slices(&meta, 2, true).expect("declined, not refused");
+        let t = c
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .expect("published");
+        assert_eq!(t.expr, Expr::src(name), "a rank-2 tensor was split anyway");
+
+        // An odd middle extent has no halfway point to cut at.
+        let meta = fused_experts(vec![4, 65, 32], 4 * 65 * 32 * 2);
+        let c = moe_slices(&meta, 2, true).expect("declined, not refused");
+        let t = c
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .expect("published");
+        assert_eq!(
+            t.expr,
+            Expr::src(name),
+            "an odd band count was halved anyway"
+        );
+
+        // A name that is neither of the two spellings.
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: "model.layers.0.mlp.experts.up_gate_proj".to_string(),
+                file_id: model_loader::types::FileId(0),
+                file_offset: 0,
+                span_bytes: 4 * 128 * 32 * 2,
+                shape: vec![4, 128, 32],
+                encoding: Encoding::Raw(DType::BF16),
+            }],
+        };
+        let c = moe_slices(&meta, 2, true).expect("declined, not refused");
+        let t = c
+            .tensors
+            .iter()
+            .find(|t| t.name == "model.layers.0.mlp.experts.up_gate_proj")
+            .expect("published");
+        assert_eq!(t.expr, Expr::src("model.layers.0.mlp.experts.up_gate_proj"));
+
+        // A packed encoding whose elements are not at affine byte offsets
+        // cannot be sliced at all, and that one IS refused: silently
+        // declining would leave the tensor unsharded while the forward pass
+        // went on expecting a local band.
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: name.to_string(),
+                file_id: model_loader::types::FileId(0),
+                file_offset: 0,
+                span_bytes: 4 * 128 * 32,
+                shape: vec![4, 128, 32],
+                encoding: mxfp4_encoding(2),
+            }],
+        };
+        let e = moe_slices(&meta, 2, true).expect_err("a packed bank was sliced");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("non-affine") && msg.contains(name),
+            "the refusal should name the tensor and the reason: {msg}"
+        );
+    }
+
+    /// The fusion budget picks a model CLASS, and QKV wins when only one fits.
+    ///
+    /// Fused dense projections replace the originals and the unfused fallback
+    /// binds non-owning views into the fused buffer, so this is not a memory
+    /// budget in the usual sense -- nothing is duplicated. It selects which
+    /// groups get a fused GEMM: everything through 8B-class models, and
+    /// QKV-only above that, where gate/up fusion regressed.
+    ///
+    /// Two things make it worth pinning. The preference is not symmetric: when
+    /// the pair does not fit, QKV goes first because it is much smaller than
+    /// gate/up on Qwen-style models and it is what enables the fused decode
+    /// postprocess. And it is a greedy fill rather than a choice: the second
+    /// admission is charged against what the first actually SPENT, so a large
+    /// QKV can exclude a gate/up that would have fit alone, while a QKV that
+    /// does not fit at all spends nothing and leaves gate/up the whole budget.
+    /// Writing the second test as `gate_up_bytes <= BUDGET` reads like the
+    /// same rule and lets both in.
+    ///
+    /// The spans are stated rather than allocated; ten gigabytes of fixture is
+    /// not a thing a test can build.
+    #[test]
+    fn when_both_fused_groups_do_not_fit_the_budget_qkv_is_the_one_that_gets_in() {
+        const GB: u64 = 1024 * 1024 * 1024;
+
+        // `span_bytes` is what the budget reads, so the shapes stay small and
+        // the declared spans do the talking.
+        let rows = |qkv_gb: u64, gate_up_gb: u64| {
+            let one = |name: &str, span: u64| RawTensor {
+                id: TensorId(0),
+                name: name.to_string(),
+                file_id: model_loader::types::FileId(0),
+                file_offset: 0,
+                span_bytes: span,
+                shape: vec![64, 64],
+                encoding: Encoding::Raw(DType::BF16),
+            };
+            let p = "model.layers.0.";
+            let mut tensors = vec![
+                one(&format!("{p}self_attn.q_proj.weight"), qkv_gb * GB / 3),
+                one(&format!("{p}self_attn.k_proj.weight"), qkv_gb * GB / 3),
+                one(&format!("{p}self_attn.v_proj.weight"), qkv_gb * GB / 3),
+                one(&format!("{p}mlp.gate_proj.weight"), gate_up_gb * GB / 2),
+                one(&format!("{p}mlp.up_proj.weight"), gate_up_gb * GB / 2),
+            ];
+            for (i, t) in tensors.iter_mut().enumerate() {
+                t.id = TensorId(i as u32);
+            }
+            CheckpointMetadata {
+                files: Vec::new(),
+                tensors,
+            }
+        };
+
+        let fused = |qkv_gb: u64, gate_up_gb: u64| -> (bool, bool) {
+            let meta = rows(qkv_gb, gate_up_gb);
+            let target = tp(1);
+            let policy = Policy::default();
+            let enc = StoredEncoding::dense();
+            let mut b = Builder::new(
+                &meta,
+                "test-row",
+                LoadShape::dense(1, 64, false),
+                &enc,
+                &target,
+                &policy,
+            );
+            b.dense_fused_projection_joins().expect("joins");
+            b.publish_remaining().expect("publish");
+            let c = b.finish().expect("finish");
+            let has = |n: &str| c.tensors.iter().any(|t| t.name == n);
+            (
+                has("model.layers.0.self_attn.qkv_proj.fused.weight"),
+                has("model.layers.0.mlp.gate_up_proj.fused.weight"),
+            )
+        };
+
+        // Comfortably inside: both groups fuse.
+        assert_eq!(fused(1, 2), (true, true), "a small model should fuse both");
+
+        // Over the 10 GiB line together, and each under it alone. QKV gets in
+        // and gate/up does not -- and gate/up is the LARGER of the two, so a
+        // rule that simply kept the bigger one would answer the other way.
+        assert_eq!(
+            fused(3, 9),
+            (true, false),
+            "over budget together, QKV is the group that should fuse"
+        );
+
+        // QKV alone exceeds the budget. It is dropped, and it spends NOTHING
+        // on the way out: `used` is charged only where the group is actually
+        // admitted, so gate/up then gets the whole budget rather than
+        // inheriting a debt for a fusion that did not happen. This is the
+        // arm that distinguishes a greedy fill in priority order from a
+        // strict "QKV or nothing".
+        assert_eq!(
+            fused(12, 2),
+            (false, true),
+            "a QKV that does not fit should not spend budget on its way out"
+        );
+    }
+
+    // ── The pairing a shipped FP8 scale gets, or does not ────────────
+
+    fn raw_t(id: u32, name: &str, shape: Vec<i64>, encoding: Encoding) -> RawTensor {
+        use model_loader::types::{FileId, TensorId};
+        RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 0,
+            shape,
+            encoding,
+        }
+    }
+
+    const W: &str = "model.layers.0.self_attn.o_proj.weight";
+    const S: &str = "model.layers.0.self_attn.o_proj.weight_scale";
+
+    /// An FP8 weight and the factors the checkpoint shipped beside it.
+    /// 128 columns against 4 scale columns is a block of 32.
+    fn fp8_pair(weight_cols: i64, scale_cols: i64) -> Vec<RawTensor> {
+        vec![
+            raw_t(1, W, vec![64, weight_cols], Encoding::Raw(DType::F8E4M3)),
+            raw_t(2, S, vec![64, scale_cols], Encoding::Raw(DType::F32)),
+        ]
+    }
+
+    fn publish_fp8(tensors: Vec<RawTensor>) -> ModelContract {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors,
+        };
+        let t = target();
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(
+            &meta,
+            "fp8-test",
+            LoadShape::dense(1, 64, false),
+            &enc,
+            &t,
+            &policy,
+        );
+        b.publish_remaining().expect("publish");
+        b.finish().expect("finish")
+    }
+
+    fn scales_of(c: &ModelContract, name: &str) -> Option<Scales> {
+        c.tensors
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is declared"))
+            .scales
+            .clone()
+    }
+
+    /// The block size is READ OFF the two shapes, never assumed.
+    ///
+    /// A scale that never names its weight is not a load error: the
+    /// weight binds as raw FP8 and the factors sit beside it unread, so
+    /// every number the kernel produces is off by whatever the factors
+    /// were going to correct. That is a wrong answer, not a failure, and
+    /// the only place it can be caught is here.
+    #[test]
+    fn a_shipped_fp8_scale_names_its_weight_and_the_block_it_covers() {
+        let c = publish_fp8(fp8_pair(128, 4));
+        let s = scales_of(&c, S).expect("the scale names its weight");
+        assert_eq!(s.of, W, "the factors must name the tensor they scale");
+        assert_eq!(s.group_size, 32, "128 columns over 4 factors is 32");
+        assert_eq!(s.granularity, QuantGranularity::PerGroup);
+        assert_eq!(s.form, ScaleForm::F32Factors);
+    }
+
+    /// Different shapes, different block -- it is not a constant.
+    #[test]
+    fn the_block_comes_from_the_shapes_and_not_from_a_constant() {
+        for (cols, factors, block) in [(128i64, 4i64, 32u32), (128, 1, 128), (256, 2, 128)] {
+            let c = publish_fp8(fp8_pair(cols, factors));
+            assert_eq!(
+                scales_of(&c, S).expect("paired").group_size,
+                block,
+                "{cols} columns over {factors} factors"
+            );
+        }
+    }
+
+    /// A companion that is not really FP8 is LEFT ALONE.
+    ///
+    /// The `.weight_scale` suffix is a naming convention, not a
+    /// guarantee. Binding factors to a BF16 weight would tell the loader
+    /// to dequantize something that was never quantized.
+    #[test]
+    fn factors_beside_a_weight_that_is_not_fp8_are_left_unpaired() {
+        let mut ck = fp8_pair(128, 4);
+        ck[0].encoding = Encoding::Raw(DType::BF16);
+        assert!(
+            scales_of(&publish_fp8(ck), S).is_none(),
+            "a BF16 weight was told it has block factors"
+        );
+    }
+
+    /// A scale whose weight is not in the checkpoint at all.
+    #[test]
+    fn factors_with_no_weight_beside_them_are_left_unpaired() {
+        let ck = vec![raw_t(2, S, vec![64, 4], Encoding::Raw(DType::F32))];
+        assert!(scales_of(&publish_fp8(ck), S).is_none());
+    }
+
+    /// A scale that states ZERO factor columns.
+    ///
+    /// `weight_cols / scale_cols` is the block, so a zero divides by
+    /// zero and a scale with no shape at all has no last dimension to
+    /// divide by. Both are left unpaired rather than panicking, because
+    /// this runs over every tensor of every checkpoint.
+    #[test]
+    fn factors_that_cannot_state_a_block_are_left_unpaired() {
+        for shape in [vec![64, 0], Vec::new()] {
+            let mut ck = fp8_pair(128, 4);
+            ck[1].shape = shape.clone();
+            assert!(
+                scales_of(&publish_fp8(ck), S).is_none(),
+                "a scale shaped {shape:?} produced a block anyway"
+            );
+        }
+    }
+
+    /// FEWER weight columns than factors is a block of zero.
+    ///
+    /// Integer division truncates, so 4 columns over 8 factors is `0` --
+    /// a `group_size` of zero is a division the lowering does not guard.
+    /// The pass declines rather than declaring it.
+    #[test]
+    fn a_block_that_truncates_to_zero_is_declined_rather_than_declared() {
+        assert!(
+            scales_of(&publish_fp8(fp8_pair(4, 8)), S).is_none(),
+            "four columns over eight factors declared a block of zero"
+        );
+    }
+
+    /// A weight an earlier pass CLAIMED is not published under this name.
+    ///
+    /// Naming a consumed tensor would be a contract the loader rejects
+    /// outright -- the `of` would point at an output that does not
+    /// exist. This is the one decline that depends on what another pass
+    /// did rather than on the tensors themselves.
+    #[test]
+    fn factors_whose_weight_an_earlier_pass_consumed_are_left_unpaired() {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: fp8_pair(128, 4),
+        };
+        let t = target();
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(
+            &meta,
+            "fp8-test",
+            LoadShape::dense(1, 64, false),
+            &enc,
+            &t,
+            &policy,
+        );
+        let claimed = b.find(W).expect("the weight is there").id;
+        b.consumed.insert(claimed);
+        b.publish_remaining().expect("publish");
+        let c = b.finish().expect("finish");
+        assert!(
+            scales_of(&c, S).is_none(),
+            "the factors named a weight no pass published"
+        );
+        assert!(
+            !c.tensors.iter().any(|x| x.name == W),
+            "the fixture must actually withhold the weight, or this test \
+             is asserting over a weight that IS published"
+        );
+    }
 }

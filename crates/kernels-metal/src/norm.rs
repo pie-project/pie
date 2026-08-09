@@ -10,6 +10,29 @@ use kernels::{KernelSig, kernel};
 use crate::axes::*;
 
 pub static KERNELS: &[KernelSig] = &[
+    // 1 in add_bias.metal
+    // The Qwen-2 family's attention biases. Sourced exactly as
+    // `kernels-cuda-new`'s `norm::add_bias_bf16` and `kernels-vulkan`'s row
+    // are, so that the three backends read one statement the same way: IN
+    // PLACE over the value it biases (`out` from `Out(0)`, the same bytes as
+    // `In(0)`), the bias off the statement's named weight, and the row width
+    // derived rather than stated -- an `AddBias` carries no scalars, because a
+    // bias vector's length is the projection's width and the trace knows it.
+    //
+    // Stated on this side because coverage is defined as parity: the shared
+    // Metal text can only name an op some Metal kernel implements, and until
+    // this row none did, so `qkv_bias` models were served without their
+    // biases. Whether a given Metal DEPLOYMENT launches it is a separate
+    // claim, made by `LlamaLikeMetalFacts::add_bias`.
+    kernel!(add_bias "add_bias", file = Some("norm/add_bias.metal"),
+        launch = kernels::LaunchRule::RouteRows,
+        in_place = &[(0, 0)],
+        operands = kernels::operands![
+            out: BufMut <- kernels::Source::Out(0),
+            bias: Buf <- kernels::Source::Weight(0),
+            width: I32 <- kernels::Source::OutWidth(0),
+        ],
+        axes = &[BF16]),
     // 1 in gated_rms.metal
     kernel!(gated_rms "gated_rms", axes = &[BF16]),
     // 1 in gated_rms.metal

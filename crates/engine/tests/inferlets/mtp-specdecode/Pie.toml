@@ -1,4 +1,0 @@
-[package]
-name = "mtp-specdecode"
-version = "0.1.0"
-description = "Test inferlet: MTP spec-decode over forward-hybrid — second client of the fold-behind + discard-buffered window (drafts-channel swap of mtp-native-verify)"

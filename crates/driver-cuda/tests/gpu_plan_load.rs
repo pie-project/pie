@@ -24,24 +24,32 @@ fn snapshot(repo: &str) -> Option<PathBuf> {
     })
 }
 
-fn descriptor() -> Option<String> {
-    let p = PathBuf::from(
-        "/tmp/claude-0/-root--patissier-work-tart-alpha/\
-         7460e4c3-f305-45df-9603-2298b0c0c60e/scratchpad/qwen3_descriptor.json",
-    );
-    std::fs::read_to_string(p).ok()
+/// How the row is chosen, and how its weights are read.
+///
+/// Both used to be one hand-written descriptor JSON, read from a scratchpad
+/// path belonging to the session that wrote it. Identity is a manifest match
+/// now, so `Override::None` says "match it like anything else" and the
+/// checkpoint's own tensors answer; the encoding is the bf16 the repo
+/// publishes.
+fn chosen() -> (model::catalog::Override, model::encoding::Encoding) {
+    (
+        model::catalog::Override::None,
+        model::encoding::Encoding::dense(),
+    )
 }
 
 #[test]
 fn a_checkpoint_stages_into_device_memory_through_its_plan() {
-    let (Some(snap), Some(desc)) = (snapshot("Qwen--Qwen3-0.6B"), descriptor()) else {
-        eprintln!("skipped: no cached Qwen3-0.6B or descriptor");
+    let Some(snap) = snapshot("Qwen--Qwen3-0.6B") else {
+        eprintln!("skipped: no cached Qwen3-0.6B");
         return;
     };
     let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(&snap)
         .expect("the checkpoint parses");
+    let (chosen, encoding) = chosen();
     let target = cuda_storage_target(0, 1);
-    let (plan, _moe) = compile_load_plan(&snap, &meta, &target, &desc).expect("the plan compiles");
+    let (plan, _moe) =
+        compile_load_plan(&snap, &meta, &target, &chosen, &encoding).expect("the plan compiles");
 
     // THE JOINS ARE IN THE PLAN. `Projections::Fused` is what the CUDA
     // GEMMs want, and the shell used to satisfy it by reading q/k/v back
@@ -90,19 +98,20 @@ fn a_checkpoint_stages_into_device_memory_through_its_plan() {
 /// the shards back together, and that is orchestration, not layout.
 #[test]
 fn a_rank_of_a_tp_group_plans_a_smaller_arena() {
-    let (Some(snap), Some(desc)) = (snapshot("Qwen--Qwen3-0.6B"), descriptor()) else {
-        eprintln!("skipped: no cached Qwen3-0.6B or descriptor");
+    let Some(snap) = snapshot("Qwen--Qwen3-0.6B") else {
+        eprintln!("skipped: no cached Qwen3-0.6B");
         return;
     };
     let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(&snap)
         .expect("the checkpoint parses");
-    let whole = compile_load_plan(&snap, &meta, &cuda_storage_target(0, 1), &desc)
+    let (chosen, encoding) = chosen();
+    let whole = compile_load_plan(&snap, &meta, &cuda_storage_target(0, 1), &chosen, &encoding)
         .expect("the unsharded plan compiles")
         .0;
-    let half = compile_load_plan(&snap, &meta, &cuda_storage_target(0, 2), &desc)
+    let half = compile_load_plan(&snap, &meta, &cuda_storage_target(0, 2), &chosen, &encoding)
         .expect("rank 0 of 2 compiles")
         .0;
-    let other = compile_load_plan(&snap, &meta, &cuda_storage_target(1, 2), &desc)
+    let other = compile_load_plan(&snap, &meta, &cuda_storage_target(1, 2), &chosen, &encoding)
         .expect("rank 1 of 2 compiles")
         .0;
 

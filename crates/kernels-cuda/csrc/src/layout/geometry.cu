@@ -1,86 +1,49 @@
+//===-- geometry.cu - the two CSR launchers --------------------------===//
+//
+// Two host launchers and not one `__global__`: the device text is in
+// `layout/geometry.cuh`, which this file includes so the archive and the JIT
+// header set hold the SAME definition rather than two that drift.
+//
+//===----------------------------------------------------------------------===//
+
+// The scalar layer and the fixed-width integer names, out of the prelude.
+#include "pie_device.cuh"
 #include "geometry.hpp"
+
+// The `__global__`s these launchers fire. ONE definition of each.
+#include "layout/geometry.cuh"
 
 namespace pie_cuda_driver::kernels::layout {
 
-namespace {
-
-// One thread per request. Derives `kv_len[r]` from the CSR page descriptors,
-// bit-identical to the host formula in request.rs (append_request_with_options):
-//   page_count = kv_page_indptr[r+1] - kv_page_indptr[r]
-//   kv_len[r]  = page_count == 0 ? 0
-//                                : (page_count - 1) * page_size + last_page_len
-// All arithmetic is u32 (matches the host's Vec<u32> column) so the device and
-// host results are byte-for-byte equal — the M5 C1-FINAL handshake invariant.
-__global__ void derive_kv_len_kernel(
-    const std::uint32_t* __restrict__ kv_page_indptr,
-    const std::uint32_t* __restrict__ kv_last_page_lens,
-    std::uint32_t page_size,
-    std::uint32_t num_requests,
-    std::uint32_t* __restrict__ kv_len) {
-  const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-  if (r >= num_requests) {
-    return;
-  }
-  const std::uint32_t page_count = kv_page_indptr[r + 1] - kv_page_indptr[r];
-  kv_len[r] =
-      page_count == 0u ? 0u : (page_count - 1u) * page_size + kv_last_page_lens[r];
-}
-
-}  // namespace
-
 void launch_derive_kv_len(
-    const std::uint32_t* kv_page_indptr,
-    const std::uint32_t* kv_last_page_lens,
-    std::uint32_t page_size,
-    std::uint32_t num_requests,
-    std::uint32_t* kv_len,
+    const device::u32* kv_page_indptr,
+    const device::u32* kv_last_page_lens,
+    device::u32 page_size,
+    device::u32 num_requests,
+    device::u32* kv_len,
     cudaStream_t stream) {
   if (num_requests == 0) {
     return;
   }
-  constexpr std::uint32_t kThreads = 256;
-  const std::uint32_t blocks = (num_requests + kThreads - 1) / kThreads;
-  derive_kv_len_kernel<<<blocks, kThreads, 0, stream>>>(
+  constexpr device::u32 kThreads = 256;
+  const device::u32 blocks = (num_requests + kThreads - 1) / kThreads;
+  device::derive_kv_len<<<blocks, kThreads, 0, stream>>>(
       kv_page_indptr, kv_last_page_lens, page_size, num_requests, kv_len);
 }
 
-namespace {
-
-// One thread per flattened page slot. Resolves a working-set slot id to its
-// physical page-pool BlockId via the runtime-uploaded dictionary:
-//   page_indices[i] = slot_to_block[pages[i]]
-// An out-of-range slot id (>= num_slots) is a loud sentinel (0xFFFFFFFF), never
-// a silent wrap — a corrupt/padding slot must fail visibly, not gather a wrong
-// page. Slot id 0 is valid and resolved like any other.
-__global__ void resolve_slot_to_block_kernel(
-    const std::uint32_t* __restrict__ pages,
-    const std::uint32_t* __restrict__ slot_to_block,
-    std::uint32_t num_slots,
-    std::uint32_t count,
-    std::uint32_t* __restrict__ page_indices) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) {
-    return;
-  }
-  const std::uint32_t slot = pages[i];
-  page_indices[i] = slot < num_slots ? slot_to_block[slot] : 0xFFFFFFFFu;
-}
-
-}  // namespace
-
 void launch_resolve_slot_to_block(
-    const std::uint32_t* pages,
-    const std::uint32_t* slot_to_block,
-    std::uint32_t num_slots,
-    std::uint32_t count,
-    std::uint32_t* page_indices,
+    const device::u32* pages,
+    const device::u32* slot_to_block,
+    device::u32 num_slots,
+    device::u32 count,
+    device::u32* page_indices,
     cudaStream_t stream) {
   if (count == 0) {
     return;
   }
-  constexpr std::uint32_t kThreads = 256;
-  const std::uint32_t blocks = (count + kThreads - 1) / kThreads;
-  resolve_slot_to_block_kernel<<<blocks, kThreads, 0, stream>>>(
+  constexpr device::u32 kThreads = 256;
+  const device::u32 blocks = (count + kThreads - 1) / kThreads;
+  device::resolve_slot_to_block<<<blocks, kThreads, 0, stream>>>(
       pages, slot_to_block, num_slots, count, page_indices);
 }
 

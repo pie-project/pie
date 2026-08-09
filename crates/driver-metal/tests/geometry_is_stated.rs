@@ -7,10 +7,13 @@
 //! those are the OPERATOR's numbers ... and `alt_quant`/`mxfp4_experts`
 //! because those are solved from the staged tensors".
 //!
-//! That sentence was a plan, not a description. Nothing set those
-//! fields and nothing read them, so a `Default` answered questions the
-//! driver never asked — and while the doc read as a division of labour,
-//! it was one end of a contract with no other end.
+//! That sentence was a plan, not a description, and it has now failed
+//! at both of the fields it named. `alt_quant`'s half was false about
+//! the load plan — `QuantSpec` had the answer per tensor the whole
+//! time. `mxfp4_experts`'s half was false about ITSELF: it promised a
+//! fact "solved from the staged tensors" on a struct whose constructor
+//! is handed a deployment, a load shape and an affine point, and never
+//! a tensor. It was gone with the promise.
 //!
 //! Two fields had already gone the whole way: `mrope_section` and
 //! `norm_topk_prob` were declared, defaulted, and read by nobody at all,
@@ -59,15 +62,6 @@ const FILLED_ELSEWHERE: &[(&str, &str)] = &[
          builds ONE kernel set. The field stays unset because filling it \
          would need a SECOND kernel set to be worth anything; what changed \
          is that its absence is now a refusal instead of a wrong answer.",
-    ),
-    (
-        "mxfp4_experts",
-        "NOT WIRED, as `alt_quant`. Whether the expert bank stays in the \
-         checkpoint's MXFP4 rather than being re-quantized at load, which \
-         changes what is BOUND — MXFP4 has block exponents and no zero \
-         point, so there is no `.biases` to bind. No gpt-oss row is served \
-         on Metal yet (`manifest.rs` cannot identify MLX's split \
-         publication), so nothing has had to answer.",
     ),
 ];
 
@@ -153,11 +147,17 @@ fn every_geometry_field_is_stated_or_accounted_for() {
 }
 
 /// The account does not outlive the field it accounts for.
+///
+/// BOTH lists, not just `FILLED_ELSEWHERE`. An excuse whose field is
+/// gone is worse than no excuse: it reads as a live gap, and the two
+/// entries this test now guards were each removed only after somebody
+/// went looking for whether the sentence was still true.
 #[test]
 fn nothing_is_accounted_for_that_the_struct_no_longer_declares() {
     let names = declared(&source());
     let stale: Vec<&str> = FILLED_ELSEWHERE
         .iter()
+        .chain(DECLARED_BUT_UNREAD.iter())
         .map(|(n, _)| *n)
         .filter(|n| !names.contains(*n))
         .collect();
@@ -170,13 +170,23 @@ fn nothing_is_accounted_for_that_the_struct_no_longer_declares() {
 /// is either a quantity that already travels another road — in which
 /// case there are now two answers to one question and only one of them
 /// is live — or a plan.
-const DECLARED_BUT_UNREAD: &[(&str, &str)] = &[(
-    "mxfp4_experts",
-    "The same gap `FILLED_ELSEWHERE` names: nothing states it because \
-     nothing solves the format from the staged tensors, and nothing \
-     reads it because no gpt-oss row is served on Metal. Both ends \
-     unwritten, which is why it is on both lists.",
-)];
+///
+/// **It is empty, and that is the point.** Its last entry was
+/// `mxfp4_experts`, and it turned out to be the first case exactly:
+/// whether the expert bank stays in the checkpoint's MXFP4 is already
+/// answered on the other road, by `Loaded::mxfp4` off the load plan,
+/// through `binding::observed` into `MetalBinding::moe_mxfp4`, which
+/// the llama-like text reads to emit `WeightRepr::Mxfp4Marlin` — and
+/// which the Metal kernel-set refusal reads to let an MXFP4 bank past
+/// the affine point it does not sit at. The excuse written here said
+/// "nothing solves the format from the staged tensors". Two live
+/// readers of the solved answer say otherwise.
+///
+/// Keeping this list empty is a stronger claim than any entry in it:
+/// every declared field is read. Add an entry only with the pass that
+/// will read it, and check first that the quantity is not already
+/// travelling.
+const DECLARED_BUT_UNREAD: &[(&str, &str)] = &[];
 
 /// Every `.field` read anywhere under `src/`.
 ///

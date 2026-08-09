@@ -17,21 +17,6 @@ use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::KimiK3Facts;
 
-/// Does this build provision the KV store a deployment asks for?
-///
-/// A property of the BINARY, not of any checkpoint — which is why it is
-/// stated here beside the projection rather than carried on a row. This
-/// is where `unbuilt_kv_store()` went: that method existed because a
-/// generation could hold a `FACTS_ROWS` row, load happily, report itself
-/// healthy, and die at its first fire inside a walk. It answered with a
-/// STRING (`"an MLA latent cache"`), and `deployment_of` then decided
-/// which store the string meant by asking whether it contained
-/// `"compress"`.
-#[must_use]
-pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    kv.has_a_store_in_this_build()
-}
-
 /// This row's tensors.
 ///
 /// # A hybrid's per-layer rows are a UNION, and they have to be
@@ -321,13 +306,9 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
 /// the honest answer rather than a load that dies at its first fire.
 pub fn deployment(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Result<Deployment, Refusal> {
     let planned = plan(f, rope_theta, norm_eps);
-    if kv_store_is_built(&planned.kv) {
-        Ok(planned)
-    } else {
-        Err(Refusal::Unsupported(
-            "this build provisions no MLA latent store; the row's compressed \
-             KV has nowhere to live",
-        ))
+    match planned.kv.store_refusal() {
+        Some(no_store) => Err(no_store),
+        None => Ok(planned),
     }
 }
 
@@ -336,7 +317,7 @@ pub fn deployment(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Result<Dep
 ///
 /// Separate from [`deployment`] so the two statements stay separable —
 /// "what this model needs" is the row's, "what this binary provides" is
-/// [`kv_store_is_built`]'s, and collapsing them is how a capability
+/// [`KvStyle::has_a_store_in_this_build`]'s, and collapsing them is how a capability
 /// question turns back into a family name.
 #[must_use]
 fn plan(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
@@ -423,7 +404,6 @@ fn plan(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         norm_topk_prob: f.moe.norm_topk_prob,
         routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
@@ -534,7 +514,6 @@ pub const NO_METAL: &str = "kimi-k3 has no Metal text in this build: its forward
 ///
 /// [`Refusal::Unsupported`] when the row states a gated MLA output,
 /// which this build has no text for.
-#[cfg(feature = "forward")]
 pub fn trace(
     f: &KimiK3Facts,
     class: model_compiler::trace::FireClass,
@@ -1191,15 +1170,14 @@ mod tests {
     #[test]
     fn the_plan_exists_even_where_the_build_refuses_it() {
         let planned = plan(&k3(), 10_000.0, 1e-5);
-        assert!(!kv_store_is_built(&planned.kv));
-        assert!(kv_store_is_built(&KvStyle::Paged));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: Vec::new() }));
+        assert!(!planned.kv.has_a_store_in_this_build());
+        assert!(KvStyle::Paged.has_a_store_in_this_build());
+        assert!(!KvStyle::CompressedPlane { ratios: Vec::new() }.has_a_store_in_this_build());
     }
 
     /// The text traces for both fire classes, and names this
     /// generation's own family string — the goldens are keyed on it, so
     /// a rename here is a rename of every recorded plan.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_text_traces_for_both_fire_classes() {
         use model_compiler::trace::FireClass;
@@ -1217,7 +1195,6 @@ mod tests {
     /// A row whose MLA gates its output is refused rather than traced,
     /// because the text asserts on it. Turning that panic into a
     /// refusal is the whole reason `trace` returns a `Result`.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_gated_mla_output_is_refused_and_not_traced() {
         use model_compiler::trace::FireClass;

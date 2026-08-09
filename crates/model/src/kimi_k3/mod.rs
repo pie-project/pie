@@ -21,7 +21,6 @@
 pub mod contract;
 
 /// The declared forward -- an MLA / KDA hybrid over an MXFP4 MoE stack.
-#[cfg(feature = "forward")]
 pub mod forward;
 
 /// The SHAPE, ungated: a catalog row is written in these words.
@@ -31,12 +30,12 @@ pub mod spec;
 /// its text.
 pub mod project;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::Advertised;
@@ -150,15 +149,7 @@ pub const VARIANTS: &[KimiK3] = &[KimiK3 {
     tied_embeddings: false,
 }];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&KimiK3` to `&dyn Variant`;
-/// the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(KimiK3);
 
 impl KimiK3 {
     /// What a driver ADVERTISES about this row, as distinct from what it
@@ -266,7 +257,6 @@ impl Variant for KimiK3 {
     /// refusal is where the assertion inside the text stops being a
     /// panic; the first is why a row with nowhere to put its KV never
     /// gets a fire to begin with.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -423,7 +413,6 @@ mod tests {
     /// The trace refuses, because the row states a gate the text asserts
     /// against. A `Result` here is what turns that assertion from a
     /// panic inside a walk into an answer at the boundary.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_row_refuses_to_trace_the_gate_its_text_cannot_state() {
         use model_compiler::trace::FireClass;
@@ -591,7 +580,6 @@ mod tests {
     /// The comparison is against [`project::NO_METAL`] itself and not a
     /// paraphrase, so the sentence a caller is shown is the sentence
     /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -605,6 +593,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {
@@ -621,22 +610,47 @@ mod tests {
                 );
             }
         }
-        // And the refusal is about the BACKEND and nothing else: the
-        // same rows keep answering a CUDA load exactly as they did.
+        // CUDA is refused too, and on a DIFFERENT ground. This block
+        // used to be an `assert_ne!` against the Metal sentence, which
+        // was the weakest of the four MLA families' versions of this
+        // test and is why one behaviour change produced three failures
+        // and one pass: `deepseek_v4`, `glm_5` and `kimi_k2` asserted
+        // that CUDA still traced, this asserted only that the refusal
+        // was not the Metal one, and all four had taken the same new
+        // line in `trace`.
         //
-        // kimi-k3's one row refuses CUDA too, on the SEPARATE ground
-        // `project::trace` states — its MLA output gate has no
-        // declaration in this build's text, because the semantic
-        // `SigmoidGateMul` wants equal shapes and MLA's absorb is
-        // rank-3. That the two sentences are different is the assertion
-        // with teeth: a backend gate placed to fire first for every load
-        // would swallow the more specific refusal and report the wrong
-        // missing thing.
+        // THIS ROW HAS TWO REASONS and they are now ORDERED. The store
+        // refusal fires first, because `trace` asks `deployment` before
+        // it traces; the output-gate refusal `project::trace` states —
+        // the semantic `SigmoidGateMul` wants equal shapes and MLA's
+        // absorb is rank-3 — is reached only once a store exists. The
+        // prose here used to warn that a gate firing first "would
+        // swallow the more specific refusal and report the wrong missing
+        // thing", and the answer is that it reports the FIRST missing
+        // thing: a store has to land before a text can be asked for, so
+        // the refusals are staged rather than lost.
+        //
+        // What is asserted is the invariant that the ordering created:
+        // the door and the fire refuse with ONE sentence. That is the
+        // gap the new line closed — `deployment()` consulted the store
+        // and `trace()` did not, so a row refused at the door and handed
+        // out a fire anyway.
         for v in VARIANTS {
-            let cuda = v.trace(FireClass::Decode, Deployed::single());
-            let err = cuda.expect_err("the output gate is still unstated");
+            let at_the_door = v
+                .deployment(Deployed::single())
+                .expect_err("this build provisions no store for this row's KvStyle");
+            let at_the_fire = v
+                .trace(FireClass::Decode, Deployed::single())
+                .expect_err("a row refused at the door must not hand out a fire");
+            assert_eq!(
+                at_the_fire, at_the_door,
+                "`{}` refuses a CUDA load at the door and at the fire with two \
+                 different sentences; they are one question and must not have \
+                 two answers",
+                v.id
+            );
             assert_ne!(
-                err,
+                at_the_fire,
                 Refusal::Unsupported(project::NO_METAL),
                 "`{}` answered a CUDA load with the METAL refusal",
                 v.id

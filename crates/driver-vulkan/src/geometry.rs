@@ -236,6 +236,20 @@ pub enum Ungeometric {
         /// The narrowest compiled tile, which still did not divide it.
         tile: u32,
     },
+    /// A rule this backend compiles no module for.
+    ///
+    /// `kernels::LaunchRule` is the whole fleet's vocabulary and CUDA states
+    /// rules for blocks nothing here implements -- mamba's scans, MLA's
+    /// prepare, gemma-4's alt-up streams, the packed-head attentions. A text
+    /// naming one is a model this backend does not serve, and the refusal is
+    /// carried by the rule rather than by a shape.
+    ///
+    /// Named individually in [`lanes`]'s match rather than caught by a `_`
+    /// arm: the compiler is what tells this file that the fleet grew a rule,
+    /// and a wildcard would turn that into a silent `Unruled` at run time.
+    /// It has already paid for itself once, when twenty-one rules arrived at
+    /// once.
+    Unruled(Rule),
 }
 
 impl core::fmt::Display for Ungeometric {
@@ -253,6 +267,9 @@ impl core::fmt::Display for Ungeometric {
             ),
             Self::PartialTile { rows, tile } => {
                 write!(f, "{rows} rows is not a whole number of {tile}-row tiles")
+            }
+            Self::Unruled(rule) => {
+                write!(f, "this backend compiles no module launched as {rule:?}")
             }
         }
     }
@@ -278,6 +295,44 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
     let rows = dims.rows.max(1);
     Ok(match rule {
         Rule::Unstated => return Err(Ungeometric::Unstated),
+        // Rules for blocks this backend has no shaders for. Listed one by one
+        // and not behind a `_`, so that the next rule the fleet adds stops
+        // this build rather than reaching a fire.
+        //
+        // The mamba four (`RecurrentScan`, `PerRow`, `PerChannel`,
+        // `ElementwiseIn`, `WarpTiledScan`, `PerRowNarrow`), MLA's prepare,
+        // the paged-score taps `driver-vulkan` advertises `has_attn_score:
+        // false` for, the packed-head attentions, gemma-4's alt-up, and the
+        // two routed-qmv variants whose transposed and quad forms
+        // `quant/qmv.comp` does not compile.
+        Rule::RecurrentScan
+        | Rule::PerRow
+        | Rule::PerChannel
+        | Rule::ElementwiseIn
+        | Rule::RowScores
+        | Rule::RowsPerHead
+        | Rule::RowsFlat
+        | Rule::Slab
+        | Rule::Tile16
+        | Rule::AxialRope
+        | Rule::WarpTiledScan
+        | Rule::PerRowNarrow
+        | Rule::PagedScores
+        | Rule::PagedScoresDecode
+        | Rule::MlaPrepare
+        | Rule::RowsPackedHeads
+        | Rule::RowsPackedHeadsNarrow
+        | Rule::WarpPackedHeads
+        | Rule::RoutedQmvTransposed
+        | Rule::AltUpStreams
+        | Rule::RoutedQmvQuad
+        // The three CUDA launcher shapes. `PerRequest` is a grid over the
+        // batch's REQUEST count and `Dims` here carries no request field;
+        // `Single` and `SingleWarp` are one block of a fixed width, which is
+        // a statement about a serial walk no shader in this crate performs.
+        | Rule::PerRequest
+        | Rule::Single
+        | Rule::SingleWarp => return Err(Ungeometric::Unruled(rule)),
         // Four outputs per subgroup, two subgroups per workgroup: 32 lanes
         // wide and `ceil(n / 4)` tall. The round-up is load-bearing --
         // `driver-metal`'s `grid::qmv` records a shared expert's gate, one
@@ -528,9 +583,89 @@ mod tests {
                 checked += 1;
             }
         }
-        // A sweep that skipped everything would pass. Every rule but `Unstated`
-        // answers for these dims, against six workgroup shapes.
-        assert!(checked >= (kernels::LaunchRule::ALL.len() - 1) * locals.len());
+        // A sweep that skipped everything would pass, and most of the fleet's
+        // rules ARE skipped here -- see `SERVED`, which is the list this
+        // floor is taken from and the one test that says what it means.
+        assert!(
+            checked >= SERVED.len() * locals.len(),
+            "{checked} checks over {} shapes",
+            locals.len()
+        );
+    }
+
+    /// Every launch rule this backend has a module for.
+    ///
+    /// `kernels::LaunchRule` is the whole fleet's vocabulary, and most of it
+    /// is CUDA's: mamba scans, MLA, the paged-score taps, packed-head
+    /// attentions, gemma-4's alt-up. This is the part `kernels-vulkan`
+    /// compiles a shader for, and `lanes` answers for exactly these.
+    const SERVED: &[Rule] = &[
+        Rule::Qmv,
+        Rule::Rms,
+        Rule::Rope,
+        Rule::Elementwise,
+        Rule::ElementwiseRows,
+        Rule::PerHead,
+        Rule::SdpaVector,
+        Rule::PerHeadElementwise,
+        Rule::GatedRms,
+        Rule::RouterLane,
+        Rule::RouterSort,
+        Rule::RouteRows,
+        Rule::RoutedQmv,
+        Rule::SplitPacked,
+        Rule::Qmm,
+    ];
+
+    /// The rules this backend serves are exactly `SERVED`, and every other
+    /// rule the fleet states refuses BY NAME.
+    ///
+    /// The point is the second half. `lanes` names all twenty-four unserved
+    /// rules in one arm rather than catching them with a `_`, so that the
+    /// compiler stops this build when the fleet grows a rule -- which is
+    /// exactly what happened when twenty-one arrived at once and this match
+    /// was the thing that noticed. A wildcard would have compiled, and a
+    /// mamba text would have reached a fire and been refused there, or worse,
+    /// launched on whichever grid the wildcard chose.
+    ///
+    /// So this test is a ledger and a tripwire: a rule added upstream is
+    /// either put in `SERVED` with a module behind it, or it is refused, and
+    /// there is no third state.
+    #[test]
+    fn the_rules_this_backend_serves_are_exactly_the_ones_with_shaders() {
+        let m = Module {
+            local: Local([32, 2, 2]),
+            tile: Some(Tile { rows: 32, cols: 64 }),
+        };
+        for &rule in kernels::LaunchRule::ALL {
+            let module = Module {
+                tile: (rule == Rule::Qmm).then_some(Tile { rows: 32, cols: 64 }),
+                ..m
+            };
+            // `SdpaVector` refuses a module whose workgroup width is not the
+            // fire's head width -- that is the mis-selection guard, not a
+            // rule gap -- so it is asked with the module it was built for.
+            let d = if rule == Rule::SdpaVector {
+                Dims {
+                    head_dim: module.local.at(0),
+                    ..dims()
+                }
+            } else {
+                dims()
+            };
+            let answer = lanes(rule, d, module);
+            if SERVED.contains(&rule) {
+                assert!(answer.is_ok(), "{rule:?} is served but did not answer");
+            } else if rule == Rule::Unstated {
+                assert_eq!(answer, Err(Ungeometric::Unstated));
+            } else {
+                assert_eq!(
+                    answer,
+                    Err(Ungeometric::Unruled(rule)),
+                    "{rule:?} has no shader and must refuse by name"
+                );
+            }
+        }
     }
 
     /// Which rules answer a grid with a zero in it, stated exactly.

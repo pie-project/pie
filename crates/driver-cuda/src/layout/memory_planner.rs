@@ -131,13 +131,17 @@ pub struct ModelShape {
     pub num_key_value_heads: i32,
     /// Head dimension the kernels use for envelopes.
     pub head_dim_kernel: i32,
-    /// The catalog id of the loaded row, e.g. `"qwen3-8b"`.
+    /// The catalog id of the loaded row, carried OPAQUELY.
     ///
-    /// It was `model_type` — `"qwen3"` — which names twelve
-    /// checkpoints of six shapes, so every question asked of it needed
-    /// a second clause to narrow it (`model_type == "qwen3" &&
-    /// hidden_size == 4096`). An id needs none, because it already
-    /// names one model.
+    /// The planner never compares it, branches on it, or parses it — it is
+    /// copied into [`ProfileKey::model_type`](super::profile_key::ProfileKey)
+    /// and nowhere else, because a measured profile belongs to the checkpoint
+    /// that was measured and the cache key has to say which one. Identity as a
+    /// cache key is not identity as a decision.
+    ///
+    /// It used to be read a second way, as `hf.model_id == "qwen3-8b"`, to
+    /// pick a shape knee. That question moved out to [`ShapeKnees`], which the
+    /// caller answers.
     pub model_id: String,
 }
 
@@ -440,7 +444,7 @@ fn token_ladder(
     profile: &str,
     prefill_target: i32,
     score_as_auto: bool,
-    prefer_qwen3_8b_tp2_ada: bool,
+    prefer_page16_prefill_knee: bool,
     calibrating: bool,
     prefill_cap: i32,
 ) -> Vec<i32> {
@@ -460,7 +464,7 @@ fn token_ladder(
     if score_as_auto {
         ns.push(4 * prefill_target);
         ns.push(1.max(prefill_target / 4));
-        if prefer_qwen3_8b_tp2_ada {
+        if prefer_page16_prefill_knee {
             ns.push(5632);
         }
     }
@@ -526,13 +530,13 @@ fn page_score(
     tp_size: i32,
     profile: &str,
     score_as_auto: bool,
-    prefer_qwen3_8b_tp2_ada: bool,
+    prefer_page16_prefill_knee: bool,
     r: i32,
     n: i32,
     max_page_refs: i32,
 ) -> f64 {
     if score_as_auto {
-        if prefer_qwen3_8b_tp2_ada {
+        if prefer_page16_prefill_knee {
             return if kv_page_size == 16 { 0.35 } else { -0.10 };
         }
         if tp_size == 1 {
@@ -599,7 +603,7 @@ struct ScoreTerms {
 
 impl ScoreTerms {
     /// The `auto` objective: a different shape of formula, not a reweighting.
-    fn auto(&self, tp_size: i32, prefer_qwen3_8b_prefill: bool) -> f64 {
+    fn auto(&self, tp_size: i32, prefer_raised_prefill_cap: bool) -> f64 {
         let cohort_score = policy::target_saturation_score(self.r, self.score_decode_target);
         #[expect(
             clippy::cast_precision_loss,
@@ -624,7 +628,7 @@ impl ScoreTerms {
             2.0
         };
         let kv_weight = if enough { 2.0 } else { 4.0 };
-        let prefill_underfill_penalty = if prefer_qwen3_8b_prefill {
+        let prefill_underfill_penalty = if prefer_raised_prefill_cap {
             (-policy::log2_ratio(self.n, self.score_prefill_target)).max(0.0)
         } else {
             0.0
@@ -705,74 +709,94 @@ impl ScoreTerms {
     }
 }
 
-/// The per-(model, GPU) shape preferences the C++ hard-codes.
+/// Which measured shape knees this checkpoint is eligible for, stated by the
+/// caller.
 ///
-/// Each is a measured knee, not a heuristic, and each is deliberately written
-/// against architecture rather than checkpoint name so a re-quantised or
-/// renamed copy of the same model still gets it.
+/// **The planner does not know what model it is planning for, and this is how
+/// it stays that way.** Each knee below is a measurement taken on one
+/// checkpoint and one card, so something has to connect "this checkpoint" to
+/// "this knee" — but that something is not the driver. What stood here was a
+/// `Family` enum with `Qwen35` / `Qwen35Moe` / `NemotronH` variants and a
+/// `hf.model_id == "qwen3-8b"` string compare, which put four checkpoint
+/// identities inside a crate that is not allowed to hold one.
+///
+/// The split is: the caller states WHICH knees a checkpoint qualifies for,
+/// and the planner decides whether the DEVICE and the config also qualify
+/// (see [`ShapePreferences::detect`]). A card being Ada, a rank count being
+/// two, a profile being `auto` — those are the driver's own facts and stay
+/// here. Which checkpoint earned the measurement is not.
+///
+/// [`Default`] is "no knee applies", which is what an ordinary load passes
+/// and what every checkpoint without a measurement of its own gets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShapeKnees {
+    /// This checkpoint's prefill measurement wants the cap raised to 12288 on
+    /// a wide Ampere-or-later part at TP1.
+    pub raised_prefill_cap: bool,
+    /// This checkpoint measured a 5632-token, page-16 knee on Ada at TP2.
+    pub page16_prefill_knee: bool,
+    /// This checkpoint measured an 8k-workspace knee on Ada at TP2 — prompt
+    /// bursts that need 128 short prompts in one prefill batch.
+    pub wide_workspace_knee: bool,
+    /// This checkpoint measured an N=2048 prefill knee at TP>1: decode-heavy,
+    /// but still hurt when the prompt wave is split into 1k chunks.
+    pub tp_prefill_knee_2048: bool,
+    /// This checkpoint drafts MTP rows, which the arena has to be sized for.
+    ///
+    /// Separate from the knees above because it is not a tuning preference:
+    /// omitting it silently UNDER-SIZES the arena by the draft rows rather
+    /// than costing a few percent.
+    pub mtp_draft_rows: bool,
+}
+
+/// The per-(model, GPU) shape preferences the C++ hard-codes, resolved
+/// against this device.
+///
+/// Each is a measured knee, not a heuristic. The checkpoint half of the
+/// question arrives as [`ShapeKnees`]; what is decided here is the device and
+/// config half.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ShapePreferences {
-    /// Qwen3-8B TP1 on Ada: raise the prefill cap to 12288.
-    qwen3_8b_prefill: bool,
-    /// Qwen3-8B TP2 on L40: 5632 tokens, page 16.
-    qwen3_8b_tp2_ada: bool,
-    /// Nemotron-H TP2 on L40: the 8k workspace.
-    nemotron_h_tp2_ada: bool,
-    /// Qwen3.6-MoE TP2: the N=2048 knee.
-    qwen3_5_moe_tp2: bool,
+    /// Raise the prefill cap to 12288.
+    raised_prefill_cap: bool,
+    /// 5632 tokens, page 16.
+    page16_prefill_knee: bool,
+    /// The 8k workspace.
+    wide_workspace_knee: bool,
+    /// The N=2048 knee.
+    tp_prefill_knee_2048: bool,
 }
 
 impl ShapePreferences {
     fn detect(
         cfg: &PlannerConfig,
-        hf: &ModelShape,
         prop: &DeviceProps,
         auto_profile: bool,
-        family: Family,
+        knees: ShapeKnees,
     ) -> Self {
         let base = auto_profile && FORCED_PREFILL == 0;
         let wide = prop.sm_count >= 100;
-        // ONE ROW, named. This was `model_type == "qwen3" &&
-        // hidden_size == 4096` — a family string plus a width, standing
-        // in for an identity nobody could state.
-        let qwen3_8b = hf.model_id == "qwen3-8b";
         let ada = prop.major == 8 && prop.minor == 9;
         Self {
-            qwen3_8b_prefill: base
+            raised_prefill_cap: base
                 && cfg.tp_size == 1
                 && prop.major >= 8
                 && prop.major < 12
                 && wide
-                && qwen3_8b,
-            qwen3_8b_tp2_ada: base && cfg.tp_size == 2 && ada && wide && qwen3_8b,
-            nemotron_h_tp2_ada: base
+                && knees.raised_prefill_cap,
+            page16_prefill_knee: base
                 && cfg.tp_size == 2
                 && ada
                 && wide
-                && family == Family::NemotronH,
-            qwen3_5_moe_tp2: family == Family::Qwen35Moe && cfg.tp_size > 1,
+                && knees.page16_prefill_knee,
+            wide_workspace_knee: base
+                && cfg.tp_size == 2
+                && ada
+                && wide
+                && knees.wide_workspace_knee,
+            tp_prefill_knee_2048: knees.tp_prefill_knee_2048 && cfg.tp_size > 1,
         }
     }
-}
-
-/// Which architecture family the checkpoint belongs to, for the two score
-/// adjustments that name one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Family {
-    /// Anything without a shape adjustment of its own.
-    #[default]
-    Generic,
-    /// Qwen3.6 dense, whose linear-attention state the MTP draft rows are
-    /// sized against.
-    ///
-    /// Distinct from `Qwen35Moe` because the C++ names them together for the
-    /// MTP rows and separately for the TP2 knee; collapsing them silently
-    /// under-sizes the dense arena by the draft rows.
-    Qwen35,
-    /// Qwen3.6-MoE, which has a TP2 prefill knee.
-    Qwen35Moe,
-    /// Nemotron-H, which has a TP2 prefill knee.
-    NemotronH,
 }
 
 /// Build the candidate lattice, score it, and pick a winner.
@@ -794,7 +818,7 @@ pub fn plan(
     hf: &ModelShape,
     prop: &DeviceProps,
     mem: DeviceMemory,
-    family: Family,
+    knees: ShapeKnees,
     costs: &dyn ModelCosts,
     profiles: &dyn ProfileSource,
 ) -> Result<Planned, PlanError> {
@@ -826,18 +850,18 @@ pub fn plan(
         throughput_decode_target,
     );
 
-    let prefs = ShapePreferences::detect(cfg, hf, prop, auto_profile, family);
+    let prefs = ShapePreferences::detect(cfg, prop, auto_profile, knees);
     let base_prefill_cap = policy::prefill_candidate_cap(prop.major);
     let prefill_cap = if FORCED_PREFILL > 0 {
         FORCED_PREFILL.max(base_prefill_cap)
-    } else if prefs.qwen3_8b_prefill {
+    } else if prefs.raised_prefill_cap {
         base_prefill_cap.max(12288)
     } else {
         base_prefill_cap
     };
-    let auto_prefill_target = if prefs.qwen3_8b_tp2_ada {
+    let auto_prefill_target = if prefs.page16_prefill_knee {
         5632
-    } else if prefs.qwen3_8b_prefill {
+    } else if prefs.raised_prefill_cap {
         prefill_cap
     } else {
         prefill_cap
@@ -871,7 +895,7 @@ pub fn plan(
             policy_profile,
             prefill_target,
             score_as_auto,
-            prefs.qwen3_8b_tp2_ada,
+            prefs.page16_prefill_knee,
             cfg.calibrating,
             prefill_cap,
         );
@@ -918,7 +942,7 @@ pub fn plan(
                         ),
                     );
                     let output_rows = r0;
-                    let mtp_rows = if matches!(family, Family::Qwen35 | Family::Qwen35Moe) {
+                    let mtp_rows = if knees.mtp_draft_rows {
                         r0.wrapping_mul(cfg.mtp_num_drafts.clamp(0, 32))
                     } else {
                         0
@@ -1074,7 +1098,7 @@ pub fn plan(
                             cfg.tp_size,
                             policy_profile,
                             score_as_auto,
-                            prefs.qwen3_8b_tp2_ada,
+                            prefs.page16_prefill_knee,
                             r,
                             n,
                             max_page_refs,
@@ -1087,24 +1111,24 @@ pub fn plan(
                         score_prefill_target,
                     };
                     let mut score = if score_as_auto {
-                        terms.auto(cfg.tp_size, prefs.qwen3_8b_prefill)
+                        terms.auto(cfg.tp_size, prefs.raised_prefill_cap)
                     } else {
                         terms.named(policy_profile)
                     };
-                    // Qwen3.6-MoE TP2 is decode-heavy but still suffers when
-                    // the prompt wave is split into 1k-token chunks. The
-                    // measured knee on L40 is N=2048.
-                    if prefs.qwen3_5_moe_tp2
+                    // A decode-heavy TP>1 shape that still suffers when the
+                    // prompt wave is split into 1k-token chunks. The measured
+                    // knee on L40 is N=2048.
+                    if prefs.tp_prefill_knee_2048
                         && (auto_profile || policy_profile == "latency")
                         && FORCED_PREFILL == 0
                     {
                         score += if n >= 2048 { 1.5 } else { -1.5 };
                         score -= policy::log2_ratio(n, 2048).abs() * 4.0;
                     }
-                    // Nemotron-H TP2 prompt bursts on L40 need the 8k
-                    // workspace to keep 128 short prompts in one prefill
-                    // batch; the 8k plan still leaves 256 recurrent slots.
-                    if prefs.nemotron_h_tp2_ada {
+                    // TP2 prompt bursts on L40 that need the 8k workspace to
+                    // keep 128 short prompts in one prefill batch; the 8k plan
+                    // still leaves 256 recurrent slots.
+                    if prefs.wide_workspace_knee {
                         score += if n >= 8192 { 1.5 } else { -1.5 };
                         score -= policy::log2_ratio(n, 8192).abs() * 4.0;
                     }
@@ -1407,7 +1431,7 @@ fn select(
         selector = Selector::CalibrationCeiling;
     }
 
-    if best.is_none() && prefs.qwen3_8b_prefill {
+    if best.is_none() && prefs.raised_prefill_cap {
         let preferred_tokens = policy::prefill_candidate_cap(prop.major).max(12288);
         let auto_decode_target = candidates.first().map_or(0, |c| c.decode_target);
         let mut preferred: Option<usize> = None;

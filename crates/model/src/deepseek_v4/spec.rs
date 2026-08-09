@@ -25,7 +25,7 @@
 //!
 //! The compression SCHEDULE ([`Dsv4Facts::ratios`]) is new here and is
 //! not a transcription: the vtable this replaces answered the question
-//! with `KvStyle::Dsv4 { ratios: Vec::new() }` — an empty list, on every
+//! with `KvStyle::CompressedPlane { ratios: Vec::new() }` — an empty list, on every
 //! load, whatever the checkpoint said — and an empty list is what
 //! `dsv4_geometry::compress_bytes_per_token` reads as "this model needs
 //! no compressor cache". The planner then sized a V4's KV pool without
@@ -131,6 +131,17 @@ pub struct Dsv4Facts {
 }
 
 impl Dsv4Facts {
+    /// Whether layer `l` takes the routed MLP.
+    ///
+    /// The shared predicate, named locally. Four families spell this
+    /// call and the LOGIC is already shared -- `after_dense_prefix`
+    /// lives in `model_compiler::facts` for exactly that reason, and its
+    /// own doc explains why it is named for the PREFIX rather than for
+    /// the mixture. What is left here is a one-line projection onto this
+    /// family's own field, which is cheaper than the trait that would
+    /// remove it: a required accessor plus a default body is more
+    /// machinery than the line it replaces.
+    #[must_use]
     pub fn is_moe_layer(&self, l: u32) -> bool {
         model_compiler::facts::after_dense_prefix(self.dense_layers, l)
     }

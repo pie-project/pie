@@ -436,6 +436,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .map(|d| {
             driver::register_driver_backend(
                 driver::DriverSpec {
+                    // Overwritten by `register_driver_backend` from the
+                    // backend itself; see `DriverSpec::device_domain`.
+                    device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,

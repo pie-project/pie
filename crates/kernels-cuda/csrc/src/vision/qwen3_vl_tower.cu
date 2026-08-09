@@ -22,6 +22,26 @@
 // scripts/qwen3_vl_vision_parity_ref.py dumps (/tmp/qwen3_vl_vision_parity/).
 // Per MULTIMODAL.md §11, parity is bf16-vs-bf16 rel_rms + cosine, not max_abs.
 
+//
+// THE KERNELS ARE NOT HERE. All eleven moved to `vision/qwen3_vl_tower.cuh`
+// in the JIT crate's header tree, where they are named templates over the
+// storage format; this file keeps the host half -- which for this tower is
+// the larger half: the mutex-guarded bilinear pos-embed cache, the
+// `merge_reorder` permutation, the flashinfer attention plan, the cuBLAS
+// handle, the deepstack merger loop and the three entry points. The move is
+// what made the kernels reachable from NVRTC at all: an anonymous namespace
+// has no name to give `nvrtcAddNameExpression`, so the runtime could not
+// resolve a `CUfunction` for one of them. It is a MOVE and not a copy, which
+// `tests/sources.rs::no_global_is_defined_twice` enforces.
+//
+// Five of the eleven turned out to be DEAD -- `k_add_inplace`, `k_split_qkv`,
+// `k_split_qkv_bias`, `k_rope_vis`, `k_rope_qk`, each superseded in place by a
+// fused successor and left behind. The header says which superseded which.
+//
+// Every launch below therefore spells an INSTANTIATION -- `vd::k_bias<bfd>`
+// -- and every bf16 pointer crosses through `D()`. See the alias block for
+// why the cast is there and why it is not a conversion.
+
 #include "vision/qwen3_vl_tower.hpp"
 
 #include <algorithm>
@@ -32,13 +52,13 @@
 #include <cstdlib>
 #include <cublas_v2.h>
 #include <map>
-#include <math_constants.h>
 #include <mutex>
 #include <stdexcept>
 #include <tuple>
 #include <string>
 #include <vector>
 
+#include "vision/qwen3_vl_tower.cuh"
 #include "vision/tower_naive_kernels.cuh"
 
 namespace pie_cuda_driver::model {
@@ -69,143 +89,52 @@ namespace {
 
 #define QCK(x) do{cudaError_t e=(x);if(e)throw std::runtime_error(std::string("qwen3vl_vision: ")+cudaGetErrorString(e));}while(0)
 
-// Add bias[col] to y[m,col] (the GEMM epilogue the old k_matmul folded in).
-__global__ void k_bias(bf* y,const bf* b,long M,int N){
-    long i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=M*(long)N)return;
-    y[i]=Bf(F(y[i])+F(b[i%N]));}
+// `bf` used to arrive from `tower_naive_kernels.cuh`, which declared it inside
+// this namespace next to the kernels it typed. The kernels left and the
+// spelling has to stay, because every host signature in this file and its
+// `.hpp` is written in it.
+typedef __nv_bfloat16 bf;
+
+// The bridge between the tower's `bf` and the kernels' `T`.
+//
+// `bf` is NVIDIA's `__nv_bfloat16`, which is what `vision/qwen3_vl_tower.hpp`
+// declares and what every caller passes; the templates in the `.cuh` are
+// instantiated at `device::bf16`, the prelude's own two-byte struct. They are
+// the same sixteen bits and NOT the same type -- the prelude cannot name
+// NVIDIA's, because NVRTC bundles no device headers and `<cuda_bf16.h>` is one
+// of the 31 it answered none of.
+//
+// So the pointer is REINTERPRETED, once, at each launch. `D` is spelled as a
+// pair of overloads rather than a cast at every argument because a
+// `reinterpret_cast` written out thirty times is thirty places to get the
+// constness wrong, and the compiler cannot tell a wrong one from a right one.
+namespace vd = ::pie_cuda_driver::kernels::vision::device;
+using bfd = ::pie_cuda_driver::kernels::device::bf16;
+inline bfd* D(bf* p) { return reinterpret_cast<bfd*>(p); }
+inline const bfd* D(const bf* p) { return reinterpret_cast<const bfd*>(p); }
+
+// `k_bias` was here, with the other ten. See `vision/qwen3_vl_tower.cuh`.
 
 // cuBLAS GEMM + optional bias, replacing the naive k_matmul. M=rows, O=out, K=in.
 inline void gemm_bias(cublasHandle_t blas,const bf* x,const QVisLinear& lin,
                       bf* y,int M,int O,int K,cudaStream_t S){
     qwen3vl_vis_gemm_bf16(blas,x,lin.w,y,M,O,K);
-    if(lin.b) k_bias<<<((long)M*O+255)/256,256,0,S>>>(y,lin.b,(long)M,O);
+    if(lin.b) vd::k_bias<bfd><<<((long)M*O+255)/256,256,0,S>>>(D(y),D(lin.b),(long)M,O);
 }
 
 // (Projections now route through cuBLAS via gemm_bias(); the naive per-output
 // k_matmul that lived here has been removed.)
-
-// LayerNorm over the last dim D (mean + variance), gamma+beta.  One block/row.
-__global__ void k_add_inplace(bf* h,const bf* x,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t)h[i]=Bf(F(h[i])+F(x[i]));}
-
-// Add the precomputed interpolated abs pos-embed `pe[n_patch,D]` into `h`.
-__global__ void k_add_pe(bf* h,const bf* pe,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t)h[i]=Bf(F(h[i])+F(pe[i]));}
-
-// Plain (non-gated) gelu-tanh: o = 0.5*x*(1+tanh(√(2/π)(x+0.044715x³))).
-// Used by the ViT block MLP (hidden_act = gelu_pytorch_tanh).
-__global__ void k_gelu_tanh(const bf* x,bf* o,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;
-    if(i<t){float v=F(x[i]);o[i]=Bf(0.5f*v*(1.f+tanhf(0.7978845608f*(v+0.044715f*v*v*v))));}}
-
-// Split fused QKV `[N, 3*hidden]` (row layout q|k|v) into q,k,v `[N, hidden]`.
-__global__ void k_split_qkv(const bf* qkv,bf* q,bf* k,bf* v,int N,int H){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,d=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||d>=H)return;
-    const bf* r=qkv+(long)n*3*H;q[(long)n*H+d]=r[d];k[(long)n*H+d]=r[H+d];v[(long)n*H+d]=r[2*H+d];}
-
-// Split fused QKV AND add the (per-section) qkv bias in one pass — folds the
-// post-GEMM bias add into the split so the qkv projection skips its bias kernel.
-__global__ void k_split_qkv_bias(const bf* qkv,const bf* b,bf* q,bf* k,bf* v,int N,int H){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,d=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||d>=H)return;
-    const bf* r=qkv+(long)n*3*H;
-    float bq=b?F(b[d]):0.f, bk=b?F(b[H+d]):0.f, bv=b?F(b[2*H+d]):0.f;
-    q[(long)n*H+d]=Bf(F(r[d])+bq);k[(long)n*H+d]=Bf(F(r[H+d])+bk);v[(long)n*H+d]=Bf(F(r[2*H+d])+bv);}
-
-// gelu_pytorch_tanh with a fused per-column bias add — folds fc1's bias kernel
-// into the activation (block MLP only; mergers keep the separate erf path).
-__global__ void k_gelu_bias(bf* x,const bf* b,int N,int D){
-    long i=blockIdx.x*(long)blockDim.x+threadIdx.x; long t=(long)N*D; if(i>=t)return;
-    float v=F(x[i])+(b?F(b[i%D]):0.f);
-    x[i]=Bf(0.5f*v*(1.f+tanhf(0.7978845608f*(v+0.044715f*v*v*v))));}
-
-// ViT 2D-RoPE (transformers rotate_half layout). Per HF: the rotary table is
-// built from `position_ids` `[N,2]=(row,col)`: rope dim = head_dim/2 = 32, the
-// inv_freq has head_dim/4 = 16 entries. `rotary_pos_emb = (pos[...,None]*inv_freq)
-// .flatten(1)` → per token a length-32 vector = [row*invf(0..15), col*invf(0..15)],
-// then `emb = cat(rope,rope)` → length 64; cos/sin length 64. Attention applies
-// q_embed = q*cos + rotate_half(q)*sin over the full head_dim=64, where
-// rotate_half splits at 32. So effectively: pair index j in [0,16) rotates
-// (q[j], q[j+32]) by angle row*invf[j]; pair index j in [16,32) rotates
-// (q[j], q[j+32]) by angle col*invf[j-16].  invf[c] = theta^(-2c/(head_dim/2)).
-//   half = head_dim/2 (=32); quarter = head_dim/4 (=16).
-// PARITY TODO: confirm the rotate_half pairing (j, j+half) and that the row/col
-// split of the rope dim is [0:quarter)=row, [quarter:half)=col, against
-// transformers apply_rotary_pos_emb_vision + Qwen3VLVisionRotaryEmbedding(head_dim//2).
-__global__ void k_rope_vis(bf* q,const float* pos,int N,int NH,int HEAD,float theta){
-    int n=blockIdx.z,head=blockIdx.y,j=blockIdx.x*blockDim.x+threadIdx.x;
-    int half=HEAD/2, quarter=HEAD/4; if(n>=N||head>=NH||j>=half)return;
-    bf* v=q+(((long)n*NH+head)*HEAD);
-    float row=pos[2L*n],col=pos[2L*n+1];
-    // angle for rope-dim index j: first `quarter` use row, next `quarter` use col.
-    int c = (j<quarter) ? j : (j-quarter);
-    float coord = (j<quarter) ? row : col;
-    float invf = powf(theta, -2.f*(float)c/(float)half);
-    float ang = coord*invf, cs=cosf(ang), sn=sinf(ang);
-    // rotate_half over the full head: pair (j, j+half).
-    float a=F(v[j]), b=F(v[j+half]);
-    v[j]      = Bf(a*cs - b*sn);
-    v[j+half] = Bf(b*cs + a*sn);}
-
-// Apply the same 2D-RoPE to BOTH q and k in one launch (q/k share positions),
-// halving the rope kernel count per layer. Math identical to k_rope_vis.
-__global__ void k_rope_qk(bf* q,bf* k,const float* pos,int N,int NH,int HEAD,float theta){
-    int n=blockIdx.z,head=blockIdx.y,j=blockIdx.x*blockDim.x+threadIdx.x;
-    int half=HEAD/2, quarter=HEAD/4; if(n>=N||head>=NH||j>=half)return;
-    float row=pos[2L*n],col=pos[2L*n+1];
-    int c = (j<quarter) ? j : (j-quarter);
-    float coord = (j<quarter) ? row : col;
-    float invf = powf(theta, -2.f*(float)c/(float)half);
-    float ang = coord*invf, cs=cosf(ang), sn=sinf(ang);
-    long base=((long)n*NH+head)*HEAD;
-    bf* vq=q+base; float aq=F(vq[j]), bq=F(vq[j+half]);
-    vq[j]=Bf(aq*cs-bq*sn); vq[j+half]=Bf(bq*cs+aq*sn);
-    bf* vk=k+base; float ak=F(vk[j]), bk=F(vk[j+half]);
-    vk[j]=Bf(ak*cs-bk*sn); vk[j+half]=Bf(bk*cs+ak*sn);}
-
-// Fused split-qkv(+bias)+RoPE: read fused qkv[N,3H] once, add the per-section
-// bias, write q,k,v[N,H] with q/k already 2D-RoPE'd — one pass instead of a
-// split kernel then a rope kernel (saves the rope's q/k read+write round-trip).
-// One block per (n, head); thread j handles rope pair (j, j+half) of q and k
-// plus the v copy for both lanes. Math identical to k_split_qkv_bias + k_rope_qk.
-__global__ void k_split_rope_qkv(const bf* qkv,const bf* b,bf* q,bf* k,bf* v,
-                                 const float* pos,int N,int NH,int HEAD,float theta){
-    int n=blockIdx.y, head=blockIdx.x; if(n>=N||head>=NH) return;
-    const int H=NH*HEAD, half=HEAD/2, quarter=HEAD/4;
-    const bf* qr=qkv+(long)n*3*H + head*HEAD;   // q section for this head
-    const bf* kr=qr + H;                         // k section
-    const bf* vr=kr + H;                         // v section
-    const bf* bq=b? b+head*HEAD          : nullptr;
-    const bf* bk=b? b+H+head*HEAD        : nullptr;
-    const bf* bv=b? b+2*H+head*HEAD      : nullptr;
-    long o=((long)n*NH+head)*HEAD; bf* qo=q+o; bf* ko=k+o; bf* vo=v+o;
-    float row=pos[2L*n], col=pos[2L*n+1];
-    for(int j=threadIdx.x; j<half; j+=blockDim.x){
-        int c=(j<quarter)?j:(j-quarter);
-        float coord=(j<quarter)?row:col;
-        float invf=powf(theta,-2.f*(float)c/(float)half);
-        float ang=coord*invf, cs=cosf(ang), sn=sinf(ang);
-        float q0=F(qr[j])+(bq?F(bq[j]):0.f), q1=F(qr[j+half])+(bq?F(bq[j+half]):0.f);
-        qo[j]=Bf(q0*cs-q1*sn); qo[j+half]=Bf(q1*cs+q0*sn);
-        float k0=F(kr[j])+(bk?F(bk[j]):0.f), k1=F(kr[j+half])+(bk?F(bk[j+half]):0.f);
-        ko[j]=Bf(k0*cs-k1*sn); ko[j+half]=Bf(k1*cs+k0*sn);
-        vo[j]=Bf(F(vr[j])+(bv?F(bv[j]):0.f));
-        vo[j+half]=Bf(F(vr[j+half])+(bv?F(bv[j+half]):0.f));
-    }}
-
-// (Attention QK/softmax/AV now run inside flashinfer; the cuBLAS+softmax kernels
-// that lived here were removed.)
-
-// (AV now runs via cuBLAS in the block loop; the naive k_av was removed.)
-
-// 2×2 spatial-merge gather: input `h[n_patch, C]` is already in spatial-merge
-// order (every `merge²` consecutive patches form one output token — see the
-// header / the host `get_vision_position_ids` reorder). Output `g[n_token, merge²*C]`
-// concatenates the `merge²` patch rows of each group: g[tok, u*C + c] = h[tok*U+u, c].
-// PARITY TODO: confirm the within-group order (u = 0..U-1) matches the HF reshape
-// `(h//m, m, w//m, m, C) -> (h//m * w//m, m*m, C) -> (..., m*m*C)`; the host
-// reorder is built so consecutive rows ARE that group, so a plain concat suffices.
-__global__ void k_merge_gather(const bf* h,bf* g,int n_token,int U,int C){
-    int tok=blockIdx.y*blockDim.y+threadIdx.y,d=blockIdx.x*blockDim.x+threadIdx.x;
-    int W=U*C; if(tok>=n_token||d>=W)return;
-    int u=d/C, c=d%C;
-    g[(long)tok*W+d]=h[((long)tok*U+u)*C+c];}
+//
+// The ten kernels that were here -- k_add_inplace, k_add_pe, k_gelu_tanh,
+// k_split_qkv, k_split_qkv_bias, k_gelu_bias, k_rope_vis, k_rope_qk,
+// k_split_rope_qkv, k_merge_gather -- are in `vision/qwen3_vl_tower.cuh`,
+// templated over the storage format. That header says which four a
+// `LaunchRule` states, which two are refused on geometry, and which five are
+// dead and why.
+//
+// (Attention QK/softmax/AV now run inside flashinfer; the cuBLAS+softmax
+// kernels that lived here were removed. AV runs via cuBLAS in the block loop;
+// the naive k_av went with them.)
 
 dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 
@@ -215,8 +144,8 @@ dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 void mlp(cublasHandle_t blas,const bf* in,bf* mid,bf* out,const QVisLinear& fc1,const QVisLinear& fc2,
          int N,int Din,int Dmid,int Dout,cudaStream_t S,bool erf_gelu=false){
     gemm_bias(blas,in,fc1,mid,N,Dmid,Din,S);
-    if(erf_gelu) k_gelu_erf<<<((long)N*Dmid+255)/256,256,0,S>>>(mid,mid,(long)N*Dmid);
-    else         k_gelu_tanh    <<<((long)N*Dmid+255)/256,256,0,S>>>(mid,mid,(long)N*Dmid);
+    if(erf_gelu) vd::k_gelu_erf<bfd><<<((long)N*Dmid+255)/256,256,0,S>>>(D(mid),D(mid),(long)N*Dmid);
+    else         vd::k_gelu_tanh<bfd><<<((long)N*Dmid+255)/256,256,0,S>>>(D(mid),D(mid),(long)N*Dmid);
     gemm_bias(blas,mid,fc2,out,N,Dout,Dmid,S);
 }
 
@@ -232,12 +161,12 @@ void run_merger(cublasHandle_t blas,const QVisMerger& m,const bf* h,int n_patch,
     bf* mid=MAL((long)n_token*W);
     if(!m.is_postshuffle){
         // main: norm over hidden first, then gather.
-        k_layernorm<<<n_patch,256,0,S>>>(h,m.norm.g,m.norm.b,normed,n_patch,hidden,eps);
-        k_merge_gather<<<G2(W,n_token),B2,0,S>>>(normed,grouped,n_token,merge_unit,hidden);
+        vd::k_layernorm<bfd><<<n_patch,256,0,S>>>(D(h),D(m.norm.g),D(m.norm.b),D(normed),n_patch,hidden,eps);
+        vd::k_merge_gather<bfd><<<G2(W,n_token),B2,0,S>>>(D(normed),D(grouped),n_token,merge_unit,hidden);
     }else{
         // deepstack: gather first (→4096), then norm over 4096.
-        k_merge_gather<<<G2(W,n_token),B2,0,S>>>(h,grouped,n_token,merge_unit,hidden);
-        k_layernorm<<<n_token,256,0,S>>>(grouped,m.norm.g,m.norm.b,grouped,n_token,W,eps);
+        vd::k_merge_gather<bfd><<<G2(W,n_token),B2,0,S>>>(D(h),D(grouped),n_token,merge_unit,hidden);
+        vd::k_layernorm<bfd><<<n_token,256,0,S>>>(D(grouped),D(m.norm.g),D(m.norm.b),D(grouped),n_token,W,eps);
     }
     mlp(blas,grouped,mid,out,m.fc1,m.fc2,n_token,W,W,out_hidden,S,/*erf_gelu=*/true);
     cudaFreeAsync(normed,S);cudaFreeAsync(grouped,S);cudaFreeAsync(mid,S);
@@ -304,7 +233,7 @@ void run_qwen3vl_vision(cublasHandle_t blas,const QwenVisRawWeights& w,
     emit_ckpt("patch_embed",h,(long)N*Hd);
 
     // Add the host-interpolated abs pos-embed (already [N, hidden]).
-    k_add_pe<<<((long)N*Hd+255)/256,256,0,S>>>(h,pos_embed_interp,(long)N*Hd);
+    vd::k_add_pe<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(pos_embed_interp),(long)N*Hd);
     if(VTIM) cudaEventRecord(e_p1,S);
 
     int deep_written=0;
@@ -314,10 +243,10 @@ void run_qwen3vl_vision(cublasHandle_t blas,const QwenVisRawWeights& w,
         // Fused epilogues: qkv bias folds into the split, q/k rope share one
         // launch, the o-projection writes the residual directly (cuBLAS beta=1)
         // so h += attn@Wo^T in-place — only the o-bias remains as a kernel.
-        if(!GEMM_ONLY) k_layernorm<<<N,256,0,S>>>(h,L.norm1.g,L.norm1.b,hn,N,Hd,EPS);
+        if(!GEMM_ONLY) vd::k_layernorm<bfd><<<N,256,0,S>>>(D(h),D(L.norm1.g),D(L.norm1.b),D(hn),N,Hd,EPS);
         qwen3vl_vis_gemm_bf16(blas,hn,L.qkv.w,qkv,N,3*Hd,Hd);
         // Fused split(+bias)+RoPE: one pass over qkv → q,k,v (q/k roped).
-        if(!GEMM_ONLY) k_split_rope_qkv<<<dim3(NH,N),HEAD/2,0,S>>>(qkv,L.qkv.b,q,k,v,rope_pos,N,NH,HEAD,THETA);
+        if(!GEMM_ONLY) vd::k_split_rope_qkv<bfd><<<dim3(NH,N),HEAD/2,0,S>>>(D(qkv),D(L.qkv.b),D(q),D(k),D(v),rope_pos,N,NH,HEAD,THETA);
         // Full bidirectional attention over all N patches (single image).
         if(VTIM) cudaEventRecord(aS[li],S);
         // Flash attention (flashinfer): block-diagonal per image (multi-seq), all
@@ -325,13 +254,13 @@ void run_qwen3vl_vision(cublasHandle_t blas,const QwenVisRawWeights& w,
         qwen3vl_vis_attn(q, k, v, attn, num_img, n_patch_h, NH, HEAD, S);
         if(VTIM) cudaEventRecord(aE[li],S);
         qwen3vl_vis_gemm_bf16(blas,attn,L.o.w,h,N,Hd,Hd,/*beta=*/1.0f);
-        if(!GEMM_ONLY && L.o.b) k_bias<<<((long)N*Hd+255)/256,256,0,S>>>(h,L.o.b,(long)N,Hd);
+        if(!GEMM_ONLY && L.o.b) vd::k_bias<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(L.o.b),(long)N,Hd);
         // ── mlp (pre-norm: norm2 → fc1 → gelu(+bias) → fc2 → residual) ──
-        if(!GEMM_ONLY) k_layernorm<<<N,256,0,S>>>(h,L.norm2.g,L.norm2.b,hn,N,Hd,EPS);
+        if(!GEMM_ONLY) vd::k_layernorm<bfd><<<N,256,0,S>>>(D(h),D(L.norm2.g),D(L.norm2.b),D(hn),N,Hd,EPS);
         qwen3vl_vis_gemm_bf16(blas,hn,L.fc1.w,mid,N,IM,Hd);
-        if(!GEMM_ONLY) k_gelu_bias<<<((long)N*IM+255)/256,256,0,S>>>(mid,L.fc1.b,N,IM);
+        if(!GEMM_ONLY) vd::k_gelu_bias<bfd><<<((long)N*IM+255)/256,256,0,S>>>(D(mid),D(L.fc1.b),N,IM);
         qwen3vl_vis_gemm_bf16(blas,mid,L.fc2.w,h,N,Hd,IM,/*beta=*/1.0f);
-        if(!GEMM_ONLY && L.fc2.b) k_bias<<<((long)N*Hd+255)/256,256,0,S>>>(h,L.fc2.b,(long)N,Hd);
+        if(!GEMM_ONLY && L.fc2.b) vd::k_bias<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(L.fc2.b),(long)N,Hd);
         // ── deepstack tap (post-block, before next layer) — per image ──
         for(int d=0; d<(int)w.deepstack_layer_idx.size(); ++d){
             if(w.deepstack_layer_idx[d]==li && deep_written<num_deep){
@@ -527,7 +456,7 @@ void scatter_qwen3vl_vision(const Qwen3VLVisionInputs& vin, bf* hidden,
         float* pix_f32_d; QCK(cudaMallocAsync(&pix_f32_d,(long)n_floats*4,S));
         QCK(cudaMemcpyAsync(pix_f32_d,pix_h,(long)n_floats*4,cudaMemcpyHostToDevice,S));
         bf* pix_bf_d; QCK(cudaMallocAsync(&pix_bf_d,(long)n_floats*sizeof(bf),S));
-        k_f32_to_bf16<<<(n_floats+255)/256,256,0,S>>>(pix_f32_d,pix_bf_d,n_floats);
+        vd::k_f32_to_bf16<bfd><<<(n_floats+255)/256,256,0,S>>>(pix_f32_d,D(pix_bf_d),n_floats);
         // tile the cached single-grid rope/pe across the num_img concatenated rows.
         auto rp=grid_rope_pe(g0t,g0h,g0w);
         float* rope_d; QCK(cudaMallocAsync(&rope_d,(long)num_img*n_patch*2*4,S));
@@ -566,7 +495,7 @@ void scatter_qwen3vl_vision(const Qwen3VLVisionInputs& vin, bf* hidden,
             float* pix_f32_d; QCK(cudaMallocAsync(&pix_f32_d,(long)n_floats*4,S));
             QCK(cudaMemcpyAsync(pix_f32_d,pix_h,(long)n_floats*4,cudaMemcpyHostToDevice,S));
             bf* pix_bf_d; QCK(cudaMallocAsync(&pix_bf_d,(long)n_floats*sizeof(bf),S));
-            k_f32_to_bf16<<<(n_floats+255)/256,256,0,S>>>(pix_f32_d,pix_bf_d,n_floats);
+            vd::k_f32_to_bf16<bfd><<<(n_floats+255)/256,256,0,S>>>(pix_f32_d,D(pix_bf_d),n_floats);
             auto rp=grid_rope_pe(gt,gh,gw);
             bf* main_d; QCK(cudaMallocAsync(&main_d,(long)n_token*OUT*sizeof(bf),S));
             std::vector<bf*> deep_d(num_deep,nullptr);

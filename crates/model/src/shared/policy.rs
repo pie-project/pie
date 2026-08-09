@@ -173,3 +173,156 @@ pub struct Policy {
     /// Per-family switches; see [`FamilyKnobs`].
     pub knobs: FamilyKnobs,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The words `pie model build --quant` accepts, and what each means.
+    ///
+    /// This crate holds no caller: [`RuntimeQuant::resolve`] is reached from
+    /// `src/ops/model/build.rs` in the WORKSPACE ROOT, which a `-p model`
+    /// run never executes. That is why the rule was written down here and
+    /// then measured at 23% — the one file in the crate with no test at
+    /// all, because a grep for callers under `crates/` finds none and the
+    /// binary lives beside `crates/` rather than under it.
+    #[test]
+    fn every_quantization_the_cli_accepts_resolves_to_one_outcome() {
+        for (request, fp8_native, expected) in [
+            ("", false, RuntimeQuant::None),
+            ("", true, RuntimeQuant::None),
+            ("int8", false, RuntimeQuant::Int8),
+            ("mxfp4", false, RuntimeQuant::Mxfp4),
+            ("int4", false, RuntimeQuant::Int4),
+        ] {
+            assert_eq!(
+                RuntimeQuant::resolve(request, fp8_native),
+                Ok(expected),
+                "--quant {request:?} with fp8_native={fp8_native}"
+            );
+        }
+    }
+
+    /// FP8 is the one request the device can veto.
+    ///
+    /// Every other word means the same thing on every device, which is why
+    /// `fp8_native` is a parameter rather than a field: it changes exactly
+    /// one answer. `pie model build` prints "dropped, as serve would drop
+    /// it" by comparing this function's answer against the word it passed
+    /// in, so a rule that stopped collapsing would make the CLI bake in a
+    /// requantization it announced as dropped, and one that always
+    /// collapsed would make it silently bake in none.
+    #[test]
+    fn fp8_without_a_device_that_runs_it_is_no_request_at_all() {
+        assert_eq!(
+            RuntimeQuant::resolve("fp8", false),
+            Ok(RuntimeQuant::None),
+            "an fp8 request on a device without native FP8 collapses"
+        );
+        assert_eq!(
+            RuntimeQuant::resolve("fp8", true),
+            Ok(RuntimeQuant::Fp8),
+            "and stands on a device with it"
+        );
+    }
+
+    /// An unknown word is refused, and the refusal says which word.
+    ///
+    /// The alternative — falling through to `None` — is the failure this
+    /// crate is written against: a typo (`--quant fp-8`) that builds
+    /// successfully, serves bf16, and reports nothing.
+    #[test]
+    fn a_quantization_this_build_does_not_know_is_refused_by_name() {
+        let message = RuntimeQuant::resolve("fp-8", true).expect_err("`fp-8` is no quantization");
+        assert!(
+            message.contains("fp-8"),
+            "the refusal names the word the operator typed: {message:?}"
+        );
+        assert!(
+            RuntimeQuant::resolve("bf16", true).is_err(),
+            "`bf16` is the ABSENCE of a requantization and is spelled by \
+             omitting the flag; accepting it here would give the operator \
+             two spellings whose only difference is which one is checked"
+        );
+    }
+
+    /// The variants are sent as their positions, and the positions are these.
+    ///
+    /// [`RuntimeQuant`] carries no `#[repr]` and no written-out
+    /// discriminants, so `as u32` reports DECLARATION ORDER. The `Int4` doc
+    /// says it must stay last for exactly this reason and nothing enforced
+    /// it: reordering two variants renumbers the wire, both sides still
+    /// compile, and the far side reads `Mxfp4` where the caller wrote
+    /// `Int8`.
+    #[test]
+    fn the_wire_positions_are_the_ones_the_other_side_reads() {
+        for (quant, position) in [
+            (RuntimeQuant::None, 0),
+            (RuntimeQuant::Fp8, 1),
+            (RuntimeQuant::Int8, 2),
+            (RuntimeQuant::Mxfp4, 3),
+            (RuntimeQuant::Int4, 4),
+        ] {
+            assert_eq!(quant as u32, position, "{quant:?} is sent as {position}");
+        }
+    }
+
+    /// The three mirrored enums send the numbers the C header declares.
+    ///
+    /// These carry `#[repr(u32)]` and spelled-out discriminants because
+    /// they mirror `model/contract.hpp`. The numbers are restated here
+    /// rather than read off the variant, since a test that derives them
+    /// from the type agrees with any renumbering.
+    #[test]
+    fn the_mirrored_enums_send_the_numbers_the_header_declares() {
+        assert_eq!(Component::Full as u32, 0);
+        assert_eq!(Component::Text as u32, 1);
+        assert_eq!(Component::Encode as u32, 2);
+
+        assert_eq!(Mxfp4MoeRequest::Auto as u32, 0);
+        assert_eq!(Mxfp4MoeRequest::RoutedDecode as u32, 1);
+        assert_eq!(Mxfp4MoeRequest::NativeGemm as u32, 2);
+        assert_eq!(Mxfp4MoeRequest::EagerBf16 as u32, 3);
+
+        assert_eq!(Mxfp4MoePolicy::RoutedDecode as u32, 0);
+        assert_eq!(Mxfp4MoePolicy::NativeGemm as u32, 1);
+        assert_eq!(Mxfp4MoePolicy::EagerBf16 as u32, 2);
+    }
+
+    /// Every default is the inert choice at its own position.
+    ///
+    /// `boot.rs` states all seven fields and so never reaches these, but a
+    /// family's fixture builds `Policy::default()` and any call that grows
+    /// a field later fills it from here. The whole point of the type is
+    /// that a value nobody asked for asks for nothing.
+    #[test]
+    fn the_default_policy_asks_for_nothing() {
+        let policy = Policy::default();
+        assert_eq!(policy.runtime_quant, RuntimeQuant::None);
+        assert_eq!(policy.moe_request, Mxfp4MoeRequest::Auto);
+        assert_eq!(policy.component, Component::Full);
+        assert!(!policy.stream_routed_experts);
+        assert_eq!(policy.projections, Projections::Fused);
+        assert_eq!(policy.naming, Naming::Hf);
+    }
+
+    /// The one knob that defaults ON, and why it has a hand-written impl.
+    ///
+    /// `nemotron_tp_mamba_sharding` mirrors an env var spelled as a DISABLE
+    /// (`PIE_NEMOTRON_DISABLE_TP_MAMBA_SHARD`), so its absence means on. A
+    /// `#[derive(Default)]` on this struct would quietly make it off and
+    /// un-shard every Mamba mixer — a contract change that re-plans, with
+    /// no error anywhere.
+    #[test]
+    fn the_inverted_knob_defaults_to_the_sharding_being_on() {
+        let knobs = FamilyKnobs::default();
+        assert!(
+            knobs.nemotron_tp_mamba_sharding,
+            "the env var is a kill switch, so its absence is `true`"
+        );
+        assert!(
+            !knobs.qwen35_mtp_int8_lm_head,
+            "this one is spelled as an enable, so its absence is `false`"
+        );
+    }
+}

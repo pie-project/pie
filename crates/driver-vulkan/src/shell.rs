@@ -40,6 +40,7 @@ use model_compiler::trace::ForwardPlan;
 
 use crate::device::{Device, Failed, Pipelines, Unavailable};
 use crate::dispatch::Geometry;
+use crate::frames::{Launched, Unlaunched, pages_named, requests_of, tokens_of};
 use crate::pages::Book;
 use crate::resources::{Pool, Shape, Weights};
 use crate::turns::{Held, Serving, Step, Turn};
@@ -564,6 +565,135 @@ impl Shell {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Serve one frame from the engine.
+    ///
+    /// # What this does that [`Self::step`] does not
+    ///
+    /// Nothing to the book. The engine's scheduler owns page allocation --
+    /// eviction, prefix sharing, the copy plans -- and hands down the physical
+    /// pages it chose; running those through this driver's own allocator would
+    /// give two allocators one page and no way to notice. See
+    /// [`crate::frames`].
+    ///
+    /// # The order, and why it is this one
+    ///
+    /// * admit first, WITHOUT side effects, so a refused frame can be
+    ///   re-posted rather than undone;
+    /// * grow the pool to the highest page the frame NAMES, since the pool
+    ///   may have been trimmed below a mark the scheduler was right to hand
+    ///   out;
+    /// * convert every step's CSRs BEFORE firing any of them, so a frame with
+    ///   a malformed third step does not append the first two;
+    /// * then fire, in the frame's own execution order, because step `n + 1`
+    ///   reads the cache step `n` appended.
+    ///
+    /// # Errors
+    ///
+    /// [`Unlaunched`]. A frame the pool cannot hold is an `Ok` answer --
+    /// [`Launched::Exhausted`] or [`Launched::Impossible`] -- and not an
+    /// error, because a full cache is a scheduling fact rather than a fault.
+    pub fn launch(&mut self, frame: &driver_api::FrameSubmission) -> Result<Launched, Unlaunched> {
+        if frame.steps.is_empty() {
+            return Err(Unlaunched::Malformed("a frame of no steps".to_string()));
+        }
+        let need = pages_named(frame);
+        // Against what the pool COULD hold rather than what it holds now: the
+        // pool gives pages back down to a high-water mark, and a frame past
+        // that mark is one it can serve after growing. Calling that impossible
+        // would have the scheduler permanently drop work it had correctly
+        // admitted, because the pool had been idle.
+        if need > self.pool.ceiling(&self.device) {
+            return Ok(Launched::Impossible);
+        }
+        if need > self.pool.shape().pages {
+            self.pool
+                .resize(&self.device, need)
+                .map_err(|e| Unlaunched::Unstepped(crate::turns::Unstepped::Failed(e)))?;
+        }
+
+        // Every step converted before any is fired. A frame whose third step
+        // does not close its CSR would otherwise have appended the first two
+        // steps' keys, and the scheduler's retry of the same frame would
+        // append them twice.
+        let mut work = Vec::with_capacity(frame.steps.len());
+        for step in &frame.steps {
+            step.plan
+                .validate_geometry()
+                .map_err(|e| Unlaunched::Malformed(format!("this frame's geometry: {e}")))?;
+            step.plan
+                .validate_kv_writes(self.pool.shape().page_size)
+                .map_err(|e| Unlaunched::Malformed(format!("this frame's KV writes: {e}")))?;
+            // Before any conversion: a plan naming something this driver
+            // does not implement is refused by the field's own name rather
+            // than served without it. See `frames::unserved_in`.
+            if let Some(what) = crate::frames::unserved_in(&step.plan) {
+                return Err(Unlaunched::Unserved(what));
+            }
+            work.push((requests_of(&step.plan)?, tokens_of(&step.plan)?));
+        }
+
+        let mut out = Vec::with_capacity(work.len());
+        for (requests, tokens) in &work {
+            let borrowed: Vec<&[u32]> = tokens.iter().map(Vec::as_slice).collect();
+            let serving = Serving {
+                plan: &self.text.decode,
+                prefill: &self.text.prefill,
+                geometry: self.text.geometry,
+                tier: self.tier,
+            };
+            let mut held = Held {
+                book: &mut self.book,
+                pool: &mut self.pool,
+                weights: &self.weights,
+            };
+            out.push(
+                serving
+                    .over(
+                        &self.device,
+                        &mut self.pipelines,
+                        &self.modules,
+                        &mut held,
+                        requests,
+                        &borrowed,
+                    )
+                    .map_err(Unlaunched::Unstepped)?,
+            );
+        }
+        Ok(Launched::Ran(out))
+    }
+
+    /// Encode a program's stages without firing them.
+    ///
+    /// Refused by name, as `driver-cuda` and `driver-metal` refuse it. There
+    /// is no separate encode step in this driver: a fire records its own
+    /// command buffer inside [`Self::step`], and there is nothing for a caller
+    /// to hold between the two halves.
+    ///
+    /// # Errors
+    ///
+    /// Always [`Unlaunched::Unserved`].
+    pub fn encode(&mut self) -> Result<(), Unlaunched> {
+        Err(Unlaunched::Unserved(
+            "encode: a fire records and submits in one call, so there is no \
+             encoded frame to hand back",
+        ))
+    }
+
+    /// Move a recurrent state between slots.
+    ///
+    /// Refused by name. This driver serves attention models only -- there is
+    /// no recurrent-state pool to move anything between, and the plans it
+    /// lowers name none.
+    ///
+    /// # Errors
+    ///
+    /// Always [`Unlaunched::Unserved`].
+    pub fn copy_state(&mut self) -> Result<(), Unlaunched> {
+        Err(Unlaunched::Unserved(
+            "copy_state: no model this driver serves holds a recurrent state",
+        ))
     }
 
     /// The cache's shape.

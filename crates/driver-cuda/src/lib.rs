@@ -153,7 +153,7 @@ pub mod layout;
 // is. The gate used to run per-file through `store/`, `model/` and
 // `tensor.rs`, and a per-file gate is discipline rather than structure:
 // it holds until someone adds a file, and the cost of it slipping was
-// measured — `memory_planner`, `mla_geometry` and `dsv4_geometry` sat
+// measured — `memory_planner`, `mla_geometry` and `compressed_plane_geometry` sat
 // parity-tested with zero callers for months, because the only builds
 // that could have noticed were builds that needed a GPU.
 //

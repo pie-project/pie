@@ -42,7 +42,13 @@ pub enum ReasoningEvent {
 /// Events emitted by the tool decoder.
 #[derive(Debug, Clone)]
 pub enum ToolEvent {
-    /// Tool call detected
+    /// NOTHING TO REPORT YET — not "a tool call has started".
+    ///
+    /// There is no third variant, so this is what every decoder returns
+    /// while it is still waiting: before an opening marker, between one
+    /// and its close, after a block that named no function, and for
+    /// every token of a model that has no tool protocol at all. A
+    /// consumer that treats it as a detection sees one on every feed.
     Start,
     /// Complete tool call: (name, arguments-json)
     Call(String, String),

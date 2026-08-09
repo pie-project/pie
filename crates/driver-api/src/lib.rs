@@ -16,8 +16,9 @@
 //!   Still `#[repr(C)]` and still `{ptr, len}` where a slice would do, which
 //!   is the shape they took when they crossed a C boundary. Nothing crosses
 //!   one now; converting them to borrowed Rust is a mechanical sweep over
-//!   ~65 construction sites in `engine`, `driver-cuda` and
-//!   `driver-dummy`, and it is the next step rather than this one.
+//!   ~65 construction sites in `engine` and `driver-cuda` (it was ~65
+//!   across three crates before `driver-dummy` was deleted), and it is the
+//!   next step rather than this one.
 //! - [`adopt`]: the [`local`] → [`plan`] direction, copying a borrowed launch
 //!   package into the owned one a driver keeps for the life of the program.
 //!   It survives exactly as long as `local`'s borrowed shape does.

@@ -26,20 +26,21 @@ use crate::plan::{
     TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_SCALE, TileMapKind,
     TransformFusion,
 };
-use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDecl};
+use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 
-/// The `kernels-cuda` rows a load may run on the device, by table symbol.
+/// The kernel rows a load may run on the device, by table symbol.
 ///
-/// Named here rather than reached for out of `kernels_cuda`, because the plan
-/// for a CUDA target is compiled on machines that have no CUDA at all — the
-/// import path does it, and so does every test. A plan is a claim about what a
-/// device will do, and making that claim must not require the device's
+/// Named here rather than reached for out of `kernels-cuda-new`, because the
+/// plan for a CUDA target is compiled on machines that have no CUDA at all —
+/// the import path does it, and so does every test. A plan is a claim about
+/// what a device will do, and making that claim must not require the device's
 /// toolchain.
 ///
 /// What keeps them honest is the other side: with `feature = "cuda"` on,
-/// `executor::cuda` calls exactly these and a test resolves each against
-/// `kernels_cuda::quant::KERNELS`. A symbol that stopped existing fails that
-/// build rather than becoming a plan nothing can run.
+/// `executor::cuda` calls exactly these through the generated typed entry
+/// points and a test resolves each against `kernels_cuda_new::runtime::hosts`.
+/// A symbol that stopped existing fails that build rather than becoming a
+/// plan nothing can run.
 pub const CUDA_CAST_FP32_TO_BF16: &str = "quant::cast_fp32_to_bf16";
 pub const CUDA_SCALE_ROWS_BF16: &str = "quant::scale_rows_bf16";
 pub const CUDA_QUANTIZE_BF16_TO_MXFP4: &str = "quant::quantize_bf16_to_mxfp4_e2m1_per_block";
@@ -282,6 +283,15 @@ pub struct TileMapFacts {
     /// operand, rather than multiplying by the uniform constant in
     /// `scale_factor_bits`.
     pub blocked_scale: bool,
+    /// Whether every operand resolves to a span of the arena.
+    ///
+    /// A kernel runs on a device and a device reaches the arena, so this is a
+    /// precondition of naming one rather than a preference. It is a FACT and
+    /// not a check because the answer decides the plan: an operand the arena
+    /// does not hold means `kernel = None`, which is the plan saying the host
+    /// runs this one — visibly, in the field a reader looks at — instead of
+    /// the executor discovering it at launch and quietly doing the same thing.
+    pub operands_in_arena: bool,
 }
 
 /// What the lowering decided. Written into the instruction verbatim.
@@ -306,11 +316,17 @@ pub struct TileLowering {
 /// Runs over a finished plan, so a decision may depend on anything the plan
 /// says. It only ever *writes* decision fields — never adds, removes, or
 /// reorders instructions — which is what lets a backend that declines to decide
-/// leave the plan bit-identical. That is also why it is not a [`Pass`]: it
-/// rewrites nothing there would be anything to count.
+/// leave the plan bit-identical.
 ///
-/// [`Pass`]: crate::plan::pass::Pass
-pub fn lower(plan: &mut LoadPlan) {
+/// It is the LAST [`Stage::Rewrite`] pass, and being a pass at all is what
+/// makes `validate-kernel-operands` possible: a check runs after every
+/// rewrite, so a validator can only speak about `TransformSpec::kernel` if the
+/// thing that fills it in has already run. It was a bare function called after
+/// the pipeline, which put the plan's most consequential decision outside the
+/// only machinery that checks the plan.
+///
+/// [`Stage::Rewrite`]: crate::plan::pass::Stage::Rewrite
+pub fn lower(plan: &mut LoadPlan) -> usize {
     let target = plan.target.clone();
     let index = PlanIndex::new(plan);
 
@@ -322,6 +338,7 @@ pub fn lower(plan: &mut LoadPlan) {
         .map(|instr| tile_map_facts(plan, &index, instr))
         .collect();
 
+    let mut named = 0;
     for (instr, facts) in plan.instrs.iter_mut().zip(facts) {
         let (
             Some(facts),
@@ -336,13 +353,24 @@ pub fn lower(plan: &mut LoadPlan) {
         tile.rows_per_tile = lowering.rows_per_tile;
         transform.fusion = lowering.fusion;
         transform.kernel = lowering.kernel.map(str::to_string);
+        named += usize::from(lowering.kernel.is_some());
     }
+    named
+}
+
+/// [`lower`], as the pipeline runs it. The count is the kernels it named.
+pub(super) fn lower_backend_tiling(plan: &mut LoadPlan) -> crate::error::Result<usize> {
+    Ok(lower(plan))
 }
 
 fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering {
+    // Nothing to name a row for: the operands are not where a kernel could
+    // read them. Stated once here rather than in each backend's table, because
+    // it is true of every device and of no host.
+    let kernel = |chosen| facts.operands_in_arena.then_some(chosen).flatten();
     match target.backend {
         BackendKind::Cuda => TileLowering {
-            kernel: cuda_kernel(facts),
+            kernel: kernel(cuda_kernel(facts)),
             ..cuda_encode(facts, target)
         },
         // Neither Metal nor Vulkan runs a transform: the host executor
@@ -354,7 +382,35 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
     }
 }
 
-/// Which `kernels-cuda` row runs these operands, or `None` for the host.
+/// Which row this target would run these operands as, or `None` for the host.
+///
+/// The kernel table, asked a question about operands that do not exist yet.
+/// [`stage_device_transforms`] rewrites a transform so its operands are on the
+/// device, and it has to know BEFORE rewriting whether the rewrite buys
+/// anything — so it builds the facts the rewritten instruction would have and
+/// asks here. Restating the table there instead is how the driver and the
+/// loader came to hold two opinions about one device
+/// (`.wiki/fix/loader.md` §3.1); there is one table and this is the way in.
+///
+/// [`stage_device_transforms`]: super::stage::stage_device_transforms
+pub(crate) fn kernel_for(facts: &TileMapFacts, target: &StorageTarget) -> Option<&'static str> {
+    lower_tile_map(facts, target).kernel
+}
+
+/// Everything the lowering rule reads about one instruction, extracted from
+/// the plan.
+///
+/// `pub(crate)` for the staging pass, which asks [`kernel_for`] about a
+/// modified copy of what this returns.
+pub(crate) fn facts_of(
+    plan: &LoadPlan,
+    index: &PlanIndex,
+    instr: &StorageInstr,
+) -> Option<TileMapFacts> {
+    tile_map_facts(plan, index, instr)
+}
+
+/// Which kernel row runs these operands, or `None` for the host.
 ///
 /// **This is the table that used to live in the driver**, as a `run_tile_map`
 /// that took the operands and answered `Ok(false)` when it had no kernel for
@@ -585,23 +641,58 @@ fn tile_map_facts(
             .is_none_or(|source| extent_is_compact(&source.stride)),
         shape: outputs
             .first()
-            .and_then(|buffer| logical_shape(plan, index, *buffer)),
+            .and_then(|buffer| logical_shape(plan, *buffer)),
         max_tile_bytes: tile.max_tile_bytes,
         dest_dtype: outputs
             .first()
-            .and_then(|buffer| raw_dtype(plan, index, *buffer)),
+            .and_then(|buffer| raw_dtype(plan, *buffer)),
         in_place: rewrites_in_place(plan, source.as_ref(), inputs, outputs, dest.as_ref()),
         blocked_scale: !transform.scale_blocks.is_empty(),
+        operands_in_arena: inputs
+            .iter()
+            .chain(outputs)
+            .chain(dest.as_ref().map(|dest| &dest.buffer))
+            .all(|buffer| in_arena(plan, *buffer)),
     })
 }
 
-/// The dtype behind a buffer, when its tensor is unquantized.
+/// Whether a buffer resolves to a span of the arena, through views.
+///
+/// The same walk the executor's `resolve` does — a window on a resident buffer
+/// IS in the arena, and reading only the buffer's own offset reports every
+/// alias as absent.
+fn in_arena(plan: &LoadPlan, id: BufferId) -> bool {
+    let mut id = id;
+    for _ in 0..MAX_VIEW_HOPS {
+        let Ok(decl) = plan.buffer(id) else {
+            return false;
+        };
+        if decl.arena_offset().is_some() {
+            return true;
+        }
+        let base = plan.instrs.iter().find_map(|instr| match instr {
+            StorageInstr::CreateView { input, output, .. } if *output == id => Some(*input),
+            _ => None,
+        });
+        match base {
+            Some(base) => id = base,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// How deep a chain of views may go before the walk gives up; the same guard
+/// [`crate::plan::spans`] uses, for the same reason.
+const MAX_VIEW_HOPS: usize = 16;
+
+/// The dtype behind a buffer, when it is unquantized.
 ///
 /// `None` for a quantized destination rather than its logical dtype: the two
 /// are different claims, and a rule that read "bf16" off an MXFP4 output would
 /// pick a kernel for bytes that are not there.
-fn raw_dtype(plan: &LoadPlan, index: &PlanIndex, buffer: BufferId) -> Option<DType> {
-    match index.buffer_tensor(plan, buffer)?.encoding {
+fn raw_dtype(plan: &LoadPlan, buffer: BufferId) -> Option<DType> {
+    match plan.buffer(buffer).ok()?.ty.encoding {
         Encoding::Raw(dtype) => Some(dtype),
         Encoding::Quant(_) => None,
     }
@@ -610,11 +701,12 @@ fn raw_dtype(plan: &LoadPlan, index: &PlanIndex, buffer: BufferId) -> Option<DTy
 /// Whether the transform's destination is the same bytes as its input.
 ///
 /// Answers the question the executor answers with `op.src != op.dst`, and
-/// answers it the same way: by resolving both to arena spans. That is possible
-/// HERE, and only here, because [`lower`] runs after
-/// `assign-persistent-offsets` — a plan reaching this pass has its layout, so
-/// two buffers that were allocated separately and then placed at one offset
-/// are visible as the one operand they became.
+/// answers it by BUFFER IDENTITY: the same buffer, covered whole. It used to
+/// resolve both sides to arena spans and compare those, which made the answer
+/// depend on where a pass had put things — true only after
+/// `assign-persistent-offsets`, and `None` for an operand the arena had not
+/// placed. Identity is the same answer wherever it is asked, which is what
+/// lets `stage-device-transforms` ask it before the placement exists.
 ///
 /// A checkpoint source is never in place: its bytes are on disk.
 fn rewrites_in_place(
@@ -627,31 +719,20 @@ fn rewrites_in_place(
     if source.is_some() {
         return false;
     }
-    let Some(src) = inputs.first().and_then(|id| span_of(plan, *id)) else {
+    let Some(&src) = inputs.first() else {
         return false;
     };
-    let dst = match dest {
+    match dest {
         Some(dest) => {
-            let Some((base, _)) = span_of(plan, dest.buffer) else {
+            let Ok(decl) = plan.buffer(dest.buffer) else {
                 return false;
             };
-            (
-                base + dest.offset + dest.stride.base_offset,
-                extent_bytes(&dest.stride),
-            )
+            dest.buffer == src
+                && dest.offset + dest.stride.base_offset == 0
+                && extent_bytes(&dest.stride) == decl.bytes
         }
-        None => match outputs.first().and_then(|id| span_of(plan, *id)) {
-            Some(span) => span,
-            None => return false,
-        },
-    };
-    src == dst
-}
-
-/// A buffer's `(arena offset, bytes)`, when it has been placed.
-fn span_of(plan: &LoadPlan, id: BufferId) -> Option<(u64, u64)> {
-    let decl = plan.buffer(id).ok()?;
-    Some((decl.persistent_offset?, decl.bytes))
+        None => outputs.first() == Some(&src),
+    }
 }
 
 /// The bytes one extent covers: the product of its counts, times the width of
@@ -676,18 +757,23 @@ fn source_dtype(
             .source(plan, source.tensor_id)
             .map(|decl| encoding_dtype(&decl.encoding));
     }
-    index
-        .buffer_tensor(plan, *inputs.first()?)
-        .map(TensorDecl::dtype)
+    // The BUFFER's own type, not its tensor's. This lookup used to go through
+    // `BufferDecl::tensor`, so an operand that was not a bound tensor — every
+    // intermediate a transform chain produces — typed as `None`, no kernel row
+    // was named, and the transform ran on the host no matter what the device
+    // could do (`.wiki/fix/loader.md` §3.2).
+    plan.buffer(*inputs.first()?)
+        .ok()
+        .map(|decl| encoding_dtype(&decl.ty.encoding))
 }
 
 /// The declared 2-D shape behind a buffer.
 ///
 /// MXFP4 outputs are allocated flat (`u8[bytes]`), so the buffer's own size
-/// says nothing about rows and columns; the logical shape lives on the tensor
-/// declaration. Same recovery `encode_tile_map` did in C++.
-fn logical_shape(plan: &LoadPlan, index: &PlanIndex, buffer: BufferId) -> Option<(u64, u64)> {
-    match index.buffer_tensor(plan, buffer)?.shape.as_slice() {
+/// says nothing about rows and columns; the logical shape lives on the buffer's
+/// declared type. Same recovery `encode_tile_map` did in C++.
+fn logical_shape(plan: &LoadPlan, buffer: BufferId) -> Option<(u64, u64)> {
+    match plan.buffer(buffer).ok()?.ty.shape.as_slice() {
         [rows, cols] => Some((u64::try_from(*rows).ok()?, u64::try_from(*cols).ok()?)),
         _ => None,
     }

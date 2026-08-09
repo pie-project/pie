@@ -7,6 +7,14 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// PIE: the carried fp16/bf16 shims are a census of the names the ALREADY
+// migrated tree spelled; Marlin is the first source to reach for the packed
+// broadcasts and `__hsub2`. See `pie_marlin_intrinsics.h` for the four names
+// and for the note that they belong in the shims, not here.
+#ifdef __CUDACC_RTC__
+  #include "pie_marlin_intrinsics.h"
+#endif
+
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
@@ -109,7 +117,25 @@ class MarlinScalarType<vllm::kFE4M3fn.id()> {
 
   static __host__ __device__
       float2 inline num22float2(const __nv_fp8x2_e4m3 x) {
+#ifdef __CUDACC_RTC__
+    // PIE: the carried `cuda_fp8.h` declares `__nv_fp8x2_e4m3` as STORAGE and
+    // says so -- "no constructor is spelled anywhere, so none is written
+    // here" -- which leaves the vendor's `explicit operator float2()` absent
+    // and this cast without a conversion. Spelled out through the two names
+    // the shim does carry, which is the vendor's own body: an fp8 byte widens
+    // to an fp16 bit pattern exactly, and fp16 widens to fp32 exactly, so
+    // both hops are lossless and the pair is bit-identical to `(float2)x`.
+    // No shape in `kernels.def` outputs fp8; this specialisation is compiled
+    // regardless because a full class specialisation's members are.
+    float2 out;
+    out.x = __half2float(static_cast<__half>(__nv_cvt_fp8_to_halfraw(
+        static_cast<__nv_fp8_storage_t>(x.__x & 0xFFu), __NV_E4M3)));
+    out.y = __half2float(static_cast<__half>(__nv_cvt_fp8_to_halfraw(
+        static_cast<__nv_fp8_storage_t>(x.__x >> 8), __NV_E4M3)));
+    return out;
+#else
     return (float2)x;
+#endif
   }
 };
 

@@ -9,22 +9,20 @@
 //! present only because three role libs each parsed their own), no `worker.`
 //! prefixing all 44 keys, and no `[model.driver.options]` four levels down.
 
-use worker::driver_ffi::{self, Flavor};
+use worker::driver_ffi;
 
 /// Render the default `config.toml`.
 pub fn default_config_content() -> String {
     let flavor = driver_ffi::default_flavor();
     let driver_block = match flavor {
         #[cfg(feature = "driver-cuda")]
-        Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
+        Some(driver_ffi::Flavor::Cuda) => CUDA_DRIVER_BLOCK,
         #[cfg(feature = "driver-metal")]
-        Some(Flavor::Metal) => METAL_DRIVER_BLOCK,
-        Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
-        // Fallback for exhaustiveness: `default_flavor` always returns `Some`
-        // (dummy is linked unconditionally), and `worker` may compile
-        // `Flavor::Cuda`/`Metal` while this crate's matching `driver-*` arm is
-        // cfg'd off (workspace feature-unification can desync the two) — those
-        // land here → the dummy block.
+        Some(driver_ffi::Flavor::Metal) => METAL_DRIVER_BLOCK,
+        // `default_flavor` answers `None` when this binary carries no driver,
+        // and `worker` may compile `Flavor::Cuda`/`Metal` while this crate's
+        // matching `driver-*` arm is cfg'd off (workspace feature-unification
+        // can desync the two). Both land here.
         _ => DUMMY_DRIVER_BLOCK,
     };
     let model_block = match flavor {
@@ -32,7 +30,7 @@ pub fn default_config_content() -> String {
         // matvec and has no unquantized kernel, so the stock bf16 default
         // imports fine and then cannot bind at load. A default has to run.
         #[cfg(feature = "driver-metal")]
-        Some(Flavor::Metal) => METAL_MODEL_BLOCK,
+        Some(driver_ffi::Flavor::Metal) => METAL_MODEL_BLOCK,
         _ => DEFAULT_MODEL_BLOCK,
     };
     format!("{HEADER}{model_block}{driver_block}{TAIL}")
@@ -180,9 +178,9 @@ mod tests {
         // than assumed: the template's `type` is the flavor this binary has.
         let expected = match driver_ffi::default_flavor() {
             #[cfg(feature = "driver-cuda")]
-            Some(Flavor::Cuda) => "cuda_native",
+            Some(driver_ffi::Flavor::Cuda) => "cuda_native",
             #[cfg(feature = "driver-metal")]
-            Some(Flavor::Metal) => "metal",
+            Some(driver_ffi::Flavor::Metal) => "metal",
             _ => "dummy",
         };
         let content = default_config_content();

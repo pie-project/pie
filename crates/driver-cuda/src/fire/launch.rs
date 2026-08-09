@@ -1464,7 +1464,8 @@ fn kv_pools_for(
     // family quietly served the wrong store.
     match dep.kv {
         model::deployment::KvStyle::Paged => {}
-        model::deployment::KvStyle::Mla { .. } | model::deployment::KvStyle::Dsv4 { .. } => {
+        model::deployment::KvStyle::Mla { .. }
+        | model::deployment::KvStyle::CompressedPlane { .. } => {
             return Err(PIE_STATUS_UNSUPPORTED);
         }
     }
@@ -2603,6 +2604,125 @@ fn peel_word(
     )
 }
 
+/// The fire's ROUTED-EXPERT FANOUT, read out of the lowered plan.
+///
+/// [`crate::bind::DispatchCtx::experts_per_token`] is a GEOMETRY axis — a
+/// routed decode opens `dim3 grid(num_tokens * top_k, ..)`
+/// (`dequant_fp4.cu:56`, `dequant_wna16.cu:71`) — and a grid is sized before
+/// an operand is read, so it cannot arrive as an operand. It is also not in
+/// `model::deployment::Geometry`, which states hidden, heads, head width,
+/// intermediates and vocab and stops.
+///
+/// What the fire does hold is its own lowered launches, and the mixture
+/// statements state the fanout as a wire param at a position `dsl` fixes per
+/// statement kind. This reads it from there.
+///
+/// # Keyed on the SYMBOL, and that is the whole design
+///
+/// §21.14's test is *"does the new spelling make a wrong predicate
+/// well-formed?"*, and a field filled by a derivation is a spelling like any
+/// other. The wrong reading available here is *"take `params[k]` of whatever
+/// launch is in front of you"* — and `params[1]` is `window_left` on an
+/// attention dispatch, `params[1]` is `w.width` on an unrouted `qmv`, and
+/// `params[2]` is the ROW PITCH on a strided copy. Any of those would type
+/// as a `u32` and none of them is a fanout.
+///
+/// So there is no index in this function's interface. The only way to ask is
+/// to name a symbol, and a symbol's parameter layout is stated by the one
+/// `dsl` constructor that emits it — which is a fact under version control on
+/// the side that owns it, not a convention this driver remembers. A statement
+/// whose layout is not in [`ROUTED_FANOUT_AT`] is invisible here, which is
+/// absence and which reads as a refusal downstream.
+///
+/// # And it must AGREE
+///
+/// A fire's mixture layers all route to the same fanout — the router picks
+/// `k` and every downstream statement consumes the same `k` — so
+/// disagreement is not a fire with two mixtures, it is a plan this driver has
+/// misread. The answer to disagreement is `0`, which is absence, which every
+/// reading rule refuses. That is the difference between a derivation and a
+/// guess: a guess resolves a conflict, this one reports it.
+///
+/// A fire with NO routed statement gets `0` too, and for a dense model that
+/// is simply true.
+fn fire_experts_per_token(lowered: &model_compiler::lower::Lowered) -> i32 {
+    /// Where a routed statement states its fanout, by symbol.
+    ///
+    /// Each entry is `(symbol, index into that launch's params)` and each is
+    /// transcribed from the `dsl` constructor that emits it — the citation
+    /// is in the entry, because a table like this is only as good as its
+    /// provenance:
+    ///
+    ///  * `dsl.rs:2887` `router_topk` — `vec![n_experts, experts_per_token]`
+    ///  * `dsl.rs:2920` `route_sort` and `:2951` `route_gather` —
+    ///    `vec![padded, n_experts, experts_per_token, tile_rows, ..]`,
+    ///    deliberately one shared layout so the sort's padding and the
+    ///    gather's bounds cannot disagree
+    ///  * `dsl.rs:3038` `combine_sorted` — `vec![width, experts_per_token]`
+    ///
+    /// The routed GEMV is handled below rather than here, because `dsl`
+    /// builds its symbol by `format!` from the weight repr.
+    const ROUTED_FANOUT_AT: &[(&str, usize)] = &[
+        ("router_topk_bfloat16", 1),
+        ("router_topk_scaled_bfloat16", 1),
+        ("route_sort", 2),
+        ("route_gather", 2),
+        ("combine_sorted", 1),
+    ];
+    /// The routed GEMV's family — `dsl.rs:2997-3004` builds
+    /// `mxfp4_qmv_routed_bias`, `affine_qmv_routed{point}` and
+    /// `affine_qmv_routed_bias{point}`, where `{point}` is the affine point
+    /// suffix. All three take `dsl.rs:3015`'s
+    /// `vec![in_w, w.width, 0, in_w, experts_per_token]`, so the index is
+    /// one and the match is on the stem.
+    ///
+    /// A PREFIX and not a `contains`: `affine_qmv_routed` is the start of
+    /// every routed GEMV symbol and the start of nothing else, whereas a
+    /// substring test would also match a hypothetical
+    /// `dequant_affine_qmv_routed_epilogue` with a different layout.
+    const ROUTED_QMV_STEMS: &[&str] = &["mxfp4_qmv_routed", "affine_qmv_routed"];
+    const ROUTED_QMV_FANOUT_AT: usize = 4;
+
+    let mut seen: Option<u32> = None;
+    for l in &lowered.launches {
+        let Some(sym) = lowered.kernels.get(l.kernel as usize) else {
+            continue;
+        };
+        let at = ROUTED_FANOUT_AT
+            .iter()
+            .find_map(|&(s, i)| (s == sym.as_str()).then_some(i))
+            .or_else(|| {
+                ROUTED_QMV_STEMS
+                    .iter()
+                    .any(|s| sym.starts_with(s))
+                    .then_some(ROUTED_QMV_FANOUT_AT)
+            });
+        let Some(at) = at else { continue };
+        // The run this launch's `params` names, then the slot inside it. A
+        // launch whose run is shorter than the layout says is a launch this
+        // table has misidentified, so it is skipped rather than read at a
+        // clamped index -- reading `params[len-1]` because `params[4]` is out
+        // of range is exactly the invented number this whole function avoids.
+        let run = l.params.start as usize..l.params.end as usize;
+        let Some(v) = lowered.params.get(run).and_then(|p| p.get(at).copied()) else {
+            continue;
+        };
+        // A stated ZERO is not a fanout either, and it is what a text that
+        // did not fill the slot leaves. Absence, uniformly.
+        if v == 0 {
+            continue;
+        }
+        match seen {
+            None => seen = Some(v),
+            // DISAGREEMENT IS ABSENCE. See the doc: the answer to a plan this
+            // driver has misread is a refusal, not the first reading.
+            Some(prev) if prev != v => return 0,
+            Some(_) => {}
+        }
+    }
+    seen.and_then(|v| i32::try_from(v).ok()).unwrap_or(0)
+}
+
 fn tail_csrs(kv_indptr: &[u32], qo_indptr: &[u32], split: usize) -> TailCsrs {
     let page0 = kv_indptr.get(split).copied().unwrap_or(0);
     let tok0 = qo_indptr.get(split).copied().unwrap_or(0);
@@ -2854,7 +2974,7 @@ pub(crate) fn step_impl(
                 // `LLAMA_LIKE` string table made from the Metal side.
                 backend: model::catalog::Backend::Cuda,
                 tp_size: model.tp_size,
-                layer_scalars: &model.gemma_layer_scalars,
+                layer_scalars: &model.layer_scalars,
             },
             class,
             &fire_rows,
@@ -3159,7 +3279,13 @@ pub(crate) fn step_impl(
     let theta_by_layer = dep.theta_by_layer();
     let rotary_by_layer = dep.rotary_by_layer();
     let softcap = dep.logit_softcap;
-    let ple_dim = dep.ple_dim;
+    // `u32` on the deployment, `i32` on the ctx, narrowed HERE because this
+    // is the one place that holds both types. Saturating rather than
+    // wrapping: a PLE width past `i32::MAX` is a corrupt config, and a grid
+    // divided by a negative extent is a launch of nothing rather than a
+    // refusal. `unwrap_or` never fires on any real deployment — gemma-4's is
+    // 256.
+    let ple_dim = i32::try_from(dep.ple_dim).unwrap_or(i32::MAX);
     let scales = dep.scales.clone();
     // THE PEEL WINDOW, and this is where layer 3 stops being vocabulary.
     //
@@ -3296,6 +3422,11 @@ pub(crate) fn step_impl(
         situ_beta: 0.0,
         situ_linear_beta: 0.0,
         wna16_group_size: 0,
+        // THE FIRE'S OWN FANOUT, derived once from the lowered plan by
+        // symbol. `0` for a dense fire, and `0` for one whose routed
+        // statements disagree — see `fire_experts_per_token`, which argues
+        // both.
+        experts_per_token: fire_experts_per_token(lowered),
         altup_streams: 0,
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),

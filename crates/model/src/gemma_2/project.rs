@@ -11,7 +11,6 @@
 //! each other.
 
 // Only the texts name a backend, and only they are gated.
-#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
@@ -131,7 +130,7 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
     // The checkpoint's own head dim, unpadded: 256 and 128 are both
     // instantiated, so the rounding is the identity here and the
     // question is asked rather than assumed.
-    let head_dim = crate::shared::llama_like::project::round_up_attn_head_dim(f.attn.head_dim);
+    let head_dim = crate::deployment::round_up_attn_head_dim(f.attn.head_dim);
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
             // One shape for every layer, which is what this row was
@@ -206,7 +205,6 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
         // gemma-3 carries the per-head q/k norm and NO V norm: the two
         // are separate facts, and this row is where that is said.
         v_norm: false,
-        k_eq_v: false,
         // Dense: no router reads this.
         norm_topk_prob: true,
         // No router of this family states a scaling factor.
@@ -262,7 +260,6 @@ pub const NO_METAL: &str = "gemma-2 has no Metal text in this build: its forward
 /// load — no TP-sharded fused bank to ask about, no host scalars — and
 /// the three projections keep one shape so a reader can see which
 /// generation reads what.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Gemma2Facts,

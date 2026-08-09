@@ -54,23 +54,32 @@ const FAMILIES: &[&str] = &[
 /// thing this test exists to catch.
 fn budget() -> BTreeMap<&'static str, usize> {
     [
-        // Cost per token differs by architecture, and that is arithmetic
-        // about bytes rather than a branch about behaviour.
-        ("layout/memory_planner.rs", 30),
-        // A kernel's name is its own.
-        // SYMBOL names, not a family branch: `ssm::nemotron_mamba_split_bf16`
-        // is what the kernel is CALLED, and the join reads its arity. The
-        // budget was fourteen while the arms were hand-written; the ten
-        // that left were the arms.
-        ("bind/mod.rs", 4),
-        // gemma-4's towers are a real family-specific ABI entry, and the
-        // next thing worth generalising.
-        ("serve/encode.rs", 7),
-        ("serve/transfer.rs", 4),
-        ("serve/load.rs", 3),
-        ("serve/state.rs", 2),
+        // The two `pie_k_vision_gemma4_*_encode` LAUNCHER SYMBOLS, and
+        // nothing else. Seven became five when the GQA instantiation set
+        // became this crate's own `serve::DECODE_GQA_GROUPS`, and five became
+        // two when the ~50 tower tensor paths moved to
+        // `model::shared::tower_names` — which owns the names AND the
+        // launcher order, because the stride (62 audio, 41 vision) is the
+        // ABI.
+        //
+        // Two is the FLOOR and not a deferral. What is left is the name of
+        // the function being called: an encode entry has to call some
+        // launcher, and this build's audio tower launcher is spelled that in
+        // `kernels-cuda`. Lowering it further means renaming the kernel,
+        // which is that crate's business and not a fact about this one —
+        // the same line `bind/mod.rs` used to sit on, except there the names
+        // were being MATCHED to make a routing decision, which is what made
+        // them removable.
+        ("serve/encode.rs", 2),
         // Never listed until the counter learned to read `LoraGemma`.
         ("fire/lora.rs", 3),
+        // `bind/mod.rs` left this table entirely. Its four were the mamba
+        // join's kernel SYMBOLS — `ssm::nemotron_mamba_split_bf16` and its
+        // neighbours — matched by name to route values across statements.
+        // The wiring is stated on the kernel rows now
+        // (`KernelSig::publishes_aux` for the publishers, the `Source::Aux`
+        // operands already there for the consumers), so the join is
+        // arithmetic over the table and names nothing.
     ]
     .into_iter()
     .collect()

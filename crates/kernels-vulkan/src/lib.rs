@@ -214,6 +214,10 @@ const EMPTY: KernelSig = KernelSig {
     sink: None,
     in_place: &[],
     depth_prefix_plan: false,
+    // Empty, and it is a fact about this table rather than a placeholder: an
+    // aux slot is a mamba block's, and no kernel here is one. `Prepare::Ssm`
+    // does not appear in this file either.
+    publishes_aux: &[],
     operands: &[],
     returns: "",
     axes: &[],
@@ -235,6 +239,7 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         sink: k.sink,
         in_place: k.in_place,
         depth_prefix_plan: k.depth_prefix_plan,
+        publishes_aux: k.publishes_aux,
         operands: k.operands,
         returns: k.returns,
         axes: k.axes,

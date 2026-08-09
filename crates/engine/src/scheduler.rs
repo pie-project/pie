@@ -519,6 +519,34 @@ pub fn submit_async(
     )
 }
 
+/// The memory a driver's KV pages live in, for a plan being addressed to it.
+///
+/// # Why this is a lookup and not a constant
+///
+/// It WAS a constant. Every `KvCopyPlan` this module built stamped
+/// `PIE_MEMORY_DOMAIN_CUDA_DEVICE` on both ends, at four sites here and five
+/// more in `dispatch`, whichever driver the plan was for. That is right on
+/// CUDA and names somebody else's memory everywhere else, and the copy in
+/// question is a page-to-page move inside one pool -- so a driver that
+/// checked the tag, which is the only thing standing between a prefix-cache
+/// hit and a copy across unrelated allocations, had to refuse every one.
+///
+/// The domain is the BACKEND's answer, recorded on its `DriverSpec` when it
+/// registered.
+///
+/// # An unknown driver
+///
+/// Answers `HOST_PINNED`, which no driver's device pages live in, so a plan
+/// built for a driver that is not registered is refused by the receiver
+/// rather than accepted as one of its own. The call sites cannot return an
+/// error from inside a struct literal, and the id they hold has already been
+/// used to reach a scheduler handle on the next line.
+pub(crate) fn device_domain(driver_idx: usize) -> ::driver_api::PieMemoryDomain {
+    crate::driver::get_spec(driver_idx).map_or(::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED, |s| {
+        s.device_domain
+    })
+}
+
 pub(crate) fn nudge(driver_idx: usize) {
     if let Ok(handle) = scheduler_handle(driver_idx) {
         let _ = handle.nudge();
@@ -537,9 +565,9 @@ pub fn submit_async_with_kv_copy(
     copy_dst: Vec<u32>,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_domain: device_domain(driver_idx),
         src_device_ordinal: 0,
-        dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: device_domain(driver_idx),
         dst_device_ordinal: 0,
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
@@ -585,9 +613,9 @@ pub fn submit_prebuilt_async_with_kv_copy(
     copy_dst: Vec<u32>,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_domain: device_domain(driver_idx),
         src_device_ordinal: 0,
-        dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: device_domain(driver_idx),
         dst_device_ordinal: 0,
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
@@ -616,9 +644,9 @@ pub fn submit_prebuilt_async_with_kv_and_rs_copy(
     rs_copy_dst: Vec<u32>,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_domain: device_domain(driver_idx),
         src_device_ordinal: 0,
-        dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: device_domain(driver_idx),
         dst_device_ordinal: 0,
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
@@ -683,9 +711,12 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     lora_program: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        // The HANDLE's, because this path is given a scheduler rather than a
+        // driver id -- and it is the same answer, recorded when that
+        // scheduler was built.
+        src_domain: handle.device_domain(),
         src_device_ordinal: 0,
-        dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: handle.device_domain(),
         dst_device_ordinal: 0,
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
@@ -717,4 +748,25 @@ pub async fn get_stats() -> AggregateStats {
         .filter_map(|slot| slot.as_ref().map(|handle| handle.stats()))
         .collect();
     stats::aggregate(&scheduler_stats)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A plan for a driver nobody registered names memory no device has.
+    ///
+    /// `device_domain` cannot return an error -- its callers use it inside a
+    /// struct literal -- so the question is what it answers when the lookup
+    /// misses. `HOST_PINNED` is chosen because no driver's DEVICE pages live
+    /// there: the plan is built, addressed, and refused by whatever receives
+    /// it. The alternative, defaulting to a device domain, hands an unknown
+    /// driver's plan the tag of a real pool and asks a driver to copy pages
+    /// into it.
+    #[test]
+    fn an_unregistered_driver_names_no_devices_memory() {
+        let domain = super::device_domain(usize::MAX);
+        assert_eq!(domain, ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED);
+        assert_ne!(domain, ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE);
+        assert_ne!(domain, ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE);
+        assert_ne!(domain, ::driver_api::PIE_MEMORY_DOMAIN_METAL_PRIVATE);
+    }
 }

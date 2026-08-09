@@ -16,23 +16,6 @@ use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::Glm5Facts;
 
-/// Does this build provision the KV store a deployment asks for?
-///
-/// A property of the BINARY, not of any checkpoint — which is why it is
-/// stated here beside the projection rather than carried on a row. This
-/// is where `unbuilt_kv_store()` went: that method existed because a
-/// family could hold a `FACTS_ROWS` row, load happily, report itself
-/// healthy, and die at its first fire inside a walk. It answered with a
-/// STRING, and `deployment_of` then decided which store the string meant
-/// by asking whether it contained `"compress"`.
-///
-/// The row states its [`KvStyle`] outright now, this asks one question of
-/// the enum, and a store that gets built is one arm changing here.
-#[must_use]
-pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    kv.has_a_store_in_this_build()
-}
-
 /// This row's tensors.
 ///
 /// The MLA rows are the interesting ones, and they are interesting
@@ -191,13 +174,9 @@ pub fn manifest(f: &Glm5Facts, tied_embeddings: bool) -> Manifest {
 /// row's [`KvStyle`].
 pub fn deployment(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Result<Deployment, Refusal> {
     let planned = plan(f, rope_theta, norm_eps);
-    if kv_store_is_built(&planned.kv) {
-        Ok(planned)
-    } else {
-        Err(Refusal::Unsupported(
-            "this build provisions no MLA latent store; the row's compressed \
-             KV and its DSA page mask have nowhere to live",
-        ))
+    match planned.kv.store_refusal() {
+        Some(no_store) => Err(no_store),
+        None => Ok(planned),
     }
 }
 
@@ -206,7 +185,7 @@ pub fn deployment(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Result<Deplo
 ///
 /// Separate from [`deployment`] so the two statements stay separable —
 /// "what this model needs" is the row's, "what this binary provides" is
-/// [`kv_store_is_built`]'s, and collapsing them is how a capability
+/// [`KvStyle::has_a_store_in_this_build`]'s, and collapsing them is how a capability
 /// question turns back into a family name.
 #[must_use]
 fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
@@ -260,7 +239,7 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
             head_dim: page_row,
             // Nothing pads it. A latent row is not a head width a kernel
             // is instantiated at, and the store that would hold it is
-            // not built here anyway — see [`kv_store_is_built`].
+            // not built here anyway — see [`KvStyle::has_a_store_in_this_build`].
             head_dim_kernel: page_row,
             intermediate: f.dense_intermediate,
             // The mixture's inner width is a DIFFERENT number from the
@@ -294,7 +273,6 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         // GLM publishes `true` where its DeepSeek-shaped siblings
         // publish `false` -- see `Glm5MoeFacts`.
         norm_topk_prob: f.moe.norm_topk_prob,
@@ -356,7 +334,6 @@ pub const NO_METAL: &str = "glm-5 has no Metal text in this build: its forward i
 /// No binding facts on the way in, unlike kimi-k2's: this generation's
 /// text takes the fused `mla_prepare` unconditionally and states no rope
 /// variant, so the shape is the whole input.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Glm5Facts,
@@ -839,15 +816,14 @@ mod tests {
     #[test]
     fn the_plan_exists_even_where_the_build_refuses_it() {
         let planned = plan(&glm5(), 10_000.0, 1e-5);
-        assert!(!kv_store_is_built(&planned.kv));
-        assert!(kv_store_is_built(&KvStyle::Paged));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: Vec::new() }));
+        assert!(!planned.kv.has_a_store_in_this_build());
+        assert!(KvStyle::Paged.has_a_store_in_this_build());
+        assert!(!KvStyle::CompressedPlane { ratios: Vec::new() }.has_a_store_in_this_build());
     }
 
     /// The text traces for both fire classes, and names this
     /// generation's own family string — the goldens are keyed on it, so
     /// a rename here is a rename of every recorded plan.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_text_traces_for_both_fire_classes() {
         use model_compiler::trace::FireClass;

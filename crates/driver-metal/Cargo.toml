@@ -99,7 +99,7 @@ kernels-metal = { path = "../kernels-metal", default-features = false }
 # model it loaded -- and `driver-cuda` takes the same two for the same
 # reason. Selecting is not CHOOSING A KERNEL: the text names every symbol, and
 # what the driver does is look up which text the checkpoint it loaded is.
-model = { path = "../model", default-features = false, features = ["contract", "forward"] }
+model = { path = "../model", default-features = false, features = ["contract"] }
 model-loader = { path = "../model-loader" }
 
 # Apple-only. Everything that names a Metal type lives under `src/metal/` and
@@ -218,7 +218,7 @@ tensor-compiler = { path = "../tensor-compiler" }
 # Tests only. The binder is proved against a REAL lowering, and the texts live
 # behind `model`'s `forward` feature -- which the driver itself does not need,
 # so it is enabled here rather than in the dependency table above.
-model = { path = "../model", default-features = false, features = ["contract", "forward"] }
+model = { path = "../model", default-features = false, features = ["contract"] }
 
 # `required-features` keeps `cargo test -p driver-metal` with no feature to
 # the portable half, rather than failing to build the device targets. It is

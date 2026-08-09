@@ -13,7 +13,7 @@
 //!
 //! ## The proof
 //!
-//! `kernels_cuda::abi::emit_c_shim` generates one `extern "C"` function per
+//! `kernels_cuda_new::abi::emit_c_shim` generates one `extern "C"` function per
 //! row whose body CALLS the launcher, with the real `rope.hpp` in scope. The
 //! generated translation unit is then compiled. A row that misstates an
 //! operand's type, constness, width, position, or the arity of the whole list
@@ -43,7 +43,7 @@ use driver_cuda::bind::abi::{
     YarnOriginalParams,
 };
 use kernels::{KernelSig, Operand, Ty};
-use kernels_cuda::abi::Record;
+use kernels_cuda_new::abi::Record;
 
 /// Where `kernels-cuda`'s sources are, relative to this crate.
 fn csrc() -> PathBuf {
@@ -145,7 +145,12 @@ fn compile_with(shim: &str, extra: &[PathBuf]) -> Result<(), String> {
 }
 
 fn rope_shim(table: &'static [KernelSig]) -> String {
-    kernels_cuda::abi::emit_c_shim(&[table], &[ROPE_HPP]).expect("no entry-point collisions")
+    kernels_cuda_new::abi::emit_c_shim(
+        &[table],
+        &[ROPE_HPP],
+        &kernels_cuda_new::device::jit_dispatched(),
+    )
+    .expect("no entry-point collisions")
 }
 
 /// The headers `attn`'s rows are declared in.
@@ -170,7 +175,8 @@ fn attn_headers() -> Vec<String> {
 fn attn_shim(table: &'static [KernelSig]) -> String {
     let hs = attn_headers();
     let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
-    kernels_cuda::abi::emit_c_shim(&[table], &refs).expect("no entry-point collisions")
+    kernels_cuda_new::abi::emit_c_shim(&[table], &refs, &kernels_cuda_new::device::jit_dispatched())
+        .expect("no entry-point collisions")
 }
 
 /// The headers `norm`'s rows are declared in — every `norm/*.hpp`.
@@ -193,7 +199,7 @@ fn norm_headers() -> Vec<String> {
 /// that four executors reach.
 #[test]
 fn every_norm_row_states_its_launcher_exactly() {
-    let table = kernels_cuda::norm::KERNELS;
+    let table = kernels_cuda_new::table::norm::KERNELS;
     let stated = table.iter().filter(|k| !k.operands.is_empty()).count();
     assert_eq!(
         stated,
@@ -204,7 +210,12 @@ fn every_norm_row_states_its_launcher_exactly() {
     );
     let hs = norm_headers();
     let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
-    let shim = kernels_cuda::abi::emit_c_shim(&[table], &refs).expect("no entry-point collisions");
+    let shim = kernels_cuda_new::abi::emit_c_shim(
+        &[table],
+        &refs,
+        &kernels_cuda_new::device::jit_dispatched(),
+    )
+    .expect("no entry-point collisions");
     if let Err(err) = compile(&shim) {
         panic!(
             "the generated shim does not compile, so a row misstates its \
@@ -218,7 +229,7 @@ fn every_norm_row_states_its_launcher_exactly() {
 /// wrong -- `gpt_oss_glu_bf16` alone carries three.
 #[test]
 fn every_mlp_row_states_its_launcher_exactly() {
-    let table = kernels_cuda::mlp::KERNELS;
+    let table = kernels_cuda_new::table::mlp::KERNELS;
     let stated = table.iter().filter(|k| !k.operands.is_empty()).count();
     assert_eq!(
         stated,
@@ -227,9 +238,12 @@ fn every_mlp_row_states_its_launcher_exactly() {
         table.len() - stated,
         table.len()
     );
-    let shim =
-        kernels_cuda::abi::emit_c_shim(&[table], &["mlp/swiglu.hpp", "mlp/gaussian_topk.hpp"])
-            .expect("no entry-point collisions");
+    let shim = kernels_cuda_new::abi::emit_c_shim(
+        &[table],
+        &["mlp/swiglu.hpp", "mlp/gaussian_topk.hpp"],
+        &kernels_cuda_new::device::jit_dispatched(),
+    )
+    .expect("no entry-point collisions");
     if let Err(err) = compile(&shim) {
         panic!(
             "the generated shim does not compile, so a row misstates its \
@@ -263,10 +277,10 @@ fn every_mlp_row_states_its_launcher_exactly() {
 #[test]
 fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
     let tables: [&'static [KernelSig]; 4] = [
-        kernels_cuda::quant::KERNELS,
-        kernels_cuda::layout::KERNELS,
-        kernels_cuda::gemm::KERNELS,
-        kernels_cuda::moe::KERNELS,
+        kernels_cuda_new::table::quant::KERNELS,
+        kernels_cuda_new::table::layout::KERNELS,
+        kernels_cuda_new::table::gemm::KERNELS,
+        kernels_cuda_new::table::moe::KERNELS,
     ];
     let headers = [
         "quant/dequant_fp4.hpp",
@@ -296,8 +310,12 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
         "moe/topk_sigmoid.hpp",
         "moe/topk_softmax.hpp",
     ];
-    let shim =
-        kernels_cuda::abi::emit_c_shim(&tables, &headers).expect("no entry-point collisions");
+    let shim = kernels_cuda_new::abi::emit_c_shim(
+        &tables,
+        &headers,
+        &kernels_cuda_new::device::jit_dispatched(),
+    )
+    .expect("no entry-point collisions");
     if let Err(err) = compile(&shim) {
         panic!(
             "the generated shim does not compile, so a row misstates its \
@@ -315,7 +333,7 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
 /// and `void*` in four, and the two are the same pointer at a call site.
 #[test]
 fn every_ssm_row_states_its_launcher_exactly() {
-    let table = kernels_cuda::ssm::KERNELS;
+    let table = kernels_cuda_new::table::ssm::KERNELS;
     // THREE rows stay unstated, and naming them is the point of pinning
     // the count rather than asserting it away:
     //
@@ -334,7 +352,7 @@ fn every_ssm_row_states_its_launcher_exactly() {
         table.len() - stated,
         table.len()
     );
-    let shim = kernels_cuda::abi::emit_c_shim(
+    let shim = kernels_cuda_new::abi::emit_c_shim(
         &[table],
         &[
             "ssm/causal_conv1d.hpp",
@@ -343,6 +361,7 @@ fn every_ssm_row_states_its_launcher_exactly() {
             "ssm/kda.hpp",
             "ssm/nemotron_h.hpp",
         ],
+        &kernels_cuda_new::device::jit_dispatched(),
     )
     .expect("no entry-point collisions");
     if let Err(err) = compile(&shim) {
@@ -356,7 +375,7 @@ fn every_ssm_row_states_its_launcher_exactly() {
 /// The pilot itself: every stated `rope` row describes its launcher exactly.
 #[test]
 fn every_rope_row_states_its_launcher_exactly() {
-    let shim = rope_shim(kernels_cuda::rope::KERNELS);
+    let shim = rope_shim(kernels_cuda_new::table::rope::KERNELS);
     if let Err(err) = compile(&shim) {
         panic!(
             "the generated shim does not compile, so a row misstates its \
@@ -375,7 +394,7 @@ fn every_rope_row_states_its_launcher_exactly() {
 /// compile — which is the point of running it as one shim rather than fifty.
 #[test]
 fn every_attn_row_states_its_launcher_exactly() {
-    let table = kernels_cuda::attn::KERNELS;
+    let table = kernels_cuda_new::table::attn::KERNELS;
     let stated = table.iter().filter(|k| !k.operands.is_empty()).count();
     assert_eq!(
         stated,
@@ -419,7 +438,7 @@ fn every_launcher_the_header_declares_has_a_row() {
     let missing: Vec<&String> = declared
         .iter()
         .filter(|d| {
-            !kernels_cuda::rope::KERNELS
+            !kernels_cuda_new::table::rope::KERNELS
                 .iter()
                 .any(|k| k.symbol == format!("rope::{d}"))
         })
@@ -448,9 +467,20 @@ enum NoRow {
     /// Only sibling `.cu` files in this crate call it. Checked below rather
     /// than believed.
     KernelsInternal,
+    /// **Nothing calls it at all** — not the driver, not a sibling `.cu`, not
+    /// `dsl::cuda`. It had a row until `new-horizon.md` §28.4 measured the
+    /// row as a second name for a job a reached row already does, and the row
+    /// went; the launcher stays because §10.10 says a launcher goes only when
+    /// its WHOLE consumer set has gone, and this one's last consumer is
+    /// `kernels-cuda/tests/sources.rs`' `EXPECTED = 401` `<<<>>>` census.
+    /// That is a backlog entry, and this is where it is written down.
+    ///
+    /// Checked exactly as `KernelsInternal` is, and then harder: the driver
+    /// must not mention it AND no `.cu` in `csrc` may call it.
+    Orphaned,
 }
 
-/// Every launcher `attn`'s headers declare is a row, or is one of four
+/// Every launcher `attn`'s headers declare is a row, or is one of five
 /// documented kinds of not-a-row.
 ///
 /// The rope pilot could assert the flat thing — every declaration has a row —
@@ -458,11 +488,15 @@ enum NoRow {
 /// test that asserted it anyway would have to be deleted rather than
 /// answered. What is actually load-bearing is that no launcher joins these
 /// headers without someone deciding which kind it is: 77 declarations against
-/// 50 rows is not a gap to close, it is 27 decisions, and this is where they
-/// are written down.
+/// 43 rows is not a gap to close, it is 34 decisions, and this is where they
+/// are written down. Seven of the 34 arrived at once, when §28.4's audit
+/// measured seven rows as duplicates and deleted them — a decision moving
+/// from "row" to "stated reason" is the same decision, restated.
 ///
 /// `KernelsInternal` is not taken on trust — the claim is "the driver never
 /// calls this", the driver's sources are next door, and so it is checked.
+/// `Orphaned` is the stronger claim and gets the stronger check: nothing at
+/// all calls it, so both the driver AND every `.cu` body in `csrc` are read.
 #[test]
 fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     #[rustfmt::skip]
@@ -496,6 +530,18 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         ("gated_softmax_pool_bf16",                     NoRow::KernelsInternal),
         ("write_kv_to_pages_at_positions_bf16",         NoRow::KernelsInternal),
         ("write_mla_to_pages_bf16",                     NoRow::KernelsInternal),
+        // §28.4's seven: each had a row, each row was a second name for a
+        // job a reached row already does, and none of the seven wrappers in
+        // `dsl.rs` had a caller. The four below are still reached from a
+        // sibling `.cu`; the three under `Orphaned` are reached from
+        // nowhere at all.
+        ("write_kv_to_pages_bf16",                      NoRow::KernelsInternal),
+        ("dispatch_attention_flashinfer_decode_bf16",   NoRow::KernelsInternal),
+        ("dispatch_attention_flashinfer_prefill_sm90_bf16", NoRow::KernelsInternal),
+        ("attention_naive_paged_bf16",                  NoRow::KernelsInternal),
+        ("write_kv_to_pages_bf16_devwin",               NoRow::Orphaned),
+        ("qkv_decode_qk_norm_rope_write_kv_bf16_devwin", NoRow::Orphaned),
+        ("attention_flashinfer_prefill_custom",         NoRow::Orphaned),
     ];
 
     let declared = declared_launchers();
@@ -506,7 +552,7 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     );
 
     let has_row = |n: &str| {
-        kernels_cuda::attn::KERNELS
+        kernels_cuda_new::table::attn::KERNELS
             .iter()
             .any(|k| k.symbol == format!("attn::{n}") || k.symbol.ends_with(&format!("::{n}")))
     };
@@ -546,7 +592,9 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     );
     let wrong: Vec<&str> = exceptions
         .iter()
-        .filter(|(_, why)| *why == NoRow::KernelsInternal)
+        .filter(|(_, why)| {
+            *why == NoRow::KernelsInternal || *why == NoRow::Orphaned
+        })
         .map(|(n, _)| *n)
         .filter(|n| mentions_word(&driver_text, n))
         .collect();
@@ -555,6 +603,75 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         "called `KernelsInternal` but the driver calls it, so it is really \
          DriverInternal or a missing row: {wrong:?}"
     );
+
+    // The `Orphaned` claim is the stronger one and it is checked in full:
+    // NOTHING calls these. The driver was ruled out above; here every `.cu`
+    // in `csrc` is read and a call — a mention that is not the declaration,
+    // the definition, or a string literal — is a failure, because a launcher
+    // with a live caller is not orphaned, it is `KernelsInternal`.
+    let mut cu_text = String::new();
+    collect_cu_bodies(&csrc(), &mut cu_text);
+    assert!(
+        cu_text.len() > 100_000,
+        "only {} bytes of .cu body found, so the orphan check is vacuous",
+        cu_text.len()
+    );
+    let not_orphans: Vec<&str> = exceptions
+        .iter()
+        .filter(|(_, why)| *why == NoRow::Orphaned)
+        .map(|(n, _)| *n)
+        .filter(|n| mentions_word(&cu_text, n))
+        .collect();
+    assert!(
+        not_orphans.is_empty(),
+        "called `Orphaned` but a sibling `.cu` calls it, so it is really \
+         `KernelsInternal`: {not_orphans:?}"
+    );
+}
+
+/// Every `.cu` under `csrc`, with its own declarations, definitions and
+/// string literals removed — what is left is call sites.
+///
+/// A launcher's definition names it and so does its header; neither is a
+/// caller, and a check that could not tell them apart would report every
+/// launcher in the tree as reached. The three lines dropped are: a line
+/// opening `void <name>(`, which is a definition or a declaration, and any
+/// line whose occurrence of the name sits inside a `"`-quoted string, which
+/// is an error message.
+fn collect_cu_bodies(dir: &Path, out: &mut String) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_cu_bodies(&p, out);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("cu")
+            && let Ok(t) = std::fs::read_to_string(&p)
+        {
+            for line in t.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("void ") || trimmed.starts_with("//") {
+                    continue;
+                }
+                // Strip `"`-quoted spans, so an error message naming the
+                // launcher it is thrown from is not read as a call.
+                let mut kept = String::with_capacity(line.len());
+                let mut in_str = false;
+                for c in line.chars() {
+                    if c == '"' {
+                        in_str = !in_str;
+                        continue;
+                    }
+                    if !in_str {
+                        kept.push(c);
+                    }
+                }
+                out.push_str(&kept);
+                out.push('\n');
+            }
+        }
+    }
 }
 
 /// Every `void` launcher declared across `attn/*.hpp`, by name.
@@ -634,7 +751,7 @@ fn mentions_word(hay: &str, needle: &str) -> bool {
 /// is about `stated()`, so its subject should be too.
 #[test]
 fn an_unstated_row_is_skipped_rather_than_called_with_nothing() {
-    let stated = kernels_cuda::rope::KERNELS
+    let stated = kernels_cuda_new::table::rope::KERNELS
         .iter()
         .find(|k| !k.operands.is_empty())
         .expect("some rope row is stated");
@@ -659,7 +776,7 @@ fn an_unstated_row_is_skipped_rather_than_called_with_nothing() {
 /// see and this one can.
 #[test]
 fn a_wrong_row_does_not_compile() {
-    let base = kernels_cuda::rope::KERNELS
+    let base = kernels_cuda_new::table::rope::KERNELS
         .iter()
         .find(|k| k.symbol == "rope::qk_rmsnorm_rope_bf16")
         .expect("the pilot row");
@@ -719,6 +836,9 @@ fn a_wrong_row_does_not_compile() {
             sink: base.sink,
             in_place: base.in_place,
             depth_prefix_plan: base.depth_prefix_plan,
+            publishes_aux: base.publishes_aux,
+            head_param: base.head_param,
+            heads_param: base.heads_param,
             operands: leaked,
             returns: base.returns,
             axes: base.axes,
@@ -743,7 +863,7 @@ fn a_wrong_row_does_not_compile() {
 /// exactly the text the mutations touch.
 #[test]
 fn renaming_an_operand_is_not_a_mistake() {
-    let base = kernels_cuda::rope::KERNELS
+    let base = kernels_cuda_new::table::rope::KERNELS
         .iter()
         .find(|k| k.symbol == "rope::qk_rmsnorm_rope_bf16")
         .expect("the pilot row");
@@ -766,6 +886,9 @@ fn renaming_an_operand_is_not_a_mistake() {
         sink: base.sink,
         in_place: base.in_place,
         depth_prefix_plan: base.depth_prefix_plan,
+        publishes_aux: base.publishes_aux,
+        head_param: base.head_param,
+        heads_param: base.heads_param,
         operands: renamed,
         returns: base.returns,
         axes: base.axes,
@@ -787,10 +910,10 @@ fn renaming_an_operand_is_not_a_mistake() {
 /// checks.
 #[test]
 fn the_rust_bindings_name_the_symbols_the_shim_defines() {
-    let shim = rope_shim(kernels_cuda::rope::KERNELS);
-    let rs = kernels_cuda::abi::emit_rust_bindings(&[kernels_cuda::rope::KERNELS]);
-    for k in kernels_cuda::rope::KERNELS {
-        let entry = kernels_cuda::abi::entry_name(k.symbol);
+    let shim = rope_shim(kernels_cuda_new::table::rope::KERNELS);
+    let rs = kernels_cuda_new::abi::emit_rust_bindings(&[kernels_cuda_new::table::rope::KERNELS]);
+    for k in kernels_cuda_new::table::rope::KERNELS {
+        let entry = kernels_cuda_new::abi::entry_name(k.symbol);
         assert!(
             shim.contains(&format!("void {entry}(")),
             "{entry} not defined"
@@ -843,11 +966,16 @@ fn the_whole_bridge_generates_for_both_sides() {
     );
 
     let tables: &[&'static [kernels::KernelSig]] = &[
-        kernels_cuda::KERNELS,
-        kernels_cuda::driver_internal::DRIVER_KERNELS,
+        kernels_cuda_new::table::KERNELS,
+        kernels_cuda_new::table::driver_internal::DRIVER_KERNELS,
     ];
     let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
-    let shim = kernels_cuda::abi::emit_c_shim(tables, &refs).expect("no entry-point collisions");
+    let shim = kernels_cuda_new::abi::emit_c_shim(
+        tables,
+        &refs,
+        &kernels_cuda_new::device::jit_dispatched(),
+    )
+    .expect("no entry-point collisions");
 
     // The WHOLE bridge needs the real toolkit headers, and that is the
     // difference from every per-family case above. Those compile against
@@ -911,21 +1039,21 @@ fn the_whole_bridge_generates_for_both_sides() {
 /// Every mirrored record, with the offsets its Rust side computes.
 fn records() -> Vec<Record> {
     vec![
-        kernels_cuda::record!(KvCacheLayerView => "::pie_cuda_driver::KvCacheLayerView" {
+        kernels_cuda_new::record!(KvCacheLayerView => "::pie_cuda_driver::KvCacheLayerView" {
             layer, source_layer, num_pages, page_size, num_kv_heads, head_dim,
             scheme, storage_dtype, block_size,
             k_pages, v_pages, k_scales, v_scales, k_bf16_pages, v_bf16_pages,
             k_env_min, k_env_max,
             hnd_layout, native_bf16,
         }),
-        kernels_cuda::record!(AttentionWorkspaceView => "::pie_cuda_driver::AttentionWorkspaceView" {
+        kernels_cuda_new::record!(AttentionWorkspaceView => "::pie_cuda_driver::AttentionWorkspaceView" {
             float_buffer, float_bytes, int_buffer, int_bytes, page_locked_int,
         }),
-        kernels_cuda::record!(MlaCacheLayerView => "::pie_cuda_driver::MlaCacheLayerView" {
+        kernels_cuda_new::record!(MlaCacheLayerView => "::pie_cuda_driver::MlaCacheLayerView" {
             layer, num_pages, page_size, kv_lora_rank, qk_rope_head_dim,
             ckv_pages, kpe_pages,
         }),
-        kernels_cuda::record!(HopperPrefillPlan => "::pie_cuda_driver::kernels::attn::HopperPrefillPlan" {
+        kernels_cuda_new::record!(HopperPrefillPlan => "::pie_cuda_driver::kernels::attn::HopperPrefillPlan" {
             qo_tile_indices_offset, qo_indptr_offset, kv_indptr_offset,
             qo_len_offset, kv_len_offset, head_indices_offset,
             work_indptr_offset, batch_indices_offset,
@@ -933,7 +1061,7 @@ fn records() -> Vec<Record> {
             total_tokens, num_requests, num_q_heads, num_kv_heads, head_dim,
             page_size, window_left, causal, valid,
         }),
-        kernels_cuda::record!(YarnOriginalParams => "::pie_cuda_driver::kernels::attn::YarnOriginalParams" {
+        kernels_cuda_new::record!(YarnOriginalParams => "::pie_cuda_driver::kernels::attn::YarnOriginalParams" {
             factor, beta_fast, beta_slow, attention_factor, original_max_position,
         }),
     ]
@@ -962,7 +1090,7 @@ const MIRROR_HPPS: &[&str] = &[
 /// other descriptor in the launcher surface is the same kind of thing.
 #[test]
 fn the_mirrors_have_the_layout_the_cpp_has() {
-    let tu = kernels_cuda::abi::emit_layout_assertions(&records(), MIRROR_HPPS);
+    let tu = kernels_cuda_new::abi::emit_layout_assertions(&records(), MIRROR_HPPS);
     if let Err(err) = compile(&tu) {
         panic!("a mirror disagrees with the C++ record:\n{err}\n--- tu ---\n{tu}");
     }
@@ -984,7 +1112,10 @@ fn a_wrong_mirror_does_not_compile() {
     let bad = |mutate: &dyn Fn(&mut Record)| {
         let mut rs = records();
         mutate(&mut rs[0]);
-        compile(&kernels_cuda::abi::emit_layout_assertions(&rs, MIRROR_HPPS))
+        compile(&kernels_cuda_new::abi::emit_layout_assertions(
+            &rs,
+            MIRROR_HPPS,
+        ))
     };
 
     let cases: Vec<(&str, Mutation)> = vec![
@@ -1042,7 +1173,7 @@ fn the_member_count_check_does_not_depend_on_field_names() {
     }
     // The offsetof asserts DO name fields, so drop them and keep the rest:
     // what is under test is the binding, not the offsets.
-    let tu = kernels_cuda::abi::emit_layout_assertions(&rs, MIRROR_HPPS)
+    let tu = kernels_cuda_new::abi::emit_layout_assertions(&rs, MIRROR_HPPS)
         .lines()
         .filter(|l| !l.contains("offsetof"))
         .filter(|l| !l.contains("is not at"))
@@ -1065,7 +1196,7 @@ fn the_member_count_check_does_not_depend_on_field_names() {
 fn without_the_binding_a_dropped_field_would_go_unnoticed() {
     let mut rs = records();
     rs[0].fields.pop();
-    let tu = kernels_cuda::abi::emit_layout_assertions(&rs, MIRROR_HPPS);
+    let tu = kernels_cuda_new::abi::emit_layout_assertions(&rs, MIRROR_HPPS);
     assert!(compile(&tu).is_err(), "with the binding, this must fail");
 
     let without = tu
@@ -1103,7 +1234,8 @@ fn headers_in(dir: &str) -> Vec<String> {
 
 fn shim_over(table: &'static [KernelSig], headers: &[String]) -> String {
     let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
-    kernels_cuda::abi::emit_c_shim(&[table], &refs).expect("no entry-point collisions")
+    kernels_cuda_new::abi::emit_c_shim(&[table], &refs, &kernels_cuda_new::device::jit_dispatched())
+        .expect("no entry-point collisions")
 }
 
 /// Every row of a family states its launcher exactly, and every row is stated.
@@ -1137,7 +1269,7 @@ fn prove_family(family: &str, table: &'static [KernelSig], headers: &[String]) {
 fn every_sample_row_states_its_launcher_exactly() {
     prove_family(
         "sample",
-        kernels_cuda::sample::KERNELS,
+        kernels_cuda_new::table::sample::KERNELS,
         &headers_in("sample"),
     );
 }
@@ -1184,7 +1316,7 @@ fn the_unstated_rows_are_exactly_the_ones_with_a_written_reason() {
         ("pie_lora_qkv_correction",                      Unstated::NotACppFunction),
     ];
 
-    let unstated: Vec<&str> = kernels_cuda::KERNELS
+    let unstated: Vec<&str> = kernels_cuda_new::table::KERNELS
         .iter()
         .filter(|k| k.operands.is_empty())
         .map(|k| k.symbol)
@@ -1238,7 +1370,7 @@ fn every_driver_internal_row_states_its_launcher_exactly() {
     headers.push("vision/gemma4_towers_c.hpp".into());
     prove_family(
         "driver-internal",
-        kernels_cuda::driver_internal::DRIVER_KERNELS,
+        kernels_cuda_new::table::driver_internal::DRIVER_KERNELS,
         &headers,
     );
 }
@@ -1292,39 +1424,75 @@ enum NormNoRow {
     /// An autotuner probe: returns `bool` and has zero driver call sites.
     /// Both halves checked below.
     AutotunerProbe,
+    /// **Nothing calls it at all** — not the driver, not a sibling `.cu`, not
+    /// the emitter, not `dsl::cuda`. It had a row until `new-horizon.md`
+    /// §28.4 measured the row as a second name for a job a reached row
+    /// already does, and the row went; the launcher stays because §10.10
+    /// says a launcher goes only when its WHOLE consumer set has gone, and
+    /// this one's last consumer is `kernels-cuda/tests/sources.rs`'
+    /// `EXPECTED = 401` `<<<>>>` census. That is a backlog entry, and this
+    /// is where it is written down.
+    ///
+    /// The same kind as `attn`'s [`NoRow::Orphaned`] and checked the same
+    /// way, in full: the driver must not mention it, no `.cu` in `csrc` may
+    /// call it, and no emitter may choose it.
+    Orphaned,
 }
 
-/// Every launcher `norm`'s headers declare is a row, or is one of two
+/// Every launcher `norm`'s headers declare is a row, or is one of three
 /// documented kinds of not-a-row.
 ///
 /// The `attn` twin above owns the long rationale; what is specific to `norm`
-/// is the arithmetic — 32 declarations against 26 rows is 6 decisions — and
-/// that BOTH exception kinds are checkable, so neither is taken on trust.
+/// is the arithmetic — 32 declarations against 24 rows is 8 decisions — and
+/// that ALL THREE exception kinds are checkable, so none is taken on trust.
 /// `rmsnorm_bf16` is the loud case here the way `split_qkv_bf16` was for
 /// `attn`: 1,337 call sites, every one of them emitter-chosen.
 #[test]
 fn every_norm_launcher_is_a_row_or_a_stated_exception() {
     #[rustfmt::skip]
     let exceptions: &[(&str, NormNoRow)] = &[
-        ("rmsnorm_bf16",               NormNoRow::EmitterChosen),
-        ("add_bias_bf16",              NormNoRow::EmitterChosen),
-        ("rmsnorm_gemma_bf16",         NormNoRow::EmitterChosen),
-        ("rmsnorm_gated_fp32_in_bf16", NormNoRow::EmitterChosen),
-        ("rmsnorm_bf16_tuned",         NormNoRow::AutotunerProbe),
-        ("rmsnorm_rasr_tuned",         NormNoRow::AutotunerProbe),
+        ("rmsnorm_bf16",                    NormNoRow::EmitterChosen),
+        ("add_bias_bf16",                   NormNoRow::EmitterChosen),
+        ("rmsnorm_gemma_bf16",              NormNoRow::EmitterChosen),
+        ("rmsnorm_gated_fp32_in_bf16",      NormNoRow::EmitterChosen),
+        ("rmsnorm_bf16_tuned",              NormNoRow::AutotunerProbe),
+        ("rmsnorm_rasr_tuned",              NormNoRow::AutotunerProbe),
+        // §28.4's two, deleted here. `add_bias_bf16_strided` is the
+        // contiguous `add_bias_bf16`'s row-pitch overload, and that one is
+        // `EmitterChosen` two lines up — the strided spelling is the header's,
+        // and `lower.rs` chooses the flat one. `residual_add_scale_rmsnorm_bf16`
+        // claimed gemma-4's end-of-layer shape in its own doc, and gemma-4
+        // fires `rmsnorm_residual_add_scale_rmsnorm_bf16` instead: a different,
+        // four-statement row with 221 golden lines.
+        ("add_bias_bf16_strided",           NormNoRow::Orphaned),
+        ("residual_add_scale_rmsnorm_bf16", NormNoRow::Orphaned),
     ];
 
     // `bool ` is load-bearing: the probes are the only non-`void` launchers,
-    // and a void-only scan would count 30 and never see them.
+    // and a void-only scan would never see them.
     let declared = declared_in("norm", &["void ", "bool "]);
-    assert!(
-        declared.len() >= 32,
-        "the scan found {} declarations, so its shape assumption broke",
-        declared.len()
-    );
+
+    // A SHAPE CHECK, not a census. This asserted a floor on the count, and
+    // the count now falls every time a kernel migrates: `scalar_mul`'s
+    // launcher went with its `.cu`, then all six of `altup_aux`'s
+    // (`new-horizon.md` §10.8, §10.11). A number that has to be edited on
+    // every migration is a number nobody reads -- and the thing it was
+    // guarding against is a scan that silently matched NOTHING.
+    //
+    // So the guard names two launchers that are still there instead: one
+    // `void`, one `bool`, which is what makes the two prefixes above
+    // load-bearing rather than decorative.
+    for expected in ["rmsnorm_bf16", "rmsnorm_bf16_tuned"] {
+        assert!(
+            declared.iter().any(|d| d == expected),
+            "the scan found {} declarations and `{expected}` is not among \
+             them, so its shape assumption broke",
+            declared.len()
+        );
+    }
 
     let has_row = |n: &str| {
-        kernels_cuda::norm::KERNELS
+        kernels_cuda_new::table::norm::KERNELS
             .iter()
             .any(|k| k.symbol == format!("norm::{n}"))
     };
@@ -1378,6 +1546,23 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
          missing row or some other kind of not-a-row: {unchosen:?}"
     );
 
+    // The `Orphaned` claim's first half, against the SAME emitter text: a
+    // launcher an emitter chooses is `EmitterChosen`, not an orphan, and
+    // `add_bias_bf16_strided` sits one whole-word match away from
+    // `add_bias_bf16`, which `lower.rs` does choose. `mentions_word` is what
+    // keeps those two apart.
+    let chosen_after_all: Vec<&str> = exceptions
+        .iter()
+        .filter(|(_, why)| *why == NormNoRow::Orphaned)
+        .map(|(n, _)| *n)
+        .filter(|n| mentions_word(&emitter_text, n))
+        .collect();
+    assert!(
+        chosen_after_all.is_empty(),
+        "called `Orphaned` but an emitter chooses it, so it is really \
+         `EmitterChosen`: {chosen_after_all:?}"
+    );
+
     // The `AutotunerProbe` claim, both halves. A probe RETURNS its verdict —
     let norm_text: String = norm_headers()
         .iter()
@@ -1418,6 +1603,41 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
         called.is_empty(),
         "called `AutotunerProbe` but the driver mentions it, so its \"zero \
          driver call sites\" is stale: {called:?}"
+    );
+
+    // The `Orphaned` claim's other two halves, on the same two texts the
+    // kinds above are checked against plus one more. The driver was just
+    // read, so reuse it; then every `.cu` body in `csrc`, which is the half
+    // `KernelsInternal` exists to name.
+    let orphans: Vec<&str> = exceptions
+        .iter()
+        .filter(|(_, why)| *why == NormNoRow::Orphaned)
+        .map(|(n, _)| *n)
+        .collect();
+    let driver_calls: Vec<&&str> = orphans
+        .iter()
+        .filter(|n| mentions_word(&driver_text, n))
+        .collect();
+    assert!(
+        driver_calls.is_empty(),
+        "called `Orphaned` but the driver mentions it, so it is really \
+         `DriverInternal` or a missing row: {driver_calls:?}"
+    );
+    let mut cu_text = String::new();
+    collect_cu_bodies(&csrc(), &mut cu_text);
+    assert!(
+        cu_text.len() > 100_000,
+        "only {} bytes of .cu body found, so the orphan check is vacuous",
+        cu_text.len()
+    );
+    let not_orphans: Vec<&&str> = orphans
+        .iter()
+        .filter(|n| mentions_word(&cu_text, n))
+        .collect();
+    assert!(
+        not_orphans.is_empty(),
+        "called `Orphaned` but a sibling `.cu` calls it, so it is really \
+         `KernelsInternal`: {not_orphans:?}"
     );
 }
 

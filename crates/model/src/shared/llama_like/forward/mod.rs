@@ -692,6 +692,32 @@ fn llama_like_metal_text(
             } else {
                 (gemm(&x, &q_proj), gemm(&x, &k_proj), gemm(&x, &v_proj))
             };
+            // Qwen-2 family qkv biases: on the raw projections, before norms
+            // and rope -- the semantic text's position and the CUDA text's.
+            //
+            // Gated on the DEPLOYMENT and not on the model alone, which is
+            // the whole of what `add_bias` says: whether the biases exist is
+            // `f.qkv_bias`, and it has answered `true` for Qwen-2 since the
+            // row was written. This text stated no bias for anyone anyway,
+            // because no Metal-side kernel added one -- so every Qwen-2
+            // served through it computed its q/k/v without them. Nothing
+            // downstream could tell: the biases are small and the text stays
+            // fluent, which is why the gap survived until a driver compared
+            // a whole distribution against a CPU oracle.
+            //
+            // A deployment that says `false` gets exactly the text it got
+            // before. That is the conservative half of the same claim -- see
+            // `LlamaLikeMetalFacts::add_bias` for why `driver-metal` still
+            // says it.
+            let (q, k, v) = if f.qkv_bias && metal.add_bias {
+                (
+                    dsl::metal::add_bias(&q, &w.q_bias),
+                    dsl::metal::add_bias(&k, &w.k_bias),
+                    dsl::metal::add_bias(&v, &w.v_bias),
+                )
+            } else {
+                (q, k, v)
+            };
             let (q, k) = if f.qk_norm == QkNorm::Off {
                 (q, k)
             } else {

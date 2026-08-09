@@ -20,45 +20,63 @@
       "rewrites": 35
     },
     {
-      "pass": "coalesce-persistent-arena-writes",
+      "pass": "stage-device-transforms",
       "instrs_before": 91,
-      "instrs_after": 91,
+      "instrs_after": 119,
+      "rewrites": 28
+    },
+    {
+      "pass": "coalesce-persistent-arena-writes",
+      "instrs_before": 119,
+      "instrs_after": 119,
       "rewrites": 0
     },
     {
       "pass": "hoist-bulk-arena-writes",
-      "instrs_before": 91,
-      "instrs_after": 89,
+      "instrs_before": 119,
+      "instrs_after": 117,
       "rewrites": 2
     },
     {
       "pass": "recompute-memory-plan",
-      "instrs_before": 89,
-      "instrs_after": 89,
+      "instrs_before": 117,
+      "instrs_after": 117,
       "rewrites": 0
     },
     {
+      "pass": "lower-backend-tiling",
+      "instrs_before": 117,
+      "instrs_after": 117,
+      "rewrites": 14
+    },
+    {
       "pass": "validate-fill-order",
-      "instrs_before": 89,
-      "instrs_after": 89,
+      "instrs_before": 117,
+      "instrs_after": 117,
       "rewrites": 0
     },
     {
       "pass": "validate-target-support",
-      "instrs_before": 89,
-      "instrs_after": 89,
+      "instrs_before": 117,
+      "instrs_after": 117,
       "rewrites": 0
     },
     {
       "pass": "validate-scale-factors",
-      "instrs_before": 89,
-      "instrs_after": 89,
+      "instrs_before": 117,
+      "instrs_after": 117,
       "rewrites": 0
     },
     {
       "pass": "validate-persistent-layout",
-      "instrs_before": 89,
-      "instrs_after": 89,
+      "instrs_before": 117,
+      "instrs_after": 117,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-kernel-operands",
+      "instrs_before": 117,
+      "instrs_after": 117,
       "rewrites": 0
     }
   ],
@@ -852,6 +870,15 @@
     {
       "id": 0,
       "tensor": 0,
+      "ty": {
+        "shape": [
+          512,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 262144,
       "alignment": 256,
       "temporary": false,
@@ -860,6 +887,14 @@
     {
       "id": 1,
       "tensor": 1,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 512,
       "alignment": 256,
       "temporary": false,
@@ -868,6 +903,21 @@
     {
       "id": 2,
       "tensor": 2,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 65536,
       "alignment": 256,
       "temporary": false,
@@ -876,6 +926,14 @@
     {
       "id": 3,
       "tensor": 21,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 1024,
       "alignment": 256,
       "temporary": false,
@@ -884,6 +942,21 @@
     {
       "id": 4,
       "tensor": 3,
+      "ty": {
+        "shape": [
+          64,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 16384,
       "alignment": 256,
       "temporary": false,
@@ -892,6 +965,14 @@
     {
       "id": 5,
       "tensor": 22,
+      "ty": {
+        "shape": [
+          64
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 256,
       "alignment": 256,
       "temporary": false,
@@ -900,6 +981,21 @@
     {
       "id": 6,
       "tensor": 4,
+      "ty": {
+        "shape": [
+          64,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 16384,
       "alignment": 256,
       "temporary": false,
@@ -908,6 +1004,14 @@
     {
       "id": 7,
       "tensor": 23,
+      "ty": {
+        "shape": [
+          64
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 256,
       "alignment": 256,
       "temporary": false,
@@ -916,6 +1020,21 @@
     {
       "id": 8,
       "tensor": 5,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 65536,
       "alignment": 256,
       "temporary": false,
@@ -924,6 +1043,14 @@
     {
       "id": 9,
       "tensor": 24,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 1024,
       "alignment": 256,
       "temporary": false,
@@ -932,6 +1059,14 @@
     {
       "id": 10,
       "tensor": 6,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 512,
       "alignment": 256,
       "temporary": false,
@@ -940,6 +1075,21 @@
     {
       "id": 11,
       "tensor": 7,
+      "ty": {
+        "shape": [
+          704,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 180224,
       "alignment": 256,
       "temporary": false,
@@ -948,6 +1098,14 @@
     {
       "id": 12,
       "tensor": 25,
+      "ty": {
+        "shape": [
+          704
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 2816,
       "alignment": 256,
       "temporary": false,
@@ -956,6 +1114,21 @@
     {
       "id": 13,
       "tensor": 8,
+      "ty": {
+        "shape": [
+          704,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 180224,
       "alignment": 256,
       "temporary": false,
@@ -964,6 +1137,14 @@
     {
       "id": 14,
       "tensor": 26,
+      "ty": {
+        "shape": [
+          704
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 2816,
       "alignment": 256,
       "temporary": false,
@@ -972,6 +1153,21 @@
     {
       "id": 15,
       "tensor": 9,
+      "ty": {
+        "shape": [
+          256,
+          704
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 180224,
       "alignment": 256,
       "temporary": false,
@@ -980,6 +1176,14 @@
     {
       "id": 16,
       "tensor": 27,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 1024,
       "alignment": 256,
       "temporary": false,
@@ -988,6 +1192,14 @@
     {
       "id": 17,
       "tensor": 10,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 512,
       "alignment": 256,
       "temporary": false,
@@ -996,6 +1208,21 @@
     {
       "id": 18,
       "tensor": 11,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 65536,
       "alignment": 256,
       "temporary": false,
@@ -1004,6 +1231,14 @@
     {
       "id": 19,
       "tensor": 28,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 1024,
       "alignment": 256,
       "temporary": false,
@@ -1012,6 +1247,21 @@
     {
       "id": 20,
       "tensor": 12,
+      "ty": {
+        "shape": [
+          64,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 16384,
       "alignment": 256,
       "temporary": false,
@@ -1020,6 +1270,14 @@
     {
       "id": 21,
       "tensor": 29,
+      "ty": {
+        "shape": [
+          64
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 256,
       "alignment": 256,
       "temporary": false,
@@ -1028,6 +1286,21 @@
     {
       "id": 22,
       "tensor": 13,
+      "ty": {
+        "shape": [
+          64,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 16384,
       "alignment": 256,
       "temporary": false,
@@ -1036,6 +1309,14 @@
     {
       "id": 23,
       "tensor": 30,
+      "ty": {
+        "shape": [
+          64
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 256,
       "alignment": 256,
       "temporary": false,
@@ -1044,6 +1325,21 @@
     {
       "id": 24,
       "tensor": 14,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 65536,
       "alignment": 256,
       "temporary": false,
@@ -1052,6 +1348,14 @@
     {
       "id": 25,
       "tensor": 31,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 1024,
       "alignment": 256,
       "temporary": false,
@@ -1060,6 +1364,14 @@
     {
       "id": 26,
       "tensor": 15,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 512,
       "alignment": 256,
       "temporary": false,
@@ -1068,6 +1380,21 @@
     {
       "id": 27,
       "tensor": 16,
+      "ty": {
+        "shape": [
+          704,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 180224,
       "alignment": 256,
       "temporary": false,
@@ -1076,6 +1403,14 @@
     {
       "id": 28,
       "tensor": 32,
+      "ty": {
+        "shape": [
+          704
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 2816,
       "alignment": 256,
       "temporary": false,
@@ -1084,6 +1419,21 @@
     {
       "id": 29,
       "tensor": 17,
+      "ty": {
+        "shape": [
+          704,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 180224,
       "alignment": 256,
       "temporary": false,
@@ -1092,6 +1442,14 @@
     {
       "id": 30,
       "tensor": 33,
+      "ty": {
+        "shape": [
+          704
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 2816,
       "alignment": 256,
       "temporary": false,
@@ -1100,6 +1458,21 @@
     {
       "id": 31,
       "tensor": 18,
+      "ty": {
+        "shape": [
+          256,
+          704
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "Fp8E4M3",
+            "logical_dtype": "F8E4M3",
+            "bits_per_element": 8,
+            "group_size": 1,
+            "channel_axis": 0
+          }
+        }
+      },
       "bytes": 180224,
       "alignment": 256,
       "temporary": false,
@@ -1108,6 +1481,14 @@
     {
       "id": 32,
       "tensor": 34,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "F32"
+        }
+      },
       "bytes": 1024,
       "alignment": 256,
       "temporary": false,
@@ -1116,6 +1497,14 @@
     {
       "id": 33,
       "tensor": 19,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 512,
       "alignment": 256,
       "temporary": false,
@@ -1124,10 +1513,271 @@
     {
       "id": 34,
       "tensor": 20,
+      "ty": {
+        "shape": [
+          512,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 262144,
       "alignment": 256,
       "temporary": false,
       "persistent_offset": 264704
+    },
+    {
+      "id": 35,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 131072,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 36,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          64,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 37,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          64,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 38,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 131072,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 39,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          704,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 360448,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 40,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          704,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 360448,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 41,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          256,
+          704
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 360448,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 42,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 131072,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 43,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          64,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 44,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          64,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 45,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 131072,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 46,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          704,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 360448,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 47,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          704,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 360448,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
+    },
+    {
+      "id": 48,
+      "tensor": null,
+      "ty": {
+        "shape": [
+          256,
+          704
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
+      "bytes": 360448,
+      "alignment": 256,
+      "temporary": true,
+      "persistent_offset": null,
+      "scratch_offset": 1954304
     }
   ],
   "instrs": [
@@ -1158,192 +1808,276 @@
     {
       "Allocate": {
         "id": 4,
-        "buffer": 4
+        "buffer": 35
       }
     },
     {
       "Allocate": {
         "id": 5,
-        "buffer": 5
+        "buffer": 4
       }
     },
     {
       "Allocate": {
         "id": 6,
-        "buffer": 6
+        "buffer": 5
       }
     },
     {
       "Allocate": {
         "id": 7,
-        "buffer": 7
+        "buffer": 36
       }
     },
     {
       "Allocate": {
         "id": 8,
-        "buffer": 8
+        "buffer": 6
       }
     },
     {
       "Allocate": {
         "id": 9,
-        "buffer": 9
+        "buffer": 7
       }
     },
     {
       "Allocate": {
         "id": 10,
-        "buffer": 10
+        "buffer": 37
       }
     },
     {
       "Allocate": {
         "id": 11,
-        "buffer": 11
+        "buffer": 8
       }
     },
     {
       "Allocate": {
         "id": 12,
-        "buffer": 12
+        "buffer": 9
       }
     },
     {
       "Allocate": {
         "id": 13,
-        "buffer": 13
+        "buffer": 38
       }
     },
     {
       "Allocate": {
         "id": 14,
-        "buffer": 14
+        "buffer": 10
       }
     },
     {
       "Allocate": {
         "id": 15,
-        "buffer": 15
+        "buffer": 11
       }
     },
     {
       "Allocate": {
         "id": 16,
-        "buffer": 16
+        "buffer": 12
       }
     },
     {
       "Allocate": {
         "id": 17,
-        "buffer": 17
+        "buffer": 39
       }
     },
     {
       "Allocate": {
         "id": 18,
-        "buffer": 18
+        "buffer": 13
       }
     },
     {
       "Allocate": {
         "id": 19,
-        "buffer": 19
+        "buffer": 14
       }
     },
     {
       "Allocate": {
         "id": 20,
-        "buffer": 20
+        "buffer": 40
       }
     },
     {
       "Allocate": {
         "id": 21,
-        "buffer": 21
+        "buffer": 15
       }
     },
     {
       "Allocate": {
         "id": 22,
-        "buffer": 22
+        "buffer": 16
       }
     },
     {
       "Allocate": {
         "id": 23,
-        "buffer": 23
+        "buffer": 41
       }
     },
     {
       "Allocate": {
         "id": 24,
-        "buffer": 24
+        "buffer": 17
       }
     },
     {
       "Allocate": {
         "id": 25,
-        "buffer": 25
+        "buffer": 18
       }
     },
     {
       "Allocate": {
         "id": 26,
-        "buffer": 26
+        "buffer": 19
       }
     },
     {
       "Allocate": {
         "id": 27,
-        "buffer": 27
+        "buffer": 42
       }
     },
     {
       "Allocate": {
         "id": 28,
-        "buffer": 28
+        "buffer": 20
       }
     },
     {
       "Allocate": {
         "id": 29,
-        "buffer": 29
+        "buffer": 21
       }
     },
     {
       "Allocate": {
         "id": 30,
-        "buffer": 30
+        "buffer": 43
       }
     },
     {
       "Allocate": {
         "id": 31,
-        "buffer": 31
+        "buffer": 22
       }
     },
     {
       "Allocate": {
         "id": 32,
-        "buffer": 32
+        "buffer": 23
       }
     },
     {
       "Allocate": {
         "id": 33,
-        "buffer": 33
+        "buffer": 44
       }
     },
     {
       "Allocate": {
         "id": 34,
+        "buffer": 24
+      }
+    },
+    {
+      "Allocate": {
+        "id": 35,
+        "buffer": 25
+      }
+    },
+    {
+      "Allocate": {
+        "id": 36,
+        "buffer": 45
+      }
+    },
+    {
+      "Allocate": {
+        "id": 37,
+        "buffer": 26
+      }
+    },
+    {
+      "Allocate": {
+        "id": 38,
+        "buffer": 27
+      }
+    },
+    {
+      "Allocate": {
+        "id": 39,
+        "buffer": 28
+      }
+    },
+    {
+      "Allocate": {
+        "id": 40,
+        "buffer": 46
+      }
+    },
+    {
+      "Allocate": {
+        "id": 41,
+        "buffer": 29
+      }
+    },
+    {
+      "Allocate": {
+        "id": 42,
+        "buffer": 30
+      }
+    },
+    {
+      "Allocate": {
+        "id": 43,
+        "buffer": 47
+      }
+    },
+    {
+      "Allocate": {
+        "id": 44,
+        "buffer": 31
+      }
+    },
+    {
+      "Allocate": {
+        "id": 45,
+        "buffer": 32
+      }
+    },
+    {
+      "Allocate": {
+        "id": 46,
+        "buffer": 48
+      }
+    },
+    {
+      "Allocate": {
+        "id": 47,
+        "buffer": 33
+      }
+    },
+    {
+      "Allocate": {
+        "id": 48,
         "buffer": 34
       }
     },
     {
       "BulkExtentWrite": {
-        "id": 35,
+        "id": 49,
         "source": {
           "file_id": 0,
           "tensor_id": 0,
@@ -1367,7 +2101,7 @@
     },
     {
       "BulkExtentWrite": {
-        "id": 36,
+        "id": 50,
         "source": {
           "file_id": 0,
           "tensor_id": 6,
@@ -1391,7 +2125,7 @@
     },
     {
       "BulkExtentWrite": {
-        "id": 37,
+        "id": 51,
         "source": {
           "file_id": 0,
           "tensor_id": 10,
@@ -1415,7 +2149,7 @@
     },
     {
       "BulkExtentWrite": {
-        "id": 38,
+        "id": 52,
         "source": {
           "file_id": 0,
           "tensor_id": 15,
@@ -1439,7 +2173,7 @@
     },
     {
       "BulkExtentWrite": {
-        "id": 39,
+        "id": 53,
         "source": {
           "file_id": 0,
           "tensor_id": 19,
@@ -1463,22 +2197,21 @@
     },
     {
       "Finalize": {
-        "id": 40,
+        "id": 54,
         "tensor": 0,
         "name": "model.embed_tokens.weight"
       }
     },
     {
       "Finalize": {
-        "id": 41,
+        "id": 55,
         "tensor": 1,
         "name": "model.layers.0.input_layernorm.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 42,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 56,
         "source": {
           "file_id": 0,
           "tensor_id": 2,
@@ -1502,8 +2235,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 35,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 131072,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 57,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          35
+        ],
         "outputs": [
           2,
           3
@@ -1526,22 +2283,21 @@
     },
     {
       "Finalize": {
-        "id": 43,
+        "id": 58,
         "tensor": 3,
         "name": "model.layers.0.self_attn.q_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 44,
+        "id": 59,
         "tensor": 2,
         "name": "model.layers.0.self_attn.q_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 45,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 60,
         "source": {
           "file_id": 0,
           "tensor_id": 3,
@@ -1565,8 +2321,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 36,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 61,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          36
+        ],
         "outputs": [
           4,
           5
@@ -1589,22 +2369,21 @@
     },
     {
       "Finalize": {
-        "id": 46,
+        "id": 62,
         "tensor": 5,
         "name": "model.layers.0.self_attn.k_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 47,
+        "id": 63,
         "tensor": 4,
         "name": "model.layers.0.self_attn.k_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 48,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 64,
         "source": {
           "file_id": 0,
           "tensor_id": 4,
@@ -1628,8 +2407,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 37,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 65,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          37
+        ],
         "outputs": [
           6,
           7
@@ -1652,22 +2455,21 @@
     },
     {
       "Finalize": {
-        "id": 49,
+        "id": 66,
         "tensor": 7,
         "name": "model.layers.0.self_attn.v_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 50,
+        "id": 67,
         "tensor": 6,
         "name": "model.layers.0.self_attn.v_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 51,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 68,
         "source": {
           "file_id": 0,
           "tensor_id": 5,
@@ -1691,8 +2493,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 38,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 131072,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 69,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          38
+        ],
         "outputs": [
           8,
           9
@@ -1715,29 +2541,28 @@
     },
     {
       "Finalize": {
-        "id": 52,
+        "id": 70,
         "tensor": 9,
         "name": "model.layers.0.self_attn.o_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 53,
+        "id": 71,
         "tensor": 8,
         "name": "model.layers.0.self_attn.o_proj.weight"
       }
     },
     {
       "Finalize": {
-        "id": 54,
+        "id": 72,
         "tensor": 10,
         "name": "model.layers.0.post_attention_layernorm.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 55,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 73,
         "source": {
           "file_id": 0,
           "tensor_id": 7,
@@ -1761,8 +2586,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 39,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 360448,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 74,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          39
+        ],
         "outputs": [
           11,
           12
@@ -1785,22 +2634,21 @@
     },
     {
       "Finalize": {
-        "id": 56,
+        "id": 75,
         "tensor": 12,
         "name": "model.layers.0.mlp.gate_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 57,
+        "id": 76,
         "tensor": 11,
         "name": "model.layers.0.mlp.gate_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 58,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 77,
         "source": {
           "file_id": 0,
           "tensor_id": 8,
@@ -1824,8 +2672,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 40,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 360448,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 78,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          40
+        ],
         "outputs": [
           13,
           14
@@ -1848,22 +2720,21 @@
     },
     {
       "Finalize": {
-        "id": 59,
+        "id": 79,
         "tensor": 14,
         "name": "model.layers.0.mlp.up_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 60,
+        "id": 80,
         "tensor": 13,
         "name": "model.layers.0.mlp.up_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 61,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 81,
         "source": {
           "file_id": 0,
           "tensor_id": 9,
@@ -1887,8 +2758,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 41,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 360448,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 82,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          41
+        ],
         "outputs": [
           15,
           16
@@ -1911,29 +2806,28 @@
     },
     {
       "Finalize": {
-        "id": 62,
+        "id": 83,
         "tensor": 16,
         "name": "model.layers.0.mlp.down_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 63,
+        "id": 84,
         "tensor": 15,
         "name": "model.layers.0.mlp.down_proj.weight"
       }
     },
     {
       "Finalize": {
-        "id": 64,
+        "id": 85,
         "tensor": 17,
         "name": "model.layers.1.input_layernorm.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 65,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 86,
         "source": {
           "file_id": 0,
           "tensor_id": 11,
@@ -1957,8 +2851,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 42,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 131072,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 87,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          42
+        ],
         "outputs": [
           18,
           19
@@ -1981,22 +2899,21 @@
     },
     {
       "Finalize": {
-        "id": 66,
+        "id": 88,
         "tensor": 19,
         "name": "model.layers.1.self_attn.q_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 67,
+        "id": 89,
         "tensor": 18,
         "name": "model.layers.1.self_attn.q_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 68,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 90,
         "source": {
           "file_id": 0,
           "tensor_id": 12,
@@ -2020,8 +2937,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 43,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 91,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          43
+        ],
         "outputs": [
           20,
           21
@@ -2044,22 +2985,21 @@
     },
     {
       "Finalize": {
-        "id": 69,
+        "id": 92,
         "tensor": 21,
         "name": "model.layers.1.self_attn.k_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 70,
+        "id": 93,
         "tensor": 20,
         "name": "model.layers.1.self_attn.k_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 71,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 94,
         "source": {
           "file_id": 0,
           "tensor_id": 13,
@@ -2083,8 +3023,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 44,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 95,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          44
+        ],
         "outputs": [
           22,
           23
@@ -2107,22 +3071,21 @@
     },
     {
       "Finalize": {
-        "id": 72,
+        "id": 96,
         "tensor": 23,
         "name": "model.layers.1.self_attn.v_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 73,
+        "id": 97,
         "tensor": 22,
         "name": "model.layers.1.self_attn.v_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 74,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 98,
         "source": {
           "file_id": 0,
           "tensor_id": 14,
@@ -2146,8 +3109,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 45,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 131072,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 99,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          45
+        ],
         "outputs": [
           24,
           25
@@ -2170,29 +3157,28 @@
     },
     {
       "Finalize": {
-        "id": 75,
+        "id": 100,
         "tensor": 25,
         "name": "model.layers.1.self_attn.o_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 76,
+        "id": 101,
         "tensor": 24,
         "name": "model.layers.1.self_attn.o_proj.weight"
       }
     },
     {
       "Finalize": {
-        "id": 77,
+        "id": 102,
         "tensor": 26,
         "name": "model.layers.1.post_attention_layernorm.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 78,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 103,
         "source": {
           "file_id": 0,
           "tensor_id": 16,
@@ -2216,8 +3202,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 46,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 360448,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 104,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          46
+        ],
         "outputs": [
           27,
           28
@@ -2240,22 +3250,21 @@
     },
     {
       "Finalize": {
-        "id": 79,
+        "id": 105,
         "tensor": 28,
         "name": "model.layers.1.mlp.gate_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 80,
+        "id": 106,
         "tensor": 27,
         "name": "model.layers.1.mlp.gate_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 81,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 107,
         "source": {
           "file_id": 0,
           "tensor_id": 17,
@@ -2279,8 +3288,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 47,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 360448,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 108,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          47
+        ],
         "outputs": [
           29,
           30
@@ -2303,22 +3336,21 @@
     },
     {
       "Finalize": {
-        "id": 82,
+        "id": 109,
         "tensor": 30,
         "name": "model.layers.1.mlp.up_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 83,
+        "id": 110,
         "tensor": 29,
         "name": "model.layers.1.mlp.up_proj.weight"
       }
     },
     {
-      "TileMap": {
-        "id": 84,
-        "kind": "Encode",
+      "ExtentWrite": {
+        "id": 111,
         "source": {
           "file_id": 0,
           "tensor_id": 18,
@@ -2342,8 +3374,32 @@
           },
           "dtype": "BF16"
         },
+        "dest": {
+          "buffer": 48,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 360448,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TileMap": {
+        "id": 112,
+        "kind": "Encode",
+        "source": null,
         "dest": null,
-        "inputs": [],
+        "inputs": [
+          48
+        ],
         "outputs": [
           31,
           32
@@ -2366,28 +3422,28 @@
     },
     {
       "Finalize": {
-        "id": 85,
+        "id": 113,
         "tensor": 32,
         "name": "model.layers.1.mlp.down_proj.weight_scale_inv"
       }
     },
     {
       "Finalize": {
-        "id": 86,
+        "id": 114,
         "tensor": 31,
         "name": "model.layers.1.mlp.down_proj.weight"
       }
     },
     {
       "Finalize": {
-        "id": 87,
+        "id": 115,
         "tensor": 33,
         "name": "model.norm.weight"
       }
     },
     {
       "Finalize": {
-        "id": 88,
+        "id": 116,
         "tensor": 34,
         "name": "lm_head.weight"
       }
@@ -2482,14 +3538,43 @@
     85,
     86,
     87,
-    88
+    88,
+    89,
+    90,
+    91,
+    92,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    99,
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116
   ],
   "memory": {
     "persistent_bytes": 1954304,
+    "scratch_bytes": 360448,
     "temporary_peak_bytes": 0,
     "transform_scratch_peak_bytes": 183040,
     "checkpoint_read_bytes": 3344896,
-    "device_write_bytes": 1954304
+    "device_write_bytes": 4772352
   },
   "attachments": [
     {

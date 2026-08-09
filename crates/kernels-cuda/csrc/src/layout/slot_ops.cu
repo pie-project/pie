@@ -1,4 +1,17 @@
+//===-- slot_ops.cu - the two slot-conditional launchers -------------===//
+//
+// Two host launchers and not one `__global__`: the device text is in
+// `layout/slot_ops.cuh`, which this file includes so the archive and the JIT
+// header set hold the SAME definition rather than two that drift.
+//
+//===----------------------------------------------------------------------===//
+
+// The scalar layer and the fixed-width integer names, out of the prelude.
+#include "pie_device.cuh"
 #include "layout/slot_ops.hpp"
+
+// The `__global__`s these launchers fire. ONE definition of each.
+#include "layout/slot_ops.cuh"
 
 #include <cuda_runtime.h>
 
@@ -6,52 +19,14 @@
 
 namespace pie_cuda_driver::kernels::layout {
 
-namespace {
-
-__global__ void zero_slots_if_fresh_kernel(
-    std::uint8_t* base,
-    std::size_t slot_bytes,
-    std::size_t layer_stride_bytes,
-    const std::int32_t* slot_ids,
-    const std::uint8_t* is_fresh,
-    std::size_t request_count)
-{
-    const std::size_t request = blockIdx.x;
-    const std::size_t layer = blockIdx.y;
-    if (request >= request_count || is_fresh[request] == 0) return;
-    const std::int32_t slot = slot_ids[request];
-    if (slot < 0) return;
-    std::uint8_t* out =
-        base + layer * layer_stride_bytes +
-        static_cast<std::size_t>(slot) * slot_bytes;
-    for (std::size_t i = threadIdx.x; i < slot_bytes; i += blockDim.x) {
-        out[i] = 0;
-    }
-}
-
-__global__ void copy_if_valid_slot_kernel(
-    const std::uint8_t* src,
-    std::uint8_t* dst,
-    std::size_t bytes,
-    const std::int32_t* slot_ids,
-    std::size_t request)
-{
-    if (slot_ids[request] < 0) return;
-    for (std::size_t i = threadIdx.x; i < bytes; i += blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-
-}  // namespace
-
 void zero_slots_if_fresh(
-    std::uint8_t* base,
-    std::size_t slot_bytes,
-    std::size_t layer_stride_bytes,
-    std::size_t layer_count,
-    const std::int32_t* slot_ids,
-    const std::uint8_t* is_fresh,
-    std::size_t request_count,
+    device::u8* base,
+    device::usize slot_bytes,
+    device::usize layer_stride_bytes,
+    device::usize layer_count,
+    const device::i32* slot_ids,
+    const device::u8* is_fresh,
+    device::usize request_count,
     cudaStream_t stream)
 {
     if (base == nullptr || slot_bytes == 0 || layer_count == 0 ||
@@ -59,7 +34,7 @@ void zero_slots_if_fresh(
         return;
     }
     constexpr int kThreads = 256;
-    zero_slots_if_fresh_kernel<<<
+    device::zero_slots_if_fresh<<<
         dim3(
             static_cast<unsigned int>(request_count),
             static_cast<unsigned int>(layer_count)),
@@ -74,16 +49,16 @@ void zero_slots_if_fresh(
 }
 
 void copy_if_valid_slot(
-    const std::uint8_t* src,
-    std::uint8_t* dst,
-    std::size_t bytes,
-    const std::int32_t* slot_ids,
-    std::size_t request,
+    const device::u8* src,
+    device::u8* dst,
+    device::usize bytes,
+    const device::i32* slot_ids,
+    device::usize request,
     cudaStream_t stream)
 {
     if (bytes == 0) return;
     constexpr int kThreads = 256;
-    copy_if_valid_slot_kernel<<<1, kThreads, 0, stream>>>(
+    device::copy_if_valid_slot<<<1, kThreads, 0, stream>>>(
         src, dst, bytes, slot_ids, request);
     CUDA_CHECK(cudaGetLastError());
 }

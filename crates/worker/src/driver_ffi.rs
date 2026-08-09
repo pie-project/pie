@@ -2,15 +2,20 @@
 
 use crate::config::DriverKind;
 
-/// Which driver flavor to dispatch to at runtime. Variants are
-/// gated by Cargo features for cuda/metal; dummy is always present.
+/// Which driver flavor to dispatch to at runtime.
+///
+/// EVERY variant is feature-gated, and there is no longer an ungated one.
+/// `Dummy` used to be that: an always-present interpreter flavor that a
+/// build with neither device feature fell back to. It went with the crate,
+/// so a binary built without `driver-cuda` or `driver-metal` now has no
+/// flavor at all — which is the truth it was papering over, since that
+/// build could never reach a device.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Flavor {
     #[cfg(feature = "driver-cuda")]
     Cuda,
     #[cfg(feature = "driver-metal")]
     Metal,
-    Dummy,
 }
 
 impl Flavor {
@@ -21,7 +26,6 @@ impl Flavor {
             Flavor::Cuda => "cuda",
             #[cfg(feature = "driver-metal")]
             Flavor::Metal => "metal",
-            Flavor::Dummy => "dummy",
         }
     }
 
@@ -50,7 +54,6 @@ impl Flavor {
                     Err(missing_feature_msg("metal", "driver-metal"))
                 }
             }
-            DriverKind::Dummy => Ok(Flavor::Dummy),
         }
     }
 }
@@ -73,29 +76,31 @@ fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
               attached to an element inside `vec![]`"
 )]
 pub fn compiled_summary() -> String {
-    let mut out = Vec::new();
+    #[cfg_attr(
+        not(any(feature = "driver-cuda", feature = "driver-metal")),
+        allow(unused_mut, reason = "every push below is feature-gated")
+    )]
+    let mut out: Vec<&'static str> = Vec::new();
     #[cfg(feature = "driver-cuda")]
     out.push("cuda");
     #[cfg(feature = "driver-metal")]
     out.push("metal");
-    out.push("dummy");
     out.join(", ")
 }
 
 /// Per-flavor compiled-in status, in TOML-discriminator form
-/// (`cuda_native` / `metal` / `dummy`). Used by both
-/// `pie driver list` and `pie doctor` to render the embedded-driver section.
-pub fn compiled_embedded() -> [(&'static str, bool); 3] {
+/// (`cuda_native` / `metal`). Used by both `pie driver list` and
+/// `pie doctor` to render the embedded-driver section.
+pub fn compiled_embedded() -> [(&'static str, bool); 2] {
     [
         ("cuda_native", cfg!(feature = "driver-cuda")),
         ("metal", cfg!(feature = "driver-metal")),
-        ("dummy", true),
     ]
 }
 
 /// Pick a sensible default flavor for commands that don't specify one
 /// (e.g. `pie smoke` without `--flavor`, `pie config init`'s template).
-/// Order: cuda → metal → dummy.
+/// Order: cuda → metal, and `None` when neither was compiled in.
 pub fn default_flavor() -> Option<Flavor> {
     #[cfg(feature = "driver-cuda")]
     {
@@ -104,10 +109,6 @@ pub fn default_flavor() -> Option<Flavor> {
     #[cfg(all(not(feature = "driver-cuda"), feature = "driver-metal"))]
     {
         return Some(Flavor::Metal);
-    }
-    #[cfg(all(not(feature = "driver-cuda"), not(feature = "driver-metal")))]
-    {
-        return Some(Flavor::Dummy);
     }
     #[allow(unreachable_code)]
     None

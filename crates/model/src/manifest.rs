@@ -83,6 +83,25 @@ pub struct TensorSpec {
     /// Logical rather than stored: see the module doc on quantization.
     pub extents: Vec<u64>,
     pub presence: Presence,
+    /// Other LAYOUTS the same quantity is published in.
+    ///
+    /// Not a spelling. A spelling is a rule in [`Observed::logical`],
+    /// written once and true of every row — which is why that function
+    /// carries three rules and no per-family table. This is for a
+    /// quantity two publications DIVIDE differently, where no
+    /// context-free renaming can make one name of two: gpt-oss's
+    /// gate/up bias is one `[experts, 2 * intermediate]` tensor from
+    /// OpenAI and two `[experts, intermediate]` tensors from MLX.
+    ///
+    /// Each alternative is a COMPLETE substitute — every name in it
+    /// must be published at extents that agree, or that alternative
+    /// does not apply. Half a layout is not a layout, and accepting one
+    /// would identify a checkpoint by a tensor it happens to share.
+    ///
+    /// Only consulted when the primary name is ABSENT, so a manifest
+    /// still states one layout and the rest are what a differently
+    /// divided publication may bring instead.
+    pub instead: Vec<Vec<(String, Vec<u64>)>>,
 }
 
 impl TensorSpec {
@@ -93,6 +112,7 @@ impl TensorSpec {
             name: name.into(),
             extents: extents.into(),
             presence: Presence::Required,
+            instead: Vec::new(),
         }
     }
 
@@ -106,6 +126,7 @@ impl TensorSpec {
             name: name.into(),
             extents: Vec::new(),
             presence: Presence::Required,
+            instead: Vec::new(),
         }
     }
 
@@ -116,6 +137,7 @@ impl TensorSpec {
             name: name.into(),
             extents: Vec::new(),
             presence: Presence::Absent,
+            instead: Vec::new(),
         }
     }
 
@@ -126,7 +148,28 @@ impl TensorSpec {
             name: name.into(),
             extents: extents.into(),
             presence: Presence::Optional,
+            instead: Vec::new(),
         }
+    }
+
+    /// Accept this quantity divided the way another publication divides
+    /// it.
+    ///
+    /// See [`Self::instead`]. Chainable, because a quantity may be
+    /// published more than two ways.
+    #[must_use]
+    pub fn or_published_as<N, S>(mut self, layout: impl IntoIterator<Item = (N, S)>) -> Self
+    where
+        N: Into<String>,
+        S: Into<Vec<u64>>,
+    {
+        self.instead.push(
+            layout
+                .into_iter()
+                .map(|(n, e)| (n.into(), e.into()))
+                .collect(),
+        );
+        self
     }
 }
 
@@ -213,6 +256,7 @@ impl Manifest {
         let mut faults = Vec::new();
         for (name, spec) in self.rows() {
             match (spec.presence, observed.extents(&name)) {
+                (Presence::Required, None) if applies(&spec.instead, observed) => {}
                 (Presence::Required, None) => faults.push(Fault::Missing(name)),
                 (Presence::Absent, Some(_)) => faults.push(Fault::Unexpected(name)),
                 (Presence::Required | Presence::Optional, Some(seen))
@@ -238,6 +282,30 @@ impl Manifest {
             Err(Mismatch { faults })
         }
     }
+}
+
+/// Is any of these layouts the one this checkpoint published?
+///
+/// A layout applies when EVERY name in it is published at extents that
+/// agree — see [`TensorSpec::instead`] for why half of one is not half
+/// an answer. The names go through [`Observed::logical`] like every
+/// other spec name, so an alternative is written in the same vocabulary
+/// as the row it stands in for.
+///
+/// The `.scales` companion is asked per name, exactly as the primary
+/// path asks it: an alternative layout is published by the same
+/// converter that packed everything else, so its halves are packed too.
+fn applies(layouts: &[Vec<(String, Vec<u64>)>], observed: &Observed) -> bool {
+    layouts.iter().any(|layout| {
+        !layout.is_empty()
+            && layout.iter().all(|(name, want)| {
+                let name = Observed::logical(name);
+                observed.extents(&name).is_some_and(|seen| {
+                    want.is_empty()
+                        || extents_agree(want, seen, observed.has(&format!("{name}.scales")))
+                })
+            })
+    })
 }
 
 /// Do a spec's extents describe the observed ones?

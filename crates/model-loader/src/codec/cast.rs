@@ -98,3 +98,136 @@ mod tests {
         assert_eq!(actual, bf16::from_f32(input).to_bits());
     }
 }
+
+/// A `Cast`, dispatched on its dtype pair once and run across every core.
+///
+/// The generic route below — [`decode_values`] into a `Vec<f64>`, then
+/// [`encode_values`] back — is the right shape for a fallback and the wrong
+/// one for the only cast that matters. `materialize_contract` turns every
+/// `F16`/`F32` tensor into `Cast(Src -> BF16)` because every kernel this tree
+/// ships reads BF16, so an F32 checkpoint casts *every tensor*: the pivot
+/// costs eight bytes of scratch per source element and a `match` on the dtype
+/// inside the per-element loop, single-threaded, at 0.25 GiB/s against an
+/// `encode_rows` doing 1.66 GiB/s of strictly harder work on the same machine.
+///
+/// Both problems are fixed here and neither is fixed by a GPU: `pie model
+/// import` moves its bytes off a disk whose ceiling this was two orders of
+/// magnitude under, and a device path would bolt a PCIe round trip onto a job
+/// that belongs on the host (`.wiki/fix/loader.md` §2.1).
+///
+/// The float pairs are bit-identical to the pivot they replace, which is what
+/// makes this a pure speedup: every one of them widens to `f32` on the way in
+/// and narrows from `f32` on the way out, and `f32 -> f64 -> f32` is the
+/// identity. Every other pair still goes through the pivot, one chunk at a
+/// time, so the widening is bounded by the chunk rather than by the tensor.
+pub fn cast_elements(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Error> {
+    let in_width = from.bytes() as usize;
+    let out_width = to.bytes() as usize;
+    if in_width == 0 || !bytes.len().is_multiple_of(in_width) {
+        return Err(invalid("cast input byte count is not element-aligned"));
+    }
+    let elements = bytes.len() / in_width;
+    let mut out = vec![0u8; elements * out_width];
+    // Below about a megabyte the threads cost more than they carry, which is
+    // the threshold `encode_rows` already uses for the same reason.
+    let workers = if bytes.len() < (1 << 20) || elements == 0 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(elements)
+    };
+    if workers <= 1 {
+        return cast_chunk(bytes, &mut out, from, to).map(|()| out);
+    }
+    let per_worker = elements.div_ceil(workers);
+    let failure = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        let mut out_rest = &mut out[..];
+        let mut start = 0usize;
+        while start < elements {
+            let count = per_worker.min(elements - start);
+            let (chunk, rest) = std::mem::take(&mut out_rest).split_at_mut(count * out_width);
+            out_rest = rest;
+            let source = &bytes[start * in_width..(start + count) * in_width];
+            handles.push(scope.spawn(move || cast_chunk(source, chunk, from, to)));
+            start += count;
+        }
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok()?.err())
+            .next()
+    });
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(out),
+    }
+}
+
+/// One chunk of a cast: `src.len() / from.bytes()` elements, converted into
+/// `dst`.
+///
+/// The `match` is on the PAIR and it happens once, so each arm is a loop over
+/// two known widths that the compiler can vectorize. What the arms cover is
+/// the float conversions the loader actually performs; everything else keeps
+/// the general implementation, because a fallback that silently stopped
+/// covering a dtype pair would be a cast that produces the source's
+/// representation under the destination's name.
+fn cast_chunk(src: &[u8], dst: &mut [u8], from: DType, to: DType) -> Result<(), Error> {
+    use DType::{BF16, F16, F32};
+    match (from, to) {
+        (F32, BF16) => map_elements(src, dst, |v: [u8; 4]| {
+            bf16::from_f32(f32::from_le_bytes(v)).to_bits().to_le_bytes()
+        }),
+        (F32, F16) => map_elements(src, dst, |v: [u8; 4]| {
+            f16::from_f32(f32::from_le_bytes(v)).to_bits().to_le_bytes()
+        }),
+        (F16, BF16) => map_elements(src, dst, |v: [u8; 2]| {
+            bf16::from_f32(f16::from_bits(u16::from_le_bytes(v)).to_f32())
+                .to_bits()
+                .to_le_bytes()
+        }),
+        (BF16, F16) => map_elements(src, dst, |v: [u8; 2]| {
+            f16::from_f32(bf16::from_bits(u16::from_le_bytes(v)).to_f32())
+                .to_bits()
+                .to_le_bytes()
+        }),
+        (F16, F32) => map_elements(src, dst, |v: [u8; 2]| {
+            f16::from_bits(u16::from_le_bytes(v)).to_f32().to_le_bytes()
+        }),
+        (BF16, F32) => map_elements(src, dst, |v: [u8; 2]| {
+            bf16::from_bits(u16::from_le_bytes(v))
+                .to_f32()
+                .to_le_bytes()
+        }),
+        _ => {
+            let values = decode_values(src, from)?;
+            let bytes = encode_values(&values, to)?;
+            if bytes.len() != dst.len() {
+                return Err(invalid(format!(
+                    "cast produced {} bytes for a {}-byte chunk",
+                    bytes.len(),
+                    dst.len()
+                )));
+            }
+            dst.copy_from_slice(&bytes);
+            Ok(())
+        }
+    }
+}
+
+/// Element-wise `[u8; IN] -> [u8; OUT]` over two slices, with the widths in
+/// the type so the loop carries neither a stride nor a bounds check.
+fn map_elements<const IN: usize, const OUT: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    convert: impl Fn([u8; IN]) -> [u8; OUT],
+) -> Result<(), Error> {
+    if !src.len().is_multiple_of(IN) || src.len() / IN * OUT != dst.len() {
+        return Err(invalid("cast chunk widths do not match its buffers"));
+    }
+    for (input, output) in src.chunks_exact(IN).zip(dst.chunks_exact_mut(OUT)) {
+        output.copy_from_slice(&convert(input.try_into().unwrap()));
+    }
+    Ok(())
+}

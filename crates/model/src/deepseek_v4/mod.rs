@@ -30,7 +30,6 @@ pub mod contract;
 
 /// The declared forward — hyper-connections over compressed attention and
 /// an MoE stack.
-#[cfg(feature = "forward")]
 pub mod forward;
 
 /// The SHAPE, ungated: a catalog row is written in these words.
@@ -40,12 +39,12 @@ pub mod spec;
 /// its text.
 pub mod project;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::Advertised;
@@ -156,15 +155,7 @@ pub const VARIANTS: &[Dsv4] = &[Dsv4 {
     tied_embeddings: true,
 }];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&Dsv4` to `&dyn Variant`;
-/// the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Dsv4);
 
 impl Dsv4 {
     /// What a driver ADVERTISES about this row, as distinct from what it
@@ -211,9 +202,15 @@ impl Variant for Dsv4 {
 
     /// The head dim an AUTHORING pass needs, and for this generation it
     /// is the head's own width — K and V are one straight projection, so
-    /// there is no latent row to state instead. `n_experts` is what
-    /// makes the two expert passes walk anything at all: both key on
-    /// `.ffn.experts.<e>.` and the walk is over this count.
+    /// there is no latent row to state instead.
+    ///
+    /// `n_experts` is what the two expert passes CHECK THEMSELVES
+    /// against. This used to say it was "what makes them walk anything
+    /// at all", which was not true: both key on `.ffn.experts.<e>.` and
+    /// walk by probing names, and `contract.rs` did not read this field
+    /// once. It reads it now, at the end of each walk, because a
+    /// checkpoint missing the very name a walk probes ends the walk
+    /// instead of failing it.
     fn load_shape(&self) -> LoadShape {
         LoadShape::mixture(
             self.shape.layers,
@@ -274,7 +271,6 @@ impl Variant for Dsv4 {
     /// itself" — but nothing sequenced the two calls, and the caller it
     /// described was hypothetical. The row refused at the door and
     /// handed out a fire anyway.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -448,7 +444,6 @@ mod tests {
     /// the gated one, which is how "the declaration exists" turned into
     /// "the serving path hands out a fire for a row it just turned
     /// away".
-    #[cfg(feature = "forward")]
     #[test]
     fn the_declaration_traces_where_the_deployment_refuses() {
         use model_compiler::trace::FireClass;
@@ -650,7 +645,6 @@ mod tests {
     /// The comparison is against [`project::NO_METAL`] itself and not a
     /// paraphrase, so the sentence a caller is shown is the sentence
     /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -664,6 +658,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {

@@ -23,7 +23,7 @@
 //!
 //! # What is ported
 //!
-//! The four rules `kernels_cuda::norm_device::ENTRIES` states. Every other
+//! The four rules `kernels_cuda_new::device::ALTUP_AUX` states. Every other
 //! variant answers [`Ungeometric::Unported`] rather than a guess: a rule this
 //! backend has not written the arithmetic for is not a rule with a default,
 //! and the whole reason the table can be trusted is that a driver refuses
@@ -240,13 +240,13 @@ mod tests {
     /// about which rules are live.
     #[test]
     fn every_tier_a_rule_is_ported() {
-        for k in kernels_cuda::norm_device::ENTRIES {
+        for k in kernels_cuda_new::device::ALTUP_AUX {
             let d = dims(T, H);
             assert!(
-                !matches!(eval(k.launch, d), Err(Ungeometric::Unported(_))),
+                !matches!(eval(k.sig.launch, d), Err(Ungeometric::Unported(_))),
                 "{} states {:?}, which this driver has not ported",
-                k.symbol,
-                k.launch
+                k.sig.symbol,
+                k.sig.launch
             );
         }
     }

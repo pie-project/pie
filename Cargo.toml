@@ -85,7 +85,16 @@ members = [
     # split here is about what needs a GPU present, not about what a compiler
     # will accept.
     "crates/driver-vulkan",
-    "crates/driver-dummy",
+    # The WebGPU shell. The only driver in this list that is a
+    # `default-member`, and the reason is that it is the only one whose device
+    # half costs nothing to REACH: `wgpu` is pure Rust with no `-sys` crate
+    # anywhere in its closure, `naga` compiles the shaders in-process, and so a
+    # workspace sweep on any machine builds the whole crate and runs every test
+    # that does not need an adapter to answer. Its `native` feature gates only
+    # what asks a real adapter a question, which is a narrower line than either
+    # sibling's -- Metal splits on what a compiler accepts, Vulkan on what needs
+    # a GPU present, and this one on neither.
+    "crates/driver-wgpu",
 
     # -- model-*: what a model IS, and how it gets onto a device ------------
     # The two registries (`model_type` -> load-contract author, `arch_name` ->
@@ -110,6 +119,16 @@ members = [
     # crates default to table-only -- `native` is what costs nvcc.
     "crates/kernels",
     "crates/kernels-cuda",
+    # The JIT-native shape of the CUDA half: the table, the device sources
+    # carried in the binary, and the runtime that NVRTC-compiles and fires
+    # them. No CMake, no archive, no `links` key -- a kernel is text, so there
+    # is nothing to build ahead of time and nothing to link. It builds beside
+    # `kernels-cuda` while both paths must run, and HOLDS the rows both read:
+    # the seam that had it borrow them closed by moving the table here and
+    # inverting the edge, so `kernels-cuda` depends on this and re-exports
+    # what it used to own. A symbol still has exactly one contract; the crate
+    # that authors it is now the one a row is written for.
+    "crates/kernels-cuda-new",
     "crates/kernels-metal",
     # The Vulkan tree. Its table is `kernels-metal`'s coverage, row for row, so
     # the two are comparable rather than merely parallel; what differs is the
@@ -118,6 +137,15 @@ members = [
     # costs `glslc` -- Vulkan has no runtime shader compiler, so GLSL -> SPIR-V
     # is a BUILD-time hop where Metal's is a run-time one.
     "crates/kernels-vulkan",
+    # The WebGPU tree. Its table is `kernels-metal`'s coverage, row for row, so
+    # all three are comparable rather than merely parallel. What differs is that
+    # this one costs NO TOOLCHAIN: WGSL is compiled by `naga`, which is Rust and
+    # ships inside `wgpu`, so a module is built by the process that dispatches
+    # it. There is no `native` feature here because there is no build product to
+    # gate -- the table, the shaders and every structural test are reachable on
+    # any machine that can build Rust, which is why this one is a
+    # `default-member` where its two siblings' device halves are not.
+    "crates/kernels-wgpu",
 
     # -- tensor-*: the guest-program toolchain ------------------------------
     # authoring eDSL -> PTIR -> planning -> CUDA/Metal codegen, plus the
@@ -164,15 +192,20 @@ default-members = [
     "crates/controller-api",
     "crates/worker-api",
     "crates/driver-api",
-    "crates/driver-dummy",
     "crates/driver",
+    # See the member comment: no SDK, no vendor driver, no adapter needed to
+    # build it or to run the tests that are not gated on `native`, so a sweep
+    # should carry it where it does not carry `driver-vulkan` or `driver-metal`.
+    "crates/driver-wgpu",
     "crates/model",
     "crates/model-compiler",
     "crates/model-loader",
     "crates/kernels",
     "crates/kernels-cuda",
+    "crates/kernels-cuda-new",
     "crates/kernels-metal",
     "crates/kernels-vulkan",
+    "crates/kernels-wgpu",
     "crates/tensor-ir",
     "crates/tensor-dsl",
     "crates/tensor-compiler",
@@ -242,7 +275,6 @@ driver-cuda = ["worker/driver-cuda"]
 # Metal driver at all: `worker`'s `driver-metal` is what links the archive,
 # and this is the only package that builds a binary.
 driver-metal = ["worker/driver-metal"]
-driver-dummy = ["worker/driver-dummy"]
 # Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 

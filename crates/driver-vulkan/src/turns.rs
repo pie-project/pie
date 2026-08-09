@@ -48,7 +48,7 @@ use model_compiler::trace::ForwardPlan;
 use crate::device::{Device, Pipelines};
 use crate::dispatch::Geometry;
 use crate::pages::{Book, Unhoused};
-use crate::resources::{Frame, Model, Pool, Unstageable, Weights};
+use crate::resources::{Frame, Model, Pool, Request, Unstageable, Weights};
 use crate::serve::{Fire, Fired, Logits, Modules, Unfired, Unread, fire, logits};
 use kernels_vulkan::Capability;
 
@@ -254,8 +254,50 @@ impl Serving<'_> {
                     .map_err(Unstepped::Unhoused)?,
             );
         }
+        let tokens: Vec<&[u32]> = turns.iter().map(|t| t.tokens.as_slice()).collect();
+        self.over(device, pipelines, modules, held, &requests, &tokens)
+    }
+
+    /// Fire over requests somebody else allocated pages for.
+    ///
+    /// # Why this exists beside [`Self::step`]
+    ///
+    /// There are two page allocators in this system and only one of them can
+    /// be right for a given caller. [`crate::pages::Book`] is this driver's
+    /// own: it decides which physical page a conversation gets, which is what
+    /// a server built on this crate alone needs. The ENGINE decides for
+    /// itself -- its scheduler hands down a `kv_page_indices` CSR naming
+    /// physical pages it chose, because it also runs eviction, prefix sharing
+    /// and the copy plans that move pages between conversations.
+    ///
+    /// A driver that ran the engine's frames through its own book would have
+    /// two allocators disagreeing about who owns page 7, and the disagreement
+    /// is silent: attention reads a page that holds another conversation's
+    /// keys and returns fluent text. So the engine's path does not touch the
+    /// book at all, and this is the seam where it joins.
+    ///
+    /// `tokens` is per REQUEST, parallel to `requests`, in the same order. It
+    /// is separate from the requests because a [`Request`] states positions
+    /// and pages -- where a row goes -- and says nothing about what is in it.
+    ///
+    /// # Errors
+    ///
+    /// [`Unstepped`], minus [`Unstepped::Unhoused`], which only a growth can
+    /// produce.
+    pub fn over<M: Modules>(
+        &self,
+        device: &Device,
+        pipelines: &mut Pipelines,
+        modules: &M,
+        held: &mut Held<'_>,
+        requests: &[Request],
+        tokens: &[&[u32]],
+    ) -> Result<Step, Unstepped> {
+        if requests.is_empty() {
+            return Err(Unstepped::Nothing);
+        }
         let shape = held.pool.shape();
-        let frame = Frame::of(shape, &requests).map_err(Unstepped::Unstageable)?;
+        let frame = Frame::of(shape, requests).map_err(Unstepped::Unstageable)?;
         // EVERY ROW SAMPLES, and this is a workaround with a name.
         //
         // A frame's own seriation marks only the rows a request reads out, so
@@ -342,7 +384,7 @@ impl Serving<'_> {
         // order the turns arrived. A step that wrote them in turn order would
         // feed every conversation somebody else's token whenever the seriation
         // reordered anything, and the answer would still look like text.
-        let ids = place(turns, &frame.request_of_token);
+        let ids = place(tokens, &frame.request_of_token);
         held.pool
             .state(device, crate::binding::FireTable::TokenIds, &ids)
             .map_err(Unstepped::Failed)?;
@@ -386,7 +428,7 @@ impl Serving<'_> {
             fired,
             rows: frame.rows(),
             positions: frame.positions.clone(),
-            readout_of: last_row_of(turns.len(), &frame.request_of_token),
+            readout_of: last_row_of(requests.len(), &frame.request_of_token),
             pipelines: pipelines.built(),
         })
     }
@@ -401,8 +443,8 @@ impl Serving<'_> {
 /// A turn with no row gets zero. That cannot happen for a turn a step grew,
 /// and answering with a row that exists beats a panic in a server loop.
 #[must_use]
-fn last_row_of(turns: usize, request_of_token: &[u32]) -> Vec<usize> {
-    let mut last = vec![0usize; turns];
+fn last_row_of(requests: usize, request_of_token: &[u32]) -> Vec<usize> {
+    let mut last = vec![0usize; requests];
     for (t, which) in request_of_token.iter().enumerate() {
         if let Some(slot) = last.get_mut(*which as usize) {
             *slot = t;
@@ -428,15 +470,15 @@ fn last_row_of(turns: usize, request_of_token: &[u32]) -> Vec<usize> {
 /// aborted a server on an arithmetic slip it could survive is worse than one
 /// that fires a wrong token.
 #[must_use]
-fn place(turns: &[Turn], request_of_token: &[u32]) -> Vec<u32> {
-    let mut taken = vec![0usize; turns.len()];
+fn place(tokens: &[&[u32]], request_of_token: &[u32]) -> Vec<u32> {
+    let mut taken = vec![0usize; tokens.len()];
     let mut ids = vec![0u32; request_of_token.len()];
     for (id, which) in ids.iter_mut().zip(request_of_token) {
         let which = *which as usize;
-        let Some(turn) = turns.get(which) else {
+        let Some(mine) = tokens.get(which) else {
             continue;
         };
-        *id = turn.tokens.get(taken[which]).copied().unwrap_or(0);
+        *id = mine.get(taken[which]).copied().unwrap_or(0);
         taken[which] += 1;
     }
     ids
@@ -458,7 +500,7 @@ mod tests {
     fn each_row_gets_its_own_turns_next_token() {
         let turns = [turn(1, &[11, 12, 13]), turn(2, &[21, 22])];
         assert_eq!(
-            place(&turns, &[0, 0, 0, 1, 1]),
+            place(&[&turns[0].tokens, &turns[1].tokens], &[0, 0, 0, 1, 1]),
             vec![11, 12, 13, 21, 22],
             "in order, the placement is the concatenation"
         );
@@ -472,7 +514,10 @@ mod tests {
     #[test]
     fn an_interleaved_frame_does_not_hand_a_turn_another_turns_token() {
         let turns = [turn(1, &[11, 12, 13]), turn(2, &[21, 22])];
-        assert_eq!(place(&turns, &[1, 0, 1, 0, 0]), vec![21, 11, 22, 12, 13]);
+        assert_eq!(
+            place(&[&turns[0].tokens, &turns[1].tokens], &[1, 0, 1, 0, 0]),
+            vec![21, 11, 22, 12, 13]
+        );
     }
 
     /// A turn's answer is its LAST row, not its first.
@@ -495,9 +540,9 @@ mod tests {
     #[test]
     fn a_row_with_no_token_left_is_zero() {
         let turns = [turn(1, &[11])];
-        assert_eq!(place(&turns, &[0, 0, 0]), vec![11, 0, 0]);
+        assert_eq!(place(&[&turns[0].tokens], &[0, 0, 0]), vec![11, 0, 0]);
         assert_eq!(
-            place(&turns, &[0, 7]),
+            place(&[&turns[0].tokens], &[0, 7]),
             vec![11, 0],
             "and so is an unknown turn"
         );

@@ -50,7 +50,8 @@ pub fn describe(plan: &LoadPlan) -> String {
         out,
         "load_plan(source_tensors={}, tensors={}, \
          buffers={}, instrs={}, schedule={}, passes={}, \
-         rewrites={}, persistent_bytes={}, read_bytes={}, write_bytes={})",
+         rewrites={}, persistent_bytes={}, scratch_bytes={}, \
+         read_bytes={}, write_bytes={})",
         plan.sources.len(),
         plan.tensors.len(),
         plan.buffers.len(),
@@ -59,6 +60,7 @@ pub fn describe(plan: &LoadPlan) -> String {
         plan.passes.len(),
         rewrites,
         plan.memory.persistent_bytes,
+        plan.memory.scratch_bytes,
         plan.memory.checkpoint_read_bytes,
         plan.memory.device_write_bytes,
     );

@@ -94,14 +94,14 @@ jobs:
             triple: aarch64-apple-darwin
             archive: tar.gz
             backend: metal
-            features: driver-metal,driver-dummy
+            features: driver-metal
           - label: x86_64-windows-cuda
             runner: windows-large-x64
             platform: windows
             triple: x86_64-pc-windows-msvc
             archive: zip
             backend: cuda
-            features: driver-cuda,driver-dummy
+            features: driver-cuda
             # nvcc builds one real+PTX arch; the PTX keeps the artifact
             # forward-JIT-able on newer NVIDIA GPUs.
             cuda_arch: "75"
@@ -358,7 +358,7 @@ jobs:
           cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
             -p worker \
-            --features driver-cuda,driver-dummy
+            --features driver-cuda
 
       - name: Package
         shell: bash

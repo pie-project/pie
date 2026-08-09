@@ -115,7 +115,7 @@ jobs:
             -p worker-api -p client-api -p controller-api \
             -p ids -p waker -p transport \
             -p bootstrap -p client -p controller -p driver -p driver-api \
-            -p driver-dummy -p engine -p gateway -p grammar -p inferlet \
+            -p engine -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p kernels -p pie -p tokenizer -p worker \
             -- -D warnings
 
@@ -166,7 +166,7 @@ jobs:
             -p ids -p waker -p transport \
             -p driver-metal -p engine -p worker \
             -p bootstrap -p client -p controller -p driver -p driver-api \
-            -p driver-dummy -p gateway -p grammar -p inferlet \
+            -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p kernels -p kernels-metal -p kernels-vulkan \
             -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer
 
@@ -466,11 +466,16 @@ jobs:
             exit 1
           fi
 
-  # Dummy driver — pure Rust, builds on every OS we support. Cheapest
-  # gate for "did the standalone wiring break end to end". Runs the
-  # full unit-test suite too since dummy doesn't pull in cmake.
-  pie-worker-dummy:
-    name: pie-worker (driver-dummy)
+  # NO driver feature — pure Rust, builds on every OS we support. Cheapest
+  # gate for "did the standalone wiring break end to end". Runs the full
+  # unit-test suite too, since without a driver feature nothing pulls in
+  # cmake.
+  #
+  # This was the `driver-dummy` job. That feature named a crate that is
+  # deleted; what the job actually gated was the composition root building
+  # with no device behind it, which `--no-default-features` alone says.
+  pie-worker-no-driver:
+    name: pie-worker (no driver feature)
     strategy:
       fail-fast: false
       matrix:
@@ -489,25 +494,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-pie-worker-dummy-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pie-worker-no-driver-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo build (driver-dummy)
+      - name: cargo build (no driver feature)
         run: |
-          cargo build -p worker \
-            --no-default-features --features driver-dummy
+          cargo build -p worker --no-default-features
 
-      - name: cargo test (pie-worker, dummy)
+      - name: cargo test (pie-worker, no driver feature)
         run: |
-          cargo test -p worker \
-            --no-default-features --features driver-dummy
+          cargo test -p worker --no-default-features
 
       # The `pie` command is the root package's own binary; `worker` is a
       # library with no `[[bin]]`. Building the worker alone never produced a
       # runnable CLI, so nothing here covered the composition root.
-      - name: cargo build (pie binary, dummy)
+      - name: cargo build (pie binary, no driver feature)
         run: |
-          cargo build -p pie \
-            --no-default-features --features driver-dummy
+          cargo build -p pie --no-default-features
 
   # The Metal driver and the seam that joins it to the engine.
   #
@@ -567,7 +569,7 @@ jobs:
       - name: cargo build (worker, driver-metal)
         run: |
           cargo build -p worker \
-            --no-default-features --features driver-metal,driver-dummy
+            --no-default-features --features driver-metal
 
       # Both configurations again: a lint that only fires in one half is a
       # lint nobody sees.

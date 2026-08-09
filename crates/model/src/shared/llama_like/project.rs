@@ -15,48 +15,16 @@
 //! nothing held to the other two tables.
 
 // Only the texts name a backend, and only they are gated.
-#[cfg(feature = "forward")]
 use crate::catalog::{Backend, Deployed, MetalBinding};
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
-    PrefillStyle,
+    PrefillStyle, round_up_attn_head_dim,
 };
 use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::LlamaLikeFacts;
 
 use model_compiler::facts::{NormPlacement as SpecNorm, QkNorm};
-
-/// The attention head dims a CUDA build instantiates.
-///
-/// `kernels.def`'s `PIE_ATTN_HEAD_DIM` rows. It is a property of the
-/// BINARY, not of any checkpoint, which is why a row does not state it
-/// and why it was excluded from the descriptor when there was one.
-pub const ATTN_HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
-
-/// Smallest instantiated head dim that can hold `head_dim`, or
-/// `head_dim` itself when none can — the caller then surfaces the
-/// dispatch error rather than silently mis-sizing.
-#[must_use]
-pub fn round_up_attn_head_dim(head_dim: u32) -> u32 {
-    ATTN_HEAD_DIMS
-        .iter()
-        .copied()
-        .filter(|&d| d >= head_dim)
-        .min()
-        .unwrap_or(head_dim)
-}
-
-/// The GQA group sizes a CUDA decode instantiates.
-///
-/// FlashInfer's decode reports anything else by THROWING, and a throw
-/// crossing a C ABI is undefined behaviour. This was
-/// `refuse_unservable_gqa`, and it sat inside the llama lineage's
-/// derivation as though it were a property of that lineage. It is a
-/// property of the BUILD — every family reaching the same dispatch is
-/// subject to the same instantiation set — so it is stated here as a
-/// build capability and asked by [`Deployment::servable_by`].
-pub const DECODE_GQA_GROUPS: &[u32] = &[1, 2, 3, 4, 8];
 
 /// This row's tensors.
 ///
@@ -174,7 +142,7 @@ pub fn deployment(f: &LlamaLikeFacts, row: RowScalars) -> Deployment {
         norm_topk_prob,
         ..
     } = row;
-    let head_dim = round_up_attn_head_dim(f.head_dim).max(f.head_dim);
+    let head_dim = round_up_attn_head_dim(f.head_dim);
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
             // One shape for every layer, which is what this row was
@@ -237,7 +205,6 @@ pub fn deployment(f: &LlamaLikeFacts, row: RowScalars) -> Deployment {
         // gemmas that do not have projections of their own that say so.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         norm_topk_prob,
         // No router of this family states a scaling factor.
         routed_scaling: 1.0,
@@ -257,7 +224,6 @@ pub fn deployment(f: &LlamaLikeFacts, row: RowScalars) -> Deployment {
 /// Every field the old derivation hardcoded is hardcoded here, in one
 /// place, with the two that are not constants — the padded head dim and
 /// the TP width — coming from the row and the load respectively.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn cuda_facts(
     f: &LlamaLikeFacts,
@@ -296,7 +262,6 @@ pub fn cuda_facts(
 /// failure and the one the runtime compiler reports by listing what the
 /// shader does export — which is why `qmm_tile` is stated rather than
 /// left at the serde default of `(0, 0)`.
-#[cfg(feature = "forward")]
 pub const QMM_TILE: (u32, u32) = (16, 32);
 
 /// Why a SHARDED load has no Metal text here.
@@ -305,7 +270,6 @@ pub const QMM_TILE: (u32, u32) = (16, 32);
 /// thing compares against the same sentence the operator is shown,
 /// rather than against a paraphrase that can drift away from it — the
 /// discipline `csm::project::NO_TRACE` sets.
-#[cfg(feature = "forward")]
 pub const NO_METAL_SHARD: &str = "this Metal load states a tensor-parallel width above one and \
      `LlamaLikeMetalFacts` has no shard vocabulary: the CUDA facts carry \
      a `tp_size` that narrows every projection width in the text, and the \
@@ -326,11 +290,9 @@ pub const NO_METAL_SHARD: &str = "this Metal load states a tensor-parallel width
 ///
 /// The set is `sdpa_paged_decode`'s own axis, minus the page-shape tails
 /// (`_p32`, `_p32_sg8`), which are points of a different axis.
-#[cfg(feature = "forward")]
 pub const METAL_SDPA_HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
 
 /// [`METAL_SDPA_HEAD_DIMS`] as a refusal.
-#[cfg(feature = "forward")]
 pub const NO_METAL_HEAD_DIM: &str = "this row's heads are a width `sdpa_paged.metal` does not \
      instantiate: the shader compiles the paged decode at 64, 128, 256 \
      and 512, and the text names `sdpa_paged_decode_bfloat16_d_<width>` \
@@ -348,11 +310,9 @@ pub const NO_METAL_HEAD_DIM: &str = "this row's heads are a width `sdpa_paged.me
 /// reading every scale from the wrong offset, which is the 909,207-NaN
 /// defect the MXFP4 arm was added to fix. MXFP4 is a different codec
 /// rather than another point and has its own symbol at group 32.
-#[cfg(feature = "forward")]
 pub const METAL_ROUTED_AFFINE: (u32, u32) = (64, 4);
 
 /// [`METAL_ROUTED_AFFINE`] as a refusal.
-#[cfg(feature = "forward")]
 pub const NO_METAL_ROUTED_ENCODING: &str = "this row's expert bank reached the device at an affine \
      point `quant/qmv.metal` does not instantiate the routed matvec at: \
      the shader compiles `affine_qmv_routed` only at group 64 / 4 bits, \
@@ -410,7 +370,6 @@ pub const NO_METAL_ROUTED_ENCODING: &str = "this row's expert bank reached the d
 ///
 /// [`NO_METAL_SHARD`], [`NO_METAL_HEAD_DIM`] or
 /// [`NO_METAL_ROUTED_ENCODING`], in the order a load meets them.
-#[cfg(feature = "forward")]
 pub fn metal_kernel_refusal(
     f: &LlamaLikeFacts,
     m: &super::forward::facts::LlamaLikeMetalFacts,
@@ -541,12 +500,21 @@ pub struct RowScalars {
     pub norm_topk_prob: bool,
 }
 
-/// The METAL binding facts for this row.
+/// The METAL binding facts for this load.
 ///
 /// The twin of [`cuda_facts`], and the split is the whole point: six
 /// fields come from `bind` because a LOAD observed them, one is this
-/// build's stamp ([`QMM_TILE`]), and every remaining field is the ROW's
-/// — projected here rather than sniffed from tensors by a driver.
+/// build's stamp ([`QMM_TILE`]), and the rest are the [`MetalRow`]
+/// scalars a Metal text names and `LlamaLikeFacts` does not hold.
+///
+/// # Why it takes no `LlamaLikeFacts`
+///
+/// It used to, and never read it — the parameter was a claim that the
+/// SHAPE matters to this projection, and it does not: a shape reaches
+/// the Metal text as `llama_like_metal`'s own first argument, and what
+/// is built here is the BINDING beside it. `cuda_facts` genuinely reads
+/// one (it pads the head dim), which is why the asymmetry is real and
+/// worth the two signatures differing.
 ///
 /// # What this replaces
 ///
@@ -592,7 +560,6 @@ pub struct RowScalars {
 /// the text off the row's facts without passing through here.
 ///
 /// [`LlamaLikeMetalFacts`]: super::forward::facts::LlamaLikeMetalFacts
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_facts(
     row: RowScalars,
@@ -617,6 +584,7 @@ pub fn metal_facts(
         fuse_residual_gemv: bind.fuse_residual_gemv,
         paged_multi_batch: bind.paged_multi_batch,
         qmm_multi_batch: bind.qmm_multi_batch,
+        add_bias: bind.add_bias,
         // The checkpoint's own affine format. MLX stores the pair beside
         // the packed weight as `.scales` and `.biases`, which is a
         // zero-point layout, and the GROUP is asked of the load rather
@@ -842,7 +810,6 @@ pub fn metal_facts(
 /// which is why they are here rather than at a generation: twelve
 /// families share this text, so a width or an encoding it cannot name is
 /// a gap in the same one sentence for all of them.
-#[cfg(feature = "forward")]
 pub fn trace(
     f: &LlamaLikeFacts,
     row: RowScalars,
@@ -951,16 +918,20 @@ mod tests {
         }
     }
 
-    /// The GQA ratios this build's decode instantiates. Outside the set
+    /// The GQA ratios a build's decode instantiates. Outside the set
     /// FlashInfer THROWS, and a throw crossing a C ABI is undefined
     /// behaviour — which is why the question is asked at the door.
+    ///
+    /// The SET is not stated here any more: it is the driver's
+    /// (`driver_cuda::serve::DECODE_GQA_GROUPS`), because it describes what
+    /// that build instantiated and not what this lineage is. What this crate
+    /// owes the question is the RATIO, which is what is asserted.
     #[test]
     fn the_gqa_set_is_the_builds_and_not_the_familys() {
-        assert_eq!(DECODE_GQA_GROUPS, &[1, 2, 3, 4, 8]);
         let g = deployment(&LlamaLikeFacts::qwen3_0_6b(), row(1e6, -1))
             .shape
             .gqa_group();
-        assert!(DECODE_GQA_GROUPS.contains(&g), "qwen3-0.6b's 2 is servable");
+        assert_eq!(g, 2, "qwen3-0.6b's 16 query heads over 8 kv heads");
         assert_eq!(Geometry::EMPTY.gqa_group(), 0, "no division by zero");
     }
 
@@ -1074,7 +1045,6 @@ mod tests {
 
     /// Two bindings of one checkpoint, which is what a `MetalBinding`
     /// is for: the g64/b4 publication and the g128/b8 one.
-    #[cfg(feature = "forward")]
     fn binding(group: u32, bits: u32) -> MetalBinding {
         MetalBinding {
             quant_group: group,
@@ -1083,6 +1053,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         }
     }
 
@@ -1103,7 +1074,6 @@ mod tests {
 
     /// qwen3-0.6b's row, as the generation states it — a full-attention
     /// dense stack on one rope base.
-    #[cfg(feature = "forward")]
     fn qwen3_row() -> RowScalars {
         RowScalars {
             rope_theta: 1e6,
@@ -1125,7 +1095,6 @@ mod tests {
     /// checkpoint what it is, twice, is how the answers came to differ:
     /// a gemma read as a llama folded `(1 + w)` as `w` and dropped two
     /// norms per layer, and nothing faulted.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_metal_binding_is_the_loads_answer_and_the_rest_is_the_rows() {
         let bind = binding(64, 4);
@@ -1169,7 +1138,6 @@ mod tests {
     /// checkpoint and they differ in nothing else, which is why an
     /// encoding is a policy and not an identity — the module doc's rule,
     /// asked of the one projection that has to hold both.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_second_publication_of_one_row_moves_only_the_binding() {
         let four = binding(64, 4);
@@ -1197,7 +1165,6 @@ mod tests {
     /// Mistral-7B-v0.3 is the sharpest one available: it states a
     /// different rotary base, a different epsilon and — unlike every
     /// other row this projection serves — a WINDOW.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_second_row_states_its_own_window_and_its_own_base() {
         let f = LlamaLikeFacts::mistral_7b_v03();
@@ -1233,7 +1200,6 @@ mod tests {
     /// has no per-layer embeddings" is part of the measurement. This
     /// test is that discipline held rather than described — it fails if
     /// a future field is defaulted into existence.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_gemma_shaped_facts_are_stated_rather_than_defaulted() {
         let bind = binding(64, 4);
@@ -1265,7 +1231,6 @@ mod tests {
     /// no tile does not resolve at all, which is the better failure —
     /// so a `(0, 0)` here would be a fixture written before the field
     /// existed and not a deployment that wants no tile.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_gemm_tile_is_the_builds_stamp_and_not_the_rows() {
         let bind = binding(64, 4);
@@ -1285,7 +1250,6 @@ mod tests {
     /// produced 909,207 NaNs beginning at the first routed projection of
     /// layer 0. `None` is "the same as the dense projections", which is
     /// every checkpoint this family serves.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_expert_bank_names_its_own_format_only_when_the_load_left_one() {
         let plain = binding(64, 4);
@@ -1315,7 +1279,6 @@ mod tests {
     /// wrong frequencies from the second channel on, at every position
     /// but zero — degrading rather than failing, which is the shape of
     /// defect this catalog exists to make impossible.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_rescaled_ladder_is_a_table_and_a_plain_one_is_a_base() {
         let bind = binding(64, 4);
@@ -1337,7 +1300,6 @@ mod tests {
     /// list of eleven architecture strings and its `canonical()`
     /// reduction. The row is the dispatch; the backend is a parameter of
     /// the question.
-    #[cfg(feature = "forward")]
     #[test]
     fn one_row_traces_on_either_backend_and_says_which() {
         use model_compiler::trace::FireClass;
@@ -1371,7 +1333,6 @@ mod tests {
     /// rank's slice of the weights. That is not a crash — it is a
     /// projection reading past the end of its own tensor — so the door
     /// says no.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_sharded_metal_load_is_refused_rather_than_traced_at_full_width() {
         use crate::deployment::Refusal;
@@ -1414,7 +1375,6 @@ mod tests {
     /// "a width no kernel instantiates simply does not resolve, and the
     /// driver's row check reports it by name" -- said early enough to be
     /// a sentence.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_head_width_no_metal_shader_compiled_is_refused_by_name() {
         use crate::deployment::Refusal;
@@ -1457,7 +1417,6 @@ mod tests {
     /// `a_row_is_served_the_same_way_at_every_encoding` had to become
     /// one-directional: a pre-staging probe may be permissive, it may not
     /// be wrong.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_routed_bank_at_an_uninstantiated_affine_point_is_refused() {
         use crate::deployment::Refusal;

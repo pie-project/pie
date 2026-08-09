@@ -195,7 +195,9 @@ fn a_module_that_reads_its_workgroup_count_is_launched_exactly() {
 /// `local_size_x = PIE_HEAD_DIM`, so its four modules are 64, 128, 256 and 512
 /// wide and a geometry that assumed any single number would undershoot three of
 /// them by up to 8x. `Elementwise` is 256 in nineteen modules and `(16, 16, 1)`
-/// in `geglu_tanh_strided`, which is indexed per (channel, row).
+/// in `geglu_tanh_strided`, which is indexed per (channel, row). `RouteRows`
+/// is the third: `add_bias` cannot round its y axis up, because unlike the
+/// `moe` rows it carries no `rows` scalar to guard against.
 ///
 /// Anything ELSE that varies is drift: two shaders under one rule that no
 /// longer agree about their decomposition. The list is closed on purpose, so
@@ -224,6 +226,14 @@ fn only_the_rules_that_are_allowed_to_vary_do() {
             "SdpaVector" => 4,
             // `geglu_tanh_strided` is laid out per (channel, row).
             "Elementwise" => 2,
+            // `add_bias` is 256 on x with one row per group; the two `moe`
+            // rows are (16, 16) because they carry `rows` in a params buffer
+            // and can guard the y axis. `add_bias` carries only its width, so
+            // it takes its row count from the grid itself and must not be
+            // rounded up on y. Both decompose the SAME grid -- the rule still
+            // hands out [width, rows, 1] -- so a driver dividing by each
+            // module's own `local` is right either way.
+            "RouteRows" => 2,
             _ => 1,
         };
         assert!(
@@ -753,7 +763,7 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
         }
     }
 
-    assert_eq!(modules, 665, "a different number of modules is built");
+    assert_eq!(modules, 666, "a different number of modules is built");
     assert_eq!(holed, 165, "a different number of modules has a hole");
     assert_eq!(holes, 358, "a different number of holes in all");
     // `cast_qmm_input_bfloat16_to_float16` is the deepest: it shares a header

@@ -107,6 +107,48 @@ def measure(crate: str, bindir: Path, target: Path) -> list[dict]:
         "LLVM_PROFILE_FILE": str(profdir / f"{crate}-%p-%m.profraw"),
         "CARGO_TARGET_DIR": str(target),
     }
+    # Ask cargo which executables THIS build produces, rather than
+    # globbing `debug/deps` for anything with the execute bit.
+    #
+    # The glob swept up STALE binaries from earlier runs. A stale binary
+    # carries coverage mappings for an older instance of the crate, and
+    # because the instance's hash is part of the mangled name, llvm-cov
+    # treats it as a DIFFERENT function rather than the same one. It has no
+    # profile data, so every one of its regions reports zero -- and a line
+    # covered by the live copy is reported uncovered because the dead copy
+    # also claims it.
+    #
+    # It was found on a derived `Debug`: the impl showed as unreached while
+    # a test was formatting the struct, and the export held two `model`
+    # crate instances. On this workspace the phantom copies inflated the
+    # line count by a quarter.
+    build = subprocess.run(
+        ["cargo", "test", "-p", crate, "--all-features", "--no-run",
+         "--message-format=json"],
+        env=env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if build.returncode != 0:
+        print(build.stderr[-4000:], file=sys.stderr)
+        sys.exit(f"coverage-audit: building `{crate}`'s tests failed; fix that first.")
+    executables: list[str] = []
+    for line in build.stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if message.get("reason") == "compiler-artifact" and message.get("executable"):
+            executables.append(message["executable"])
+    if not executables:
+        sys.exit(f"coverage-audit: {crate} built no test executables.")
+
+    # A profraw from an earlier crate's run would be merged into this
+    # crate's profile, which is harmless for totals and misleading for
+    # anything read per file.
+    for stale in profdir.glob("*.profraw"):
+        stale.unlink()
     test = subprocess.run(
         ["cargo", "test", "-p", crate, "--all-features", "--no-fail-fast"],
         env=env,
@@ -129,9 +171,8 @@ def measure(crate: str, bindir: Path, target: Path) -> list[dict]:
     )
 
     objects: list[str] = []
-    for f in (target / "debug" / "deps").iterdir():
-        if f.is_file() and os.access(f, os.X_OK) and f.suffix not in (".so", ".d", ".rlib"):
-            objects += ["--object", str(f)]
+    for executable in executables:
+        objects += ["--object", executable]
     export = subprocess.run(
         [
             str(bindir / "llvm-cov"),

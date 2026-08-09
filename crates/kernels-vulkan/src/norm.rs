@@ -27,6 +27,29 @@ pub static KERNELS: &[KernelSig] = &[
             params: Buf <- kernels::Source::Param(0),
         ],
         axes = &[BF16]),
+    // 1 in norm/add_bias.comp
+    // The Qwen-2 family's attention biases, and the row that lets the shared
+    // Metal text state them at all: until this kernel and its `kernels-metal`
+    // twin, no Metal-side kernel added a bias, so the text omitted the op and
+    // every Qwen2 was served without its q/k/v biases -- fluent, wrong text,
+    // which nothing downstream can detect.
+    //
+    // Sourced exactly as `kernels-cuda-new`'s `norm::add_bias_bf16` is, so
+    // that the two backends read one statement the same way: IN PLACE over
+    // the value it biases (`out` from `Out(0)`, the same bytes as `In(0)`),
+    // the bias off the statement's named weight, and the row width derived
+    // rather than stated -- an `AddBias` carries no scalars, because a bias
+    // vector's length is the projection's width and the trace already knows
+    // it.
+    kernel!(add_bias "add_bias", file = Some("norm/add_bias.comp"),
+        launch = kernels::LaunchRule::RouteRows,
+        in_place = &[(0, 0)],
+        operands = kernels::operands![
+            out: BufMut <- kernels::Source::Out(0),
+            bias: Buf <- kernels::Source::Weight(0),
+            width: I32 <- kernels::Source::OutWidth(0),
+        ],
+        axes = &[BF16]),
     // 1 in norm/residual_add.comp
     // Three buffers and no scalars: `out = x + residual`, elementwise, and
     // `out` may alias `x`. Filled because a MIXTURE demands it -- a routed

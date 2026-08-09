@@ -2,10 +2,11 @@
 //!
 //! North star rule 4: *a shared capability must not be optional — if it
 //! can be skipped, it will be.* `driver-api` ships seventeen `validate_*`
-//! functions. `driver-dummy`, the reference implementation of this
-//! contract, calls them; this shell called NONE and re-derived similar
-//! checks by hand at 51 sites. The capability was built, shipped, and
-//! routed around.
+//! functions, and nothing calls them now: this shell called NONE and
+//! re-derived similar checks by hand at 51 sites, and the one caller that
+//! did — `driver-dummy`, the interpreter backend — is deleted. The
+//! capability was built, shipped, and routed around by every
+//! implementation there was.
 //!
 //! `serve::checked` makes the dereference and the validation one
 //! operation — there is no way to obtain a `&PieKvCopyDesc` without

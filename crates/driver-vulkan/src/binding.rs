@@ -413,36 +413,8 @@ pub fn reorder<'a, R: Resolve>(
 
     let span = launch.args.start as usize..launch.args.end as usize;
     let args = &lowered.args[span];
-
-    // The trace's three runs. `Launch::args` states inputs in operand order,
-    // then outputs, then the weights -- so the weights are the ones that ARE
-    // `Arg::Weight`, and the split between inputs and outputs is by count.
-    let widthed: Vec<usize> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| !matches!(a, Arg::Weight(_)))
-        .map(|(i, _)| i)
-        .collect();
-    let weights: Vec<usize> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| matches!(a, Arg::Weight(_)))
-        .map(|(i, _)| i)
-        .collect();
-    // How many of the widthed run are outputs: one past the highest `Out(i)`
-    // the row names. Clamped to what the trace actually handed over, because
-    // a row may state an output a given statement does not produce.
-    let results = sig
-        .operands
-        .iter()
-        .filter_map(|o| match o.source {
-            kernels::Source::Out(i) => Some(usize::from(i) + 1),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
-        .min(widthed.len());
-    let (ins, outs) = widthed.split_at(widthed.len() - results);
+    let Runs { ins, outs, weights } = runs(sig, args);
+    let (ins, outs) = (&ins[..], &outs[..]);
 
     let layer = launch.layers.start;
     let mut slots = Vec::with_capacity(sig.operands.len());
@@ -607,6 +579,62 @@ pub fn params(
     params_from(stated, declared)
 }
 
+/// The three runs `Launch::args` is laid out in, as indices into that slice.
+///
+/// `Launch::args` states inputs in operand order, then outputs, then the
+/// weights the statement names -- so the weights are the ones that ARE
+/// `Arg::Weight`, and the split between inputs and outputs is by COUNT, which
+/// only the row knows.
+///
+/// Split out of [`resolve_ordered`] when [`kernels::Source::OutWidth`] arrived:
+/// a row can name the width of its `i`-th RESULT as a scalar, and finding that
+/// result means doing the identical three-way split. Two copies of this
+/// arithmetic would be two chances to disagree about which arg is an output,
+/// and a disagreement there is a kernel handed the wrong pointer or the wrong
+/// row pitch -- both of which compute rather than fail.
+struct Runs {
+    /// Indices of the inputs, in operand order.
+    ins: Vec<usize>,
+    /// Indices of the outputs, in operand order.
+    outs: Vec<usize>,
+    /// Indices of the named weights, in the order the trace states them.
+    weights: Vec<usize>,
+}
+
+fn runs(sig: &kernels::KernelSig, args: &[Arg]) -> Runs {
+    let widthed: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !matches!(a, Arg::Weight(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let weights: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(a, Arg::Weight(_)))
+        .map(|(i, _)| i)
+        .collect();
+    // How many of the widthed run are outputs: one past the highest `Out(i)`
+    // the row names. Clamped to what the trace actually handed over, because
+    // a row may state an output a given statement does not produce.
+    let results = sig
+        .operands
+        .iter()
+        .filter_map(|o| match o.source {
+            kernels::Source::Out(i) => Some(usize::from(i) + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .min(widthed.len());
+    let (ins, outs) = widthed.split_at(widthed.len() - results);
+    Runs {
+        ins: ins.to_vec(),
+        outs: outs.to_vec(),
+        weights,
+    }
+}
+
 /// The scalars one launch hands one module, in the order the ROW places them.
 ///
 /// The statement's own run is a flat list the row indexes into, and a row may
@@ -692,6 +720,30 @@ pub fn scalars<R: Resolve>(
                     // report as a short run than as a crash.
                     run.push(stated.get(usize::from(i)).copied().unwrap_or(0));
                 }
+            }
+            // The row width of the `i`-th RESULT, which the STATEMENT does
+            // not carry. An `AddBias` states no scalars at all -- a bias
+            // vector's length is the projection's width, and the trace
+            // already said that when it sized the output -- so a row that
+            // needs the pitch has to name where to read it rather than which
+            // scalar slot holds it.
+            //
+            // Zero when the trace handed over no such result. That is the
+            // same choice `params_from` would face one line later with a
+            // short run, and it fails there with the count in hand instead
+            // of here with an index panic.
+            kernels::Source::OutWidth(i) => {
+                let span = launch.args.start as usize..launch.args.end as usize;
+                let args = &lowered.args[span];
+                let outs = runs(sig, args).outs;
+                run.push(
+                    outs.get(usize::from(i))
+                        .and_then(|at| match &args[*at] {
+                            Arg::Arena { width, .. } | Arg::Named { width, .. } => Some(*width),
+                            Arg::Weight(_) => None,
+                        })
+                        .unwrap_or(0),
+                );
             }
             _ => {}
         }
@@ -1145,6 +1197,56 @@ mod tests {
             got,
             Params::Push(vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0])
         );
+    }
+
+    /// A row that names its OUTPUT's width gets that width, and not its
+    /// input's and not zero.
+    ///
+    /// `norm::add_bias` is the only row here that reads a number the
+    /// statement does not carry and the driver does not own: an `AddBias`
+    /// states no params at all, because a bias vector's length is the
+    /// projection's width and the trace already said so when it sized the
+    /// value. Dropping the source leaves the run EMPTY against a module with
+    /// a one-word push block, which `params_from` refuses -- but reading the
+    /// wrong operand does not, and that is the failure worth a test: a bias
+    /// added at the wrong pitch is a fluent wrong answer.
+    ///
+    /// So the two widths are made DIFFERENT. The input is 64 wide and the
+    /// output 128, which no real `AddBias` would be -- the op is in place --
+    /// and that is the point: an implementation reading the first widthed
+    /// operand passes with 64, and the row said the last.
+    #[test]
+    fn a_row_that_names_its_outputs_width_is_handed_that_width() {
+        let sig = kernels::sig_in(kernels_vulkan::KERNELS, "add_bias").expect("the row is stated");
+        assert!(
+            sig.operands
+                .iter()
+                .any(|o| matches!(o.source, kernels::Source::OutWidth(0))),
+            "the row under test no longer names its output's width"
+        );
+        let low = lowered(vec![
+            Arg::Arena {
+                at: 0,
+                width: 64,
+                bytes: 2,
+            },
+            Arg::Arena {
+                at: 4096,
+                width: 128,
+                bytes: 2,
+            },
+            Arg::Weight("layer.0.q_bias".into()),
+        ]);
+        let store = Store::default();
+        let got = scalars(
+            sig,
+            &low,
+            &launch(1, 3),
+            &declared(&[0], &[None, None]),
+            &store,
+        )
+        .expect("the row's one scalar places");
+        assert_eq!(got, Params::Push(128u32.to_le_bytes().to_vec()));
     }
 
     /// A `Lowered` holding nothing but the operands under test.

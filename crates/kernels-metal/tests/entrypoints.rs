@@ -86,10 +86,18 @@ fn no_two_rows_claim_the_same_entrypoint() {
 /// because the Metal text names a QKV split and CUDA's answer to that —
 /// a kernel the driver launches that no text has to name — is the category
 /// this backend refuses to grow.
+///
+/// 100/481 deliberately: `add_bias` is a NEW kernel on both this side and the
+/// Vulkan one, added in the same diff. The Qwen-2 family carries q/k/v
+/// projection biases, `LlamaLikeFacts::qkv_bias` has always said so, and the
+/// shared Metal text omitted the op for one reason only -- no Metal kernel
+/// added a bias, so there was no symbol to name. That is a wrong ANSWER rather
+/// than a missing kernel: the biases are small, the text stays fluent without
+/// them, and nothing downstream can tell.
 #[test]
-fn the_table_is_ninety_nine_kernels_over_four_hundred_and_eighty_entrypoints() {
-    assert_eq!(kernels_metal::KERNELS.len(), 99);
-    assert_eq!(kernels_metal::entrypoints().len(), 480);
+fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints() {
+    assert_eq!(kernels_metal::KERNELS.len(), 100);
+    assert_eq!(kernels_metal::entrypoints().len(), 481);
 }
 
 /// Every entrypoint resolves through the public lookup `model-compiler` uses,

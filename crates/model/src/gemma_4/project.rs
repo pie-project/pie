@@ -238,7 +238,15 @@ pub fn deployment(f: &Gemma4Facts, row: RowScalars, load: Deployed<'_>) -> Deplo
         mixture,
         sliding_window,
         norm_eps,
-        k_eq_v,
+        // Deliberately unread, and destructured by name rather than swept
+        // under a `..` so that a field added to the row still has to be
+        // answered here. `Deployment` used to carry a copy of this "for the
+        // driver to read"; no driver read it, because the two branches that
+        // need it are elsewhere — `metal_facts` turns it into `v_from_k`,
+        // and CUDA refuses on it in `Variant::trace`. What a rank allocates
+        // does not change: `k_eq_v` decides whether V has its own
+        // PROJECTION, not how many KV heads a layer has.
+        k_eq_v: _,
     } = row;
     let attention = (0..f.layers)
         .map(|l| layer_attention(f, sliding_window, l))
@@ -278,7 +286,10 @@ pub fn deployment(f: &Gemma4Facts, row: RowScalars, load: Deployed<'_>) -> Deplo
         // gemma-2's alone, and a zero here is "no cap" rather than a
         // cap at zero — which would flatten every score to `tanh(inf)`.
         attn_logit_softcap: 0.0,
-        ple_dim: i32::try_from(f.ple_dim).unwrap_or(0),
+        // The row's own `u32`, carried across unchanged. This was
+        // `i32::try_from(..).unwrap_or(0)`, which turned an
+        // out-of-range width into "no per-layer embeddings".
+        ple_dim: f.ple_dim,
         norm: NormPlacement::Pre,
         // THE EXCEPTION, and the reason this is a field rather than a
         // reading of the placement: gemma-4 sandwiches its norms like
@@ -291,7 +302,6 @@ pub fn deployment(f: &Gemma4Facts, row: RowScalars, load: Deployed<'_>) -> Deplo
         v_norm: true,
         // The ROW's, not the shape's: two gemma-4 checkpoints of one
         // geometry disagree about it.
-        k_eq_v,
         // As `metal_facts` records: gemma-4-26b-a4b ships no
         // `norm_topk_prob` key, and its router normalizes.
         norm_topk_prob: true,
@@ -389,7 +399,6 @@ fn scales(f: &Gemma4Facts, load: Deployed<'_>) -> BTreeMap<String, f32> {
 /// layers they belong to — the same split [`deployment`] makes, where
 /// `Geometry::head_dim` is the checkpoint's 256 and the 512 reaches a
 /// driver through `LayerAttention`.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_shape(
     f: &Gemma4Facts,
@@ -473,7 +482,6 @@ pub fn metal_shape(
 /// omitted `gemma3`, whose text it models. A row that projects itself
 /// cannot disagree with a list, because there is no list; the refusal
 /// that briefly stood in its place could, and did.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_facts(
     f: &Gemma4Facts,
@@ -500,6 +508,7 @@ pub fn metal_facts(
         fuse_residual_gemv: bind.fuse_residual_gemv,
         paged_multi_batch: bind.paged_multi_batch,
         qmm_multi_batch: bind.qmm_multi_batch,
+        add_bias: bind.add_bias,
         proj_repr: WeightRepr::Scaled {
             layout: ScaleLayout::PerGroup,
             group: bind.quant_group,
@@ -594,7 +603,6 @@ pub fn metal_facts(
 /// per-layer window list is the row's, and it is not empty: gemma-4 is
 /// the generation where an empty list would have the trace say "attends
 /// everything" while the plan applied a 512-token window.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Gemma4Facts,
@@ -1220,5 +1228,53 @@ mod tests {
                  `NormVariant::Plain` at all fourteen of its norm sites"
             );
         }
+    }
+
+    /// The one row-scalar `deployment` does not read, and the reason a
+    /// gemma-4-31b serves on Metal at all.
+    ///
+    /// `k_eq_v` says the full-attention layers read V out of the K
+    /// projection, so the checkpoint ships no `v_proj`. Three consumers
+    /// disagree about what to do with that and all three are right:
+    /// `metal_facts` hands it on as `v_from_k` and the Metal text serves
+    /// the row; `Variant::trace` refuses it on CUDA, whose hand-written
+    /// text matmuls a `v_proj` unconditionally; and this projection
+    /// ignores it, because what a rank ALLOCATES is unchanged — the KV
+    /// head count is a separate measurement.
+    ///
+    /// It had no test on the `true` side anywhere. Every constructor in
+    /// this module passes `false`, so the carry-through that makes the
+    /// claim true was only ever exercised at its uninteresting value.
+    #[test]
+    fn reading_v_out_of_k_reaches_the_metal_text_and_changes_no_allocation() {
+        use crate::catalog::MetalBinding;
+        let f = Gemma4Facts::gemma_4_e4b();
+        let row = |k_eq_v| RowScalars {
+            mixture: None,
+            sliding_window: E4B_WINDOW,
+            norm_eps: NORM_EPS,
+            k_eq_v,
+        };
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+            add_bias: false,
+        };
+        for k_eq_v in [false, true] {
+            assert_eq!(
+                super::metal_facts(&f, row(k_eq_v), &bind).v_from_k,
+                k_eq_v,
+                "the measurement reaches the text that branches on it"
+            );
+        }
+        assert_eq!(
+            deployment(&f, row(true), Deployed::single()),
+            deployment(&f, row(false), Deployed::single()),
+            "a projection that is not V's does not change what a rank reserves"
+        );
     }
 }

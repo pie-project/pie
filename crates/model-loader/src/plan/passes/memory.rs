@@ -19,6 +19,7 @@ use crate::plan::{LoadPlan, StorageInstr};
 
 pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
     let mut persistent_bytes = 0u64;
+    let mut scratch_end = 0u64;
     let mut live_bytes = 0u64;
     let mut live_peak = 0u64;
     let mut checkpoint_read_bytes = 0u64;
@@ -33,6 +34,12 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                     .checked_add(buffer.bytes)
                     .or_overflow("persistent byte overflow")?,
             );
+        } else if let Some(offset) = buffer.scratch_offset {
+            scratch_end = scratch_end.max(
+                offset
+                    .checked_add(buffer.bytes)
+                    .or_overflow("scratch byte overflow")?,
+            );
         } else if !buffer.temporary && buffer.tensor.is_some() {
             persistent_bytes = persistent_bytes
                 .checked_add(buffer.bytes)
@@ -44,7 +51,15 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
         let instr = instr_by_id(&program.instrs, *instr_id)?;
         match instr {
             StorageInstr::Allocate { buffer, .. } => {
-                let bytes = program.buffer(*buffer)?.bytes;
+                let decl = program.buffer(*buffer)?;
+                // A staging buffer is arena memory, counted in
+                // `scratch_bytes`. Letting it into `live` would report device
+                // bytes as host ones, and report them summed rather than
+                // reused.
+                if decl.scratch_offset.is_some() {
+                    continue;
+                }
+                let bytes = decl.bytes;
                 if live.insert(*buffer) {
                     live_bytes = live_bytes
                         .checked_add(bytes)
@@ -104,6 +119,9 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
     }
 
     program.memory.persistent_bytes = persistent_bytes;
+    // Scratch sits BEHIND the resident tensors, so its own offsets already
+    // include them; what the caller has to add is the difference.
+    program.memory.scratch_bytes = scratch_end.saturating_sub(persistent_bytes);
     program.memory.temporary_peak_bytes = live_peak.saturating_sub(persistent_bytes);
     program.memory.transform_scratch_peak_bytes = transform_scratch_peak_bytes;
     program.memory.checkpoint_read_bytes = checkpoint_read_bytes;

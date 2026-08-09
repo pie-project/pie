@@ -16,7 +16,7 @@
 //! ladder, `dtoa`, `json`. All of it is arithmetic over shapes and
 //! budgets, and all of it sat where no test that did not have a card
 //! could reach — which is how `memory_planner`, `mla_geometry` and
-//! `dsv4_geometry` came to be parity-tested with zero callers, for
+//! `compressed_plane_geometry` came to be parity-tested with zero callers, for
 //! months, without anyone noticing.
 //!
 //! The gate now ends at the modules that own DEVICE MEMORY. That is the
@@ -107,7 +107,7 @@ fn the_memory_planner_plans() {
         num_attention_heads: 16,
         num_key_value_heads: 4,
         head_dim_kernel: 64,
-        model_type: "llama".to_owned(),
+        model_id: "llama".to_owned(),
     };
     let props = mp::DeviceProps {
         name: String::new(),
@@ -125,7 +125,7 @@ fn the_memory_planner_plans() {
         &shape,
         &props,
         memory,
-        mp::Family::Generic,
+        mp::ShapeKnees::default(),
         &PaperModel,
         &NoMeasurement,
     )
@@ -143,12 +143,12 @@ fn the_memory_planner_plans() {
 
 /// The geometry modules resolve their shapes.
 ///
-/// `mla_geometry` and `dsv4_geometry` are the other two the rule names.
+/// `mla_geometry` and `compressed_plane_geometry` are the other two the rule names.
 /// They are still waiting on a forward path — there is no MLA arm in the
 /// executor — so this is the ONLY place either of them runs.
 #[test]
 fn the_attention_geometries_resolve() {
-    use driver_cuda::layout::{dsv4_geometry, mla_geometry};
+    use driver_cuda::layout::{compressed_plane_geometry, mla_geometry};
 
     // DeepSeek's numbers: 512 compressed KV, 64 rope.
     let mla = mla_geometry::MlaGeometry::new(8, 128, 16, 512, 64, driver_cuda::DType::Bf16)
@@ -159,9 +159,9 @@ fn the_attention_geometries_resolve() {
     );
     assert_eq!(mla.kv_lora_rank() + mla.qk_rope_head_dim(), 576, "512 + 64");
 
-    let widths = dsv4_geometry::layer_widths(&[1, 2, 4], 3, 128);
+    let widths = compressed_plane_geometry::layer_widths(&[1, 2, 4], 3, 128);
     assert_eq!(widths.len(), 3, "one width per layer");
-    let per_token = dsv4_geometry::compress_bytes_per_token(&[1, 2, 4], 128);
+    let per_token = compressed_plane_geometry::compress_bytes_per_token(&[1, 2, 4], 128);
     assert!(per_token > 0, "a compressed token costs something");
 }
 

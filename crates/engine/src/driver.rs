@@ -22,9 +22,9 @@ pub mod submission;
 pub use waker;
 
 pub use backend::{
-    DriverBackend, DriverSpec, DummyDriver, FrameLaunchOutcome, RemoteDisconnectHandle,
-    RemoteDriver, SchedulerLimits, get_spec, register_driver, register_driver_backend,
-    take_driver_backend, unregister_driver,
+    DriverBackend, DriverSpec, FrameLaunchOutcome, RemoteDisconnectHandle, RemoteDriver,
+    SchedulerLimits, get_spec, register_driver, register_driver_backend, take_driver_backend,
+    unregister_driver,
 };
 pub use channel::{ChannelCloser, ChannelEndpoint, ChannelValue, RegisteredChannel};
 pub use command::{

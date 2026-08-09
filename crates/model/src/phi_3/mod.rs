@@ -10,7 +10,7 @@
 //! Phi-3-mini is 3072 hidden over 32 heads, so its head is 96 wide, and
 //! this build instantiates 64/128/256/512. The row states 96 — the
 //! checkpoint's truth, and the width a tensor-parallel split must
-//! respect — and [`project::round_up_attn_head_dim`] pads it to 128 for
+//! respect — and [`crate::deployment::round_up_attn_head_dim`] pads it to 128 for
 //! the kernel. The two are separate answers to separate questions
 //! (`load_shape().head_dim` is 96; `Deployment::attention[l].head_dim`
 //! is 128), and the softmax scale follows the PADDED width because that
@@ -32,12 +32,12 @@ pub mod chat;
 #[cfg(feature = "contract")]
 pub mod contract;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -165,12 +165,7 @@ pub const VARIANTS: &[Phi3] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Phi3);
 
 impl Phi3 {
     /// The scalars this row states, read ONCE.
@@ -250,7 +245,6 @@ impl Variant for Phi3 {
     /// 128k releases extend by LongRoPE — a per-channel factor table
     /// that is a different statement entirely — and they have no row in
     /// this table, so nothing here may claim to serve them.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -585,7 +579,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "forward")]
     #[test]
     fn every_row_traces_both_fire_classes() {
         use model_compiler::trace::FireClass;

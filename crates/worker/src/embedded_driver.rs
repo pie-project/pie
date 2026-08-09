@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow};
 
 #[cfg(any(feature = "driver-cuda", test))]
 use crate::config::{CudaMemoryProfile, CudaNativeDriverOptions};
-use crate::config::{DummyDriverOptions, MetalDriverOptions};
+use crate::config::MetalDriverOptions;
 use crate::driver_ffi::Flavor;
 
 // THE TWO LINK ANCHORS ARE GONE WITH THE C++ THEY SERVED.
@@ -66,10 +66,6 @@ fn nccl_unique_id_hex() -> Result<String> {
 /// Per-flavor driver options, passed to native-driver creation helpers so the
 /// caller doesn't have to discriminate on `DriverKind` in two places.
 ///
-/// The `Dummy` variant carries `random_seed` and `activation_dtype`
-/// alongside `DummyDriverOptions` because those are universal
-/// `[model.driver]` fields.
-///
 /// `Clone` exists so `serve.rs` can rebuild a per-group variant
 /// (different `device`) from a model-level template without
 /// re-deserializing TOML.
@@ -79,22 +75,24 @@ pub enum DriverOptions {
     CudaNative(CudaNativeDriverOptions),
     #[cfg(feature = "driver-metal")]
     Metal(MetalDriverOptions),
-    Dummy {
-        opts: DummyDriverOptions,
-        random_seed: u64,
-        activation_dtype: String,
-    },
 }
 
 impl DriverOptions {
     /// Which compiled flavor this options bundle targets.
+    ///
+    /// With no `driver-*` feature this enum has NO variants, so there is no
+    /// value to be called on and the match is empty. That is stated with a
+    /// wildcard rather than left to inference, because an empty match on a
+    /// `&self` of an uninhabited type is not something the compiler will
+    /// accept as exhaustive through a reference.
     pub fn flavor(&self) -> Flavor {
         match self {
             #[cfg(feature = "driver-cuda")]
             DriverOptions::CudaNative(_) => Flavor::Cuda,
             #[cfg(feature = "driver-metal")]
             DriverOptions::Metal(_) => Flavor::Metal,
-            DriverOptions::Dummy { .. } => Flavor::Dummy,
+            #[cfg(not(any(feature = "driver-cuda", feature = "driver-metal")))]
+            _ => unreachable!("`DriverOptions` has no variants in this build"),
         }
     }
 }
@@ -365,85 +363,6 @@ pub fn remove_launch_state() {
 // `embedded_driver::DriverCapabilities` path.
 pub use driver_api::DriverCapabilities;
 
-/// Read the DUMMY driver's three defaults out of `<snapshot>/config.json`.
-///
-/// Used by [`dummy_native_options`] when the operator did not state them
-/// in `[model.driver.options]`. The dummy driver serves no weights — it
-/// answers with the right SHAPES and the wrong numbers — so a vocabulary
-/// size and a context ceiling read straight off the file are exactly
-/// right for it. A real driver asks the catalog; this one has no
-/// checkpoint to identify.
-///
-/// # The label is CHECKED now, not merely derived
-///
-/// `arch_name` used to be `architectures[0]`, lowercased, with a task
-/// suffix stripped from a list written here — and `driver-metal` had a
-/// SECOND copy of the same idea whose list was one entry shorter. So
-/// `Gemma4ForConditionalGeneration` became `gemma4` on this side and
-/// `gemma4forconditionalgeneration` on that one, where it matched no
-/// chat row and fell through `instruct::create`'s `_ =>` arm to ChatML.
-/// The model then generated fluently and ended turns it was not having
-/// with an `<|im_end|>` its vocabulary does not contain.
-///
-/// The derivation survives, because a `config.json` is the only thing
-/// here to derive from. What is new is that its output is held against
-/// [`model::catalog::arches`] — the labels rows actually advertise — so
-/// a stem no row claims is a REFUSAL naming what it produced and what
-/// was available, instead of a string that travels quietly.
-fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
-    let path = snapshot_dir.join("config.json");
-    let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("read {path:?}: {e}"))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| anyhow!("parse {path:?}: {e}"))?;
-
-    let vocab_size = v
-        .get("vocab_size")
-        .and_then(|x| x.as_u64())
-        .ok_or_else(|| anyhow!("`vocab_size` missing from {path:?}"))? as u32;
-
-    let raw_arch = v
-        .get("architectures")
-        .and_then(|a| a.as_array())
-        .and_then(|a| a.first())
-        .and_then(|a| a.as_str())
-        .ok_or_else(|| anyhow!("`architectures[0]` missing from {path:?}"))?;
-    // "Qwen3ForCausalLM" → "qwen3". The task suffix is what comes off: a
-    // multimodal release is named `<Stem>ForConditionalGeneration`, and
-    // leaving that whole misses every label a row advertises.
-    //
-    // The list is explicit rather than "cut at the first `for`" because
-    // `ReformerForCausalLM` has one inside its own stem.
-    let raw_arch_lower = raw_arch.to_lowercase();
-    let arch_name = raw_arch_lower
-        .strip_suffix("forconditionalgeneration")
-        .or_else(|| raw_arch_lower.strip_suffix("forcausallm"))
-        .unwrap_or(&raw_arch_lower)
-        .to_string();
-    // AND THEN CHECKED. See this function's doc for the failure this
-    // catches; the point is that the stem is a guess and the catalog is
-    // the authority, so a guess that names nothing stops here.
-    let known = model::catalog::arches();
-    if !known.iter().any(|a| *a == arch_name) {
-        return Err(anyhow!(
-            "`architectures[0]` in {path:?} is {raw_arch:?}, which reduces to \
-             the family {arch_name:?} — and no catalog row advertises that \
-             family. This build serves {known:?}. State \
-             `[model.driver.options] arch_name` explicitly if the dummy \
-             driver should answer with it anyway."
-        ));
-    }
-
-    let max_model_len = v
-        .get("max_position_embeddings")
-        .or_else(|| v.get("max_sequence_length"))
-        .or_else(|| v.get("model_max_length"))
-        .or_else(|| v.get("context_length"))
-        .or_else(|| v.get("n_positions"))
-        .and_then(|x| x.as_u64())
-        .unwrap_or(4096) as u32;
-
-    Ok((vocab_size, arch_name, max_model_len))
-}
 
 /// Emit the metal driver's bootstrap TOML — same `[model]` + `[batching]` +
 /// `[runtime]` layout consumed by `crates/driver-metal/csrc/src/config.hpp`. The metal
@@ -675,147 +594,6 @@ fn local_driver_state_dir(group_id: usize, tp: Option<&TpLaunch>) -> Result<Path
     Ok(state_dir)
 }
 
-/// The catalog row the dummy driver reports having loaded.
-///
-/// `engine::model::register` resolves this id to a row and takes the layer
-/// count, the vocabulary and the chat template from it. So unlike
-/// `vocab_size` and `arch_name` it is not decorative: the engine acts on
-/// it, and an id that resolves to nothing stops the boot.
-///
-/// # Two answers, because the dummy is two things
-///
-/// **Stated** (`[model.driver.options] model_id`) it is taken at its word.
-/// That is the same leniency `vocab_size` already gets from this driver and
-/// for the same reason -- the dummy loads no weights, so there is nothing
-/// for a manifest to be checked against. `tests/boot_artifact.rs` converts
-/// a four-byte checkpoint precisely to prove the artifact plumbing works
-/// without any; asking it to match a real model's tensors would be asking
-/// it to stop being the test it is. The id still has to NAME a row, which
-/// is what keeps a typo from reaching the engine.
-///
-/// **Absent** it is identified from the checkpoint's tensors -- the same
-/// question `pie model build` asks, in the same words. A snapshot that
-/// really is a model gets the real answer without anyone writing it down.
-///
-/// The leniency is this function's, not the catalog's: nothing but the
-/// dummy driver calls it, and a real driver identifies or refuses.
-fn identify_snapshot(snapshot_dir: &Path, stated: Option<&str>) -> Result<String> {
-    if let Some(id) = stated {
-        let row = model::catalog::find(id).ok_or_else(|| {
-            anyhow!(
-                "`[model.driver.options] model_id` is {id:?}, which this build's \
-                 model catalog does not contain; nearest ids: {:?}",
-                model::catalog::nearest_ids(id, 3),
-            )
-        })?;
-        return Ok(row.id().to_owned());
-    }
-    let metadata = model_loader::checkpoint::read::parse_checkpoint_metadata(snapshot_dir)
-        .map_err(|e| anyhow!("read the checkpoint at {snapshot_dir:?} to identify it: {e}"))?;
-    let row = model::catalog::identify(&metadata, &model::catalog::Override::None).map_err(
-        |unmatched| {
-            anyhow!(
-                "the checkpoint at {snapshot_dir:?} does not identify: {unmatched}. \
-                 State `[model.driver.options] model_id` to say which row the dummy \
-                 driver should report."
-            )
-        },
-    )?;
-    Ok(row.id().to_owned())
-}
-
-fn dummy_native_options(
-    opts: &DummyDriverOptions,
-    snapshot_dir: &Path,
-    _random_seed: u64,
-    activation_dtype: &str,
-) -> Result<driver_dummy::DummyDriverOptions> {
-    let (vocab_size, arch_name, max_model_len) = match (opts.vocab_size, opts.arch_name.as_deref())
-    {
-        (Some(v), Some(a)) => {
-            let (_, _, auto_len) =
-                read_hf_config_defaults(snapshot_dir).unwrap_or_else(|_| (v, a.to_string(), 4096));
-            (v, a.to_string(), auto_len)
-        }
-        (v_opt, a_opt) => {
-            let (auto_v, auto_a, auto_len) = read_hf_config_defaults(snapshot_dir)
-                .with_context(|| "auto-discovering vocab_size + arch_name for dummy driver")?;
-            (
-                v_opt.unwrap_or(auto_v),
-                a_opt.map(str::to_string).unwrap_or(auto_a),
-                auto_len,
-            )
-        }
-    };
-
-    let model_id = identify_snapshot(snapshot_dir, opts.model_id.as_deref())?;
-    // ONE VOCABULARY, NOT TWO.
-    //
-    // The engine sizes its logits from the ROW; this driver checks bound
-    // programs against its own advertised `vocab_size`. When the two
-    // disagree the boot succeeds and the first chat completion fails deep
-    // inside program binding -- "declared type violates the registry rule
-    // (profile: vocab=256)" -- naming neither the row nor the option that
-    // produced it.
-    //
-    // So they are held equal here, where both are in hand and both names
-    // are sayable. This is the same rule the catalog is for, applied to the
-    // one driver that can still hold two answers because it fabricates one
-    // of them.
-    let row_vocab = model::catalog::find(&model_id)
-        .expect("`identify_snapshot` returns an id it resolved")
-        .deployment(model::catalog::Deployed::single())
-        .map_err(|refusal| anyhow!("this build refuses {model_id:?}: {refusal}"))?
-        .shape
-        .vocab;
-    if vocab_size != row_vocab {
-        return Err(anyhow!(
-            "`[model.driver.options] vocab_size` is {vocab_size}, but the row \
-             {model_id:?} has a vocabulary of {row_vocab}. The engine sizes \
-             logits from the row and this driver checks programs against the \
-             option, so a bound program would be refused later with neither \
-             number named. Set one to match the other."
-        ));
-    }
-
-    let max_forward_tokens = 4096u32;
-    let max_forward_requests = 128u32;
-    let total_pages = 256u32
-        .max(max_forward_tokens.div_ceil(16))
-        .max(max_model_len.div_ceil(16))
-        .max(max_forward_requests.saturating_mul(2));
-
-    Ok(driver_dummy::DummyDriverOptions {
-        total_pages,
-        // tart: no declared plan on the dummy — empty site summary.
-        model_site_summary: Default::default(),
-        kv_page_size: 16,
-        swap_pool_size: 0,
-        vocab_size,
-        max_model_len,
-        arch_name,
-        activation_dtype: activation_dtype.to_string(),
-        snapshot_dir: path_string(snapshot_dir),
-        max_forward_tokens,
-        max_forward_requests,
-        max_page_refs: total_pages,
-        model_id,
-        has_mtp_logits: true,
-        has_mtp_drafts: true,
-        has_value_head: true,
-        has_attn_score: true,
-        callback_delay_ms: 0,
-        reject_launches: false,
-        reject_launches_remaining: 0,
-        fail_launches_after_accept: false,
-        retry_launches_remaining: 0,
-        elastic_admission: false,
-        prepare_exhaustions_remaining: 0,
-        prepare_impossible_above_kv_pages: 0,
-        operation_log: None,
-        launch_observer: None,
-    })
-}
 
 /// What a driver may be pointed at: a `.zt` artifact, or a snapshot directory.
 ///
@@ -906,6 +684,15 @@ pub(crate) fn create_driver_backend_group(
     Ok(crate::translate::GroupDriver { caps, backend })
 }
 
+#[cfg_attr(
+    not(any(feature = "driver-cuda", feature = "driver-metal")),
+    allow(
+        unused_variables,
+        unreachable_code,
+        reason = "with no `driver-*` feature `DriverOptions` is uninhabited, so \
+                  every path that takes one diverges"
+    )
+)]
 pub(crate) fn create_driver_backend(
     options: &DriverOptions,
     snapshot_dir: &Path,
@@ -918,7 +705,18 @@ pub(crate) fn create_driver_backend(
     let _ = (group_id, tp, config);
     validate_snapshot_dir(snapshot_dir)?;
 
-    let (mut backend, runtime_quant, mxfp4_moe) = match options {
+    // TYPED, because with no `driver-*` feature `DriverOptions` has no
+    // variants at all and this `match` diverges — inference has nothing to
+    // work from. That build reaches no device, which is the truth since the
+    // interpreter backend was deleted: there is no ungated flavor left to
+    // fall back to.
+    let (mut backend, runtime_quant, mxfp4_moe): (
+        ::engine::driver::DriverBackend,
+        &str,
+        &str,
+    ) = match options {
+        #[cfg(not(any(feature = "driver-cuda", feature = "driver-metal")))]
+        _ => unreachable!("`DriverOptions` has no variants in this build"),
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
             if opts.mtp_assistant_snapshot_dir.is_some() {
@@ -949,19 +747,14 @@ pub(crate) fn create_driver_backend(
                 ::engine::driver::DriverBackend::metal_create(config_path.as_bytes())?;
             (backend, "", "auto")
         }
-        DriverOptions::Dummy {
-            opts,
-            random_seed,
-            activation_dtype,
-        } => {
-            let options = dummy_native_options(opts, snapshot_dir, *random_seed, activation_dtype)?;
-            let (backend, _facts) = ::engine::driver::DriverBackend::dummy(options)?;
-            (backend, "", "auto")
-        }
     };
     // Uniform across backends now that the load is a request rather than a
-    // compiled plan: the dummy driver simply ignores everything but the
-    // component scope (§10.3).
+    // compiled plan (§10.3). Unreachable in a build with no `driver-*`
+    // feature, where the match above diverges on an empty enum.
+    #[cfg_attr(
+        not(any(feature = "driver-cuda", feature = "driver-metal")),
+        allow(unreachable_code, reason = "`DriverOptions` has no variants in this build")
+    )]
     let desc = model_load_desc(snapshot_dir, runtime_quant, mxfp4_moe, component)?;
     let caps = backend.load_model(vec![desc])?;
 
@@ -1008,56 +801,6 @@ mod tests {
         assert_eq!(caps.max_page_refs, 262144);
     }
 
-    #[test]
-    fn dummy_boot_uses_create_compile_load_sequence() {
-        let tmp = tempfile::tempdir().unwrap();
-        let snapshot = tmp.path().join("snapshot");
-        std::fs::create_dir(&snapshot).unwrap();
-        std::fs::write(
-            snapshot.join("config.json"),
-            r#"{
-                "model_type": "qwen3",
-                "architectures": ["Qwen3ForCausalLM"],
-                "num_hidden_layers": 1,
-                "vocab_size": 128,
-                "max_position_embeddings": 128
-            }"#,
-        )
-        .unwrap();
-        let header =
-            r#"{"model.embed_tokens.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#;
-        let mut checkpoint = (header.len() as u64).to_le_bytes().to_vec();
-        checkpoint.extend_from_slice(header.as_bytes());
-        checkpoint.extend_from_slice(&[1, 2, 3, 4]);
-        std::fs::write(snapshot.join("model.safetensors"), checkpoint).unwrap();
-
-        let group = create_driver_backend(
-            &DriverOptions::Dummy {
-                opts: DummyDriverOptions {
-                    vocab_size: None,
-                    arch_name: None,
-                    // STATED, because this checkpoint is four bytes: what
-                    // is under test is the create/compile/load sequence,
-                    // and a fixture that had to match a real model's
-                    // tensors would be testing the manifest instead.
-                    model_id: Some(model::test_rows::TINY_LLAMA.to_string()),
-                    ready_timeout: crate::config::Duration::from_secs(5),
-                },
-                random_seed: 7,
-                activation_dtype: "f32".to_string(),
-            },
-            &snapshot,
-            CONFIG,
-            0,
-            None,
-            driver_api::ModelComponent::Full,
-        )
-        .unwrap();
-        assert_eq!(group.caps.arch_name, "qwen3");
-        assert_eq!(group.caps.vocab_size, 128);
-        assert_eq!(group.caps.model_id, model::test_rows::TINY_LLAMA);
-        assert_eq!(group.caps.snapshot_dir, snapshot.display().to_string());
-    }
 
     #[cfg(feature = "driver-cuda")]
     #[tokio::test]

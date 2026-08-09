@@ -1,0 +1,152 @@
+[package]
+name = "driver-wgpu"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The WebGPU execution shell, in Rust: adapters and devices, bind groups, WGSL pipelines and command encoding. Grows beside driver-vulkan and driver-metal, sharing their launch vocabulary and needing neither an SDK nor a C toolchain."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "driver_wgpu"
+path = "src/lib.rs"
+
+# No `build.rs`, where `driver-vulkan` has one. Its script exists to relay
+# `DEP_PIE_KERNELS_VULKAN_SPV_DIR`, because SPIR-V is a build product that has
+# to be found on disk. `kernels-wgpu` embeds every shader source in its rlib
+# with `include_str!` and serves them from `kernels_wgpu::entrypoint_source`,
+# so there is no directory to locate and nothing to relay.
+
+# NOT `[lints] workspace = true`, for the reason both siblings give: that table
+# sets `unsafe_code = "forbid"`, and they cannot keep it because every `ash`
+# entry point and every `objc2` message send is unsafe by construction.
+#
+# This crate CAN keep it, and `lib.rs` says so with `#![forbid(unsafe_code)]` --
+# `wgpu` is a safe API, so the whole crate is safe Rust including the device
+# half. The table is still restated by hand rather than taken whole, because
+# taking it would put the forbid in a manifest where a reader looking for the
+# crate's guarantees does not pass; the ratchets and the forbid belong next to
+# each other, in `lib.rs`, where the argument for them is.
+
+[features]
+# No default, for the reason `driver-metal/Cargo.toml` states at length: a
+# default has to be turned OFF to reach the portable half, and a check that can
+# be skipped will be.
+#
+# The split is a THIRD one, and the difference is the point. `driver-metal`
+# splits on what a COMPILER will accept -- no Linux host can build an `objc2`
+# message send. `driver-vulkan` splits on what needs a GPU to be PRESENT, since
+# `ash` is a loader that builds anywhere. Here BOTH halves build anywhere AND
+# the shader front end runs anywhere: `naga` is Rust, so this crate parses the
+# WGSL it will dispatch, reads off its workgroup and its bindings, and checks
+# them against the row -- with no adapter, no driver and no SDK. `native` gates
+# only what needs an ADAPTER to answer.
+default = []
+
+# The device half: `wgpu`, an adapter, a queue, real pipelines.
+native = ["dep:wgpu"]
+
+[dependencies]
+# The handshake the engine's seam speaks: `DeviceFacts` and the ABI version.
+# `default-features = false` drops the tarpc service, which is the only thing
+# in that crate this one does not want: tokio's platform closure carries
+# `windows-sys` and `js-sys`, and `tests/pure.rs` is not going to be taught to
+# ignore a `-sys` crate.
+driver-api = { path = "../driver-api", default-features = false }
+
+# The launch vocabulary. `LaunchRule` is the same enum both siblings match on,
+# and that sharing is load-bearing rather than tidy: the three shells disagree
+# about the GRID and must not disagree about which rule a row names.
+kernels = { path = "../kernels" }
+
+# The WebGPU signature table, the launch ABI, and the WGSL sources themselves.
+# No feature to select: that crate has none, because WGSL is not a build
+# product. `entrypoint_source` is what `src/reflect.rs` parses, so the shader
+# tree is a dependency of the PORTABLE half here where `kernels-vulkan`'s `.spv`
+# tree is a dependency of a build script.
+kernels-wgpu = { path = "../kernels-wgpu" }
+
+# The plan a driver executes: `Lowered`, `Launch`, `Arg`. `src/binding.rs`
+# turns those into bind-group entries, so this is a real dependency and not a
+# testing one -- the same shape both siblings have, for the same reason.
+model-compiler = { path = "../model-compiler" }
+
+# The PTIR channel plane: the program/channel/instance registry, the ring and
+# every bind-time derivation. A REAL dependency and not a dev one -- this is
+# not a checkpoint format, it is the plane the engine registers work on, and
+# `src/programs.rs` serves it.
+#
+# `default-features = false` on the same terms `driver-api` above gets it, and
+# for a defect that was found rather than predicted: `driver` names no `tarpc`
+# anywhere, but its edge took `driver-api`'s DEFAULT features, and `rpc`
+# reaches `js-sys` and `wasm-bindgen-shared` through tokio. `tests/pure.rs`
+# caught that in `driver-vulkan` and would catch it here.
+driver = { path = "../driver" }
+
+# The WGSL front end, DIRECTLY and not through `wgpu`.
+#
+# `wgpu` re-exports the same crate, and taking it that way would work and would
+# be wrong: reflection is wanted in the PORTABLE half. `src/reflect.rs` answers
+# what a module declares -- its workgroup, its bindings, its uniform block --
+# and every one of those questions is about the SOURCE, not about a device. A
+# `naga` edge is what lets `cargo test -p driver-wgpu` with no features check a
+# real shader against a real row on a machine with no adapter in it.
+#
+# `wgsl-in` is named because `naga`'s default feature set has no front end at
+# all: without it `naga::front::wgsl` does not exist. Pinned to the version
+# `wgpu` 30 resolves, so the two are one crate and cannot disagree about what
+# WGSL is.
+naga = { version = "30", features = ["wgsl-in"] }
+
+# `default-features = false` drops the windowing and surface stack -- this is
+# compute, there is no swapchain. `vulkan`/`metal`/`dx12` are the three native
+# backends worth having; `wgsl` is the front end, and it is the same `naga`
+# above, unified by cargo. `noop` is deliberately absent: a shell that silently
+# ran on no device would report success for nothing.
+wgpu = { version = "30", default-features = false, features = [
+    "wgsl",
+    "vulkan",
+    "metal",
+    "dx12",
+], optional = true }
+
+[dev-dependencies]
+# `tests/pure.rs` only: reading what `cargo metadata` says the resolver did, so
+# that "this crate is pure Rust" is asked of the closure rather than of a
+# reading of the manifests. That question is this crate's headline -- `wgpu`
+# being pure Rust is the entire reason this backend exists beside CUDA and
+# Metal -- so the test that asks it is not optional furniture.
+serde_json = "1.0"
+
+# Neither an adapter nor a shader compiler: it asks the resolver what this
+# crate depends on. Ungated on purpose -- the constraint it checks is about the
+# builds that DO NOT have a toolchain, and it runs the query with `native` ON
+# because a purity claim about the half without the GPU API is not the claim.
+[[test]]
+name = "pure"
+
+# The device half's own suite: an adapter, real pipelines, real numbers.
+#
+# `required-features` and NOT an `#[ignore]` on every test, which is the shape
+# that rots: an ignored test is one nobody runs, and a suite that needs a GPU is
+# exactly the suite whose failures matter. Gated on the feature, so a build box
+# with no adapter does not compile it; on a machine that HAS one it runs in a
+# plain `cargo test -p driver-wgpu --features native`.
+#
+# A machine with the feature on and no adapter answering is a third case, and
+# each test SKIPS with a printed reason rather than failing -- see
+# `tests/device.rs`'s own note on why that is not the same as ignoring it.
+#
+# This stanza and `tests/device.rs` must land and leave TOGETHER, and both
+# orders have already been got wrong once. A stanza with no file makes this
+# manifest unparseable, and cargo parses every member's manifest for ANY
+# command -- so it does not break one crate's tests, it breaks `cargo check` and
+# `cargo test -p kernels-wgpu` with an error ("can't find `device` test") whose
+# text has no relationship to what the person ran. A file with no stanza is the
+# mirror image and quieter: cargo AUTO-DISCOVERS `tests/*.rs`, so the suite
+# compiles into the default build, where everything it names is behind
+# `#[cfg(feature = "native")]` and does not exist.
+[[test]]
+name = "device"
+required-features = ["native"]

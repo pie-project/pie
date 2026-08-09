@@ -1412,7 +1412,8 @@ mod tests {
         for (dst, src, len) in [(10u64, 100u64, 150u64), (100, 10, 150), (60, 62, 130)] {
             assert!(
                 dst.abs_diff(src) < len,
-                "a {len}-byte move between {src} and {dst} does not overlap,                  so it cannot tell the two walk directions apart"
+                "a {len}-byte move between {src} and {dst} does not overlap, \
+                 so it cannot tell the two walk directions apart"
             );
             let mut want = source.clone();
             want.copy_within(usize_of(src)..usize_of(src + len), usize_of(dst));

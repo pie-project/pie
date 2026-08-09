@@ -361,7 +361,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         weights: staged.spans,
         owned: staged.owned,
         aliases: std::collections::BTreeMap::new(),
-        gemma_layer_scalars: Vec::new(),
+        layer_scalars: Vec::new(),
         tp_size: state.tp_size,
     };
     wire_trace_names(&mut model);
@@ -380,7 +380,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
             // one is asking is the caller's to state.
             backend: model::catalog::Backend::Cuda,
             tp_size: state.tp_size,
-            layer_scalars: &model.gemma_layer_scalars,
+            layer_scalars: &model.layer_scalars,
         })
         .map_err(|e| i32::from(crate::Error::from(e)))?;
 
@@ -412,9 +412,9 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
              driver does not build — `pools::mla_cache` is ported and has \
              no forward path to serve",
         ),
-        model::deployment::KvStyle::Dsv4 { .. } => Some(
+        model::deployment::KvStyle::CompressedPlane { .. } => Some(
             "this checkpoint attends through a compressed KV plane, which this \
-             driver does not build — `pools::dsv4_compress_cache` is ported \
+             driver does not build — `pools::compressed_plane_cache` is ported \
              and has no forward path to serve",
         ),
     } {
@@ -435,12 +435,11 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     //
     // It is asked HERE rather than in `model` because it is not a fact
     // about the checkpoint — it is a fact about what this build
-    // instantiated. `model` states the shape and names the set
-    // (`DECODE_GQA_GROUPS`); the driver is what decides that the set
-    // applies to it.
+    // instantiated, and `super::DECODE_GQA_GROUPS` is where this crate
+    // states it. `model` states the shape; the driver states the set.
     model
         .deployment
-        .servable_by(model::shared::llama_like::project::DECODE_GQA_GROUPS)
+        .servable_by(super::DECODE_GQA_GROUPS)
         .map_err(|why| -> i32 {
             // The refusal's OWN sentence, plus the numbers. `servable_by`
             // distinguishes a fractional ratio from an uninstantiated
@@ -452,7 +451,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
                      instantiates {:?}",
                     model.deployment.shape.q_heads,
                     model.deployment.shape.kv_heads,
-                    model::shared::llama_like::project::DECODE_GQA_GROUPS,
+                    super::DECODE_GQA_GROUPS,
                 ),
             }
             .into()
@@ -833,7 +832,7 @@ fn wire_trace_names(model: &mut LoadedModel) {
             );
         }
     }
-    model.gemma_layer_scalars = wiring
+    model.layer_scalars = wiring
         .scalars
         .iter()
         .map(|n| {
@@ -875,8 +874,8 @@ fn wire_trace_names(model: &mut LoadedModel) {
 /// here rather than hidden in a constant.
 fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Vec<u8>, i32> {
     use crate::layout::memory_planner::{
-        DeviceMemory, DeviceProps, Family, ModelCosts, ModelShape, NoProfiles, PlannerConfig,
-        ProfileSource, plan,
+        DeviceMemory, DeviceProps, ModelCosts, ModelShape, NoProfiles, PlannerConfig,
+        ProfileSource, ShapeKnees, plan,
     };
     use crate::layout::model_costs::{CheckpointCosts, DiskProfiles};
 
@@ -972,11 +971,19 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     // stand-in when no cache directory can even be derived.
     let disk = DiskProfiles::discover("").ok();
     let profiles: &dyn ProfileSource = disk.as_ref().map_or(&NoProfiles, |d| d);
-    let planned =
-        plan(&cfg, &shape, &props, mem, Family::Generic, &costs, profiles).map_err(|e| {
-            eprintln!("[driver-cuda] load_model: memory planner: {e:?}");
-            PIE_STATUS_EXHAUSTED
-        })?;
+    let planned = plan(
+        &cfg,
+        &shape,
+        &props,
+        mem,
+        ShapeKnees::default(),
+        &costs,
+        profiles,
+    )
+    .map_err(|e| {
+        eprintln!("[driver-cuda] load_model: memory planner: {e:?}");
+        PIE_STATUS_EXHAUSTED
+    })?;
     for note in &planned.notes {
         eprintln!("[driver-cuda] {note}");
     }

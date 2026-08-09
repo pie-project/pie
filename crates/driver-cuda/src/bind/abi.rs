@@ -298,7 +298,7 @@ pub enum Mxfp4RowSelect {
 ///
 /// `build.rs` writes this file to `OUT_DIR` from the same kernel tables the
 /// launch_abi tests prove, beside the C shim it compiles and links. One
-/// declaration per stated row, `pie_k_<symbol>` — see `kernels_cuda::abi`.
+/// declaration per stated row, `pie_k_<symbol>` — see `kernels_cuda_new::abi`.
 ///
 /// Everything here is `unsafe` in the plainest sense: the bindings state
 /// types, and the TRUTH of each pointer (liveness, extent, stream ordering)

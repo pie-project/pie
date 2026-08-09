@@ -1,6 +1,9 @@
+// The scalar layer and the fixed-width integer names, out of the
+// prelude: NVRTC has no CUDA device headers, and this file is meant
+// to compile under both it and nvcc.
+#include "pie_device.cuh"
 #include "gemm/gemv.hpp"
 
-#include <cuda_bf16.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -23,10 +26,10 @@ namespace {
 // 23.6 MB per layer) the one-at-a-time version sustained about 963 GB/s.
 template <int kWarps, int kUnrollP = 4>
 __global__ void gemv_bf16_kernel(
-    const __nv_bfloat16* __restrict__ weight,
-    const __nv_bfloat16* __restrict__ act,
-    const __nv_bfloat16* __restrict__ bias,
-    __nv_bfloat16* __restrict__ out,
+    const device::bf16* __restrict__ weight,
+    const device::bf16* __restrict__ act,
+    const device::bf16* __restrict__ bias,
+    device::bf16* __restrict__ out,
     int N, int K, float beta)
 {
     const int row = blockIdx.x * kWarps + threadIdx.y;
@@ -48,24 +51,24 @@ __global__ void gemv_bf16_kernel(
         }
         #pragma unroll
         for (int u = 0; u < kUnroll; ++u) {
-            const __nv_bfloat16* wb =
-                reinterpret_cast<const __nv_bfloat16*>(&wv[u]);
-            const __nv_bfloat16* xb =
-                reinterpret_cast<const __nv_bfloat16*>(&xv[u]);
+            const device::bf16* wb =
+                reinterpret_cast<const device::bf16*>(&wv[u]);
+            const device::bf16* xb =
+                reinterpret_cast<const device::bf16*>(&xv[u]);
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+                acc += device::bf16_to_f32(wb[j]) * device::bf16_to_f32(xb[j]);
             }
         }
     }
     for (; i < vectors; i += 32) {
         float4 wv = w4[i];
         float4 xv = x4[i];
-        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
-        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+        const device::bf16* wb = reinterpret_cast<const device::bf16*>(&wv);
+        const device::bf16* xb = reinterpret_cast<const device::bf16*>(&xv);
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+            acc += device::bf16_to_f32(wb[j]) * device::bf16_to_f32(xb[j]);
         }
     }
     #pragma unroll
@@ -73,17 +76,17 @@ __global__ void gemv_bf16_kernel(
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
     if (threadIdx.x == 0) {
-        if (beta != 0.f) acc += beta * __bfloat162float(out[row]);
+        if (beta != 0.f) acc += beta * device::bf16_to_f32(out[row]);
         // Round to bf16 *before* adding the bias, then round again. That is
         // a redundant-looking double rounding, and it is deliberate: it is
         // exactly what the separate `add_bias_bf16_kernel` did when it read
         // this kernel's bf16 output back. Folding the two launches into one
         // is a launch-count optimization, not an arithmetic change, so it
         // has to stay bit-identical or it stops being free to validate.
-        __nv_bfloat16 v = __float2bfloat16(acc);
+        device::bf16 v = device::f32_to_bf16(acc);
         if (bias != nullptr) {
-            v = __float2bfloat16(__bfloat162float(v) +
-                                 __bfloat162float(bias[row]));
+            v = device::f32_to_bf16(device::bf16_to_f32(v) +
+                                 device::bf16_to_f32(bias[row]));
         }
         out[row] = v;
     }
@@ -150,10 +153,10 @@ inline int gemv_unroll_depth() {
 // 12.5 -> 16.4. Results were bit-identical, so this is purely a loss.
 template <int kWarps, int kUnrollP = 1>
 __global__ void gemv_splitk_bf16_kernel(
-    const __nv_bfloat16* __restrict__ weight,
-    const __nv_bfloat16* __restrict__ act,
-    const __nv_bfloat16* __restrict__ bias,
-    __nv_bfloat16* __restrict__ out,
+    const device::bf16* __restrict__ weight,
+    const device::bf16* __restrict__ act,
+    const device::bf16* __restrict__ bias,
+    device::bf16* __restrict__ out,
     int N, int K, float beta)
 {
     const int row = blockIdx.x;
@@ -183,24 +186,24 @@ __global__ void gemv_splitk_bf16_kernel(
         }
         #pragma unroll
         for (int u = 0; u < kU; ++u) {
-            const __nv_bfloat16* wb =
-                reinterpret_cast<const __nv_bfloat16*>(&wv[u]);
-            const __nv_bfloat16* xb =
-                reinterpret_cast<const __nv_bfloat16*>(&xv[u]);
+            const device::bf16* wb =
+                reinterpret_cast<const device::bf16*>(&wv[u]);
+            const device::bf16* xb =
+                reinterpret_cast<const device::bf16*>(&xv[u]);
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+                acc += device::bf16_to_f32(wb[j]) * device::bf16_to_f32(xb[j]);
             }
         }
     }
     for (; i < vectors; i += stride) {
         float4 wv = w4[i];
         float4 xv = x4[i];
-        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
-        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+        const device::bf16* wb = reinterpret_cast<const device::bf16*>(&wv);
+        const device::bf16* xb = reinterpret_cast<const device::bf16*>(&xv);
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+            acc += device::bf16_to_f32(wb[j]) * device::bf16_to_f32(xb[j]);
         }
     }
     #pragma unroll
@@ -215,12 +218,12 @@ __global__ void gemv_splitk_bf16_kernel(
     float total = 0.f;
     #pragma unroll
     for (int w = 0; w < kWarps; ++w) total += partial[w];
-    if (beta != 0.f) total += beta * __bfloat162float(out[row]);
+    if (beta != 0.f) total += beta * device::bf16_to_f32(out[row]);
     // Same double rounding as the kernel above, for the same reason: it is
     // what the separate bias kernel used to do, so the fold stays bit-exact.
-    __nv_bfloat16 v = __float2bfloat16(total);
+    device::bf16 v = device::f32_to_bf16(total);
     if (bias != nullptr) {
-        v = __float2bfloat16(__bfloat162float(v) + __bfloat162float(bias[row]));
+        v = device::f32_to_bf16(device::bf16_to_f32(v) + device::bf16_to_f32(bias[row]));
     }
     out[row] = v;
 }
@@ -238,22 +241,22 @@ __global__ void gemv_splitk_bf16_kernel(
 // load and issuing one GEMM.
 template <int kWarps, int kUnrollP = 1>
 __global__ void gemv3_bf16_kernel(
-    const __nv_bfloat16* __restrict__ w0,
-    const __nv_bfloat16* __restrict__ w1,
-    const __nv_bfloat16* __restrict__ w2,
-    const __nv_bfloat16* __restrict__ b0,
-    const __nv_bfloat16* __restrict__ b1,
-    const __nv_bfloat16* __restrict__ b2,
-    __nv_bfloat16* __restrict__ o0,
-    __nv_bfloat16* __restrict__ o1,
-    __nv_bfloat16* __restrict__ o2,
-    const __nv_bfloat16* __restrict__ act,
+    const device::bf16* __restrict__ w0,
+    const device::bf16* __restrict__ w1,
+    const device::bf16* __restrict__ w2,
+    const device::bf16* __restrict__ b0,
+    const device::bf16* __restrict__ b1,
+    const device::bf16* __restrict__ b2,
+    device::bf16* __restrict__ o0,
+    device::bf16* __restrict__ o1,
+    device::bf16* __restrict__ o2,
+    const device::bf16* __restrict__ act,
     int n0, int n1, int n2, int K)
 {
     int row = blockIdx.x;
-    const __nv_bfloat16* weight;
-    const __nv_bfloat16* bias;
-    __nv_bfloat16* out;
+    const device::bf16* weight;
+    const device::bf16* bias;
+    device::bf16* out;
     if (row < n0)            { weight = w0; bias = b0; out = o0; }
     else if (row < n0 + n1)  { row -= n0;      weight = w1; bias = b1; out = o1; }
     else                     { row -= n0 + n1; weight = w2; bias = b2; out = o2; }
@@ -281,24 +284,24 @@ __global__ void gemv3_bf16_kernel(
         }
         #pragma unroll
         for (int u = 0; u < kU; ++u) {
-            const __nv_bfloat16* wb =
-                reinterpret_cast<const __nv_bfloat16*>(&wv[u]);
-            const __nv_bfloat16* xb =
-                reinterpret_cast<const __nv_bfloat16*>(&xv[u]);
+            const device::bf16* wb =
+                reinterpret_cast<const device::bf16*>(&wv[u]);
+            const device::bf16* xb =
+                reinterpret_cast<const device::bf16*>(&xv[u]);
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+                acc += device::bf16_to_f32(wb[j]) * device::bf16_to_f32(xb[j]);
             }
         }
     }
     for (; i < vectors; i += stride) {
         float4 wv = w4[i];
         float4 xv = x4[i];
-        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
-        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+        const device::bf16* wb = reinterpret_cast<const device::bf16*>(&wv);
+        const device::bf16* xb = reinterpret_cast<const device::bf16*>(&xv);
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+            acc += device::bf16_to_f32(wb[j]) * device::bf16_to_f32(xb[j]);
         }
     }
     #pragma unroll
@@ -312,9 +315,9 @@ __global__ void gemv3_bf16_kernel(
     float total = 0.f;
     #pragma unroll
     for (int w = 0; w < kWarps; ++w) total += partial[w];
-    __nv_bfloat16 v = __float2bfloat16(total);
+    device::bf16 v = device::f32_to_bf16(total);
     if (bias != nullptr) {
-        v = __float2bfloat16(__bfloat162float(v) + __bfloat162float(bias[row]));
+        v = device::f32_to_bf16(device::bf16_to_f32(v) + device::bf16_to_f32(bias[row]));
     }
     out[row] = v;
 }
@@ -379,10 +382,10 @@ bool gemv_bf16(
             gemv_splitk_bf16_kernel<kSplitWarpsB, /*kUnrollP=*/2>
                 <<<dim3(static_cast<unsigned>(N)), dim3(32, kSplitWarpsB), 0,
                    stream>>>(
-                    static_cast<const __nv_bfloat16*>(weight),
-                    static_cast<const __nv_bfloat16*>(act),
-                    static_cast<const __nv_bfloat16*>(bias),
-                    static_cast<__nv_bfloat16*>(out),
+                    static_cast<const device::bf16*>(weight),
+                    static_cast<const device::bf16*>(act),
+                    static_cast<const device::bf16*>(bias),
+                    static_cast<device::bf16*>(out),
                     N, K, beta);
             return true;
         }
@@ -390,10 +393,10 @@ bool gemv_bf16(
         gemv_splitk_bf16_kernel<kSplitWarps>
             <<<dim3(static_cast<unsigned>(N)), dim3(32, kSplitWarps), 0,
                stream>>>(
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<const __nv_bfloat16*>(act),
-                static_cast<const __nv_bfloat16*>(bias),
-                static_cast<__nv_bfloat16*>(out),
+                static_cast<const device::bf16*>(weight),
+                static_cast<const device::bf16*>(act),
+                static_cast<const device::bf16*>(bias),
+                static_cast<device::bf16*>(out),
                 N, K, beta);
         return true;
     }
@@ -407,19 +410,19 @@ bool gemv_bf16(
         gemv_bf16_kernel<kWarps, 2>
             <<<dim3(static_cast<unsigned>(blocks)), dim3(32, kWarps), 0,
                stream>>>(
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<const __nv_bfloat16*>(act),
-                static_cast<const __nv_bfloat16*>(bias),
-                static_cast<__nv_bfloat16*>(out),
+                static_cast<const device::bf16*>(weight),
+                static_cast<const device::bf16*>(act),
+                static_cast<const device::bf16*>(bias),
+                static_cast<device::bf16*>(out),
                 N, K, beta);
         return true;
     }
     gemv_bf16_kernel<kWarps, 4>
         <<<dim3(static_cast<unsigned>(blocks)), dim3(32, kWarps), 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(weight),
-            static_cast<const __nv_bfloat16*>(act),
-            static_cast<const __nv_bfloat16*>(bias),
-            static_cast<__nv_bfloat16*>(out),
+            static_cast<const device::bf16*>(weight),
+            static_cast<const device::bf16*>(act),
+            static_cast<const device::bf16*>(bias),
+            static_cast<device::bf16*>(out),
             N, K, beta);
     return true;
 }
@@ -432,19 +435,19 @@ bool gemv3_bf16_tuned(
     cudaStream_t stream)
 {
     if (K <= 0 || (K % 8) != 0) return false;
-    const auto* a = static_cast<const __nv_bfloat16*>(act);
+    const auto* a = static_cast<const device::bf16*>(act);
     auto go = [&](auto W, auto U) {
         constexpr int kW = decltype(W)::value, kU = decltype(U)::value;
         gemv3_bf16_kernel<kW, kU>
             <<<dim3(static_cast<unsigned>(n0 + n1 + n2)), dim3(32, kW), 0,
                stream>>>(
-                static_cast<const __nv_bfloat16*>(w0),
-                static_cast<const __nv_bfloat16*>(w1),
-                static_cast<const __nv_bfloat16*>(w2),
+                static_cast<const device::bf16*>(w0),
+                static_cast<const device::bf16*>(w1),
+                static_cast<const device::bf16*>(w2),
                 nullptr, nullptr, nullptr,
-                static_cast<__nv_bfloat16*>(o0),
-                static_cast<__nv_bfloat16*>(o1),
-                static_cast<__nv_bfloat16*>(o2), a, n0, n1, n2, K);
+                static_cast<device::bf16*>(o0),
+                static_cast<device::bf16*>(o1),
+                static_cast<device::bf16*>(o2), a, n0, n1, n2, K);
     };
 #define PIE_G3_CASE(W, U) \
     if (warps == (W) && unroll == (U)) {                                   \
@@ -493,32 +496,32 @@ bool gemv3_bf16(
         gemv3_bf16_kernel<kW, /*kUnrollP=*/2>
             <<<dim3(static_cast<unsigned>(n0 + n1 + n2)), dim3(32, kW), 0,
                stream>>>(
-                static_cast<const __nv_bfloat16*>(w0),
-                static_cast<const __nv_bfloat16*>(w1),
-                static_cast<const __nv_bfloat16*>(w2),
-                static_cast<const __nv_bfloat16*>(b0),
-                static_cast<const __nv_bfloat16*>(b1),
-                static_cast<const __nv_bfloat16*>(b2),
-                static_cast<__nv_bfloat16*>(o0),
-                static_cast<__nv_bfloat16*>(o1),
-                static_cast<__nv_bfloat16*>(o2),
-                static_cast<const __nv_bfloat16*>(act), n0, n1, n2, K);
+                static_cast<const device::bf16*>(w0),
+                static_cast<const device::bf16*>(w1),
+                static_cast<const device::bf16*>(w2),
+                static_cast<const device::bf16*>(b0),
+                static_cast<const device::bf16*>(b1),
+                static_cast<const device::bf16*>(b2),
+                static_cast<device::bf16*>(o0),
+                static_cast<device::bf16*>(o1),
+                static_cast<device::bf16*>(o2),
+                static_cast<const device::bf16*>(act), n0, n1, n2, K);
         return true;
     }
     constexpr int kSplitWarps = 8;
     gemv3_bf16_kernel<kSplitWarps>
         <<<dim3(static_cast<unsigned>(n0 + n1 + n2)), dim3(32, kSplitWarps), 0,
            stream>>>(
-            static_cast<const __nv_bfloat16*>(w0),
-            static_cast<const __nv_bfloat16*>(w1),
-            static_cast<const __nv_bfloat16*>(w2),
-            static_cast<const __nv_bfloat16*>(b0),
-            static_cast<const __nv_bfloat16*>(b1),
-            static_cast<const __nv_bfloat16*>(b2),
-            static_cast<__nv_bfloat16*>(o0),
-            static_cast<__nv_bfloat16*>(o1),
-            static_cast<__nv_bfloat16*>(o2),
-            static_cast<const __nv_bfloat16*>(act),
+            static_cast<const device::bf16*>(w0),
+            static_cast<const device::bf16*>(w1),
+            static_cast<const device::bf16*>(w2),
+            static_cast<const device::bf16*>(b0),
+            static_cast<const device::bf16*>(b1),
+            static_cast<const device::bf16*>(b2),
+            static_cast<device::bf16*>(o0),
+            static_cast<device::bf16*>(o1),
+            static_cast<device::bf16*>(o2),
+            static_cast<const device::bf16*>(act),
             n0, n1, n2, K);
     return true;
 }
@@ -534,10 +537,10 @@ bool gemv_bf16_tuned(
     int N, int K, int warps, int unroll, cudaStream_t stream)
 {
     if (N <= 0 || K <= 0 || (K % 8) != 0) return false;
-    const auto* w = static_cast<const __nv_bfloat16*>(weight);
-    const auto* a = static_cast<const __nv_bfloat16*>(act);
-    const auto* b = static_cast<const __nv_bfloat16*>(bias);
-    auto* o = static_cast<__nv_bfloat16*>(out);
+    const auto* w = static_cast<const device::bf16*>(weight);
+    const auto* a = static_cast<const device::bf16*>(act);
+    const auto* b = static_cast<const device::bf16*>(bias);
+    auto* o = static_cast<device::bf16*>(out);
     auto go = [&](auto W, auto U) {
         constexpr int kW = decltype(W)::value, kU = decltype(U)::value;
         const long long blocks = (N + kW - 1) / kW;
@@ -569,10 +572,10 @@ bool gemv_splitk_tuned(
     int N, int K, int warps, int unroll, cudaStream_t stream)
 {
     if (N <= 0 || K <= 0 || (K % 8) != 0) return false;
-    const auto* w = static_cast<const __nv_bfloat16*>(weight);
-    const auto* a = static_cast<const __nv_bfloat16*>(act);
-    const auto* b = static_cast<const __nv_bfloat16*>(bias);
-    auto* o = static_cast<__nv_bfloat16*>(out);
+    const auto* w = static_cast<const device::bf16*>(weight);
+    const auto* a = static_cast<const device::bf16*>(act);
+    const auto* b = static_cast<const device::bf16*>(bias);
+    auto* o = static_cast<device::bf16*>(out);
     auto go = [&](auto W, auto U) {
         constexpr int kW = decltype(W)::value, kU = decltype(U)::value;
         gemv_splitk_bf16_kernel<kW, kU>

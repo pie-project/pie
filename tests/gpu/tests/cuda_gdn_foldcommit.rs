@@ -1,9 +1,9 @@
 //! **fold-commit on the REAL linear model** — drives the `gdn-foldcommit`
 //! inferlet on Qwen3.5-0.8B (GDN backbone) so the buffer/fold machinery is
 //! exercised against real weights rather than the mock model in
-//! `crates/engine/tests/rs_frame.rs`.
+//! the engine's deleted rs_frame test.
 //!
-//! `crates/engine/tests/rs_frame.rs` proves the HOST bookkeeping (slot accounting, CSR shapes,
+//! the engine's deleted rs_frame test proves the HOST bookkeeping (slot accounting, CSR shapes,
 //! refusals). It cannot prove the driver actually replays buffered
 //! activations, because its model computes nothing. Everything about the
 //! recurrent read path lives on the far side of that boundary, so it needs a

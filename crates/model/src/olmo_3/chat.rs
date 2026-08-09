@@ -120,9 +120,16 @@ impl Instruct for OlmoInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
+        // The same list `seal()` publishes, not just the turn end. The guest
+        // stops sampling on `seal()` and reads its text out of this decoder,
+        // so a token that is terminal to one and ordinary to the other ends
+        // generation without ever producing `Done` -- and an inferlet that
+        // loops until `Done`, which is how the surface reads, loses the last
+        // message of every conversation the model chose to end with
+        // `<|endoftext|>` rather than `<|im_end|>`.
         Box::new(GenericChatDecoder::new(
             self.tokenizer.clone(),
-            self.im_end.clone(),
+            self.stop_ids.clone(),
         ))
     }
 
@@ -702,6 +709,32 @@ mod tool_tests {
         let mut tail = inst.tokenizer.encode("!");
         tail.extend(inst.tokenizer.encode("<|im_end|>"));
         assert!(matches!(d.feed(&tail), ChatEvent::Done(t) if t == "hi!"));
+    }
+
+    /// The decoder stops on EVERY token `seal()` calls terminal.
+    ///
+    /// These were two tests that each checked their own half -- one that
+    /// `seal()` returns the turn end AND eos, one that the decoder stops at
+    /// the turn end -- and both passed while the two disagreed about
+    /// `<|endoftext|>`. The guest stops sampling on `seal()` and reads its
+    /// text out of this decoder, so a token terminal to one and ordinary to
+    /// the other ends generation without ever producing `Done`: an inferlet
+    /// that loops until `Done` loses the last message of every conversation
+    /// the model chose to end with eos.
+    ///
+    /// Stated over the whole of `seal()` rather than by naming the token, so
+    /// a third stop token added to one side has to be added to the other.
+    #[test]
+    fn every_token_the_seal_calls_terminal_also_ends_the_decoder() {
+        let inst = OlmoInstruct::new(tok());
+        for id in inst.seal() {
+            let mut d = inst.chat_decoder();
+            assert!(
+                matches!(d.feed(&[id]), ChatEvent::Done(_)),
+                "seal() calls {id} terminal but the chat decoder reads it as \
+                 ordinary text"
+            );
+        }
     }
 
     /// `cue()` already emits `<think>`, so the reasoning decoder must

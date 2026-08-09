@@ -7,7 +7,6 @@
 
 /// The forward pass: a semantic text that names operations and never kernels,
 /// and one lowered text per backend.
-#[cfg(feature = "forward")]
 pub mod forward;
 
 /// The SHAPE: the numbers a checkpoint of this family has.

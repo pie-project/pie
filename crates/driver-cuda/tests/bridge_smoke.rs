@@ -415,6 +415,8 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
         scales: std::collections::BTreeMap::new(),
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         yarn: [0.0; 4],
         yarn_original_max: 0,
         glu_limit: 0.0,
@@ -1272,6 +1274,8 @@ fn zero_weight_decode(leg: Leg) {
         scales: std::collections::BTreeMap::new(),
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         yarn: [0.0; 4],
         yarn_original_max: 0,
         glu_limit: 0.0,
@@ -1858,6 +1862,8 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         scales: std::collections::BTreeMap::new(),
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         yarn: [0.0; 4],
         yarn_original_max: 0,
         glu_limit: 0.0,
@@ -2393,6 +2399,8 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         scales: std::collections::BTreeMap::new(),
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         yarn: [0.0; 4],
         yarn_original_max: 0,
         glu_limit: 0.0,
@@ -2942,6 +2950,8 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         scales: std::collections::BTreeMap::new(),
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         yarn: [0.0; 4],
         yarn_original_max: 0,
         glu_limit: 0.0,
@@ -3406,6 +3416,8 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         scales: std::collections::BTreeMap::new(),
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         yarn: [0.0; 4],
         yarn_original_max: 0,
         glu_limit: 0.0,
@@ -4290,7 +4302,11 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     let facts = Gemma3nFacts {
         vocab: VOCAB as u32,
         hidden: HIDDEN as u32,
-        per_layer_intermediate: vec![512; LAYERS],
+        // `&'static [u32]`, not a `Vec`, since the catalog refactor made a
+        // shape's per-layer runs borrow the model's own tables — a fixture
+        // states its run as a promoted const the same way `model`'s catalog
+        // entries do.
+        per_layer_intermediate: &[512; LAYERS],
         laurel_rank: 32,
         ple_width: 64,
         sparsity_layers: 2,
@@ -4305,7 +4321,7 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         },
         // Empty reads as "no window" — what this fixture meant before the
         // field existed, and what a zero-weight walk needs either way.
-        window_left: Vec::new(),
+        window_left: &[],
     };
     let plan = gemma3n_cuda(&facts, FireClass::Decode);
     let rows: Vec<Row> = vec![
@@ -4562,6 +4578,8 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         },
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         yarn: [0.0; 4],
         yarn_original_max: 0,
         glu_limit: 0.0,
@@ -4949,6 +4967,8 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         scales: std::collections::BTreeMap::new(),
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         // The 20b's YaRN set, in the launcher's order.
         yarn: [32.0, 32.0, 1.0, 1.0],
         yarn_original_max: 4096,

@@ -34,7 +34,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use driver_api::local::{
     PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL, PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32,
@@ -289,7 +289,7 @@ pub struct Channel {
     pub extern_name: Vec<u8>,
     /// Instances currently attached, and the direction each attached in.
     pub attachments: BTreeMap<u64, Direction>,
-    state: Rc<ChannelState>,
+    state: Arc<ChannelState>,
 }
 
 impl Channel {
@@ -301,7 +301,7 @@ impl Channel {
 
     /// The ring itself.
     #[must_use]
-    pub fn state(&self) -> &Rc<ChannelState> {
+    pub fn state(&self) -> &Arc<ChannelState> {
         &self.state
     }
 }
@@ -346,7 +346,15 @@ pub struct Instance {
 }
 
 /// Programs, channels and instances, and the rules between them.
-#[derive(Debug, Default)]
+///
+/// `Default` is written rather than derived, and the difference is not
+/// cosmetic: both counters start at ONE, because zero is the ABI's "none" for
+/// a program id and an instance id alike -- `validate_instance_binding`
+/// refuses a binding whose `instance_id` is zero, and the engine's
+/// `InstanceBindingPlan` spells "any instance" as a requested id of zero. A
+/// derived `Default` handed out zero as the first instance, and a registry
+/// built that way refused its own first bind.
+#[derive(Debug)]
 pub struct Registry {
     next_program: u64,
     next_instance: u64,
@@ -356,6 +364,12 @@ pub struct Registry {
     channels: BTreeMap<u64, Channel>,
 }
 
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Registry {
     /// An empty registry.
     #[must_use]
@@ -363,7 +377,10 @@ impl Registry {
         Self {
             next_program: 1,
             next_instance: 1,
-            ..Self::default()
+            programs: BTreeMap::new(),
+            program_by_hash: BTreeMap::new(),
+            instances: BTreeMap::new(),
+            channels: BTreeMap::new(),
         }
     }
 
@@ -600,9 +617,9 @@ impl Registry {
                 "the ring was checked empty and its capacity is at least one"
             );
         }
-        let states: Vec<Rc<ChannelState>> = channel_ids
+        let states: Vec<Arc<ChannelState>> = channel_ids
             .iter()
-            .map(|id| Rc::clone(&self.channels[id].state))
+            .map(|id| Arc::clone(&self.channels[id].state))
             .collect();
         let program = &self.programs[&program_id];
         let interp = make_instance(&program.plan, states);
@@ -690,6 +707,25 @@ impl Registry {
         let outcome = super::step(&mut instance.interp, &program.plan, inputs);
         if outcome == super::StepOutcome::Committed {
             instance.fire_seq += 1;
+        }
+        // A fault kills the instance, and the instance was somebody's
+        // producer. `step` latches the poison flag on the INSTANCE, which is
+        // a fact only this crate can see; the ring's poison WORD is the one
+        // an external agent reads, and a host parked on a channel this dead
+        // instance was going to put to would otherwise wait for a cell that
+        // is never coming. So the fault is published on the rings whose host
+        // side READS -- those and no others, because a channel the host
+        // writes into has no waiter to tell, and poisoning it would fail a
+        // producer for a consumer's death.
+        if matches!(outcome, super::StepOutcome::Faulted(_)) {
+            let dead: Vec<u64> = instance.channel_ids.clone();
+            for channel_id in dead {
+                if let Some(channel) = self.channels.get(&channel_id)
+                    && channel.role == HostRole::Reader
+                {
+                    channel.state().fault();
+                }
+            }
         }
         Ok(outcome)
     }
@@ -996,6 +1032,103 @@ mod tests {
         assert!(missing.is_err(), "an unbound instance cannot fire");
     }
 
+    /// A fault publishes poison on the rings the host reads, and nowhere else.
+    ///
+    /// # Why a log line is not a report
+    ///
+    /// `step` latches the fault on the INSTANCE, which is a fact only this
+    /// crate can see, and every seam above it treats a faulted member as one
+    /// program's problem rather than the frame's -- correctly, since the other
+    /// requests in the batch ran. But the guest behind the faulted one is
+    /// parked on its output ring waiting for a cell that a dead instance will
+    /// never put, and `pipeline::channel` learns that only by reading the
+    /// ring's POISON word out of the shared mapping. Left unwritten, the fault
+    /// is a hang: no error reaches the guest, no completion arrives, and the
+    /// only trace is a warning in the server's log.
+    ///
+    /// The second half is the limit. A channel the host WRITES into has no
+    /// waiter to tell -- the host is its producer -- and poisoning it would
+    /// report a consumer's death to a producer that is still perfectly able
+    /// to write. So this is the one direction, checked here because "poison
+    /// everything attached" is the obvious implementation and passes any test
+    /// that looks only at the output ring.
+    #[test]
+    fn a_faulted_instance_poisons_the_rings_its_host_reads_and_not_the_ones_it_writes() {
+        // Capacity one, already full, and the epilogue puts: `commit` refuses
+        // the overflow and faults. Readiness is 0 -- unstated -- so the gate
+        // above does not turn this into a Blocked, which is the difference
+        // between "not yet" and "never".
+        let out = LaunchChannel {
+            id: 0,
+            capacity: 1,
+            dtype: PIE_CHANNEL_DTYPE_F32,
+            flags: PIE_CHANNEL_HOST_VISIBLE | PIE_CHANNEL_HOST_READER,
+            extern_dir: -1,
+            readiness: 0,
+            shape: vec![1],
+            extern_name: vec![],
+        };
+        let mut inbox = out.clone();
+        inbox.id = 1;
+        // No reader bit: host-visible and WRITTEN by the host.
+        inbox.flags = PIE_CHANNEL_HOST_VISIBLE;
+
+        let mut package = package(vec![out.clone(), inbox.clone()]);
+        package.values = vec![driver_api::plan::LaunchValue {
+            id: 0,
+            source: driver_api::local::PIE_VALUE_CONST,
+            dtype: PIE_CHANNEL_DTYPE_F32,
+            intrinsic: 0,
+            channel: 0,
+            literal_bits: 0,
+            shape: vec![1],
+        }];
+        package.stages[0].puts = vec![driver_api::plan::LaunchPut {
+            channel: 0,
+            value: 0,
+        }];
+
+        let mut registry = Registry::new();
+        let program = registry
+            .register_program(0xDEAD, package, vec![])
+            .expect("program");
+        register_matching(&mut registry, 10, &out);
+        register_matching(&mut registry, 11, &inbox);
+        let instance = registry
+            .bind_instance(program, None, Geometry::Host, &[10, 11], &[])
+            .expect("instance");
+
+        // Fill the output ring, so the put has nowhere to land.
+        assert!(
+            registry
+                .channel(10)
+                .expect("the ring")
+                .state()
+                .push(&super::super::Value::F32(vec![0.0])),
+            "the fixture could not fill its own ring"
+        );
+
+        let outcome = registry
+            .fire(instance, &super::super::PassInputs::none())
+            .expect("a bound instance fires");
+        assert!(
+            matches!(outcome, super::super::StepOutcome::Faulted(_)),
+            "the fixture did not fault, so this test proves nothing: {outcome:?}"
+        );
+        assert_ne!(
+            registry.channel(10).expect("the ring").state().poison(),
+            0,
+            "the fault was not published on the ring the host reads, so a guest \
+             parked on it waits for a cell a dead instance will never put"
+        );
+        assert_eq!(
+            registry.channel(11).expect("the ring").state().poison(),
+            0,
+            "a channel the host WRITES was poisoned by its consumer's death, \
+             which fails a producer that is still able to produce"
+        );
+    }
+
     #[test]
     fn every_mismatched_field_refuses_by_name_rather_than_by_dump() {
         let decl = channel_decl(0, 0, -1);
@@ -1205,5 +1338,67 @@ mod tests {
             Geometry::from_wire(3).is_err(),
             "an unknown class was accepted"
         );
+    }
+
+    /// A default-built registry hands out the same ids a `new` one does.
+    ///
+    /// # What this is guarding
+    ///
+    /// `Default` used to be DERIVED, which started both counters at zero.
+    /// Zero is the ABI's "none": `validate_instance_binding` refuses a
+    /// binding whose `instance_id` is zero, so the first instance bound out
+    /// of a default-built registry was rejected by the layer above -- and
+    /// every caller in this crate's own tests used `new`, so nothing here
+    /// saw it. `driver-vulkan`'s `Programs` is `#[derive(Default)]` over
+    /// this type, which is how it reached a real driver.
+    ///
+    /// Asserted through `bind_instance` rather than by reading the fields,
+    /// because the field is private and the ID IS THE OBSERVABLE.
+    #[test]
+    fn a_default_registry_does_not_hand_out_the_abis_none() {
+        let decl = channel_decl(1, PIE_CHANNEL_HOST_VISIBLE, -1);
+        let mut registry = Registry::default();
+        let program = registry
+            .register_program(1, package(vec![decl.clone()]), vec![])
+            .expect("a one-stage program");
+        assert_ne!(program, 0, "program zero is the ABI's `no program`");
+        register_matching(&mut registry, 1, &decl);
+        let instance = registry
+            .bind_instance(program, None, Geometry::Host, &[1], &[])
+            .expect("an instance over the one channel");
+        assert_ne!(
+            instance, 0,
+            "instance zero is refused by `validate_instance_binding`, so this \
+             registry cannot bind its own first instance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod thread_safety {
+    /// A [`Registry`] can be held by a driver the engine registers.
+    ///
+    /// # Why this is a test and not a doc line
+    ///
+    /// `engine` keeps every driver in a `'static RwLock<Vec<
+    /// Option<DriverRegistration>>>`, so a backend that owns a registry must
+    /// be `Send + Sync`. It was neither: `ChannelState` used a `RefCell` for
+    /// its cell bytes and instances held rings behind an `Rc`, which made the
+    /// whole registry `!Send` and `!Sync` by construction.
+    ///
+    /// Nothing said so. The failure was a compile error on the engine's
+    /// static, in another crate, naming a type this file does not mention --
+    /// and the fix looked like it belonged there. So the property is asserted
+    /// HERE, where losing it happens: one `Rc` or one `RefCell` reintroduced
+    /// anywhere reachable from a `Registry` fails this, in this crate, with
+    /// the offending field named.
+    #[test]
+    fn a_registry_can_cross_threads_and_be_shared() {
+        const fn require<T: Send + Sync>() {}
+        require::<super::Registry>();
+        require::<crate::channel::ChannelState>();
+        require::<super::Channel>();
+        require::<super::Instance>();
+        require::<super::Program>();
     }
 }

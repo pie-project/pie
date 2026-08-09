@@ -1,0 +1,134 @@
+NOTICE
+======
+
+This crate redistributes third-party source. What follows names it, states its
+licence, and says exactly what was changed -- in that order, because the third
+part is the one a rebase needs.
+
+
+FlashInfer
+----------
+
+    Project:    FlashInfer
+    Upstream:   https://github.com/flashinfer-ai/flashinfer
+    Version:    v0.6.15
+    Licence:    Apache License 2.0
+    Copyright:  Copyright (c) 2023-2025 by FlashInfer team
+    Located at: csrc/vendor/flashinfer/
+    Licence at: csrc/vendor/flashinfer/LICENSE (upstream's file, unmodified)
+
+The pin is not ours to choose. `crates/kernels-cuda/csrc/CMakeLists.txt`
+fetches the same tree for the ahead-of-time build:
+
+    CPMAddPackage(
+      NAME flashinfer
+      GITHUB_REPOSITORY flashinfer-ai/flashinfer
+      GIT_TAG v0.6.15
+      GIT_SHALLOW TRUE
+      DOWNLOAD_ONLY YES)
+
+and the vendored files were copied from the tree that command produced --
+`.../build/_deps/flashinfer-src/include/flashinfer/` -- rather than from a
+fresh clone, so that the text carried here is byte-for-byte the text the AOT
+build compiles. Seventeen copies of that tree exist under `target/`, one per
+build hash; all seventeen were compared and are identical.
+
+### What is vendored
+
+Twenty-eight files: the transitive `#include` closure, inside the FlashInfer
+tree, of the fifteen headers `crates/kernels-cuda/csrc/src` names --
+`attention/{cascade,decode,mask,mla,prefill,scheduler,state,variants,
+default_decode_params,default_prefill_params}.cuh` and
+`{fastdiv,layout,page,pos_enc,utils}.cuh`. 18,187 lines.
+
+Not vendored, and deliberately: `attention/hopper/*`, `comm/*`,
+`gemm/bmm_fp8.cuh`, `cutlass_utils.cuh` and `mamba/selective_state_update.cuh`.
+They are outside the closure of those fifteen seeds, they are a different
+architecture's problem (sm_90 TMA, NVSHMEM, CUTLASS), and vendoring text
+nobody compiles would be weight in every binary.
+
+### What was changed
+
+Nothing but guards. **33 `#ifndef __CUDACC_RTC__` guards across 14 of the 28
+files, 206 added lines**; the other 14 files are byte-identical to upstream.
+Every copyright header is intact and untouched. Nothing was reformatted,
+renamed, reordered or "improved" -- include order in particular is upstream's,
+which is why several files carry four small guards where one large one would
+have needed a line moved.
+
+A guard exists because NVRTC compiles for the device only. It refuses a
+function marked `__host__` outright ("a function explicitly marked as a
+__host__ function is not allowed in JIT mode"), it has no C++ standard
+library, and it has no include path -- so `<iostream>`, `<sstream>`,
+`<vector>`, the `cudaLaunchKernel` wrappers and the `std::ostringstream` error
+paths have to be hidden from it. They are hidden, not deleted: the ahead-of-
+time build defines no `__CUDACC_RTC__` and therefore sees upstream exactly.
+
+Each guard is preceded by a marker of a fixed form:
+
+    // PIE: guarded for NVRTC -- <what and why>. Upstream is unmodified apart
+    // from markers of this form; see NOTICE. Removing them restores the file.
+
+One `grep -rn "// PIE:" csrc/vendor/flashinfer/` finds all 33. The boilerplate
+sentence appears once per file, on its first marker. `csrc/vendor/MODIFICATIONS`
+lists the count per file, and the property that list asserts -- *strip the
+markers, the `#ifndef` under each and its matching `#endif`, and every file is
+byte-for-byte upstream* -- was checked mechanically, per file, before this
+NOTICE was written.
+
+Two consequences are worth recording because they are not visible in a diff:
+
+  * `attention/scheduler.cuh` is guarded in its entirety, all 1,808 lines of
+    it. It is the host planner -- `std::vector` bin-packing, workspace
+    carving, `cudaOccupancyMaxActiveBlocksPerMultiprocessor` -- and the three
+    `__global__` declarations at its top are forward declarations that exist
+    only to give the occupancy query a function pointer. There is no device
+    code in it to keep. Under the JIT the plan is Rust's job.
+  * `attention/default_prefill_params.cuh` loses its six `__host__`
+    constructors, and `page.cuh` and `fastdiv.cuh` theirs, for the reason
+    above: NVRTC rejects the *declaration*, not just the body. The structs and
+    their `__host__ __device__` accessors -- which is what a kernel reads out
+    of `__grid_constant__` -- are untouched, and the fields are filled from
+    Rust.
+
+### What is NOT FlashInfer's, in the same directory
+
+`csrc/vendor/` also holds six small headers written by PIE, carrying no
+third-party text:
+
+    cstdint, type_traits, cuda.h, cuda_runtime.h, bit,
+    boost/math/ccmath/fabs.hpp
+
+They are named after the headers they stand in for because an `#include`
+resolves against a header set by exact spelling -- this crate has no include
+path on disk, so the spelling in the directive *is* the identity of the
+header. Each one exists because guarding its include was tried and measured to
+break device code, and each says so in its own banner. In particular
+`boost/math/ccmath/fabs.hpp` contains no Boost code and is not derived from
+Boost: it is a one-line constexpr absolute value under a name FlashInfer asks
+for.
+
+
+FP16 (Marat Dukhan / AMD), via FlashInfer
+-----------------------------------------
+
+    File:       csrc/vendor/flashinfer/fp16.h
+    Licence:    MIT
+    Copyright:  SPDX-FileCopyrightText: 2017-2024 Marat Dukhan
+                SPDX-FileCopyrightText: 2025 Advanced Micro Devices, Inc.
+
+FlashInfer redistributes this file under MIT inside its Apache-2.0 tree and
+its SPDX headers are preserved byte for byte, so this notice only restates
+what the file already says. It is vendored because the closure walk reaches
+it: `attention/prefill.cuh` includes it under `FP16_QK_REDUCTION_SUPPORTED`.
+One guard, on an unused `<limits>`.
+
+
+CCCL, NVIDIA CUDA headers
+-------------------------
+
+Neither is vendored, and that is the point of `csrc/src`'s shims. Where
+`examples/flashinfer_probe.rs` reads NVIDIA's `cuda_fp16.h` or FlashInfer's
+vendored CCCL from disk, it does so at RUN time, in a probe, to separate "is
+this source acceptable to NVRTC" from "is our shim correct". No toolkit text
+is carried in this crate's binary and none is redistributed.

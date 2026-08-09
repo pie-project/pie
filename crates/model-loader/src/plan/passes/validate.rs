@@ -212,6 +212,90 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
     Ok(0)
 }
 
+/// A named kernel's operands are all in the arena.
+///
+/// **This was a policy the executor applied silently.**
+/// `HostExecutor::arena_tile_map_op` opened with `if source.is_some() { return
+/// Ok(None) }` — a transform reading the checkpoint was never offered to the
+/// backing, no matter what the plan said — so a plan could state
+/// `kernel = quant::quantize_bf16_to_fp8_e4m3_per_channel` and the load would
+/// run it on the host, correctly, and about a hundred times slower. Nothing
+/// reported the difference; the only way to see it was to instrument a load
+/// and count launches (`.wiki/fix/loader.md` §5.4).
+///
+/// That is the exact defect [`tile`](super::tile)'s header describes and was
+/// written to remove — a decision made while executing, invisible in the plan
+/// — reintroduced one layer up. `stage-device-transforms` makes the check
+/// unnecessary by construction: the compiler no longer emits a kernel-bearing
+/// `TileMap` whose operands are not device-addressable. So the rule moves here,
+/// where breaking it names the tensor and fails `compile` rather than
+/// producing a plan that loads correctly and slowly.
+///
+/// A view is resolved to its base: a window on a resident buffer IS in the
+/// arena, which is the same walk `executor::host::resolve` does.
+pub(super) fn validate_kernel_operands(program: &mut LoadPlan) -> Result<usize> {
+    for instr in &program.instrs {
+        let StorageInstr::TileMap {
+            kind,
+            source,
+            dest,
+            inputs,
+            outputs,
+            transform,
+            ..
+        } = instr
+        else {
+            continue;
+        };
+        let Some(kernel) = transform.kernel.as_deref() else {
+            continue;
+        };
+        if source.is_some() {
+            return Err(Error::Contract(format!(
+                "{kind:?} names kernel `{kernel}` but reads the checkpoint, whose \
+                 bytes are on the host; stage-device-transforms should have given \
+                 it a buffer to read"
+            )));
+        }
+        let mut operands: Vec<BufferId> = inputs.iter().chain(outputs).copied().collect();
+        operands.extend(dest.as_ref().map(|dest| dest.buffer));
+        for operand in operands {
+            if !in_arena(program, operand)? {
+                return Err(Error::Contract(format!(
+                    "{kind:?} names kernel `{kernel}` but operand buffer {} has no \
+                     arena offset, so a backing could not be told where it is",
+                    operand.0
+                )));
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// Whether a buffer resolves to a span of the arena, through views.
+fn in_arena(program: &LoadPlan, id: BufferId) -> Result<bool> {
+    let mut id = id;
+    for _ in 0..MAX_VIEW_HOPS {
+        let decl = program.buffer(id)?;
+        if decl.arena_offset().is_some() {
+            return Ok(true);
+        }
+        let base = program.instrs.iter().find_map(|instr| match instr {
+            StorageInstr::CreateView { input, output, .. } if *output == id => Some(*input),
+            _ => None,
+        });
+        match base {
+            Some(base) => id = base,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// How deep a chain of views may go before the walk gives up; the same guard
+/// [`crate::plan::spans`] uses, for the same reason.
+const MAX_VIEW_HOPS: usize = 16;
+
 /// Operand-unit invariants the optimizer/ABI must preserve and the C++ executor
 /// relies on. Checked explicitly on the final plan so a future rewrite fails
 /// fast instead of silently regressing — these were previously only an implicit

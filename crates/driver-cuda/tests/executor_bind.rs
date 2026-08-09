@@ -463,9 +463,9 @@ const AWAITING_THE_VERIFY_STASH_POOL: &[&str] =
     &["qwen35_verify_stash_load", "qwen35_verify_stash_store"];
 
 fn bridged_symbols() -> BTreeSet<&'static str> {
-    let rows: BTreeSet<&'static str> = kernels_cuda::KERNELS
+    let rows: BTreeSet<&'static str> = kernels_cuda_new::table::KERNELS
         .iter()
-        .chain(kernels_cuda::driver_internal::DRIVER_KERNELS)
+        .chain(kernels_cuda_new::table::driver_internal::DRIVER_KERNELS)
         .filter(|k| !k.operands.is_empty())
         .map(|k| k.symbol)
         .collect();
@@ -1400,19 +1400,22 @@ fn every_lowered_symbol_has_an_arm() {
     // Read off `emit_rust_dispatch` rather than off the build's output:
     // the generator is the claim, and reading `OUT_DIR` would make this
     // pass or fail on whether a build script had run.
-    let generated = kernels_cuda::abi::emit_rust_dispatch(&[
-        kernels_cuda::attn::KERNELS,
-        kernels_cuda::rope::KERNELS,
-        kernels_cuda::norm::KERNELS,
-        kernels_cuda::mlp::KERNELS,
-        kernels_cuda::gemm::KERNELS,
-        kernels_cuda::moe::KERNELS,
-        kernels_cuda::ssm::KERNELS,
-        kernels_cuda::quant::KERNELS,
-        kernels_cuda::layout::KERNELS,
-        kernels_cuda::sample::KERNELS,
-        kernels_cuda::driver_internal::DRIVER_KERNELS,
-    ]);
+    let generated = kernels_cuda_new::abi::emit_rust_dispatch(
+        &[
+            kernels_cuda_new::table::attn::KERNELS,
+            kernels_cuda_new::table::rope::KERNELS,
+            kernels_cuda_new::table::norm::KERNELS,
+            kernels_cuda_new::table::mlp::KERNELS,
+            kernels_cuda_new::table::gemm::KERNELS,
+            kernels_cuda_new::table::moe::KERNELS,
+            kernels_cuda_new::table::ssm::KERNELS,
+            kernels_cuda_new::table::quant::KERNELS,
+            kernels_cuda_new::table::layout::KERNELS,
+            kernels_cuda_new::table::sample::KERNELS,
+            kernels_cuda_new::table::driver_internal::DRIVER_KERNELS,
+        ],
+        &[],
+    );
     for line in generated.lines() {
         // A branch opens `"symbol" if ... => {`.
         //
@@ -1752,4 +1755,75 @@ mod the_mixture {
             "mixture kernels with no bridge row: {unreachable:?}"
         );
     }
+}
+
+/// The mamba block's CROSS-STATEMENT wiring survives being read off the
+/// kernel rows instead of matched by name.
+///
+/// The join used to recognise four literal symbols
+/// (`ssm::nemotron_mamba_split_bf16` and its neighbours) to route the split's
+/// raw `dt` and the params prep's fp32 tables to the scan. Both ends are
+/// stated now — `KernelSig::publishes_aux` for the publishers, the
+/// `Source::Aux` operands for the consumers — so the join names nothing.
+///
+/// This pins the OUTCOME rather than the mechanism: every launch whose row
+/// reads an aux slot must come out of the join with every slot filled. A row
+/// that starts reading `Aux` without a publisher, or a publisher whose output
+/// index drifts, fails here rather than by handing the scan a null.
+#[test]
+fn every_aux_reading_launch_gets_a_full_set_of_slots() {
+    use driver_cuda::bind::DispatchPlan;
+
+    let plan = model::nemotron_h::forward::nemotron_h_cuda(
+        &model::nemotron_h::forward::facts::NemotronHFacts::nemotron_h_synthetic(),
+        FireClass::Decode,
+    );
+    let l = nemotron_lowered(4);
+    let dp = DispatchPlan::new(&plan, &l);
+
+    // The widest slot any row in this lowering mentions, which is what the
+    // join sizes its vector by.
+    let width = l
+        .kernels
+        .iter()
+        .filter_map(|k| kernels::sig_in(kernels_cuda_new::table::KERNELS, k))
+        .flat_map(|s| {
+            s.publishes_aux
+                .iter()
+                .map(|&(slot, _)| slot)
+                .chain(s.operands.iter().filter_map(|o| match o.source {
+                    kernels::Source::Aux(i) => Some(i),
+                    _ => None,
+                }))
+        })
+        .max()
+        .map_or(0, |m| usize::from(m) + 1);
+    assert_eq!(width, 6, "the mamba block's stated order is six slots");
+
+    let mut seen = 0usize;
+    for (i, launch) in l.launches.iter().enumerate() {
+        let k = &l.kernels[launch.kernel as usize];
+        let Some(sig) = kernels::sig_in(kernels_cuda_new::table::KERNELS, k) else {
+            continue;
+        };
+        if !sig
+            .operands
+            .iter()
+            .any(|o| matches!(o.source, kernels::Source::Aux(_)))
+        {
+            continue;
+        }
+        seen += 1;
+        assert_eq!(
+            dp.spec(i).aux.len(),
+            width,
+            "launch {i} ({k}, layer {:?}) reads an aux slot but the join filled {} of {width}",
+            launch.layers,
+            dp.spec(i).aux.len()
+        );
+    }
+    assert!(
+        seen > 0,
+        "no launch in this lowering reads an aux slot — the claim is vacuous"
+    );
 }

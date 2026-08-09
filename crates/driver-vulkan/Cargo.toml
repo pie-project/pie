@@ -61,12 +61,26 @@ kernels-vulkan = { path = "../kernels-vulkan", default-features = false }
 # testing one -- the same shape `driver-metal` has, for the same reason.
 model-compiler = { path = "../model-compiler" }
 
+# The PTIR channel plane: the program/channel/instance registry, the ring and
+# every bind-time derivation. A REAL dependency and not a dev one, unlike
+# `model-loader` and `model`, and the difference is the point -- this is not a
+# checkpoint format, it is the plane the engine registers work on, and
+# `src/programs.rs` serves it.
+#
+# It costs `tests/pure.rs` nothing, but only after the edge was narrowed:
+# `driver` depends on `driver-api` and `tensor-ir`, both already in this
+# crate's closure, but it took `driver-api`'s DEFAULT features, and `rpc`
+# reaches `js-sys` and `wasm-bindgen-shared` through tokio. `driver` names no
+# `tarpc`, so its edge is `default-features = false` now.
+driver = { path = "../driver" }
+
 ash = { version = "0.38", default-features = false, features = [
     "loaded",
     "std",
 ], optional = true }
 
 [dev-dependencies]
+
 # `tests/checkpoint.rs` only: the tensor names and extents a real `.zt` states,
 # which is the one place a weight's SIZE exists -- `Arg::Weight` carries a name
 # and no width. A dev-dependency and not a real one on purpose: a driver that
@@ -86,7 +100,6 @@ model-loader = { path = "../model-loader" }
 # without compiling a real contract. Still dev-only: nothing in `src/` reads
 # a checkpoint.
 model = { path = "../model", default-features = false, features = [
-    "forward",
     "contract",
 ] }
 

@@ -288,7 +288,16 @@ fn qwen3_5_mlx_name(raw_name: &str, tied: bool) -> Result<Option<String>, Error>
     if mlx::already_lowered(raw_name) {
         return Ok(Some(raw_name.to_string()));
     }
-    let Some(decoder) = mlx::decoder_member(raw_name) else {
+    // The same two-spellings fact `author_qwen3_5` declares, and for the same
+    // reason: the vision-language checkpoints nest the decoder under
+    // `language_model.` and the text-only ones (`qwen3_5_text`) do not, and
+    // both are this row. `mlx::decoder_member` knows only the nested pair
+    // because gemma-4, its other caller, has no un-nested release; the bare
+    // `model.` wrapper is added here rather than there so gemma-4 keeps
+    // refusing a spelling it never ships. Safe after the arms above: the
+    // vision tower and the MTP head are skipped under this same wrapper.
+    let Some(decoder) = mlx::decoder_member(raw_name).or_else(|| raw_name.strip_prefix("model."))
+    else {
         return mlx::fail(format!(
             "Metal Qwen3.5 schema has no declared mapping or skip for '{raw_name}'"
         ));
@@ -310,4 +319,565 @@ fn qwen3_5_mlx_name(raw_name: &str, tied: bool) -> Result<Option<String>, Error>
         return Ok(Some(format!("layers.{layer}.{renamed}")));
     }
     Ok(Some(format!("layers.{layer}.{member}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::LoadShape;
+    use crate::encoding::Encoding as StoredEncoding;
+    use crate::shared::policy::{FamilyKnobs, Policy};
+    use model_loader::checkpoint::CheckpointMetadata;
+    use model_loader::contract::ModelContract;
+    use model_loader::plan::StorageTarget;
+    use model_loader::types::{BackendKind, FileId, TensorId};
+
+    const HIDDEN: i64 = 64;
+    const K: i64 = 16;
+    const V: i64 = 32;
+    const LA: &str = "model.layers.0.linear_attn.";
+
+    fn bf16() -> Encoding {
+        Encoding::Raw(DType::BF16)
+    }
+    fn f32e() -> Encoding {
+        Encoding::Raw(DType::F32)
+    }
+
+    struct Ck(Vec<RawTensor>);
+
+    impl Ck {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn push(mut self, name: &str, shape: &[i64], encoding: Encoding) -> Self {
+            let elements: i64 = shape.iter().product();
+            self.0.push(RawTensor {
+                id: TensorId(u32::try_from(self.0.len()).expect("a small fixture")),
+                name: name.to_string(),
+                file_id: FileId(0),
+                file_offset: 0,
+                span_bytes: u64::try_from(elements * 2).unwrap_or(0),
+                shape: shape.to_vec(),
+                encoding,
+            });
+            self
+        }
+    }
+
+    /// A dense hybrid layer: the three `[2K + V, ...]` GDN tensors plus the
+    /// `in_proj_z` that says where the value block starts.
+    fn gdn_checkpoint() -> Ck {
+        let conv = 2 * K + V;
+        Ck::new()
+            .push(&format!("{LA}in_proj_qkv.weight"), &[conv, HIDDEN], bf16())
+            .push(&format!("{LA}in_proj_z.weight"), &[V, HIDDEN], bf16())
+            .push(&format!("{LA}conv1d.weight"), &[conv, 1, 4], bf16())
+            .push(&format!("{LA}conv1d.bias"), &[conv], bf16())
+            .push(&format!("{LA}A_log"), &[V], f32e())
+            .push(&format!("{LA}norm.weight"), &[V], bf16())
+            .push(&format!("{LA}dt_bias"), &[V], bf16())
+            .push("model.norm.weight", &[HIDDEN], bf16())
+    }
+
+    fn target(tp_size: u32) -> StorageTarget {
+        StorageTarget {
+            backend: BackendKind::Cuda,
+            tp_rank: 0,
+            tp_size,
+            max_tile_bytes: 1 << 20,
+            preferred_alignment: 256,
+            tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK,
+            ..StorageTarget::default()
+        }
+    }
+
+    fn run(
+        ck: Ck,
+        tp_size: u32,
+        policy: &Policy,
+        author: impl FnOnce(&mut Builder<'_>) -> Result<(), Error>,
+    ) -> Result<ModelContract, Error> {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: ck.0,
+        };
+        let enc = StoredEncoding::dense();
+        let t = target(tp_size);
+        let mut b = Builder::new(
+            &meta,
+            "qwen3.5-test",
+            LoadShape::dense(1, 128, true),
+            &enc,
+            &t,
+            policy,
+        );
+        author(&mut b)?;
+        b.finish()
+    }
+
+    fn dense(ck: Ck, tp_size: u32) -> Result<ModelContract, Error> {
+        run(ck, tp_size, &Policy::default(), author_qwen3_5)
+    }
+
+    fn shape_of<'a>(contract: &'a ModelContract, name: &str) -> Option<&'a Vec<i64>> {
+        contract
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.shape.as_ref())
+    }
+
+    // ─── the [K | K | V] shard ───────────────────────────────────────
+
+    /// At one rank there is nothing to split, and the tensors are
+    /// published as they lie.
+    #[test]
+    fn a_single_rank_leaves_the_gdn_tensors_alone() {
+        let contract = dense(gdn_checkpoint(), 1).expect("the fixture authors");
+        assert_eq!(
+            shape_of(&contract, &format!("{LA}in_proj_qkv.weight")),
+            Some(&vec![2 * K + V, HIDDEN])
+        );
+    }
+
+    /// Across two ranks each block is banded separately and rejoined, so
+    /// a rank holds `[K/2 | K/2 | V/2]` rather than the top half of the
+    /// stack — which would hand it all of K and none of V.
+    #[test]
+    fn two_ranks_each_get_their_own_share_of_every_block() {
+        let contract = dense(gdn_checkpoint(), 2).expect("the fixture authors");
+        for (name, trailing) in [
+            (format!("{LA}in_proj_qkv.weight"), vec![HIDDEN]),
+            (format!("{LA}conv1d.weight"), vec![1, 4]),
+            (format!("{LA}conv1d.bias"), Vec::new()),
+        ] {
+            let mut expected = vec![K + V / 2];
+            expected.extend(trailing);
+            assert_eq!(
+                shape_of(&contract, &name),
+                Some(&expected),
+                "{name} is this rank's [K/2 | K/2 | V/2]"
+            );
+        }
+    }
+
+    /// The block widths come from the checkpoint, not from a config
+    /// field, so a pair that cannot state them is left alone rather than
+    /// split on a guess.
+    #[test]
+    fn a_stack_that_does_not_state_its_blocks_is_left_replicated() {
+        let conv = 2 * K + V;
+        for (case, ck) in [
+            (
+                "there is no in_proj_z to measure V by",
+                Ck::new()
+                    .push(&format!("{LA}in_proj_qkv.weight"), &[conv, HIDDEN], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+            ),
+            (
+                "the value block is the whole stack",
+                Ck::new()
+                    .push(&format!("{LA}in_proj_qkv.weight"), &[conv, HIDDEN], bf16())
+                    .push(&format!("{LA}in_proj_z.weight"), &[conv, HIDDEN], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+            ),
+            (
+                "what is left over does not halve into two key blocks",
+                Ck::new()
+                    .push(&format!("{LA}in_proj_qkv.weight"), &[conv, HIDDEN], bf16())
+                    .push(&format!("{LA}in_proj_z.weight"), &[V + 1, HIDDEN], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+            ),
+        ] {
+            let contract = dense(ck, 2).unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert_eq!(
+                shape_of(&contract, &format!("{LA}in_proj_qkv.weight")),
+                Some(&vec![conv, HIDDEN]),
+                "{case}: the stack was published whole"
+            );
+        }
+        // A stack with no extents at all cannot be measured either, and
+        // asking `shape[0]` of it must not be how we find that out.
+        let ck = Ck::new()
+            .push(&format!("{LA}in_proj_qkv.weight"), &[], bf16())
+            .push(&format!("{LA}in_proj_z.weight"), &[V, HIDDEN], bf16())
+            .push("model.norm.weight", &[HIDDEN], bf16());
+        let contract = dense(ck, 2).expect("the fixture authors");
+        assert!(
+            contract
+                .tensors
+                .iter()
+                .any(|t| t.name == format!("{LA}in_proj_qkv.weight")),
+            "published, not banded"
+        );
+    }
+
+    /// A companion whose leading extent is not the stack's is not one of
+    /// these tensors, whatever it is called.
+    #[test]
+    fn a_companion_of_the_wrong_height_is_not_banded() {
+        let conv = 2 * K + V;
+        let ck = Ck::new()
+            .push(&format!("{LA}in_proj_qkv.weight"), &[conv, HIDDEN], bf16())
+            .push(&format!("{LA}in_proj_z.weight"), &[V, HIDDEN], bf16())
+            .push(&format!("{LA}conv1d.bias"), &[conv + 8], bf16())
+            .push("model.norm.weight", &[HIDDEN], bf16());
+        let contract = dense(ck, 2).expect("the fixture authors");
+        assert_eq!(
+            shape_of(&contract, &format!("{LA}conv1d.bias")),
+            Some(&vec![conv + 8]),
+            "left to the generic rule"
+        );
+    }
+
+    // ─── the two fp32 parameters ─────────────────────────────────────
+
+    /// Both conventions land on fp32, and `dt_bias` beside them does
+    /// not — the suffix list is exact for that reason.
+    #[test]
+    fn only_the_two_named_parameters_are_widened() {
+        for (case, encoding) in [("HF ships it bf16", bf16()), ("or fp32", f32e())] {
+            let given = encoding.clone();
+            let ck = Ck::new()
+                .push(&format!("{LA}A_log"), &[V], encoding.clone())
+                .push(&format!("{LA}norm.weight"), &[V], encoding.clone())
+                .push(&format!("{LA}dt_bias"), &[V], encoding)
+                .push("model.norm.weight", &[HIDDEN], bf16());
+            let contract = dense(ck, 1).expect("the fixture authors");
+            let of = |name: &str| {
+                contract
+                    .tensors
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.encoding.clone())
+            };
+            assert_eq!(of(&format!("{LA}A_log")), Some(f32e()), "{case}");
+            assert_eq!(of(&format!("{LA}norm.weight")), Some(f32e()), "{case}");
+            assert_eq!(
+                of(&format!("{LA}dt_bias")),
+                Some(given),
+                "{case}: dt_bias sits in the same module and is left as it lies"
+            );
+        }
+    }
+
+    /// A parameter that is neither bf16 nor fp32 is left where it lies:
+    /// the cast this pass writes has exactly two operands it knows.
+    #[test]
+    fn a_parameter_of_a_third_width_is_not_cast() {
+        let ck = Ck::new()
+            .push(&format!("{LA}A_log"), &[V], Encoding::Raw(DType::F16))
+            .push("model.norm.weight", &[HIDDEN], bf16());
+        let contract = dense(ck, 1).expect("the fixture authors");
+        assert_eq!(
+            contract
+                .tensors
+                .iter()
+                .find(|t| t.name == format!("{LA}A_log"))
+                .map(|t| t.encoding.clone()),
+            Some(Encoding::Raw(DType::F16))
+        );
+    }
+
+    // ─── the speculative head's int8 view ────────────────────────────
+
+    fn mtp_policy() -> Policy {
+        Policy {
+            knobs: FamilyKnobs {
+                qwen35_mtp_int8_lm_head: true,
+                ..FamilyKnobs::default()
+            },
+            ..Policy::default()
+        }
+    }
+
+    fn untied_head() -> Ck {
+        Ck::new()
+            .push("mtp.fc.weight", &[HIDDEN, HIDDEN], bf16())
+            .push("lm_head.weight", &[128, HIDDEN], bf16())
+            .push("model.embed_tokens.weight", &[128, HIDDEN], bf16())
+            .push("model.norm.weight", &[HIDDEN], bf16())
+    }
+
+    /// Both views are published. This is not a re-encode: the draft step
+    /// reads int8 and the main path reads the same head in bf16, so the
+    /// original has to survive.
+    #[test]
+    fn the_speculative_head_gets_an_int8_view_beside_the_bf16_one() {
+        let contract =
+            run(untied_head(), 1, &mtp_policy(), author_qwen3_5).expect("the fixture authors");
+        let int8 = contract
+            .tensors
+            .iter()
+            .find(|t| t.name == "mtp.lm_head")
+            .expect("the int8 view was published");
+        match &int8.encoding {
+            Encoding::Quant(spec) => assert_eq!(spec.scheme, QuantScheme::Int8Symmetric),
+            other => panic!("expected an int8 encoding, got {other:?}"),
+        }
+        assert_eq!(
+            contract
+                .tensors
+                .iter()
+                .find(|t| t.name == "lm_head.weight")
+                .map(|t| t.encoding.clone()),
+            Some(bf16()),
+            "the main path's head is left alone"
+        );
+    }
+
+    /// A tied checkpoint has no `lm_head.weight`; the head IS the
+    /// embedding table, which is what the bind resolves to and therefore
+    /// what gets quantized.
+    #[test]
+    fn a_tied_checkpoint_quantizes_the_table_the_head_resolves_to() {
+        let ck = Ck::new()
+            .push("mtp.fc.weight", &[HIDDEN, HIDDEN], bf16())
+            .push("model.embed_tokens.weight", &[128, HIDDEN], bf16())
+            .push("model.norm.weight", &[HIDDEN], bf16());
+        let contract = run(ck, 1, &mtp_policy(), author_qwen3_5).expect("the fixture authors");
+        assert!(
+            contract.tensors.iter().any(|t| t.name == "mtp.lm_head"),
+            "the suffix fallback found the table"
+        );
+    }
+
+    /// Three ways this pass declines, each for its own reason.
+    #[test]
+    fn the_int8_view_is_declined_rather_than_forced() {
+        for (case, ck, policy) in [
+            (
+                "the knob is off, which is the default",
+                untied_head(),
+                Policy::default(),
+            ),
+            (
+                "there is no speculative head to read it",
+                Ck::new()
+                    .push("lm_head.weight", &[128, HIDDEN], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+                mtp_policy(),
+            ),
+            (
+                "the checkpoint already ships a quantized head",
+                Ck::new()
+                    .push("mtp.fc.weight", &[HIDDEN, HIDDEN], bf16())
+                    .push(
+                        "lm_head.weight",
+                        &[128, HIDDEN],
+                        Encoding::Raw(DType::F8E4M3),
+                    )
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+                mtp_policy(),
+            ),
+            (
+                "there is no head at all",
+                Ck::new()
+                    .push("mtp.fc.weight", &[HIDDEN, HIDDEN], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+                mtp_policy(),
+            ),
+        ] {
+            let contract =
+                run(ck, 1, &policy, author_qwen3_5).unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert!(
+                !contract.tensors.iter().any(|t| t.name == "mtp.lm_head"),
+                "{case}: nothing was published"
+            );
+        }
+    }
+
+    // ─── the shared expert's join ────────────────────────────────────
+
+    const SE: &str = "model.layers.0.mlp.shared_expert";
+
+    fn moe_checkpoint() -> Ck {
+        Ck::new()
+            .push(&format!("{SE}.gate_proj.weight"), &[V, HIDDEN], bf16())
+            .push(&format!("{SE}.up_proj.weight"), &[V, HIDDEN], bf16())
+            .push(&format!("{SE}.down_proj.weight"), &[HIDDEN, V], bf16())
+            .push("model.norm.weight", &[HIDDEN], bf16())
+    }
+
+    fn moe(ck: Ck, tp_size: u32) -> Result<ModelContract, Error> {
+        run(ck, tp_size, &Policy::default(), author_qwen3_5_moe)
+    }
+
+    /// The slab is additive: both unfused projections stay live, because
+    /// the fold-into-routed path reads them separately and which path
+    /// runs is a per-step decision.
+    #[test]
+    fn the_shared_expert_join_is_additive() {
+        let contract = moe(moe_checkpoint(), 1).expect("the fixture authors");
+        assert_eq!(
+            shape_of(&contract, &format!("{SE}.gate_up_proj.weight")),
+            Some(&vec![2 * V, HIDDEN])
+        );
+        for kept in ["gate_proj", "up_proj"] {
+            assert!(
+                contract
+                    .tensors
+                    .iter()
+                    .any(|t| t.name == format!("{SE}.{kept}.weight")),
+                "{kept} stays live"
+            );
+        }
+    }
+
+    /// Three ways the join declines, all silently — this pass is
+    /// optional and a checkpoint without the pair is not an error.
+    #[test]
+    fn a_shared_expert_the_join_cannot_serve_is_passed_over() {
+        for (case, ck) in [
+            (
+                "there is no pair",
+                Ck::new()
+                    .push(&format!("{SE}.gate_proj.weight"), &[V, HIDDEN], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+            ),
+            (
+                "the pair is not bf16",
+                Ck::new()
+                    .push(
+                        &format!("{SE}.gate_proj.weight"),
+                        &[V, HIDDEN],
+                        Encoding::Raw(DType::F8E4M3),
+                    )
+                    .push(&format!("{SE}.up_proj.weight"), &[V, HIDDEN], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+            ),
+            (
+                "the two do not agree on their input width",
+                Ck::new()
+                    .push(&format!("{SE}.gate_proj.weight"), &[V, HIDDEN], bf16())
+                    .push(&format!("{SE}.up_proj.weight"), &[V, HIDDEN / 2], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+            ),
+            (
+                "a projection is not a matrix",
+                Ck::new()
+                    .push(&format!("{SE}.gate_proj.weight"), &[V], bf16())
+                    .push(&format!("{SE}.up_proj.weight"), &[V, HIDDEN], bf16())
+                    .push("model.norm.weight", &[HIDDEN], bf16()),
+            ),
+        ] {
+            let contract = moe(ck, 1).unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert!(
+                shape_of(&contract, &format!("{SE}.gate_up_proj.weight")).is_none(),
+                "{case}: nothing was joined"
+            );
+        }
+    }
+
+    // ─── the Metal names ─────────────────────────────────────────────
+
+    #[test]
+    fn the_head_lands_where_tying_says() {
+        for (tied, expected) in [(false, "lm_head.weight"), (true, "shared_embedding.weight")] {
+            for spelling in ["lm_head.weight", "language_model.lm_head.weight"] {
+                assert_eq!(
+                    qwen3_5_mlx_name(spelling, tied).expect("a declared name"),
+                    Some(expected.to_string()),
+                    "{spelling} at tied={tied}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_embedding_lands_where_tying_says() {
+        for (tied, expected) in [
+            (false, "embed_tokens.weight"),
+            (true, "shared_embedding.weight"),
+        ] {
+            assert_eq!(
+                qwen3_5_mlx_name("model.language_model.embed_tokens.weight", tied)
+                    .expect("a declared name"),
+                Some(expected.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn the_final_norm_is_renamed_and_a_layer_keeps_its_index() {
+        assert_eq!(
+            qwen3_5_mlx_name("model.language_model.norm.weight", false).expect("a declared name"),
+            Some("final_norm.weight".to_string())
+        );
+        assert_eq!(
+            qwen3_5_mlx_name(
+                "model.language_model.layers.3.self_attn.q_proj.weight",
+                false
+            )
+            .expect("a declared name"),
+            Some("layers.3.self_attn.q_proj.weight".to_string())
+        );
+    }
+
+    /// All three wrappers this row ships under land on the same name.
+    ///
+    /// `author_qwen3_5` declares two of them (`model.language_model.` for
+    /// the vision-language releases, bare `model.` for `qwen3_5_text`), and
+    /// `mlx_lm` writes the third by swapping the two words. A Metal load of
+    /// a text-only checkpoint used to be refused at its very first tensor
+    /// because this schema knew only the nested pair.
+    #[test]
+    fn every_wrapper_this_row_ships_under_lands_on_one_name() {
+        for wrapper in ["model.language_model.", "language_model.model.", "model."] {
+            assert_eq!(
+                qwen3_5_mlx_name(&format!("{wrapper}norm.weight"), false).expect("a declared name"),
+                Some("final_norm.weight".to_string()),
+                "{wrapper}"
+            );
+            assert_eq!(
+                qwen3_5_mlx_name(&format!("{wrapper}layers.3.mlp.down_proj.weight"), false)
+                    .expect("a declared name"),
+                Some("layers.3.mlp.down_proj.weight".to_string()),
+                "{wrapper}"
+            );
+        }
+    }
+
+    /// The vision tower and the speculative head are not the text
+    /// decoder, under either of the two spellings the decoder has.
+    #[test]
+    fn what_this_driver_does_not_run_is_skipped() {
+        for skipped in [
+            "visual.blocks.0.attn.qkv.weight",
+            "model.visual.blocks.0.attn.qkv.weight",
+            "vision_tower.blocks.0.attn.qkv.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "model.mtp.fc.weight",
+        ] {
+            assert_eq!(
+                qwen3_5_mlx_name(skipped, false).expect("a declared skip"),
+                None,
+                "{skipped}"
+            );
+        }
+    }
+
+    /// A name with no mapping and no skip is refused rather than passed
+    /// through, which is what makes the two lists above exhaustive.
+    #[test]
+    fn a_name_with_neither_a_mapping_nor_a_skip_is_refused() {
+        let err =
+            qwen3_5_mlx_name("transformer.h.0.ln_1.weight", false).expect_err("no arm claims this");
+        assert!(
+            err.to_string().contains("no declared mapping or skip")
+                && err.to_string().contains("transformer.h.0.ln_1.weight"),
+            "{err}"
+        );
+    }
+
+    /// The lowering's own output is a valid input, which is what lets a
+    /// contract be re-authored over one it already produced.
+    #[test]
+    fn an_already_lowered_name_is_an_identity() {
+        assert_eq!(
+            qwen3_5_mlx_name("layers.0.self_attn.q_proj.weight", false).expect("a declared name"),
+            Some("layers.0.self_attn.q_proj.weight".to_string())
+        );
+    }
 }

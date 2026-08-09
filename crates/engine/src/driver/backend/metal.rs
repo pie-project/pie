@@ -211,8 +211,11 @@ impl MetalDriver {
             driver_metal::serve::Launched::Impossible => Ok(FrameLaunchOutcome::Impossible),
             driver_metal::serve::Launched::Ran { faults } => {
                 // Reported here rather than in the driver, because choosing a
-                // logging backend is not a library's business. A fault poisons
-                // the one instance and does not fail the frame.
+                // logging backend is not a library's business. A fault kills
+                // the one instance and does not fail the frame; the guest
+                // behind it learns of it from the poison word
+                // `driver::Registry::fire` publishes on the rings that
+                // instance's host reads, not from this line.
                 for (instance, why) in faults {
                     tracing::warn!(instance, %why, "metal: program faulted");
                 }

@@ -39,12 +39,43 @@
 //! **`Cast`, `Scale` and `Encode` run HERE**, on the device, when both
 //! operands are already in the arena. The host path for those is a device read
 //! that synchronizes, an arithmetic loop, and a device write — a full round
-//! trip to compute something `kernels-cuda` has a kernel for.
+//! trip to compute something `kernels-cuda-new` has a kernel for.
+//!
+//! # The four rows are fired, not linked
+//!
+//! They used to be `kernels_cuda::ffi::pie_k_*` — `extern "C"` symbols an
+//! ahead-of-time archive defines, each forwarding into a C++ host launcher
+//! holding a `<<<>>>`. That made this feature imply nvcc, CMake and a CUDA
+//! toolkit in the one crate whose toolkit-free build is what lets
+//! `pie model convert` run anywhere. They are now
+//! [`kernels_cuda_new::api`]'s generated functions, which reach the same
+//! device text through NVRTC at run time.
+//!
+//! The generator is the same one, reading the same rows: `emit_rust_api`
+//! replaced `emit_c_shim`, so *"a row that changes its operands changes both
+//! call sites or fails to compile"* still holds — that property is the whole
+//! reason the shim was worth having. What changed is three things at each
+//! call site, and each is a decision rather than a translation:
+//!
+//! * **A stream is not an operand.** It is `cuLaunchKernel`'s sixth
+//!   parameter, outside the `void**`, so it left the argument list and became
+//!   [`Stream`] — see [`CudaArena::fire_on`].
+//! * **An extent the launch rule recovers is not an operand either.** Every
+//!   `rows` argument is gone: three of these four rows put the row on
+//!   `grid.x`, so the rule derives it from [`Dims`] and the `__global__`
+//!   never took it. What each row's rule reads, and what this file therefore
+//!   has to supply, is written beside each launch.
+//! * **A refusal is a `Result`.** The C symbol returned nothing, so a
+//!   rejected launch was invisible and the load finished holding whatever the
+//!   arena had. See [`refused`] for what happens now and why it is not a
+//!   fallback.
 
 use std::borrow::Cow;
 use std::ffi::c_void;
 
 use cudarc::runtime::sys as rt;
+use kernels_cuda_new::api;
+use kernels_cuda_new::runtime::{Dims, Stream};
 
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, TileMapOp};
@@ -447,28 +478,76 @@ impl ArenaBacking for CudaArena {
 }
 
 impl CudaArena {
+    /// The stream every launch below is ordered on, in the JIT's spelling.
+    ///
+    /// A `cudaStream_t` and a `CUstream` are one pointer to one object under
+    /// two typedefs — which is exactly what lets this arena create nothing,
+    /// own nothing, and still order a `cuLaunchKernel` on the stream its
+    /// caller handed [`CudaArena::new`]. [`Stream::from_runtime`] is that
+    /// change of spelling, named rather than spelled `as` at four call sites,
+    /// because an unexplained pointer cast is indistinguishable from a wrong
+    /// one.
+    ///
+    /// The borrow is the point: the returned handle cannot outlive `&self`,
+    /// and `new`'s safety contract already says the stream outlives the
+    /// arena. A launch queued on a destroyed stream is what the lifetime
+    /// exists to make unspellable.
+    fn fire_on(&self) -> Stream<'_> {
+        // SAFETY: `self.stream` is the live `cudaStream_t` the caller of
+        // `CudaArena::new` promised outlives this value, so it is live for
+        // the borrow this returns.
+        unsafe { Stream::from_runtime(self.stream.cast()) }
+    }
+
     /// `quant::cast_fp32_to_bf16`.
     ///
     /// The element count is the one arithmetic fact left here, and it is
     /// addressing rather than selection: the row takes a count, and the spans
     /// are bytes.
+    ///
+    /// **What the rule recovers:** nothing. `LaunchRule::Elementwise` reads
+    /// `rows * width` to size a flat grid, and `n` stays an operand because
+    /// the kernel tests its own index against it — the distinction between an
+    /// extent a rule RECOVERS and one a kernel READS. So the rectangle is
+    /// stated as one row of `n`, which is the shape this transform actually
+    /// has: a `Cast` is over a byte run and the plan's 2-D shape, if it has
+    /// one, is not what the kernel indexes by.
     fn cast(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         self.bounds(op.src.offset, op.src.len)?;
         self.bounds(op.dst.offset, op.dst.len)?;
-        // SAFETY: both spans are in bounds, and the plan chose this row for an
-        // f32 source and a bf16 destination.
+        let n = op.src.len / 4;
+        // `Dims` is nine `u32`s and the archive's `size_t n` was not. A cast
+        // of more than 4 Gi elements — a 16 GiB f32 tensor in one span — is
+        // refused rather than truncated, because the truncation is a grid
+        // that covers a prefix and leaves the tail holding whatever the arena
+        // had.
+        let width = u32::try_from(n)
+            .map_err(|_| plan_disagrees("the cast covers more elements than a `Dims` states"))?;
+        // SAFETY: both spans are in bounds, the plan chose this row for an
+        // f32 source and a bf16 destination, and the stream is live for the
+        // launch.
         unsafe {
-            kernels_cuda::ffi::pie_k_quant_cast_fp32_to_bf16(
+            api::quant_cast_fp32_to_bf16(
                 self.at(op.src.offset).cast_const(),
                 self.at(op.dst.offset),
-                op.src.len / 4,
-                self.stream.cast(),
-            );
+                n,
+                rect(1, width, width),
+                self.fire_on(),
+            )
         }
+        .map_err(|why| refused(CUDA_CAST_FP32_TO_BF16, &why))?;
         Ok(())
     }
 
     /// `quant::scale_rows_bf16`, the per-row multiply, in place.
+    ///
+    /// **What the rule recovers:** `rows`. `LaunchRule::RouteRows` is one
+    /// block per row on `grid.x`, so the row count left the argument list and
+    /// the `__global__` never took it; `width` stays an operand because the
+    /// kernel's `for (c = threadIdx.x; c < width; c += blockDim.x)` reads it.
+    /// The rule reads `width` too — as the BLOCK width, rounded up to a warp
+    /// and capped at 1024 — which is the one number that differs from the
+    /// archive's fixed 256 and is inert for exactly that stride.
     fn scale(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let factors = op
@@ -479,67 +558,88 @@ impl CudaArena {
         // SAFETY: both spans are in bounds; the kernel writes `dst` in place,
         // which is what the plan checked before naming this row.
         unsafe {
-            kernels_cuda::ffi::pie_k_quant_scale_rows_bf16(
+            api::quant_scale_rows_bf16(
                 self.at(op.dst.offset),
                 self.at(factors.offset).cast_const(),
-                rows,
-                cols,
-                self.stream.cast(),
-            );
+                as_int(cols)?,
+                rect(rows, cols, cols),
+                self.fire_on(),
+            )
         }
+        .map_err(|why| refused(CUDA_SCALE_ROWS_BF16, &why))?;
         Ok(())
     }
 
     /// `quant::quantize_bf16_to_mxfp4_e2m1_per_block`.
+    ///
+    /// **What the rule recovers:** `rows`, as in [`Self::scale`] — the same
+    /// `RouteRows`, the same `<<<rows, ...>>>`. `cols` stays an operand
+    /// because the packer computes three row bases from it.
+    ///
+    /// The block width the rule derives is stated as the group count,
+    /// `cols / 32`, and not as `cols`: the kernel's loop is over 32-element
+    /// MXFP4 blocks, one whole block per thread, so a block sized on the
+    /// element width would launch 32 threads for every one with work. The
+    /// plan has already refused a `cols` that is not a whole number of
+    /// groups, so the division is exact — and it is the same truncation the
+    /// kernel's own `groups = cols / 32` performs either way.
     fn encode_mxfp4(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
         // SAFETY: every span is bounds-checked by `encode_scales`; the row
-        // takes a source, a payload, an E8M0 scale array and two extents.
+        // takes a source, a payload, an E8M0 scale array and one extent.
         unsafe {
-            kernels_cuda::ffi::pie_k_quant_quantize_bf16_to_mxfp4_e2m1_per_block(
+            api::quant_quantize_bf16_to_mxfp4_e2m1_per_block(
                 self.at(op.src.offset).cast_const(),
-                self.at(op.dst.offset).cast::<u8>(),
-                self.at(scales.offset).cast::<u8>(),
-                rows,
-                cols,
-                self.stream.cast(),
-            );
+                self.at(op.dst.offset),
+                self.at(scales.offset),
+                as_int(cols)?,
+                rect(rows, cols / 32, cols),
+                self.fire_on(),
+            )
         }
+        .map_err(|why| refused(CUDA_QUANTIZE_BF16_TO_MXFP4, &why))?;
         Ok(())
     }
 
     /// `quant::quantize_bf16_to_fp8_e4m3_per_channel`.
+    ///
+    /// **What the rule recovers:** `rows`, and the block and the shared
+    /// memory with it. `LaunchRule::Rms` is `<<<rows, 256, (256 / 32) * 4>>>`
+    /// — the archive's launch digit for digit — and it reads nothing else,
+    /// because the block width is fixed by the reduction rather than by the
+    /// row: `absmax` folds warp by warp into a shared array sized on 256, and
+    /// a block of another width reads past it. `cols` stays an operand.
+    ///
+    /// `width` is supplied anyway, and is the source's row width. No rule
+    /// reads it here; a zero left in a field nobody can look up is the thing
+    /// [`Dims`] asks callers not to do.
     fn encode_fp8(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
         // SAFETY: as above; the scales are `f32` for this row.
         unsafe {
-            kernels_cuda::ffi::pie_k_quant_quantize_bf16_to_fp8_e4m3_per_channel(
+            api::quant_quantize_bf16_to_fp8_e4m3_per_channel(
                 self.at(op.src.offset).cast_const(),
-                self.at(op.dst.offset).cast::<u8>(),
-                self.at(scales.offset).cast::<f32>(),
-                rows,
-                cols,
-                self.stream.cast(),
-            );
+                self.at(op.dst.offset),
+                self.at(scales.offset),
+                as_int(cols)?,
+                rect(rows, cols, cols),
+                self.fire_on(),
+            )
         }
+        .map_err(|why| refused(CUDA_QUANTIZE_BF16_TO_FP8, &why))?;
         Ok(())
     }
 
-    /// The 2-D extent every row above takes, as the `int`s they take it in.
+    /// The 2-D extent every row above takes, in the plan's own units.
     ///
     /// An `Err` rather than a decline, for the reason the unknown-symbol arm
     /// is: the plan states a shape and chose a row that needs one, so its
     /// absence here is the two disagreeing.
-    fn extent_2d(&self, op: &TileMapOp<'_>) -> Result<(i32, i32), Error> {
-        let (rows, cols) = op
-            .shape
-            .ok_or_else(|| plan_disagrees("the row takes a 2-D extent"))?;
-        let (Ok(rows), Ok(cols)) = (i32::try_from(rows), i32::try_from(cols)) else {
-            return Err(plan_disagrees("the extent does not fit an `int`"));
-        };
-        Ok((rows, cols))
+    fn extent_2d(&self, op: &TileMapOp<'_>) -> Result<(u32, u32), Error> {
+        op.shape
+            .ok_or_else(|| plan_disagrees("the row takes a 2-D extent"))
     }
 
     /// `Encode`'s second destination, bounds-checked along with the first.
@@ -557,6 +657,49 @@ impl CudaArena {
     }
 }
 
+/// The fire's rectangle, in the three axes a load can answer.
+///
+/// [`Dims`] has twelve, and the other nine describe a MODEL or a STATEMENT —
+/// query heads, head width, rotary channels, expert counts, a request count,
+/// an AltUp stream count — which a load-time transform does not have and must
+/// not invent. They stay zero, and
+/// that is safe rather than lucky: every rule that reads one refuses a zero
+/// outright (`Ungeometric::Empty`), and none of the four rows here is
+/// head-shaped. A loader that filled them with plausible numbers would be
+/// stating a model geometry that nothing checked.
+///
+/// `stated_head_dim` is the one whose zero is a VALUE and not a refusal —
+/// "the statement named no per-head width" — and zero is the honest answer
+/// here for the same reason as the rest: these four transforms name none.
+/// `LaunchRule::RowsPerHead` would read it as the plain per-row arm, which is
+/// what a loader's flat rectangle is.
+///
+/// `in_width` is likewise read by no rule these four use. It is filled with
+/// the operand's own row width, following the same convention the driver's
+/// generated dispatch uses — the first input's width — so the two callers of
+/// this crate state a rectangle the same way.
+const fn rect(rows: u32, width: u32, in_width: u32) -> Dims {
+    Dims {
+        rows,
+        width,
+        in_width,
+        q_heads: 0,
+        kv_heads: 0,
+        head_dim: 0,
+        stated_head_dim: 0,
+        rotary_dims: 0,
+        n_experts: 0,
+        experts_per_token: 0,
+        requests: 0,
+        altup_streams: 0,
+    }
+}
+
+/// An extent as the `int` the `__global__` reads it in.
+fn as_int(extent: u32) -> Result<i32, Error> {
+    i32::try_from(extent).map_err(|_| plan_disagrees("the extent does not fit an `int`"))
+}
+
 /// The compiler named a row whose operands are not what arrived.
 ///
 /// Never a fallback. The host path would produce the right bytes, and that is
@@ -566,6 +709,29 @@ fn plan_disagrees(what: &str) -> Error {
     Error::Contract(format!("cuda arena: the plan named a kernel but {what}"))
 }
 
+/// The JIT would not fire the row the plan named.
+///
+/// **This is the answer the `pie_k_*` symbols could not give.** They returned
+/// `void`: a launch refused for a collapsed rectangle, a unit NVRTC would not
+/// compile, or an argument list that did not match the row produced no value
+/// to inspect, and the load went on to publish a tensor holding whatever the
+/// arena happened to contain. These four kernels quantise and cast WEIGHTS —
+/// a wrong answer here is a checkpoint that loads, runs, and is quietly
+/// wrong — so the refusal is propagated and the load fails with the row
+/// named.
+///
+/// It is deliberately not a fall back to the host, for [`plan_disagrees`]'
+/// reason and one more: every variant of the JIT's error is drift between
+/// this build and the table it was built from — an unknown symbol, a unit
+/// that will not compile, a rectangle that collapsed to nothing — and none of
+/// them is a condition that running the same transform somewhere else
+/// resolves. It would only make the drift slower to find.
+fn refused(symbol: &str, why: &kernels_cuda_new::runtime::Error) -> Error {
+    Error::Contract(format!(
+        "cuda arena: the plan named `{symbol}` and the JIT refused it: {why}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plan::passes::tile::{
@@ -573,15 +739,24 @@ mod tests {
         CUDA_SCALE_ROWS_BF16,
     };
 
-    /// Every symbol the compiler may name is a row this build can launch.
+    /// Every symbol the compiler may name is a row this build can FIRE.
     ///
     /// The constants live in `plan::passes::tile` so that a CUDA plan compiles
     /// on a machine with no CUDA — which means nothing there can check them.
-    /// This is the other half: with the feature on, the table is in the graph,
+    /// This is the other half: with the feature on, the JIT is in the graph,
     /// and a row that was renamed or removed fails here instead of becoming a
     /// plan whose kernel `run_tile_map` reports as unknown at load time.
+    ///
+    /// It asks `runtime::hosts` rather than scanning a table, and the change
+    /// is not cosmetic. A row present in `kernels_cuda::quant::KERNELS` was a
+    /// row someone had DECLARED; a symbol `hosts` answers for is one a
+    /// compiled unit carries the text of and `fire` will resolve — which is
+    /// the question this file's four launches actually ask. The rows were
+    /// spelled differently on the JIT side until recently
+    /// (`quant::cast_f32_to_bf16` for `quant::cast_fp32_to_bf16`), and that
+    /// is exactly the drift a table scan would have called green.
     #[test]
-    fn every_symbol_the_plan_may_name_is_a_row_in_the_table() {
+    fn every_symbol_the_plan_may_name_is_a_row_this_build_can_fire() {
         for symbol in [
             CUDA_CAST_FP32_TO_BF16,
             CUDA_SCALE_ROWS_BF16,
@@ -589,11 +764,9 @@ mod tests {
             CUDA_QUANTIZE_BF16_TO_FP8,
         ] {
             assert!(
-                kernels_cuda::quant::KERNELS
-                    .iter()
-                    .any(|k| k.symbol == symbol),
-                "the loader may compile a plan naming `{symbol}`, and \
-                 `kernels_cuda::quant` has no such row"
+                kernels_cuda_new::runtime::hosts(symbol),
+                "the loader may compile a plan naming `{symbol}`, and no unit \
+                 in `kernels-cuda-new` hosts it"
             );
         }
     }

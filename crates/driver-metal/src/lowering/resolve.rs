@@ -35,221 +35,27 @@ use crate::lowering::executor::{Resolver, Slice};
 static SCALES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| ".scales".to_string());
 use model_compiler::trace::ValueId;
 
-/// How a checkpoint spells what a text names.
+/// How a checkpoint spells what a text names — [`model`]'s map, re-exported.
 ///
-/// Data rather than code: a family that spells its tensors differently is a
-/// different spelling in this map, not a different resolver.
+/// **The map itself is no longer here.** It is
+/// [`model::shared::weight_names::Names`], beside the HuggingFace map that
+/// module already owned, because both are translations between two spellings
+/// `model` authors: the DSL invents `layer.3.qkv`, a contract author writes
+/// `layers.3.self_attn.qkv_proj.fused.weight`, and neither is this crate's to
+/// choose. While the table lived here, this backend knew what a gemma-4
+/// per-layer projection, a gpt-oss attention sink and a qwen3-moe expert bank
+/// are each called.
 ///
-/// # Why a role has SEVERAL spellings
-///
-/// One role, one name was the earlier shape, and it forced a second map
-/// (`Names::mlx_gemma4`) the moment a second convention appeared — and then
-/// the driver had to CHOOSE which map, which is the driver choosing, which is
-/// the one thing this crate may not do.
-///
-/// So a role names every spelling it has ever been seen under, and the
-/// CHECKPOINT decides: [`Store::checkpoint_name`] takes the first candidate
-/// the loaded tensor map actually publishes. Adding a convention is adding a
-/// string, and no caller learns anything.
-///
-/// Three real disagreements this covers, all measured against checkpoints on
-/// disk rather than guessed:
-///
-///   - `embed`/`lm_head`: `shared_embedding` when the deployment TIES them,
-///     `embed_tokens` and `lm_head` when it does not (gpt-oss).
-///   - the expert bank: `mlp.switch_mlp.*` (qwen3-moe),
-///     `experts.switch_glu.*` (gemma4), `mlp.experts.*` (gpt-oss).
-///   - the router: `mlp.gate` (qwen3-moe), `mlp.router` (gpt-oss).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Names {
-    /// What a layer-scoped name gets in front of its index —
-    /// `model.layers.` for a HuggingFace export.
-    pub layer_prefix: String,
-    /// The text's role name → the checkpoint's paths within a layer, in the
-    /// order they are tried. `qkv` → `self_attn.qkv_proj`.
-    pub roles: HashMap<String, Vec<String>>,
-    /// Names with no layer at all — `embed`, `lm_head`, `final_norm`.
-    pub globals: HashMap<String, Vec<String>>,
-    /// What the checkpoint calls a packed weight's own tensor.
-    ///
-    /// `.weight` for a tensor that hangs under a module, and **the empty
-    /// string** for one that IS the value: gpt-oss ships `self_attn.sinks`,
-    /// not `self_attn.sinks.weight`, because a sink is a vector and not a
-    /// linear layer.
-    pub weight_suffix: Vec<String>,
-    /// What it calls the zero point the text spells `.zeros`.
-    ///
-    /// `.biases` for MLX's affine quantisation and `.bias` for the MXFP4
-    /// expert banks, which spell the same role one character apart.
-    pub zero_point_suffix: Vec<String>,
-}
-
-impl Names {
-    /// gemma4's expert bank, which is now [`Names::mlx`] and nothing else.
-    ///
-    /// Kept as a name so callers need not all change at once. It USED to be a
-    /// second map, because gemma4 ships `layers.N.experts.switch_glu.*` where
-    /// qwen3-moe ships `layers.N.mlp.switch_mlp.*` -- and that made the driver
-    /// pick a map per checkpoint, which is the driver choosing.
-    ///
-    /// Both spellings are candidates of the one map now, so there is nothing
-    /// left to pick.
-    #[deprecated(note = "`Names::mlx` carries gemma4's spellings as candidates")]
-    #[must_use]
-    pub fn mlx_gemma4() -> Self {
-        Self::mlx()
-    }
-
-    /// The convention `model::llama_3::contract` publishes, which is what
-    /// `stage_plan_weights` keys its map by.
-    ///
-    /// **Read off the contract, not guessed.** The lowering maps
-    /// `model.layers.{l}.{member}` to `layers.{l}.{member}`,
-    /// `model.embed_tokens.*` to `shared_embedding.*` when the deployment ties
-    /// its embeddings, and `model.norm.weight` to `final_norm.weight`. An
-    /// earlier draft of this map assumed the HuggingFace spelling and was
-    /// wrong on all three — it was self-consistent, and the test that held the
-    /// text against it passed, because both sides were this file.
-    ///
-    /// # The two names with no tensor
-    ///
-    /// `qkv` and `gate_up` are FUSED handles, and **no Metal deployment has
-    /// them**: `compile_load_plan` authors with `Projections::InPlace`, and
-    /// `dense_fused_projection_joins` returns before doing anything under that
-    /// policy. So the MLX path publishes the three and two projections
-    /// separately, which is also what `weight_binds` binds.
-    ///
-    /// They are still mapped, to the spelling a JOINING plan would publish —
-    /// `…qkv_proj.fused.weight`, with the loader's own `.fused` infix — so that
-    /// a deployment which does join resolves. The text asks the tensors which
-    /// it is (`LlamaLikeFacts::fused_qkv`, `LlamaLikeMetalFacts::gate_up_fused`)
-    /// rather than either side assuming.
-    #[must_use]
-    pub fn mlx() -> Self {
-        let roles = [
-            // The fused pair — see the note above. The `.fused` infix is the
-            // loader's own: `dense_fused_projection_joins` publishes
-            // `…qkv_proj.fused.weight`, not `…qkv_proj.weight`.
-            ("qkv", "self_attn.qkv_proj.fused"),
-            ("gate_up", "mlp.gate_up_proj.fused"),
-            // The projections as the checkpoint ships them.
-            ("q_proj", "self_attn.q_proj"),
-            ("k_proj", "self_attn.k_proj"),
-            ("v_proj", "self_attn.v_proj"),
-            ("o_proj", "self_attn.o_proj"),
-            // The DSL's own handle names (`Layer::gate_proj` / `up_proj`),
-            // which is what the text spells.
-            ("gate_proj", "mlp.gate_proj"),
-            ("up_proj", "mlp.up_proj"),
-            ("down", "mlp.down_proj"),
-            // The mixture. `mlp.gate` is MLX's name for the ROUTER -- an
-            // unfortunate collision with `mlp.gate_proj`, which is an
-            // expert's gate half, and worth spelling out here because the two
-            // are one character apart and mean entirely different tensors.
-            //
-            // The expert banks carry no expert index: `switch_mlp` stores all
-            // of them in one `[experts, out, in]` tensor and the routed kernel
-            // indexes it by the slot it read.
-            // Three conventions for one bank, and the checkpoint picks:
-            // qwen3-moe's `switch_mlp`, gemma4's `switch_glu`, gpt-oss's
-            // plain `experts`.
-            ("router", "mlp.gate|mlp.router"),
-            (
-                "expert_gate",
-                "mlp.switch_mlp.gate_proj|experts.switch_glu.gate_proj|mlp.experts.gate_proj",
-            ),
-            (
-                "expert_up",
-                "mlp.switch_mlp.up_proj|experts.switch_glu.up_proj|mlp.experts.up_proj",
-            ),
-            (
-                "expert_down",
-                "mlp.switch_mlp.down_proj|experts.switch_glu.down_proj|mlp.experts.down_proj",
-            ),
-            ("shared_gate", "mlp.shared_expert.gate_proj"),
-            ("shared_up", "mlp.shared_expert.up_proj"),
-            ("shared_down", "mlp.shared_expert.down_proj"),
-            ("shared_gate_proj", "mlp.shared_expert_gate"),
-            // The norms.
-            // gemma's per-layer embedding network: a second table, its
-            // projection and norm, and the per-layer gate and output.
-            ("ple_gate", "per_layer_gate"),
-            ("ple_out", "per_layer_projection"),
-            // `layer_scalar`, measured against
-            // `mlx-community/gemma-4-26b-a4b-it-4bit`'s index and NOT the
-            // `per_layer_scalar` the role is called. A role name and a
-            // checkpoint name are two different things, which is what this map
-            // is for.
-            ("scalar", "layer_scalar"),
-            // The attention sink, one learned logit per head.
-            ("attn_sinks", "self_attn.sinks"),
-            ("q_norm", "self_attn.q_norm"),
-            ("k_norm", "self_attn.k_norm"),
-            ("attn_norm", "input_layernorm"),
-            // TWO spellings, and which one a checkpoint means is decided by
-            // which one it ships. Under `NormPlacement::Pre` the pre-FFN norm
-            // IS `post_attention_layernorm` — it sits after the attention and
-            // before the MLP, and llama publishes nothing else. gemma splits
-            // that position in two (`post_attention_layernorm` norms the
-            // attention's OUTPUT, `pre_feedforward_layernorm` norms the MLP's
-            // input), so it must take the second.
-            //
-            // Ordered gemma-first because the alternative resolves to the
-            // first spelling the checkpoint HAS: a llama checkpoint ships no
-            // `pre_feedforward_layernorm` and falls through, and a gemma one
-            // would otherwise bind its attention-output norm as the MLP's
-            // input norm and drop two norms entirely.
-            (
-                "mlp_norm",
-                "pre_feedforward_layernorm|post_attention_layernorm",
-            ),
-            // The SANDWICH's output norms, which only a gemma text names.
-            ("post_attn_norm", "post_attention_layernorm"),
-            ("post_mlp_norm", "post_feedforward_layernorm"),
-        ]
-        .into_iter()
-        .map(|(a, b): (&str, &str)| (a.to_string(), b.split('|').map(str::to_string).collect()))
-        .collect();
-        let globals = [
-            // Tied: one table serves both ends, which is why the readout and
-            // the embedding answer to the same name.
-            // Tied deployments publish ONE table under `shared_embedding`;
-            // untied ones (gpt-oss) publish `embed_tokens` and `lm_head`
-            // separately. Which is which is the checkpoint's to say.
-            ("embed", "shared_embedding|embed_tokens"),
-            // gemma's SECOND embedding table and its projection: layer-less,
-            // gathered once per step, so they are globals rather than a
-            // layer's.
-            ("ple_embed", "per_layer_embedding"),
-            ("ple_proj", "per_layer_input_projection"),
-            ("ple_proj_norm", "per_layer_input_norm"),
-            ("lm_head", "shared_embedding|lm_head"),
-            ("final_norm", "final_norm"),
-        ]
-        .into_iter()
-        .map(|(a, b): (&str, &str)| (a.to_string(), b.split('|').map(str::to_string).collect()))
-        .collect();
-        Self {
-            layer_prefix: "layers.".to_string(),
-            roles,
-            globals,
-            // `.weight` first, then the bare name: a role whose tensor IS
-            // the value (`self_attn.sinks`) hangs under no module.
-            weight_suffix: vec![".weight".to_string(), String::new()],
-            // The text says `.zeros`, the checkpoint says `.biases` -- or
-            // `.bias`, for the MXFP4 expert banks. Both are right on their own
-            // side; the map is where they meet.
-            zero_point_suffix: vec![".biases".to_string(), ".bias".to_string()],
-        }
-    }
-}
+/// The alias stays because [`Store`] is built from one and the resolver is
+/// this crate's, so the two names meet here whichever side owns the strings.
+pub use model::shared::weight_names::Names;
 
 /// What a traced name decomposes into.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Traced<'a> {
     layer: Option<u32>,
     role: &'a str,
-    /// `.scales` / `.zeros`, or empty for the packed tensor itself.
+    /// `.scales`, `.zeros`, `.bias`, or empty for the packed tensor itself.
     sidecar: &'a str,
 }
 
@@ -258,8 +64,17 @@ struct Traced<'a> {
 /// Returns `None` for a name that is not in the text's shape at all, which is
 /// drift rather than a spelling this map has not learned.
 fn decompose(name: &str) -> Option<Traced<'_>> {
+    // `.bias` is a THIRD sidecar and not a spelling of `.zeros`: a routed
+    // expert bank publishes one additive value per output row beside the
+    // codec's per-group plane, and `qmv_routed_bias` reads them at two
+    // different buffers. The text spells the roles that carry a bias into
+    // their own name (`q_bias`, `router_bias`) with an underscore, so no
+    // existing name ends in this suffix and nothing is reclassified by
+    // adding it.
     let (rest, sidecar) = match name.rfind('.') {
-        Some(at) if matches!(&name[at..], ".scales" | ".zeros") => (&name[..at], &name[at..]),
+        Some(at) if matches!(&name[at..], ".scales" | ".zeros" | ".bias") => {
+            (&name[..at], &name[at..])
+        }
         _ => (name, ""),
     };
     if let Some(tail) = rest.strip_prefix("layer.") {
@@ -404,8 +219,16 @@ impl<'a> Store<'a> {
             },
         };
         let suffixes: &[String] = match t.sidecar {
+            // A role whose name ends in `_bias` asks its module for the bias
+            // tensor rather than the weight. The role table holds MODULES --
+            // `q_bias` and `q_proj` both name `self_attn.q_proj` -- so the
+            // role is the only thing that distinguishes the two tensors, and
+            // the underscore is the only thing that distinguishes this role
+            // from the `.bias` SIDECAR two arms down.
+            "" if t.role.ends_with("_bias") => &self.names.bias_suffix,
             "" => &self.names.weight_suffix,
             ".scales" => std::slice::from_ref(&*SCALES),
+            ".bias" => &self.names.bias_suffix,
             _ => &self.names.zero_point_suffix,
         };
         bases
@@ -505,6 +328,115 @@ mod tests {
         assert_eq!(
             s.checkpoint_name("layer.0.qkv.zeros").as_deref(),
             Some("layers.0.self_attn.qkv_proj.fused.biases")
+        );
+    }
+
+    /// The additive bias and the zero point are ONE CHARACTER apart and are
+    /// not the same tensor.
+    ///
+    /// This map used to answer both from `zero_point_suffix`, which listed
+    /// `.biases` and `.bias` as "the same role one character apart" for the
+    /// MXFP4 expert banks. Measured on `mlx-community/gpt-oss-20b-MXFP4-Q4`:
+    /// an expert bank publishes `weight`, `scales` and `bias` and NO
+    /// `biases`, and the bias is `[32, 2880]` — one value per output row,
+    /// where the zero point beside `scales` would be `[32, 2880, 90]`, one
+    /// per group. `qmv_routed_bias` reads them at two different buffers.
+    ///
+    /// It went uncontradicted because it was unreachable: `.zeros` is asked
+    /// only of an affine weight, and `.biases` answers every one of those
+    /// first. The `.bias` entry could only ever have fired for an affine
+    /// checkpoint that spelled its zero point the other way, and none does.
+    #[test]
+    fn the_expert_banks_bias_is_not_its_zero_point() {
+        let (t, n) = (HashMap::new(), HashMap::new());
+        let s = store(&t, &n);
+        // Three conventions answer `expert_gate` — qwen3-moe's `switch_mlp`,
+        // gemma4's `switch_glu`, gpt-oss's plain `experts` — and the store
+        // tries them in order, so the question is what the LIST holds.
+        for sidecar in ["", ".scales", ".bias"] {
+            assert!(
+                s.checkpoint_names(&format!("layer.0.expert_gate{sidecar}"))
+                    .contains(&format!(
+                        "layers.0.mlp.experts.gate_proj{}",
+                        match sidecar {
+                            "" => ".weight",
+                            other => other,
+                        }
+                    )),
+                "`{sidecar}` does not reach gpt-oss's spelling"
+            );
+        }
+        // And an affine weight's zero point still gets the plural, which is
+        // the half that would break if `.bias` were simply prepended to the
+        // list instead of being given its own sidecar.
+        assert_eq!(
+            s.checkpoint_name("layer.0.o_proj.zeros").as_deref(),
+            Some("layers.0.self_attn.o_proj.biases")
+        );
+    }
+
+    /// A role whose NAME ends in `_bias` is not a sidecar.
+    ///
+    /// `q_bias`, `k_bias`, `v_bias` and `router_bias` are whole ROLES — the
+    /// checkpoint hangs them off a different module, not off the weight they
+    /// bias — and they are spelled with an underscore. Adding `.bias` to the
+    /// sidecar list must not reclassify them, and the separator is the only
+    /// thing that tells the two apart.
+    ///
+    /// This asks `decompose` rather than the map, because the claim is about
+    /// the SPLIT alone. What the three roles then RESOLVE to is
+    /// `the_qwen_2_projection_biases_resolve_to_the_tensors_the_checkpoint_
+    /// publishes` below.
+    #[test]
+    fn a_role_that_ends_in_bias_is_a_role_and_not_a_sidecar() {
+        let underscored = decompose("layer.7.q_bias").expect("a layer-scoped name");
+        assert_eq!(underscored.role, "q_bias");
+        assert_eq!(underscored.sidecar, "");
+
+        let dotted = decompose("layer.7.expert_gate.bias").expect("a layer-scoped name");
+        assert_eq!(dotted.role, "expert_gate");
+        assert_eq!(dotted.sidecar, ".bias");
+    }
+
+    /// The Qwen-2 family's three projection biases reach the tensors an MLX
+    /// checkpoint actually publishes.
+    ///
+    /// The strings were in `weight_names.rs` all along — in the CUDA
+    /// `Wiring`, which builds its aliases eagerly and never consulted
+    /// `Names::mlx()`. The role MAP, which is what this driver reads, did not
+    /// have them, and nothing noticed for as long as no Metal text could
+    /// state a bias: `LlamaLikeMetalFacts::add_bias` was defaulted off
+    /// because `lowering::dispatch` had no `Source::OutWidth` arm, so the
+    /// text never asked and the missing role never answered.
+    ///
+    /// Three absences in a row, each of which made the next invisible. This
+    /// is the last of them, and it is the one that would have surfaced as a
+    /// loud `UnknownWeight("layer.0.q_bias")` rather than as seven models
+    /// quietly computing their projections without a bias — which is what
+    /// they did. `driver-vulkan`'s numpy oracle put numbers on the
+    /// difference: `[88204, 6100, 41777, 2930]` against `[5937, 1560, 16925,
+    /// 43715]`, entirely different tokens.
+    #[test]
+    fn the_qwen_2_projection_biases_resolve_to_the_tensors_the_checkpoint_publishes() {
+        let (t, n) = (HashMap::new(), HashMap::new());
+        let s = store(&t, &n);
+        for (role, tensor) in [
+            ("q_bias", "layers.3.self_attn.q_proj.bias"),
+            ("k_bias", "layers.3.self_attn.k_proj.bias"),
+            ("v_bias", "layers.3.self_attn.v_proj.bias"),
+        ] {
+            assert_eq!(
+                s.checkpoint_name(&format!("layer.3.{role}")).as_deref(),
+                Some(tensor),
+                "`{role}` does not reach the tensor Qwen-2.5 ships"
+            );
+        }
+        // The bias is a whole tensor and not a sidecar of the projection, so
+        // asking the projection for one must still miss — otherwise the two
+        // spellings would collide and either could answer.
+        assert_ne!(
+            s.checkpoint_name("layer.3.q_proj").as_deref(),
+            Some("layers.3.self_attn.q_proj.bias")
         );
     }
 

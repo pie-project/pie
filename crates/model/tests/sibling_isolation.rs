@@ -145,8 +145,8 @@ fn the_sibling_path_shape_is_real() {
         .count();
     assert!(
         hits >= 2,
-        "matched {hits} `crate::<generation>::` paths in a registry, which is \
-         where they are supposed to be everywhere; the guard is not looking \
-         for the right shape"
+        "matched {hits} `crate::<generation>::` paths in `catalog.rs`, which is \
+         THE registry and names every generation whose rows it gathers; the \
+         guard is not looking for the right shape"
     );
 }

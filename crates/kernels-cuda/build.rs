@@ -16,7 +16,7 @@
 //!
 //! Without the `native` feature this script does nothing at all, which is the
 //! point of the feature: `model-compiler` depends on this crate for the
-//! signature table and must never pay nvcc to read it.
+//! signature table it re-exports and must never pay nvcc to read it.
 //!
 //! # The launch shim
 //!
@@ -32,6 +32,10 @@
 //! different matter and stay with their callers: those are DECLARATIONS, any
 //! number of crates may state them, and `driver-cuda`'s name its own
 //! `#[repr(C)]` mirrors.
+//!
+//! It is BUILT here and LINKED by whoever calls it, which is the same split
+//! `libpie_kernels_cuda.a` already has and not a second arrangement to
+//! remember. `shim()`'s doc has the measurement that forced it.
 //!
 //! Everything the shim compiles against is this crate's already — `csrc/src`'s
 //! per-family headers and the vendored Marlin wrapper — which is the same
@@ -52,96 +56,50 @@ fn main() {
     native::build();
 }
 
-// This crate's own tables and emitters, read by the build script that builds
-// them. A build script cannot depend on its own crate, so the modules are
-// included by path instead — which works only because every one of them
-// imports `kernels` and nothing else. A module here that reached for a
-// sibling, or for `crate::`, would have to be pulled in with it.
+// The table's crate, and the emitter that reads it.
 //
-// `abi.rs`'s two `crate::` mentions are a `#[cfg(test)]` module and an
-// intra-doc link, neither of which this build sees.
+// THERE IS NO `#[path]` INCLUDE HERE ANY MORE, and the absence is the end of
+// a constraint rather than a tidy-up. A build script cannot depend on the
+// crate it builds, so every module this script needed from `src/` had to be
+// pulled in as a source file — fourteen of them, under the rule "every one
+// imports `kernels` and nothing else, because a module that reached for a
+// sibling or for `crate::` would drag it in too."
 //
-// `dead_code` is allowed on each because this script uses two of `abi`'s
-// emitters and the `KERNELS` statics; the rest of what a family module offers
-// is unused HERE and load-bearing in the library. Silencing it per module is
-// what keeps a real unused-code warning in the library visible.
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/abi.rs"]
-mod abi;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/adapter.rs"]
-mod adapter;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/attn.rs"]
-mod attn;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/driver_internal.rs"]
-mod driver_internal;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/gemm.rs"]
-mod gemm;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/layout.rs"]
-mod layout;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/mlp.rs"]
-mod mlp;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/moe.rs"]
-mod moe;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/norm.rs"]
-mod norm;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/quant.rs"]
-mod quant;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/rope.rs"]
-mod rope;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/sample.rs"]
-mod sample;
-#[cfg(feature = "native")]
-#[allow(dead_code)]
-#[path = "src/ssm.rs"]
-mod ssm;
+// A build script MAY depend on any crate that is not the one it builds. The
+// tables moved to `kernels-cuda-new` and thirteen of those includes became
+// one `[build-dependencies]` line; `src/abi.rs` followed the rows it reads
+// and took the fourteenth with it. So the rule is not "one file, one
+// exception" any more — it is nothing at all, and `native::tables()` below
+// reads `kernels_cuda_new::table::TABLES` rather than restating the family
+// list, which is the failure this removes: a family added in one place and
+// forgotten in the other emitted no shim entry and failed at LINK time.
+//
+// What the include cost while it lasted is worth recording, because it is the
+// argument for not reaching for the trick again. `abi.rs`'s `#[cfg(test)]`
+// module named `crate::attn::KERNELS` and compiled only because a build
+// script is never built with `--test` — a silent exemption that looked like
+// an invariant. An `extern crate` path has one meaning in the library and in
+// the script; an included module has two, and only one of them is checked.
 
 #[cfg(feature = "native")]
 mod native {
     use std::path::{Path, PathBuf};
 
-    /// Every family table, in the crate's own concatenation order.
+    /// Every family table, plus the rows only the driver fires.
     ///
-    /// `driver_internal` joins them: its rows are launchers the driver fires
-    /// with no DSL statement, which changes which invariant they answer to
-    /// and not whether they need an entry point.
+    /// `kernels_cuda_new::table::TABLES` is the same list `KERNELS`
+    /// concatenates, read rather than restated — a second hand-written copy
+    /// of it is the shape that goes stale in silence, since a family added
+    /// there and forgotten here emits no `extern "C"` and fails at link time
+    /// in whichever binary happened to state one of its symbols first.
+    ///
+    /// `driver_internal` is appended because it is deliberately NOT in that
+    /// list: its rows have no DSL statement, which changes which invariant
+    /// they answer to and not whether they need an entry point.
     fn tables() -> Vec<&'static [kernels::KernelSig]> {
-        vec![
-            crate::attn::KERNELS,
-            crate::rope::KERNELS,
-            crate::norm::KERNELS,
-            crate::mlp::KERNELS,
-            crate::gemm::KERNELS,
-            crate::moe::KERNELS,
-            crate::ssm::KERNELS,
-            crate::quant::KERNELS,
-            crate::layout::KERNELS,
-            crate::sample::KERNELS,
-            crate::adapter::KERNELS,
-            crate::driver_internal::DRIVER_KERNELS,
-        ]
+        let mut out = kernels_cuda_new::table::TABLES.to_vec();
+        out.push(kernels_cuda_new::table::driver_internal::DRIVER_KERNELS);
+        out
     }
 
     fn csrc_src() -> PathBuf {
@@ -193,11 +151,48 @@ mod native {
     /// C++ overload resolution decides whether the row is right — arity,
     /// order, constness and width, all at once, all as compile errors.
     ///
-    /// Emitted FIRST so that `-lpie_launch_shim` precedes every other `-l`
-    /// this crate or its dependents state. A static archive is scanned once,
-    /// in place, and the shim references `pie_kernels_cuda`; cargo emits a
-    /// dependency's directives ahead of its dependent's, so the consumer that
-    /// names `-lpie_kernels_cuda` lands after this by construction.
+    /// # This crate BUILDS the archive and does not LINK it
+    ///
+    /// `cargo_metadata(false)` below, and the `cargo:launch_shim=` line after
+    /// it, are the whole of that sentence. What they replace was
+    /// `cc::Build`'s default `cargo:rustc-link-lib=static=pie_launch_shim`,
+    /// and the doc that used to sit here said it was *"emitted FIRST so that
+    /// `-lpie_launch_shim` precedes every other `-l` this crate or its
+    /// dependents state … cargo emits a dependency's directives ahead of its
+    /// dependent's."*
+    ///
+    /// **Cargo does not do that.** A build script's `-l` is passed to the
+    /// rustc invocation for its OWN package's lib and to no other; only its
+    /// `-L` reaches a dependent's command line. Transitive propagation of a
+    /// `-l` is rustc's, through crate metadata, and rustc can only carry an
+    /// upstream crate's native libraries into a link if it LOADED that crate.
+    ///
+    /// `static=` compounds it. The default modifier is `+bundle`, which means
+    /// rustc does not re-emit a `-l` at all — it copies the archive's members
+    /// INTO `libkernels_cuda.rlib` (`ar t` shows `…-shim.o`, `nm -g` shows
+    /// all 212 `pie_k_*` as ` T ` there). So the definitions travel on the
+    /// rlib, and the rlib travels only if the crate is loaded.
+    ///
+    /// Since §19 and §21.8 moved every table, header and emitter out of here,
+    /// **no crate in the workspace names `kernels_cuda::` any more.** Cargo
+    /// still passes `--extern kernels_cuda=…rlib` to `driver-cuda`'s tests;
+    /// rustc never loads it, so of the 118 rlibs on that link line
+    /// `libkernels_cuda-*.rlib` is not one, and every `pie_k_*` the generated
+    /// dispatch calls is undefined — 112 of them, seen as seven only because
+    /// `rust-lld` stops at `--error-limit=20`.
+    ///
+    /// The control is `pie_kernels_cuda`, which uses the *same* `static=` and
+    /// works: `driver-cuda/build.rs` emits it, `driver_cuda` IS loaded, and
+    /// its rlib carries the CMake objects. So the rule is not about the
+    /// modifier. **The crate that references a symbol is the crate that must
+    /// name the archive defining it**, and for `pie_k_*` that is `driver-cuda`
+    /// — which already states exactly this rule for `libpie_kernels_cuda.a`
+    /// twenty lines below, and now states it for the shim too, in the order a
+    /// once-scanned archive needs.
+    ///
+    /// This crate keeps OWNING the shim, for the reason the module header
+    /// gives: it is the only definition, and it must be compiled where the
+    /// launchers it forwards into are. Building is not linking.
     fn shim(out_dir: &Path) {
         println!("cargo:rerun-if-env-changed=CUDA_HOME");
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
@@ -213,7 +208,12 @@ mod native {
 
         let includes = includes();
         let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
-        let text = crate::abi::emit_c_shim(&tables(), &include_refs)
+        // The rows NVRTC compiles get no shim entry: there is no host
+        // launcher for one to forward to, and emitting it is what kept the
+        // `.cu` alive.
+        let jit: Vec<&'static kernels_cuda_new::device::DeviceKernel> =
+            kernels_cuda_new::device::jit_dispatched();
+        let text = kernels_cuda_new::abi::emit_c_shim(&tables(), &include_refs, &jit)
             .expect("two rows may not claim one entry point");
         let shim_path = out_dir.join("shim.cpp");
         std::fs::write(&shim_path, text).expect("write shim.cpp");
@@ -228,17 +228,36 @@ mod native {
         // which is what the loader's quantize/cast/scale are.
         std::fs::write(
             out_dir.join("ffi.rs"),
-            crate::abi::emit_rust_bindings_portable(&tables()),
+            kernels_cuda_new::abi::emit_rust_bindings_portable(&tables()),
         )
         .expect("write ffi.rs");
 
+        // `cc` would otherwise print `cargo:rustc-link-lib=static=…` (and
+        // `stdc++`, and an `-L` to OUT_DIR) against THIS crate. See the doc
+        // above for why that is the one place they cannot be printed. What
+        // is lost with them is `cc`'s own `rerun-if-env-changed` set, so the
+        // two entries that actually change this compilation are restated.
+        for var in ["CXX", "CXXFLAGS"] {
+            println!("cargo:rerun-if-env-changed={var}");
+        }
         cc::Build::new()
             .cpp(true)
             .std("c++20")
             .include(csrc_src())
             .include(&cuda_include)
             .file(&shim_path)
+            .cargo_metadata(false)
             .compile("pie_launch_shim");
+
+        // THE HANDOFF FOR THE SHIM, read as `DEP_PIE_KERNELS_CUDA_LAUNCH_SHIM`
+        // by any crate with a direct dependency on this one — the same
+        // mechanism `build()`'s `lib`/`include`/FlashInfer keys use, and for
+        // the same reason: a consumer that has to name an archive needs its
+        // directory stated rather than inherited. `driver-cuda`'s `-L` for
+        // this path did arrive implicitly (cargo does propagate a
+        // dependency's `-L`), and relying on that is the other half of the
+        // mechanism this defect hid inside. It is explicit now.
+        println!("cargo:launch_shim={}", out_dir.display());
     }
 
     pub fn build() {
@@ -254,6 +273,14 @@ mod native {
         for dir in ["CMakeLists.txt", "cmake", "src", "third_party"] {
             println!("cargo:rerun-if-changed=csrc/{dir}");
         }
+        // The device headers, which are not under `csrc/` any more: the
+        // `.cuh` files moved to `kernels-cuda-new/csrc/src` and the CMake
+        // reaches them with `-iquote`. Cargo cannot see that, and the failure
+        // it causes is the quiet one -- an edited kernel template, an archive
+        // that is not rebuilt because nothing this script watches changed, and
+        // a `.a` whose kernels are one revision behind the `.cuh` the JIT
+        // compiles from the same bytes.
+        println!("cargo:rerun-if-changed=../kernels-cuda-new/csrc/src");
 
         let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
         shim(&out_dir);
@@ -299,10 +326,14 @@ mod native {
         // order. The search paths above do propagate and are the half that
         // belongs here.
         //
-        // `-lpie_launch_shim` IS emitted here, by `shim()` above, and the same
-        // rule is why: the shim references the launchers, so it must precede
-        // the archive, and "before every dependent" is exactly where a
-        // dependency's directives land.
+        // AND DELIBERATELY NO `-lpie_launch_shim` EITHER, which is this
+        // round's correction rather than a restatement. The line above used
+        // to say the shim's directive WAS emitted here and that "before every
+        // dependent is exactly where a dependency's directives land". Cargo
+        // does not land them there at all -- see `shim()`'s doc for the
+        // measurement -- and the shim was consequently linked by nothing.
+        // Both archives are named by the crate that calls into them, in the
+        // order a once-scanned archive needs.
 
         // --- the handoff -------------------------------------------------------
         //

@@ -22,7 +22,6 @@ pub mod contract;
 
 /// The declared forward — MLA over a dense-prefix MoE stack with WNA16
 /// experts.
-#[cfg(feature = "forward")]
 pub mod forward;
 
 /// The SHAPE, ungated: a catalog row is written in these words.
@@ -32,12 +31,12 @@ pub mod spec;
 /// its text.
 pub mod project;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::Advertised;
@@ -157,15 +156,42 @@ pub const VARIANTS: &[KimiK2] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
+/// The YaRN rescaling `moonshotai/Kimi-K2-Instruct` publishes.
 ///
-/// The `OnceLock` is only the widening from `&KimiK2` to `&dyn Variant`;
-/// the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+/// Four of the five are transcribed from the published `config.json`:
+/// `{"beta_fast": 1.0, "beta_slow": 1.0, "factor": 32.0, "mscale": 1.0,
+/// "mscale_all_dim": 1.0, "original_max_position_embeddings": 4096,
+/// "type": "yarn"}`. NOT from `synthetic--kimi-k2.json`, which states
+/// `rope_scaling: null` — the synthetics are a normalizer's fixtures,
+/// and reading a rope ladder off one would be reading the fixture.
+///
+/// `beta_fast: 1.0` is deliberate and looks wrong: the YaRN paper's
+/// values are 32 and 1, and gpt-oss states exactly those. K2 publishes
+/// 1.0 for both, which HF takes as-is (`rope_parameters_dict.get(
+/// "beta_fast") or 32` — 1.0 is truthy), so it is the checkpoint's
+/// answer and not a missing field.
+///
+/// The fifth, `attention_factor`, the config does not state, and it is
+/// NOT the `0.1 * ln(factor) + 1` gpt-oss carries. HF infers it as
+/// `get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)`
+/// when BOTH `mscale` and `mscale_all_dim` are present, and falls back
+/// to the plain formula only when they are not. K2 states `1.0` for
+/// both, so numerator and denominator are the same number and the
+/// factor is exactly `1.0` — where the formula would have given
+/// `1.3466` and lengthened every attention logit by a third.
+///
+/// `original_max_position` is 4096 and the row's `max_model_len` is
+/// 131_072: 4096 * 32 is exactly the extended context, the same
+/// arithmetic gpt-oss's pair satisfies.
+const ROPE_SCALING: crate::deployment::RopeScaling = crate::deployment::RopeScaling::Yarn {
+    factor: 32.0,
+    beta_fast: 1.0,
+    beta_slow: 1.0,
+    attention_factor: 1.0,
+    original_max_position: 4_096,
+};
+
+crate::rows_of!(KimiK2);
 
 impl Variant for KimiK2 {
     fn id(&self) -> &'static str {
@@ -205,6 +231,7 @@ impl Variant for KimiK2 {
             &self.shape,
             self.rope_theta,
             self.norm_eps,
+            self.rope_yarn,
             Advertised {
                 arch: ARCH,
                 max_model_len: self.max_model_len,
@@ -234,7 +261,6 @@ impl Variant for KimiK2 {
     /// the refusal happened "before anything reaches here" — but nothing
     /// sequenced the two calls, so a build with no MLA latent store
     /// refused at the door and handed out a fire anyway.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -308,6 +334,88 @@ mod tests {
             assert_ne!(
                 v.max_model_len, 2048,
                 "{}: 2048 is `synthetic--kimi-k2.json`'s fixture ceiling, not a release's",
+                v.id,
+            );
+        }
+    }
+
+    /// The bool that picks the YaRN kernel is the bool that carries its
+    /// numbers.
+    ///
+    /// `rope_yarn: true` says "the config asks for YaRN, so the CUDA
+    /// reading binds `rope_yarn_original_bf16`", and the projection said
+    /// `rope_scaling: None`, which that field's doc defines as "this
+    /// stack uses its `rope_theta` ladder unrescaled". One checkpoint,
+    /// two answers. `fire::launch` resolves `None` to `yarn: [0.0; 4]`
+    /// on the one kernel that reads it — a degenerate ramp, in that
+    /// file's own words — so the row would have attended at the wrong
+    /// wavelengths past 4096 and degraded fluently, which is the way
+    /// this crate keeps finding.
+    ///
+    /// The numbers are the published config's, checked here so a
+    /// transcription error is a failure rather than a wavelength.
+    #[test]
+    fn the_bool_that_picks_the_yarn_kernel_carries_its_numbers() {
+        for v in VARIANTS {
+            // Through the TOTAL projection, not `Variant::deployment`:
+            // this build provisions no MLA store, so the row refuses at
+            // the door (`the_row_loads_and_refuses_to_serve_in_this_
+            // build`) and the statement would be unobservable. The
+            // refusal is about what this binary provides; the ladder is
+            // a fact about the checkpoint either way.
+            let d = project::deployment_unrefused(
+                &v.shape,
+                v.rope_theta,
+                v.norm_eps,
+                v.rope_yarn,
+                Advertised {
+                    arch: ARCH,
+                    max_model_len: v.max_model_len,
+                    media_encode: false,
+                },
+            );
+            assert_eq!(
+                v.rope_yarn,
+                d.rope_scaling.is_some(),
+                "{}: `rope_yarn` picks the kernel and `rope_scaling` \
+                 feeds it; a row that answers these differently sends \
+                 the YaRN rope a zeroed ramp",
+                v.id,
+            );
+            let Some(crate::deployment::RopeScaling::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                attention_factor,
+                original_max_position,
+            }) = d.rope_scaling
+            else {
+                panic!("{}: K2 publishes `type: yarn`", v.id);
+            };
+            // The published `moonshotai/Kimi-K2-Instruct` config, field
+            // for field. `beta_fast` is 1.0 and not the paper's 32.0:
+            // K2 states it, and HF takes a stated 1.0 as-is.
+            assert_eq!((factor, beta_fast, beta_slow), (32.0, 1.0, 1.0), "{}", v.id);
+            assert_eq!(original_max_position, 4_096, "{}", v.id);
+            // NOT `0.1 * ln(32) + 1`. That formula is HF's fallback for
+            // a config that omits `mscale`/`mscale_all_dim`; K2 states
+            // both as 1.0, so the inferred ratio is exactly one. Taking
+            // gpt-oss's 1.3466 here would scale every attention logit by
+            // a third with nothing to fault on.
+            assert!(
+                (attention_factor - 1.0).abs() < 1e-6,
+                "{}: mscale == mscale_all_dim makes the ratio 1.0, not \
+                 the {:.4} the plain formula gives",
+                v.id,
+                0.1f32.mul_add(32.0f32.ln(), 1.0),
+            );
+            // 4096 * 32 is exactly the advertised ceiling, which is what
+            // this pair is supposed to satisfy.
+            assert_eq!(
+                original_max_position * (factor as u32),
+                v.max_model_len,
+                "{}: the original context times the factor is the \
+                 extended one, or one of them came off the wrong line",
                 v.id,
             );
         }
@@ -435,7 +543,6 @@ mod tests {
     /// Asking the gated one here is what let this test and
     /// `catalog::tests::a_row_that_cannot_deploy_cannot_trace_either`
     /// state opposite things about the same call.
-    #[cfg(feature = "forward")]
     #[test]
     fn every_row_traces_both_fire_classes() {
         use model_compiler::trace::FireClass;
@@ -518,7 +625,6 @@ mod tests {
     /// The comparison is against [`project::NO_METAL`] itself and not a
     /// paraphrase, so the sentence a caller is shown is the sentence
     /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -532,6 +638,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {

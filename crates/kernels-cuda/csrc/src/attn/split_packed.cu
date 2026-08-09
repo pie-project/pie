@@ -1,98 +1,41 @@
+// The host launchers, and nothing else. Both `__global__`s live in
+// `attn/split_packed.cuh` -- ONE definition, read by nvcc here and by NVRTC
+// from the same text at run time.
+//
+// Neither has a row. `LaunchRule::SplitPacked` is the rule that fits and it
+// is not ported by this backend's `runtime::launch` yet;
+// `attn/split_packed.cuh` records what a port has to know, including why the
+// rule's wider grid computes the same thing this narrower one does.
+#include "attn/split_packed.cuh"
 #include "attn/split_packed.hpp"
 
-#include <cstdint>
-
-#include <cuda_bf16.h>
 
 namespace pie_cuda_driver::kernels::attn {
 
 namespace {
 
-// Vectorise copies as ushort4 = 8 bf16 values. The matmul output dims
-// (Hq, Hk, intermediate) are all multiples of head_dim or fc width and
-// in practice multiples of 8 for every model we ship. Fall back to a
-// scalar tail just in case.
-__global__ void split_qkv_kernel(
-    const __nv_bfloat16* __restrict__ src,
-    __nv_bfloat16* __restrict__ q_out,
-    __nv_bfloat16* __restrict__ k_out,
-    __nv_bfloat16* __restrict__ v_out,
-    int q_dim, int kv_dim)
-{
-    const int n = blockIdx.y;
-    const int stride = q_dim + 2 * kv_dim;
-    const __nv_bfloat16* src_row = src + static_cast<long long>(n) * stride;
+using bf16 = ::pie_cuda_driver::kernels::device::bf16;
 
-    // Q block: cols [0, q_dim)
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < q_dim;
-         j += blockDim.x * gridDim.x) {
-        q_out[static_cast<long long>(n) * q_dim + j] = src_row[j];
-    }
-    // K block: cols [q_dim, q_dim + kv_dim)
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < kv_dim;
-         j += blockDim.x * gridDim.x) {
-        k_out[static_cast<long long>(n) * kv_dim + j] = src_row[q_dim + j];
-    }
-    // V block: cols [q_dim + kv_dim, q_dim + 2*kv_dim)
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < kv_dim;
-         j += blockDim.x * gridDim.x) {
-        v_out[static_cast<long long>(n) * kv_dim + j] = src_row[q_dim + kv_dim + j];
-    }
-}
+constexpr int BLOCK = 256;
 
 }  // namespace
-
-// Peel device-window variant (north-star-dsl.md, the device-window
-// campaign): the row window rides in device memory; the grid spans the
-// full lane count and out-of-window rows early-out, so a captured
-// launch replays across row splits. Buffers are BASE pointers (the
-// host-window form windows by caller offsets).
-__global__ void split_qkv_devwin_kernel(
-    const __nv_bfloat16* __restrict__ src,
-    __nv_bfloat16* __restrict__ q_out,
-    __nv_bfloat16* __restrict__ k_out,
-    __nv_bfloat16* __restrict__ v_out,
-    const std::uint32_t* __restrict__ win,
-    int q_dim, int kv_dim)
-{
-    const int n = blockIdx.y;
-    const int w0 = static_cast<int>(win[0]);
-    const int w1 = static_cast<int>(win[1]);
-    if (n < w0 || n >= w0 + w1) return;
-    const int stride = q_dim + 2 * kv_dim;
-    const __nv_bfloat16* src_row = src + static_cast<long long>(n) * stride;
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < q_dim;
-         j += blockDim.x * gridDim.x) {
-        q_out[static_cast<long long>(n) * q_dim + j] = src_row[j];
-    }
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < kv_dim;
-         j += blockDim.x * gridDim.x) {
-        k_out[static_cast<long long>(n) * kv_dim + j] = src_row[q_dim + j];
-    }
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < kv_dim;
-         j += blockDim.x * gridDim.x) {
-        v_out[static_cast<long long>(n) * kv_dim + j] =
-            src_row[q_dim + kv_dim + j];
-    }
-}
 
 void split_qkv_bf16_devwin(
     const void* packed,
     void* q_out, void* k_out, void* v_out,
-    const std::uint32_t* win_d,
+    const device::u32* win_d,
     int n_max, int q_dim, int kv_dim,
     cudaStream_t stream)
 {
     if (n_max <= 0) return;
-    constexpr int BLOCK = 256;
     const int max_dim = q_dim > kv_dim ? q_dim : kv_dim;
     const int xblocks = (max_dim + BLOCK - 1) / BLOCK;
     dim3 grid(xblocks, n_max);
-    split_qkv_devwin_kernel<<<grid, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(packed),
-        static_cast<__nv_bfloat16*>(q_out),
-        static_cast<__nv_bfloat16*>(k_out),
-        static_cast<__nv_bfloat16*>(v_out),
+    device::split_qkv_devwin<bf16><<<grid, BLOCK, 0, stream>>>(
+        static_cast<const bf16*>(packed),
+        static_cast<bf16*>(q_out),
+        static_cast<bf16*>(k_out),
+        static_cast<bf16*>(v_out),
         win_d, q_dim, kv_dim);
 }
 
@@ -103,15 +46,14 @@ void split_qkv_bf16(
     cudaStream_t stream)
 {
     if (n_tokens == 0) return;
-    constexpr int BLOCK = 256;
     const int max_dim = q_dim > kv_dim ? q_dim : kv_dim;
     const int xblocks = (max_dim + BLOCK - 1) / BLOCK;
     dim3 grid(xblocks, n_tokens);
-    split_qkv_kernel<<<grid, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(packed),
-        static_cast<__nv_bfloat16*>(q_out),
-        static_cast<__nv_bfloat16*>(k_out),
-        static_cast<__nv_bfloat16*>(v_out),
+    device::split_qkv<bf16><<<grid, BLOCK, 0, stream>>>(
+        static_cast<const bf16*>(packed),
+        static_cast<bf16*>(q_out),
+        static_cast<bf16*>(k_out),
+        static_cast<bf16*>(v_out),
         q_dim, kv_dim);
 }
 

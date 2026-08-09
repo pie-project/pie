@@ -20,6 +20,12 @@
       "rewrites": 11
     },
     {
+      "pass": "stage-device-transforms",
+      "instrs_before": 33,
+      "instrs_after": 33,
+      "rewrites": 0
+    },
+    {
       "pass": "coalesce-persistent-arena-writes",
       "instrs_before": 33,
       "instrs_after": 33,
@@ -33,6 +39,12 @@
     },
     {
       "pass": "recompute-memory-plan",
+      "instrs_before": 31,
+      "instrs_after": 31,
+      "rewrites": 0
+    },
+    {
+      "pass": "lower-backend-tiling",
       "instrs_before": 31,
       "instrs_after": 31,
       "rewrites": 0
@@ -57,6 +69,12 @@
     },
     {
       "pass": "validate-persistent-layout",
+      "instrs_before": 31,
+      "instrs_after": 31,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-kernel-operands",
       "instrs_before": 31,
       "instrs_after": 31,
       "rewrites": 0
@@ -442,6 +460,15 @@
     {
       "id": 0,
       "tensor": 0,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 131072,
       "alignment": 256,
       "temporary": false,
@@ -450,6 +477,14 @@
     {
       "id": 1,
       "tensor": 1,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 512,
       "alignment": 256,
       "temporary": false,
@@ -458,6 +493,21 @@
     {
       "id": 2,
       "tensor": 2,
+      "ty": {
+        "shape": [
+          128,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "AwqInt4",
+            "logical_dtype": "BF16",
+            "bits_per_element": 4,
+            "group_size": 32,
+            "channel_axis": null
+          }
+        }
+      },
       "bytes": 16384,
       "alignment": 256,
       "temporary": false,
@@ -466,6 +516,21 @@
     {
       "id": 3,
       "tensor": 3,
+      "ty": {
+        "shape": [
+          32,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "AwqInt4",
+            "logical_dtype": "BF16",
+            "bits_per_element": 4,
+            "group_size": 32,
+            "channel_axis": null
+          }
+        }
+      },
       "bytes": 4096,
       "alignment": 256,
       "temporary": false,
@@ -474,6 +539,21 @@
     {
       "id": 4,
       "tensor": 4,
+      "ty": {
+        "shape": [
+          32,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "AwqInt4",
+            "logical_dtype": "BF16",
+            "bits_per_element": 4,
+            "group_size": 32,
+            "channel_axis": null
+          }
+        }
+      },
       "bytes": 4096,
       "alignment": 256,
       "temporary": false,
@@ -482,6 +562,21 @@
     {
       "id": 5,
       "tensor": 5,
+      "ty": {
+        "shape": [
+          256,
+          128
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "AwqInt4",
+            "logical_dtype": "BF16",
+            "bits_per_element": 4,
+            "group_size": 32,
+            "channel_axis": null
+          }
+        }
+      },
       "bytes": 16384,
       "alignment": 256,
       "temporary": false,
@@ -490,6 +585,21 @@
     {
       "id": 6,
       "tensor": 6,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "AwqInt4",
+            "logical_dtype": "BF16",
+            "bits_per_element": 4,
+            "group_size": 32,
+            "channel_axis": null
+          }
+        }
+      },
       "bytes": 32768,
       "alignment": 256,
       "temporary": false,
@@ -498,6 +608,21 @@
     {
       "id": 7,
       "tensor": 7,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "AwqInt4",
+            "logical_dtype": "BF16",
+            "bits_per_element": 4,
+            "group_size": 32,
+            "channel_axis": null
+          }
+        }
+      },
       "bytes": 32768,
       "alignment": 256,
       "temporary": false,
@@ -506,6 +631,21 @@
     {
       "id": 8,
       "tensor": 8,
+      "ty": {
+        "shape": [
+          256,
+          256
+        ],
+        "encoding": {
+          "Quant": {
+            "scheme": "AwqInt4",
+            "logical_dtype": "BF16",
+            "bits_per_element": 4,
+            "group_size": 32,
+            "channel_axis": null
+          }
+        }
+      },
       "bytes": 32768,
       "alignment": 256,
       "temporary": false,
@@ -514,6 +654,14 @@
     {
       "id": 9,
       "tensor": 9,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 512,
       "alignment": 256,
       "temporary": false,
@@ -522,6 +670,14 @@
     {
       "id": 10,
       "tensor": 10,
+      "ty": {
+        "shape": [
+          256
+        ],
+        "encoding": {
+          "Raw": "BF16"
+        }
+      },
       "bytes": 512,
       "alignment": 256,
       "temporary": false,
@@ -952,6 +1108,7 @@
   ],
   "memory": {
     "persistent_bytes": 271872,
+    "scratch_bytes": 0,
     "temporary_peak_bytes": 0,
     "transform_scratch_peak_bytes": 0,
     "checkpoint_read_bytes": 271872,

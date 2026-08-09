@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 use crate::config::CudaNativeDriverOptions;
 #[cfg(feature = "driver-metal")]
 use crate::config::MetalDriverOptions;
-use crate::config::{self, DriverKind, DummyDriverOptions};
+use crate::config::{self, DriverKind};
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::DriverOptions;
 
@@ -72,7 +72,7 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
 /// flavor was not compiled into this binary.
 pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlavor> {
     match kind {
-        DriverKind::CudaNative | DriverKind::Metal | DriverKind::Dummy => Flavor::from_kind(kind)
+        DriverKind::CudaNative | DriverKind::Metal => Flavor::from_kind(kind)
             .map(ResolvedFlavor::Embedded)
             .map_err(|msg| anyhow!("model {model_name:?}: {msg}")),
     }
@@ -85,6 +85,15 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
 /// The cuda variant's `device` is filled from the first device in the
 /// model's list as a placeholder — the per-group spawn loop overwrites
 /// it with the right device for each DP replica.
+#[cfg_attr(
+    not(any(feature = "driver-cuda", feature = "driver-metal")),
+    allow(
+        unused_variables,
+        unreachable_code,
+        reason = "with no `driver-*` feature `DriverOptions` is uninhabited, so \
+                  every path that produces one diverges"
+    )
+)]
 pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result<DriverOptions> {
     match flavor {
         #[cfg(feature = "driver-cuda")]
@@ -113,19 +122,6 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
                 .try_into()
                 .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
             Ok(DriverOptions::Metal(p))
-        }
-        Flavor::Dummy => {
-            let d: DummyDriverOptions = m
-                .driver
-                .options
-                .clone()
-                .try_into()
-                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-            Ok(DriverOptions::Dummy {
-                opts: d,
-                random_seed: m.driver.random_seed,
-                activation_dtype: m.driver.activation_dtype.clone(),
-            })
         }
     }
 }

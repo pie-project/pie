@@ -39,8 +39,6 @@
 //! stops testing is worse than no test, because the list at the top keeps
 //! claiming the set is known.
 
-#![cfg(feature = "forward")]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -97,17 +95,6 @@ const DECLARED_BUT_UNREAD: &[(&str, &[&str])] = &[
         "deepseek_v4",
         &["hash_routed", "o_groups", "swiglu_limit_milli"],
     ),
-    // The routed MLP's top-k. `gemma_4/forward/mod.rs` contains no
-    // routing pass at all — no gate, no top-k, no expert dispatch — so
-    // for as long as CUDA was the only text, the A4B's mixture was
-    // declared and untraced. `moe_intermediate` LEFT this list because
-    // the projection carries it to a planner for sizing, and
-    // `experts_per_token` left the same way: `gemma_4::project::
-    // metal_shape` states it on the `LlamaLikeFacts` that
-    // `llama_like_metal` routes on, so the Metal text dispatches experts
-    // by this number. The CUDA text still does not, and `Gemma4::
-    // untraced` refuses the A4B row on both backends until it does —
-    // which is a refusal a reader can find, and not a silent axis.
     // MLA's aligned MoE block. `index_topk` LEFT this list when the
     // indexer's statement started carrying it on the param channel —
     // which is the shape every line here is meant to leave by.
@@ -372,6 +359,116 @@ fn every_declared_fact_is_read_by_its_family() {
          checkpoint ships. Either read it or say which unfinished pass it \
          belongs to."
     );
+}
+
+/// An entry's comment explains that entry, and only that entry.
+///
+/// This list is prose above tuples, and prose above a tuple is load
+/// bearing: it is the sentence that makes a listed defect a known one.
+/// The failure mode is that the TUPLE leaves and the COMMENT does not.
+/// It happened: `gemma_4`'s eleven-line comment was rewritten to say why
+/// the entry was going, the entry went, and the comment stayed — sitting
+/// above `("glm_5", …)`, where it read as glm-5's explanation and said
+/// nothing true about it. The header had already absorbed the point, so
+/// the surviving text was pure misdirection.
+///
+/// The rule is what makes it findable: a comment above an entry may name
+/// its own family and no other. Cross-family prose belongs in the module
+/// header, which is where the same commit correctly put it. So a comment
+/// that outlives its entry becomes a comment naming a family that is not
+/// the one it now sits above, and that is a thing a scan can see.
+#[test]
+fn no_comment_outlives_the_entry_it_explains() {
+    let src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/facts_are_read.rs"),
+    )
+    .expect("this test's own source");
+
+    let open = src
+        .find("const DECLARED_BUT_UNREAD")
+        .expect("the list is declared here");
+    let start = src[open..].find("&[").expect("the list opens") + open;
+    let end = src[start..].find("\n];").expect("the list closes") + start;
+    let entries = commented_entries(&src[start..end]);
+
+    // The parse is line-shaped, so it must be held to the list it
+    // parses: a reformat that makes it find nothing would otherwise
+    // make it pass loudest.
+    assert_eq!(
+        entries.len(),
+        DECLARED_BUT_UNREAD.len(),
+        "the comment scan found {} of {} entries, so its shape \
+         assumption broke",
+        entries.len(),
+        DECLARED_BUT_UNREAD.len()
+    );
+
+    let families = families();
+    let mut strays: Vec<String> = Vec::new();
+    for (fam, comment) in &entries {
+        for other in families.keys() {
+            if other != fam && names(comment, other) {
+                strays.push(format!("`{other}` named above the `{fam}` entry"));
+            }
+        }
+    }
+    assert!(
+        strays.is_empty(),
+        "these comments explain a family other than the entry they sit \
+         above:\n  {strays:?}\n\nEither the entry they belonged to was \
+         deleted and they should have gone with it, or the remark is \
+         cross-cutting and belongs in this file's header — which is \
+         where the prose about families that LEFT already lives."
+    );
+}
+
+/// Whether `hay` names `family`, as a word rather than a prefix.
+///
+/// `qwen_3_5` contains `qwen_3`, so a substring test would report every
+/// qwen-3.5 comment as naming a family it does not.
+fn names(hay: &str, family: &str) -> bool {
+    let mut from = 0;
+    while let Some(i) = hay[from..].find(family) {
+        let at = from + i;
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + family.len()..].chars().next();
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !word(before) && !word(after) {
+            return true;
+        }
+        from = at + family.len();
+    }
+    false
+}
+
+/// Each entry of the list, with the comment block directly above it.
+///
+/// Line-shaped on purpose: the entries are `rustfmt`'s output, so the
+/// two spellings it produces — `("csm", &[…]),` on one line, and a bare
+/// `(` with the name beneath — are the two this handles. A third
+/// spelling fails the count assertion in the caller rather than being
+/// skipped in silence.
+fn commented_entries(block: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut comment = String::new();
+    let mut opened = false;
+    for line in block.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("//") {
+            comment.push_str(rest.trim());
+            comment.push(' ');
+        } else if t == "(" {
+            opened = true;
+        } else if let Some(name) = t
+            .strip_prefix("(\"")
+            .or_else(|| opened.then(|| t.strip_prefix('"')).flatten())
+            .and_then(|r| r.split('"').next())
+        {
+            out.push((name.to_string(), std::mem::take(&mut comment)));
+            opened = false;
+        }
+    }
+    out
 }
 
 /// The scan must actually FIND declarations, in every family it counts.

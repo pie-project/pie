@@ -32,6 +32,9 @@ fn facts(source_dtype: DType, rows: u64, cols: u64, max_tile_bytes: u64) -> Tile
         dest_dtype: None,
         in_place: false,
         blocked_scale: false,
+        // These operands are on the device; the fixture is about which row a
+        // target picks, not about where the bytes are.
+        operands_in_arena: true,
     }
 }
 
@@ -271,7 +274,7 @@ fn encode_plan(encoding: Encoding, rows: i64, cols: i64) -> LoadPlan {
         shape: vec![rows, cols],
         encoding,
     });
-    plan.tensors.push(TensorDecl {
+    plan.tensors.push(crate::types::TensorDecl {
         id: TensorId(0),
         name: "w".to_string(),
         shape: vec![rows, cols],
@@ -282,10 +285,12 @@ fn encode_plan(encoding: Encoding, rows: i64, cols: i64) -> LoadPlan {
     plan.buffers.push(BufferDecl {
         id: BufferId(0),
         tensor: Some(TensorId(0)),
+        ty: crate::contract::TensorType::raw(vec![rows, cols], DType::BF16),
         bytes: 0,
         alignment: 1,
         temporary: false,
         persistent_offset: None,
+        scratch_offset: None,
     });
     plan.instrs.push(StorageInstr::TileMap {
         id: InstrId(0),
@@ -357,6 +362,8 @@ fn a_quantized_source_resolves_to_its_logical_dtype() {
 #[test]
 fn a_non_2d_output_is_left_untiled() {
     let mut plan = encode_plan(Encoding::Raw(DType::BF16), 4096, 4096);
+    // The BUFFER's shape, which is where a transform's operands are typed now.
+    plan.buffers[0].ty.shape = vec![4096];
     plan.tensors[0].shape = vec![4096];
     lower(&mut plan);
     assert_eq!(only_tile_map(&plan).0.rows_per_tile, 0);

@@ -26,10 +26,9 @@
 //! binding supplies such a ring through [`make_instance`]. Keeping this file
 //! host-only is what makes the ring unit-testable without a GPU.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use driver_api::local::{PIE_CHANNEL_HOST_READER, PIE_CHANNEL_HOST_VISIBLE};
 
@@ -39,21 +38,44 @@ use super::value::{
     Value, concrete_dtype, decode_wire, encode_wire, value_matches, wire_cell_bytes,
 };
 
+/// What a poisoned cell lock means.
+///
+/// A panic while a ring's bytes were being encoded or decoded. Every one of
+/// those sections is a `copy_from_slice` over a range this module computed,
+/// with no user code inside it, so reaching this is a bug in this file rather
+/// than a condition a caller can produce or recover from.
+const POISONED: &str = "a channel's cells were left locked by a panic";
+
 /// One authoritative channel ring.
 ///
-/// Interior mutability (a [`RefCell`] for the cell bytes, atomics for the
+/// Interior mutability (a [`Mutex`] for the cell bytes, atomics for the
 /// head/tail/poison/closed words) rather than `&mut self`, because a channel is
 /// shared: an imported/exported channel is one ring referenced by two
-/// instances, and an [`ExecPlan`]'s instance holds each ring behind an [`Rc`].
+/// instances, and an [`ExecPlan`]'s instance holds each ring behind an [`Arc`].
 /// The `&self` methods keep that sharing expressible without unsafe pointer
 /// aliasing, which is exactly the class of bug the port exists to remove.
+///
+/// # Why a lock and an `Arc`, and not a `RefCell` and an `Rc`
+///
+/// Those are what this was, and they made a `ChannelState` neither [`Send`]
+/// nor [`Sync`] -- so a [`Registry`](crate::registry::Registry) was neither,
+/// and so was any driver holding one. `engine` keeps every driver in a
+/// `'static RwLock<Vec<Option<DriverRegistration>>>`, which requires both.
+/// The consequence was not a slow path, it was a driver that could not be
+/// registered at all, and the compile error landed on that static rather than
+/// here. `driver-metal` has the same shape and never saw it, being gated to
+/// Apple.
+///
+/// The lock is uncontended in the single-threaded use this was written for --
+/// one cell's bytes, taken and released inside one method -- and no method
+/// holds it across a call to another.
 pub struct ChannelState {
     dtype: tensor_ir::DType,
     numel: usize,
     capacity: usize,
     cell_bytes: usize,
     cap1: usize,
-    cells: RefCell<Vec<u8>>,
+    cells: Mutex<Vec<u8>>,
     words: [AtomicU64; 4],
 }
 
@@ -93,7 +115,7 @@ impl ChannelState {
             capacity,
             cell_bytes,
             cap1,
-            cells: RefCell::new(vec![0u8; cell_bytes * cap1]),
+            cells: Mutex::new(vec![0u8; cell_bytes * cap1]),
             words: Default::default(),
         }
     }
@@ -107,7 +129,7 @@ impl ChannelState {
     /// all.
     #[must_use]
     pub fn mirror_base(&self) -> u64 {
-        self.cells.borrow().as_ptr() as u64
+        self.cells.lock().expect(POISONED).as_ptr() as u64
     }
 
     /// The address of the four control words.
@@ -177,7 +199,7 @@ impl ChannelState {
     /// full from empty.
     #[must_use]
     pub fn cells_len(&self) -> usize {
-        self.cells.borrow().len()
+        self.cells.lock().expect(POISONED).len()
     }
 
     /// Bytes of control words: head, tail, poison, closed.
@@ -193,6 +215,25 @@ impl ChannelState {
     /// entitled to finish reading it; closed means no more, not gone.
     pub fn close(&self) {
         self.store_word(3, 1);
+    }
+
+    /// Latch the poison word, so a host parked on this ring learns that the
+    /// producer died rather than waiting for a cell that is never coming.
+    ///
+    /// # Why a latch and not an error return
+    ///
+    /// The engine reads this word out of the shared mapping directly --
+    /// `pipeline::channel` turns a non-zero poison into "driver published
+    /// poison epoch N" and fails the guest's `take` with it -- so this is the
+    /// only way a driver can tell a waiter anything. A fault reported any
+    /// other way (a log line, a return value the seam drops) leaves the guest
+    /// blocked on a ring nothing will ever put to, which is a hang and not a
+    /// failure.
+    ///
+    /// Like [`Self::close`] it leaves the cells alone: a reader holding a
+    /// cell that arrived before the fault is entitled to finish reading it.
+    pub fn fault(&self) {
+        self.store_word(2, 1);
     }
 
     /// How many live cells the ring holds.
@@ -212,7 +253,7 @@ impl ChannelState {
     /// touched.
     #[must_use]
     pub fn decode_sequence(&self, sequence: u64) -> Value {
-        let cells = self.cells.borrow();
+        let cells = self.cells.lock().expect(POISONED);
         decode_wire(&cells[self.slot_range(sequence)], self.dtype, self.numel)
             .unwrap_or_else(|| Value::zeros(self.dtype, self.numel))
     }
@@ -221,7 +262,7 @@ impl ChannelState {
     /// tail word afterward for the write to become visible.
     pub fn encode_sequence(&self, sequence: u64, value: &Value) {
         let range = self.slot_range(sequence);
-        let mut cells = self.cells.borrow_mut();
+        let mut cells = self.cells.lock().expect(POISONED);
         encode_wire(value, &mut cells[range]);
     }
 
@@ -304,8 +345,8 @@ impl ChannelState {
 /// capacity straight off the declaration's shape, returning an [`Rc`] because a
 /// channel is shared by construction.
 #[must_use]
-pub fn make_host_channel_state(dtype_byte: u8, dims: &[u32], capacity: u32) -> Rc<ChannelState> {
-    Rc::new(ChannelState::host(
+pub fn make_host_channel_state(dtype_byte: u8, dims: &[u32], capacity: u32) -> Arc<ChannelState> {
+    Arc::new(ChannelState::host(
         concrete_dtype(dtype_byte),
         shape_numel(dims) as usize,
         capacity as usize,
@@ -321,7 +362,7 @@ pub fn make_host_channel_state(dtype_byte: u8, dims: &[u32], capacity: u32) -> R
 #[derive(Clone, Debug, Default)]
 pub struct InterpInstance {
     /// One ring per declared channel, in channel-id order.
-    pub channels: Vec<Rc<ChannelState>>,
+    pub channels: Vec<Arc<ChannelState>>,
     /// Whether a hard fault has killed this instance.
     pub poisoned: bool,
 }
@@ -333,7 +374,7 @@ pub struct InterpInstance {
 /// plan's channel count; a mismatch yields an instance with no channels, which
 /// every `step` then reports as un-ready rather than indexing out of bounds.
 #[must_use]
-pub fn make_instance(plan: &ExecPlan, channels: Vec<Rc<ChannelState>>) -> InterpInstance {
+pub fn make_instance(plan: &ExecPlan, channels: Vec<Arc<ChannelState>>) -> InterpInstance {
     let mut inst = InterpInstance::default();
     if channels.len() == plan.package.channels.len() {
         inst.channels = channels;
@@ -352,7 +393,7 @@ pub fn make_instance(plan: &ExecPlan, channels: Vec<Rc<ChannelState>>) -> Interp
 #[must_use]
 pub fn make_host_instance(
     plan: &ExecPlan,
-    externs: &BTreeMap<u32, Rc<ChannelState>>,
+    externs: &BTreeMap<u32, Arc<ChannelState>>,
     seeds: &BTreeMap<u32, Value>,
 ) -> InterpInstance {
     let mut inst = InterpInstance::default();

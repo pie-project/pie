@@ -48,8 +48,6 @@
 //! corpus is asserted below; coverage of the catalog is the manifest's
 //! job, not this file's.
 
-#![cfg(feature = "forward")]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -429,11 +427,6 @@ fn compare_deployment(c: &mut Compare, o: &Value, dep: &Deployment) {
     }
     c.u32("vocab", stated_u32(o, &["vocab_size"]), dep.shape.vocab);
     c.u32(
-        "moe_intermediate",
-        stated_u32(o, &["moe_intermediate_size"]),
-        dep.shape.moe_intermediate,
-    );
-    c.u32(
         "max_model_len",
         stated_u32(o, &["max_position_embeddings"]),
         dep.advertised.max_model_len,
@@ -532,7 +525,7 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
         )),
         (
             Some((kind, v)),
-            Some(RopeScaling::Llama3 {
+            Some(RopeScaling::Piecewise {
                 factor,
                 low_freq_factor,
                 high_freq_factor,

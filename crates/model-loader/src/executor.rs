@@ -27,6 +27,26 @@ pub mod walk;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+// `cuda` says *that* there is a device; `cuda-12`/`cuda-13` say WHICH
+// libcudart this binary will meet, and the rows in `cuda` cannot be fired
+// without one — `kernels-cuda-new` gates its whole runtime layer, and
+// therefore its generated `api`, on that choice, so `--features cuda` alone
+// would reach a missing `kernels_cuda_new::api` and read as a crate that has
+// not got the entry points rather than as a build that never said which CUDA
+// it is for.
+//
+// In practice cudarc's build script panics first — it prints nineteen
+// `cuda-XXXXX` features and no hint that this crate spells the choice
+// `cuda-13` — so this is the diagnostic a reader gets once the version
+// question is asked of THIS crate rather than of a dependency two levels
+// down, and the one that survives a cudarc that grows a default.
+#[cfg(all(feature = "cuda", not(any(feature = "cuda-12", feature = "cuda-13"))))]
+compile_error!(
+    "model-loader's `cuda` feature needs a runtime version too: enable \
+     `cuda-12` or `cuda-13`, matching the libcudart this binary will load. \
+     `driver-cuda`'s own `cuda-12`/`cuda-13` already pass the choice on."
+);
+
 use std::collections::HashMap;
 use std::path::Path;
 

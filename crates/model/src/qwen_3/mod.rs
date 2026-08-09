@@ -14,12 +14,12 @@
 //! `instruct::create` under `"Qwen3ForCausalLM"`. Three tables, three
 //! keys, no one holding them together.
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -46,19 +46,29 @@ pub struct Qwen3 {
     /// tracer takes it per-layer through `Deployment` rather than
     /// through the shape.
     pub rope_theta: f32,
+    /// The RMSNorm epsilon every norm of the stack carries.
+    ///
+    /// `1e-6` on all eight rows today, and stated eight times anyway.
+    /// This was a generation `const NORM_EPS`, argued as "a
+    /// generation-level constant is an honest way to say that, where
+    /// eight copies of a literal invite one of them to drift" -- and it
+    /// is the one place this generation disagreed with its six llama-like
+    /// siblings, which all carry the field. `olmo_2` states the rule they
+    /// keep: it is *"a measurement of a checkpoint, and the next release
+    /// that changes it must change a number rather than break a rule."*
+    ///
+    /// The drift the constant was guarding against is CHECKED --
+    /// `tests/catalog_differential.rs` holds every row's epsilon against
+    /// that checkpoint's own `config.json`, so a copy that drifts fails.
+    /// What a constant does instead is make a real per-checkpoint
+    /// difference INEXPRESSIBLE, and a Qwen 3 release that moves the
+    /// epsilon would then be served at the old one: finite, plausible,
+    /// wrong.
+    pub norm_eps: f32,
     /// Sliding-window width, `-1` for full attention. Qwen 3 dense
     /// ships `sliding_window: null`.
     pub window: i32,
 }
-
-/// RMSNorm epsilon, shared by the whole generation.
-///
-/// Stated once rather than per row because every published Qwen 3
-/// config carries the same `1e-6` — a generation-level constant is an
-/// honest way to say that, where eight copies of a literal invite one
-/// of them to drift. The qwen-2 generation before it used `1e-5`, and
-/// that generation states its own.
-const NORM_EPS: f32 = 1e-6;
 
 /// The family label a GUEST PROGRAM matches on.
 ///
@@ -126,6 +136,7 @@ pub const VARIANTS: &[Qwen3] = &[
             qkv_bias: false,
         },
         rope_theta: 1_000_000.0,
+        norm_eps: 1e-6,
         window: -1,
     },
     // Qwen/Qwen3-1.7B — the same 28-layer geometry at twice the width.
@@ -152,6 +163,7 @@ pub const VARIANTS: &[Qwen3] = &[
             qkv_bias: false,
         },
         rope_theta: 1_000_000.0,
+        norm_eps: 1e-6,
         window: -1,
     },
     // Qwen/Qwen3-4B.
@@ -178,6 +190,7 @@ pub const VARIANTS: &[Qwen3] = &[
             qkv_bias: false,
         },
         rope_theta: 1_000_000.0,
+        norm_eps: 1e-6,
         window: -1,
     },
     // Qwen/Qwen3-8B — the first untied head in the generation.
@@ -204,6 +217,7 @@ pub const VARIANTS: &[Qwen3] = &[
             qkv_bias: false,
         },
         rope_theta: 1_000_000.0,
+        norm_eps: 1e-6,
         window: -1,
     },
     // Qwen/Qwen3-14B.
@@ -230,6 +244,7 @@ pub const VARIANTS: &[Qwen3] = &[
             qkv_bias: false,
         },
         rope_theta: 1_000_000.0,
+        norm_eps: 1e-6,
         window: -1,
     },
     // Qwen/Qwen3-32B.
@@ -256,6 +271,7 @@ pub const VARIANTS: &[Qwen3] = &[
             qkv_bias: false,
         },
         rope_theta: 1_000_000.0,
+        norm_eps: 1e-6,
         window: -1,
     },
     // Qwen/Qwen3-30B-A3B — a MIXTURE, and still llama-like: the
@@ -288,6 +304,7 @@ pub const VARIANTS: &[Qwen3] = &[
             qkv_bias: false,
         },
         rope_theta: 1_000_000.0,
+        norm_eps: 1e-6,
         window: -1,
     },
     // Qwen/Qwen3-235B-A22B.
@@ -314,19 +331,12 @@ pub const VARIANTS: &[Qwen3] = &[
             qkv_bias: false,
         },
         rope_theta: 1_000_000.0,
+        norm_eps: 1e-6,
         window: -1,
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&Qwen3` to `&dyn Variant`;
-/// the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Qwen3);
 
 impl Qwen3 {
     /// The scalars this row states, read ONCE.
@@ -338,7 +348,7 @@ impl Qwen3 {
     fn row(&self) -> project::RowScalars {
         project::RowScalars {
             rope_theta: self.rope_theta,
-            norm_eps: NORM_EPS,
+            norm_eps: self.norm_eps,
             window: self.window,
             rope_rescaled: false,
             // TRUE for every qwen3 row, dense and routed. `Qwen3-30B-A3B`
@@ -417,17 +427,16 @@ impl Variant for Qwen3 {
 
     /// This row's text, for whichever backend asked.
     ///
-    /// The epsilon is the generation CONSTANT and not a row field, for
-    /// the reason [`NORM_EPS`] gives: every published Qwen-3 config
-    /// states `1e-6`, and a row that could hold a different one would
-    /// be a row that can disagree with the generation for no reason a
-    /// checkpoint gave it.
+    /// The epsilon is the ROW's, like every other number here and like
+    /// every llama-like sibling's. It was a generation constant, on the
+    /// argument that a value eight configs agree on should be written
+    /// once; see [`Qwen3::norm_eps`] for why the agreement is a
+    /// measurement to repeat rather than a rule to encode.
     ///
     /// `rope_rescaled: false`: Qwen 3 publishes no `rope_scaling` in
     /// any release this table holds, dense or mixture. Its long-context
     /// story is YaRN applied at serve time, which is not a fact the
     /// weights carry.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,

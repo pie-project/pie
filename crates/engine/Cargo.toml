@@ -17,7 +17,6 @@ path = "src/lib.rs"
 # maps driver-reported model sites onto its vocabulary.
 model-compiler = { path = "../model-compiler" }
 driver-api = { path = "../driver-api" }
-driver-dummy = { path = "../driver-dummy" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
 # THE CUTOVER, DONE. This was `driver-cuda-new` beside a C++ `driver-cuda`
@@ -30,6 +29,14 @@ driver-cuda = { path = "../driver-cuda", optional = true }
 # written in the same language should cost. Its device half is
 # `#[cfg(target_vendor = "apple")]`, so the seam below is too.
 driver-metal = { path = "../driver-metal", optional = true }
+
+# The Rust Vulkan shell, and the checkpoint reader it deliberately does not
+# have. `driver-vulkan` keeps `model-loader` a DEV-dependency and proves the
+# closure with a test, because a driver that depended on a checkpoint format
+# would be a driver that could not be handed bytes. So the conversion runs
+# here, on the side that already reads checkpoints.
+driver-vulkan = { path = "../driver-vulkan", optional = true }
+model-loader = { path = "../model-loader", default-features = false, optional = true }
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7"
@@ -66,7 +73,7 @@ tokenizer = { path = "../tokenizer" }
 grammar = { path = "../grammar" }
 # `forward` for the site table, which traces a real declaration to work out
 # where a fire's hook sites are.
-model = { path = "../model", features = ["forward"] }
+model = { path = "../model" }
 rmp-serde = "1.3.1"
 blake3 = "1.8.5"
 num-traits = "0.2.19"
@@ -123,6 +130,29 @@ driver-cuda = ["dep:driver-cuda", "driver-cuda/cuda-13", "driver-cuda/abi"]
 # makes `driver_metal::gpu` an unresolved path IN THIS CRATE, which is the
 # better place to find out.
 driver-metal = ["dep:driver-metal", "driver-metal/metal-4"]
+# The Rust Vulkan shell's seam. A library call, like the Metal one, and gated
+# on the feature ALONE -- not on a target. Vulkan is a loader rather than a
+# platform: the same crate builds and runs on Linux, Windows and Android.
+#
+# `driver-vulkan/native` is not optional here for the same reason
+# `driver-metal/metal-4` is not: that crate has no default feature so its
+# portable half can be tested without a GPU, and a consumer that wants the
+# serving path has to say so. Omitting it makes `driver_vulkan::device` an
+# unresolved path IN THIS CRATE, which is the better place to find out.
+#
+# `model-loader` comes with it, because THIS crate loads the checkpoint for
+# that driver -- see `src/driver/backend/vulkan.rs` for why loading is on this
+# side of the seam and not the other.
+driver-vulkan = [
+    "dep:driver-vulkan",
+    "driver-vulkan/native",
+    "dep:model-loader",
+    # `catalog::identify`, `contract::author` and `boot::compile_load_plan_for`
+    # -- the identification and the load plan. This crate already takes
+    # `model` for `forward`; `contract` is the half that reads a publisher's
+    # checkpoint, and only this backend needs it.
+    "model/contract",
+]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in
@@ -141,16 +171,12 @@ tensor-ir = { path = "../tensor-ir" }
 # The same `model`, with the one row that is not a model. The mock harness
 # has to name a row because `model::register` resolves one; see
 # `tests/common/env.rs`'s `MOCK_MODEL_ID` and `model::test_rows`.
-model = { path = "../model", features = ["forward", "test-rows"] }
+model = { path = "../model", features = ["test-rows"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 # Benchmarks must allocate the way production does. Every engine entry point
 # links `worker`, which sets mimalloc as the global allocator; a bench that
 # omitted it would measure glibc malloc and report a machine nobody runs.
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
-
-[[bench]]
-name = "grammar_wit"
-harness = false
 
 #[profile.release]
 #lto = "fat"

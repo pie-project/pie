@@ -1,8 +1,19 @@
+//===-- quant_bf16_to_fp8.cu - the ahead-of-time entry points ------------===//
+//
+// Fourteen launchers and no device text. Every `__global__` this file fires
+// lives in `quant_bf16_to_fp8.cuh`, which the JIT compiles from the same
+// bytes -- see the header for why the split exists, why twelve kernels became
+// nine templates, what each `<<<>>>` became, and which three have no launch
+// rule.
+//
+// `model-loader` calls `quantize_bf16_to_fp8_e4m3_per_tensor`,
+// `quantize_bf16_to_fp8_e4m3_per_channel` and their int8 siblings by name
+// from Rust, so none of these entry points is going away.
+//
+//===----------------------------------------------------------------------===//
 #include "quant/quant_bf16_to_fp8.hpp"
 
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
+#include "quant/quant_bf16_to_fp8.cuh"
 #include "cuda_check.hpp"
 
 namespace pie_cuda_driver::kernels::quant {
@@ -10,276 +21,11 @@ namespace pie_cuda_driver::kernels::quant {
 namespace {
 
 constexpr int BLOCK = 256;
-constexpr float FP8_E4M3_MAX = 448.f;     // OCP MX spec: max representable
-constexpr float INT8_MAX_F   = 127.f;     // signed int8 symmetric range
 
-// ── Blockwise FP8 activation quantization (DeepSeek W8A8 block fp8) ──
-//
-// One CUDA block per (row, k-group).  `group_size` is 128 in every real
-// deployment, so a single warp-shuffle reduction over 128 lanes' worth of
-// values covers the group; we use a fixed 128-thread block and let each
-// thread own exactly one element when gs == 128.  Larger group sizes are
-// handled by striding.
-__global__ void quant_act_fp8_per_group_kernel(
-    const __nv_bfloat16* __restrict__ act,
-    __nv_fp8_storage_t*  __restrict__ out,
-    float*               __restrict__ scale_out,
-    int                               m,
-    int                               k,
-    int                               gs,
-    int                               n_groups)
-{
-    const int row = blockIdx.y;
-    const int g   = blockIdx.x;
-    if (row >= m || g >= n_groups) return;
-
-    const int   base  = g * gs;
-    const int   count = min(gs, k - base);
-    const std::size_t off = static_cast<std::size_t>(row) * k + base;
-
-    float amax = 0.f;
-    for (int i = threadIdx.x; i < count; i += blockDim.x) {
-        amax = fmaxf(amax, fabsf(__bfloat162float(act[off + i])));
-    }
-    __shared__ float warp_max[128 / 32];
-    const unsigned lane = threadIdx.x & 31;
-    const unsigned warp = threadIdx.x / 32;
-    for (int o = 16; o > 0; o >>= 1) {
-        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, o));
-    }
-    if (lane == 0) warp_max[warp] = amax;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float v = warp_max[0];
-        for (unsigned w = 1; w < blockDim.x / 32; ++w) v = fmaxf(v, warp_max[w]);
-        warp_max[0] = v;
-    }
-    __syncthreads();
-    amax = warp_max[0];
-
-    // scale (multiplicative, matching cuBLASLt's contract: value = fp8 * scale)
-    const float scale     = (amax > 0.f) ? (amax / FP8_E4M3_MAX) : 1.f;
-    const float scale_rcp = (amax > 0.f) ? (FP8_E4M3_MAX / amax) : 0.f;
-    if (threadIdx.x == 0) {
-        scale_out[static_cast<std::size_t>(row) * n_groups + g] = scale;
-    }
-    for (int i = threadIdx.x; i < count; i += blockDim.x) {
-        const float v = __bfloat162float(act[off + i]) * scale_rcp;
-        out[off + i] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
-    }
-}
-
-// Block-wide absmax via warp shuffles + shared-mem reduction. We do the
-// final atomic into the device scalar (one atomic per block, not per
-// thread) so the kernel stays scale-free on `n`.
-__global__ void absmax_bf16_kernel(
-    const __nv_bfloat16* __restrict__ W,
-    float*               __restrict__ out,
-    std::size_t                       n)
-{
-    __shared__ float warp_max[BLOCK / 32];
-    const unsigned tid    = threadIdx.x;
-    const unsigned warp   = tid / 32;
-    const unsigned lane   = tid & 31;
-    std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + tid;
-    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * BLOCK;
-
-    float local = 0.f;
-    for (; i < n; i += stride) {
-        const float v = fabsf(__bfloat162float(W[i]));
-        if (v > local) local = v;
-    }
-    // Warp reduction.
-    for (int off = 16; off > 0; off >>= 1) {
-        const float other = __shfl_down_sync(0xffffffff, local, off);
-        if (other > local) local = other;
-    }
-    if (lane == 0) warp_max[warp] = local;
-    __syncthreads();
-    // First warp reduces the per-warp results.
-    if (warp == 0) {
-        local = (tid < BLOCK / 32) ? warp_max[lane] : 0.f;
-        for (int off = 16; off > 0; off >>= 1) {
-            const float other = __shfl_down_sync(0xffffffff, local, off);
-            if (other > local) local = other;
-        }
-        if (lane == 0) atomicMax(reinterpret_cast<int*>(out),
-                                 __float_as_int(local));
-    }
-}
-
-__global__ void quant_bf16_to_fp8_kernel(
-    const __nv_bfloat16*    __restrict__ W,
-    __nv_fp8_storage_t*     __restrict__ out,
-    float                                 scale_inv,
-    std::size_t                           n)
-{
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    const float f = __bfloat162float(W[i]) * scale_inv;
-    // __nv_cvt_float_to_fp8 already saturates to ±448 for E4M3.
-    out[i] = __nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3);
-}
-
-// Stage 1: one block per row, output absmax per row to `absmax_out`.
-// Used by the TP-aware quant path so the host can all-reduce the
-// per-row absmax across ranks before computing the final scales.
-__global__ void absmax_per_row_kernel(
-    const __nv_bfloat16*    __restrict__ W,
-    float*                  __restrict__ absmax_out,  // [rows]
-    int                                   cols)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    extern __shared__ float warp_max[];
-
-    const std::size_t row_off = static_cast<std::size_t>(row) * cols;
-    float local = 0.f;
-    for (int j = tid; j < cols; j += BLOCK) {
-        const float v = fabsf(__bfloat162float(W[row_off + j]));
-        if (v > local) local = v;
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        const float other = __shfl_down_sync(0xffffffff, local, off);
-        if (other > local) local = other;
-    }
-    const int lane = tid & 31;
-    const int warp = tid / 32;
-    if (lane == 0) warp_max[warp] = local;
-    __syncthreads();
-    if (warp == 0) {
-        local = (tid < BLOCK / 32) ? warp_max[lane] : 0.f;
-        for (int off = 16; off > 0; off >>= 1) {
-            const float other = __shfl_down_sync(0xffffffff, local, off);
-            if (other > local) local = other;
-        }
-        if (lane == 0) absmax_out[row] = local;
-    }
-}
-
-// Convert per-row absmax → weight_scale_inv = absmax / FP8_MAX in place.
-__global__ void absmax_to_scale_inv_kernel(float* x, int n) {
-    const int i = blockIdx.x * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    const float v = x[i];
-    x[i] = (v > 0.f) ? (v / FP8_E4M3_MAX) : 1.f;
-}
-
-// INT8 variant: convert per-row absmax → scale_inv = absmax / 127.
-__global__ void absmax_to_scale_inv_int8_kernel(float* x, int n) {
-    const int i = blockIdx.x * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    const float v = x[i];
-    x[i] = (v > 0.f) ? (v / INT8_MAX_F) : 1.f;
-}
-
-// Cast bf16 → int8 using a precomputed per-row scale_inv. Mirrors the
-// FP8 cast but stores int8 with INT8_MAX_F saturation.
-__global__ void cast_per_channel_int8_kernel(
-    const __nv_bfloat16* __restrict__ W,
-    std::int8_t*         __restrict__ out,
-    const float*         __restrict__ scale_inv_dev,
-    int                                cols)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const float scale_inv = scale_inv_dev[row];
-    const float quant = (scale_inv > 0.f) ? (1.f / scale_inv) : 0.f;
-    const std::size_t row_off = static_cast<std::size_t>(row) * cols;
-    for (int j = tid; j < cols; j += BLOCK) {
-        const float f = __bfloat162float(W[row_off + j]) * quant;
-        int q = static_cast<int>(rintf(f));
-        if (q > 127)  q = 127;
-        if (q < -128) q = -128;
-        out[row_off + j] = static_cast<std::int8_t>(q);
-    }
-}
-
-__global__ void dequant_int8_per_channel_kernel(
-    const std::int8_t* __restrict__ W,
-    __nv_bfloat16*     __restrict__ out,
-    const float*       __restrict__ scale_inv_dev,
-    int                              cols,
-    std::size_t                      n)
-{
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    const int row = static_cast<int>(i / static_cast<std::size_t>(cols));
-    const float scale_inv = scale_inv_dev[row];
-    const float f = static_cast<float>(W[i]) * scale_inv;
-    out[i] = __float2bfloat16(f);
-}
-
-// Stage 2: cast `[rows, cols]` bf16 → fp8 using per-row weight_scale_inv.
-__global__ void cast_per_channel_kernel(
-    const __nv_bfloat16*    __restrict__ W,
-    __nv_fp8_storage_t*     __restrict__ out,
-    const float*            __restrict__ scale_inv,  // [rows]
-    int                                   cols)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const float s = scale_inv[row];
-    const float s_recip = (s > 0.f) ? (1.f / s) : 0.f;
-    const std::size_t row_off = static_cast<std::size_t>(row) * cols;
-    for (int j = tid; j < cols; j += BLOCK) {
-        const float f = __bfloat162float(W[row_off + j]) * s_recip;
-        out[row_off + j] = __nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3);
-    }
-}
-
-// One block per row. Threads in the block cooperatively absmax the row
-// (warp shuffle + shared mem reduction), pick `scale_inv_row = fp8_max /
-// max(absmax, eps)`, then cast each element. We emit BOTH the fp8 row
-// and `weight_scale_inv = absmax / fp8_max` (the multiplicative factor
-// the GEMM dispatcher will hand cuBLASLt) — splitting the work means
-// the dispatcher never has to compute reciprocals at runtime.
-__global__ void quant_per_channel_kernel(
-    const __nv_bfloat16*    __restrict__ W,
-    __nv_fp8_storage_t*     __restrict__ out,
-    float*                  __restrict__ scale_inv,   // [rows]
-    int                                  cols)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    extern __shared__ float warp_max[];
-
-    const std::size_t row_off = static_cast<std::size_t>(row) * cols;
-    float local = 0.f;
-    for (int j = tid; j < cols; j += BLOCK) {
-        const float v = fabsf(__bfloat162float(W[row_off + j]));
-        if (v > local) local = v;
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        const float other = __shfl_down_sync(0xffffffff, local, off);
-        if (other > local) local = other;
-    }
-    const int lane = tid & 31;
-    const int warp = tid / 32;
-    if (lane == 0) warp_max[warp] = local;
-    __syncthreads();
-    float row_max;
-    if (warp == 0) {
-        local = (tid < BLOCK / 32) ? warp_max[lane] : 0.f;
-        for (int off = 16; off > 0; off >>= 1) {
-            const float other = __shfl_down_sync(0xffffffff, local, off);
-            if (other > local) local = other;
-        }
-        if (lane == 0) warp_max[0] = local;
-    }
-    __syncthreads();
-    row_max = warp_max[0];
-
-    // Degenerate row → scale_inv = 1, all-zero fp8.
-    const float fp8_inv = (row_max > 0.f) ? (FP8_E4M3_MAX / row_max) : 1.f;
-    const float weight_scale_inv = (row_max > 0.f) ? (row_max / FP8_E4M3_MAX) : 1.f;
-    if (tid == 0) scale_inv[row] = weight_scale_inv;
-
-    for (int j = tid; j < cols; j += BLOCK) {
-        const float f = __bfloat162float(W[row_off + j]) * fp8_inv;
-        out[row_off + j] = __nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3);
-    }
-}
+// `LaunchRule::Rms` requests exactly this: one float per warp of a 256-wide
+// block. The rule and this expression are the same arithmetic, stated in the
+// two places that must agree while both paths run.
+constexpr std::size_t ROW_REDUCE_SHMEM = (BLOCK / 32) * sizeof(float);
 
 }  // namespace
 
@@ -293,102 +39,40 @@ void launch_absmax_bf16(
     // and keeps the atomic contention bounded.
     const unsigned blocks_full = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
     const unsigned blocks = blocks_full < 1024u ? blocks_full : 1024u;
-    absmax_bf16_kernel<<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(W_bf16), absmax_dev, n);
+    device::absmax_bf16<<<blocks, BLOCK, 0, stream>>>(
+        static_cast<const device::bf16*>(W_bf16), absmax_dev, n);
 }
 
 void launch_quant_bf16_to_fp8_e4m3(
-    const void* W_bf16, std::uint8_t* W_fp8,
+    const void* W_bf16, device::u8* W_fp8,
     float scale_inv, std::size_t n, cudaStream_t stream)
 {
     if (n == 0) return;
     const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    quant_bf16_to_fp8_kernel<<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(W_bf16),
-        reinterpret_cast<__nv_fp8_storage_t*>(W_fp8),
-        scale_inv, n);
+    device::quant_flat<device::fp8_e4m3><<<blocks, BLOCK, 0, stream>>>(
+        static_cast<const device::bf16*>(W_bf16), W_fp8, scale_inv, n);
 }
 
 void quantize_bf16_to_fp8_e4m3_per_channel(
-    const void* W_bf16, std::uint8_t* W_fp8,
+    const void* W_bf16, device::u8* W_fp8,
     float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
 {
     if (rows == 0 || cols == 0) return;
-    const std::size_t shmem = (BLOCK / 32) * sizeof(float);
-    quant_per_channel_kernel<<<rows, BLOCK, shmem, stream>>>(
-        static_cast<const __nv_bfloat16*>(W_bf16),
-        reinterpret_cast<__nv_fp8_storage_t*>(W_fp8),
-        scale_inv_dev, cols);
+    device::quant_per_channel<device::fp8_e4m3>
+        <<<rows, BLOCK, ROW_REDUCE_SHMEM, stream>>>(
+            static_cast<const device::bf16*>(W_bf16),
+            W_fp8, scale_inv_dev, cols);
 }
-
-namespace {
-
-// One block per row: warp-shuffle absmax → cast bf16 → int8 with
-// per-row scale. Mirrors `quant_per_channel_kernel` but stores int8
-// instead of fp8 and uses INT8_MAX_F for the saturation point.
-__global__ void quant_int8_per_channel_kernel(
-    const __nv_bfloat16* __restrict__ W,
-    std::int8_t*         __restrict__ out,
-    float*               __restrict__ scale_inv,
-    int                                cols)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    extern __shared__ float warp_max[];
-
-    const std::size_t row_off = static_cast<std::size_t>(row) * cols;
-    float local = 0.f;
-    for (int j = tid; j < cols; j += BLOCK) {
-        const float v = fabsf(__bfloat162float(W[row_off + j]));
-        if (v > local) local = v;
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        const float other = __shfl_down_sync(0xffffffff, local, off);
-        if (other > local) local = other;
-    }
-    const int lane = tid & 31;
-    const int warp = tid / 32;
-    if (lane == 0) warp_max[warp] = local;
-    __syncthreads();
-    float row_max;
-    if (warp == 0) {
-        local = (tid < BLOCK / 32) ? warp_max[lane] : 0.f;
-        for (int off = 16; off > 0; off >>= 1) {
-            const float other = __shfl_down_sync(0xffffffff, local, off);
-            if (other > local) local = other;
-        }
-        if (lane == 0) warp_max[0] = local;
-    }
-    __syncthreads();
-    row_max = warp_max[0];
-    const float int_inv = (row_max > 0.f) ? (INT8_MAX_F / row_max) : 1.f;
-    const float weight_scale_inv = (row_max > 0.f)
-        ? (row_max / INT8_MAX_F)
-        : 1.f;
-    if (tid == 0) scale_inv[row] = weight_scale_inv;
-
-    for (int j = tid; j < cols; j += BLOCK) {
-        const float f = __bfloat162float(W[row_off + j]) * int_inv;
-        // Symmetric round-half-to-even is the sane default; rintf is
-        // round-to-nearest-even.
-        int q = static_cast<int>(rintf(f));
-        if (q > 127) q = 127;
-        if (q < -128) q = -128;
-        out[row_off + j] = static_cast<std::int8_t>(q);
-    }
-}
-
-}  // namespace
 
 void quantize_bf16_to_int8_per_channel(
-    const void* W_bf16, std::int8_t* W_int8,
+    const void* W_bf16, device::i8* W_int8,
     float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
 {
     if (rows == 0 || cols == 0) return;
-    const std::size_t shmem = (BLOCK / 32) * sizeof(float);
-    quant_int8_per_channel_kernel<<<rows, BLOCK, shmem, stream>>>(
-        static_cast<const __nv_bfloat16*>(W_bf16),
-        W_int8, scale_inv_dev, cols);
+    device::quant_per_channel<device::int8_sym>
+        <<<rows, BLOCK, ROW_REDUCE_SHMEM, stream>>>(
+            static_cast<const device::bf16*>(W_bf16),
+            W_int8, scale_inv_dev, cols);
 }
 
 // Per-token activation INT8 quant is mathematically the same op as
@@ -396,7 +80,7 @@ void quantize_bf16_to_int8_per_channel(
 // row-major buffer, producing one scale_inv per row. Reuse the same
 // kernel — only the semantic naming differs.
 void quantize_bf16_to_int8_per_token(
-    const void* act_bf16, std::int8_t* act_int8,
+    const void* act_bf16, device::i8* act_int8,
     float* act_scale_inv, int n_tokens, int k, cudaStream_t stream)
 {
     quantize_bf16_to_int8_per_channel(
@@ -408,61 +92,34 @@ void launch_absmax_to_scale_inv_int8(
 {
     if (rows == 0) return;
     const int blocks = (rows + BLOCK - 1) / BLOCK;
-    absmax_to_scale_inv_int8_kernel<<<blocks, BLOCK, 0, stream>>>(
+    device::absmax_to_scale_inv<device::int8_sym><<<blocks, BLOCK, 0, stream>>>(
         absmax_inout, rows);
 }
 
 void launch_cast_bf16_to_int8_per_channel(
-    const void* W_bf16, std::int8_t* W_int8,
+    const void* W_bf16, device::i8* W_int8,
     const float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
 {
     if (rows == 0 || cols == 0) return;
-    cast_per_channel_int8_kernel<<<rows, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(W_bf16),
+    device::cast_per_channel<device::int8_sym><<<rows, BLOCK, 0, stream>>>(
+        static_cast<const device::bf16*>(W_bf16),
         W_int8, scale_inv_dev, cols);
 }
 
 void launch_dequant_int8_to_bf16_per_channel(
-    const std::int8_t* W_int8, void* W_bf16,
+    const device::i8* W_int8, void* W_bf16,
     const float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
 {
     if (rows == 0 || cols == 0) return;
     const std::size_t n =
         static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
     const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    dequant_int8_per_channel_kernel<<<blocks, BLOCK, 0, stream>>>(
-        W_int8,
-        static_cast<__nv_bfloat16*>(W_bf16),
-        scale_inv_dev,
-        cols,
-        n);
+    device::dequant_int8_per_channel<device::bf16><<<blocks, BLOCK, 0, stream>>>(
+        W_int8, static_cast<device::bf16*>(W_bf16), scale_inv_dev, cols, n);
 }
-
-namespace {
-
-// W8A8 post-GEMM dequant: bf16[m,n] = int32[m,n] * act_inv[m] * w_inv[n].
-// One thread per output element. Bandwidth-bound; no need to fuse with
-// the GEMM since cuBLAS writes the int32 accumulator and we just scale
-// it row × column afterwards.
-__global__ void w8a8_dequant_kernel(
-    const std::int32_t* __restrict__ acc,
-    const float*        __restrict__ act_inv,
-    const float*        __restrict__ w_inv,
-    __nv_bfloat16*      __restrict__ out,
-    int                                M,
-    int                                N)
-{
-    const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (n >= N || m >= M) return;
-    const float v = static_cast<float>(acc[m * N + n]) * act_inv[m] * w_inv[n];
-    out[m * N + n] = __float2bfloat16(v);
-}
-
-}  // namespace
 
 void dequant_int32_w8a8_to_bf16(
-    const std::int32_t* acc_int32, const float* act_scale_inv,
+    const device::i32* acc_int32, const float* act_scale_inv,
     const float* w_scale_inv, void* out_bf16,
     int M, int N, cudaStream_t stream)
 {
@@ -470,9 +127,9 @@ void dequant_int32_w8a8_to_bf16(
     constexpr int BX = 32, BY = 8;
     const dim3 block(BX, BY);
     const dim3 grid((N + BX - 1) / BX, (M + BY - 1) / BY);
-    w8a8_dequant_kernel<<<grid, block, 0, stream>>>(
+    device::w8a8_dequant<<<grid, block, 0, stream>>>(
         acc_int32, act_scale_inv, w_scale_inv,
-        static_cast<__nv_bfloat16*>(out_bf16), M, N);
+        static_cast<device::bf16*>(out_bf16), M, N);
 }
 
 void launch_absmax_per_row_bf16(
@@ -480,9 +137,9 @@ void launch_absmax_per_row_bf16(
     int rows, int cols, cudaStream_t stream)
 {
     if (rows == 0 || cols == 0) return;
-    const std::size_t shmem = (BLOCK / 32) * sizeof(float);
-    absmax_per_row_kernel<<<rows, BLOCK, shmem, stream>>>(
-        static_cast<const __nv_bfloat16*>(W_bf16), absmax_dev, cols);
+    device::absmax_per_row<device::bf16>
+        <<<rows, BLOCK, ROW_REDUCE_SHMEM, stream>>>(
+            static_cast<const device::bf16*>(W_bf16), absmax_dev, cols);
 }
 
 void launch_absmax_to_scale_inv(
@@ -490,23 +147,22 @@ void launch_absmax_to_scale_inv(
 {
     if (rows == 0) return;
     const auto blocks = static_cast<unsigned>((rows + BLOCK - 1) / BLOCK);
-    absmax_to_scale_inv_kernel<<<blocks, BLOCK, 0, stream>>>(
+    device::absmax_to_scale_inv<device::fp8_e4m3><<<blocks, BLOCK, 0, stream>>>(
         absmax_inout, rows);
 }
 
 void launch_cast_bf16_to_fp8_e4m3_per_channel(
-    const void* W_bf16, std::uint8_t* W_fp8,
+    const void* W_bf16, device::u8* W_fp8,
     const float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
 {
     if (rows == 0 || cols == 0) return;
-    cast_per_channel_kernel<<<rows, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(W_bf16),
-        reinterpret_cast<__nv_fp8_storage_t*>(W_fp8),
-        scale_inv_dev, cols);
+    device::cast_per_channel<device::fp8_e4m3><<<rows, BLOCK, 0, stream>>>(
+        static_cast<const device::bf16*>(W_bf16),
+        W_fp8, scale_inv_dev, cols);
 }
 
 float quantize_bf16_to_fp8_e4m3_per_tensor(
-    const void* W_bf16, std::uint8_t* W_fp8,
+    const void* W_bf16, device::u8* W_fp8,
     std::size_t n, cudaStream_t stream)
 {
     if (n == 0) return 1.f;
@@ -534,15 +190,19 @@ float quantize_bf16_to_fp8_e4m3_per_tensor(
     // We pick `weight_scale_inv` such that bf16 ≈ fp8 * weight_scale_inv,
     // i.e. weight_scale_inv = absmax / fp8_max. The cast multiplies by
     // the reciprocal:  fp8 = round(bf16 * (fp8_max / absmax)).
-    const float weight_scale_inv = absmax / FP8_E4M3_MAX;
-    const float scale_inv        = FP8_E4M3_MAX / absmax;
+    //
+    // The saturation point comes from the format tag rather than a local
+    // constant, so the host's scale and the device's clamp cannot disagree.
+    const float fp8_max = device::fp8_e4m3::max_abs();
+    const float weight_scale_inv = absmax / fp8_max;
+    const float scale_inv        = fp8_max / absmax;
     launch_quant_bf16_to_fp8_e4m3(W_bf16, W_fp8, scale_inv, n, stream);
     return weight_scale_inv;
 }
 
 void quantize_bf16_to_fp8_e4m3_per_token_group(
     const void*    act_bf16,
-    std::uint8_t*  act_fp8,
+    device::u8*  act_fp8,
     float*         act_scale,
     int            m,
     int            k,
@@ -552,10 +212,9 @@ void quantize_bf16_to_fp8_e4m3_per_token_group(
     if (m <= 0 || k <= 0 || group_size <= 0) return;
     const int n_groups = (k + group_size - 1) / group_size;
     const dim3 grid(static_cast<unsigned>(n_groups), static_cast<unsigned>(m));
-    quant_act_fp8_per_group_kernel<<<grid, 128, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(act_bf16),
-        reinterpret_cast<__nv_fp8_storage_t*>(act_fp8),
-        act_scale, m, k, group_size, n_groups);
+    device::quant_act_fp8_per_group<<<grid, 128, 0, stream>>>(
+        static_cast<const device::bf16*>(act_bf16),
+        act_fp8, act_scale, m, k, group_size, n_groups);
     CUDA_CHECK(cudaGetLastError());
 }
 

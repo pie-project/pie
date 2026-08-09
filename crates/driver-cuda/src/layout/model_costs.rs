@@ -144,17 +144,17 @@ impl ModelCosts for CheckpointCosts {
     /// a token budget". It had no caller.
     fn per_kv_token_bytes(&self) -> u64 {
         // DSV4 CARRIES A COMPRESSOR CACHE BESIDE ITS KV, and it is charged
-        // per token like the rest. `dsv4_geometry::compress_bytes_per_token`'s
+        // per token like the rest. `compressed_plane_geometry::compress_bytes_per_token`'s
         // own doc says where it belongs: "This is what the memory planner adds
         // on top of the KV cache for a V4 model." It had no caller either.
         //
         // A checkpoint that states no ratios adds zero, which is every family
         // but this one.
         let ratios: &[i32] = match &self.dep.kv {
-            model::deployment::KvStyle::Dsv4 { ratios } => ratios,
+            model::deployment::KvStyle::CompressedPlane { ratios } => ratios,
             model::deployment::KvStyle::Paged | model::deployment::KvStyle::Mla { .. } => &[],
         };
-        let compress = super::dsv4_geometry::compress_bytes_per_token(
+        let compress = super::compressed_plane_geometry::compress_bytes_per_token(
             ratios,
             u32::try_from(self.head_dim()).unwrap_or(0),
         );
@@ -292,7 +292,11 @@ mod tests {
             head_dim: 128,
             head_dim_kernel: 128,
             intermediate: 3072,
+            // Dense: no router, so no per-token expert count and no shared
+            // FFN beside one.
             moe_intermediate: 0,
+            experts_per_token: 0,
+            shared_intermediate: 0,
             vocab: 151_936,
         };
         d.attention = (0..28)
@@ -327,6 +331,9 @@ mod tests {
             v_h: 32,
             k_d: 128,
             v_d: 128,
+            // Mamba-2's grouping, which a GDN slab does not have — the same
+            // zero `kimi_k3` and `qwen_3_5` state.
+            n_groups: 0,
             conv_dim: (2 * key_width + value_width) as i32,
             conv_k: 4,
         }
@@ -459,7 +466,7 @@ mod tests {
         let plain = CheckpointCosts::new(&qwen3_0_6b(), 1).per_kv_token_bytes();
 
         let mut d = qwen3_0_6b();
-        d.kv = KvStyle::Dsv4 {
+        d.kv = KvStyle::CompressedPlane {
             ratios: vec![4, 4, 4],
         };
         let with_compressor = CheckpointCosts::new(&d, 1).per_kv_token_bytes();

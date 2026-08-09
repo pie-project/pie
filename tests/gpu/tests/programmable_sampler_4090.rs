@@ -29,7 +29,7 @@ use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Capability assertions (hotel — unit-tested standalone in
-// `crates/engine/tests/sampler_assert.rs` against golf's locked JSON schema; here they
+// the engine's deleted sampler_assert test against golf's locked JSON schema; here they
 // run on real on-GPU output). Model-independent: they check the *property*, not
 // token ids.
 // ---------------------------------------------------------------------------

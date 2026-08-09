@@ -9,7 +9,15 @@
   #include <cuda.h>
   #include <cuda_fp16.h>
   #include <cuda_runtime.h>
+  // PIE: `<iostream>` reaches nothing in this header -- no `std::cout`, no
+  // `operator<<`, nothing below the guard names it -- and it is the one
+  // include here NVRTC cannot answer. `<cuda.h>` and `<cuda_runtime.h>`
+  // resolve against the carried set (`kernels-cuda-new/csrc/vendor`), and the
+  // three device headers are the shims proved bit-identical over 39,847,842
+  // comparisons (new-horizon.md §15.2).
+  #ifndef __CUDACC_RTC__
   #include <iostream>
+  #endif
 
   // Stub for `torch::Tensor` references that may leak into headers we don't
   // touch. The runtime path never instantiates them — they're only present

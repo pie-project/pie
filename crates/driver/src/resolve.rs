@@ -404,7 +404,7 @@ fn resolve_inner(
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use driver_api::plan::{LaunchChannel, LaunchStage, LaunchStagePlan};
     use tensor_ir::registry::Stage;
@@ -469,13 +469,13 @@ mod tests {
             plans: vec![LaunchStagePlan::default()],
         };
         let plan = adopt_launch_package(package).expect("well-formed");
-        let rings: Vec<Rc<ChannelState>> = channels
+        let rings: Vec<Arc<ChannelState>> = channels
             .iter()
             .zip(cells)
             .map(|(declared, cell)| {
                 let dtype = super::super::value::concrete_dtype(declared.dtype);
                 let lanes = declared.shape.first().copied().unwrap_or(1) as usize;
-                let ring = Rc::new(ChannelState::host(dtype, lanes, 1));
+                let ring = Arc::new(ChannelState::host(dtype, lanes, 1));
                 if let Some(value) = cell {
                     assert!(
                         ring.push(value),

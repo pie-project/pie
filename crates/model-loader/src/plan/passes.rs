@@ -23,6 +23,7 @@ use crate::plan::pass::{Pass, Stage};
 mod arena;
 mod memory;
 mod rewrite;
+mod stage;
 pub mod tile;
 mod validate;
 
@@ -42,6 +43,18 @@ pub fn all() -> &'static [Pass] {
             stage: Stage::Rewrite,
             run: arena::assign_persistent_offsets,
         },
+        // After the resident layout, because a staging buffer goes BEHIND the
+        // resident tensors and needs to know where they end; before the
+        // coalescing, because the writes it emits are ordinary buffer-relative
+        // ones and it is the coalescer's job to decide what becomes a bulk
+        // arena write. (It decides "not these": a staging write must stay
+        // beside the transform that reads it, and `hoist-bulk-arena-writes`
+        // moves every bulk write to the front.)
+        Pass {
+            name: "stage-device-transforms",
+            stage: Stage::Rewrite,
+            run: stage::stage_device_transforms,
+        },
         Pass {
             name: "coalesce-persistent-arena-writes",
             stage: Stage::Rewrite,
@@ -56,6 +69,13 @@ pub fn all() -> &'static [Pass] {
             name: "recompute-memory-plan",
             stage: Stage::Rewrite,
             run: memory::recompute_memory_plan,
+        },
+        // LAST of the rewrites, and that is what makes the checks below able
+        // to speak about a kernel at all: this is what names them.
+        Pass {
+            name: "lower-backend-tiling",
+            stage: Stage::Rewrite,
+            run: tile::lower_backend_tiling,
         },
         Pass {
             name: "validate-fill-order",
@@ -76,6 +96,11 @@ pub fn all() -> &'static [Pass] {
             name: "validate-persistent-layout",
             stage: Stage::Check,
             run: validate::validate_persistent_layout,
+        },
+        Pass {
+            name: "validate-kernel-operands",
+            stage: Stage::Check,
+            run: validate::validate_kernel_operands,
         },
     ]
 }

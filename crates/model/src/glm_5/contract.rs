@@ -153,3 +153,314 @@ fn bf16_kv_b_proj(b: &mut Builder<'_>) -> Result<(), Error> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::LoadShape;
+    use crate::encoding::Encoding as StoredEncoding;
+    use crate::shared::policy::Policy;
+    use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
+    use model_loader::contract::ModelContract;
+    use model_loader::plan::StorageTarget;
+
+    const HIDDEN: i64 = 512;
+    const LATENT: i64 = 128;
+
+    fn fp8() -> Encoding {
+        Encoding::Raw(DType::F8E4M3)
+    }
+
+    fn f32e() -> Encoding {
+        Encoding::Raw(DType::F32)
+    }
+
+    fn bf16() -> Encoding {
+        Encoding::Raw(DType::BF16)
+    }
+
+    fn tensor(id: u32, name: &str, shape: Vec<i64>, encoding: Encoding) -> RawTensor {
+        use model_loader::types::{FileId, TensorId};
+        RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 0,
+            shape,
+            encoding,
+        }
+    }
+
+    /// One layer's `kv_b_proj` and whatever factors came with it.
+    fn checkpoint(weight: Encoding, factors: Option<(&str, Vec<i64>, Encoding)>) -> Vec<RawTensor> {
+        let mut ck = vec![tensor(
+            1,
+            "model.layers.0.self_attn.kv_b_proj.weight",
+            vec![HIDDEN, LATENT],
+            weight,
+        )];
+        if let Some((suffix, shape, encoding)) = factors {
+            ck.push(tensor(
+                2,
+                &format!("model.layers.0.self_attn.kv_b_proj.{suffix}"),
+                shape,
+                encoding,
+            ));
+        }
+        ck
+    }
+
+    fn author_over(tensors: Vec<RawTensor>) -> ModelContract {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors,
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let encoding = StoredEncoding::dense();
+        let policy = Policy::default();
+        let mut b = Builder::new(
+            &meta,
+            "glm-5-test",
+            LoadShape::mixture(1, 0, 2, true),
+            &encoding,
+            &target,
+            &policy,
+        );
+        bf16_kv_b_proj(&mut b).expect("the pass does not refuse");
+        b.publish_remaining().expect("the tail publishes");
+        b.finish().expect("the contract compiles")
+    }
+
+    /// What the contract declares, and in what encoding.
+    fn declared(contract: &ModelContract) -> Vec<(String, Encoding)> {
+        contract
+            .tensors
+            .iter()
+            .map(|t| (t.name.clone(), t.encoding.clone()))
+            .collect()
+    }
+
+    /// Whether the factors are still a tensor the DRIVER binds.
+    ///
+    /// When the pass claims the pair it declares the scale `Internal` --
+    /// the plan still materializes it, because the dequantize term reads
+    /// it, but no bind path looks it up. An unclaimed scale is published
+    /// `Public` by `publish_remaining` instead.
+    ///
+    /// This is the only thing that can tell a claimed BF16 weight from an
+    /// unclaimed one, because both are DECLARED bf16 -- one by this pass
+    /// and one by the generic path.
+    fn scale_is_bound_by_the_driver(contract: &ModelContract) -> bool {
+        contract.tensors.iter().any(|t| {
+            t.name.contains("scale") && t.visibility == model_loader::contract::Visibility::Public
+        })
+    }
+
+    fn kv_b_proj(contract: &ModelContract) -> Option<Encoding> {
+        declared(contract)
+            .into_iter()
+            .find(|(name, _)| name.ends_with("kv_b_proj.weight"))
+            .map(|(_, encoding)| encoding)
+    }
+
+    /// The shipped FP8 is consumed and a BF16 tensor is what the kernel binds.
+    ///
+    /// This is the whole reason the pass exists: the kimi_mla kernels this
+    /// family shares read `kv_b_proj` as BF16 and there is no FP8 variant,
+    /// so if this pass does nothing the bind gets a tensor its kernel
+    /// cannot read.
+    #[test]
+    fn an_fp8_kv_b_proj_is_published_as_the_bf16_the_kernel_reads() {
+        let contract = author_over(checkpoint(
+            fp8(),
+            Some(("weight_scale_inv", vec![HIDDEN / 128, LATENT / 128], f32e())),
+        ));
+        assert_eq!(
+            kv_b_proj(&contract),
+            Some(bf16()),
+            "the FP8 weight is dequantized at load, not bound as it shipped"
+        );
+        assert!(
+            !scale_is_bound_by_the_driver(&contract),
+            "the factors became the term's own operand, not something the \
+             bind path looks up"
+        );
+    }
+
+    /// A BF16 checkpoint gets no pass at all.
+    ///
+    /// The generic dense path already publishes it, and running the
+    /// dequantize term over a tensor that is already BF16 would be a copy
+    /// of the largest attention weight in the model for nothing.
+    /// A BF16 checkpoint gets no pass, even when factors are lying beside it.
+    ///
+    /// The fixture ships the scale on purpose. Without it the encoding
+    /// check is unfalsifiable: a BF16 weight run through the dequantize
+    /// term would be declared BF16 too, which is what it already was, and
+    /// only the CONSUMED scale says which of the two published it.
+    #[test]
+    fn a_bf16_checkpoint_is_left_to_the_generic_path() {
+        let contract = author_over(checkpoint(
+            bf16(),
+            Some(("weight_scale_inv", vec![HIDDEN / 128, LATENT / 128], f32e())),
+        ));
+        assert_eq!(
+            kv_b_proj(&contract),
+            Some(bf16()),
+            "it is still published -- by `publish_remaining`, not by this pass"
+        );
+        assert!(
+            scale_is_bound_by_the_driver(&contract),
+            "the pass did not claim the pair, so the factors are still a \
+             tensor the driver binds"
+        );
+    }
+
+    /// Both spellings of the blocking are the same term.
+    ///
+    /// GLM-5.1 ships a DeepSeek-style square block, one factor per 128x128
+    /// tile. Other exports of the same architecture ship one factor per
+    /// output channel, as a RANK-1 vector. `scale_per_block` reads the
+    /// blocking off the ratio of the two shapes, so the rank-1 case only
+    /// has to be reshaped to `[rows, 1]` -- the same bytes under the rank
+    /// the pairing needs.
+    #[test]
+    fn a_per_channel_vector_and_a_square_block_both_pair() {
+        for (what, shape) in [
+            ("a square block", vec![HIDDEN / 128, LATENT / 128]),
+            ("a per-channel vector", vec![HIDDEN]),
+        ] {
+            let contract =
+                author_over(checkpoint(fp8(), Some(("weight_scale_inv", shape, f32e()))));
+            assert_eq!(
+                kv_b_proj(&contract),
+                Some(bf16()),
+                "{what} names the blocking and the pass pairs with it"
+            );
+        }
+    }
+
+    /// Three spellings of the factor name, and the pass finds each.
+    ///
+    /// `_scale_inv` is DeepSeek's, `_scale` is the compressed-tensors one,
+    /// and a bare `.scale` hangs off the module rather than off `.weight`.
+    /// An export whose spelling this pass does not know does not fail --
+    /// it falls through to the generic path and binds FP8 to a kernel that
+    /// reads BF16, which is why each spelling is stated.
+    #[test]
+    fn every_spelling_of_the_scale_is_found() {
+        for suffix in ["weight_scale_inv", "weight_scale", "scale"] {
+            let contract = author_over(checkpoint(
+                fp8(),
+                Some((suffix, vec![HIDDEN / 128, LATENT / 128], f32e())),
+            ));
+            assert_eq!(
+                kv_b_proj(&contract),
+                Some(bf16()),
+                "`{suffix}` is a spelling this pass reads"
+            );
+        }
+    }
+
+    /// An FP8 weight with no factors anywhere is not claimed.
+    ///
+    /// There is nothing to dequantize WITH, so the pass declines and the
+    /// generic path publishes what shipped. Stated because the alternative
+    /// -- refusing the load -- would reject a checkpoint some other pass
+    /// may be able to serve.
+    #[test]
+    fn an_fp8_weight_with_no_factors_is_left_alone() {
+        let contract = author_over(checkpoint(fp8(), None));
+        assert_eq!(
+            kv_b_proj(&contract),
+            Some(fp8()),
+            "unpaired FP8 is published as it shipped rather than refused"
+        );
+    }
+
+    /// The whole author runs the pass, not just this test.
+    ///
+    /// Every other test here calls `bf16_kv_b_proj` directly, so deleting
+    /// the call from [`author_glm5`] left all of them green -- the pass
+    /// worked perfectly and nothing ran it. That is the shape the failure
+    /// would really take: FP8 `kv_b_proj` bound to a kimi_mla kernel that
+    /// reads BF16, which is wrong numbers rather than a load error.
+    ///
+    /// It does NOT pin the order against `allow_bf16_runtime_quant`,
+    /// though the author's comment reads as if something should: swapping
+    /// the two lines is invisible here, and correctly so. That call only
+    /// sets a flag, which is read by a later pass, so both orderings still
+    /// have this pass consume the FP8 pair before anything can act on the
+    /// flag. Pinning it would need a fixture that requests a re-quant, and
+    /// the ordering that would then matter is this pass against the
+    /// CONSUMER of the flag rather than against its setter.
+    #[test]
+    fn the_author_itself_runs_the_pass() {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: checkpoint(
+                fp8(),
+                Some(("weight_scale_inv", vec![HIDDEN / 128, LATENT / 128], f32e())),
+            ),
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let encoding = StoredEncoding::dense();
+        let policy = Policy::default();
+        let mut b = Builder::new(
+            &meta,
+            "glm-5-test",
+            LoadShape::mixture(1, 0, 2, true),
+            &encoding,
+            &target,
+            &policy,
+        );
+        author_glm5(&mut b).expect("the author does not refuse");
+        let contract = b.finish().expect("the contract compiles");
+        assert_eq!(
+            kv_b_proj(&contract),
+            Some(bf16()),
+            "the author reaches the pass; without the call the kernel gets \
+             the FP8 it cannot read"
+        );
+        assert!(
+            !scale_is_bound_by_the_driver(&contract),
+            "and the pair was consumed by THIS pass rather than left for a \
+             later one"
+        );
+    }
+
+    /// The factors have to be F32, and the weight has to be a matrix.
+    ///
+    /// Both are what `scale_per_block` assumes and neither is checked
+    /// downstream: a rank-1 weight has no axis to shard and an integer
+    /// factor is not a multiplier.
+    #[test]
+    fn a_pairing_the_term_cannot_express_is_declined_rather_than_built() {
+        let bad_factor_type = author_over(checkpoint(
+            fp8(),
+            Some(("weight_scale_inv", vec![HIDDEN / 128, LATENT / 128], bf16())),
+        ));
+        assert_eq!(
+            kv_b_proj(&bad_factor_type),
+            Some(fp8()),
+            "a BF16 factor is not the F32 multiplier the term takes"
+        );
+
+        let scalar_factor = author_over(checkpoint(
+            fp8(),
+            Some(("weight_scale_inv", Vec::new(), f32e())),
+        ));
+        assert_eq!(
+            kv_b_proj(&scalar_factor),
+            Some(fp8()),
+            "a rank-0 factor states no blocking at all"
+        );
+    }
+}

@@ -27,7 +27,7 @@
 
 pub mod budget;
 pub mod calibrate;
-pub mod dsv4_geometry;
+pub mod compressed_plane_geometry;
 pub mod dtoa;
 pub mod json;
 pub mod kv_format;

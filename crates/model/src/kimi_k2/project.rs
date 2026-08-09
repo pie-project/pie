@@ -16,25 +16,6 @@ use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::KimiFacts;
 
-/// Does this build provision the KV store a deployment asks for?
-///
-/// A property of the BINARY, not of any checkpoint — which is why it is
-/// stated here beside the projection rather than carried on a row. This
-/// is where `unbuilt_kv_store()` went. That method existed because a
-/// family could hold a `FACTS_ROWS` row, load happily, report itself
-/// healthy, and die at its first fire inside a walk; it answered with a
-/// STRING, and the caller then decided which store the string meant by
-/// asking whether it contained `"compress"`.
-///
-/// The row states its [`KvStyle`] outright now, this asks one question
-/// of the enum, and a store that gets built is one arm changing here.
-/// `gpu::pools::mla_cache` is ported and waiting; until an executor arm
-/// names an MLA dispatch there is nothing to point it at.
-#[must_use]
-pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    kv.has_a_store_in_this_build()
-}
-
 /// This row's tensors.
 ///
 /// The MLA rows are the interesting ones, and they are interesting
@@ -178,16 +159,13 @@ pub fn deployment(
     f: &KimiFacts,
     rope_theta: f32,
     norm_eps: f32,
+    rope_yarn: bool,
     advertised: Advertised,
 ) -> Result<Deployment, Refusal> {
-    let planned = plan(f, rope_theta, norm_eps, advertised);
-    if kv_store_is_built(&planned.kv) {
-        Ok(planned)
-    } else {
-        Err(Refusal::Unsupported(
-            "this build provisions no MLA paged store; the row's compressed \
-             latent KV has nowhere to live",
-        ))
+    let planned = plan(f, rope_theta, norm_eps, rope_yarn, advertised);
+    match planned.kv.store_refusal() {
+        Some(no_store) => Err(no_store),
+        None => Ok(planned),
     }
 }
 
@@ -196,10 +174,40 @@ pub fn deployment(
 ///
 /// Separate from [`deployment`] so the two statements stay separable —
 /// "what this model needs" is the row's, "what this binary provides" is
-/// [`kv_store_is_built`]'s, and collapsing them is how a capability
+/// [`KvStyle::has_a_store_in_this_build`]'s, and collapsing them is how a capability
 /// question turns back into a family name.
+/// [`plan`] under a name a sibling module may say out loud.
+///
+/// The projection is TOTAL and the refusal is not, so a caller that
+/// wants the row's statement rather than this build's capability needs
+/// a door to it. `kimi_k2`'s own tests are that caller: no MLA store is
+/// provisioned here, so every K2 row refuses at [`deployment`], and
+/// asserting what the row STATES through a function that returns
+/// `Err` would be asserting the build instead.
+///
+/// `#[cfg(test)]` because that is the whole truth of it: the doc says
+/// "`kimi_k2`'s own tests are that caller" and they are the only one, so
+/// a serving build carried a public-in-crate door nothing walks through.
+#[cfg(test)]
 #[must_use]
-fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -> Deployment {
+pub(super) fn deployment_unrefused(
+    f: &KimiFacts,
+    rope_theta: f32,
+    norm_eps: f32,
+    rope_yarn: bool,
+    advertised: Advertised,
+) -> Deployment {
+    plan(f, rope_theta, norm_eps, rope_yarn, advertised)
+}
+
+#[must_use]
+fn plan(
+    f: &KimiFacts,
+    rope_theta: f32,
+    norm_eps: f32,
+    rope_yarn: bool,
+    advertised: Advertised,
+) -> Deployment {
     let a = &f.attn;
     // MLA's page row holds the LATENT plus the one shared rope half —
     // `kv_a_width()` — and not a head-split key. That is what every MLA
@@ -246,7 +254,7 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
             head_dim: page_row,
             // Nothing pads it. A latent row is not a head width a kernel
             // is instantiated at, and the store that would hold it is
-            // not built here anyway — see [`kv_store_is_built`].
+            // not built here anyway — see [`KvStyle::has_a_store_in_this_build`].
             head_dim_kernel: page_row,
             intermediate: f.dense_intermediate,
             // The mixture's inner width is a DIFFERENT number from the
@@ -280,7 +288,6 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         norm_topk_prob: f.moe.norm_topk_prob,
         routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
@@ -290,7 +297,17 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
         // projection only sees geometry. Carried through untouched — a
         // projection that edited the label would be inventing one.
         advertised,
-        rope_scaling: None,
+        // The bank of numbers hangs off the same bool that picks the
+        // kernel. `rope_yarn` said "the config asks for YaRN, so the
+        // CUDA reading binds `rope_yarn_original_bf16`" while this line
+        // said `None`, which that field's doc defines as "this stack
+        // uses its `rope_theta` ladder unrescaled". One checkpoint, two
+        // answers, and the loser is findable: `fire::launch` matches
+        // `None` to `yarn: [0.0; 4]` and `yarn_original_max: 0` on the
+        // ONE kernel that reads them, which its own comment calls "a
+        // degenerate ramp, not an absent one". K2 publishes a yarn
+        // block; see [`super::ROPE_SCALING`] for it, field by field.
+        rope_scaling: rope_yarn.then_some(super::ROPE_SCALING),
         towers: Default::default(),
     }
 }
@@ -303,7 +320,6 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
 /// derivation this replaces asked the loaded checkpoint
 /// (`alias("layer.0.q_kv_a_fused").is_some()`) — the same answer,
 /// obtained by probing the result of a decision this crate made.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn cuda_facts(rope_yarn_original: bool) -> super::forward::facts::KimiCudaFacts {
     super::forward::facts::KimiCudaFacts {
@@ -344,7 +360,6 @@ pub const NO_METAL: &str = "kimi-k2 has no Metal text in this build: its forward
      CUDA backend serves this row";
 
 /// Trace this row's CUDA text for one fire class.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &KimiFacts,
@@ -378,7 +393,7 @@ mod tests {
             max_model_len: 131_072,
             media_encode: false,
         };
-        let d = plan(&k2(), 50_000.0, 1e-6, stated.clone());
+        let d = plan(&k2(), 50_000.0, 1e-6, true, stated.clone());
         assert_eq!(
             d.advertised, stated,
             "a projection that edits the label is inventing one"
@@ -559,7 +574,7 @@ mod tests {
     /// resident `config.json`.
     #[test]
     fn the_kv_style_is_stated_rather_than_matched_on_a_substring() {
-        let d = plan(&k2(), 50_000.0, 1e-6, Advertised::default());
+        let d = plan(&k2(), 50_000.0, 1e-6, true, Advertised::default());
         assert_eq!(
             d.kv,
             KvStyle::Mla {
@@ -568,11 +583,11 @@ mod tests {
             }
         );
         assert!(
-            !kv_store_is_built(&d.kv),
+            !d.kv.has_a_store_in_this_build(),
             "no executor arm names an MLA dispatch"
         );
-        assert!(kv_store_is_built(&KvStyle::Paged));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: vec![1] }));
+        assert!(KvStyle::Paged.has_a_store_in_this_build());
+        assert!(!KvStyle::CompressedPlane { ratios: vec![1] }.has_a_store_in_this_build());
     }
 
     /// Loadable and not servable, said at the DOOR. This is why
@@ -582,7 +597,7 @@ mod tests {
     /// its first fire, inside a walk, with the model already resident.
     #[test]
     fn a_row_with_no_store_in_this_build_refuses_before_the_first_fire() {
-        let refusal = deployment(&k2(), 50_000.0, 1e-6, Advertised::default())
+        let refusal = deployment(&k2(), 50_000.0, 1e-6, true, Advertised::default())
             .expect_err("no MLA store here");
         assert!(
             matches!(refusal, Refusal::Unsupported(what) if what.contains("MLA")),
@@ -591,7 +606,7 @@ mod tests {
         // And the refusal is about the BUILD, not about the row: the
         // projection is total and still says what the model needs.
         assert_eq!(
-            plan(&k2(), 50_000.0, 1e-6, Advertised::default()).layers,
+            plan(&k2(), 50_000.0, 1e-6, true, Advertised::default()).layers,
             61
         );
     }
@@ -602,7 +617,7 @@ mod tests {
     #[test]
     fn the_launch_geometry_is_the_rows_own_numbers() {
         let f = k2();
-        let d = plan(&f, 50_000.0, 1e-6, Advertised::default());
+        let d = plan(&f, 50_000.0, 1e-6, true, Advertised::default());
         assert_eq!(d.layers, 61);
         assert_eq!(d.norm_eps, 1e-6);
         assert_eq!(d.attention.len(), 61);
@@ -641,7 +656,7 @@ mod tests {
     #[test]
     fn the_scale_is_over_the_dot_and_not_over_the_page_row() {
         let f = k2();
-        let d = plan(&f, 50_000.0, 1e-6, Advertised::default());
+        let d = plan(&f, 50_000.0, 1e-6, true, Advertised::default());
         let want = 1.0 / (192.0f32).sqrt();
         for a in &d.attention {
             assert!((a.sm_scale - want).abs() < 1e-6, "{}", a.sm_scale);
@@ -655,7 +670,6 @@ mod tests {
     /// The binding facts, which are about the LOAD and not the model:
     /// the contract stages the fused latent bank, so the trace reads one
     /// GEMM where the split binding reads two.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_binding_facts_say_what_the_contract_staged() {
         let cuda = cuda_facts(true);
@@ -669,7 +683,6 @@ mod tests {
 
     /// Every fire class traces, which is the aspect answer a row owes
     /// even though this build refuses to serve it.
-    #[cfg(feature = "forward")]
     #[test]
     fn every_fire_class_traces() {
         use model_compiler::trace::FireClass;

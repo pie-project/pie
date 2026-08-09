@@ -85,7 +85,20 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             // `target/` holds generated sources nobody edits.
-            if path.file_name().is_some_and(|n| n == "target") {
+            //
+            // `examples/` holds PROBE PROGRAMS, whose stdout is a report: a
+            // column of labels, a run of spaces, a column of values. That is
+            // the alignment this file's header promises not to flag, and it
+            // is indistinguishable from the slip by any predicate over one
+            // line, because a probe's labels are ordinary lowercase words
+            // (`device        {}`, `headers:       {} carried`). Nothing here
+            // is a message an operator reads — an example is run by hand, by
+            // the person who just built it. Every shipped message still sits
+            // in `src/`, `tests/` or a binary, all of which are scanned.
+            if path
+                .file_name()
+                .is_some_and(|n| n == "target" || n == "examples")
+            {
                 continue;
             }
             rust_sources(&path, out);
@@ -98,45 +111,124 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Whether `run` — a stretch of spaces inside a string literal — sits
 /// between two pieces of prose.
 ///
-/// `before` ends at the run and `after` begins at it. Prose on the right
-/// is a letter or an opening quote/bracket that would start one. Prose
-/// on the left is a lowercase letter with a word of three or more
-/// letters somewhere behind it: the letter rules out a column of `{}`
-/// or hex, and the word rules out a run of single-character cells.
+/// `before` ends at the run and `after` begins at it.
 ///
-/// The left test was once "the last three characters are lowercase",
-/// which sounds like the same thing and is not. English wraps at
-/// spaces, so the word before the break is often short — and `no`,
-/// `is`, `a`, `to` and `of` all put a space in that window and turned
-/// the test off. Three of the five sites this file was scanning for
-/// were sitting in `gpt_oss/contract.rs` the whole time, each one
-/// caught by nothing because the word before the swallowed indent was
-/// two letters long.
+/// # What this asks, and what it used to ask
 ///
-/// # The one indent that is not a slip
+/// It asks whether there is prose on BOTH sides. It used to ask whether
+/// a word ABUTS the run, which is a different question and a much worse
+/// one, because the character right before a line break is whatever the
+/// sentence happened to end on. Two rounds of widening found five real
+/// sites hiding behind that:
 ///
-/// A literal holding generated source — the C and Metal that
-/// `tensor-compiler` emits — indents its own continuation lines, and
-/// those runs are load-bearing. They are told apart by what precedes
-/// them: an `\n` escape. A newline the author wrote and then indented
-/// under is an indent; a run of spaces with no newline in front of it
-/// is a newline someone deleted.
+/// ```text
+/// ...which no          scheme...      <- a two-letter word
+/// ...with no '_scales'          beside it     <- a closing quote
+/// ...having no rows —          delete...      <- an em dash
+/// ...does not overlap,          so it...      <- a comma
+/// ...is not shaped          [experts, ...     <- opens with a bracket
+/// ```
+///
+/// Each was a real garbled message, and each was invisible to a
+/// predicate looking at one character. Prose-on-both-sides sees all
+/// five and does not care what punctuation the break landed on.
+///
+/// # The two things that are not slips
+///
+/// A run doing alignment sits in a literal that is a table or a
+/// diagram, and those have no lowercase words on one side or the other
+/// (`NAME    WIDTH`, `{:>8}    {}`, `+---+    +---+`) — or, when they do
+/// have words, the run is followed by a COLUMN MARKER rather than by
+/// prose: `avg_missing_at_fire    = {}` and `config    | final_mu` are
+/// both real aligned output this must not flag.
+///
+/// A run inside generated source — the C and Metal `tensor-compiler`
+/// emits — is an indent the author wrote, and is told apart by the `\n`
+/// escape in front of it. A newline someone deleted leaves no newline
+/// behind; that is the whole signature.
 fn splits_prose(before: &str, after: &str) -> bool {
     if before.ends_with("\\n") {
         return false;
     }
-    let lhs = before
-        .chars()
-        .next_back()
-        .is_some_and(|c| c.is_ascii_lowercase())
-        && before
-            .split(|c: char| !c.is_ascii_alphabetic())
-            .any(|word| word.len() >= 3);
-    let rhs = after
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '(' || c == '`' || c == '\'');
-    lhs && rhs
+    // Prose starts the right side: a letter, or a bracket or quote that
+    // would open one. Not `=`, `|` or `:`, which are what a column of
+    // aligned output puts there.
+    //
+    // A bare `{` is not one of those brackets. It opens a FORMAT
+    // PLACEHOLDER, which is the commonest column marker there is -- an
+    // aligned table's whole purpose is a label, a run of spaces, and an
+    // interpolated cell:
+    //
+    // ```text
+    // println!("storage      {} buffers per stage (WebGPU guarantees {})");
+    // ```
+    //
+    // An escaped `{{` prints as a literal brace and really could open a
+    // phrase, so it is kept. THE COST, the same one the tail rule pays at
+    // the other end: a swallowed indent whose continuation begins with a
+    // placeholder -- `"the tensor      {name} was not found"` -- is no
+    // longer flagged. It is not distinguishable from a table cell by
+    // anything visible in one literal, and the file's header promises
+    // aligned output will not be flagged.
+    let mut rest = after.chars();
+    let opens_prose = match rest.next() {
+        Some('{') => rest.next() == Some('{'),
+        Some(c) => c.is_ascii_alphabetic() || "(`'[\"".contains(c),
+        None => false,
+    };
+    opens_prose && has_word(before) && has_word(after)
+}
+
+/// Whether `text` holds a lowercase word of three or more letters,
+/// NOT counting the inside of a format placeholder.
+///
+/// The evidence that a side is prose rather than a column of headings,
+/// hex, or single-character cells.
+///
+/// A placeholder's identifier is not prose: the reader never sees
+/// `limits`, they see whatever it interpolates. Counting it read this
+///
+/// ```text
+/// println!("limits       {limits}");
+/// ```
+///
+/// as a sentence split by an indent, when it is one row of a
+/// column-aligned table -- the exact case this file's header promises
+/// not to flag. Its neighbours `"adapter      {}"` and
+/// `"kind         {:?}"` were already safe for the accidental reason
+/// that a positional placeholder holds no letters; captured identifiers
+/// made the same row unsafe, so the rule is stated rather than inherited
+/// from the placeholder's spelling.
+///
+/// THE COST, stated because a control found it: a genuinely swallowed
+/// indent whose tail is a lone placeholder and nothing else --
+/// `"...checkpoint          {disagrees}"` -- is no longer flagged. It is
+/// indistinguishable from a table cell by this rule, and a joined source
+/// line almost never ends there: a continuation carries the rest of its
+/// sentence, and a control confirms `"...          disagrees with {it}
+/// entirely"` still bites.
+fn has_word(text: &str) -> bool {
+    let mut prose = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `{{` and `}}` are escaped braces and print as themselves.
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+            }
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => prose.push(c),
+            _ => {}
+        }
+    }
+    prose
+        .split(|c: char| !c.is_ascii_lowercase())
+        .any(|word| word.len() >= 3)
 }
 
 /// The width at which a run of spaces stops being a gap and starts
@@ -148,31 +240,70 @@ fn splits_prose(before: &str, after: &str) -> bool {
 /// original sites carried runs of 14 to 22.
 const INDENT_WIDTH: usize = 6;
 
+/// Every string literal on one source line, as bodies without their quotes.
+///
+/// One line can hold SEVERAL, and what sits between two of them is code.
+/// This used to take the first `"` to the last `"` and call everything
+/// between it one body, which is right for the single-literal line the slip
+/// produces and wrong for a table:
+///
+/// ```text
+/// DeviceKernel { path: "attn::write_kv",        elem: "device::bf16" },
+///                      ^------------------ "body" ------------------^
+/// ```
+///
+/// The run being measured there is the alignment between two fields — the
+/// exact case this file's header promises not to flag — and it read as prose
+/// on both sides because `write_kv` and `elem` are both lowercase words.
+fn literal_bodies(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut bodies = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] != b'"' {
+            // A backslash escapes the next byte, so `\"` does not close.
+            j += if bytes[j] == b'\\' { 2 } else { 1 };
+        }
+        if j > bytes.len() {
+            break;
+        }
+        if j < bytes.len() {
+            bodies.push(&line[start..j]);
+        }
+        i = j + 1;
+    }
+    bodies
+}
+
 fn collapsed_literals(src: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     for (idx, line) in src.lines().enumerate() {
-        // Only inside a string literal, and only one per line: the
-        // slip joins two source lines, so the result is always a
-        // single-line literal.
-        let Some(open) = line.find('"') else { continue };
-        let rest = &line[open + 1..];
-        let Some(close) = rest.rfind('"') else {
-            continue;
-        };
-        let body = &rest[..close];
-        let mut at = 0;
-        while let Some(pos) = body[at..].find(&" ".repeat(INDENT_WIDTH)) {
-            let start = at + pos;
-            let end = start
-                + body[start..]
-                    .find(|c: char| c != ' ')
-                    .unwrap_or(body.len() - start);
-            if splits_prose(&body[..start], &body[end..]) {
-                let shown: String = body.chars().take(90).collect();
-                found.push((idx + 1, shown));
+        for body in literal_bodies(line) {
+            let mut at = 0;
+            let mut hit = false;
+            while let Some(pos) = body[at..].find(&" ".repeat(INDENT_WIDTH)) {
+                let start = at + pos;
+                let end = start
+                    + body[start..]
+                        .find(|c: char| c != ' ')
+                        .unwrap_or(body.len() - start);
+                if splits_prose(&body[..start], &body[end..]) {
+                    let shown: String = body.chars().take(90).collect();
+                    found.push((idx + 1, shown));
+                    hit = true;
+                    break;
+                }
+                at = end.max(start + 1);
+            }
+            if hit {
                 break;
             }
-            at = end.max(start + 1);
         }
     }
     found
@@ -184,8 +315,29 @@ fn no_message_carries_a_swallowed_indent() {
     rust_sources(&crates_dir(), &mut sources);
     rust_sources(&workspace_root().join("src"), &mut sources);
     rust_sources(&workspace_root().join("tests"), &mut sources);
+
+    // A scan that reaches less than it means to reports the same green as
+    // a clean workspace, and this one has now found garbled messages in
+    // `model`, `driver-metal` and `tensor-compiler` — three crates, one of
+    // which is not even a library. A bare count is too weak a guard: the
+    // largest crate alone would satisfy it. Name what has to be reachable.
+    for (crate_name, sentinel) in [
+        ("model", "src/catalog.rs"),
+        ("engine", "src/lib.rs"),
+        ("driver-metal", "src/lib.rs"),
+        ("driver-cuda", "src/lib.rs"),
+        ("tensor-compiler", "src/lib.rs"),
+        ("model-loader", "src/lib.rs"),
+    ] {
+        let wanted = crates_dir().join(crate_name).join(sentinel);
+        assert!(
+            sources.contains(&wanted),
+            "the scan does not reach {}; it has narrowed",
+            wanted.display()
+        );
+    }
     assert!(
-        sources.len() > 200,
+        sources.len() > 600,
         "the scan found only {} sources; it is not reaching the workspace",
         sources.len()
     );
@@ -221,13 +373,23 @@ fn the_predicate_tells_prose_from_alignment() {
     // Assembled rather than written: a literal carrying the defect
     // would be a real offender, and the scan above reads this file.
     let gap = " ".repeat(12);
+    // Literal widths, not `INDENT_WIDTH`: a fixture written in terms of
+    // the constant moves with it, and pins nothing. Six is caught and
+    // five is not, which is the threshold said in the only way that
+    // survives someone editing the constant.
+    let edge = " ".repeat(6);
     for offender in [
         format!("    \"the row ships no v_proj{gap}and the text projects one\","),
-        // The shape that went uncaught for three sites: the word before
-        // the break is two letters, so a fixed three-character window
-        // lands on a space and gives up.
+        // Each of these hid behind a predicate that looked at the one
+        // character in front of the run. What is in front of a line
+        // break is whatever the sentence ended on.
         format!("    \"is a packed weight with no{gap}scales this scheme describes\","),
         format!("    \"is not quantized in groups of 64, which is{gap}what it reads\","),
+        format!("    \"an MXFP4 block tensor with no '_scales'{gap}beside it\","),
+        format!("    \"MXFP4 tensor is not shaped{gap}[experts, rows] against its scales\","),
+        format!("    \"listed as having no rows —{gap}delete the line or ship one\","),
+        format!("    \"the move does not overlap,{gap}so it cannot tell them apart\","),
+        format!("    \"a run exactly this wide{edge}is already an indent\","),
     ] {
         assert_eq!(
             collapsed_literals(&offender).len(),
@@ -237,22 +399,104 @@ fn the_predicate_tells_prose_from_alignment() {
     }
 
     for benign in [
-        // A table: the run follows a heading or a number, not a word.
+        // A table: no lowercase words to make either side prose.
         "    \"NAME            WIDTH       PAGES\",",
         "    println!(\"{:>8}            {}\", a, b);",
         // A diagram.
         "    \"  +---+            +---+\",",
         // A short gap: two spaces after a period is not an indent.
         "    \"one sentence.  another sentence.\",",
+        // One space under the threshold: still a gap, not an indent.
+        "    \"a run one narrower than this     stays a gap\",",
         // Generated source: the run follows a newline the author put
         // there, so it is an indent and not a deletion.
         "    \"inline ulong salt(uint s) {{\\n  return splitmix64(\\n      ulong(s));\",",
         // Single-character cells: lowercase, but no word behind them.
         "    \"a       b       c\",",
+        // Aligned output that DOES have words on both sides. The run is
+        // followed by a column marker, which prose never is.
+        "    \"avg_missing_at_fire            = {}   (dense all-ready fire)\",",
+        "    \"[MIRO19] config              | final_mu  tail_S | distinct%\",",
     ] {
         assert!(
             collapsed_literals(benign).is_empty(),
             "flagged alignment as prose: {benign}"
         );
     }
+}
+
+/// The two predicates, over cases the workspace does not currently hold.
+///
+/// The tests above are CORPUS scans: they answer "does this build carry a
+/// swallowed indent", which is the question worth failing on, but they
+/// exercise only the shapes that happen to exist. A control undoing the
+/// placeholder rule inside `has_word` was silent for exactly that reason --
+/// no source here has a run whose LEFT side is a lone placeholder. The rule
+/// is still load-bearing, so the cases are written down instead of waited
+/// for.
+///
+/// Passed as two sides rather than as one literal on purpose: `splits_prose`
+/// takes `before` and `after` already split, so nothing here has to contain
+/// a run of spaces -- which matters, because this file is itself scanned by
+/// the tests above.
+#[test]
+fn the_predicates_answer_the_shapes_the_corpus_does_not_hold() {
+    // Flagged: prose on both sides, which is what a joined source line
+    // leaves behind.
+    for (before, after) in [
+        (
+            "the checkpoint declares one count and",
+            "the row declares another",
+        ),
+        ("a tensor was missing", "(and the loader said nothing)"),
+        ("the shard did not divide", "`local_extent` returned zero"),
+    ] {
+        assert!(
+            splits_prose(before, after),
+            "not flagged as a split sentence: {before:?} / {after:?}"
+        );
+    }
+
+    // Not flagged: a column of aligned output. Every one of these is real
+    // or near-real diagnostic printing.
+    for (before, after) in [
+        // The right side is a cell, not a continuation.
+        ("storage", "{} buffers per stage"),
+        ("limits", "{limits}"),
+        ("kind", "{:?}"),
+        // The left side is a cell. This is the case no source here has,
+        // and the one whose control was silent.
+        ("{count}", "items were dropped"),
+        ("{:>8}", "rows carried"),
+        // A column marker rather than prose.
+        ("avg_missing_at_fire", "= {}"),
+        ("config", "| final_mu"),
+        // An indent the author wrote, told apart by the newline in front.
+        ("a generated header\\n", "still indented"),
+    ] {
+        assert!(
+            !splits_prose(before, after),
+            "flagged as a split sentence: {before:?} / {after:?}"
+        );
+    }
+
+    // An escaped brace prints as a brace and really can open a phrase, so
+    // it is not treated as a placeholder.
+    assert!(splits_prose(
+        "the type resolved to",
+        "{{unknown}} at that point"
+    ));
+
+    // `has_word` on its own: a placeholder's identifier is not prose,
+    // because the reader never sees it.
+    assert!(has_word("the row declares"));
+    assert!(!has_word("{limits}"));
+    assert!(!has_word("{:?}"));
+    assert!(!has_word("{}"));
+    assert!(has_word("{}{}rows"), "prose beside a placeholder is prose");
+    assert!(
+        !has_word("ab cd"),
+        "words under three letters are not prose"
+    );
+    assert!(!has_word("NAME WIDTH"), "a heading is not prose");
 }

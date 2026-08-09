@@ -20,16 +20,16 @@
 //!    wrong length is refused before the driver sees it. This is a check the
 //!    shim path never had — there, a caller with the right TYPES in the wrong
 //!    ORDER compiled fine.
-//! 3. **The entry exists**, at load time, because [`KernelModule::load`]
-//!    resolves every row's symbol up front rather than on first use. A
-//!    missing kernel is a startup failure, not a failure on the first fire
-//!    that happens to need it.
+//! 3. **The instantiation exists**, at load time, because
+//!    [`KernelModule::load_mangled`] resolves every row's mangled name up
+//!    front rather than on first use. A missing kernel is a startup
+//!    failure, not a failure on the first fire that happens to need it.
 //!
 //! What is genuinely lost is that (2) is a runtime check where the shim's was
 //! a compile-time one. It is bought back by generation: the caller does not
 //! write the list, the row does.
 
-use std::ffi::{CString, c_void};
+use std::ffi::c_void;
 
 use cudarc::driver::sys as dr;
 use kernels::{KernelSig, Ty};
@@ -54,6 +54,23 @@ pub enum ArgValue {
     F32(f32),
     /// A pointer-width unsigned scalar.
     Usize(usize),
+    /// A one-byte host ENUMERATOR — `Ty::KvScheme` and `Ty::KvDType`, the
+    /// `enum class … : ::std::uint8_t` mirrors `attn/attention_naive_paged.cuh`
+    /// declares at `:141` and `:152`.
+    ///
+    /// **THE THIRD COPY OF THE POINTER/SCALAR DECISION, and the one whose
+    /// absence is invisible until a launch.** `kernels_cuda_new`'s
+    /// `runtime::args::is_pointer` decides how the JIT crate marshals a kind
+    /// and `emit::crossing` decides what the generated Rust binding says; both
+    /// live in the crate that owns the kernels. This one decides what THIS
+    /// driver will accept, and a kind added to those two and not to this is a
+    /// row that emits, compiles, and is refused at launch with
+    /// `ArgError::Unsupported`.
+    ///
+    /// One byte in the cubin's metadata, so `cell` widening it to a `u64` is
+    /// safe for `ArgValue::Ptr`'s reason: `cuLaunchKernel` copies
+    /// `sizeof(param)` bytes from this cell's own address.
+    U8(u8),
 }
 
 impl ArgValue {
@@ -65,6 +82,7 @@ impl ArgValue {
             ArgValue::U32(_) => "a u32",
             ArgValue::F32(_) => "an f32",
             ArgValue::Usize(_) => "a usize",
+            ArgValue::U8(_) => "a u8 enumerator",
         }
     }
 
@@ -81,6 +99,7 @@ impl ArgValue {
             ArgValue::U32(v) => u64::from(v),
             ArgValue::F32(v) => u64::from(v.to_bits()),
             ArgValue::Usize(v) => v as u64,
+            ArgValue::U8(v) => u64::from(v),
         }
     }
 }
@@ -180,6 +199,9 @@ const fn is_pointer(ty: Ty) -> bool {
             | Ty::U16s
             | Ty::U16sMut
             | Ty::I8s
+            | Ty::I8sMut
+            | Ty::Bf16s
+            | Ty::F16s
             | Ty::F32s
             | Ty::F32sMut
             | Ty::BufArray
@@ -234,6 +256,7 @@ impl Args {
                 Ty::U32 => matches!(value, ArgValue::U32(_)),
                 Ty::F32 => matches!(value, ArgValue::F32(_)),
                 Ty::Usize => matches!(value, ArgValue::Usize(_)),
+                Ty::KvScheme | Ty::KvDType => matches!(value, ArgValue::U8(_)),
                 ty => {
                     return Err(ArgError::Unsupported {
                         symbol: sig.symbol,
@@ -335,58 +358,72 @@ unsafe impl Send for KernelModule {}
 unsafe impl Sync for KernelModule {}
 
 impl KernelModule {
-    /// Load `image` (a cubin or fatbin) and resolve every row in `table`.
+    /// Load `image` and resolve every row, looking each one up by the
+    /// MANGLED name NVRTC reported for its instantiation.
+    ///
+    /// `lowered` is `(row symbol, mangled name)` — `bind::nvrtc::Compiled`'s
+    /// output, which came from `nvrtcGetLoweredName` and is the only thing
+    /// that knows what a C++ template instantiation is called once the
+    /// compiler is done with it.
     ///
     /// # Errors
     ///
     /// [`Error::Driver`] if the image does not load on this device, or
-    /// [`Error::NoEntry`] if it carries no entry point for some row. The
-    /// second is the interesting one: it is the check that the table and the
-    /// build agree about which kernels exist, and it happens once.
-    pub fn load(image: &[u8], table: &'static [KernelSig]) -> Result<Self, Error> {
+    /// [`Error::NoEntry`] if some row has no lowered name or the image
+    /// carries no such symbol. The second is the check that the table and
+    /// the compile agree about which kernels exist, and it happens ONCE, at
+    /// load — not on the first fire that happens to need the missing one.
+    pub fn load_mangled(
+        image: &[u8],
+        table: &[&'static KernelSig],
+        lowered: &[(&'static str, String)],
+    ) -> Result<Self, Error> {
+        let module = Self::load_image(image)?;
+        let mut entries = Vec::with_capacity(table.len());
+        for sig in table {
+            let Some((_, mangled)) = lowered.iter().find(|(s, _)| *s == sig.symbol) else {
+                // SAFETY: `module` loaded and nothing else holds it.
+                unsafe { dr::cuModuleUnload(module) };
+                return Err(Error::NoEntry {
+                    symbol: sig.symbol,
+                    entry: "<no lowered name>".into(),
+                });
+            };
+            match super::nvrtc::function_by_name(module, mangled) {
+                Ok(function) => entries.push((sig.symbol, function)),
+                Err(_) => {
+                    // SAFETY: as above -- unload before returning, or a stale
+                    // image leaks a module per failed startup.
+                    unsafe { dr::cuModuleUnload(module) };
+                    return Err(Error::NoEntry {
+                        symbol: sig.symbol,
+                        entry: mangled.clone(),
+                    });
+                }
+            }
+        }
+        Ok(Self { module, entries })
+    }
+
+    /// `cuModuleLoadData`, with the empty image refused rather than handed
+    /// over to be read past.
+    fn load_image(image: &[u8]) -> Result<dr::CUmodule, Error> {
         if image.is_empty() {
             return Err(Error::Invalid("the kernel image is empty".into()));
         }
         let mut module: dr::CUmodule = std::ptr::null_mut();
         // SAFETY: `image` is a live byte image and `module` a live
         // out-parameter. `cuModuleLoadData` reads the image's own header for
-        // its length, which is why the slice length is not passed and why an
-        // empty slice is refused above rather than handed over to be read
-        // past.
+        // its length, which is why the slice length is not passed.
         let code = unsafe { dr::cuModuleLoadData(&raw mut module, image.as_ptr().cast()) };
-        if code != dr::CUresult::CUDA_SUCCESS {
-            return Err(Error::Driver {
+        if code == dr::CUresult::CUDA_SUCCESS {
+            Ok(module)
+        } else {
+            Err(Error::Driver {
                 call: "cuModuleLoadData",
                 code,
-            });
+            })
         }
-        let mut entries = Vec::with_capacity(table.len());
-        for sig in table {
-            let entry = kernels_cuda::abi::device_entry_name(sig.symbol);
-            let Ok(c_name) = CString::new(entry.clone()) else {
-                // SAFETY: `module` loaded successfully just above and nothing
-                // has used it.
-                unsafe { dr::cuModuleUnload(module) };
-                return Err(Error::Invalid(format!(
-                    "entry name `{entry}` contains a NUL"
-                )));
-            };
-            let mut function: dr::CUfunction = std::ptr::null_mut();
-            // SAFETY: `module` is loaded; `c_name` outlives the call.
-            let code =
-                unsafe { dr::cuModuleGetFunction(&raw mut function, module, c_name.as_ptr()) };
-            if code != dr::CUresult::CUDA_SUCCESS {
-                // SAFETY: as above. Unload before returning, or a stale image
-                // leaks a module per failed startup.
-                unsafe { dr::cuModuleUnload(module) };
-                return Err(Error::NoEntry {
-                    symbol: sig.symbol,
-                    entry,
-                });
-            }
-            entries.push((sig.symbol, function));
-        }
-        Ok(Self { module, entries })
     }
 
     /// The entry point for a row, by symbol.
@@ -428,7 +465,7 @@ impl KernelModule {
         let Some(function) = self.entry(sig.symbol) else {
             return Err(Error::NoEntry {
                 symbol: sig.symbol,
-                entry: kernels_cuda::abi::device_entry_name(sig.symbol),
+                entry: "<not this module's>".into(),
             });
         };
         // A zero grid launches nothing and reports success. `launch::eval`
@@ -487,13 +524,14 @@ impl Drop for KernelModule {
 mod tests {
     use super::{ArgError, ArgValue, Args};
     use kernels::Ty;
-    use kernels_cuda::norm_device::ENTRIES;
+    use kernels_cuda_new::device::ALTUP_AUX as ENTRIES;
 
     fn row(symbol: &str) -> &'static kernels::KernelSig {
         ENTRIES
             .iter()
-            .find(|k| k.symbol == symbol)
+            .find(|k| k.sig.symbol == symbol)
             .expect("the pilot states this row")
+            .sig
     }
 
     /// The happy path: `tanh_bf16` takes a buffer and a count.

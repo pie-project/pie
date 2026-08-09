@@ -1,7 +1,7 @@
 //! Pie standalone server config — TOML schema mirror of `pie.config`.
 //!
 //! Same TOML the legacy Python server consumed. Embedded drivers
-//! ([`DriverKind::CudaNative`] / [`DriverKind::Metal`] / [`DriverKind::Dummy`])
+//! ([`DriverKind::CudaNative`] / [`DriverKind::Metal`])
 //! are dispatched in [`crate::engine::start_engine`] via
 //! [`crate::preflight::resolve_flavor`].
 //!
@@ -934,8 +934,8 @@ fn default_frame_dispatch_depth() -> u32 {
 #[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
 // fields are read on the Rust side yet.
 pub struct DriverConfig {
-    /// Driver discriminator. Embedded drivers (`cuda_native`,
-    /// `metal`, `dummy`) run in-process.
+    /// Driver discriminator. Embedded drivers (`cuda_native`, `metal`)
+    /// run in-process.
     #[serde(rename = "type")]
     pub kind: DriverKind,
     /// Single string or list of strings — both accepted on input.
@@ -986,16 +986,6 @@ impl DriverConfig {
                     })?;
                 validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
-            DriverKind::Dummy => {
-                let _: DummyDriverOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [model.driver.options] for driver type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-            }
         }
         Ok(())
     }
@@ -1028,9 +1018,6 @@ pub enum DriverKind {
     /// Native CUDA driver — embedded as a static lib in `worker`
     /// (requires `--features driver-cuda`).
     CudaNative,
-    /// Rust dummy driver — random tokens, no model load. Always
-    /// embedded in `worker`.
-    Dummy,
     /// Native MLX + Metal driver for Apple Silicon — embedded as a static
     /// lib in `worker` (requires `--features driver-metal`, macOS only).
     Metal,
@@ -1040,7 +1027,6 @@ impl DriverKind {
     pub fn as_str(self) -> &'static str {
         match self {
             DriverKind::CudaNative => "cuda_native",
-            DriverKind::Dummy => "dummy",
             DriverKind::Metal => "metal",
         }
     }
@@ -1206,49 +1192,6 @@ impl Default for MetalDriverOptions {
             shutdown_timeout: Duration::from_secs(5),
         }
     }
-}
-
-/// `[model.driver.options]` for `type = "dummy"`. The dummy driver
-/// fabricates everything a real driver would otherwise read from
-/// model weights — `vocab_size` and `arch_name` are required because no
-/// safe default exists. Page geometry and timeouts have generic defaults;
-/// the driver derives its synthetic KV page pool from these limits.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DummyDriverOptions {
-    /// Vocabulary size advertised in the caps handshake. Should match
-    /// the tokenizer the artifact carries. When `None` the
-    /// standalone reads `vocab_size` from `<snapshot_dir>/config.json`
-    /// before launching the driver.
-    #[serde(default)]
-    pub vocab_size: Option<u32>,
-    /// Architecture name advertised in the caps handshake (e.g.
-    /// `"qwen3"`, `"llama3"`). When `None` the standalone derives it
-    /// from `<snapshot_dir>/config.json` (lowercased first
-    /// `architectures[0]` with a `forcausallm` suffix stripped).
-    #[serde(default)]
-    pub arch_name: Option<String>,
-    /// The catalog id advertised in the caps handshake — `"qwen3-0.6b"`,
-    /// not `"qwen3"`. The engine looks this up to get the layer count, the
-    /// vocabulary and the chat template, so unlike the two above it is not
-    /// a label: it names a row.
-    ///
-    /// When `None` the standalone IDENTIFIES the checkpoint from its
-    /// tensors, which is what a real driver does. Stating it here is the
-    /// same escape hatch `pie model build --as` is, and it is held to the
-    /// same rule — an id that does not match the tensors is refused, not
-    /// believed.
-    #[serde(default)]
-    pub model_id: Option<String>,
-
-    /// How long to wait for the caps handshake. Short, because the dummy
-    /// driver fabricates its answer rather than loading anything.
-    #[serde(default = "default_dummy_ready_timeout")]
-    pub ready_timeout: Duration,
-}
-
-fn default_dummy_ready_timeout() -> Duration {
-    Duration::from_secs(5)
 }
 
 /// `[model.driver.options]` for `type = "cuda_native"`.
@@ -1837,51 +1780,14 @@ max_num_kv_pages = 1024
         assert!(err.contains("max_num_kv_pages"), "got: {err}");
     }
 
-    #[test]
-    fn rejects_legacy_dummy_kv_page_knob() {
-        let stale = r#"
-[model]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "dummy"
-device = ["cpu"]
-
-[model.driver.options]
-vocab_size = 151936
-arch_name = "qwen3"
-max_num_kv_pages = 1024
-"#;
-        let cfg: Config = toml::from_str(stale).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("max_num_kv_pages"), "got: {err}");
-    }
-
-    #[test]
-    fn rejects_public_driver_capacity_knobs() {
-        for (ty, key) in [
-            ("dummy", "max_forward_tokens"),
-            ("dummy", "max_forward_requests"),
-            ("dummy", "max_model_len"),
-        ] {
-            let mut options = String::new();
-            if ty == "dummy" {
-                options.push_str("vocab_size = 151936\narch_name = \"qwen3\"\n");
-            }
-            options.push_str(&format!("{key} = 1\n"));
-            let text = format!(
-                "[model]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
-                 type = \"{ty}\"\ndevice = [\"cpu\"]\n[model.driver.options]\n{options}"
-            );
-            let cfg: Config = toml::from_str(&text).unwrap();
-            let err = match cfg.validate() {
-                Ok(()) => panic!("type={ty} key={key} unexpectedly accepted"),
-                Err(err) => err.to_string(),
-            };
-            assert!(err.contains(key), "type={ty} key={key} got: {err}");
-        }
-    }
+    // `rejects_public_driver_capacity_knobs` was here, and it went with
+    // the driver it was about. It asserted that `max_forward_tokens`,
+    // `max_forward_requests` and `max_model_len` are the DRIVER's to
+    // derive rather than the operator's to set -- a rule that read as
+    // general and was not: it held only for the dummy driver, whose
+    // options struct listed none of the three. Both surviving kinds
+    // accept all three as declared fields, so retargeting the test onto
+    // one of them asserts a rule this schema does not have.
 
     #[test]
     fn device_string_or_list() {
@@ -2258,17 +2164,15 @@ name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "dummy"
+type = "metal"
 device = ["cpu"]
 
 [model.driver.options]
 gpu_mem_utilization = 0.50
-vocab_size = 151936
-arch_name = "qwen3"
 "#;
         let cfg: Config = toml::from_str(stale).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("gpu_mem_utilization"), "got: {err}");
-        assert!(err.contains("Dummy"), "got: {err}");
+        assert!(err.contains("Metal"), "got: {err}");
     }
 }

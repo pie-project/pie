@@ -36,7 +36,6 @@
 //! wired — which is invisible from inside every module that exists. So
 //! it walks `catalog()`, and its lower bound on the row count is there
 //! because a walk of an empty iterator passes every assertion in it.
-#![cfg(feature = "forward")]
 
 use model::catalog::{self, Backend, Deployed, MetalBinding};
 use model::deployment::Refusal;
@@ -58,6 +57,14 @@ const BINDING: MetalBinding = MetalBinding {
     fuse_residual_gemv: true,
     paged_multi_batch: true,
     qmm_multi_batch: true,
+    // TRUE, and the only one of the four whose value is a copy of something
+    // this crate cannot see. `driver-metal::model::binding::build_kernels` is
+    // where the claim lives; the layering forbids a dependency on it, so this
+    // restates it and `every_role_the_mlx_map_answers_is_one_some_trace_asks
+    // _for` is what catches the restatement going stale — with `false` here,
+    // the Metal text states no bias, no trace asks for `q_bias`, and the map
+    // entry that answers it looks like dead weight.
+    add_bias: true,
 };
 
 /// The catalog is big enough that a walk of it means something.

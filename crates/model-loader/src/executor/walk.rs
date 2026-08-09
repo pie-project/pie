@@ -32,7 +32,7 @@ use half::bf16;
 use std::collections::HashSet;
 
 use super::{Progress, Residency};
-use crate::codec::cast::{decode_values, encode_values};
+use crate::codec::cast::{cast_elements, decode_values, encode_values};
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
 use crate::codec::int4::decode_int4b8_elements;
 use crate::codec::mlx::mlx_affine_group_params;
@@ -128,7 +128,7 @@ pub(super) fn run(
     let arena_len = if stream {
         0
     } else {
-        usize::try_from(plan.memory.persistent_bytes)
+        usize::try_from(plan.memory.arena_bytes())
             .map_err(|_| invalid("persistent arena does not fit host address space"))?
     };
     if ArenaBacking::len(arena) < arena_len {
@@ -347,7 +347,7 @@ impl Walk<'_, '_> {
         let decl = self.plan.buffer(id)?;
         let len = checked_usize(decl.bytes)?;
         let loc = if !self.stream
-            && let Some(offset) = decl.persistent_offset
+            && let Some(offset) = decl.arena_offset()
         {
             let offset = checked_usize(offset)?;
             let end = offset
@@ -558,7 +558,8 @@ impl Walk<'_, '_> {
             // MLX affine scheme keeps its own arm: it publishes three tensors
             // where every other scheme publishes two.
             TileMapKind::Encode if transform.to == Some(QuantScheme::MlxAffineU4) => {
-                let written = self.encode_mlx_affine_u4(&input, outputs, &transform)?;
+                let written =
+                    self.encode_mlx_affine_u4(&input, source, inputs, outputs, &transform)?;
                 for (buffer, bytes) in written {
                     self.write_buffer(buffer, 0, &bytes)?;
                 }
@@ -754,14 +755,13 @@ impl Walk<'_, '_> {
         })
     }
 
-    /// A buffer's tensor's declared shape, when it is 2-D.
+    /// A buffer's declared shape, when it is 2-D.
     ///
-    /// The same source `host::encode_bytes` reads — a tensor's declaration,
-    /// not an extent's dims — so a backing and the host path launch over one
+    /// The same source `host::encode_bytes` reads — the buffer's own type, not
+    /// an extent's dims — so a backing and the host path launch over one
     /// number rather than two that can disagree.
     fn buffer_shape_2d(&self, id: BufferId) -> Option<(u32, u32)> {
-        let shape = &self.index.buffer_tensor(self.plan, id)?.shape;
-        let &[rows, cols] = shape.as_slice() else {
+        let &[rows, cols] = self.plan.buffer(id).ok()?.ty.shape.as_slice() else {
             return None;
         };
         Some((u32::try_from(rows).ok()?, u32::try_from(cols).ok()?))
@@ -834,6 +834,8 @@ impl Walk<'_, '_> {
     fn encode_mlx_affine_u4(
         &self,
         bytes: &[u8],
+        source: Option<&SourceExtent>,
+        inputs: &[BufferId],
         outputs: &[BufferId],
         transform: &TransformSpec,
     ) -> Result<Vec<(BufferId, Vec<u8>)>, Error> {
@@ -852,12 +854,7 @@ impl Walk<'_, '_> {
                 outputs.len()
             )));
         };
-        let shape = self
-            .index
-            .buffer_tensor(self.plan, *weight)
-            .ok_or_else(|| invalid("Encode output has no tensor type"))?
-            .shape
-            .clone();
+        let shape = self.buffer_shape(*weight)?.to_vec();
         let [rows, cols] = shape[..] else {
             return Err(invalid(format!(
                 "encoding to {scheme:?} walks [rows, cols] tiles, not {shape:?}"
@@ -873,7 +870,21 @@ impl Walk<'_, '_> {
         // The operand is whatever the chain decoded to; `decode_values` gives
         // f64 and the quantizer works in f32, which is what MLX's own encoder
         // does and therefore what the codes have to be rounded from.
-        let values = decode_values(bytes, self.buffer_dtype_of_input(*weight, bytes.len())?)?;
+        //
+        // Read off the OPERAND, which knows its own dtype. It used to be
+        // recovered by dividing the byte count by the destination's element
+        // count and matching 2 against BF16 and 4 against F32 — a guess of
+        // exactly the kind this crate refuses everywhere else, and one only
+        // needed because a buffer's type lived on a tensor an intermediate
+        // does not have.
+        let operand_dtype = if let Some(input) = inputs.first() {
+            self.buffer_dtype(*input)?
+        } else if let Some(source) = source {
+            self.source_dtype(source.tensor_id)?
+        } else {
+            return Err(invalid("host Encode requires a source or input buffer"));
+        };
+        let values = decode_values(bytes, operand_dtype)?;
         if values.len() as i64 != rows * cols {
             return Err(invalid(format!(
                 "Encode was handed {} elements for the {shape:?} it must quantize",
@@ -905,41 +916,6 @@ impl Walk<'_, '_> {
         ])
     }
 
-    /// The dtype an Encode's operand bytes are read as.
-    ///
-    /// The operand is an intermediate the chain produced, so its width is what
-    /// the byte count and the destination's element count agree on: the
-    /// destination buffer is quantized, and asking it for a `DType` would get
-    /// the scheme's logical type rather than the operand's storage type.
-    fn buffer_dtype_of_input(&self, weight: BufferId, bytes: usize) -> Result<DType, Error> {
-        let shape = &self
-            .index
-            .buffer_tensor(self.plan, weight)
-            .ok_or_else(|| invalid("Encode output has no tensor type"))?
-            .shape;
-        let elements: i64 = shape.iter().product();
-        match bytes as i64 / elements.max(1) {
-            2 => Ok(DType::BF16),
-            4 => Ok(DType::F32),
-            other => Err(invalid(format!(
-                "Encode operand is {other} bytes per element, which is neither \
-                 the BF16 nor the F32 a quantizer reads"
-            ))),
-        }
-    }
-
-    /// One factor per block, read from the last input buffer.
-    ///
-    /// The blocking is `transform.scale_blocks`, one entry per axis, so this
-    /// walks the destination's logical shape rather than flattening. Flattening
-    /// was exact while groups were confined to the last axis — there, the runs
-    /// of the row-major layout and the runs of the logical shape are the same —
-    /// but a block that spans rows has its factor at a stride, and chunking
-    /// cannot see it.
-    ///
-    /// The factors' own extents are derived from the two, not read: the shape
-    /// ratio is what defines the blocking, and reading a third statement of it
-    /// would be a third thing to disagree.
     fn scale_per_block(
         &self,
         mut values: Vec<f64>,
@@ -951,12 +927,7 @@ impl Walk<'_, '_> {
             .last()
             .ok_or_else(|| invalid("per-block Scale has no factor operand"))?;
         let factors = decode_values(&self.buffer_bytes(factors)?, self.buffer_dtype(factors)?)?;
-        let shape = self
-            .index
-            .buffer_tensor(self.plan, output)
-            .ok_or_else(|| invalid("per-block Scale output has no tensor type"))?
-            .shape
-            .clone();
+        let shape = self.buffer_shape(output)?.to_vec();
         let blocks = &transform.scale_blocks;
         if shape.len() != blocks.len() {
             return Err(invalid(format!(
@@ -1037,8 +1008,7 @@ impl Walk<'_, '_> {
         if from == to {
             return Ok(bytes.to_vec());
         }
-        let values = decode_values(bytes, from)?;
-        encode_values(&values, to)
+        cast_elements(bytes, from, to)
     }
 
     /// Decode a self-contained blocked payload to its logical dtype: the
@@ -1152,24 +1122,14 @@ impl Walk<'_, '_> {
         let &[payload, scales] = outputs else {
             return Err(invalid("host Encode expects weight and scale outputs"));
         };
-        let shape = self
-            .index
-            .buffer_tensor(self.plan, payload)
-            .ok_or_else(|| invalid("host Encode payload has no tensor type"))?
-            .shape
-            .clone();
+        let shape = self.buffer_shape(payload)?.to_vec();
         let &[rows, cols] = shape.as_slice() else {
             return Err(invalid(format!(
                 "host Encode expects a 2-D weight, got shape {shape:?}"
             )));
         };
         let (rows, cols) = (checked_usize_i64(rows)?, checked_usize_i64(cols)?);
-        let scale_shape = self
-            .index
-            .buffer_tensor(self.plan, scales)
-            .ok_or_else(|| invalid("host Encode scale has no tensor type"))?
-            .shape
-            .clone();
+        let scale_shape = self.buffer_shape(scales)?.to_vec();
 
         let dtype = if let Some(source) = source {
             self.source_dtype(source.tensor_id)?
@@ -1423,14 +1383,15 @@ impl Walk<'_, '_> {
     }
 
     fn buffer_dtype(&self, id: BufferId) -> Result<DType, Error> {
-        let tensor = self
-            .index
-            .buffer_tensor(self.plan, id)
-            .ok_or_else(|| invalid(format!("buffer {} has no tensor type", id.0)))?;
-        match tensor.encoding {
-            Encoding::Raw(dtype) => Ok(dtype),
+        match &self.plan.buffer(id)?.ty.encoding {
+            Encoding::Raw(dtype) => Ok(*dtype),
             Encoding::Quant(_) => Err(invalid("host Cast does not accept quantized buffers")),
         }
+    }
+
+    /// A buffer's declared shape.
+    fn buffer_shape(&self, id: BufferId) -> Result<&[i64], Error> {
+        Ok(self.plan.buffer(id)?.ty.shape.as_slice())
     }
 
     fn source_dtype(&self, id: crate::types::TensorId) -> Result<DType, Error> {
@@ -3010,18 +2971,22 @@ mod tests {
             BufferDecl {
                 id: BufferId(0),
                 tensor: Some(TensorId(0)),
+                ty: crate::contract::TensorType::raw(vec![2, 2], DType::U8),
                 bytes: 4,
                 alignment: 8,
                 temporary: false,
                 persistent_offset: Some(0),
+                scratch_offset: None,
             },
             BufferDecl {
                 id: BufferId(1),
                 tensor: Some(TensorId(1)),
+                ty: crate::contract::TensorType::raw(vec![2, 2], DType::U16),
                 bytes: 8,
                 alignment: 8,
                 temporary: false,
                 persistent_offset: Some(8),
+                scratch_offset: None,
             },
         ];
         program.instrs = vec![
@@ -3187,3 +3152,4 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 }
+

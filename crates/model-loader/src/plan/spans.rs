@@ -186,10 +186,12 @@ mod tests {
         BufferDecl {
             id: BufferId(id),
             tensor: tensor.map(TensorId),
+            ty: crate::contract::TensorType::raw(vec![bytes as i64], DType::U8),
             bytes,
             alignment: 1,
             temporary: false,
             persistent_offset: offset,
+            scratch_offset: None,
         }
     }
 

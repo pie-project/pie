@@ -32,8 +32,6 @@
 //! that quietly stops testing is worse than no test, because the header
 //! keeps claiming the gate is standing.
 
-#![cfg(feature = "forward")]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

@@ -16,7 +16,6 @@
 //! it was not having. The row below states `Gemma3nText` because that is
 //! what a gemma-3n speaks.
 
-#[cfg(feature = "forward")]
 pub mod forward;
 
 /// The three projections a row of this generation makes: its tensor
@@ -27,12 +26,12 @@ pub mod project;
 /// exist under every aspect.
 pub mod spec;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -185,15 +184,7 @@ pub const VARIANTS: &[Gemma3n] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&Gemma3n` to `&dyn
-/// Variant`; the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Gemma3n);
 
 impl Variant for Gemma3n {
     fn id(&self) -> &'static str {
@@ -287,7 +278,6 @@ impl Variant for Gemma3n {
         }
     }
 
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -590,7 +580,6 @@ mod tests {
     /// The comparison is against [`project::NO_METAL`] itself and not a
     /// paraphrase, so the sentence a caller is shown is the sentence
     /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -604,6 +593,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {

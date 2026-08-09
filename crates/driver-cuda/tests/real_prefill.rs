@@ -406,6 +406,8 @@ fn ab(spec: &Spec) {
         scales: std::collections::BTreeMap::new(),
         moe_norm_topk: false,
         moe_routed_scaling: 1.0,
+        // Dense fixtures: no routed statement, which this field spells `0`.
+        experts_per_token: 0,
         yarn: [0.0; 4],
         yarn_original_max: 0,
         glu_limit: 0.0,

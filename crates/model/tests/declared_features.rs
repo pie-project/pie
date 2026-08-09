@@ -360,10 +360,11 @@ fn the_gate_reader_still_finds_gates() {
 /// driver for a module it can legitimately see.
 ///
 /// It used to be pinned against real source — `deployment_cuda` was
-/// `all(forward, config)` and `families` was `any(chat, forward)`. Both
-/// are gone: `config` was deleted with the descriptor, and `families`
-/// became `shared/`, whose modules each carry a single-feature gate. No
-/// `any(..)` is left in the crate's surface.
+/// `all(forward, config)` and `families` was `any(chat, forward)`. All
+/// three of those features are gone now: `config` was deleted with the
+/// descriptor, `families` became `shared/`, and `forward` was deleted
+/// once every consumer was found to enable it. Two features are left
+/// and no `any(..)` or `all(..)` is in the crate's surface at all.
 ///
 /// So it is fed one. A branch with no live example is a branch that
 /// rots, and deleting the assertion instead would leave the code with
@@ -377,9 +378,9 @@ fn an_any_gate_reads_as_no_requirement_rather_than_as_both() {
     read_gates_into(
         &mut gates,
         r#"
-#[cfg(any(feature = "chat", feature = "forward"))]
+#[cfg(any(feature = "chat", feature = "contract"))]
 pub mod either;
-#[cfg(all(feature = "chat", feature = "forward"))]
+#[cfg(all(feature = "chat", feature = "contract"))]
 pub mod both;
 #[cfg(feature = "contract")]
 pub mod one;

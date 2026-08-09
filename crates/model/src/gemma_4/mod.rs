@@ -36,15 +36,14 @@ pub mod spec;
 /// Written in `model-compiler`'s tracing eDSL: ordinary Rust that runs at
 /// model-load time with the checkpoint's facts in hand and records what one
 /// pass computes. The traced form is what a driver executes.
-#[cfg(feature = "forward")]
 pub mod forward;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::{Advertised, AudioTower, Deployment, Refusal, Towers, VisionTower};
@@ -258,12 +257,7 @@ pub const VARIANTS: &[Gemma4] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Gemma4);
 
 impl Gemma4 {
     /// The four numbers this row states that its shape cannot.
@@ -395,7 +389,6 @@ impl Variant for Gemma4 {
     /// [`Refusal::Unsupported`] for the A4B, by the same predicate
     /// [`Self::deployment`] refuses on — a row that cannot be deployed
     /// cannot be traced.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -435,8 +428,11 @@ impl Variant for Gemma4 {
         // a row whose checkpoint ships no `v_proj` would be traced
         // against one here.
         //
-        // `Deployment::k_eq_v` states the measurement and this is the
-        // reader CUDA never grew. Refusing is the whole of what this
+        // `Gemma4Facts::k_eq_v` states the measurement and this is the
+        // reader CUDA never grew. `Deployment` used to carry a copy of
+        // it "for the driver to read"; no driver read it and none was
+        // going to, because the branch that needs it is HERE. Refusing
+        // is the whole of what this
         // file can honestly do about it: the alternative is a plan that
         // binds a tensor the checkpoint does not contain.
         if self.k_eq_v {
@@ -467,7 +463,6 @@ mod tests {
         rows,
     };
     // Only the Metal text's tests call the projection by name.
-    #[cfg(feature = "forward")]
     use super::project;
     use crate::deployment::{AttnOutput, PrefillStyle, Refusal};
 
@@ -884,7 +879,6 @@ mod tests {
     /// whose text does not exist — and what stops that is not a refusal
     /// but the widths: a gemma-4 traced as a generic llama would carry
     /// ONE attention shape, and this asserts the two.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_traces_this_rows_two_attention_shapes_and_not_a_llamas() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -897,6 +891,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         let mut two_shaped = 0usize;

@@ -36,12 +36,12 @@
 
 #[cfg(feature = "chat")]
 pub mod chat;
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -327,15 +327,7 @@ pub const VARIANTS: &[Llama3] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&Llama3` to `&dyn Variant`;
-/// the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Llama3);
 
 impl Llama3 {
     /// The scalars this row states, read ONCE.
@@ -392,7 +384,7 @@ impl Variant for Llama3 {
         // row here would have attended past 8192 with the wrong
         // wavelengths — degrading rather than failing, which is the
         // shape of defect this catalog exists to make impossible.
-        deployment.rope_scaling = Some(crate::deployment::RopeScaling::Llama3 {
+        deployment.rope_scaling = Some(crate::deployment::RopeScaling::Piecewise {
             factor: self.rope_factor,
             low_freq_factor: ROPE_LOW_FREQ_FACTOR,
             high_freq_factor: ROPE_HIGH_FREQ_FACTOR,
@@ -444,7 +436,7 @@ impl Variant for Llama3 {
     /// `rope_rescaled: TRUE`, and it is the one row field here with
     /// teeth: llama-3 rotates on a piecewise-rescaled ladder
     /// ([`Self::deployment`] states the four numbers as
-    /// `RopeScaling::Llama3`), and NO `rope_theta` expresses it. The
+    /// `RopeScaling::Piecewise`), and NO `rope_theta` expresses it. The
     /// Metal text therefore reads a frequency TABLE the driver derived
     /// at load rather than deriving a ladder from the base, and this
     /// flag is how it knows which.
@@ -454,7 +446,6 @@ impl Variant for Llama3 {
     /// `pie.model/1` descriptor, and a factor of zero reads as "no
     /// rescaling", so every llama-3 attended past its trained 8192 with
     /// the wrong wavelengths — degrading rather than failing.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -652,7 +643,7 @@ mod tests {
             let d = v
                 .deployment(Deployed::single())
                 .expect("every llama-3 row deploys");
-            let Some(crate::deployment::RopeScaling::Llama3 {
+            let Some(crate::deployment::RopeScaling::Piecewise {
                 factor,
                 low_freq_factor,
                 high_freq_factor,
@@ -917,7 +908,6 @@ mod tests {
     /// back is the llama-like one — the family a row states by which
     /// projection it calls, no longer by which string reached which
     /// table.
-    #[cfg(feature = "forward")]
     #[test]
     fn every_row_traces_both_fire_classes() {
         use model_compiler::trace::FireClass;

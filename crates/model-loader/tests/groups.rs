@@ -181,10 +181,45 @@ fn both_spellings_of_a_group_compile_to_the_same_program() {
     )
     .unwrap();
 
-    assert_eq!(
-        fused.groups[0].plan.buffers, named.groups[0].plan.buffers,
-        "the same tensor needs the same buffer either way"
-    );
+    // The two contracts declare the SAME tensor at different ranks — a
+    // selected band keeps the axis it was selected along, so `banded` says
+    // `[1, ROWS, COLS]` where `group` says `[ROWS, COLS]` — and a buffer now
+    // carries the type it was declared with. That difference is the contracts'
+    // and not the compiler's, so it is stated here rather than compared away:
+    // everything about the buffer that the LOAD depends on has to match.
+    let fused_buffers = &fused.groups[0].plan.buffers;
+    let named_buffers = &named.groups[0].plan.buffers;
+    assert_eq!(fused_buffers.len(), named_buffers.len());
+    for (fused, named) in fused_buffers.iter().zip(named_buffers) {
+        assert_eq!(
+            (
+                fused.id,
+                fused.tensor,
+                fused.bytes,
+                fused.alignment,
+                fused.temporary,
+                fused.persistent_offset,
+                fused.scratch_offset,
+                &fused.ty.encoding,
+            ),
+            (
+                named.id,
+                named.tensor,
+                named.bytes,
+                named.alignment,
+                named.temporary,
+                named.persistent_offset,
+                named.scratch_offset,
+                &named.ty.encoding,
+            ),
+            "the same tensor needs the same buffer either way"
+        );
+        assert_eq!(
+            fused.ty.element_count().unwrap(),
+            named.ty.element_count().unwrap(),
+            "and the two ranks describe the same elements"
+        );
+    }
     assert_eq!(fused.groups[0].plan.memory, named.groups[0].plan.memory);
 }
 

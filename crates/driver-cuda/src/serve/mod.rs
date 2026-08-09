@@ -57,6 +57,28 @@ pub use crate::fire::launch::fire_class_of;
 pub use encode::pie_cuda_encode;
 pub use transfer::{pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_resize_pool};
 
+/// The GQA group sizes THIS BUILD's decode instantiates.
+///
+/// FlashInfer's decode reports anything else by THROWING, and a throw
+/// crossing a C ABI is undefined behaviour, which is why `load_model` asks at
+/// the door rather than discovering it at launch.
+///
+/// **It is stated here and not in `model`.** The set is a fact about what
+/// this crate's kernels were built with, and
+/// [`Deployment::servable_by`](model::deployment::Deployment::servable_by)
+/// takes it as an ARGUMENT for exactly that reason — its own doc says
+/// "`model` states the shape, the driver states what it instantiated, and
+/// neither one has to know the other's answer."
+///
+/// The const nevertheless lived in `model::shared::llama_like::project`,
+/// so this crate reached through a FAMILY's namespace to read a fact about
+/// its own build. Its doc there already argued it "sat inside the llama
+/// lineage's derivation as though it were a property of that lineage"; this
+/// is that argument finished. The live proof it belongs to no lineage is
+/// Qwen3.6-27B — 24 query heads over 4 kv heads is a group of six, reaching
+/// the same dispatch from a different generation.
+pub const DECODE_GQA_GROUPS: &[u32] = &[1, 2, 3, 4, 8];
+
 use crate::fire::launch::launch_impl;
 use load::{adopt_and_compile, create_impl, destroy_impl, load_impl};
 use state::{ChannelState, InstanceEntry, ProgramEntry, channel_dtype, shell, slice_of};
@@ -65,10 +87,11 @@ use state::{ChannelState, InstanceEntry, ProgramEntry, channel_dtype, shell, sli
 ///
 /// North star rule 4 says a shared capability must not be optional: if it
 /// can be skipped, it will be. `driver-api` ships seventeen `validate_*`
-/// functions; `driver-dummy` — the reference implementation of this
-/// contract — calls them, and this shell called NONE, re-deriving similar
-/// checks by hand at 51 sites. The capability was built, shipped, and
-/// routed around.
+/// functions, and NOTHING calls them now: this shell called none of them,
+/// re-deriving similar checks by hand at 51 sites, and the one caller that
+/// did — `driver-dummy`, the interpreter backend — is deleted. The
+/// capability was built, shipped, and routed around by every
+/// implementation there was.
 ///
 /// Calling them would not have fixed that, only postponed it: a helper
 /// that must be remembered is the same shape as a validator that must be

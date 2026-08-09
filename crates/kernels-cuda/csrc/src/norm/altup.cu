@@ -1,59 +1,13 @@
+// The kernels live in the header; this file is the two entry points that
+// still launch them ahead of time -- and, for altup, the only way they are
+// launched at all: their three-axis grid matches no stated `LaunchRule`, so
+// no JIT row names them. `altup.cuh` says why.
+#include "pie_device.cuh"
+#include "norm/altup.cuh"
 #include "norm/altup.hpp"
 
-#include <cuda_bf16.h>
-#include <cstdio>
 
 namespace pie_cuda_driver::kernels::norm {
-
-namespace {
-
-__global__ void altup_predict_kernel(
-    const __nv_bfloat16* __restrict__ streams,
-    const float* __restrict__         coefs,
-    __nv_bfloat16* __restrict__       predictions,
-    int K, int T, int H)
-{
-    const int t = blockIdx.x;
-    const int k = blockIdx.y;
-    const int h = blockIdx.z * blockDim.x + threadIdx.x;
-    if (t >= T || k >= K || h >= H) return;
-
-    const long long stream_stride = (long long)T * H;
-
-    // Σ_j coefs[t, j, k] · streams[j, t, h], plus the residual streams[k, t, h].
-    float sum = 0.f;
-    for (int j = 0; j < K; ++j) {
-        const float c = coefs[(long long)t * K * K + (long long)j * K + k];
-        const float s = __bfloat162float(
-            streams[(long long)j * stream_stride + (long long)t * H + h]);
-        sum += c * s;
-    }
-    sum += __bfloat162float(streams[(long long)k * stream_stride + (long long)t * H + h]);
-    predictions[(long long)k * stream_stride + (long long)t * H + h] = __float2bfloat16(sum);
-}
-
-__global__ void altup_correct_kernel(
-    const __nv_bfloat16* __restrict__ predictions,
-    const __nv_bfloat16* __restrict__ activated,
-    const float* __restrict__         correction_coefs_plus_one,
-    __nv_bfloat16* __restrict__       corrected,
-    int K, int T, int H, int active_idx)
-{
-    const int t = blockIdx.x;
-    const int k = blockIdx.y;
-    const int h = blockIdx.z * blockDim.x + threadIdx.x;
-    if (t >= T || k >= K || h >= H) return;
-
-    const long long stream_stride = (long long)T * H;
-    const float a       = __bfloat162float(activated[(long long)t * H + h]);
-    const float p_act   = __bfloat162float(predictions[(long long)active_idx * stream_stride + (long long)t * H + h]);
-    const float p_k     = __bfloat162float(predictions[(long long)k * stream_stride + (long long)t * H + h]);
-    const float coef    = correction_coefs_plus_one[(long long)t * K + k];
-    const float result  = (a - p_act) * coef + p_k;
-    corrected[(long long)k * stream_stride + (long long)t * H + h] = __float2bfloat16(result);
-}
-
-}  // namespace
 
 void altup_predict_bf16(
     const void* streams, const float* coefs, void* predictions,
@@ -62,9 +16,9 @@ void altup_predict_bf16(
     if (T <= 0 || K <= 0 || H <= 0) return;
     constexpr int BLOCK = 128;
     const dim3 grid(T, K, (H + BLOCK - 1) / BLOCK);
-    altup_predict_kernel<<<grid, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(streams), coefs,
-        static_cast<__nv_bfloat16*>(predictions),
+    device::altup_predict<device::bf16><<<grid, BLOCK, 0, stream>>>(
+        static_cast<const device::bf16*>(streams), coefs,
+        static_cast<device::bf16*>(predictions),
         K, T, H);
 }
 
@@ -76,11 +30,11 @@ void altup_correct_bf16(
     if (T <= 0 || K <= 0 || H <= 0) return;
     constexpr int BLOCK = 128;
     const dim3 grid(T, K, (H + BLOCK - 1) / BLOCK);
-    altup_correct_kernel<<<grid, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(predictions),
-        static_cast<const __nv_bfloat16*>(activated),
+    device::altup_correct<device::bf16><<<grid, BLOCK, 0, stream>>>(
+        static_cast<const device::bf16*>(predictions),
+        static_cast<const device::bf16*>(activated),
         correction_coefs_plus_one,
-        static_cast<__nv_bfloat16*>(corrected),
+        static_cast<device::bf16*>(corrected),
         K, T, H, active_idx);
 }
 

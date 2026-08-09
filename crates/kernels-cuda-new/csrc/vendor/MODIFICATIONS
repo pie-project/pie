@@ -1,0 +1,54 @@
+MODIFICATIONS -- every vendored file, and how many guards it carries
+===================================================================
+
+Generated from the tree, and kept honest by the property it asserts: strip
+every `// PIE:` marker, the `#ifndef __CUDACC_RTC__` under it and that
+directive's matching `#endif`, and each file below is byte-for-byte
+FlashInfer v0.6.15. That was checked per file before this list was written.
+`grep -rn "// PIE:" csrc/vendor/flashinfer/` finds all 33 markers.
+
+Columns: guards, added lines, file lines.
+
+file                                       guards   added    lines
+-----------------------------------------------------------------
+allocator.h                                     1       7      111
+attention/cascade.cuh                           0       0      791
+attention/decode.cuh                            1       8     1191
+attention/default_decode_params.cuh             0       0      279
+attention/default_prefill_params.cuh            4      26      474
+attention/heap.h                                1       6       72
+attention/mask.cuh                              0       0       30
+attention/mla.cuh                               1       7     1143
+attention/mla_params.cuh                        0       0       84
+attention/prefill.cuh                           0       0     4367
+attention/scheduler.cuh                         1      13     1840
+attention/state.cuh                             0       0       83
+attention/variant_helper.cuh                    0       0      104
+attention/variants.cuh                          0       0       97
+cp_async.cuh                                    0       0      265
+exception.h                                     1       9      115
+fastdiv.cuh                                     1       8       67
+fp16.h                                          1       7      184
+frag_layout_swizzle.cuh                         0       0       75
+layout.cuh                                      3      16      144
+math.cuh                                        1      12      284
+mma.cuh                                         0       0      705
+page.cuh                                        8      35      914
+permuted_smem.cuh                               0       0      191
+pos_enc.cuh                                     4      21     1653
+profiler.cuh                                    0       0      149
+utils.cuh                                       5      31      581
+vec_dtypes.cuh                                  0       0     2194
+-----------------------------------------------------------------
+28 files                                       33     206    18187
+
+14 files are untouched. `LICENSE` is upstream's, copied and not counted.
+
+Not upstream, written by PIE, in this directory rather than in the tree:
+
+    bit                          std::bit_cast, for fp16.h
+    boost/math/ccmath/fabs.hpp   one constexpr fabs, for fp16.h
+    cstdint                      the eight fixed-width typedefs
+    cuda.h                       CUDA_VERSION, derived from __CUDACC_VER_*
+    cuda_runtime.h               ushort/uchar, and <cstdint>
+    type_traits                  integral_constant and six things built on it

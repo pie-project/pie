@@ -16,14 +16,13 @@
 //! and a projection that took the row would have to be written twice.
 
 // Only the texts name a backend, and only they are gated.
-#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
+use crate::deployment::round_up_attn_head_dim;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
     PrefillStyle, RecurrentShape,
 };
 use crate::manifest::{Manifest, TensorSpec};
-use crate::shared::llama_like::project::round_up_attn_head_dim;
 
 use super::spec::{Qwen35HybridFacts, Qwen35MlpKind};
 
@@ -189,8 +188,7 @@ pub fn manifest(f: &Qwen35HybridFacts) -> Manifest {
 #[must_use]
 pub fn deployment(f: &Qwen35HybridFacts, rope_theta: f32, norm_eps: f32) -> Deployment {
     let a = &f.attn;
-    let kernel = round_up_attn_head_dim(a.head_dim);
-    let head_dim = kernel.max(a.head_dim);
+    let head_dim = round_up_attn_head_dim(a.head_dim);
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
             // One shape for every layer, which is what this row was
@@ -217,7 +215,7 @@ pub fn deployment(f: &Qwen35HybridFacts, rope_theta: f32, norm_eps: f32) -> Depl
             q_heads: a.q_heads,
             kv_heads: a.kv_heads,
             head_dim: a.head_dim,
-            head_dim_kernel: kernel,
+            head_dim_kernel: head_dim,
             // A dense row's width is the block's; a mixture's dense
             // width is ZERO because no layer here runs a dense block —
             // Qwen3.5's mixture is uniform, every MLP is the router's.
@@ -260,7 +258,6 @@ pub fn deployment(f: &Qwen35HybridFacts, rope_theta: f32, norm_eps: f32) -> Depl
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         // `Qwen3-30B-A3B` publishes `true` while the `Qwen3MoeConfig`
         // class default is `False`; the row wins. A dense qwen3.5 states
         // it too and nothing reads it.
@@ -318,7 +315,6 @@ fn gdn_shape(f: &Qwen35HybridFacts) -> RecurrentShape {
 /// from whether this row has a mixture, and `moe_residual_fold` follows
 /// from the load's TP width, because at `tp > 1` the block writes to
 /// scratch and an allreduce follows.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn cuda_facts(
     f: &Qwen35HybridFacts,
@@ -387,7 +383,6 @@ pub const NO_METAL: &str = "qwen-3.5 has no Metal text in this build: its forwar
      different shape; the CUDA backend serves this row";
 
 /// Trace this row's CUDA text for one fire class.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Qwen35HybridFacts,
@@ -703,7 +698,6 @@ mod tests {
 
     /// The binding facts are the LIVE env defaults, and the two that
     /// are not constants follow from the row and the load.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_binding_facts_are_the_live_defaults() {
         let dense_facts = cuda_facts(&dense(), Deployed::single());
@@ -746,7 +740,6 @@ mod tests {
     }
 
     /// The trace is the row's, for every class a fire can carry.
-    #[cfg(feature = "forward")]
     #[test]
     fn every_fire_class_traces() {
         use model_compiler::trace::FireClass;

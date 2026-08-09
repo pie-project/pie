@@ -28,7 +28,6 @@
 //! layer emits both per layer.
 
 // Only the texts name a backend, and only they are gated.
-#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
@@ -201,7 +200,7 @@ pub fn deployment(
     rope_theta_local: f32,
     norm_eps: f32,
 ) -> Deployment {
-    let head_dim = crate::shared::llama_like::project::round_up_attn_head_dim(f.attn.head_dim);
+    let head_dim = crate::deployment::round_up_attn_head_dim(f.attn.head_dim);
     let attention = (0..f.layers())
         .map(|l| {
             let window = model_compiler::facts::window_left_at(f.window_left, l);
@@ -270,7 +269,10 @@ pub fn deployment(
         // every other row of the catalog: the driver sizes the per-layer
         // embedding gather from it, and the old derivation left it at
         // the trait's default of zero.
-        ple_dim: i32::try_from(f.ple_width).unwrap_or(0),
+        // See `Deployment::ple_dim`: the row holds a `u32` and this
+        // no longer narrows through a conversion whose failure arm
+        // meant "this stack has none".
+        ple_dim: f.ple_width,
         norm: NormPlacement::Pre,
         // A gemma-3 derivative, and it kept the fold: this generation's
         // forward fires `NormVariant::Gemma`.
@@ -278,7 +280,6 @@ pub fn deployment(
         // gemma-3 carries the per-head q/k norm and NO V norm: the two
         // are separate facts, and this row is where that is said.
         v_norm: false,
-        k_eq_v: false,
         // Dense: no router reads this.
         norm_topk_prob: true,
         // No router of this family states a scaling factor.
@@ -336,7 +337,6 @@ pub const NO_METAL: &str = "gemma-3n has no Metal text in this build: its forwar
 /// `load` is unread and named anyway, as gemma-2's is: gemma-3n binds
 /// nothing from the load, and the three projections keep one shape so a
 /// reader can see at a glance which generation reads what.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Gemma3nFacts,
@@ -455,7 +455,11 @@ mod tests {
     fn the_per_layer_embedding_width_reaches_the_deployment() {
         let d = deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6);
         assert_eq!(d.ple_dim, 256);
-        assert_eq!(d.ple_dim, i32::try_from(e2b().ple_width).unwrap());
+        assert_eq!(
+            d.ple_dim,
+            e2b().ple_width,
+            "the row's own width, no conversion between"
+        );
         assert!(d.ple_dim > 0, "the default this row replaces was 0");
     }
 

@@ -24,12 +24,12 @@
 //! [`project::manifest`] for how a manifest pins the mixture's geometry
 //! without naming either spelling.
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -46,7 +46,6 @@ pub mod contract;
 /// Written in `model-compiler`'s tracing eDSL: ordinary Rust that runs at
 /// model-load time with the checkpoint's facts in hand and records what one
 /// pass computes. The traced form is what a driver executes.
-#[cfg(feature = "forward")]
 pub mod forward;
 
 /// What a gpt-oss checkpoint IS — ungated, because a row is written in
@@ -218,15 +217,7 @@ pub const VARIANTS: &[GptOss] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&GptOss` to `&dyn Variant`;
-/// the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(GptOss);
 
 impl Variant for GptOss {
     fn id(&self) -> &'static str {
@@ -296,7 +287,6 @@ impl Variant for GptOss {
         }
     }
 
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -638,7 +628,6 @@ mod tests {
             assert!(!v.manifest().tensors.is_empty(), "{}", v.id());
             assert_ne!(v.load_shape().layers, 0, "{}", v.id());
             assert!(v.deployment(Deployed::single()).is_ok(), "{}", v.id());
-            #[cfg(feature = "forward")]
             for class in [
                 model_compiler::trace::FireClass::Decode,
                 model_compiler::trace::FireClass::Prefill,
@@ -689,7 +678,6 @@ mod tests {
     /// The comparison is against [`project::NO_METAL`] itself and not a
     /// paraphrase, so the sentence a caller is shown is the sentence
     /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -703,6 +691,7 @@ mod tests {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {

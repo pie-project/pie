@@ -18,18 +18,19 @@ crate-type = ["rlib"]
 # Binary half — the `pie` CLI. Parses argv via clap and dispatches into
 # the lib.
 [features]
-# Default = no embedded backend feature; the always-linked dummy driver is
-# selected at runtime. Enable `driver-cuda` (Linux/NVIDIA) or `driver-metal`
-# (macOS) for real inference. `driver-dummy` is
-# kept as a compatibility no-op for older build commands; the dummy
-# Rust driver is no longer gated.
+# Default = no embedded backend feature. Enable `driver-cuda`
+# (Linux/NVIDIA) or `driver-metal` (macOS) to reach a device; with neither,
+# this crate builds and serves nothing locally.
+#
+# There used to be a third: an always-linked `driver-dummy` selected at
+# runtime, plus a `driver-dummy = []` no-op kept for older build commands.
+# Both are gone with the crate.
 default = []
 # Each flavor turns on a DEPENDENCY, not a branch in this crate's build
 # script. Both drivers are Rust now, so what this crate needs from them is
 # that they be in the graph.
 driver-cuda = ["engine/driver-cuda"]
 driver-metal = ["engine/driver-metal"]
-driver-dummy = []
 nixl = ["dep:transport", "transport/nixl"]
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
@@ -96,7 +97,6 @@ tracing = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 
 # Always-linked Rust dummy driver — random tokens, no model load.
-driver-dummy = { path = "../driver-dummy" }
 # `default-features = false` drops the loader's testkit (oracle, contract
 # fixture builder, CPU executor). Nothing under `ffi/` reaches them, and this is
 # what keeps that true.
@@ -117,7 +117,7 @@ model-compiler = { path = "../model-compiler" }
 # out of an artifact under the same name `convert` writes it under. It
 # used to ask for `config`, a feature that carried an 845-line normalizer
 # whose whole output the catalog now states as a `const`.
-model = { path = "../model", features = ["forward", "contract"] }
+model = { path = "../model", features = ["contract"] }
 tokenizer = { path = "../tokenizer" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
@@ -135,7 +135,7 @@ tensor-ir = { path = "../tensor-ir" }
 # a model. Identity is a manifest match now, so the dummy driver has to name
 # a row it can be held to, and the smallest real one is half a gigabyte of
 # embedding. See `model::test_rows`.
-model = { path = "../model", features = ["forward", "contract", "test-rows"] }
+model = { path = "../model", features = ["contract", "test-rows"] }
 
 [build-dependencies]
 # `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a

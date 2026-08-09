@@ -32,18 +32,34 @@
 //   * subsampling stride math — Conv2d(k3,s2,p1) twice over (time,freq); the
 //     LayerNorm is over the CHANNEL axis (permute to channels-last) then ReLU.
 
+//
+// THE KERNELS ARE NOT HERE. All twelve moved to `vision/gemma4_audio.cuh` in
+// the JIT crate's header tree, where they are named templates over the
+// storage format; this file keeps the host half -- the three entry points,
+// the checkpoint hook, the scratch arena, the conformer loop -- and includes
+// them. The move is what made them reachable from NVRTC at all: an anonymous
+// namespace has no name to give `nvrtcAddNameExpression`, so the runtime
+// could not resolve a `CUfunction` for one of them. It is a MOVE and not a
+// copy, which `tests/sources.rs::no_global_is_defined_twice` enforces,
+// because `norm/altup_aux` shipped a release with two copies that had drifted
+// and every test passing.
+//
+// Every launch below therefore spells an INSTANTIATION -- `vd::k_silu<bfd>`
+// -- and every bf16 pointer crosses through `D()`. See the alias block for
+// why the cast is there and why it is not a conversion.
+
 #include "vision/gemma4_audio.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <math_constants.h>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "ssm/causal_conv1d.hpp"
+#include "ssm/causal_conv1d.cuh"
 
+#include "vision/gemma4_audio.cuh"
 #include "vision/gemma4_naive_kernels.cuh"
 
 namespace pie_cuda_driver::model {
@@ -58,6 +74,25 @@ void set_gemma4_audio_ckpt(Gemma4AudioCkptFn fn, void* user) {
 namespace {
 
 typedef __nv_bfloat16 bf;
+
+// The bridge between the tower's `bf` and the kernels' `T`.
+//
+// `bf` is NVIDIA's `__nv_bfloat16`, which is what `vision/gemma4_audio.hpp`
+// declares and what every caller passes; the templates in the `.cuh` are
+// instantiated at `device::bf16`, the prelude's own two-byte struct. They are
+// the same sixteen bits and NOT the same type -- the prelude cannot name
+// NVIDIA's, because NVRTC bundles no device headers and `<cuda_bf16.h>` is one
+// of the 31 it answered none of.
+//
+// So the pointer is REINTERPRETED, once, at each launch. `D` is spelled as a
+// pair of overloads rather than a cast at every argument because a
+// `reinterpret_cast` written out fifty times is fifty places to get the
+// constness wrong, and the compiler cannot tell a wrong one from a right one.
+namespace vd = ::pie_cuda_driver::kernels::vision::device;
+namespace sd = ::pie_cuda_driver::kernels::ssm::device;
+using bfd = ::pie_cuda_driver::kernels::device::bf16;
+inline bfd* D(bf* p) { return reinterpret_cast<bfd*>(p); }
+inline const bfd* D(const bf* p) { return reinterpret_cast<const bfd*>(p); }
 #define ACK(x) do{cudaError_t e=(x);if(e)throw std::runtime_error(std::string("gemma4_audio: ")+cudaGetErrorString(e));}while(0)
 
 class DeviceScratch {
@@ -80,74 +115,18 @@ private:
     std::vector<void*> allocations_;
 };
 
-// ── Shared elementwise / GEMM / norm kernels (vision-style) ──────────────────
-__global__ void k_matmul_bias(const bf* x,const bf* W,const bf* b,bf* y,int N,int K,int O){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,o=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||o>=O)return;
-    const bf* xr=x+(long)n*K;const bf* wr=W+(long)o*K;float a=b?F(b[o]):0.f;for(int k=0;k<K;k++)a+=F(xr[k])*F(wr[k]);y[(long)n*O+o]=Bf(a);}
-// Plain RMSNorm: `w` may be null (parameterless, gamma=1).
-__global__ void k_silu(const bf* x,bf* o,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t){float v=F(x[i]);o[i]=Bf(v/(1.f+__expf(-v)));}}
-// out = a + scale*b   (residual add with macaron weight).
-__global__ void k_axpy(bf* a,const bf* b,float scale,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t)a[i]=Bf(F(a[i])+scale*F(b[i]));}
-// GLU over last dim: o[n,d] = x[n,d] * sigmoid(x[n, d+D]) for d in [0,D).
-__global__ void k_glu(const bf* x,bf* o,int N,int D){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,d=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||d>=D)return;
-    float a=F(x[(long)n*2*D+d]),g=F(x[(long)n*2*D+D+d]);o[(long)n*D+d]=Bf(a/(1.f+__expf(-g)));}
-// LayerNorm over channel axis (no bias, learnable scale) + ReLU, applied to a
-// [rows, C] tensor where each row is the channel vector at one (t,f) cell.
-__global__ void k_layernorm_relu(const bf* x,const bf* w,bf* o,int R,int C,float eps){
-    int r=blockIdx.x;if(r>=R)return;const bf* xr=x+(long)r*C;bf* orow=o+(long)r*C;
-    float m=0;for(int c=threadIdx.x;c<C;c+=blockDim.x)m+=F(xr[c]);
-    for(int s=warpSize/2;s>0;s>>=1)m+=__shfl_down_sync(0xffffffff,m,s);
-    __shared__ float wm[32],wv[32],mean,inv;if((threadIdx.x&31)==0)wm[threadIdx.x>>5]=m;__syncthreads();
-    if(threadIdx.x==0){float t=0;int nw=(blockDim.x+31)/32;for(int i=0;i<nw;i++)t+=wm[i];mean=t/C;}__syncthreads();
-    float v=0;for(int c=threadIdx.x;c<C;c+=blockDim.x){float d=F(xr[c])-mean;v+=d*d;}
-    for(int s=warpSize/2;s>0;s>>=1)v+=__shfl_down_sync(0xffffffff,v,s);
-    if((threadIdx.x&31)==0)wv[threadIdx.x>>5]=v;__syncthreads();
-    if(threadIdx.x==0){float t=0;int nw=(blockDim.x+31)/32;for(int i=0;i<nw;i++)t+=wv[i];inv=rsqrtf(t/C+eps);}__syncthreads();
-    for(int c=threadIdx.x;c<C;c+=blockDim.x){float y=(F(xr[c])-mean)*inv*(w?F(w[c]):1.f);orow[c]=Bf(y>0.f?y:0.f);}}
-
-// ── SSCP: Conv2d(in_ch,out_ch,k3,s2,p1) over a [in_ch, T, Freq] feature map.
-// Output [out_ch, To, Fo] with To=floor((T-1)/2)+1, Fo=floor((Freq-1)/2)+1.
-// PARITY TODO: verify padding=1 + stride=2 indexing vs torch Conv2d.
-__global__ void k_conv2d_s2(const bf* in,const bf* W,bf* out,
-                            int IC,int Tin,int Fin,int OC,int To,int Fo){
-    int oc=blockIdx.z;int to=blockIdx.y*blockDim.y+threadIdx.y,fo=blockIdx.x*blockDim.x+threadIdx.x;
-    if(oc>=OC||to>=To||fo>=Fo)return;
-    float acc=0;
-    for(int ic=0;ic<IC;ic++){
-        const bf* wk=W+(((long)oc*IC+ic)*3)*3;            // [3,3]
-        for(int kt=0;kt<3;kt++)for(int kf=0;kf<3;kf++){
-            int ti=to*2+kt-1, fi=fo*2+kf-1;                // stride 2, pad 1
-            if(ti<0||ti>=Tin||fi<0||fi>=Fin)continue;
-            acc+=F(in[((long)ic*Tin+ti)*Fin+fi])*F(wk[kt*3+kf]);
-        }
-    }
-    out[((long)oc*To+to)*Fo+fo]=Bf(acc);
-}
-// Reshape conv output [OC, To, Fo] → [To, Fo*OC] (channels-last per (t,f)) so
-// the LayerNorm runs over the channel axis. Here we produce [To*Fo, OC].
-__global__ void k_chlast(const bf* in,bf* out,int OC,int To,int Fo){
-    int oc=blockIdx.z;int to=blockIdx.y*blockDim.y+threadIdx.y,fo=blockIdx.x*blockDim.x+threadIdx.x;
-    if(oc>=OC||to>=To||fo>=Fo)return;
-    out[(((long)to*Fo+fo)*OC)+oc]=in[((long)oc*To+to)*Fo+fo];
-}
-// After LayerNorm+ReLU on [To*Fo, OC], reshape back to [OC, To, Fo].
-__global__ void k_chfirst(const bf* in,bf* out,int OC,int To,int Fo){
-    int oc=blockIdx.z;int to=blockIdx.y*blockDim.y+threadIdx.y,fo=blockIdx.x*blockDim.x+threadIdx.x;
-    if(oc>=OC||to>=To||fo>=Fo)return;
-    out[((long)oc*To+to)*Fo+fo]=in[(((long)to*Fo+fo)*OC)+oc];
-}
-// Flatten the final SSCP map [OC, To, Fo] → [To, Fo*OC] for input_proj_linear.
-// HF: permute(0,2,3,1) then reshape(B,To,Fo*OC).
-__global__ void k_sscp_flatten(const bf* in,bf* out,int OC,int To,int Fo){
-    int to=blockIdx.y*blockDim.y+threadIdx.y,j=blockIdx.x*blockDim.x+threadIdx.x;
-    int FoOC=Fo*OC;if(to>=To||j>=FoOC)return;int fo=j/OC,oc=j%OC;
-    out[(long)to*FoOC+j]=in[((long)oc*To+to)*Fo+fo];
-}
-
-// `k_depthwise_causal` was here. It is `kernels::ssm::causal_conv1d_prefill_
-// noact_bf16` -- bit for bit the same accumulation in the same order -- and
-// the call site says so.
+// The twelve kernels were here, between this line and `B2`. They are in
+// `vision/gemma4_audio.cuh` now, templated over the storage format -- see
+// that header for which two of them a `LaunchRule` states and why the other
+// ten are refused.
+//
+// A thirteenth was here and is not anywhere: `k_depthwise_causal` is
+// `ssm::device::causal_conv1d_prefill<T, false>` -- bit for bit the same
+// accumulation in the same order -- and the conformer loop fires that
+// template directly. It went through the `ssm::causal_conv1d_prefill_noact_bf16`
+// host launcher until this session; that launcher is now unreferenced by any
+// C++ in the tree and named by no table row, which is the whole of its
+// consumer set.
 
 dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 
@@ -164,64 +143,9 @@ dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 // p = max_past - (t-j), i.e. the sinusoidal position whose position_id == t-j.
 // Verified flat-vs-blocked to <1e-6 abs (scripts/ref_full_attn.py).
 namespace {
-__global__ void k_qkv_scale(bf* q,bf* k,const bf* pds,int N,int H,int hd,
-                            float q_scale,float k_scale){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,e=blockIdx.x*blockDim.x+threadIdx.x;
-    int HD=H*hd;if(n>=N||e>=HD)return;int d=e%hd;
-    float sp=logf(1.f+expf(F(pds[d])));                 // softplus(per_dim_scale)
-    q[(long)n*HD+e]=Bf(F(q[(long)n*HD+e])*q_scale*sp);
-    k[(long)n*HD+e]=Bf(F(k[(long)n*HD+e])*k_scale);
-}
-// Build the sinusoidal relative-position encoding `pe[P, hidden]`, P=max_past+1.
-// position_ids = arange(max_past, -1, -1) = [max_past, .., 1, 0]; row r holds
-// position_id = max_past - r. scaled_time[r, m] = (max_past-r) * inv[m];
-// pe[r] = concat(sin(scaled_time[r]), cos(scaled_time[r])).
-__global__ void k_rel_pos_enc(bf* pe,int P,int hidden){
-    int r=blockIdx.y*blockDim.y+threadIdx.y,d=blockIdx.x*blockDim.x+threadIdx.x;
-    if(r>=P||d>=hidden)return;
-    int num_ts=hidden/2;
-    float log_inc=logf(10000.f/1.f)/fmaxf((float)(num_ts-1),1.f);
-    int m=d<num_ts?d:(d-num_ts);
-    float inv=expf((float)m*-log_inc);
-    float pos=(float)((P-1)-r);                           // position_id = max_past - r
-    float t=pos*inv;
-    pe[(long)r*hidden+d]=Bf(d<num_ts?sinf(t):cosf(t));
-}
-// Exact O(N^2) causal-sliding-window attention with relative-position bias and
-// logit soft-cap. q,k are already pre-scaled (q_scale·softplus(pds), k_scale).
-// `relk` is relative_k_proj(pe) reshaped [P, H, hd]; pe row r encodes
-// position_id = (P-1)-r, so the embedding for relative distance (t-j) lives at
-// row (P-1)-(t-j). Query t attends keys j in [t-(P-1), t].
-__global__ void k_local_attn(const bf* q,const bf* k,const bf* v,
-                             const bf* relk,bf* out,
-                             int N,int H,int hd,int P,float cap){
-    int head=blockIdx.y,i=blockIdx.x*blockDim.x+threadIdx.x;if(head>=H||i>=N)return;
-    float acc[256];                                     // hd ≤ 256 (gemma4: 128)
-    for(int d=0;d<hd;d++)acc[d]=0.f;
-    // mask: query t attends keys j with 0 <= (t-j) < max_past (= P-1, no future).
-    // So distance ∈ [0, P-2]; lo = i-(P-2). (Distance P-1 is excluded.)
-    int lo=i-(P-2); if(lo<0)lo=0;
-    const bf* qr=q+((long)i*H+head)*hd;
-    float mx=-1e30f;
-    for(int j=lo;j<=i;j++){
-        const bf* kr=k+((long)j*H+head)*hd;
-        const bf* rr=relk+((long)((P-1)-(i-j))*H+head)*hd; // pe row (P-1)-(t-j) ↔ position_id=t-j
-        float s=0;for(int d=0;d<hd;d++)s+=F(qr[d])*(F(kr[d])+F(rr[d]));
-        s=cap*tanhf(s/cap);                              // logit soft-cap
-        mx=fmaxf(mx,s);
-    }
-    float denom=0;
-    for(int j=lo;j<=i;j++){
-        const bf* kr=k+((long)j*H+head)*hd;
-        const bf* rr=relk+((long)((P-1)-(i-j))*H+head)*hd;
-        float s=0;for(int d=0;d<hd;d++)s+=F(qr[d])*(F(kr[d])+F(rr[d]));
-        s=cap*tanhf(s/cap);float w=__expf(s-mx);denom+=w;
-        const bf* vr=v+((long)j*H+head)*hd;
-        for(int d=0;d<hd;d++)acc[d]+=w*F(vr[d]);
-    }
-    float inv=denom>0.f?1.f/denom:0.f;
-    for(int d=0;d<hd;d++)out[((long)i*H+head)*hd+d]=Bf(acc[d]*inv);
-}
+// `k_qkv_scale`, `k_rel_pos_enc` and `k_local_attn` were here. They are in
+// `vision/gemma4_audio.cuh` with the other nine; the commentary above is the
+// contract they implement and stays with the call sites that rely on it.
 }  // namespace
 
 void run_gemma4_audio(const AudioRawWeights& w,
@@ -237,9 +161,9 @@ void run_gemma4_audio(const AudioRawWeights& w,
     DeviceScratch scratch;
     auto MAL=[&](long n){return scratch.alloc<bf>(n);};
     auto clin=[&](const bf* x,bf* out,bf* xc,const AudioClipRaw& c,int N,int Kin,int Out){
-        k_clamp<<<((long)N*Kin+255)/256,256,0,S>>>(x,xc,c.imin,c.imax,(long)N*Kin);
-        k_matmul<<<G2(Out,N),B2,0,S>>>(xc,c.w,out,N,Kin,Out);
-        k_clamp<<<((long)N*Out+255)/256,256,0,S>>>(out,out,c.omin,c.omax,(long)N*Out);};
+        vd::k_clamp<bfd><<<((long)N*Kin+255)/256,256,0,S>>>(D(x),D(xc),D(c.imin),D(c.imax),(long)N*Kin);
+        vd::k_matmul<bfd><<<G2(Out,N),B2,0,S>>>(D(xc),D(c.w),D(out),N,Kin,Out);
+        vd::k_clamp<bfd><<<((long)N*Out+255)/256,256,0,S>>>(D(out),D(out),D(c.omin),D(c.omax),(long)N*Out);};
 
     // ── 1) SSCP subsampling conv stack ──────────────────────────────────────
     // input_features [n_frames, n_mel] → unsqueeze channel → [1, n_frames, n_mel].
@@ -254,29 +178,29 @@ void run_gemma4_audio(const AudioRawWeights& w,
     {   // upload f32 features (host) → device → bf16 [1, T0, F0]
         float* f32d=scratch.alloc<float>((long)T0*F0);
         ACK(cudaMemcpyAsync(f32d,features,(long)T0*F0*4,cudaMemcpyHostToDevice,S));
-        k_f32_to_bf16<<<((long)T0*F0+255)/256,256,0,S>>>(f32d,feat_bf,(long)T0*F0);
+        vd::k_f32_to_bf16<bfd><<<((long)T0*F0+255)/256,256,0,S>>>(f32d,D(feat_bf),(long)T0*F0);
         ACK(cudaStreamSynchronize(S));
     }
     // layer0: conv [1,T0,F0]→[C0,T1,F1], LN-over-ch + ReLU.
     bf* c0=MAL((long)C0*T1*F1);
-    { dim3 g((F1+15)/16,(T1+15)/16,C0); k_conv2d_s2<<<g,B2,0,S>>>(feat_bf,w.sscp0_conv,c0,1,T0,F0,C0,T1,F1); }
+    { dim3 g((F1+15)/16,(T1+15)/16,C0); vd::k_conv2d_s2<bfd><<<g,B2,0,S>>>(D(feat_bf),D(w.sscp0_conv),D(c0),1,T0,F0,C0,T1,F1); }
     bf* c0cl=MAL((long)T1*F1*C0);
-    { dim3 g((F1+15)/16,(T1+15)/16,C0); k_chlast<<<g,B2,0,S>>>(c0,c0cl,C0,T1,F1); }
-    k_layernorm_relu<<<T1*F1,128,0,S>>>(c0cl,w.sscp0_norm,c0cl,T1*F1,C0,EPS);
-    { dim3 g((F1+15)/16,(T1+15)/16,C0); k_chfirst<<<g,B2,0,S>>>(c0cl,c0,C0,T1,F1); }
+    { dim3 g((F1+15)/16,(T1+15)/16,C0); vd::k_chlast<bfd><<<g,B2,0,S>>>(D(c0),D(c0cl),C0,T1,F1); }
+    vd::k_layernorm_relu<bfd><<<T1*F1,128,0,S>>>(D(c0cl),D(w.sscp0_norm),D(c0cl),T1*F1,C0,EPS);
+    { dim3 g((F1+15)/16,(T1+15)/16,C0); vd::k_chfirst<bfd><<<g,B2,0,S>>>(D(c0cl),D(c0),C0,T1,F1); }
     // layer1: conv [C0,T1,F1]→[C1,T2,F2], LN-over-ch + ReLU.
     bf* c1=MAL((long)C1*T2*F2);
-    { dim3 g((F2+15)/16,(T2+15)/16,C1); k_conv2d_s2<<<g,B2,0,S>>>(c0,w.sscp1_conv,c1,C0,T1,F1,C1,T2,F2); }
+    { dim3 g((F2+15)/16,(T2+15)/16,C1); vd::k_conv2d_s2<bfd><<<g,B2,0,S>>>(D(c0),D(w.sscp1_conv),D(c1),C0,T1,F1,C1,T2,F2); }
     bf* c1cl=MAL((long)T2*F2*C1);
-    { dim3 g((F2+15)/16,(T2+15)/16,C1); k_chlast<<<g,B2,0,S>>>(c1,c1cl,C1,T2,F2); }
-    k_layernorm_relu<<<T2*F2,128,0,S>>>(c1cl,w.sscp1_norm,c1cl,T2*F2,C1,EPS);
-    { dim3 g((F2+15)/16,(T2+15)/16,C1); k_chfirst<<<g,B2,0,S>>>(c1cl,c1,C1,T2,F2); }
+    { dim3 g((F2+15)/16,(T2+15)/16,C1); vd::k_chlast<bfd><<<g,B2,0,S>>>(D(c1),D(c1cl),C1,T2,F2); }
+    vd::k_layernorm_relu<bfd><<<T2*F2,128,0,S>>>(D(c1cl),D(w.sscp1_norm),D(c1cl),T2*F2,C1,EPS);
+    { dim3 g((F2+15)/16,(T2+15)/16,C1); vd::k_chfirst<bfd><<<g,B2,0,S>>>(D(c1cl),D(c1),C1,T2,F2); }
     // flatten [C1,T2,F2] → [T2, F2*C1] and input_proj → [T2, hidden].
     const int N=T2, FLAT=F2*C1;
     bf* flat=MAL((long)N*FLAT);
-    { dim3 g((FLAT+15)/16,(N+15)/16); k_sscp_flatten<<<g,B2,0,S>>>(c1,flat,C1,T2,F2); }
+    { dim3 g((FLAT+15)/16,(N+15)/16); vd::k_sscp_flatten<bfd><<<g,B2,0,S>>>(D(c1),D(flat),C1,T2,F2); }
     bf* h=MAL((long)N*Hd);
-    k_matmul<<<G2(Hd,N),B2,0,S>>>(flat,w.sscp_input_proj,h,N,FLAT,Hd);
+    vd::k_matmul<bfd><<<G2(Hd,N),B2,0,S>>>(D(flat),D(w.sscp_input_proj),D(h),N,FLAT,Hd);
 
     // ckpt: sscp_out (input_proj output, before any conformer layer).
     auto CKPT=[&](const char* nm,const bf* d,long n){
@@ -293,17 +217,17 @@ void run_gemma4_audio(const AudioRawWeights& w,
     // Shared across layers; relative_k_proj differs per layer so relk is per-layer.
     const int P=past+1;                                   // 13 (= context_left)
     bf* pe=MAL((long)P*Hd);
-    { dim3 g((Hd+15)/16,(P+15)/16); k_rel_pos_enc<<<g,B2,0,S>>>(pe,P,Hd); }
+    { dim3 g((Hd+15)/16,(P+15)/16); vd::k_rel_pos_enc<bfd><<<g,B2,0,S>>>(D(pe),P,Hd); }
     bf* relk=MAL((long)P*Hd);                              // relative_k_proj(pe) → [P, H*hd]
 
     auto ffn=[&](const AudioFfnRaw& ff){
         // residual = x; x=clamp; pre_ln; fc1; silu; fc2; clamp; post_ln; ×RW; +res
-        k_rms<<<N,256,0,S>>>(h,ff.pre_ln,hn,N,Hd,EPS);
+        vd::k_rms<bfd><<<N,256,0,S>>>(D(h),D(ff.pre_ln),D(hn),N,Hd,EPS);
         clin(hn,ffmid,xc,ff.fc1,N,Hd,IM);
-        k_silu<<<((long)N*IM+255)/256,256,0,S>>>(ffmid,ffmid,(long)N*IM);
+        vd::k_silu<bfd><<<((long)N*IM+255)/256,256,0,S>>>(D(ffmid),D(ffmid),(long)N*IM);
         clin(ffmid,ffout,xc,ff.fc2,N,IM,Hd);
-        k_rms<<<N,256,0,S>>>(ffout,ff.post_ln,ffout,N,Hd,EPS);
-        k_axpy<<<((long)N*Hd+255)/256,256,0,S>>>(h,ffout,RW,(long)N*Hd);
+        vd::k_rms<bfd><<<N,256,0,S>>>(D(ffout),D(ff.post_ln),D(ffout),N,Hd,EPS);
+        vd::k_axpy<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(ffout),RW,(long)N*Hd);
     };
 
     int li=0;
@@ -311,36 +235,44 @@ void run_gemma4_audio(const AudioRawWeights& w,
         // feed_forward1 (macaron half-step)
         ffn(L.ff1);
         // self-attention
-        k_rms<<<N,256,0,S>>>(h,L.norm_pre_attn,hn,N,Hd,EPS);
+        vd::k_rms<bfd><<<N,256,0,S>>>(D(h),D(L.norm_pre_attn),D(hn),N,Hd,EPS);
         clin(hn,q,xc,L.q,N,Hd,Hd); clin(hn,k,xc,L.k,N,Hd,Hd); clin(hn,v,xc,L.v,N,Hd,Hd);
-        k_qkv_scale<<<G2(Hd,N),B2,0,S>>>(q,k,L.per_dim_scale,N,NH,hd,q_scale,k_scale);
+        vd::k_qkv_scale<bfd><<<G2(Hd,N),B2,0,S>>>(D(q),D(k),D(L.per_dim_scale),N,NH,hd,q_scale,k_scale);
         // relative_k_proj(pe) → relk [P, H*hd]; NOT a clipped linear (plain matmul).
-        k_matmul<<<G2(Hd,P),B2,0,S>>>(pe,L.relative_k,relk,P,Hd,Hd);
-        { dim3 g((N+127)/128,NH); k_local_attn<<<g,128,0,S>>>(q,k,v,relk,attn,N,NH,hd,P,CAP); }
+        vd::k_matmul<bfd><<<G2(Hd,P),B2,0,S>>>(D(pe),D(L.relative_k),D(relk),P,Hd,Hd);
+        { dim3 g((N+127)/128,NH); vd::k_local_attn<bfd><<<g,128,0,S>>>(D(q),D(k),D(v),D(relk),D(attn),N,NH,hd,P,CAP); }
         clin(attn,tmp,xc,L.post,N,Hd,Hd);
-        k_rms<<<N,256,0,S>>>(tmp,L.norm_post_attn,tmp,N,Hd,EPS);
-        k_add<<<((long)N*Hd+255)/256,256,0,S>>>(h,tmp,(long)N*Hd);
+        vd::k_rms<bfd><<<N,256,0,S>>>(D(tmp),D(L.norm_post_attn),D(tmp),N,Hd,EPS);
+        vd::k_add<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(tmp),(long)N*Hd);
         // light depthwise-conv module
-        k_rms<<<N,256,0,S>>>(h,L.lconv_pre_ln,hn,N,Hd,EPS);
+        vd::k_rms<bfd><<<N,256,0,S>>>(D(h),D(L.lconv_pre_ln),D(hn),N,Hd,EPS);
         clin(hn,start,xc,L.lconv_start,N,Hd,2*Hd);            // [N, 2*hidden]
-        k_glu<<<G2(Hd,N),B2,0,S>>>(start,glu,N,Hd);            // GLU → [N, hidden]
-        // Was `k_depthwise_causal`, a local copy of this: same [N, C] layout,
-        // same [C, K] per-channel weight, same `t-(K-1)+j` indexing, same zero
-        // pad. The library's only difference was a fused silu, which is a
-        // template parameter there now. bias and state are nullptr -- this
-        // caller has neither.
-        kernels::ssm::causal_conv1d_prefill_noact_bf16(
-            glu, L.depthwise_conv, /*bias=*/nullptr, conv, /*state_out=*/nullptr,
-            N, Hd, w.conv_kernel, S);
+        vd::k_glu<bfd><<<G2(Hd,N),B2,0,S>>>(D(start),D(glu),N,Hd);            // GLU → [N, hidden]
+        // Was `k_depthwise_causal`, a local copy of this kernel: same [N, C]
+        // layout, same [C, K] per-channel weight, same `t-(K-1)+j` indexing,
+        // same zero pad. The library's only difference was a fused silu,
+        // which is a template parameter there now. bias and state are nullptr
+        // -- this caller has neither.
+        //
+        // This was a call to `kernels::ssm::causal_conv1d_prefill_noact_bf16`
+        // until the launcher's grid was copied here whole: `BLOCK = 64`,
+        // `dim3 grid(C)`, and the degenerate guard that the launcher opens
+        // with. The device text is the same template instantiated at the same
+        // two arguments, so nothing that runs on the GPU moved -- but that
+        // launcher had exactly one caller in the tree and no table row, and
+        // this was it.
+        { constexpr int BLOCK=64; const int C=Hd, K=w.conv_kernel;
+          if(N>0&&C>0&&K>0) sd::causal_conv1d_prefill<bfd,false><<<dim3(C),dim3(BLOCK),0,S>>>(
+              D(glu),D(L.depthwise_conv),nullptr,D(conv),nullptr,N,C,K); }
         // clamp(±finfo_max) is a no-op in bf16 range → skip; conv_norm + silu
-        k_rms<<<N,256,0,S>>>(conv,L.lconv_conv_norm,conv,N,Hd,EPS);
-        k_silu<<<((long)N*Hd+255)/256,256,0,S>>>(conv,conv,(long)N*Hd);
+        vd::k_rms<bfd><<<N,256,0,S>>>(D(conv),D(L.lconv_conv_norm),D(conv),N,Hd,EPS);
+        vd::k_silu<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(conv),D(conv),(long)N*Hd);
         clin(conv,tmp,xc,L.lconv_end,N,Hd,Hd);
-        k_add<<<((long)N*Hd+255)/256,256,0,S>>>(h,tmp,(long)N*Hd);
+        vd::k_add<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(tmp),(long)N*Hd);
         // feed_forward2 (macaron half-step)
         ffn(L.ff2);
         // norm_out
-        k_rms<<<N,256,0,S>>>(h,L.norm_out,h,N,Hd,EPS);
+        vd::k_rms<bfd><<<N,256,0,S>>>(D(h),D(L.norm_out),D(h),N,Hd,EPS);
         // ckpt: layer{li} output (matches HF Gemma4AudioLayer hidden_states dump).
         { char nm[16]; snprintf(nm,sizeof nm,"layer%d",li); CKPT(nm,h,(long)N*Hd); }
         ++li;
@@ -348,13 +280,13 @@ void run_gemma4_audio(const AudioRawWeights& w,
 
     // ── 3) output_proj (1024→1536 +bias) ────────────────────────────────────
     bf* enc=MAL((long)N*OPD);
-    k_matmul_bias<<<G2(OPD,N),B2,0,S>>>(h,w.output_proj_w,w.output_proj_b,enc,N,Hd,OPD);
+    vd::k_matmul_bias<bfd><<<G2(OPD,N),B2,0,S>>>(D(h),D(w.output_proj_w),D(w.output_proj_b),D(enc),N,Hd,OPD);
     CKPT("encoder_out",enc,(long)N*OPD);
 
     // ── 4) embedder: parameterless RMSNorm(1536) → projection (1536→2560) ────
     bf* en=MAL((long)N*OPD);
-    k_rms<<<N,256,0,S>>>(enc,nullptr,en,N,OPD,EPS);
-    k_matmul<<<G2(TXT,N),B2,0,S>>>(en,w.embed_proj,out_proj,N,OPD,TXT);
+    vd::k_rms<bfd><<<N,256,0,S>>>(D(enc),nullptr,D(en),N,OPD,EPS);
+    vd::k_matmul<bfd><<<G2(TXT,N),B2,0,S>>>(D(en),D(w.embed_proj),D(out_proj),N,OPD,TXT);
     CKPT("projected",out_proj,(long)N*TXT);
 
     ACK(cudaStreamSynchronize(S));

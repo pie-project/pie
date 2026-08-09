@@ -25,8 +25,14 @@ serde_json = "1.0"
 # compiler dev loop off nvcc: `check_plan` reads these on every trace, and
 # looking up a symbol's contract must not build a `.cu`. `driver-cuda` is the
 # crate that turns `native` on.
+#
+# `kernels-cuda-new` DIRECTLY, not through `kernels-cuda`'s re-export. The
+# table moved into the new crate when the dependency was inverted, so the old
+# path was a hop through a crate whose only other content is nvcc's, and this
+# crate must never be able to reach that. It also removes one name from the
+# set that has to go before `kernels-cuda` can be deleted.
 kernels = { path = "../kernels" }
-kernels-cuda = { path = "../kernels-cuda", default-features = false }
+kernels-cuda-new = { path = "../kernels-cuda-new", default-features = false }
 kernels-metal = { path = "../kernels-metal", default-features = false }
 
 [dev-dependencies]

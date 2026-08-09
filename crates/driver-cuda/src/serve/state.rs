@@ -393,9 +393,11 @@ impl ChannelState {
     /// one of those five would have to become per-channel and adoptable
     /// from a driver-owned registry keyed by channel id — the control
     /// kernels take `full_ptr()`/`head_ptr()` as flat arrays, so they
-    /// need pointer arrays rather than base pointers. `driver-dummy` is
-    /// the reference for the contract (its `ExternChannel` and the
-    /// `shared` ring in `register_channel`), not for the device layout.
+    /// need pointer arrays rather than base pointers. The contract's
+    /// reference used to be `driver-dummy` (its `ExternChannel` and the
+    /// `shared` ring in `register_channel`); that crate is deleted, so the
+    /// contract is now `driver-api`'s vocabulary and this comment is the
+    /// record of where the worked example went.
     pub(crate) const fn is_extern(&self) -> bool {
         self.extern_dir != driver_api::local::PIE_CHANNEL_EXTERN_NONE
     }
@@ -1153,11 +1155,15 @@ pub(crate) struct LoadedModel {
     /// their own in `weights`, renames get a row here — no second copy of
     /// a tensor that already sits on the device.
     pub(crate) aliases: std::collections::BTreeMap<String, String>,
-    /// gemma-4's per-layer `layer_scalar` [1] tensors, read to host once
-    /// at load (the C++ `read_bf16_scalar_once`) — the fused sandwich
-    /// norm's whole-stream multiplier, carried into `DispatchCtx::scales`
-    /// per fire. Empty on every other family.
-    pub(crate) gemma_layer_scalars: Vec<f32>,
+    /// The per-layer `layer_scalar` [1] tensors a deployment names, read to
+    /// host once at load (the C++ `read_bf16_scalar_once`) — the fused
+    /// sandwich norm's whole-stream multiplier, carried into
+    /// `DispatchCtx::scales` per fire.
+    ///
+    /// Empty for a deployment whose wiring names none, which is most of them.
+    /// WHICH deployments name them is not asked here: `wiring.scalars` is the
+    /// list, and this reads it.
+    pub(crate) layer_scalars: Vec<f32>,
     /// The group this rank's weights were sharded for, carried from the
     /// shell so a family's facts and its load plan cannot disagree about
     /// how wide a rank is. A forward derivation reads it to decide whether

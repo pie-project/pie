@@ -6,19 +6,32 @@
 //! it. A field nothing reads is not inert: it reads, to whoever adds
 //! the next family, as an axis already handled.
 //!
-//! `k_eq_v` is why this file exists. gemma-4-31b ships no `v_proj` —
-//! its full layers read V out of the K projection — and the row states
-//! that, and the projection carries it here, and the Metal text acts on
-//! it through `LlamaLikeMetalFacts::v_from_k`. The CUDA text never grew
-//! an arm: `Gemma4LayerW` declares a `v_proj` and matmuls it with
-//! nothing to branch on, and `project::trace` is not even handed the
-//! flag. So this field was read by exactly one thing — a
-//! `DecodeGeometry` copy that nothing downstream read — and when that
-//! copy went, the statement had no reader at all.
+//! `k_eq_v` is why this file exists, and it is no longer a field.
+//! gemma-4-31b ships no `v_proj` — its full layers read V out of the K
+//! projection — and the row states that, and the Metal text acts on it
+//! through `LlamaLikeMetalFacts::v_from_k`. The CUDA text never grew an
+//! arm: `Gemma4LayerW` declares a `v_proj` and matmuls it with nothing
+//! to branch on, and `project::trace` is not even handed the flag. So
+//! the field was read by exactly one thing — a `DecodeGeometry` copy
+//! that nothing downstream read — and when that copy went, the
+//! statement had no reader at all.
 //!
-//! The refusal in `Variant::trace`'s CUDA arm is what this build can
-//! honestly do about it. This test is so the NEXT such field is a
-//! failure rather than an archaeology.
+//! It was then excused HERE, and the excuse promised the field "becomes
+//! read the day the CUDA text grows the branch". That day cannot come.
+//! `Gemma4LayerW` lives in `model`, not in a driver; the branch that
+//! needs the flag is handed `&self.shape`, so growing it reads the ROW,
+//! exactly as the Metal projection already does through
+//! `Gemma4::row()`. No driver was ever going to read this: `k_eq_v`
+//! does not move the KV geometry — both halves are still cached — it
+//! decides which tensors the TEXT binds, and the text is written in
+//! this crate.
+//!
+//! So it was a second statement of one measurement, and the live one is
+//! the row's. Thirteen projections wrote it and nothing anywhere read
+//! it. The refusal in `Variant::trace`'s CUDA arm is what this build
+//! can honestly do about the missing branch, and it is made of
+//! `Gemma4::k_eq_v`. This test is so the NEXT such field is a failure
+//! rather than an archaeology.
 
 use std::collections::BTreeSet;
 
@@ -26,18 +39,15 @@ use std::collections::BTreeSet;
 ///
 /// An entry is a claim about unwritten work, not permission. It names
 /// the pass and what happens meanwhile.
-const UNREAD_BY_CONSUMERS: &[(&str, &str)] = &[(
-    "k_eq_v",
-    "Whether V comes out of the K projection. The METAL text acts on \
-     the same measurement through `LlamaLikeMetalFacts::v_from_k`, \
-     which gemma-4-31b reproduces MLX's logits through — it just does \
-     not read it from HERE, because a Metal trace is projected from the \
-     row rather than from the deployment. CUDA has no arm at all and \
-     `Variant::trace` refuses `k_eq_v` rows there rather than binding a \
-     `v_proj` no checkpoint ships. This field is the statement that \
-     refusal is made of, and it becomes read the day the CUDA text \
-     grows the branch.",
-)];
+///
+/// **Empty, and that is the point.** Its only entry was `k_eq_v`, and
+/// the entry is what kept the field: the excuse named a future reader
+/// that the crate's own layering ruled out, so the line could never
+/// have expired on its own. An entry here must therefore name a reader
+/// that could exist in a CONSUMER crate — if the pass that will read
+/// the fact lives in `model`, the fact belongs on the row, and this
+/// struct is a copy of it.
+const UNREAD_BY_CONSUMERS: &[(&str, &str)] = &[];
 
 fn crate_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
@@ -142,10 +152,13 @@ fn every_deployment_field_reaches_a_driver() {
         "no crate outside `model` reads these:\n  {dead:?}\n\nA \
          `Deployment` field is an instruction to a driver. One nobody \
          reads is an axis that LOOKS handled — which is how gemma-4's \
-         `k_eq_v` came to be stated by every projection, acted on by the \
-         Metal text from a different road, and traced against a \
-         `v_proj` on CUDA. Wire the reader, delete the field, or name it \
-         in `UNREAD_BY_CONSUMERS` with the pass that will read it.",
+         `k_eq_v` came to be stated by thirteen projections, acted on by \
+         the Metal text from a different road, and traced against a \
+         `v_proj` on CUDA. That one ended in DELETION: check first \
+         whether the fact already travels on the row, because then this \
+         copy is the second answer and not the missing reader. Otherwise \
+         wire the reader, or name it in `UNREAD_BY_CONSUMERS` with the \
+         pass that will read it — in a consumer crate.",
     );
 }
 

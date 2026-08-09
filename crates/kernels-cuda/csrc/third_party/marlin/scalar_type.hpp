@@ -5,16 +5,46 @@
 // torch-free build. Keeps the upstream `vllm::ScalarType` ABI intact so
 // the rest of marlin's source compiles unchanged.
 #include <cstdint>
+// PIE: NVRTC ships no C++ standard library -- measured, 0 of 31 headers
+// answered (new-horizon.md §13.1) -- so a device compile of this header gets
+// exactly what the carried set holds. `<cstdint>` and `<type_traits>` are
+// carried; the five below are not, and they split two ways. `<stdexcept>`,
+// `<string>` and `<variant>` are reachable only from the host-only members
+// guarded away further down, so the directive goes with them. `<tuple>` and
+// `<utility>` are NOT host-only: `id()` and `from_id()` fold the six fields
+// through a `std::pair` accumulator and a `std::tuple_cat`, and they are
+// evaluated at compile time by every `Marlin<a_type.id(), ...>` a name
+// expression spells. Guarding those away would delete the include and leave
+// the uses -- the failure `csrc/vendor/type_traits`' own header names -- so
+// they are CARRIED instead, by a header of ours that holds the four names
+// this file asks for and nothing else.
+#ifdef __CUDACC_RTC__
+#include "pie_marlin_rtc.h"
+#else
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <variant>
+#endif
 
 #ifndef PIE_MARLIN_CHECK
+// PIE: a throw needs an unwinder and a heap-allocated `std::string`, neither
+// of which a device compile has. Every TORCH_CHECK that survives the guards
+// below sits inside a `constexpr` constructor, evaluated when NVRTC resolves
+// a name expression -- and a call to a non-constexpr function is a hard error
+// in a constant expression, so the check still FIRES there, at JIT-compile
+// time, naming the type that violated it. Defining it away to `((void)0)`
+// would have been the quiet alternative and would have let `kFE2M1f`-shaped
+// mistakes reach a cubin.
+#ifdef __CUDACC_RTC__
+#define PIE_MARLIN_CHECK(cond, ...)                                            \
+    do { if (!(cond)) __trap(); } while (0)
+#else
 #define PIE_MARLIN_CHECK(cond, ...)                                            \
     do { if (!(cond)) throw std::runtime_error(                                \
         std::string("marlin: assertion failed: " #cond)); } while (0)
+#endif
 #endif
 #define TORCH_CHECK(...) PIE_MARLIN_CHECK(__VA_ARGS__)
 
@@ -190,6 +220,13 @@ class ScalarType {
   constexpr bool has_bias() const { return bias != 0; }
 
  private:
+// PIE: `str()` returns a `std::string`, `_raw_max`/`_raw_min` a
+// `std::variant`, and `_floating_point_max` type-puns through a
+// `reinterpret_cast` no constant evaluation would accept anyway. Nothing in
+// marlin's device closure calls any of them -- `marlin_template.h` reads
+// `size_bits()`, `is_signed()`, `has_bias()` and the `==` -- so under NVRTC
+// they go rather than being emulated.
+#ifndef __CUDACC_RTC__
   double _floating_point_max() const {
     TORCH_CHECK(mantissa <= 52 && exponent <= 11,
                 "Cannot represent max/min as a double for type ", str());
@@ -260,8 +297,12 @@ class ScalarType {
       }
     }
   }
+#endif  // PIE: __CUDACC_RTC__ -- the three host-only members above.
 
  public:
+// PIE: `max()`, `min()` and `str()` continue the block above -- the same
+// `std::variant` and `std::string` returns, on the public side of the class.
+#ifndef __CUDACC_RTC__
   // Max representable value for this scalar type.
   // (accounting for bias if there is one)
   constexpr std::variant<int64_t, double> max() const {
@@ -310,6 +351,7 @@ class ScalarType {
       return ret;
     }
   }
+#endif  // PIE: __CUDACC_RTC__ -- `max`, `min` and `str`.
 
   constexpr bool operator==(ScalarType const& other) const {
     return mantissa == other.mantissa && exponent == other.exponent &&

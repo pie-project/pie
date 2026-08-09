@@ -26,6 +26,19 @@ pub struct InstanceBindingPlan {
 }
 
 impl InstanceBindingPlan {
+    /// Every caller is a device backend and every one is feature-gated
+    /// (`backend/cuda.rs`, `backend/metal.rs`, `backend/vulkan.rs`), so a
+    /// build with none of those features has none. It used to have one
+    /// ungated caller — the interpreter backend — which is why this needed
+    /// no attribute before.
+    #[cfg_attr(
+        not(any(
+            feature = "driver-cuda",
+            feature = "driver-metal",
+            feature = "driver-vulkan"
+        )),
+        allow(dead_code, reason = "every caller is a feature-gated device backend")
+    )]
     pub(crate) fn validate_binding(&self, binding: &PieInstanceBinding) -> anyhow::Result<()> {
         ::driver_api::validate_instance_binding(binding)
             .map_err(|err| anyhow::anyhow!("invalid native instance binding: {err}"))?;

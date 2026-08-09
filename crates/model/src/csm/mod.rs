@@ -41,12 +41,12 @@ pub mod spec;
 /// What those numbers imply: a manifest, and two refusals.
 pub mod project;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::{Deployment, Refusal};
@@ -85,15 +85,7 @@ pub const VARIANTS: &[Csm] = &[Csm {
     shape: CsmFacts::csm_1b(),
 }];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&Csm` to `&dyn Variant`;
-/// the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Csm);
 
 impl Variant for Csm {
     fn id(&self) -> &'static str {
@@ -161,7 +153,6 @@ impl Variant for Csm {
     /// Always [`Refusal::Unsupported`], carrying
     /// [`project::NO_TRACE`] — there is no `csm/forward` module to
     /// call into.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -348,7 +339,6 @@ mod tests {
     }
 
     /// The trace refuses too, and names the module that is not there.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_row_refuses_to_trace_and_names_the_missing_module() {
         use model_compiler::trace::FireClass;

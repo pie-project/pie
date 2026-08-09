@@ -1,32 +1,45 @@
 //! `pie_cuda_encode`: the multimodal towers, run outside a fire.
 //!
-//! Gemma-4's vision and audio encoders write rows the next fire reads as
-//! embeddings. It is its own entry point because it is its own pass — no
+//! A deployment's vision and audio encoders write rows the next fire reads
+//! as embeddings. It is its own entry point because it is its own pass — no
 //! KV, no sampling, no logits.
+//!
+//! The tensor NAMES and their launcher order are
+//! [`model::shared::tower_names`]'s, not this file's: what is here is the
+//! resolution of a name to a device pointer and the call.
 
-use super::state::{LoadedModel, Shell, shell};
-use super::{checked, guard};
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK, PIE_STATUS_UNSUPPORTED,
     PieCompletion, PieDriver, PieEncodeDesc,
 };
+use model::shared::tower_names::{Slot, VISION_SLOTS_PER_LAYER, vision_head, vision_layers};
+
+use super::state::{LoadedModel, Shell, shell};
+use super::{checked, guard};
 
 /// Awaits: the MULTIMODAL encoders — image/audio features to embedding
 /// rows (the vision/audio towers, which stayed hand-written C++). The
 /// plan once mislabeled this as the Sampling-IR path; the desc's fields
 /// (`image_pixels`, `audio_features`, `output_rows`) say what it is. A
 /// text-only shell refuses it honestly.
-/// The audio half of the encode arm: `bind_gemma4_audio`'s name map as
-/// the stride-62 table (`vision/gemma4_towers_c.hpp`'s layout), the
-/// media row width from the embed projection's own bytes, and the
-/// `PieEncodeDesc` audio slices passed straight through.
-fn encode_gemma4_audio_arm(
+/// The audio half of the encode arm: the tower's name table as the
+/// stride-62 pointer list the launcher indexes, the media row width from the
+/// embed projection's own bytes, and the `PieEncodeDesc` audio slices passed
+/// straight through.
+///
+/// THE NAMES ARE NOT THIS CRATE'S. `model::shared::tower_names` states them,
+/// in launcher order, for the reason its module doc gives: a tower's tensors
+/// are named by the checkpoint and consumed by a launcher, and a backend is
+/// neither. What stood here spelled some fifty paths inline.
+fn encode_audio_arm(
     model: &LoadedModel,
     desc: &PieEncodeDesc,
     out_ptr: *mut std::ffi::c_void,
     out_bytes: usize,
     indptr_ptr: *mut u32,
 ) -> i32 {
+    use model::shared::tower_names::{AUDIO_SLOTS_PER_LAYER, Slot, audio_head, audio_layers};
+
     let Some(ac) = model.deployment.towers.audio.as_ref() else {
         eprintln!("[driver-cuda] encode: this deployment carries no audio tower");
         return PIE_STATUS_UNSUPPORTED;
@@ -41,71 +54,55 @@ fn encode_gemma4_audio_arm(
                 PIE_STATUS_UNSUPPORTED
             })
     };
-    let opt = |n: String| -> *const std::ffi::c_void {
+    let opt = |n: &str| -> *const std::ffi::c_void {
         model
             .weights
-            .get(&n)
+            .get(n)
             .map_or(core::ptr::null(), |b| b.ptr.cast_const())
     };
-    let ap = "model.audio_tower";
-    let g = |n: &str| need(&format!("{ap}.{n}"));
-    let (sscp0_conv, sscp0_norm, sscp1_conv, sscp1_norm, sscp_proj, out_w, out_b, embed) = match (
-        g("subsample_conv_projection.layer0.conv.weight"),
-        g("subsample_conv_projection.layer0.norm.weight"),
-        g("subsample_conv_projection.layer1.conv.weight"),
-        g("subsample_conv_projection.layer1.norm.weight"),
-        g("subsample_conv_projection.input_proj_linear.weight"),
-        g("output_proj.weight"),
-        g("output_proj.bias"),
-        need("model.embed_audio.embedding_projection.weight"),
-    ) {
-        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(gp), Ok(h)) => (a, b, c, d, e, f, gp, h),
-        _ => return PIE_STATUS_UNSUPPORTED,
+    // A slot says which of the two it is; that is the whole reason the list
+    // is `Slot` and not `String`.
+    let bind = |slot: &Slot| -> Result<*const std::ffi::c_void, i32> {
+        match slot {
+            Slot::Required(n) => need(n),
+            Slot::Optional(n) => Ok(opt(n)),
+        }
     };
-    let depth = ac.layers as usize;
-    let mut table: Vec<*const std::ffi::c_void> = Vec::with_capacity(depth * 62);
-    for l in 0..depth {
-        let lp = format!("{ap}.layers.{l}");
-        let clip = |base: String, table: &mut Vec<*const std::ffi::c_void>| -> Result<(), i32> {
-            table.push(need(&format!("{base}.linear.weight"))?);
-            for m in ["input_min", "input_max", "output_min", "output_max"] {
-                table.push(opt(format!("{base}.{m}")));
-            }
-            Ok(())
-        };
-        let ffn = |base: String, table: &mut Vec<*const std::ffi::c_void>| -> Result<(), i32> {
-            table.push(need(&format!("{base}.pre_layer_norm.weight"))?);
-            table.push(need(&format!("{base}.post_layer_norm.weight"))?);
-            clip(format!("{base}.ffw_layer_1"), table)?;
-            clip(format!("{base}.ffw_layer_2"), table)?;
-            Ok(())
-        };
-        let r: Result<(), i32> = (|| {
-            ffn(format!("{lp}.feed_forward1"), &mut table)?;
-            ffn(format!("{lp}.feed_forward2"), &mut table)?;
-            table.push(need(&format!("{lp}.norm_pre_attn.weight"))?);
-            table.push(need(&format!("{lp}.norm_post_attn.weight"))?);
-            clip(format!("{lp}.self_attn.q_proj"), &mut table)?;
-            clip(format!("{lp}.self_attn.k_proj"), &mut table)?;
-            clip(format!("{lp}.self_attn.v_proj"), &mut table)?;
-            clip(format!("{lp}.self_attn.post"), &mut table)?;
-            table.push(need(&format!("{lp}.self_attn.relative_k_proj.weight"))?);
-            table.push(need(&format!("{lp}.self_attn.per_dim_scale"))?);
-            table.push(need(&format!("{lp}.lconv1d.pre_layer_norm.weight"))?);
-            table.push(need(&format!("{lp}.lconv1d.conv_norm.weight"))?);
-            clip(format!("{lp}.lconv1d.linear_start"), &mut table)?;
-            clip(format!("{lp}.lconv1d.linear_end"), &mut table)?;
-            table.push(need(&format!("{lp}.lconv1d.depthwise_conv1d.weight"))?);
-            table.push(need(&format!("{lp}.norm_out.weight"))?);
-            Ok(())
-        })();
-        if let Err(e) = r {
-            return e;
+    let ap = "model.audio_tower";
+    let embed = "model.embed_audio.embedding_projection.weight";
+    let head = audio_head(ap, embed);
+    let mut heads = Vec::with_capacity(head.len());
+    for s in &head {
+        match bind(s) {
+            Ok(p) => heads.push(p),
+            Err(e) => return e,
         }
     }
+    let [
+        sscp0_conv,
+        sscp0_norm,
+        sscp1_conv,
+        sscp1_norm,
+        sscp_proj,
+        out_w,
+        out_b,
+        embed_p,
+    ] = heads[..]
+    else {
+        return PIE_STATUS_UNSUPPORTED;
+    };
+    let slots = audio_layers(ap, ac.layers);
+    let mut table: Vec<*const std::ffi::c_void> = Vec::with_capacity(slots.len());
+    for s in &slots {
+        match bind(s) {
+            Ok(p) => table.push(p),
+            Err(e) => return e,
+        }
+    }
+    debug_assert_eq!(table.len(), ac.layers as usize * AUDIO_SLOTS_PER_LAYER);
     let text_hidden = model
         .weights
-        .get("model.embed_audio.embedding_projection.weight")
+        .get(embed)
         .map_or(0, |b| b.bytes / (ac.output_dims.max(1) as usize * 2));
     let Ok(stream) = crate::device::OwnedStream::new(0) else {
         return PIE_STATUS_DRIVER_ERROR;
@@ -119,7 +116,7 @@ fn encode_gemma4_audio_arm(
             sscp_proj,
             out_w,
             out_b,
-            embed,
+            embed_p,
             table.as_ptr(),
             ac.layers as i32,
             ac.hidden as i32,
@@ -197,7 +194,7 @@ pub fn pie_cuda_encode(
         };
         if num_images == 0 {
             // Audio only: the helper writes the whole CSR itself.
-            let st = encode_gemma4_audio_arm(
+            let st = encode_audio_arm(
                 model,
                 desc,
                 desc.output_rows.ptr.cast(),
@@ -214,9 +211,10 @@ pub fn pie_cuda_encode(
             eprintln!("[driver-cuda] encode: this deployment carries no vision tower");
             return PIE_STATUS_UNSUPPORTED;
         };
-        // The vision table, `vision/gemma4_towers_c.hpp`'s stride-41 layout,
+        // The vision table, in the stride-41 layout the launcher indexes,
         // built per call from the loaded weights — name lookups, no stored
-        // pointers. The binder mapping is `bind_gemma4_vision`'s.
+        // pointers. The NAMES and their order are
+        // `model::shared::tower_names`'s; this resolves them.
         let need = |n: &str| -> Result<*const std::ffi::c_void, i32> {
             model
                 .weights
@@ -227,74 +225,50 @@ pub fn pie_cuda_encode(
                     PIE_STATUS_UNSUPPORTED
                 })
         };
-        let opt = |n: String| -> *const std::ffi::c_void {
+        let opt = |n: &str| -> *const std::ffi::c_void {
             model
                 .weights
-                .get(&n)
+                .get(n)
                 .map_or(core::ptr::null(), |b| b.ptr.cast_const())
         };
+        let bind = |slot: &Slot| -> Result<*const std::ffi::c_void, i32> {
+            match slot {
+                Slot::Required(n) => need(n),
+                Slot::Optional(n) => Ok(opt(n)),
+            }
+        };
         let vp = "model.vision_tower";
-        let patch_w = match need(&format!("{vp}.patch_embedder.input_proj.weight")) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let pos_table = match need(&format!("{vp}.patch_embedder.position_embedding_table")) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let embed_proj = match need("model.embed_vision.embedding_projection.weight") {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let depth = vc.layers as usize;
-        let mut table: Vec<*const std::ffi::c_void> = Vec::with_capacity(depth * 41);
-        for l in 0..depth {
-            let lp = format!("{vp}.encoder.layers.{l}");
-            for norm in [
-                "input_layernorm",
-                "post_attention_layernorm",
-                "pre_feedforward_layernorm",
-                "post_feedforward_layernorm",
-            ] {
-                match need(&format!("{lp}.{norm}.weight")) {
-                    Ok(p) => table.push(p),
-                    Err(e) => return e,
-                }
-            }
-            for norm in ["self_attn.q_norm", "self_attn.k_norm"] {
-                match need(&format!("{lp}.{norm}.weight")) {
-                    Ok(p) => table.push(p),
-                    Err(e) => return e,
-                }
-            }
-            for clip in [
-                "self_attn.q_proj",
-                "self_attn.k_proj",
-                "self_attn.v_proj",
-                "self_attn.o_proj",
-                "mlp.gate_proj",
-                "mlp.up_proj",
-                "mlp.down_proj",
-            ] {
-                match need(&format!("{lp}.{clip}.linear.weight")) {
-                    Ok(p) => table.push(p),
-                    Err(e) => return e,
-                }
-                for m in ["input_min", "input_max", "output_min", "output_max"] {
-                    table.push(opt(format!("{lp}.{clip}.{m}")));
-                }
+        let vembed = "model.embed_vision.embedding_projection.weight";
+        let head = vision_head(vp, vembed);
+        let mut heads = Vec::with_capacity(head.len());
+        for s in &head {
+            match bind(s) {
+                Ok(p) => heads.push(p),
+                Err(e) => return e,
             }
         }
+        let [patch_w, pos_table, embed_proj] = heads[..] else {
+            return PIE_STATUS_UNSUPPORTED;
+        };
+        let slots = vision_layers(vp, vc.layers);
+        let mut table: Vec<*const std::ffi::c_void> = Vec::with_capacity(slots.len());
+        for s in &slots {
+            match bind(s) {
+                Ok(p) => table.push(p),
+                Err(e) => return e,
+            }
+        }
+        debug_assert_eq!(table.len(), vc.layers as usize * VISION_SLOTS_PER_LAYER);
         // pos_table is `[2, S, hidden]` bf16 — S from the buffer itself; the
         // media row width from the projection (`[text_hidden, hidden]`).
         let hidden = vc.hidden.max(1) as usize;
         let pos_table_size = model
             .weights
-            .get(&format!("{vp}.patch_embedder.position_embedding_table"))
+            .get(head[1].name())
             .map_or(0, |b| b.bytes / (2 * hidden * 2));
         let text_hidden = model
             .weights
-            .get("model.embed_vision.embedding_projection.weight")
+            .get(vembed)
             .map_or(0, |b| b.bytes / (hidden * 2));
 
         let Ok(stream) = crate::device::OwnedStream::new(0) else {
@@ -346,7 +320,7 @@ pub fn pie_cuda_encode(
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
             let mut audio_bounds = vec![0u32; num_clips + 1];
-            let st = encode_gemma4_audio_arm(
+            let st = encode_audio_arm(
                 model,
                 desc,
                 unsafe { desc.output_rows.ptr.add(consumed) }.cast(),
