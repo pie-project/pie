@@ -1452,6 +1452,57 @@ fn deepseek_v4_streamed_imported_mxfp4_metadata_compiles() {
         .expect("the streamed contract compiles against imported MXFP4 metadata");
 }
 
+#[test]
+fn deepseek_v4_does_not_reinterpret_a_mixed_expert_triplet() {
+    let mut checkpoint = deepseek_v4_imported_checkpoint();
+    let w3 = checkpoint
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == "layers.0.ffn.experts.0.w3.weight")
+        .expect("the fixture has expert w3");
+    w3.encoding = Encoding::Raw(DType::U8);
+
+    for (mode, policy) in [
+        ("eager", Policy::default()),
+        (
+            "streamed",
+            Policy {
+                stream_routed_experts: true,
+                ..Policy::default()
+            },
+        ),
+    ] {
+        let contract = author(
+            &facts("deepseek_v4", 1),
+            &checkpoint,
+            &target(0, 4),
+            &policy,
+        )
+        .expect("authoring succeeds")
+        .expect("deepseek_v4 has an author");
+        assert!(
+            contract
+                .tensors
+                .iter()
+                .all(|tensor| tensor.name != "layers.0.ffn.experts.gate_up.weight"),
+            "{mode}: a mixed triplet must not become an eager MXFP4 stack"
+        );
+        assert!(
+            contract
+                .groups
+                .iter()
+                .all(|group| group.name != "layers.0.ffn.experts"),
+            "{mode}: a mixed triplet must not become a streamed MXFP4 group"
+        );
+        let published = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "layers.0.ffn.experts.0.w3.weight")
+            .expect("the unclaimed source is published unchanged");
+        assert_eq!(published.encoding, Encoding::Raw(DType::U8), "{mode}");
+    }
+}
+
 // ═══ The Metal point in policy space: Naming::Mlx, bind in place ═══
 
 fn metal_target() -> StorageTarget {

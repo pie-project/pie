@@ -252,7 +252,10 @@ fn bf16_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
             // pass's to rewrite — leave the whole checkpoint alone rather
             // than half of it, and let `author_dense_contract` publish the
             // experts as they are.
-            if !is_raw(&parts[0].encoding, DType::I8) || !is_raw(&parts[4].encoding, DType::I8) {
+            if [0, 2, 4]
+                .into_iter()
+                .any(|index| !is_raw(&parts[index].encoding, DType::I8))
+            {
                 return Ok(());
             }
 
@@ -421,7 +424,10 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
             };
             proto.push(part);
         }
-        if !is_raw(&proto[0].encoding, DType::I8) || !is_raw(&proto[4].encoding, DType::I8) {
+        if [0, 2, 4]
+            .into_iter()
+            .any(|index| !is_raw(&proto[index].encoding, DType::I8))
+        {
             // Not packed MXFP4. Leave the whole checkpoint alone rather than
             // half of it, exactly as the stacking pass does.
             return Ok(());
