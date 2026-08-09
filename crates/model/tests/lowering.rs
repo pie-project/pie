@@ -536,25 +536,27 @@ fn the_epilogue_is_a_row_count_not_a_branch() {
             .collect()
     };
 
-    // Every row sampled: norm and project over all four rows, no
-    // gather — there is nothing to skip past.
+    // Every row sampled: project over all four rows, no gather — there is
+    // nothing to skip past.
+    //
+    // NO NORM. The epilogue used to emit `norm::rmsnorm_bf16` here and it
+    // was dead on every fire: each text applies the final norm itself and
+    // hands `logits()` the normed value, so the epilogue's own norm read
+    // an already-normed input and wrote into the logits buffer that the
+    // projection overwrites on the next launch. See
+    // `the_epilogue_binds_one_ops_two_operands_to_the_launches` for how
+    // that was invisible — this assertion named the symbols, and the
+    // symbols were right.
     let all = epilogue(&sampled(4));
-    assert_eq!(
-        all,
-        vec![
-            ("norm::rmsnorm_bf16".to_string(), 0..4),
-            ("gemm::act_x_w".to_string(), 0..4),
-        ]
-    );
+    assert_eq!(all, vec![("gemm::act_x_w".to_string(), 0..4)]);
 
-    // One sampled row of four: the gather appears, and all three
-    // statements run over ONE row while the body ran over four —
-    // the epilogue's row space is Requests.
+    // One sampled row of four: the gather appears, and both statements
+    // run over ONE row while the body ran over four — the epilogue's row
+    // space is Requests.
     assert_eq!(
         epilogue(&gathered(4)),
         vec![
             ("layout::gather_bf16_rows".to_string(), 0..1),
-            ("norm::rmsnorm_bf16".to_string(), 0..1),
             ("gemm::act_x_w".to_string(), 0..1),
         ]
     );
@@ -1150,4 +1152,163 @@ fn the_buffer_table_crosses_and_agrees_with_the_operands() {
             out.arena_bytes
         );
     }
+}
+
+
+/// The epilogue's launches all bind ONE op's two operands, which is what
+/// the gather still needs and what killed the norm.
+///
+/// `lower::epilogue` emits its statements over a single `OpKind::LmHead`,
+/// whose `inputs` is `[hidden]` and `outputs` is `[logits]`. There is no
+/// third value, so every launch sees exactly `[hidden, logits]`. Two
+/// consequences, and only one of them is fixed.
+///
+/// **The rmsnorm was dead, and is gone.** Every text applies the final
+/// norm itself and hands `logits()` the normed value —
+/// `m.logits(&dsl::cuda::rmsnorm(&y, &m.final_norm()))` in llama_like,
+/// `lm_head_tied(t, &normed, ..)` in gemma-4, `lm_head(rmsnorm(y,
+/// final_norm))` in qwen3.5 — so the epilogue's own norm read an
+/// already-normed input and wrote `rows x hidden` bf16 into the LOGITS
+/// buffer, which the projection overwrites on the next launch. A wasted
+/// kernel on every fire of every family.
+///
+/// **The gather still has nowhere to write.** It must compact `[sampled,
+/// hidden]` rows for the head to read, and its only output is the logits
+/// allocation, at the wrong width and stride. That is why
+/// `driver-cuda-new` over-claims `Row::samples`: reading the step's real
+/// readout list makes every prefill state this gather, and running it
+/// produces all-zero logits. Fixing it needs a temp value, which is a
+/// TRACE change — `OpKind::LmHead` has to name the gather's destination —
+/// rather than a lowering one.
+///
+/// This test reads the ARGS. The one above reads the symbols, and that is
+/// exactly why neither problem was visible: the symbols were right.
+#[test]
+fn the_epilogue_binds_one_ops_two_operands_to_the_launches() {
+    let plan = decode_plan();
+    let at_op = plan
+        .ops
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::LmHead { .. }))
+        .expect("the class trace has an epilogue") as u32;
+
+    let args_of = |rows: &[Row]| -> Vec<(String, Vec<String>)> {
+        let out = lower(&plan, rows, Fire::default()).expect("coverable");
+        out.launches
+            .iter()
+            .filter(|l| l.op == at_op)
+            .map(|l| {
+                (
+                    out.kernels[l.kernel as usize].clone(),
+                    out.args[l.args.start as usize..l.args.end as usize]
+                        .iter()
+                        .map(|a| match a {
+                            Arg::Arena { width, .. } => format!("arena/{width}"),
+                            Arg::Named { width, .. } => format!("named/{width}"),
+                            Arg::Weight(w) => format!("weight/{w}"),
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+
+    // One sampled row of four: the gather appears, and gets the same two
+    // operands as the head — an input at the hidden width and an output
+    // at the vocabulary's. There is no third buffer for it to compact
+    // into.
+    let mut gathered = vec![Row::default(); 4];
+    gathered[3].samples = true;
+    let got = args_of(&gathered);
+    let names: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        names,
+        ["layout::gather_bf16_rows", "gemm::act_x_w"],
+        "the epilogue is a compaction and a projection — the norm the texts \
+         already did is not one of its statements"
+    );
+    let widths: Vec<&Vec<String>> = got.iter().map(|(_, a)| a).collect();
+    assert_eq!(
+        widths[0], widths[1],
+        "the gather binds the SAME two operands as the head — one op, two \
+         values, both launches"
+    );
+    assert_eq!(
+        widths[0].len(),
+        2,
+        "exactly two: there is no temp for the gather to write into, which \
+         is what makes the compaction unimplementable today"
+    );
+}
+
+/// A row that carries an adapter reaches the correction launch.
+///
+/// The whole point of reading the step's region table. `attn.qv` opens a
+/// `HasLora` guard whose then-arm is `cuda::lora_qkv_correction`, and
+/// `lower::select` resolves that guard with `rows.iter().any(|r|
+/// r.lora)`. `driver-cuda-new` built every row with `Row::default()` and
+/// never read `region_sig`, so the answer was NO on every fire no matter
+/// what the engine sent — which is the whole of "LoRA is ported and
+/// never applied".
+///
+/// The adapter itself is not a fixed form: `fwd.adapter(site, |x, y|
+/// expr)` recognises LoRA, IA3 and DoRA and lowers them to a pass-wide
+/// `lora` SINK in the prologue whose A/B are channel cells. This test is
+/// about the OTHER half — the backbone's correction launch, which is what
+/// the guard gates and what the region bit selects.
+#[test]
+fn a_lora_row_states_the_correction_and_a_plain_one_does_not() {
+    let plan = decode_plan();
+    let launches = |rows: &[Row]| -> Vec<String> {
+        let out = lower(&plan, rows, Fire::default()).expect("coverable");
+        out.launches
+            .iter()
+            .map(|l| out.kernels[l.kernel as usize].clone())
+            .collect()
+    };
+
+    let plain = vec![Row { samples: true, ..Row::default() }; 4];
+    assert!(
+        !launches(&plain).iter().any(|k| k.contains("lora")),
+        "a fire with no adapter states no correction"
+    );
+
+    // ONE row carrying it is enough: the guard is fire-wide
+    // (`rows.iter().any`), because a correction launch spans the fire and
+    // the lanes that carry no adapter get an identity from the staged
+    // table rather than a different launch list.
+    let mut adapted = plain.clone();
+    adapted[2].lora = true;
+    let with = launches(&adapted);
+    assert!(
+        with.iter().any(|k| k.contains("lora")),
+        "a row carrying an adapter states the correction; got {with:?}"
+    );
+
+    // And it is the region bit that decides, end to end: the same rows
+    // built the way the wire states them.
+    let from_wire = model_compiler::lower::rows_from_regions(
+        4,
+        &[3],
+        &[0, 2, 4],
+        &[0, model_compiler::lower::region_sig::LORA],
+        &[model_compiler::lower::region_sig::MAX_LAYERS_FULL; 2],
+    )
+    .expect("a tiling table");
+    assert!(
+        launches(&from_wire).iter().any(|k| k.contains("lora")),
+        "PIE_REGION_SIG_LORA on a region reaches the correction launch"
+    );
+    let no_bit = model_compiler::lower::rows_from_regions(
+        4,
+        &[3],
+        &[0, 2, 4],
+        &[0, 0],
+        &[model_compiler::lower::region_sig::MAX_LAYERS_FULL; 2],
+    )
+    .expect("a tiling table");
+    assert!(
+        !launches(&no_bit).iter().any(|k| k.contains("lora")),
+        "and its absence does not"
+    );
 }

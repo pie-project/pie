@@ -897,3 +897,136 @@ mod tests {
         arena.destroy(&mut mem);
     }
 }
+
+/// The ELEMENT mask the custom-mask attention dispatch reads — a different
+/// object from everything above, which is page-granularity.
+///
+/// FlashInfer's custom dispatch takes `mask_d` as one byte per `(q, kv)`
+/// pair and `mask_indptr_d` as the per-request base into it. This is the
+/// resident, always-published form: a plain causal mask, which is what the
+/// unmasked arm computes anyway, so a fire that takes the custom arm with
+/// nothing else staged gets the same answer as the fire that does not.
+///
+/// It exists so the arm can be RECORDED. Under `GuardMode::Union` both
+/// arms of `HasCustomMask` are captured whether this fire takes either,
+/// and an arm whose mask was never built aborts the whole recording —
+/// which is why the union used to decline every lowering mentioning
+/// `_custom`. See `.wiki/driver/graph.md` §5 ①.
+pub mod element_mask {
+    /// A mask this large is refused rather than published: the extent is
+    /// `sum_r qo_len[r] * kv_len[r]`, which grows with the context.
+    const MAX_MASK_BYTES: u64 = 1 << 30;
+
+    /// One fire's element mask, planned but not allocated.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ElementMaskPlan {
+        /// Bytes of `mask_d`.
+        pub mask_bytes: usize,
+        /// Byte offset of the `num_requests + 1` i32 CSR.
+        pub indptr_offset: usize,
+        /// Total bytes to allocate.
+        pub bytes: usize,
+        /// The CSR, in mask ELEMENTS.
+        pub indptr: Vec<i32>,
+        /// The mask bytes themselves — causal, request by request.
+        pub mask: Vec<u8>,
+    }
+
+    /// Plan and fill a causal element mask for the fire's geometry.
+    ///
+    /// `None` when there is nothing to mask or the mask would exceed
+    /// [`MAX_MASK_BYTES`], in which case the pointers stay null and the
+    /// custom arm declines as it always did.
+    #[must_use]
+    pub fn plan_causal(
+        qo_indptr_h: &[u32],
+        kv_page_indptr_h: &[u32],
+        kv_last_page_lens_h: &[u32],
+        page_size: i32,
+    ) -> Option<ElementMaskPlan> {
+        let requests = qo_indptr_h.len().checked_sub(1)?;
+        if requests == 0 || kv_page_indptr_h.len() < requests + 1 {
+            return None;
+        }
+        let page = u32::try_from(page_size.max(0)).unwrap_or(0);
+        let mut indptr = vec![0i32; requests + 1];
+        let mut extents = Vec::with_capacity(requests);
+        let mut total: u64 = 0;
+        for r in 0..requests {
+            let qo = qo_indptr_h[r + 1].saturating_sub(qo_indptr_h[r]);
+            let pages = kv_page_indptr_h[r + 1].saturating_sub(kv_page_indptr_h[r]);
+            let kv = if pages == 0 {
+                0
+            } else {
+                (pages - 1) * page + kv_last_page_lens_h.get(r).copied().unwrap_or(0)
+            };
+            indptr[r] = i32::try_from(total).ok()?;
+            extents.push((qo, kv));
+            total += u64::from(qo) * u64::from(kv);
+        }
+        indptr[requests] = i32::try_from(total).ok()?;
+        if total == 0 || total > MAX_MASK_BYTES {
+            return None;
+        }
+        let mask_bytes = usize::try_from(total).ok()?;
+        let mut mask = vec![0u8; mask_bytes];
+        let mut at = 0usize;
+        for &(qo, kv) in &extents {
+            // The query at local row `qi` sits at absolute position
+            // `kv - qo + qi`, so it attends every key at or before that.
+            for qi in 0..qo {
+                let last = kv.saturating_sub(qo) + qi;
+                for ki in 0..kv {
+                    mask[at + (qi * kv + ki) as usize] = u8::from(ki <= last);
+                }
+            }
+            at += (qo * kv) as usize;
+        }
+        let indptr_offset = mask_bytes.next_multiple_of(4);
+        Some(ElementMaskPlan {
+            mask_bytes,
+            indptr_offset,
+            bytes: indptr_offset + (requests + 1) * 4,
+            indptr,
+            mask,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_decode_row_attends_its_whole_context() {
+            let p = plan_causal(&[0, 1], &[0, 1], &[3], 16).expect("planned");
+            assert_eq!(p.indptr, vec![0, 3]);
+            assert_eq!(p.mask, vec![1, 1, 1]);
+        }
+
+        #[test]
+        fn a_prefill_row_attends_no_further_than_itself() {
+            // 3 query rows against a 3-long context: the plain lower triangle.
+            let p = plan_causal(&[0, 3], &[0, 1], &[3], 16).expect("planned");
+            assert_eq!(p.mask, vec![1, 0, 0, 1, 1, 0, 1, 1, 1]);
+        }
+
+        #[test]
+        fn a_continuation_attends_the_prefix_it_did_not_write() {
+            // 2 new rows onto a 5-long context: rows 3 and 4 are the new ones.
+            let p = plan_causal(&[0, 2], &[0, 1], &[5], 16).expect("planned");
+            assert_eq!(p.mask, vec![1, 1, 1, 1, 0, 1, 1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn two_requests_get_their_own_bases() {
+            let p = plan_causal(&[0, 1, 3], &[0, 1, 2], &[2, 2], 16).expect("planned");
+            assert_eq!(p.indptr, vec![0, 2, 6]);
+        }
+
+        #[test]
+        fn an_empty_fire_publishes_nothing() {
+            assert!(plan_causal(&[0], &[0], &[], 16).is_none());
+            assert!(plan_causal(&[0, 1], &[0, 0], &[0], 16).is_none());
+        }
+    }
+}

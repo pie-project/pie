@@ -33,7 +33,8 @@ use model_compiler::lower::{CondRegion, Row};
 
 use crate::cuda::{
     GraphExec, PredicateWord, SLOT_HAS_CUSTOM_MASK, SLOT_HAS_LORA, SLOT_HAS_STAGE_HOOKS,
-    SLOT_HAS_WRITE_DESC, SLOT_TOKENS_GT, SLOT_TOKENS_LE, SLOT_WANTS_ATTN_SCORE, StreamRef,
+    SLOT_HAS_WRITE_DESC, SLOT_TOKENS_GT, SLOT_TOKENS_LE, SLOT_WANTS_ATTN_SCORE, SLOT_WINDOW_ONE,
+    StreamRef,
 };
 use crate::error::{Error, Result};
 
@@ -61,6 +62,7 @@ pub fn predicate_of(slot: u32, param: u32, rows: &[Row]) -> Option<bool> {
         SLOT_HAS_CUSTOM_MASK => rows.iter().any(|r| r.custom_mask),
         SLOT_HAS_STAGE_HOOKS => rows.iter().any(|r| r.hooked),
         SLOT_HAS_LORA => rows.iter().any(|r| r.lora),
+        SLOT_WINDOW_ONE => !rows.iter().any(|r| r.multi_token),
         _ => return None,
     })
 }
@@ -111,9 +113,6 @@ pub struct BucketKey {
     pub requests: u32,
     /// Token rows in the fire.
     pub tokens: u32,
-    /// The fire class, as `FireClass as u8` — a plain integer because the
-    /// key is a hash key and the trace type carries no `Hash`.
-    pub fire: u8,
     /// Which loaded model this graph addresses. Two deployments' captures
     /// share no buffer, so they may not share a key.
     pub model: u64,
@@ -136,14 +135,37 @@ pub struct BucketKey {
 
 impl BucketKey {
     /// The key for a fire.
+    ///
+    /// THE FIRE CLASS LEFT THE KEY (`.wiki/driver/graph.md` §5 ⑦). It sat
+    /// here because Decode and Prefill were different topologies and a
+    /// capture cannot vary over topology — but the window class is
+    /// `GuardPred::WindowOne` now, so both are arms of ONE union graph and
+    /// the conditional selects between them at replay. Five classes
+    /// became two (§4.2 deleted the repair passes), and then zero axes.
+    ///
+    /// **And the removal is safe even where the trace has NOT fully
+    /// merged.** One class read survives in `llama_like`: `fused_post`,
+    /// the fused decode-QKV epilogue, which is available under Decode
+    /// only — so a decode trace and a prefill trace of the same
+    /// deployment are still different op lists. They cannot collide here
+    /// regardless, because `fire_class_of` derives the class from
+    /// `rows == requests`: `tokens` and `requests` are both in the key,
+    /// so the pair DETERMINES the class and two fires that share a key
+    /// share a class. Stated rather than left to luck, because §6.2 wants
+    /// those two axes gone and this is the invariant that has to move
+    /// with them.
+    ///
+    /// The signature keeps the parameter so callers need not all change
+    /// at once; it is ignored, deliberately, rather than silently
+    /// reintroduced by a caller that still has one to hand.
     #[must_use]
     pub const fn new(
         requests: u32,
         tokens: u32,
-        fire: model_compiler::trace::FireClass,
+        _fire: model_compiler::trace::FireClass,
         model: u64,
     ) -> Self {
-        Self { requests, tokens, fire: fire as u8, model, lora_shape: 0 }
+        Self { requests, tokens, model, lora_shape: 0 }
     }
 
     /// The same key for a fire that staged adapters.
@@ -206,6 +228,25 @@ pub fn union_eligibility(
 /// than a wrong answer.
 pub type PlanEpoch = u64;
 
+/// One bucket's captured exec, the epoch it was recorded against, and the
+/// graph node each of its launches became.
+///
+/// The nodes are §6.2's missing bookkeeping: `cudaGraphExecKernelNodeSetParams`
+/// can move a launch's rectangle on an instantiated graph, but only if
+/// something remembers which node came from which launch.
+#[derive(Debug)]
+struct Entry {
+    exec: GraphExec,
+    epoch: PlanEpoch,
+    nodes: Vec<Option<cudarc::runtime::sys::cudaGraphNode_t>>,
+}
+
+// SAFETY: a `cudaGraphNode_t` is an opaque handle into the graph the
+// `GraphExec` beside it owns; it is neither dereferenced here nor valid
+// past that graph's life, which is exactly `GraphExec`'s own contract.
+unsafe impl Send for Entry {}
+unsafe impl Sync for Entry {}
+
 /// The instantiated graphs, by bucket and by the plan epoch each was
 /// recorded against.
 ///
@@ -215,7 +256,7 @@ pub type PlanEpoch = u64;
 /// decision that wants the replay path to exist first.
 #[derive(Debug, Default)]
 pub struct SupergraphCache {
-    execs: HashMap<BucketKey, (GraphExec, PlanEpoch)>,
+    execs: HashMap<BucketKey, Entry>,
     hits: u64,
     misses: u64,
     stale: u64,
@@ -236,9 +277,9 @@ impl SupergraphCache {
     /// it recorded against is gone in any case.
     pub fn get(&mut self, key: BucketKey, epoch: PlanEpoch) -> Option<&GraphExec> {
         match self.execs.get(&key) {
-            Some((_, at)) if *at == epoch => {
+            Some(e) if e.epoch == epoch => {
                 self.hits += 1;
-                self.execs.get(&key).map(|(e, _)| e)
+                self.execs.get(&key).map(|e| &e.exec)
             }
             Some(_) => {
                 self.stale += 1;
@@ -272,8 +313,64 @@ impl SupergraphCache {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(key, (exec, epoch));
+        self.execs.insert(key, Entry { exec, epoch, nodes: Vec::new() });
         Ok(())
+    }
+
+    /// Install an exec together with the NODES its capture retained.
+    ///
+    /// `.wiki/driver/graph.md` §6.2: retuning an instantiated graph's
+    /// grids without recapturing needs a handle per launch, and a capture
+    /// used to keep none. `nodes[i]` is launch `i`'s node, or `None` where
+    /// the dispatch issued nothing.
+    ///
+    /// # Errors
+    ///
+    /// The reason the fire was ineligible, with nothing installed.
+    pub fn insert_with_nodes(
+        &mut self,
+        key: BucketKey,
+        exec: GraphExec,
+        epoch: PlanEpoch,
+        nodes: Vec<Option<cudarc::runtime::sys::cudaGraphNode_t>>,
+        eligibility: Option<Ineligible>,
+    ) -> core::result::Result<(), Ineligible> {
+        if let Some(why) = eligibility {
+            return Err(why);
+        }
+        self.execs.insert(key, Entry { exec, epoch, nodes });
+        Ok(())
+    }
+
+    /// Retune a captured exec's launch rectangles for a fire whose row
+    /// count differs from the one recorded.
+    ///
+    /// `grids` is indexed like the capture's launches; `None` leaves a
+    /// launch alone. Returns `Ok(false)` when the key holds no exec, which
+    /// is a miss rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// If CUDA rejects an update — the caller's cue to recapture, since a
+    /// rejected update means the change is one the instantiated graph
+    /// cannot absorb.
+    pub fn retune(
+        &mut self,
+        key: BucketKey,
+        epoch: PlanEpoch,
+        grids: &[Option<u32>],
+    ) -> Result<bool> {
+        let Some(entry) = self.execs.get(&key) else { return Ok(false) };
+        if entry.epoch != epoch {
+            return Ok(false);
+        }
+        for (i, want) in grids.iter().enumerate() {
+            let (Some(grid), Some(Some(node))) = (*want, entry.nodes.get(i).copied()) else {
+                continue;
+            };
+            entry.exec.set_kernel_grid(node, grid)?;
+        }
+        Ok(true)
     }
 
     /// Replay `key`'s graph onto `stream`, if it is captured.
@@ -343,9 +440,31 @@ mod tests {
         let base = BucketKey::new(4, 4, FireClass::Decode, 7);
         assert_ne!(base, BucketKey::new(5, 4, FireClass::Decode, 7));
         assert_ne!(base, BucketKey::new(4, 8, FireClass::Decode, 7));
-        assert_ne!(base, BucketKey::new(4, 4, FireClass::Prefill, 7));
         assert_ne!(base, BucketKey::new(4, 4, FireClass::Decode, 8));
         assert_ne!(base, base.with_lora(1), "the lora group shape is an axis");
+    }
+
+    #[test]
+    fn the_fire_class_is_not_an_axis() {
+        // `.wiki/driver/graph.md` §5 ⑦. It was one because Decode and
+        // Prefill were two topologies and a capture cannot vary over
+        // topology. The window class is `GuardPred::WindowOne` now, so
+        // they are two ARMS of one graph and the conditional picks at
+        // replay — one topology, no axis.
+        assert_eq!(
+            BucketKey::new(4, 4, FireClass::Decode, 7),
+            BucketKey::new(4, 4, FireClass::Prefill, 7),
+        );
+        // And where the trace has NOT merged — `fused_post` is still a
+        // Decode-only spelling — the shape axes keep the classes apart on
+        // their own: `fire_class_of` says decode iff `rows == requests`,
+        // so a fire whose key says `tokens != requests` is a prefill and
+        // one whose key says they are equal is a decode. Two fires that
+        // share a key share a class.
+        assert_ne!(
+            BucketKey::new(4, 4, FireClass::Decode, 7),
+            BucketKey::new(4, 9, FireClass::Prefill, 7),
+        );
     }
 
     #[test]

@@ -416,7 +416,7 @@ fn emit_class_fn(
         b.line("        {");
         emit_range(
             &mut b, plan, facts, cuda, is_decode,
-            Some(SgValuation { has_custom_mask: true }),
+            Some(SgValuation { has_custom_mask: true, window_one: is_decode }),
             0, plan.ops.len(), None,
         );
         b.line("        }");
@@ -427,7 +427,7 @@ fn emit_class_fn(
         b.line("        {");
         emit_range(
             &mut b, plan, facts, cuda, is_decode,
-            Some(SgValuation { has_custom_mask: false }),
+            Some(SgValuation { has_custom_mask: false, window_one: is_decode }),
             0, plan.ops.len(), None,
         );
         b.line("        }");
@@ -489,6 +489,7 @@ enum Win {
 #[derive(Clone, Copy)]
 struct SgValuation {
     has_custom_mask: bool,
+    window_one: bool,
 }
 
 impl SgValuation {
@@ -499,6 +500,9 @@ impl SgValuation {
             GuardPred::HasWriteDesc => true,
             GuardPred::WantsAttnScore => false,
             GuardPred::HasLora => false,
+            // The emitter's C++ target is generated PER CLASS, so it
+            // still knows which window class it is emitting.
+            GuardPred::WindowOne => self.window_one,
             other => panic!(
                 "emitter: pred {other:?} outside the supergraph union"
             ),
@@ -747,6 +751,11 @@ fn emit_range_scoped(
                 }
                 model_compiler::trace::GuardPred::HasLora => {
                     "lora != nullptr && lora->usable()".to_string()
+                }
+                // The window class, as the C++ read it before it was a
+                // guard: one query row per request.
+                model_compiler::trace::GuardPred::WindowOne => {
+                    "num_tokens == num_requests".to_string()
                 }
             };
             let mut region = i + 1;

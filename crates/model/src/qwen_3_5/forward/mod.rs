@@ -531,7 +531,7 @@ impl GdnLayerW {
 /// resolves at trace time (a binding fact); operand packing mirrors the
 /// driver's: qkvz = [mixed_qkv | z], ba = [b | a]. Returns
 /// `(qkv, z, a, b)`. One function so the CommitAdvance pass's no-stash
-/// arm ([`commit_advance_body`]) runs EXACTLY the normal body's GEMMs
+/// arm (the retired commit-advance pass) runs EXACTLY the normal body's GEMMs
 /// and splits, by construction rather than by parallel maintenance.
 fn gdn_in_proj(
     x: &Val,
@@ -622,16 +622,11 @@ fn gdn_attn_body_cuda(
 
     let (qkv, z, a, b) = gdn_in_proj(&x, &w, facts, /*stated=*/ true);
 
-    // FrozenVerify: the frozen verify pass caches the cheap in-proj
-    // activations for the later commit-advance replay — the stash STORE,
-    // at the hand-written launch position (after the splits, before the
-    // conv). Present iff the deployment configures the stash (the same
-    // engine-owned fact the load consumes); everything else in this body
-    // rides the Prefill arms, and write_state=false is a runtime ARG of
-    // the stated kernels, not a trace difference.
-    if class == FireClass::FrozenVerify && c.verify_stash {
-        cuda::verify_stash_store(&qkv, &a, &b, &w.rs);
-    }
+    // THE VERIFY STASH IS GONE (`.wiki/driver/graph.md` §4.2). It cached
+    // the in-proj activations so a later commit-advance pass could replay
+    // them — but a speculative decode buffers its own tokens and folds
+    // only the accepted prefix, so the BUFFER is the stash and there is
+    // no replay to feed.
 
     // Conv → prep → recurrence: the GDN core, against the layer's
     // per-request conv/recurrent state.
@@ -639,14 +634,11 @@ fn gdn_attn_body_cuda(
     // Prefill arm in every kernel choice here; only the model epilogue
     // differs, and that class match lives in `qwen3_5_hybrid_cuda_text`.
     // CommitAdvance never enters this body at all: it is its own pass
-    // ([`commit_advance_body`]), not a variant of the layer loop.
+    // (the retired commit-advance pass), not a variant of the layer loop.
     let qkv = match class {
         FireClass::Decode => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs),
-        FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify => {
+        FireClass::Prefill => {
             cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs)
-        }
-        FireClass::CommitAdvance => {
-            unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
     let (q, k, v, g, beta) = gdn_prep(
@@ -674,7 +666,7 @@ fn gdn_attn_body_cuda(
         FireClass::Decode => {
             cuda::gdn_step_batched(&q, &k, &v, &g, &beta, &w.rs, gqa, c.state_bf16)
         }
-        FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify => {
+        FireClass::Prefill => {
             // The prefill recurrence three-way, as the first
             // VALUE-PRODUCING guard chain (north-star-dsl.md 4b): the
             // guard's output is the recurrence core — the same
@@ -745,9 +737,6 @@ fn gdn_attn_body_cuda(
                 },
             )
             .expect("the guarded recurrence produces its value")
-        }
-        FireClass::CommitAdvance => {
-            unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
     // The OnAttn site: after the recurrence core, before the gated norm
@@ -999,7 +988,7 @@ fn full_attn_body_cuda(
     // dequant-less planned dispatch.
     // StateOnly runs the full backbone, prefill-shaped — the Prefill arm;
     // CommitAdvance skips full-attention layers entirely and never enters
-    // this body ([`commit_advance_body`]).
+    // this body (the retired commit-advance pass).
     let attn = match class {
         // The single-request redirect is a GUARD, not a second class: at
         // `prefill_decode` the prepare plans the prefill path for R == 1
@@ -1027,13 +1016,10 @@ fn full_attn_body_cuda(
             )
         }
         FireClass::Decode => cuda::attention_flashinfer_decode(&q, &w.kv, window_left),
-        FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify => {
+        FireClass::Prefill => {
             // No dequant statement beside it: qwen3_5's full-attention
             // path gates on a native-bf16 cache.
             cuda::attention_flashinfer_prefill(&q, &w.kv, window_left)
-        }
-        FireClass::CommitAdvance => {
-            unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
     let attn = attn.expect("a plain attention statement produces its value");
@@ -1215,7 +1201,7 @@ pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts) -> ForwardPlan {
 /// naming, verbatim — plus the two SERVICE classes (rung 4c-iv):
 /// `.state_only` (the whole backbone, prefill-shaped, minus the
 /// final-norm/lm_head epilogue) and `.commit_advance` (the spec-decode
-/// repair: a genuinely different pass — `commit_advance_body`).
+/// repair: a genuinely different pass — the retired commit-advance pass).
 pub fn qwen3_5_hybrid_cuda(
     facts: &Qwen35HybridFacts,
     cuda: &Qwen35CudaFacts,
@@ -1227,23 +1213,10 @@ pub fn qwen3_5_hybrid_cuda(
         match class {
             FireClass::Decode => "decode",
             FireClass::Prefill => "prefill",
-            FireClass::CommitAdvance => "commit_advance",
-            FireClass::StateOnly => "state_only",
-            FireClass::FrozenVerify => "frozen_verify",
         }
     );
     dsl::trace_named(&family, |t| {
         dsl::seam(t, &dsl::seam::IN, &[], None);
-        // CommitAdvance changes WHICH OPS RUN so radically — only the
-        // linear layers' conv+prep+recurrence, no embed/attention/MLP,
-        // nothing after — that it is not a variant of the walk below but
-        // its own pass, stated as its own body (north-star-dsl.md 4b:
-        // "a genuinely different pass, so a genuinely different trace").
-        if class == FireClass::CommitAdvance {
-            commit_advance_body(t, facts, cuda);
-            return;
-        }
-
         let mut y = dsl::embed_with(t, "embed", hidden);
 
         for l in 0..facts.layers {
@@ -1266,13 +1239,6 @@ pub fn qwen3_5_hybrid_cuda(
             };
         }
 
-        // The epilogue class match: StateOnly is the backbone alone —
-        // the trace simply ends after the last layer, exactly the pair
-        // the hand-written pass's `if (num_logit_rows < 0) return` skips
-        // (final-norm rmsnorm + lm_head, nothing else).
-        if class == FireClass::StateOnly {
-            return;
-        }
         hybrid_epilogue(t, facts, &y, /*stated=*/true);
     })
 }
@@ -1317,70 +1283,16 @@ fn hybrid_epilogue(t: &Trace, facts: &Qwen35HybridFacts, y: &Val, stated: bool) 
     let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
     dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
 }
-
-/// The CommitAdvance pass (north-star-dsl.md 4b, rung 4c-iv): the
-/// spec-decode repair that re-advances each LINEAR layer's conv window
-/// and recurrent state over the confirmed prefix. Full-attention layers,
-/// every MLP, embed and the epilogue do not exist in this pass — per
-/// linear layer it is exactly conv → prep → recurrence, fed either from
-/// the verify hidden stash ([`Qwen35CudaFacts::verify_stash`]) or from
-/// re-run in-projections.
-///
-/// The pass's root value is a bare [`dsl::input`] placeholder, not an
-/// embed: the hand-written no-stash path leans, degenerately, on
-/// whatever the workspace's `norm_x` buffer happens to hold from the
-/// preceding fire, and the placeholder states that reliance honestly —
-/// a value produced by no op of this trace, bound by the driver.
-///
-/// The pass is prefill-shaped, so the conv states the prefill walk; its
-/// `commit_lens` is a runtime argument the driver binds (the FLA family
-/// is the only recurrence family threading commit_lens, which is why the
-/// recurrence states [`cuda::gdn_prefill_fla`] directly — no N-threshold
-/// guard chain). The recurrence output is consumed by NOTHING in this
-/// pass — no gated norm, no o_proj — so the FLA launch stays the
-/// output-less launch it already is: the pass's product is the advanced
-/// per-request state, which is not a traced value.
-fn commit_advance_body(t: &Trace, facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFacts) {
-    let gdn = &facts.gdn;
-    let x = dsl::input(t, facts.hidden());
-    for l in (0..facts.layers).filter(|&l| !facts.is_full_attn(l)) {
-        let w = GdnLayerW::new(t, l, gdn);
-        let (qkv, a, b) = if cuda.verify_stash {
-            // The stash replays the in-proj OUTPUTS, so the GEMMs and
-            // splits are skipped entirely: qkv/a/b arrive via the one
-            // load (z is not stashed — nothing downstream reads it).
-            cuda::verify_stash_load(t, &w.rs, gdn.conv_dim(), gdn.value_heads)
-        } else {
-            // No stash: re-run the in-projections — the normal body's
-            // fused/unfused arms verbatim ([`gdn_in_proj`]) — against
-            // the input placeholder. The z leg is traced (it is part of
-            // those arms) and consumed by nothing, like the recurrence
-            // output below.
-            let (qkv, _z, a, b) = gdn_in_proj(&x, &w, gdn, /*stated=*/ true);
-            (qkv, a, b)
-        };
-        let qkv = cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs);
-        let (q, k, v, g, beta) = gdn_prep(
-            &qkv,
-            &a,
-            &b,
-            &w.prep,
-            gdn.key_heads,
-            gdn.key_head_dim,
-            gdn.value_heads,
-            gdn.value_head_dim,
-        );
-        // The hand-written commit replay passes through both hook
-        // invokes (they precede its early return), so the commit trace
-        // mirrors them (A4) — argument no-ops on every commit fire
-        // today, stated because the contract is the body's.
-        dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-        cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, cuda.state_bf16);
-        dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
-    }
-    // Nothing after the loop: no final norm, no lm_head — the pass ends
-    // with the last linear layer's recurrence.
-}
+// THE COMMIT-ADVANCE PASS IS GONE (`.wiki/driver/graph.md` §4.2).
+//
+// It re-advanced each linear layer's conv window and recurrent state over
+// a confirmed prefix, fed from a verify hidden stash -- a REPAIR, and
+// directive 4.2 says there are none. A speculative decode writes its
+// tokens into a buffer and folds only the accepted prefix into the linear
+// state; a rejected token is never folded, so the state is never wrong
+// and there is nothing to re-advance. The fold length IS the confirmed
+// prefix, and the driver resolves it (`PIE_RS_FLAG_FOLD`, and v24's
+// `_FOLD_LEN_DEVICE` for a length only the device knows).
 
 #[cfg(test)]
 mod tests {

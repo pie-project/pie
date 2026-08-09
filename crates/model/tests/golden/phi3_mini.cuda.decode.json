@@ -5245,7 +5245,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -5317,6 +5317,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -5351,6 +5367,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        7
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        7
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -5682,7 +5766,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -5754,6 +5838,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -5788,6 +5888,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        23
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        23
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -6119,7 +6287,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -6191,6 +6359,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -6225,6 +6409,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        39
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        39
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -6556,7 +6808,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -6628,6 +6880,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -6662,6 +6930,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        55
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        55
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -6993,7 +7329,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -7065,6 +7401,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -7099,6 +7451,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -7430,7 +7850,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -7502,6 +7922,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -7536,6 +7972,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        87
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        87
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -7867,7 +8371,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -7939,6 +8443,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -7973,6 +8493,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        103
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        103
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -8304,7 +8892,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -8376,6 +8964,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -8410,6 +9014,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        119
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        119
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -8741,7 +9413,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -8813,6 +9485,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -8847,6 +9535,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        135
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        135
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -9178,7 +9934,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -9250,6 +10006,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -9284,6 +10056,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        151
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        151
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -9615,7 +10455,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -9687,6 +10527,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -9721,6 +10577,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        167
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        167
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -10052,7 +10976,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -10124,6 +11048,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -10158,6 +11098,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        183
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        183
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -10489,7 +11497,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -10561,6 +11569,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -10595,6 +11619,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        199
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        199
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -10926,7 +12018,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -10998,6 +12090,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -11032,6 +12140,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        215
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        215
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -11363,7 +12539,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -11435,6 +12611,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -11469,6 +12661,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        231
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        231
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -11800,7 +13060,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -11872,6 +13132,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -11906,6 +13182,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        247
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        247
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -12237,7 +13581,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -12309,6 +13653,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -12343,6 +13703,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        263
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        263
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -12674,7 +14102,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -12746,6 +14174,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -12780,6 +14224,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        279
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        279
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -13111,7 +14623,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -13183,6 +14695,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -13217,6 +14745,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        295
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        295
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -13548,7 +15144,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -13620,6 +15216,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -13654,6 +15266,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        311
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        311
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -13985,7 +15665,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -14057,6 +15737,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -14091,6 +15787,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        327
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        327
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -14422,7 +16186,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -14494,6 +16258,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -14528,6 +16308,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        343
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        343
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -14859,7 +16707,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -14931,6 +16779,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -14965,6 +16829,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        359
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        359
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -15296,7 +17228,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -15368,6 +17300,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -15402,6 +17350,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        375
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        375
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -15733,7 +17749,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -15805,6 +17821,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -15839,6 +17871,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        391
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        391
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 24
@@ -16170,7 +18270,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -16242,6 +18342,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -16276,6 +18392,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        407
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        407
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 25
@@ -16607,7 +18791,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -16679,6 +18863,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -16713,6 +18913,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        423
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        423
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 26
@@ -17044,7 +19312,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -17116,6 +19384,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -17150,6 +19434,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        439
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        439
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 27
@@ -17481,7 +19833,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -17553,6 +19905,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -17587,6 +19955,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 28
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        455
+      ],
+      "outputs": [],
+      "layer": 28
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 28
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 28
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 28
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        455
+      ],
+      "outputs": [],
+      "layer": 28
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 28
@@ -17918,7 +20354,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -17990,6 +20426,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -18024,6 +20476,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 29
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        471
+      ],
+      "outputs": [],
+      "layer": 29
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 29
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 29
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 29
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        471
+      ],
+      "outputs": [],
+      "layer": 29
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 29
@@ -18355,7 +20875,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -18427,6 +20947,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -18461,6 +20997,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 30
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        487
+      ],
+      "outputs": [],
+      "layer": 30
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 30
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 30
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 30
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        487
+      ],
+      "outputs": [],
+      "layer": 30
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 30
@@ -18792,7 +21396,7 @@
               "ops": 3
             }
           ],
-          "else_ops": 5
+          "else_ops": 10
         }
       },
       "inputs": [],
@@ -18864,6 +21468,22 @@
         "Guard": {
           "arms": [
             {
+              "pred": "WindowOne",
+              "ops": 3
+            }
+          ],
+          "else_ops": 4
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
               "pred": "WantsAttnScore",
               "ops": 1
             }
@@ -18898,6 +21518,74 @@
       "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
+          "state": {
+            "store": "KvCache",
+            "layer": 31
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        503
+      ],
+      "outputs": [],
+      "layer": 31
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 31
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 31
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "WantsAttnScore",
+              "ops": 1
+            }
+          ],
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 31
+          },
+          "params": [
+            4294967295
+          ]
+        }
+      },
+      "inputs": [
+        503
+      ],
+      "outputs": [],
+      "layer": 31
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 31
@@ -19091,7 +21779,7 @@
     {
       "seam": "attn.out",
       "layer": 0,
-      "op": 22,
+      "op": 27,
       "values": [
         7
       ]
@@ -19099,7 +21787,7 @@
     {
       "seam": "attn.qv",
       "layer": 1,
-      "op": 33,
+      "op": 38,
       "values": [
         18,
         20
@@ -19108,23 +21796,7 @@
     {
       "seam": "attn.q",
       "layer": 1,
-      "op": 43,
-      "values": [
-        23
-      ]
-    },
-    {
-      "seam": "attn.out",
-      "layer": 1,
-      "op": 45,
-      "values": [
-        23
-      ]
-    },
-    {
-      "seam": "attn.q",
-      "layer": 1,
-      "op": 46,
+      "op": 48,
       "values": [
         23
       ]
@@ -19138,9 +21810,25 @@
       ]
     },
     {
+      "seam": "attn.q",
+      "layer": 1,
+      "op": 51,
+      "values": [
+        23
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 60,
+      "values": [
+        23
+      ]
+    },
+    {
       "seam": "attn.qv",
       "layer": 2,
-      "op": 61,
+      "op": 71,
       "values": [
         34,
         36
@@ -19149,7 +21837,7 @@
     {
       "seam": "attn.q",
       "layer": 2,
-      "op": 71,
+      "op": 81,
       "values": [
         39
       ]
@@ -19157,7 +21845,7 @@
     {
       "seam": "attn.out",
       "layer": 2,
-      "op": 73,
+      "op": 83,
       "values": [
         39
       ]
@@ -19165,7 +21853,7 @@
     {
       "seam": "attn.q",
       "layer": 2,
-      "op": 74,
+      "op": 84,
       "values": [
         39
       ]
@@ -19173,7 +21861,7 @@
     {
       "seam": "attn.out",
       "layer": 2,
-      "op": 78,
+      "op": 93,
       "values": [
         39
       ]
@@ -19181,7 +21869,7 @@
     {
       "seam": "attn.qv",
       "layer": 3,
-      "op": 89,
+      "op": 104,
       "values": [
         50,
         52
@@ -19190,7 +21878,7 @@
     {
       "seam": "attn.q",
       "layer": 3,
-      "op": 99,
+      "op": 114,
       "values": [
         55
       ]
@@ -19198,7 +21886,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 101,
+      "op": 116,
       "values": [
         55
       ]
@@ -19206,7 +21894,7 @@
     {
       "seam": "attn.q",
       "layer": 3,
-      "op": 102,
+      "op": 117,
       "values": [
         55
       ]
@@ -19214,7 +21902,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 106,
+      "op": 126,
       "values": [
         55
       ]
@@ -19222,7 +21910,7 @@
     {
       "seam": "attn.qv",
       "layer": 4,
-      "op": 117,
+      "op": 137,
       "values": [
         66,
         68
@@ -19231,7 +21919,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 127,
+      "op": 147,
       "values": [
         71
       ]
@@ -19239,7 +21927,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 129,
+      "op": 149,
       "values": [
         71
       ]
@@ -19247,7 +21935,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 130,
+      "op": 150,
       "values": [
         71
       ]
@@ -19255,7 +21943,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 134,
+      "op": 159,
       "values": [
         71
       ]
@@ -19263,7 +21951,7 @@
     {
       "seam": "attn.qv",
       "layer": 5,
-      "op": 145,
+      "op": 170,
       "values": [
         82,
         84
@@ -19272,7 +21960,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 155,
+      "op": 180,
       "values": [
         87
       ]
@@ -19280,7 +21968,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 157,
+      "op": 182,
       "values": [
         87
       ]
@@ -19288,7 +21976,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 158,
+      "op": 183,
       "values": [
         87
       ]
@@ -19296,7 +21984,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 162,
+      "op": 192,
       "values": [
         87
       ]
@@ -19304,7 +21992,7 @@
     {
       "seam": "attn.qv",
       "layer": 6,
-      "op": 173,
+      "op": 203,
       "values": [
         98,
         100
@@ -19313,7 +22001,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 183,
+      "op": 213,
       "values": [
         103
       ]
@@ -19321,7 +22009,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 185,
+      "op": 215,
       "values": [
         103
       ]
@@ -19329,7 +22017,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 186,
+      "op": 216,
       "values": [
         103
       ]
@@ -19337,7 +22025,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 190,
+      "op": 225,
       "values": [
         103
       ]
@@ -19345,7 +22033,7 @@
     {
       "seam": "attn.qv",
       "layer": 7,
-      "op": 201,
+      "op": 236,
       "values": [
         114,
         116
@@ -19354,7 +22042,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 211,
+      "op": 246,
       "values": [
         119
       ]
@@ -19362,7 +22050,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 213,
+      "op": 248,
       "values": [
         119
       ]
@@ -19370,7 +22058,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 214,
+      "op": 249,
       "values": [
         119
       ]
@@ -19378,7 +22066,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 218,
+      "op": 258,
       "values": [
         119
       ]
@@ -19386,7 +22074,7 @@
     {
       "seam": "attn.qv",
       "layer": 8,
-      "op": 229,
+      "op": 269,
       "values": [
         130,
         132
@@ -19395,7 +22083,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 239,
+      "op": 279,
       "values": [
         135
       ]
@@ -19403,7 +22091,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 241,
+      "op": 281,
       "values": [
         135
       ]
@@ -19411,7 +22099,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 242,
+      "op": 282,
       "values": [
         135
       ]
@@ -19419,7 +22107,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 246,
+      "op": 291,
       "values": [
         135
       ]
@@ -19427,7 +22115,7 @@
     {
       "seam": "attn.qv",
       "layer": 9,
-      "op": 257,
+      "op": 302,
       "values": [
         146,
         148
@@ -19436,7 +22124,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 267,
+      "op": 312,
       "values": [
         151
       ]
@@ -19444,7 +22132,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 269,
+      "op": 314,
       "values": [
         151
       ]
@@ -19452,7 +22140,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 270,
+      "op": 315,
       "values": [
         151
       ]
@@ -19460,7 +22148,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 274,
+      "op": 324,
       "values": [
         151
       ]
@@ -19468,7 +22156,7 @@
     {
       "seam": "attn.qv",
       "layer": 10,
-      "op": 285,
+      "op": 335,
       "values": [
         162,
         164
@@ -19477,7 +22165,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 295,
+      "op": 345,
       "values": [
         167
       ]
@@ -19485,7 +22173,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 297,
+      "op": 347,
       "values": [
         167
       ]
@@ -19493,7 +22181,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 298,
+      "op": 348,
       "values": [
         167
       ]
@@ -19501,7 +22189,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 302,
+      "op": 357,
       "values": [
         167
       ]
@@ -19509,7 +22197,7 @@
     {
       "seam": "attn.qv",
       "layer": 11,
-      "op": 313,
+      "op": 368,
       "values": [
         178,
         180
@@ -19518,7 +22206,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 323,
+      "op": 378,
       "values": [
         183
       ]
@@ -19526,7 +22214,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 325,
+      "op": 380,
       "values": [
         183
       ]
@@ -19534,7 +22222,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 326,
+      "op": 381,
       "values": [
         183
       ]
@@ -19542,7 +22230,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 330,
+      "op": 390,
       "values": [
         183
       ]
@@ -19550,7 +22238,7 @@
     {
       "seam": "attn.qv",
       "layer": 12,
-      "op": 341,
+      "op": 401,
       "values": [
         194,
         196
@@ -19559,7 +22247,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 351,
+      "op": 411,
       "values": [
         199
       ]
@@ -19567,7 +22255,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 353,
+      "op": 413,
       "values": [
         199
       ]
@@ -19575,7 +22263,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 354,
+      "op": 414,
       "values": [
         199
       ]
@@ -19583,7 +22271,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 358,
+      "op": 423,
       "values": [
         199
       ]
@@ -19591,7 +22279,7 @@
     {
       "seam": "attn.qv",
       "layer": 13,
-      "op": 369,
+      "op": 434,
       "values": [
         210,
         212
@@ -19600,7 +22288,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 379,
+      "op": 444,
       "values": [
         215
       ]
@@ -19608,7 +22296,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 381,
+      "op": 446,
       "values": [
         215
       ]
@@ -19616,7 +22304,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 382,
+      "op": 447,
       "values": [
         215
       ]
@@ -19624,7 +22312,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 386,
+      "op": 456,
       "values": [
         215
       ]
@@ -19632,7 +22320,7 @@
     {
       "seam": "attn.qv",
       "layer": 14,
-      "op": 397,
+      "op": 467,
       "values": [
         226,
         228
@@ -19641,7 +22329,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 407,
+      "op": 477,
       "values": [
         231
       ]
@@ -19649,7 +22337,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 409,
+      "op": 479,
       "values": [
         231
       ]
@@ -19657,7 +22345,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 410,
+      "op": 480,
       "values": [
         231
       ]
@@ -19665,7 +22353,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 414,
+      "op": 489,
       "values": [
         231
       ]
@@ -19673,7 +22361,7 @@
     {
       "seam": "attn.qv",
       "layer": 15,
-      "op": 425,
+      "op": 500,
       "values": [
         242,
         244
@@ -19682,7 +22370,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 435,
+      "op": 510,
       "values": [
         247
       ]
@@ -19690,7 +22378,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 437,
+      "op": 512,
       "values": [
         247
       ]
@@ -19698,7 +22386,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 438,
+      "op": 513,
       "values": [
         247
       ]
@@ -19706,7 +22394,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 442,
+      "op": 522,
       "values": [
         247
       ]
@@ -19714,7 +22402,7 @@
     {
       "seam": "attn.qv",
       "layer": 16,
-      "op": 453,
+      "op": 533,
       "values": [
         258,
         260
@@ -19723,7 +22411,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 463,
+      "op": 543,
       "values": [
         263
       ]
@@ -19731,7 +22419,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 465,
+      "op": 545,
       "values": [
         263
       ]
@@ -19739,7 +22427,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 466,
+      "op": 546,
       "values": [
         263
       ]
@@ -19747,7 +22435,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 470,
+      "op": 555,
       "values": [
         263
       ]
@@ -19755,7 +22443,7 @@
     {
       "seam": "attn.qv",
       "layer": 17,
-      "op": 481,
+      "op": 566,
       "values": [
         274,
         276
@@ -19764,7 +22452,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 491,
+      "op": 576,
       "values": [
         279
       ]
@@ -19772,7 +22460,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 493,
+      "op": 578,
       "values": [
         279
       ]
@@ -19780,7 +22468,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 494,
+      "op": 579,
       "values": [
         279
       ]
@@ -19788,7 +22476,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 498,
+      "op": 588,
       "values": [
         279
       ]
@@ -19796,7 +22484,7 @@
     {
       "seam": "attn.qv",
       "layer": 18,
-      "op": 509,
+      "op": 599,
       "values": [
         290,
         292
@@ -19805,7 +22493,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 519,
+      "op": 609,
       "values": [
         295
       ]
@@ -19813,7 +22501,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 521,
+      "op": 611,
       "values": [
         295
       ]
@@ -19821,7 +22509,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 522,
+      "op": 612,
       "values": [
         295
       ]
@@ -19829,7 +22517,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 526,
+      "op": 621,
       "values": [
         295
       ]
@@ -19837,7 +22525,7 @@
     {
       "seam": "attn.qv",
       "layer": 19,
-      "op": 537,
+      "op": 632,
       "values": [
         306,
         308
@@ -19846,7 +22534,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 547,
+      "op": 642,
       "values": [
         311
       ]
@@ -19854,7 +22542,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 549,
+      "op": 644,
       "values": [
         311
       ]
@@ -19862,7 +22550,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 550,
+      "op": 645,
       "values": [
         311
       ]
@@ -19870,7 +22558,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 554,
+      "op": 654,
       "values": [
         311
       ]
@@ -19878,7 +22566,7 @@
     {
       "seam": "attn.qv",
       "layer": 20,
-      "op": 565,
+      "op": 665,
       "values": [
         322,
         324
@@ -19887,7 +22575,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 575,
+      "op": 675,
       "values": [
         327
       ]
@@ -19895,7 +22583,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 577,
+      "op": 677,
       "values": [
         327
       ]
@@ -19903,7 +22591,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 578,
+      "op": 678,
       "values": [
         327
       ]
@@ -19911,7 +22599,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 582,
+      "op": 687,
       "values": [
         327
       ]
@@ -19919,7 +22607,7 @@
     {
       "seam": "attn.qv",
       "layer": 21,
-      "op": 593,
+      "op": 698,
       "values": [
         338,
         340
@@ -19928,7 +22616,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 603,
+      "op": 708,
       "values": [
         343
       ]
@@ -19936,7 +22624,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 605,
+      "op": 710,
       "values": [
         343
       ]
@@ -19944,7 +22632,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 606,
+      "op": 711,
       "values": [
         343
       ]
@@ -19952,7 +22640,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 610,
+      "op": 720,
       "values": [
         343
       ]
@@ -19960,7 +22648,7 @@
     {
       "seam": "attn.qv",
       "layer": 22,
-      "op": 621,
+      "op": 731,
       "values": [
         354,
         356
@@ -19969,7 +22657,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 631,
+      "op": 741,
       "values": [
         359
       ]
@@ -19977,7 +22665,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 633,
+      "op": 743,
       "values": [
         359
       ]
@@ -19985,7 +22673,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 634,
+      "op": 744,
       "values": [
         359
       ]
@@ -19993,7 +22681,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 638,
+      "op": 753,
       "values": [
         359
       ]
@@ -20001,7 +22689,7 @@
     {
       "seam": "attn.qv",
       "layer": 23,
-      "op": 649,
+      "op": 764,
       "values": [
         370,
         372
@@ -20010,7 +22698,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 659,
+      "op": 774,
       "values": [
         375
       ]
@@ -20018,7 +22706,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 661,
+      "op": 776,
       "values": [
         375
       ]
@@ -20026,7 +22714,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 662,
+      "op": 777,
       "values": [
         375
       ]
@@ -20034,7 +22722,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 666,
+      "op": 786,
       "values": [
         375
       ]
@@ -20042,7 +22730,7 @@
     {
       "seam": "attn.qv",
       "layer": 24,
-      "op": 677,
+      "op": 797,
       "values": [
         386,
         388
@@ -20051,7 +22739,7 @@
     {
       "seam": "attn.q",
       "layer": 24,
-      "op": 687,
+      "op": 807,
       "values": [
         391
       ]
@@ -20059,7 +22747,7 @@
     {
       "seam": "attn.out",
       "layer": 24,
-      "op": 689,
+      "op": 809,
       "values": [
         391
       ]
@@ -20067,7 +22755,7 @@
     {
       "seam": "attn.q",
       "layer": 24,
-      "op": 690,
+      "op": 810,
       "values": [
         391
       ]
@@ -20075,7 +22763,7 @@
     {
       "seam": "attn.out",
       "layer": 24,
-      "op": 694,
+      "op": 819,
       "values": [
         391
       ]
@@ -20083,7 +22771,7 @@
     {
       "seam": "attn.qv",
       "layer": 25,
-      "op": 705,
+      "op": 830,
       "values": [
         402,
         404
@@ -20092,7 +22780,7 @@
     {
       "seam": "attn.q",
       "layer": 25,
-      "op": 715,
+      "op": 840,
       "values": [
         407
       ]
@@ -20100,7 +22788,7 @@
     {
       "seam": "attn.out",
       "layer": 25,
-      "op": 717,
+      "op": 842,
       "values": [
         407
       ]
@@ -20108,7 +22796,7 @@
     {
       "seam": "attn.q",
       "layer": 25,
-      "op": 718,
+      "op": 843,
       "values": [
         407
       ]
@@ -20116,7 +22804,7 @@
     {
       "seam": "attn.out",
       "layer": 25,
-      "op": 722,
+      "op": 852,
       "values": [
         407
       ]
@@ -20124,7 +22812,7 @@
     {
       "seam": "attn.qv",
       "layer": 26,
-      "op": 733,
+      "op": 863,
       "values": [
         418,
         420
@@ -20133,7 +22821,7 @@
     {
       "seam": "attn.q",
       "layer": 26,
-      "op": 743,
+      "op": 873,
       "values": [
         423
       ]
@@ -20141,7 +22829,7 @@
     {
       "seam": "attn.out",
       "layer": 26,
-      "op": 745,
+      "op": 875,
       "values": [
         423
       ]
@@ -20149,7 +22837,7 @@
     {
       "seam": "attn.q",
       "layer": 26,
-      "op": 746,
+      "op": 876,
       "values": [
         423
       ]
@@ -20157,7 +22845,7 @@
     {
       "seam": "attn.out",
       "layer": 26,
-      "op": 750,
+      "op": 885,
       "values": [
         423
       ]
@@ -20165,7 +22853,7 @@
     {
       "seam": "attn.qv",
       "layer": 27,
-      "op": 761,
+      "op": 896,
       "values": [
         434,
         436
@@ -20174,7 +22862,7 @@
     {
       "seam": "attn.q",
       "layer": 27,
-      "op": 771,
+      "op": 906,
       "values": [
         439
       ]
@@ -20182,7 +22870,7 @@
     {
       "seam": "attn.out",
       "layer": 27,
-      "op": 773,
+      "op": 908,
       "values": [
         439
       ]
@@ -20190,7 +22878,7 @@
     {
       "seam": "attn.q",
       "layer": 27,
-      "op": 774,
+      "op": 909,
       "values": [
         439
       ]
@@ -20198,7 +22886,7 @@
     {
       "seam": "attn.out",
       "layer": 27,
-      "op": 778,
+      "op": 918,
       "values": [
         439
       ]
@@ -20206,7 +22894,7 @@
     {
       "seam": "attn.qv",
       "layer": 28,
-      "op": 789,
+      "op": 929,
       "values": [
         450,
         452
@@ -20215,7 +22903,7 @@
     {
       "seam": "attn.q",
       "layer": 28,
-      "op": 799,
+      "op": 939,
       "values": [
         455
       ]
@@ -20223,7 +22911,7 @@
     {
       "seam": "attn.out",
       "layer": 28,
-      "op": 801,
+      "op": 941,
       "values": [
         455
       ]
@@ -20231,7 +22919,7 @@
     {
       "seam": "attn.q",
       "layer": 28,
-      "op": 802,
+      "op": 942,
       "values": [
         455
       ]
@@ -20239,7 +22927,7 @@
     {
       "seam": "attn.out",
       "layer": 28,
-      "op": 806,
+      "op": 951,
       "values": [
         455
       ]
@@ -20247,7 +22935,7 @@
     {
       "seam": "attn.qv",
       "layer": 29,
-      "op": 817,
+      "op": 962,
       "values": [
         466,
         468
@@ -20256,7 +22944,7 @@
     {
       "seam": "attn.q",
       "layer": 29,
-      "op": 827,
+      "op": 972,
       "values": [
         471
       ]
@@ -20264,7 +22952,7 @@
     {
       "seam": "attn.out",
       "layer": 29,
-      "op": 829,
+      "op": 974,
       "values": [
         471
       ]
@@ -20272,7 +22960,7 @@
     {
       "seam": "attn.q",
       "layer": 29,
-      "op": 830,
+      "op": 975,
       "values": [
         471
       ]
@@ -20280,7 +22968,7 @@
     {
       "seam": "attn.out",
       "layer": 29,
-      "op": 834,
+      "op": 984,
       "values": [
         471
       ]
@@ -20288,7 +22976,7 @@
     {
       "seam": "attn.qv",
       "layer": 30,
-      "op": 845,
+      "op": 995,
       "values": [
         482,
         484
@@ -20297,7 +22985,7 @@
     {
       "seam": "attn.q",
       "layer": 30,
-      "op": 855,
+      "op": 1005,
       "values": [
         487
       ]
@@ -20305,7 +22993,7 @@
     {
       "seam": "attn.out",
       "layer": 30,
-      "op": 857,
+      "op": 1007,
       "values": [
         487
       ]
@@ -20313,7 +23001,7 @@
     {
       "seam": "attn.q",
       "layer": 30,
-      "op": 858,
+      "op": 1008,
       "values": [
         487
       ]
@@ -20321,7 +23009,7 @@
     {
       "seam": "attn.out",
       "layer": 30,
-      "op": 862,
+      "op": 1017,
       "values": [
         487
       ]
@@ -20329,7 +23017,7 @@
     {
       "seam": "attn.qv",
       "layer": 31,
-      "op": 873,
+      "op": 1028,
       "values": [
         498,
         500
@@ -20338,7 +23026,7 @@
     {
       "seam": "attn.q",
       "layer": 31,
-      "op": 883,
+      "op": 1038,
       "values": [
         503
       ]
@@ -20346,7 +23034,7 @@
     {
       "seam": "attn.out",
       "layer": 31,
-      "op": 885,
+      "op": 1040,
       "values": [
         503
       ]
@@ -20354,7 +23042,7 @@
     {
       "seam": "attn.q",
       "layer": 31,
-      "op": 886,
+      "op": 1041,
       "values": [
         503
       ]
@@ -20362,7 +23050,7 @@
     {
       "seam": "attn.out",
       "layer": 31,
-      "op": 890,
+      "op": 1050,
       "values": [
         503
       ]

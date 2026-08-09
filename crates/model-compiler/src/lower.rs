@@ -86,6 +86,161 @@ pub struct Row {
     pub samples: bool,
 }
 
+/// The region-signature bits, as the wire states them.
+///
+/// Restated here rather than imported from the C ABI, for the reason
+/// `driver-metal-new` gives for its own copy: `Row` must not depend on
+/// the descriptor surface, and the VALUES are the contract. Stated beside
+/// `Row` so the mapping below can be one function instead of one per
+/// driver — the two shells were reading the same six bits into the same
+/// eight fields, which is two chances for a bit to be read wrongly and no
+/// way to notice.
+pub mod region_sig {
+    /// The region's members carry multi-token qo windows.
+    pub const MULTI_TOKEN: u32 = 1 << 0;
+    /// Attention-stage hook programs.
+    pub const HOOK: u32 = 1 << 1;
+    /// A user (custom) attention mask.
+    pub const MASK: u32 = 1 << 2;
+    /// A depth truncation; the region's `k` is its `region_k`.
+    pub const TRUNCATED: u32 = 1 << 3;
+    /// A span-grouped correction (lora) program.
+    pub const LORA: u32 = 1 << 4;
+    /// The region's hooks write the `attn_page_mask` sink.
+    pub const HOOK_PAGE_MASK: u32 = 1 << 5;
+    /// `region_k`'s "the whole model" sentinel — NOT the absence of
+    /// [`TRUNCATED`]. A region that sets the bit and states this is full
+    /// depth, so both have to be read.
+    pub const MAX_LAYERS_FULL: u32 = u32::MAX;
+}
+
+/// Why a step's tables do not describe its rows.
+///
+/// Every variant is drift between the scheduler's tables and the step
+/// they describe — a structural disagreement, not a runtime condition, so
+/// a driver reports it rather than degrading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionDrift {
+    /// The three region arrays disagree on how many regions there are.
+    Ragged { segments: usize, sigs: usize, ks: usize },
+    /// A region names rows the step does not have.
+    OutOfRange { region: usize, end: u32, rows: usize },
+    /// Two regions claim one row, or no region claims it.
+    DoNotTile { at: u32 },
+}
+
+impl Row {
+    /// The row a region's signature describes.
+    ///
+    /// A bit-for-bit read, not a derivation: the seriation already
+    /// decided these axes and the table is its output stated once.
+    #[must_use]
+    pub const fn from_region(sig: u32, k: u32, samples: bool) -> Self {
+        Self {
+            multi_token: sig & region_sig::MULTI_TOKEN != 0,
+            custom_mask: sig & region_sig::MASK != 0,
+            // Both hook bits mean "this row runs hook programs". They
+            // differ in what the hook WRITES, which changes the attention
+            // path rather than the row's shape, so the row folds them.
+            hooked: sig & (region_sig::HOOK | region_sig::HOOK_PAGE_MASK) != 0,
+            lora: sig & region_sig::LORA != 0,
+            // The bit says truncated; the sentinel says how far. Reading
+            // only the bit would truncate the whole fire at `u32::MAX`
+            // layers.
+            depth_k: if sig & region_sig::TRUNCATED != 0 && k != region_sig::MAX_LAYERS_FULL {
+                Some(k)
+            } else {
+                None
+            },
+            write_desc: false,
+            wants_scores: false,
+            samples,
+        }
+    }
+}
+
+/// The rows a step lowers over, from its region table and readout list.
+///
+/// # Why this is shared rather than per driver
+///
+/// It is the only thing that turns the wire's axis bitset into the
+/// lowering's guard predicates, and a shell that does not call it gets
+/// `Row::default()` — every guard false, silently. `driver-cuda-new` did
+/// exactly that: `vec![Row { samples: true, ..default() }; rows]`, so
+/// `HasLora`, `HasCustomMask`, `HasStageHooks` and the depth truncation
+/// could never hold no matter what the engine sent, and LoRA looked like
+/// a missing feature when the wire had been carrying it all along.
+///
+/// # Arguments
+///
+/// `sampling_indices` is the fire's readout rows. EMPTY means the last
+/// row is read — the decode case, where the fire exists to produce that
+/// token — and not "no row is read".
+///
+/// An empty `region_row_indptr` is the legacy discipline: no seriation
+/// ran, so the fire is one region of the default point. That is not a
+/// refusal.
+///
+/// # Errors
+///
+/// [`RegionDrift`] naming which structural fact did not hold.
+pub fn rows_from_regions(
+    rows: usize,
+    sampling_indices: &[u32],
+    region_row_indptr: &[u32],
+    region_sig_bits: &[u32],
+    region_k: &[u32],
+) -> Result<Vec<Row>, RegionDrift> {
+    let mut samples = vec![false; rows];
+    for &row in sampling_indices {
+        if let Some(slot) = samples.get_mut(row as usize) {
+            *slot = true;
+        }
+    }
+    if sampling_indices.is_empty() && rows > 0 {
+        samples[rows - 1] = true;
+    }
+
+    let segments = region_row_indptr.len().saturating_sub(1);
+    if region_row_indptr.is_empty() {
+        return Ok((0..rows)
+            .map(|i| Row::from_region(0, region_sig::MAX_LAYERS_FULL, samples[i]))
+            .collect());
+    }
+    if segments != region_sig_bits.len() || segments != region_k.len() {
+        return Err(RegionDrift::Ragged {
+            segments,
+            sigs: region_sig_bits.len(),
+            ks: region_k.len(),
+        });
+    }
+
+    let mut out: Vec<Option<Row>> = vec![None; rows];
+    for region in 0..segments {
+        let (start, end) = (region_row_indptr[region], region_row_indptr[region + 1]);
+        if end as usize > rows || start > end {
+            return Err(RegionDrift::OutOfRange { region, end, rows });
+        }
+        for row in start..end {
+            let slot = &mut out[row as usize];
+            if slot.is_some() {
+                return Err(RegionDrift::DoNotTile { at: row });
+            }
+            *slot = Some(Row::from_region(
+                region_sig_bits[region],
+                region_k[region],
+                samples[row as usize],
+            ));
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            row.ok_or(RegionDrift::DoNotTile { at: u32::try_from(i).unwrap_or(u32::MAX) })
+        })
+        .collect()
+}
+
 /// How the fire will be EXECUTED, where that changes what runs.
 ///
 /// Not row facts and not a guard: one thing the driver decides about the
@@ -1020,7 +1175,24 @@ impl Lowerer<'_> {
         if sampled < window.len() as u32 {
             self.emit(at, "layout::gather_bf16_rows", op, &out)?;
         }
-        self.emit(at, "norm::rmsnorm_bf16", op, &out)?;
+        // NO FINAL NORM HERE, and its absence is the correction rather
+        // than an omission.
+        //
+        // This used to emit `norm::rmsnorm_bf16` between the two, and it
+        // was dead on every fire of every family. Each text applies the
+        // final norm ITSELF and hands `logits()` the normed value —
+        // `m.logits(&dsl::cuda::rmsnorm(&y, &m.final_norm()))` in
+        // llama_like, `lm_head_tied(t, &normed, ..)` in gemma-4,
+        // `lm_head(rmsnorm(y, final_norm))` in qwen3.5. So the epilogue's
+        // own norm read an already-normed input and wrote `rows x hidden`
+        // bf16 into the LOGITS buffer, which the projection below
+        // overwrites on the next launch (beta is 0 here — the accumulate
+        // form needs three operands and this op has two).
+        //
+        // It survived because the epilogue's test asserted the three
+        // SYMBOLS and their row ranges, and those were right; nothing
+        // read the arguments. It is residue from before the texts stated
+        // their own norm.
         self.emit(at, "gemm::act_x_w", op, &out)?;
         Ok(())
     }
@@ -1104,6 +1276,11 @@ impl Lowerer<'_> {
             // question asked of a count instead of a flag.
             GuardPred::TokensLE(k) => self.rows.len() as u32 <= k,
             GuardPred::TokensGT(k) => self.rows.len() as u32 > k,
+            // The window CLASS, as a row property. `FireClass::Decode`
+            // meant exactly this and could not say it; a mixed fire
+            // answers false and takes the ragged arm, which serves a
+            // one-token request as its degenerate case.
+            GuardPred::WindowOne => !self.rows.iter().any(|r| r.multi_token),
         };
         if holds {
             window.clone()
@@ -1876,5 +2053,103 @@ pub const fn dtype_bytes(d: DType) -> u32 {
     match d {
         DType::BF16 | DType::F16 => 2,
         DType::F32 | DType::I32 => 4,
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    /// Every bit lands on its own field.
+    ///
+    /// A bit-for-bit read has exactly one failure mode — a bit read into
+    /// the wrong field — and it is invisible: the fire runs, takes the
+    /// wrong guard arm, and returns plausible tokens. So each bit is set
+    /// ALONE and the whole row is compared, which is what catches a
+    /// transposition rather than merely a missing read.
+    #[test]
+    fn each_axis_bit_lands_on_its_own_field() {
+        let base = Row { samples: true, ..Row::default() };
+        for (bit, expected) in [
+            (region_sig::MULTI_TOKEN, Row { multi_token: true, ..base }),
+            (region_sig::MASK, Row { custom_mask: true, ..base }),
+            (region_sig::HOOK, Row { hooked: true, ..base }),
+            (region_sig::HOOK_PAGE_MASK, Row { hooked: true, ..base }),
+            (region_sig::LORA, Row { lora: true, ..base }),
+        ] {
+            assert_eq!(
+                Row::from_region(bit, region_sig::MAX_LAYERS_FULL, true),
+                expected,
+                "bit {bit:#x} landed on the wrong field"
+            );
+        }
+    }
+
+    /// The truncation bit says WHETHER; `region_k` says how far.
+    ///
+    /// Reading only the bit truncates the whole fire at `u32::MAX`
+    /// layers, which is the ABI's spelling for full depth — so the naive
+    /// read produces a depth nobody asked for out of a region that said
+    /// "all of it".
+    #[test]
+    fn a_truncation_needs_both_the_bit_and_the_depth() {
+        assert_eq!(Row::from_region(region_sig::TRUNCATED, 7, true).depth_k, Some(7));
+        assert_eq!(
+            Row::from_region(region_sig::TRUNCATED, region_sig::MAX_LAYERS_FULL, true).depth_k,
+            None,
+            "the bit plus the sentinel is FULL depth, not a truncation at u32::MAX"
+        );
+        assert_eq!(Row::from_region(0, 7, true).depth_k, None, "no bit, no truncation");
+    }
+
+    /// An empty readout list means the LAST row is read, not none.
+    #[test]
+    fn an_empty_readout_list_samples_the_last_row() {
+        let rows = rows_from_regions(3, &[], &[], &[], &[]).expect("legacy discipline");
+        assert_eq!(
+            rows.iter().map(|r| r.samples).collect::<Vec<_>>(),
+            [false, false, true],
+            "a decode fire exists to produce its last token"
+        );
+        let named = rows_from_regions(3, &[0, 2], &[], &[], &[]).expect("named readout");
+        assert_eq!(named.iter().map(|r| r.samples).collect::<Vec<_>>(), [true, false, true]);
+    }
+
+    /// Regions tile the rows, and a table that does not is drift.
+    #[test]
+    fn a_table_that_does_not_tile_is_refused() {
+        // Row 2 is claimed by nobody.
+        let gap = rows_from_regions(3, &[], &[0, 2], &[0], &[u32::MAX]);
+        assert_eq!(gap, Err(RegionDrift::DoNotTile { at: 2 }));
+        // The three arrays disagree on how many regions there are.
+        let ragged = rows_from_regions(2, &[], &[0, 1, 2], &[0], &[u32::MAX, u32::MAX]);
+        assert!(matches!(ragged, Err(RegionDrift::Ragged { .. })));
+        // A region names a row the step does not have.
+        let over = rows_from_regions(2, &[], &[0, 5], &[0], &[u32::MAX]);
+        assert!(matches!(over, Err(RegionDrift::OutOfRange { .. })));
+    }
+
+    /// A real two-region fire: one plain span and one carrying an adapter.
+    ///
+    /// The case the CUDA shell could not express at all, and the reason
+    /// this function is shared: `HasLora` asks `rows.iter().any(|r|
+    /// r.lora)`, so a shell that never filled the field answered NO to a
+    /// step that said YES.
+    #[test]
+    fn a_region_carrying_an_adapter_marks_only_its_own_rows() {
+        let rows = rows_from_regions(
+            4,
+            &[3],
+            &[0, 2, 4],
+            &[0, region_sig::LORA],
+            &[region_sig::MAX_LAYERS_FULL; 2],
+        )
+        .expect("a tiling table");
+        assert_eq!(
+            rows.iter().map(|r| r.lora).collect::<Vec<_>>(),
+            [false, false, true, true],
+            "the adapter is the second region's, not the fire's"
+        );
+        assert_eq!(rows.iter().map(|r| r.samples).collect::<Vec<_>>(), [false, false, false, true]);
     }
 }

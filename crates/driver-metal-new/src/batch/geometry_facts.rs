@@ -321,6 +321,18 @@ pub fn geometry_from_facts(f: &ModelFacts) -> Result<DecodeGeometry, GeometryRef
         } else {
             0
         },
+        // gemma-4's partial rotary, carried rather than refused: the rope
+        // rows name the statement's scalar with `grid_param`, so the extent
+        // is per statement and no longer has to be one number for the fire.
+        // Zero means "rotate the whole head", which is every other family.
+        full_partial_rotary: if f.g4_num_hidden_layers > 0
+            && f.g4_full_partial_rotary > 0.0
+            && (f.g4_full_partial_rotary - 1.0).abs() > 1e-6
+        {
+            f.g4_full_partial_rotary
+        } else {
+            0.0
+        },
         global_kv_heads: if f.g4_num_global_kv_heads > 0
             && f.g4_num_global_kv_heads != f.g4_num_key_value_heads
         {
@@ -794,6 +806,44 @@ mod tests {
              the answer: {why}"
         );
     }
+    /// gemma-4's PARTIAL rotary is carried, not flattened to a full one.
+    ///
+    /// Its full-attention layers state `partial_rotary_factor: 0.25`, so they
+    /// rotate 128 of their 512 channels while its sliding layers rotate all
+    /// 256 of theirs. `Geometry::rotary_dims` is one number for the fire, so
+    /// this used to be refused; the rope rows now name the STATEMENT's own
+    /// scalar with `grid_param`, and the extent travels per statement.
+    #[test]
+    fn a_partial_rotary_is_carried_because_the_row_names_the_statements_scalar() {
+        let gemma = ModelFacts {
+            g4_num_hidden_layers: 60,
+            g4_hidden_size: 5376,
+            g4_num_attention_heads: 32,
+            g4_num_key_value_heads: 16,
+            g4_head_dim: 256,
+            vocab_size: 262_144,
+            g4_intermediate_size: 21504,
+            g4_sliding_window: 1024,
+            g4_full_attn_interval: 6,
+            ..ModelFacts::default()
+        };
+        // `ModelFacts::default` carries gemma's real 0.25, the way it carries
+        // gemma's real rope bases — so this IS the shipped configuration and
+        // not a constructed one.
+        assert!((gemma.g4_full_partial_rotary - 0.25).abs() < 1e-6);
+        let g = geometry_from_facts(&gemma).expect("a partial rotary is expressible now");
+        assert!((g.full_partial_rotary - 0.25).abs() < 1e-6);
+
+        // A stack that rotates the WHOLE head states zero, so nothing takes
+        // the partial branch for a distinction it does not have.
+        let g = geometry_from_facts(&ModelFacts {
+            g4_full_partial_rotary: 1.0,
+            ..gemma
+        })
+        .expect("full rotation is what every other family does");
+        assert_eq!(g.full_partial_rotary, 0.0);
+    }
+
     /// A gemma4 checkpoint states TWO attention geometries, and both are
     /// carried through to the text and the pool.
     ///

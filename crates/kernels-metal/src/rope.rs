@@ -25,6 +25,11 @@ pub static KERNELS: &[KernelSig] = &[
             base: F32 <- kernels::Source::ParamF32(1),
             head_dim: I32 <- kernels::Source::Param(2),
         ],
+        // The rotation's extent is the STATEMENT's, not the fire's: gemma-4
+        // rotates a quarter of each full-attention head and all of each
+        // sliding one. The kernel never reads param 3 -- its operand list
+        // stops at 2 -- but `Rule::Rope`'s grid is half of it.
+        grid_param = Some(3),
         axes = &[BF16]),
     // 1 in rope.metal
     // The rotation a deployment that RESCALES its ladder takes. Same body as
@@ -44,6 +49,8 @@ pub static KERNELS: &[KernelSig] = &[
             // the frequencies and not in a gain.
             mscale: F32 <- kernels::Source::ParamF32(2),
         ],
+        // See `neox_decode`: the extent is the statement's.
+        grid_param = Some(3),
         axes = &[BF16]),
     // 1 in rope.metal
     kernel!(neox_freqs_mb "neox_freqs_mb", axes = &[BF16]),
@@ -57,6 +64,11 @@ pub static KERNELS: &[KernelSig] = &[
             base: F32 <- kernels::Source::ParamF32(1),
             head_dim: I32 <- kernels::Source::Param(2),
         ],
+        // The rotation's extent is the STATEMENT's, not the fire's: gemma-4
+        // rotates a quarter of each full-attention head and all of each
+        // sliding one. The kernel never reads param 3 -- its operand list
+        // stops at 2 -- but `Rule::Rope`'s grid is half of it.
+        grid_param = Some(3),
         axes = &[BF16]),
     // 1 in rope.metal
     // gemma's rotation: the same neox body over a PROPORTIONAL slice of each
@@ -71,6 +83,11 @@ pub static KERNELS: &[KernelSig] = &[
             base: F32 <- kernels::Source::ParamF32(1),
             head_dim: I32 <- kernels::Source::Param(2),
         ],
+        // The rotation's extent is the STATEMENT's, not the fire's: gemma-4
+        // rotates a quarter of each full-attention head and all of each
+        // sliding one. The kernel never reads param 3 -- its operand list
+        // stops at 2 -- but `Rule::Rope`'s grid is half of it.
+        grid_param = Some(3),
         axes = &[BF16]),
     // 1 in rope.metal
     kernel!(neox_prop_mb "neox_prop_mb", axes = &[BF16]),

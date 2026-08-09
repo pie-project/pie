@@ -38,7 +38,8 @@
 //! every decode loop is.
 
 use driver::driver_api::plan::{LaunchOp, LaunchStagePlan};
-use driver::tensor_ir::op::tags;
+use driver::tensor_ir::DType;
+use driver::tensor_ir::op::{IntrinsicId, tags};
 use driver::{
     Diagnosis, Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LANE_SLOT_BYTES, LaneChannelSlot,
     LaneHeader, LaneRecord, LaneShape, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN,
@@ -313,6 +314,129 @@ impl Prepared {
             scratch_stride,
             temporary_offset,
         })
+    }
+
+    /// How many lanes this fire dispatches.
+    ///
+    /// ONE today: multi-lane grouping is the first thing this module's own
+    /// header says it does not do. Exposed anyway, because everything
+    /// lane-indexed — the side tables, the scratch stride, the pending
+    /// flags — is written against it, and a test that hardcoded a count
+    /// would pass for the wrong reason the day it changes.
+    #[must_use]
+    pub const fn lanes(&self) -> u32 {
+        self.lanes
+    }
+
+    /// Point one intrinsic at the buffer a fire produced.
+    ///
+    /// The five side tables are allocated ZEROED by [`Prepared::build`] and
+    /// were never filled, which is what `fire.rs` meant by *"the intrinsic
+    /// side tables beyond binding them empty"*. A program that reads
+    /// `logits` therefore read address ZERO — and sampling is what a PTIR
+    /// program is FOR, so that is the whole of a top-p or an argmax
+    /// reading nothing.
+    ///
+    /// What each table means is the emitted kernel's, not a convention
+    /// invented here — `codegen/cuda/fused.rs:411-421` reads them into an
+    /// `OpParams` verbatim:
+    ///
+    /// | table | becomes | is |
+    /// |---|---|---|
+    /// | `bases` | the operand pointer | the buffer's device address |
+    /// | `modes` | `p.intrinsic_dtype` | a `DType` wire code |
+    /// | `widths` | `p.imm` | the row width, e.g. the vocabulary |
+    /// | `strides` | `p.intrinsic_row_stride` | ELEMENTS between rows |
+    /// | `offsets` | `p.intrinsic_row_offset` | which row THIS lane reads |
+    ///
+    /// The row offset is per lane and everything else is not, which is the
+    /// only asymmetry: one buffer, one layout, and each lane reading its
+    /// own row of it. `row_of(lane)` is what makes a multi-lane fire
+    /// sample each request rather than the first one N times — the same
+    /// defect `bind_intrinsic`'s C++ ancestor had when it wrote
+    /// `base_row = 0`.
+    ///
+    /// # Errors
+    ///
+    /// If `intr` is not a slot the tables carry, or a copy fails.
+    pub fn bind_intrinsic(
+        &mut self,
+        intr: IntrinsicId,
+        base: u64,
+        dtype: DType,
+        width: u32,
+        row_stride: u32,
+        row_of: impl Fn(u32) -> u32,
+        stream: StreamRef<'_>,
+    ) -> Result<()> {
+        let slot = intr as usize;
+        if slot >= INTRINSIC_SLOTS {
+            return Err(Error::invalid(
+                "ptir::fire",
+                format!(
+                    "intrinsic {slot} is past the {INTRINSIC_SLOTS}-slot pitch the \
+                     side tables are indexed with"
+                ),
+            ));
+        }
+        // Written per lane rather than as one run, because the tables are
+        // lane-major: slot `intr` of lane `l` is at `l * SLOTS + intr`, so
+        // the entries this touches are strided and a single `write_at`
+        // would overwrite the fifteen slots beside each.
+        for lane in 0..self.lanes {
+            let at = lane as usize * INTRINSIC_SLOTS + slot;
+            self.intrinsic_bases
+                .write_at(at * size_of::<u64>(), &base.to_le_bytes(), stream)?;
+            self.intrinsic_modes.write_at(
+                at * size_of::<u32>(),
+                &(dtype as u8 as u32).to_le_bytes(),
+                stream,
+            )?;
+            self.intrinsic_widths
+                .write_at(at * size_of::<u32>(), &width.to_le_bytes(), stream)?;
+            self.intrinsic_strides
+                .write_at(at * size_of::<u32>(), &row_stride.to_le_bytes(), stream)?;
+            self.intrinsic_offsets
+                .write_at(at * size_of::<u32>(), &row_of(lane).to_le_bytes(), stream)?;
+        }
+        Ok(())
+    }
+
+    /// Read one lane's binding of `intr` back, for tests and diagnosis.
+    ///
+    /// `(base, mode, width, stride, offset)`.
+    ///
+    /// # Errors
+    ///
+    /// If `intr` or `lane` is out of range, or a copy fails.
+    pub fn intrinsic_binding(
+        &self,
+        intr: IntrinsicId,
+        lane: u32,
+        stream: StreamRef<'_>,
+    ) -> Result<(u64, u32, u32, u32, u32)> {
+        let slot = intr as usize;
+        if slot >= INTRINSIC_SLOTS || lane >= self.lanes {
+            return Err(Error::invalid(
+                "ptir::fire",
+                format!("no binding for intrinsic {slot} of lane {lane}"),
+            ));
+        }
+        let at = lane as usize * INTRINSIC_SLOTS + slot;
+        let mut base = [0u8; 8];
+        self.intrinsic_bases.read_at(at * size_of::<u64>(), &mut base, stream)?;
+        let mut word = |buf: &DeviceBuffer| -> Result<u32> {
+            let mut b = [0u8; 4];
+            buf.read_at(at * size_of::<u32>(), &mut b, stream)?;
+            Ok(u32::from_le_bytes(b))
+        };
+        Ok((
+            u64::from_le_bytes(base),
+            word(&self.intrinsic_modes)?,
+            word(&self.intrinsic_widths)?,
+            word(&self.intrinsic_strides)?,
+            word(&self.intrinsic_offsets)?,
+        ))
     }
 
     /// Launch one generated region over every lane.

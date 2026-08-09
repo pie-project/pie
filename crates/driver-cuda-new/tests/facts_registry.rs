@@ -135,40 +135,34 @@ mod fire_class {
         assert_eq!(fire_class_of(&s, 9, 4), Ok(FireClass::Prefill));
     }
 
-    #[test]
-    fn every_row_replaying_buffered_tokens_is_the_commit_pass() {
-        // FOLD without BUFFER_WRITE, over a non-empty buffer span: the
-        // row's tokens come out of the slabs rather than out of a GEMM.
-        let s = step(&[PIE_RS_FLAG_FOLD; 2], &[0, 3, 6], &[0, 1], &[0]);
-        assert_eq!(fire_class_of(&s, 9, 2), Ok(FireClass::CommitAdvance));
-    }
-
-    #[test]
-    fn a_row_that_writes_its_slabs_is_the_frozen_verify_pass() {
-        let flags = [PIE_RS_FLAG_FOLD | PIE_RS_FLAG_BUFFER_WRITE; 2];
-        let s = step(&flags, &[0, 3, 6], &[0, 1], &[0]);
-        assert_eq!(fire_class_of(&s, 9, 2), Ok(FireClass::FrozenVerify));
-    }
-
-    /// `StateOnly` is NOT read here, and this pins the reason.
+    /// THE SERVICE CLASSES ARE GONE, and this is what replaces four
+    /// tests that pinned them (`.wiki/driver/graph.md` §4.2).
     ///
-    /// Its signal is an empty `sampling_indices`, and the shell does not
-    /// read that field: it marks every row `samples: true`. So the field
-    /// is empty on every fire, and keying the class on it made every
-    /// hybrid prefill a service pass with no epilogue — the logits simply
-    /// stopped arriving. When readout rows reach `Row::samples`, this
-    /// test is the one that flips.
+    /// `CommitAdvance`, `FrozenVerify` and `StateOnly` were derived from
+    /// the recurrent-state flags. The driver executes those flags now
+    /// rather than classifying on them: a speculative decode buffers its
+    /// tokens and folds only the accepted prefix, so a rejected token is
+    /// never folded and there is no repair pass to select. The class is a
+    /// shape question again, and the flags no longer change the answer.
     #[test]
-    fn recurrent_state_alone_is_not_yet_a_service_pass() {
-        let s = step(&[0, 0], &[], &[0, 1], &[]);
-        assert_eq!(fire_class_of(&s, 9, 2), Ok(FireClass::Prefill));
-        assert_eq!(fire_class_of(&s, 2, 2), Ok(FireClass::Decode));
+    fn the_recurrent_state_flags_no_longer_pick_a_class() {
+        let fold = step(&[PIE_RS_FLAG_FOLD; 2], &[0, 3, 6], &[0, 1], &[0]);
+        assert_eq!(fire_class_of(&fold, 9, 2), Ok(FireClass::Prefill));
+        assert_eq!(fire_class_of(&fold, 2, 2), Ok(FireClass::Decode));
+
+        let write = step(
+            &[PIE_RS_FLAG_FOLD | PIE_RS_FLAG_BUFFER_WRITE; 2],
+            &[0, 3, 6],
+            &[0, 1],
+            &[0],
+        );
+        assert_eq!(fire_class_of(&write, 9, 2), Ok(FireClass::Prefill));
+
+        // The mixed fire the composer used to refuse: a replaying row
+        // beside a computing one. There is no op-list difference between
+        // them any more, so there is nothing to refuse.
+        let mixed = step(&[PIE_RS_FLAG_FOLD, 0], &[0, 3, 3], &[0, 1], &[0]);
+        assert_eq!(fire_class_of(&mixed, 9, 2), Ok(FireClass::Prefill));
     }
 
-    #[test]
-    fn a_replay_row_may_not_share_a_fire_with_a_computing_one() {
-        // Row 0 replays, row 1 owns no slabs and computes.
-        let s = step(&[PIE_RS_FLAG_FOLD, 0], &[0, 3, 3], &[0, 1], &[0]);
-        assert!(fire_class_of(&s, 9, 2).is_err(), "the mixed fire is refused");
-    }
 }

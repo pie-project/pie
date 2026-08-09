@@ -37,7 +37,7 @@ use driver_api::local::{
     PIE_STATUS_UNSUPPORTED, PieChannelDesc, PieChannelEndpointBinding, PieCompletion,
     PieDriver, PieDriverCaps, PieDriverCreateDesc, PieEncodeDesc, PieFrameDesc,
     PieInstanceBinding, PieInstanceDesc, PieKvCopyDesc, PieModelLoadDesc,
-    PiePoolResizeDesc, PieProgramDesc, PieStateCopyDesc,
+    PiePoolResizeDesc, PieProgramDesc, PieStateCopyDesc, validate_create_out_params,
 };
 
 /// The shell's state — what `PieDriver` points at.
@@ -51,6 +51,13 @@ struct Shell {
     /// Does this driver hand its completions to a stream callback and
     /// return with the fire still queued? See `runahead_env`.
     runahead: bool,
+    /// How the KV pages are stored — `[driver] kv_cache_dtype`.
+    ///
+    /// `store/kv_format.rs` has had nine spellings since the port, the
+    /// layout plans their scale planes and `kv_paged.cu` switches on the
+    /// scheme to write them. What was missing was any way to ASK for one:
+    /// the shell built its pages by hand and could only build bf16.
+    kv_format: crate::store::KvCacheFormat,
     /// The traced-and-lowered program for a fire SHAPE, kept.
     ///
     /// Tracing the forward, lowering it and joining the ops back onto the
@@ -205,6 +212,21 @@ struct Shell {
     ptir: crate::ptir::Runtime,
     /// The compiled form of each registered program, by program id.
     ptir_programs: crate::ptir::Programs,
+    /// The control kernels, compiled once for this device's architecture.
+    ///
+    /// Not per instance and not per program: `readiness` and `commit`
+    /// depend on the architecture and nothing else, so a second instance
+    /// finds them built. Built lazily because a driver that never fires a
+    /// program should not pay NVRTC for two kernels it will not call.
+    ptir_control: Option<crate::ptir::Control>,
+    /// One instance's device rings, by instance id.
+    ///
+    /// Per INSTANCE by necessity rather than by choice: the rings are
+    /// sized from that instance's own `channel_ids`, in that order,
+    /// because a program names a channel by index into it. And they must
+    /// outlive a fire — rebuilding zeroes the cursors, and a cursor is the
+    /// only record of what a previous fire published.
+    ptir_sessions: std::collections::BTreeMap<u64, crate::ptir::session::Session>,
     /// The adopted plans, by program id. Separate from the compiled
     /// modules because a program can be adopted and REJECTED — an
     /// unexecutable plan is still a plan, and the reason it was rejected
@@ -255,10 +277,37 @@ struct ChannelState {
     mirror: *mut std::ffi::c_void,
     words: *mut std::ffi::c_void,
     mirror_bytes: usize,
+    /// WIRE bytes per cell — bit-packed for bools.
     cell_bytes: usize,
     /// `capacity + 1` — the ring modulus.
     ring: u32,
     host_role: u8,
+    /// Lanes in one cell, and the cell's element type.
+    ///
+    /// Kept because `cell_bytes` cannot be inverted: a bool cell is
+    /// `numel.div_ceil(8)` wire bytes, so eight lanes and one lane are
+    /// both one byte. The DEVICE ring is sized in NATIVE bytes
+    /// (`ptir::ring::ChannelShape`), and deriving one from the other needs
+    /// the shape rather than the width — which is why a driver that only
+    /// ever wrote to the host mirror could get away without these and one
+    /// that fires a program cannot.
+    numel: usize,
+    dtype: driver::tensor_ir::DType,
+}
+
+impl ChannelState {
+    /// This channel as the device rings want it.
+    fn shape(&self) -> crate::ptir::ring::ChannelShape {
+        crate::ptir::ring::ChannelShape {
+            numel: self.numel,
+            dtype: self.dtype,
+            // `ring` is `capacity + 1`, and `ChannelShape` states the
+            // capacity — the one place the two vocabularies differ, and
+            // the reason this is a method rather than a struct literal at
+            // each call.
+            capacity: self.ring.saturating_sub(1),
+        }
+    }
 }
 
 /// A fire's transient device memory, kept alive until the fire retires.
@@ -329,7 +378,43 @@ struct LoweringKey {
     model_id: u64,
     class: model_compiler::trace::FireClass,
     rows: u32,
+    /// A digest of the fire's ROWS, not just how many.
+    ///
+    /// The lowering resolves five guards off the rows — `HasLora`,
+    /// `HasCustomMask`, `HasStageHooks`, `HasWriteDesc`,
+    /// `WantsAttnScore` — and sizes the epilogue off how many of them
+    /// sample. All of that was invariant while every row was
+    /// `Row { samples: true, ..default() }`, so the count was a complete
+    /// key. It is not one now: a fire carrying an adapter and a fire
+    /// without one have the same shape and different launch lists, and a
+    /// key that could not tell them apart would serve the first
+    /// lowering to arrive to both.
+    rows_digest: u64,
     union_asked: bool,
+}
+
+/// FNV-1a over the rows' axes.
+///
+/// Not a hash of the struct: `Row` is not `Hash`, and adding the derive
+/// would make every future field silently part of a cache key. Naming
+/// the axes here means a new one has to be added deliberately.
+fn digest_rows(rows: &[model_compiler::lower::Row]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u64| {
+        h ^= b;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for r in rows {
+        eat(u64::from(r.multi_token));
+        eat(u64::from(r.custom_mask));
+        eat(u64::from(r.hooked));
+        eat(u64::from(r.lora));
+        eat(u64::from(r.write_desc));
+        eat(u64::from(r.wants_scores));
+        eat(u64::from(r.samples));
+        eat(r.depth_k.map_or(u64::MAX, u64::from));
+    }
+    h
 }
 
 /// A traced, lowered and joined program, and whether it kept its union.
@@ -371,11 +456,18 @@ struct FireDebt {
     /// completes, so a `Vec` here drains the stream inside
     /// `pie_cuda_launch` and undoes the run-ahead.
     staging: Option<(*const u8, usize)>,
-    /// Where the widened cell goes, and how wide the readout is.
-    channel: Option<ChannelState>,
+    /// One `(reader channel, logits row)` per request in the frame.
+    ///
+    /// A LIST, because a frame carries a roster and every request in it
+    /// is owed an answer. This was one channel and one row — the roster's
+    /// FIRST instance and `rows - 1` — so a two-request batch published
+    /// request 0's vocabulary and returned request 1 nothing.
+    ///
+    /// The row is not the request's index: request `r` owns `qo_indptr[r]
+    /// ..qo_indptr[r + 1]`, so its answer is at `qo_indptr[r + 1] - 1`. On
+    /// a decode that equals `r`; on a prefill it does not.
+    readouts: Vec<(ChannelState, usize)>,
     vocab: usize,
-    /// Which row carries the answer — the fire's last.
-    last_row: usize,
     /// The terminal cells this frame publishes, and the completion the
     /// runtime is waiting on.
     cells: Vec<*mut driver_api::local::PieTerminalCell>,
@@ -406,23 +498,29 @@ unsafe extern "C" fn retire_fire(data: *mut std::ffi::c_void) {
     // The logits, widened bf16 -> f32 and published. The widening is the
     // wire's, not the model's: the ring's cell is f32 and the device
     // wrote bf16, so the shift is the conversion.
-    if let (Some(ch), Some(&(ptr, len))) = (debt.channel.as_ref(), debt.staging.as_ref())
+    if let Some(&(ptr, len)) = debt.staging.as_ref()
         && debt.vocab > 0
     {
         // SAFETY: the shell's staging buffer, alive for the driver's
         // lifetime, and the D2H that filled it is ordered before this
-        // callback on the same stream.
+        // callback on the same stream. ONE copy carries every row, so
+        // each request reads its own out of the same staging.
         let staged = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let mut cell = vec![0u8; debt.vocab * 4];
-        for t in 0..debt.vocab {
-            let off = (debt.last_row * debt.vocab + t) * 2;
-            if off + 1 < staged.len() {
-                let bits = u16::from_le_bytes([staged[off], staged[off + 1]]);
-                cell[t * 4..t * 4 + 4].copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
+        for (ch, row) in &debt.readouts {
+            let mut cell = vec![0u8; debt.vocab * 4];
+            for t in 0..debt.vocab {
+                let off = (row * debt.vocab + t) * 2;
+                if off + 1 < staged.len() {
+                    let bits = u16::from_le_bytes([staged[off], staged[off + 1]]);
+                    cell[t * 4..t * 4 + 4]
+                        .copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
+                }
             }
-        }
-        if !ch.publish(&cell) {
-            eprintln!("[driver-cuda-new] launch: logits ring full; frame dropped its output");
+            if !ch.publish(&cell) {
+                eprintln!(
+                    "[driver-cuda-new] launch: logits ring full; a request dropped its output"
+                );
+            }
         }
     }
 
@@ -447,25 +545,32 @@ impl ChannelState {
     /// Publish one wire cell: write it at `tail % ring`, then advance the
     /// tail word with release ordering — the reader (the engine) consumes
     /// from the head. The writer side of the C++ ring, host-resident.
-    fn publish(&self, cell: &[u8]) -> bool {
-        if cell.len() != self.cell_bytes {
-            return false;
-        }
-        let words = self.words.cast::<u64>();
-        let head = unsafe { words.add(0).read_volatile() };
-        let tail = unsafe { words.add(1).read_volatile() };
-        if tail.wrapping_sub(head) >= u64::from(self.ring) {
-            return false; // ring full; the engine has not consumed
-        }
-        let slot = (tail % u64::from(self.ring)) as usize;
-        let dst = unsafe { self.mirror.cast::<u8>().add(slot * self.cell_bytes) };
-        debug_assert!((slot + 1) * self.cell_bytes <= self.mirror_bytes);
+    /// The host plane of this channel, as `ptir::bridge` sees it.
+    ///
+    /// One definition of the ring, and it is that one. This used to carry
+    /// its own publish — the same cursor arithmetic, the same release
+    /// fence — beside the bridge's, which is two statements of a layout
+    /// that has to agree byte for byte with the engine's poller.
+    ///
+    /// # Safety
+    ///
+    /// The returned view borrows the mirror and the words this channel
+    /// owns; `close_channel` defers the free onto an in-flight fire, so
+    /// they outlive any view a fire holds.
+    fn host_plane(&self) -> crate::ptir::bridge::HostChannel {
+        debug_assert!(self.cell_bytes * self.ring as usize <= self.mirror_bytes);
         unsafe {
-            std::ptr::copy_nonoverlapping(cell.as_ptr(), dst, cell.len());
+            crate::ptir::bridge::HostChannel::new(
+                self.mirror,
+                self.words,
+                self.cell_bytes,
+                self.ring,
+            )
         }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        unsafe { words.add(1).write_volatile(tail + 1) };
-        true
+    }
+
+    fn publish(&self, cell: &[u8]) -> bool {
+        self.host_plane().publish(cell)
     }
 }
 
@@ -498,6 +603,12 @@ impl ChannelState {
 #[derive(Default)]
 struct FireArrays {
     arena: Option<crate::cuda::DeviceBuffer>,
+    /// The unconditional attention-score sink — see [`Self::score`].
+    score: Option<crate::cuda::DeviceBuffer>,
+    /// The unconditional custom attention mask — see [`Self::mask`].
+    mask: Option<crate::cuda::DeviceBuffer>,
+    /// The driver-owned attention landing buffer — see [`Self::attn_out`].
+    attn_out: Option<crate::cuda::DeviceBuffer>,
     named: std::collections::BTreeMap<model_compiler::trace::ValueId, crate::cuda::DeviceBuffer>,
     /// The small per-fire u32 descriptor arrays, by slot.
     slots: Vec<Option<crate::cuda::DeviceBuffer>>,
@@ -529,6 +640,76 @@ impl FireArrays {
             self.epoch += 1;
         }
         Ok(self.arena.as_ref().expect("just ensured").as_ptr())
+    }
+
+    /// The score sink, at least `bytes` wide — the same pooling discipline
+    /// the arena gets, for the same reason: a captured exec bakes the
+    /// address, so the sink outlives its fire and grows rather than moving
+    /// every launch. See [`crate::model::attn_score::plan_score_sink`].
+    ///
+    /// Returns the base and writes the CSR into its own carved span, so a
+    /// replay whose KV lengths moved still scores against this fire's
+    /// truth rather than the recording fire's.
+    fn score(
+        &mut self,
+        alloc: &crate::cuda::Allocator,
+        plan: &crate::model::attn_score::ScoreSinkPlan,
+        stream: crate::cuda::StreamRef<'_>,
+    ) -> Result<*mut std::ffi::c_void, i32> {
+        if self.score.as_ref().is_none_or(|b| b.len() < plan.bytes) {
+            self.score = Some(alloc.alloc(plan.bytes).map_err(|_| PIE_STATUS_EXHAUSTED)?);
+            self.epoch += 1;
+        }
+        let b = self.score.as_mut().expect("just ensured");
+        let mut csr = Vec::with_capacity(plan.indptr.len() * 4);
+        for v in &plan.indptr {
+            csr.extend_from_slice(&v.to_le_bytes());
+        }
+        b.write_at(plan.indptr_offset, &csr, stream)
+            .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        Ok(b.as_ptr())
+    }
+
+    /// The attention output slot, for a fire whose op join names none.
+    ///
+    /// `AttnCtx::o_out` is driver-owned by design -- a guard region's
+    /// launches record no SSA output of their own -- so this is where that
+    /// design finally has storage instead of a refusal. Pooled like the
+    /// arena, because a capture bakes the address.
+    fn attn_out(
+        &mut self,
+        alloc: &crate::cuda::Allocator,
+        bytes: usize,
+    ) -> Result<*mut std::ffi::c_void, i32> {
+        let bytes = bytes.max(64);
+        if self.attn_out.as_ref().is_none_or(|b| b.len() < bytes) {
+            self.attn_out = Some(alloc.alloc(bytes).map_err(|_| PIE_STATUS_EXHAUSTED)?);
+            self.epoch += 1;
+        }
+        Ok(self.attn_out.as_ref().expect("just ensured").as_ptr())
+    }
+
+    /// The custom attention mask, pooled like the score sink and for the
+    /// same reason. See [`crate::model::page_mask::element_mask`].
+    fn mask(
+        &mut self,
+        alloc: &crate::cuda::Allocator,
+        plan: &crate::model::page_mask::element_mask::ElementMaskPlan,
+        stream: crate::cuda::StreamRef<'_>,
+    ) -> Result<*mut std::ffi::c_void, i32> {
+        if self.mask.as_ref().is_none_or(|b| b.len() < plan.bytes) {
+            self.mask = Some(alloc.alloc(plan.bytes).map_err(|_| PIE_STATUS_EXHAUSTED)?);
+            self.epoch += 1;
+        }
+        let b = self.mask.as_mut().expect("just ensured");
+        b.write_at(0, &plan.mask, stream).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        let mut csr = Vec::with_capacity(plan.indptr.len() * 4);
+        for v in &plan.indptr {
+            csr.extend_from_slice(&v.to_le_bytes());
+        }
+        b.write_at(plan.indptr_offset, &csr, stream)
+            .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        Ok(b.as_ptr())
     }
 
     /// One per-fire u32 descriptor array, by SLOT.
@@ -600,9 +781,85 @@ impl FireArrays {
     }
 }
 
+/// The KV cache, and the buffers backing it.
+///
+/// The geometry is [`store::kv_cache_live::KvCache`](crate::store::kv_cache_live::KvCache)'s:
+/// it plans one slot per layer, allocates only for the layers that OWN
+/// pages, and hands out the `KvCacheLayerView` a kernel is launched with.
+/// The shell built all of that by hand until now — two `cudaMalloc`s and
+/// fifteen literal fields per layer — and the hand-built version could
+/// not express a format, a scale plane or an envelope, which is why
+/// `kv_cache_dtype` was hardwired `"bf16"`.
+///
+/// `held` is what makes the port safe in Rust. `KvCache` keeps raw
+/// pointers and has no `Drop`, because the C++ it came from had an arena
+/// that outlived it; here the `DeviceBuffer`s its ops allocated are kept
+/// beside it, so replacing the pair on a resize frees the old one.
+///
+/// # Why the accessors
+///
+/// Four call sites in `copy_kv` and `resize_pool` used to recover the
+/// same two facts from a buffer's LENGTH: a layer's page stride and,
+/// from that, its head dim. Both are things the layout states.
 struct KvState {
-    pools: Vec<Option<(crate::cuda::DeviceBuffer, crate::cuda::DeviceBuffer)>>,
+    cache: crate::store::kv_cache_live::KvCache<crate::store::kv_cache_live::AllResident>,
+    /// Backing store for `cache`; dropping this frees the pages.
+    _held: Vec<crate::cuda::DeviceBuffer>,
     num_pages: u32,
+}
+
+impl KvState {
+    /// The pages `layer` owns, or `None` if it reads through another's.
+    fn owned(&self, layer: usize) -> Option<(*mut core::ffi::c_void, *mut core::ffi::c_void)> {
+        let l = i32::try_from(layer).ok()?;
+        let slot = self.cache.layout().slots().get(layer)?;
+        if slot.is_alias() {
+            return None;
+        }
+        Some((self.cache.k(l), self.cache.v(l)))
+    }
+
+    /// Bytes of one page at `layer` — its own stride, so the two-head-dim
+    /// families move the right amount per layer.
+    fn page_bytes(&self, layer: usize) -> Option<usize> {
+        let slot = self.cache.layout().slots().get(layer)?;
+        let k = slot.k.as_ref()?;
+        Some(usize::try_from(k.nbytes()).unwrap_or(0) / self.num_pages.max(1) as usize)
+    }
+
+    /// How many layers the cache describes.
+    fn layers(&self) -> usize {
+        self.cache.layout().slots().len()
+    }
+
+    /// `layer`'s head dim.
+    ///
+    /// The config's single number is wrong for the families whose layers
+    /// disagree, and this is the extent the copy will actually stride
+    /// through.
+    fn head_dim(&self, layer: usize) -> Option<i32> {
+        let slot = self.cache.layout().slots().get(layer)?;
+        slot.k.as_ref()?;
+        Some(self.cache.layout().head_dim_at(i32::try_from(layer).ok()?))
+    }
+
+    /// What a kernel is handed for each layer.
+    fn views(&self) -> Vec<crate::launch::KvCacheLayerView> {
+        (0..self.layers())
+            .map(|l| self.cache.layer_view(i32::try_from(l).unwrap_or(0)))
+            .collect()
+    }
+
+    /// Every layer owns pages, and every page is `page_bytes`.
+    ///
+    /// The host swap path needs both halves: it has ONE page stride for
+    /// all layers, so a per-layer head dim breaks it, and it has no way
+    /// to skip a layer that owns nothing. A wrong-sized host page is
+    /// corruption rather than degradation, so a shared-page stack is
+    /// refused rather than approximated.
+    fn uniform_stride(&self, page_bytes: usize) -> bool {
+        (0..self.layers()).all(|l| self.page_bytes(l) == Some(page_bytes))
+    }
 }
 
 /// The hybrid's driver-owned GDN state: one (conv, recurrent) slab pair
@@ -742,6 +999,101 @@ impl LoadedModel {
 const CAPS_JSON: &str =
     r#"{"driver":"driver-cuda-new","status":"phase-d-shell","abi":24}"#;
 
+/// The device-ring shapes of one instance's channels, in the order the
+/// program indexes them.
+///
+/// ORDER IS THE CONTRACT and it is the whole reason this is a function.
+/// A compiled program refers to a channel by INDEX — `Op::ChanRead(0)`,
+/// `Op::ChanPut { chan: 1, .. }` — and that index is a position in the
+/// instance's `channel_ids`, not an id and not a registration order. So
+/// building the rings means walking that list, and a missing channel is a
+/// refusal rather than a gap to skip: skipping would renumber every
+/// channel after it, and the program would read someone else's.
+///
+/// Returns `None` when the instance names a channel this shell does not
+/// hold, which is the same drift `Resolver::weight` refuses for weights.
+#[cfg(feature = "abi")]
+fn instance_ring_shapes(
+    instance: &InstanceEntry,
+    channels: &std::collections::BTreeMap<u64, ChannelState>,
+) -> Option<Vec<crate::ptir::ring::ChannelShape>> {
+    instance
+        .channel_ids
+        .iter()
+        .map(|id| channels.get(id).map(ChannelState::shape))
+        .collect()
+}
+
+/// The wire dtype byte, as the tensor IR names it.
+///
+/// The two vocabularies AGREE on 0..=3 by construction —
+/// `PIE_CHANNEL_DTYPE_F32/I32/U32/BOOL` are `DType::from_wire`'s first
+/// four — and `declare_dtypes!` asserts the ordering, so this is a lookup
+/// rather than a translation.
+///
+/// `PIE_CHANNEL_DTYPE_ACT` (4) is the exception and it is not a dtype: it
+/// names an ACTIVATION channel, whose element width is the deployment's
+/// rather than the wire's. Nothing in this shell rings an activation
+/// channel yet, so it reads as `F32` — the width `register_channel`
+/// already sizes it at — and the day one does, that is a decision to make
+/// rather than a default to inherit.
+fn channel_dtype(byte: u8) -> driver::tensor_ir::DType {
+    driver::tensor_ir::DType::from_wire(byte).unwrap_or(driver::tensor_ir::DType::F32)
+}
+
+/// A descriptor pointer, dereferenced ONLY through its validator.
+///
+/// North star rule 4 says a shared capability must not be optional: if it
+/// can be skipped, it will be. `driver-api` ships seventeen `validate_*`
+/// functions; `driver-dummy` — the reference implementation of this
+/// contract — calls them, and this shell called NONE, re-deriving similar
+/// checks by hand at 51 sites. The capability was built, shipped, and
+/// routed around.
+///
+/// Calling them would not have fixed that, only postponed it: a helper
+/// that must be remembered is the same shape as a validator that must be
+/// remembered. So the dereference and the validation are ONE operation.
+/// There is no way to obtain a `&PieKvCopyDesc` in this file without
+/// having run `validate_kv_copy_desc` over it, because the only thing
+/// that turns the pointer into a reference is this function and it takes
+/// the validator as an argument.
+///
+/// `tests/entry_validation.rs` holds the other half — that no entry point
+/// reaches a descriptor any other way — because a rule the compiler
+/// cannot state is one a reviewer has to, and this one can at least be
+/// stated once rather than at every call.
+///
+/// # Why the validators are `unsafe` and this is not
+///
+/// Four of them (`frame`, `encode`, `instance`, `channel`) walk slices the
+/// descriptor points at, so they carry the same obligation this function
+/// does: the pointer is the caller's to vouch for. Wrapping the null test
+/// and the deref together is what discharges it — a non-null descriptor
+/// from the engine is a well-formed one, and a null is the error this
+/// returns rather than the fault it would otherwise be.
+#[cfg(feature = "abi")]
+fn checked<'a, T>(
+    p: *const T,
+    validate: impl FnOnce(&T) -> driver_api::local::PieAbiValidationResult,
+    what: &str,
+) -> Result<&'a T, i32> {
+    let Some(desc) = (unsafe { p.as_ref() }) else {
+        eprintln!("[driver-cuda-new] {what}: the descriptor pointer is null");
+        return Err(PIE_STATUS_INVALID_ARGUMENT);
+    };
+    match validate(desc) {
+        Ok(()) => Ok(desc),
+        Err(e) => {
+            // The MESSAGE is the point. A hand-rolled check returns
+            // `INVALID_ARGUMENT` and the caller learns which CALL failed;
+            // the validators say which FIELD, and that difference is most
+            // of what they are worth.
+            eprintln!("[driver-cuda-new] {what}: {}", e.message());
+            Err(e.status())
+        }
+    }
+}
+
 fn shell(driver: *mut PieDriver) -> Option<&'static mut Shell> {
     // SAFETY: the only non-null `PieDriver` values in circulation are the
     // boxes `pie_cuda_create` leaked; the engine's contract is to pass
@@ -797,10 +1149,21 @@ pub fn pie_cuda_create(
     desc: *const PieDriverCreateDesc,
     caps: *mut PieDriverCaps,
 ) -> *mut PieDriver {
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
+    guard("create", std::ptr::null_mut(), || create_impl(desc, caps))
+}
+
+fn create_impl(desc: *const PieDriverCreateDesc, caps: *mut PieDriverCaps) -> *mut PieDriver {
+    // `create` RETURNS A POINTER, not a status, so it cannot pass the
+    // validator's message back — it can only refuse. The message still
+    // reaches the log, which is the whole reason this call is here and not
+    // an `abi_version` test: a caller that got a null handle learns WHY
+    // from the line `checked` prints rather than from three candidate
+    // causes.
+    let Ok(desc) = checked(desc, driver_api::local::validate_driver_create_desc, "create") else {
         return std::ptr::null_mut();
     };
-    if desc.abi_version != PIE_DRIVER_ABI_VERSION {
+    if validate_create_out_params(caps).is_err() {
+        eprintln!("[driver-cuda-new] create: the caps out-parameter must be non-null");
         return std::ptr::null_mut();
     }
     // The boot TOML rides in `config_bytes`. Two keys are read today:
@@ -824,6 +1187,38 @@ pub fn pie_cuda_create(
         .get("driver")
         .and_then(|d| d.get("runahead")?.as_bool())
         .unwrap_or_else(runahead_env);
+    // An unrecognised spelling is refused rather than defaulted: silently
+    // giving bf16 to a caller who asked for fp8 is the kind of wrong
+    // answer that reads as a slightly worse model.
+    let kv_format = match crate::store::KvCacheFormat::from_name(
+        boot.get("driver").and_then(|d| d.get("kv_cache_dtype")?.as_str()).unwrap_or("auto"),
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[driver-cuda-new] create: {e:?}");
+            return std::ptr::null_mut();
+        }
+    };
+    // The pages can be written in every catalogued format — `kv_paged.cu`
+    // switches on the scheme — but only `attn::attention_naive_paged`
+    // READS one back. The fire path's prefill and decode are FlashInfer's
+    // `_bf16` entry points, which take the view and ignore its scheme, so
+    // a non-native format today would be appended correctly and attended
+    // to as though the bytes were bf16.
+    //
+    // That is a wrong answer rather than a crash, so it is refused here.
+    // Lifting it is a kernel change (a scheme-aware attention fast path),
+    // not a plumbing one, and the plumbing should not wait for it.
+    if !kv_format.is_native_bf16() {
+        eprintln!(
+            "[driver-cuda-new] create: kv_cache_dtype '{}' can be written but not \
+             read back — the fire path's attention is FlashInfer's bf16 entry \
+             point, which ignores the scheme. Refusing rather than returning \
+             garbage logits.",
+            kv_format.name()
+        );
+        return std::ptr::null_mut();
+    }
     let driver_u32 = |key: &str, default: u32| {
         boot.get("driver")
             .and_then(|d| d.get(key)?.as_integer())
@@ -884,6 +1279,7 @@ pub fn pie_cuda_create(
         caps: CAPS_JSON.as_bytes().to_vec(),
         boot_descriptor,
         runahead,
+        kv_format,
         cublas: None,
         lowerings: std::collections::BTreeMap::new(),
         calibrating,
@@ -910,6 +1306,8 @@ pub fn pie_cuda_create(
         in_flight: std::collections::VecDeque::new(),
         fire_alloc: None,
         ptir: crate::ptir::Runtime::default(),
+        ptir_control: None,
+        ptir_sessions: std::collections::BTreeMap::new(),
         ptir_programs: crate::ptir::Programs::new(),
         ptir_plans: std::collections::BTreeMap::new(),
     });
@@ -923,6 +1321,10 @@ pub fn pie_cuda_create(
 
 /// Tear the driver down. Null is a no-op, as everywhere in the ABI.
 pub fn pie_cuda_destroy(driver: *mut PieDriver) {
+    guard("destroy", (), || destroy_impl(driver));
+}
+
+fn destroy_impl(driver: *mut PieDriver) {
     if !driver.is_null() {
         let mut shell = unsafe { Box::from_raw(driver.cast::<Shell>()) };
         // EVERY QUEUED FIRE FIRST, because they may still be writing.
@@ -977,8 +1379,9 @@ pub fn pie_cuda_load_model(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(load) = (unsafe { load.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+        let load = match checked(load, driver_api::local::validate_model_load_desc, "load_model") {
+            Ok(d) => d,
+            Err(status) => return status,
         };
         let snapshot = (!load.snapshot_dir.ptr.is_null())
             .then(|| unsafe {
@@ -1199,7 +1602,12 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // in `step_impl` and in `resize_pool`). Letting the lattice sweep page
         // sizes would have it answer a geometry the driver does not build.
         kv_page_size: 16,
-        kv_cache_dtype: "bf16".to_owned(),
+        // The driver's OWN format, so the planner sizes the pages the
+        // driver will actually allocate. It was hardwired while the shell
+        // could only build bf16; now that the format is a boot key, a
+        // hardwired planner would under-count a quantized cache by up to
+        // 4x and hand back a page budget the device cannot hold.
+        kv_cache_dtype: state.kv_format.name().to_owned(),
         tp_size: i32::try_from(model_tp).unwrap_or(1),
         mtp_num_drafts: 0,
         // FALSE EVEN WHEN CALIBRATING, and the divergence is deliberate.
@@ -1370,9 +1778,11 @@ pub fn pie_cuda_register_program(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(desc) = (unsafe { program.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
+        let desc =
+            match checked(program, driver_api::local::validate_program_desc, "register_program") {
+                Ok(d) => d,
+                Err(status) => return status,
+            };
         if desc.abi_version != PIE_DRIVER_ABI_VERSION {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
@@ -1460,32 +1870,13 @@ fn adopt_and_compile(
             .compile(desc.program_hash, &plan, kernels, versions, target)
         {
             Ok(compiled) => {
-                // COMPILED AND NEVER FIRED, which is said out loud because it
-                // is the difference between a driver that cannot run a program
-                // and one that quietly does not.
-                //
-                // `ptir_programs` has exactly one writer -- this line -- and no
-                // reader: `ptir::fire`, `ptir::launch` and `Control::compile`
-                // have no caller in this shell. So a program's stages are
-                // type-checked, lowered and compiled to a cubin, and then the
-                // fire runs the model forward and delivers logits through the
-                // instance's reader channel as if the program were not there.
-                //
-                // What that costs is the north star's first clause. Sampling
-                // lives in the program -- top-p, top-k, temperature, argmax are
-                // PTIR stages, not driver flags -- so a caller's program is
-                // ignored and it gets raw logits back instead. Silence would
-                // make that look like a numerical disagreement rather than a
-                // missing execution.
-                eprintln!(
-                    "[driver-cuda-new] register_program: program {:#018x} \
-                     compiled {} stage(s) and this driver will NOT run them. \
-                     Its outputs -- including any sampling it declares -- will \
-                     not happen; the fire delivers raw logits instead. See \
-                     `ptir-never-fires`.",
-                    desc.program_hash,
-                    plan.stages.len()
-                );
+                sg_trace(|| {
+                    format!(
+                        "  ptir program {:#018x}: {} stage(s) compiled",
+                        desc.program_hash,
+                        plan.stages.len()
+                    )
+                });
                 state.ptir_programs.insert(id, compiled);
             }
             Err(failure) => {
@@ -1566,8 +1957,13 @@ pub fn pie_cuda_register_channel(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(desc) = (unsafe { channel.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+        let desc = match checked(
+            channel,
+            |d| unsafe { driver_api::local::validate_channel_desc(d) },
+            "register_channel",
+        ) {
+            Ok(d) => d,
+            Err(status) => return status,
         };
         if desc.abi_version != PIE_DRIVER_ABI_VERSION
             || state.channels.contains_key(&desc.channel_id)
@@ -1624,6 +2020,8 @@ pub fn pie_cuda_register_channel(
                 cell_bytes: usize::try_from(wire_bytes).unwrap_or(usize::MAX),
                 ring: u32::try_from(ring).expect("ring fits u32"),
                 host_role: desc.host_role,
+                numel: usize::try_from(numel).unwrap_or(usize::MAX),
+                dtype: channel_dtype(desc.dtype),
             },
         );
         if let Some(out) = unsafe { binding.as_mut() } {
@@ -1657,8 +2055,13 @@ pub fn pie_cuda_bind_instance(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(desc) = (unsafe { instance.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+        let desc = match checked(
+            instance,
+            |d| unsafe { driver_api::local::validate_instance_desc(d) },
+            "bind_instance",
+        ) {
+            Ok(d) => d,
+            Err(status) => return status,
         };
         if desc.abi_version != PIE_DRIVER_ABI_VERSION
             || !state.programs.contains_key(&desc.program_id)
@@ -1712,8 +2115,22 @@ pub fn pie_cuda_launch(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(frame) = (unsafe { frame.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+        // NOT `validate_frame_desc` YET, and the reason is written down
+        // rather than left as an omission. That validator requires
+        // `terminal_cells.len == roster_rows.len` and a
+        // `channel_ticket_indptr` whenever ticket values are present;
+        // this shell serves frames today that state neither, so adopting
+        // it here would refuse traffic that works. Which of the two is
+        // wrong — the frames or the rule — is a question for whoever owns
+        // the ticket path, and guessing is how a validator gets weakened
+        // instead of a caller fixed. See `validators-unskippable`.
+        let frame = match checked(
+            frame,
+            |d| unsafe { driver_api::local::validate_frame_desc(d) },
+            "launch",
+        ) {
+            Ok(d) => d,
+            Err(status) => return status,
         };
         // THE CALL RETURNS WITH THE WORK STILL ON THE STREAM.
         //
@@ -2535,88 +2952,28 @@ pub fn openable_model_types() -> Vec<&'static str> {
     FACTS_ROWS.iter().map(|(k, _)| *k).collect()
 }
 
-/// The fire's CLASS, read off the descriptor rather than guessed from its
-/// shape.
+/// The fire's CLASS, read off its SHAPE — one row per request is a
+/// decode, anything else is prefill-shaped.
 ///
-/// The shape alone answers only the first question — one row per request
-/// is a decode, anything else is prefill-shaped. The MTP service passes
-/// are not shapes at all: they are *what the pass is for*, and the wire
-/// has said so since v23 in the recurrent-state flags. The C++ driver
-/// read exactly these bits into `RsExecutionMode`
-/// (`pipeline/batch_compose.hpp`) and this is that derivation, with the
-/// mode's name replaced by the class it selects:
+/// It used to read the recurrent-state flags too, and derive three MTP
+/// service classes from them (`CommitAdvance` where every row replayed
+/// buffered tokens, `FrozenVerify` where any row wrote buffered slabs,
+/// `StateOnly` where a recurrent fire had no readout rows). Those classes
+/// are gone — `.wiki/driver/graph.md` §4.2: a speculative decode buffers
+/// its tokens and folds only the accepted prefix, so a rejected token is
+/// never folded and there is nothing to repair. The driver executes the
+/// flags now (see the fold in `gdn_context`) instead of classifying on
+/// them.
 ///
-/// | rows                                   | C++ mode      | class           |
-/// |----------------------------------------|---------------|-----------------|
-/// | every row replays buffered tokens      | `BufferFold`  | `CommitAdvance` |
-/// | some row writes buffered slabs         | `BufferWrite` | `FrozenVerify`  |
-/// | recurrent, no readout rows             | `Forward`     | `StateOnly`     |
-/// | otherwise                              | `Forward`     | shape decides   |
-///
-/// The mixed case is REFUSED for the same reason the C++ composer
-/// refuses it: a replay row gathers its activations out of the slabs and
-/// a computing row does not, so the two cannot share one op list. That is
-/// a property of the pass, so it is answered here, once, rather than by
-/// every arm that would otherwise find half a fire.
+/// What remains is a shape question, and it is on its way out too: the
+/// window class is `GuardPred::WindowOne` now, so the two surviving
+/// values pick nothing the trace does not already guard. See §4.1.
 pub fn fire_class_of(
-    step: &driver_api::local::PieStepDesc,
+    _step: &driver_api::local::PieStepDesc,
     rows: usize,
     requests: usize,
 ) -> Result<model_compiler::trace::FireClass, i32> {
-    use driver_api::local::{PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD};
     use model_compiler::trace::FireClass;
-
-    let flags = slice_of(step.rs_slot_flags.ptr, step.rs_slot_flags.len);
-    let buf_indptr = slice_of(step.rs_buffer_slot_indptr.ptr, step.rs_buffer_slot_indptr.len);
-    // A row's buffer span, and 0 when the fire carries no CSR at all.
-    let span = |r: usize| -> u32 {
-        match (buf_indptr.get(r + 1), buf_indptr.get(r)) {
-            (Some(&hi), Some(&lo)) => hi.saturating_sub(lo),
-            _ => 0,
-        }
-    };
-    let mut any_buffer = false;
-    let mut any_replay = false;
-    let mut all_replay = requests > 0;
-    for r in 0..requests {
-        let f = flags.get(r).copied().unwrap_or(0);
-        let buffered = span(r) > 0;
-        // `BUFFER_WRITE` marks a row that writes AND folds; a pure replay
-        // folds without writing.
-        let replays = buffered && f & PIE_RS_FLAG_FOLD != 0 && f & PIE_RS_FLAG_BUFFER_WRITE == 0;
-        any_buffer |= buffered;
-        any_replay |= replays;
-        all_replay &= replays;
-    }
-    if any_replay && !all_replay {
-        eprintln!(
-            "[driver-cuda-new] launch: a row that only replays buffered tokens \
-             cannot share a fire with one that computes new ones"
-        );
-        return Err(PIE_STATUS_INVALID_ARGUMENT);
-    }
-    if all_replay {
-        return Ok(FireClass::CommitAdvance);
-    }
-    if any_buffer {
-        return Ok(FireClass::FrozenVerify);
-    }
-    // `StateOnly` — the backbone with the epilogue cut off — is the one
-    // class this function CANNOT yet read, and the reason is worth
-    // stating rather than working around.
-    //
-    // Its wire signal is "no readout rows", i.e. an empty
-    // `sampling_indices`. But the shell below does not read that field at
-    // all: it builds `Row { samples: true }` for every row, unconditionally.
-    // So the field is empty on every fire that reaches here, and keying a
-    // class on it would classify every hybrid prefill as a service pass —
-    // which is exactly what it did, and the hybrid's logits went missing.
-    //
-    // Reading a fact off where a statement SITS rather than what it SAYS
-    // is the defect this port keeps re-finding. `sampling_indices` will
-    // say it once the readout rows are plumbed through to `Row::samples`;
-    // until then the shape answers, and `StateOnly` is reachable only
-    // through the lowering tests.
     Ok(if rows == requests { FireClass::Decode } else { FireClass::Prefill })
 }
 
@@ -3211,6 +3568,11 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
         let ran = crate::model::executor::run_captured(
             lowered, dplan, frame, resolver, ctx, regions, gdn, &mut b,
         );
+        // The nodes the capture retained, taken BEFORE the builder is
+        // dropped: one per launch, and what lets a later fire of a
+        // different row count retune this exec's rectangles instead of
+        // recapturing (`.wiki/driver/graph.md` §6.2).
+        let nodes = b.nodes().to_vec();
         drop(b);
         // A REFUSED CAPTURE IS NOT A REFUSED FIRE.
         //
@@ -3229,7 +3591,7 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
         let ended = scope.end();
         sg_trace(|| format!("capture ran={ran:?} ended_ok={}", ended.is_ok()));
         match (ran, ended) {
-            (Ok(n), Ok(g)) => Some((n, g)),
+            (Ok(n), Ok(g)) => Some((n, g, nodes)),
             (Err(_), Ok(g)) => {
                 // AN ABANDONED CAPTURE IS NOT DESTROYED, it is forgotten.
                 //
@@ -3251,7 +3613,7 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
             (_, Err(_)) => None,
         }
     };
-    let Some((ran, graph)) = captured else {
+    let Some((ran, graph, nodes)) = captured else {
         return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
     };
     let Ok(exec) = graph.instantiate() else {
@@ -3260,7 +3622,7 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
     if exec.launch(stream).is_err() {
         return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
     }
-    let _ = cache.insert(key, exec, epoch, eligibility);
+    let _ = cache.insert_with_nodes(key, exec, epoch, nodes, eligibility);
     Ok(ran)
 }
 
@@ -3298,16 +3660,15 @@ fn launch_impl(
 fn build_lowering(
     family: &dyn PlannedFamily,
     class: model_compiler::trace::FireClass,
-    rows: usize,
+    fire_rows: &[model_compiler::lower::Row],
     union_asked: bool,
 ) -> Result<LoweredFire, i32> {
     use crate::model::executor::DispatchPlan;
-    use model_compiler::lower::{Arg, Fire, GuardMode, Row, lower_with};
+    use model_compiler::lower::{Arg, Fire, GuardMode, lower_with};
 
     let plan = family.trace(class);
-    let fire_rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
     let lower_as = |g: GuardMode| {
-        lower_with(&plan, &fire_rows, Fire { captures_across_splits: false }, g).map_err(|e| {
+        lower_with(&plan, fire_rows, Fire { captures_across_splits: false }, g).map_err(|e| {
             eprintln!("[driver-cuda-new] launch: uncovered: {e:?}");
             PIE_STATUS_UNSUPPORTED
         })
@@ -3318,50 +3679,29 @@ fn build_lowering(
     }
     let mut lowered = lower_as(if union { GuardMode::Union } else { GuardMode::Resolve })?;
 
-    // A union this fire cannot record is not a union worth building, and the
-    // decision has to be made HERE — before the arena, the pins and the
-    // attention context are sized against it — because falling back later
-    // would run one lowering's program against another's offsets.
+    // NOTHING DECLINES THE UNION ANY MORE, and the two clauses that used
+    // to are worth naming because their removal is the point of §5 (1)
+    // and (2) in `.wiki/driver/graph.md`.
     //
-    // Two things make a union unservable, and both are about prepared state.
-    // A `_capture` dispatch wants a plan raised for the full-attention
-    // variant, a folded-row layout and an observation window; a `_custom`
-    // one wants a mask the fire did not build. Under `Union` every arm is
-    // present whether this fire takes it or not, so the capture runs the one
-    // that cannot run and the whole recording is abandoned.
+    // The first refused any lowering mentioning `_capture` or `_custom` --
+    // the exact case a folded `WantsAttnScore` / `HasCustomMask` predicate
+    // exists for. Its cause was PER-ARM PREPARED STATE: under `Union`
+    // every arm is recorded whether this fire takes it or not, so the
+    // capture walked the arm whose state the fire declined to build and
+    // abandoned the whole recording. Prepared state belongs to the BUCKET
+    // now -- the score sink is published every fire, every plan the
+    // geometry permits is raised, a causal element mask stays resident.
     //
-    // And the attention output slot has to be findable from the op JOIN. The
-    // neighbour trick — "the launch after the dispatch is the o_proj" — is
-    // what `Resolve` allows and `Union` does not, because every arm is
-    // present and the neighbour belongs to some other body.
-    if union {
-        let d = DispatchPlan::new(&plan, &lowered);
-        let servable = !lowered
-            .kernels
-            .iter()
-            .any(|k| k.contains("_capture") || k.contains("_custom"))
-            && {
-                let name = if lowered
-                    .kernels
-                    .iter()
-                    .any(|k| k == "attn::dispatch_attention_flashinfer_decode")
-                {
-                    "attn::dispatch_attention_flashinfer_decode"
-                } else {
-                    "attn::dispatch_attention_flashinfer_prefill_bf16"
-                };
-                lowered
-                    .launches
-                    .iter()
-                    .position(|x| lowered.kernels[x.kernel as usize] == name)
-                    .is_some_and(|fi| matches!(d.spec(fi).outs.first(), Some(Arg::Arena { .. })))
-            };
-        if !servable {
-            sg_trace(|| "union declined: unservable for this fire".into());
-            union = false;
-            lowered = lower_as(GuardMode::Resolve)?;
-        }
-    }
+    // The second refused a fire whose attention output slot the op JOIN
+    // could not name. The old fallback -- "the launch after the dispatch
+    // is the o_proj, so its input is the slot" -- is a fact read off where
+    // a statement SITS, true under `Resolve` (the guard has deleted every
+    // arm the fire did not take) and false under `Union` (every arm is
+    // present and the neighbour belongs to some other body). But declining
+    // was never the only answer: `AttnCtx::o_out` is a DRIVER-owned
+    // pointer, so a fire whose join names no slot gets a driver-owned
+    // buffer instead of losing its graph. See `o_off` at the fire site.
+
     let dplan = DispatchPlan::new(&plan, &lowered);
     sg_trace(|| format!("built: launches={} union={union}", lowered.launches.len()));
     Ok(LoweredFire { plan, lowered, dplan, union })
@@ -3390,6 +3730,16 @@ struct Admitted {
     rows: usize,
     /// Requests the step's CSR partitions those rows into.
     requests: usize,
+    /// The rows the lowering will resolve its guards against, read from
+    /// the step's REGION TABLE.
+    ///
+    /// This shell used to build `vec![Row { samples: true, ..default() };
+    /// rows]` and never look at `region_sig` — zero reads in the whole
+    /// file. So `HasLora`, `HasCustomMask`, `HasStageHooks` and the depth
+    /// truncation could not hold no matter what the engine sent, and
+    /// every fire claimed to sample every row. LoRA looked like a missing
+    /// feature; the wire had been carrying it the whole time.
+    fire_rows: Vec<model_compiler::lower::Row>,
 }
 
 /// See [`Admitted`].
@@ -3446,6 +3796,81 @@ fn admit(
     let rows = token_ids.len();
     let requests = kv_lens.len();
     let class = fire_class_of(step, rows, requests)?;
+    // THE REGION TABLE, which is the seriation's output stated once. An
+    // empty one is the legacy discipline — no seriation ran, so the fire
+    // is one region of the default point — and not a refusal.
+    let mut fire_rows = model_compiler::lower::rows_from_regions(
+        rows,
+        slice_of(step.sampling_indices.ptr, step.sampling_indices.len),
+        slice_of(step.region_row_indptr.ptr, step.region_row_indptr.len),
+        slice_of(step.region_sig.ptr, step.region_sig.len),
+        slice_of(step.region_k.ptr, step.region_k.len),
+    )
+    .map_err(|drift| {
+        eprintln!(
+            "[driver-cuda-new] launch: the step's region table does not describe \
+             its rows: {drift:?}"
+        );
+        PIE_STATUS_INVALID_ARGUMENT
+    })?;
+    // EVERY ROW SAMPLES, and this override is the one thing above that is
+    // not the wire's answer.
+    //
+    // `lower::epilogue` states a gather when `sampled < window.len()` —
+    // a prefill reads one distribution per request out of a stream of one
+    // row per token, and those rows are not contiguous. But it emits the
+    // gather, the final norm and the head over ONE op's operands, so the
+    // gather's output IS the logits buffer: it would write `[sampled, H]`
+    // rows into a `[sampled, vocab]` allocation at the wrong stride and
+    // the head would read what it wrote. The intermediate the C++
+    // epilogue uses (`ws.norm_x`) has no SSA value for the lowering to
+    // hand out.
+    //
+    // So the compaction waits on a lowering that can state that temp, and
+    // until then every row claims its readout — which is what this shell
+    // did unconditionally, and is exactly right for a decode. The cost is
+    // a prefill computing the head over every row instead of one per
+    // request: slower, and the same numbers.
+    //
+    // The five AXES above are the wire's, and they are the point: `lora`,
+    // `custom_mask`, `hooked`, `multi_token` and `depth_k` now hold when
+    // the engine says they do. `samples` is the only field a shell can
+    // over-claim without changing an answer.
+    for r in &mut fire_rows {
+        r.samples = true;
+    }
+    // AN ADAPTER THIS DRIVER CANNOT APPLY IS REFUSED.
+    //
+    // Now that the region bit is read, a marked row reaches the
+    // `HasLora` guard and the trace states `pie_lora_qkv_correction`.
+    // The executor's arm for it returns `Ok(())` when `ctx.lora` is
+    // `None` — which it always is, because nothing stages the table
+    // yet — and that no-op is LOAD-BEARING for union captures: under
+    // `GuardMode::Union` every arm lowers and the predicate is decided
+    // at replay, so the arm has to be issuable with nothing to correct.
+    //
+    // So the refusal cannot live in the arm. It lives here, where the
+    // question is whether this FIRE asked for something the driver
+    // cannot do. Running it would apply no correction and return tokens
+    // that look like a slightly worse model, which is the one failure
+    // mode worth refusing over.
+    //
+    // What lifts it: the adapter arrives as a pass-wide `lora` SINK in
+    // the program's PROLOGUE (`fwd.adapter` lowers LoRA, IA3 and DoRA
+    // into it; the A/B are channel cells). Reading that sink's operands
+    // into a `LoraTable` and staging it with
+    // `model::lora::llama_like_lora_stage` is what fills `ctx.lora` —
+    // and `caps.has_lora` turns true with it.
+    if fire_rows.iter().any(|r| r.lora) {
+        eprintln!(
+            "[driver-cuda-new] launch: a region carries an adapter \
+             (PIE_REGION_SIG_LORA) and this driver stages none — the \
+             prologue's `lora` sink has no reader, so the correction would \
+             be a no-op. Refusing rather than answering without it; \
+             `caps.has_lora` is false."
+        );
+        return Err(PIE_STATUS_UNSUPPORTED);
+    }
 
     // A family that does not DECLARE a service class must be turned away
     // rather than traced: its text answers the three with `unreachable!`,
@@ -3458,7 +3883,161 @@ fn admit(
         );
         return Err(PIE_STATUS_UNSUPPORTED);
     }
-    Ok((Admitted { class, rows, requests }, family))
+    Ok((Admitted { class, rows, requests, fire_rows }, family))
+}
+
+/// Run the instance's registered program over the fire's logits.
+///
+/// `step_impl`'s SAMPLING phase, and the reason `ptir_programs` had a
+/// writer and no reader until now. Sampling is a PTIR stage and not a
+/// driver flag — top-p, top-k, temperature and argmax are ops a caller's
+/// program states — so a fire that skipped this returned raw logits and
+/// ignored every sampling parameter the request carried.
+///
+/// Returns `Ok(false)` when there is nothing to run, which is the common
+/// case and not a failure: an instance with no program, a program that
+/// compiled to nothing, or an instance whose channels this shell does not
+/// hold. The caller then delivers logits the old way.
+///
+/// # Why a refusal here is not a failed request
+///
+/// A program that DECLINES a fire has said so deliberately, and one whose
+/// inputs are not ready is waiting on the engine rather than broken.
+/// Neither is a reason to fail the step: the cursors are left where they
+/// were, so the next fire sees the same inputs and the same decision.
+/// Only a device error propagates.
+#[cfg(feature = "abi")]
+#[allow(clippy::too_many_arguments)]
+fn run_program(
+    // THE FIVE FIELDS THIS PHASE TOUCHES, not `&mut Shell` — the caller
+    // has already borrowed `model`, `named_bufs`, `stream` and `alloc` out
+    // of the shell, so a whole-shell borrow here is a conflict. Same wall
+    // `deliver_logits` and `gdn_context` hit, same answer.
+    instances: &std::collections::BTreeMap<u64, InstanceEntry>,
+    channels: &std::collections::BTreeMap<u64, ChannelState>,
+    programs: &crate::ptir::Programs,
+    control: &mut Option<crate::ptir::Control>,
+    sessions: &mut std::collections::BTreeMap<u64, crate::ptir::session::Session>,
+    disk: &crate::ptir::Disk,
+    device_ordinal: i32,
+    instance_id: u64,
+    logits: (u64, u32, u32),
+    rows: usize,
+    // The row of `logits` this instance's program reads — the last row of
+    // its token span, not its index.
+    row: usize,
+    alloc: &crate::cuda::Allocator,
+    stream: &crate::cuda::OwnedStream,
+) -> Result<bool, i32> {
+    use crate::ptir::session::{Fired, Session};
+
+    let Some(instance) = instances.get(&instance_id) else {
+        return Ok(false);
+    };
+    let Some(compiled) = programs.get(instance.program_id) else {
+        return Ok(false);
+    };
+    // THE EPILOGUE'S plan, not the first one.
+    //
+    // Sampling is an epilogue stage. `plans.first()` was the epilogue
+    // only by the accident that no program in the tree has a prologue —
+    // and `fwd.adapter` puts its `lora` sink in one, so the first program
+    // that carries an adapter would have had its ADAPTER fired here and
+    // its sampler never run, with the fire reporting a successful publish
+    // either way.
+    //
+    // Falling back to the first stage keeps a package that states no
+    // kinds working, which is what every fixture in the tree is.
+    let stage = compiled
+        .stage_of_kind(crate::ptir::runtime::stage_kind::EPILOGUE)
+        .unwrap_or(0);
+    let Some(plan) = compiled.plans.get(stage).cloned() else {
+        return Ok(false);
+    };
+    let Some(shapes) = instance_ring_shapes(instance, channels) else {
+        eprintln!(
+            "[driver-cuda-new] launch: instance {instance_id} names a channel this \
+             driver does not hold; its program cannot be given rings"
+        );
+        return Ok(false);
+    };
+    let channel_ids = instance.channel_ids.clone();
+    let compiled = compiled.clone();
+
+    // THE CONTROL KERNELS, ONCE. Same disk as the program runtime's on
+    // purpose: the two share a key scheme, so a second cache directory
+    // would recompile both every boot and neither would ever hit.
+    if control.is_none() {
+        let target = ptir_target(device_ordinal)?;
+        let architecture = crate::ptir::nvrtc::arch_flag(target.major, target.minor);
+        match crate::ptir::Control::compile(disk, &architecture, "pie-cuda") {
+            Ok(built) => *control = Some(built),
+            Err(failure) => {
+                eprintln!(
+                    "[driver-cuda-new] launch: the PTIR control kernels will not \
+                     compile ({}); this fire delivers raw logits",
+                    failure.reason()
+                );
+                return Ok(false);
+            }
+        }
+    }
+
+    if !sessions.contains_key(&instance_id) {
+        let session = Session::new(alloc, &shapes, stream.as_ref()).map_err(|error| {
+            eprintln!("[driver-cuda-new] launch: cannot ring instance {instance_id}: {error}");
+            PIE_STATUS_EXHAUSTED
+        })?;
+        sessions.insert(instance_id, session);
+    }
+
+    // The host planes, in the instance's channel ORDER — which is the
+    // order a program indexes them by, and not the map's.
+    let mut host: Vec<crate::ptir::bridge::HostChannel> = Vec::with_capacity(channel_ids.len());
+    for id in &channel_ids {
+        let Some(channel) = channels.get(id) else {
+            return Ok(false);
+        };
+        host.push(channel.host_plane());
+    }
+
+    let control = control.as_ref().expect("just ensured");
+    let session = sessions.get_mut(&instance_id).expect("just ensured");
+    let extents = driver::Extents {
+        row_count: u32::try_from(rows).unwrap_or(1),
+        token_count: u32::try_from(rows).unwrap_or(1),
+        sampled_rows: 1,
+        ..driver::Extents::default()
+    };
+    match session.fire(
+        &compiled,
+        &plan,
+        control,
+        &mut host,
+        logits,
+        // ONE LANE per fire — `ptir::fire` says grouping is unbuilt — but
+        // no longer one ROW per frame: the caller fires once per request
+        // and hands each its own. When grouping lands, the lane index
+        // selects among the group's rows and nothing else here changes.
+        |_lane| u32::try_from(row).unwrap_or(0),
+        extents,
+        alloc,
+        stream.as_ref(),
+    ) {
+        Ok(Fired::Committed { published }) => Ok(published > 0),
+        Ok(Fired::Declined) => {
+            sg_trace(|| format!("  ptir instance {instance_id} declined the fire"));
+            Ok(false)
+        }
+        Ok(Fired::NotReady) => {
+            sg_trace(|| format!("  ptir instance {instance_id} was not ready"));
+            Ok(false)
+        }
+        Err(error) => {
+            eprintln!("[driver-cuda-new] launch: the program refused: {error}");
+            Err(PIE_STATUS_DRIVER_ERROR)
+        }
+    }
 }
 
 /// Publish the fire's readout: the LAST row's logits, out through the
@@ -3500,6 +4079,13 @@ fn deliver_logits(
     >,
     stream: crate::cuda::StreamRef<'_>,
     rows: usize,
+    // Where each request's token span ends, so its answer row can be
+    // found. `qo_indptr[r + 1] - 1` is request `r`'s last row.
+    qo_indptr: &[u32],
+    // The requests this fallback is for — the ones whose PTIR program did
+    // not publish. A frame can be mixed, and a request that already has a
+    // sampled answer must not also get a vocabulary.
+    serve: &[usize],
     debt: &mut Option<FireDebt>,
 ) -> Result<(), i32> {
     use model_compiler::lower::Arg;
@@ -3517,64 +4103,496 @@ let logits_value = (0..lowered.launches.len())
         })
     });
 let instance_ids = slice_of(frame.instance_ids.ptr, frame.instance_ids.len);
-if let (Some(lv), Some(&iid)) = (logits_value, instance_ids.first())
-    && let Some(inst) = instances.get(&iid)
+let vocab = usize::try_from(model.hf.vocab_size).unwrap_or(0);
+
+// EVERY REQUEST, each its OWN reader channel and its OWN row.
+//
+// This used to take `instance_ids.first()` and `rows - 1`, so a frame
+// with a roster of two published request 0's vocabulary and returned
+// request 1 nothing at all. The row is not the index: request `r` owns
+// `qo_indptr[r]..qo_indptr[r + 1]`, so its answer is at
+// `qo_indptr[r + 1] - 1` — equal to `r` on a decode, and not on a
+// prefill.
+let readouts: Vec<(ChannelState, usize)> = serve
+    .iter()
+    .filter_map(|&r| {
+        let iid = instance_ids.get(r)?;
+        let inst = instances.get(iid)?;
+        let end = qo_indptr.get(r + 1).copied()? as usize;
+        let row = end.saturating_sub(1).min(rows.saturating_sub(1));
+        let ch = inst.channel_ids.iter().find_map(|cid| {
+            channels.get(cid).filter(|ch| {
+                ch.host_role == driver_api::local::PIE_CHANNEL_HOST_ROLE_READER
+                    && ch.cell_bytes == vocab * 4
+            })
+        })?;
+        Some((*ch, row))
+    })
+    .collect();
+
+// THE D2H IS ENQUEUED, NOT AWAITED. Its destination belongs to
+// the debt rather than to this stack frame — a `Vec` here would
+// be freed the moment this call returns, which with an
+// asynchronous completion is before the copy lands.
+//
+// ONE copy carries every row, so N requests cost one D2H and N
+// widenings rather than N copies.
+if let (Some(lv), false) = (logits_value, readouts.is_empty())
+    && let Some(buf) = named_bufs.get(&lv)
 {
-    let vocab = usize::try_from(model.hf.vocab_size).unwrap_or(0);
-    let target = inst.channel_ids.iter().find_map(|cid| {
-        channels.get(cid).filter(|ch| {
-            ch.host_role == driver_api::local::PIE_CHANNEL_HOST_ROLE_READER
-                && ch.cell_bytes == vocab * 4
-        })
-    });
-    // THE D2H IS ENQUEUED, NOT AWAITED. Its destination belongs to
-    // the debt rather than to this stack frame — a `Vec` here would
-    // be freed the moment this call returns, which with an
-    // asynchronous completion is before the copy lands.
-    if let (Some(ch), Some(buf)) = (target, named_bufs.get(&lv)) {
-        match debt.as_mut() {
-            Some(d) => {
-                // The shell's buffer, grown to fit and reused. Not the
-                // debt's: see `FireDebt::staging`.
-                if logits_staging.as_ref().is_none_or(|p| p.len() < buf.len()) {
-                    *logits_staging = Some(
-                        crate::cuda::PinnedBuf::new(buf.len())
-                            .map_err(|_| PIE_STATUS_EXHAUSTED)?,
-                    );
-                }
-                let pin = logits_staging.as_mut().expect("just sized");
-                let view = (pin.as_slice().as_ptr(), buf.len());
-                buf.copy_to_host(&mut pin.as_mut_slice()[..buf.len()], stream)
-                    .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-                d.staging = Some(view);
-                d.channel = Some(*ch);
+    match debt.as_mut() {
+        Some(d) => {
+            // The shell's buffer, grown to fit and reused. Not the
+            // debt's: see `FireDebt::staging`.
+            if logits_staging.as_ref().is_none_or(|p| p.len() < buf.len()) {
+                *logits_staging = Some(
+                    crate::cuda::PinnedBuf::new(buf.len())
+                        .map_err(|_| PIE_STATUS_EXHAUSTED)?,
+                );
             }
-            None => {
-                // A step that owes nothing has already synchronized,
-                // so the old shape is still correct for it.
-                let mut bf16 = vec![0u8; buf.len()];
-                buf.copy_to_host(&mut bf16, stream)
-                    .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-                stream.synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-                let last = rows - 1;
+            let pin = logits_staging.as_mut().expect("just sized");
+            let view = (pin.as_slice().as_ptr(), buf.len());
+            buf.copy_to_host(&mut pin.as_mut_slice()[..buf.len()], stream)
+                .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+            d.staging = Some(view);
+            d.readouts = readouts;
+        }
+        None => {
+            // A step that owes nothing has already synchronized,
+            // so the old shape is still correct for it.
+            let mut bf16 = vec![0u8; buf.len()];
+            buf.copy_to_host(&mut bf16, stream)
+                .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+            stream.synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+            for (ch, row) in &readouts {
                 let mut cell = vec![0u8; vocab * 4];
                 for t in 0..vocab {
-                    let off = (last * vocab + t) * 2;
-                    let bits = u16::from_le_bytes([bf16[off], bf16[off + 1]]);
-                    cell[t * 4..t * 4 + 4]
-                        .copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
+                    let off = (row * vocab + t) * 2;
+                    if off + 1 < bf16.len() {
+                        let bits = u16::from_le_bytes([bf16[off], bf16[off + 1]]);
+                        cell[t * 4..t * 4 + 4]
+                            .copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
+                    }
                 }
                 if !ch.publish(&cell) {
                     eprintln!(
-                        "[driver-cuda-new] launch: logits ring full; frame dropped its output"
+                        "[driver-cuda-new] launch: logits ring full; a request dropped \
+                         its output"
                     );
                 }
             }
         }
     }
-
 }
     Ok(())
+}
+
+
+/// Make the shell's persistent device state ready, and reclaim what the
+/// last fires finished with.
+///
+/// `step_impl`'s DEVICE STATE phase, promoted out of it — and the reason
+/// it could be is that it is the only phase before the launch that takes
+/// `&mut Shell` and borrows nothing else. Extracting it is what lets
+/// every shared borrow below it (`model`, the lowering, the stream, the
+/// allocator) be taken AFTER the mutation rather than across it, which is
+/// the borrow conflict that stopped `deliver_logits` from taking a
+/// `&mut Shell` and would have stopped each of these too.
+///
+/// The stream and the allocator used to be built per fire. The stream
+/// because nothing needed it to outlive the call, and the allocator
+/// because it was convenient — but an allocator that POOLS and is rebuilt
+/// every fire has no pool, so every buffer a fire wanted was a fresh
+/// `cudaMalloc`. Both are the shell's now, which is a saving on its own
+/// and is the precondition for run-ahead: a second fire cannot queue
+/// behind the first onto a stream that dies with the first call.
+///
+/// # Reclaim, and when it waits
+///
+/// A fire's scratch cannot be freed while it runs and cannot be freed
+/// from the callback — CUDA forbids calling the runtime from a host
+/// function, and `cudaFree` is the runtime — so it is freed here. What
+/// matters is WHEN.
+///
+/// This used to hold exactly one holder and `synchronize()` on it, which
+/// is a run-ahead that never runs ahead: the call that would queue fire
+/// n+1 blocked until fire n had finished. It cost nothing to notice while
+/// issuing a fire took longer than running one, and it is the whole game
+/// now that issue is 0.81 ms against 2.9 ms of work.
+///
+/// So: drop everything already retired without asking the driver to wait,
+/// and wait only when the queue is at depth. `RUNAHEAD_DEPTH` is the
+/// backpressure — the driver runs at most that many fires ahead of the
+/// GPU, which bounds the SCRATCH it is holding rather than the time.
+#[cfg(feature = "abi")]
+fn ready_device_state(state: &mut Shell) -> Result<(), i32> {
+    if state.fire_stream.is_none() {
+        state.fire_stream =
+            Some(crate::cuda::OwnedStream::new(0).map_err(|_| PIE_STATUS_DRIVER_ERROR)?);
+    }
+    if state.fire_alloc.is_none() {
+        state.fire_alloc = Some(crate::cuda::Allocator::new());
+    }
+    while state
+        .in_flight
+        .front()
+        .is_some_and(|f| f.done.is_complete().unwrap_or(true))
+    {
+        let done = state.in_flight.pop_front().expect("just checked");
+        retire(done);
+    }
+    while state.in_flight.len() >= RUNAHEAD_DEPTH {
+        let oldest = state.in_flight.pop_front().expect("nonempty");
+        oldest.done.synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        retire(oldest);
+    }
+    Ok(())
+}
+
+/// The hybrids' recurrent context: driver-owned slabs, instance slots.
+///
+/// `step_impl`'s GDN phase, promoted out of it — and the LARGEST of its
+/// phases at a hundred lines, which is why it is worth the six
+/// parameters. It also settles the design question the cut left open.
+///
+/// # Named fields, not a carrier
+///
+/// The middle phases each read the shell one way and write it another,
+/// so `&mut Shell` is a borrow conflict against the `model`, `stream`
+/// and `alloc` the caller already holds — the same wall `deliver_logits`
+/// hit. Two answers were on the table: a `Fire<'a>` struct holding the
+/// borrowed halves, or naming the fields each phase touches.
+///
+/// Naming them wins, and doing it three times is what says so. This
+/// phase touches exactly ONE field of the shell (`gdn`) and reads four
+/// things the caller has already resolved; a carrier would have handed
+/// it the whole fire so it could reach one `Option`. The parameter list
+/// IS the phase's contract, and a reader who wants to know whether the
+/// recurrent slabs can affect the attention plan can answer it from the
+/// signature.
+///
+/// The `alloc`/`stream` pair is shared and `gdn` is mutable, which the
+/// compiler accepts at the call site because they are disjoint fields —
+/// and that is the property a carrier would have hidden rather than
+/// removed.
+///
+/// Returns the context the dispatch reads, and the slot-id buffer it
+/// points into: the buffer is returned rather than dropped because the
+/// context holds a raw pointer to it, and a fire that let it go would
+/// bind a freed address.
+#[cfg(feature = "abi")]
+fn gdn_context(
+    gdn: &mut Option<GdnState>,
+    family: &dyn PlannedFamily,
+    step: &driver_api::local::PieStepDesc,
+    requests: usize,
+    alloc: &crate::cuda::Allocator,
+    stream: &crate::cuda::OwnedStream,
+) -> Result<(Option<crate::model::executor::GdnCtx>, Option<crate::cuda::DeviceBuffer>), i32> {
+        use crate::model::executor::GdnCtx;
+
+    let mut gdn_ctx: Option<GdnCtx> = None;
+    let mut _slot_ids_buf: Option<crate::cuda::DeviceBuffer> = None;
+    if let Some(shape) = family.gdn_shape() {
+        let (conv_stride, state_stride, state_elem) =
+            (shape.conv_stride, shape.state_stride, shape.state_elem);
+        const GDN_SLOTS: u32 = 8;
+        if (*gdn).is_none() {
+            let mut slabs = Vec::new();
+            for l in 0..shape.layers {
+                if !shape.linear_layers.contains(&l) {
+                    slabs.push(None);
+                    continue;
+                }
+                let mut c = alloc
+                    .alloc(GDN_SLOTS as usize * conv_stride * 2)
+                    .map_err(|_| PIE_STATUS_EXHAUSTED)?;
+                let mut r = alloc
+                    .alloc(GDN_SLOTS as usize * state_stride * state_elem)
+                    .map_err(|_| PIE_STATUS_EXHAUSTED)?;
+                c.memset(0, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+                r.memset(0, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+                slabs.push(Some((c, r)));
+            }
+            (*gdn) = Some(GdnState {
+                slabs,
+                num_slots: GDN_SLOTS,
+                conv_stride_elems: i64::try_from(conv_stride).unwrap_or(0),
+                state_stride_elems: i64::try_from(state_stride).unwrap_or(0),
+                state_elem_bytes: state_elem,
+            });
+        }
+        let gdn_state = (*gdn).as_mut().expect("just ensured");
+        // The ENGINE assigns slots: `rs_slot_ids`, one per request. RESET
+        // zeroes a slot before the fire; BUFFER_WRITE routes the pass's
+        // state into a buffer slot instead of the live one; FOLD copies
+        // the accepted prefix back afterwards. See the fold below.
+        let rs_slot_ids = slice_of(step.rs_slot_ids.ptr, step.rs_slot_ids.len);
+        let rs_flags = slice_of(step.rs_slot_flags.ptr, step.rs_slot_flags.len);
+        if rs_slot_ids.len() != requests {
+            eprintln!("[driver-cuda-new] launch: hybrid fire without rs_slot_ids");
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
+        }
+        // THE BUFFER/FOLD FLAGS ARE ACCEPTED NOW, and that is directive
+        // 4.2 of `.wiki/driver/graph.md`.
+        //
+        // They used to be refused wholesale — "rs fold/buffer flags await
+        // spec-decode" — which left the tree carrying TWO mechanisms for
+        // one job: this one, complete on the ABI side since v23/v24, and
+        // the repair fire classes (`CommitAdvance`, `StateOnly`,
+        // `FrozenVerify`) that existed only because this one was off.
+        //
+        // The mechanism is the whole argument for deleting them. A
+        // speculative decode writes its tokens into a BUFFER slot and
+        // folds only the accepted prefix into the live slot; a rejected
+        // token is simply never folded, so there is nothing to repair.
+        // `FrozenVerify` is "prefill plus a verify-stash store" — the
+        // buffer IS the stash. `CommitAdvance` is "replay the confirmed
+        // prefix" — the fold length IS that prefix.
+        let rs_fold_lens = slice_of(step.rs_fold_lens.ptr, step.rs_fold_lens.len);
+        let rs_buffer_slot_ids =
+            slice_of(step.rs_buffer_slot_ids.ptr, step.rs_buffer_slot_ids.len);
+        let rs_buffer_indptr =
+            slice_of(step.rs_buffer_slot_indptr.ptr, step.rs_buffer_slot_indptr.len);
+        let need_slots = rs_slot_ids.iter().copied().max().map_or(1, |m| m + 1);
+        gdn_state.ensure_slots(need_slots, &alloc, &stream)?;
+        for (r, &slot) in rs_slot_ids.iter().enumerate() {
+            if rs_flags.get(r).copied().unwrap_or(0) & driver_api::local::PIE_RS_FLAG_RESET
+                == 0
+            {
+                continue;
+            }
+            // Zero the slot's conv + recurrent regions on every slab.
+            for slab in gdn_state.slabs.iter().flatten() {
+                use cudarc::runtime::sys::{cudaError, cudaMemsetAsync};
+                let conv_bytes = gdn_state.conv_stride_elems as usize * 2;
+                let st_bytes =
+                    gdn_state.state_stride_elems as usize * gdn_state.state_elem_bytes;
+                for (buf, stride) in [(&slab.0, conv_bytes), (&slab.1, st_bytes)] {
+                    let code = unsafe {
+                        cudaMemsetAsync(
+                            buf.as_ptr().cast::<u8>().add(slot as usize * stride).cast(),
+                            0,
+                            stride,
+                            stream.as_ref().as_raw().cast(),
+                        )
+                    };
+                    if code != cudaError::cudaSuccess {
+                        return Err(PIE_STATUS_DRIVER_ERROR);
+                    }
+                }
+            }
+        }
+        let slot_ids_h: Vec<i32> = rs_slot_ids
+            .iter()
+            .enumerate()
+            .map(|(r, &live)| {
+                // A BUFFER_WRITE row's pass writes the BUFFER slot, not
+                // the live one — that is the whole of "the pass scatters
+                // its own tokens". The buffer CSR names one slot per
+                // buffered token; the pass writes the row's head, which
+                // is its first entry.
+                let f = rs_flags.get(r).copied().unwrap_or(0);
+                let slot = if f & driver_api::local::PIE_RS_FLAG_BUFFER_WRITE != 0 {
+                    rs_buffer_indptr
+                        .get(r)
+                        .and_then(|&lo| rs_buffer_slot_ids.get(lo as usize))
+                        .copied()
+                        .unwrap_or(live)
+                } else {
+                    live
+                };
+                i32::try_from(slot).unwrap_or(0)
+            })
+            .collect();
+        // Every slot the fire names has to exist, buffer slots included.
+        let need_buffer = rs_buffer_slot_ids.iter().copied().max().map_or(0, |m| m + 1);
+        gdn_state.ensure_slots(need_buffer.max(need_slots), &alloc, &stream)?;
+        // THE FOLD, recorded on the fire's stream so it lands after the
+        // pass that filled the buffer. Copying the accepted prefix's LAST
+        // state into the live slot is the whole operation: a linear
+        // state is a running summary, so the state after token `k` is the
+        // state the next fire continues from, and the tokens past `k`
+        // were rejected and are simply never folded.
+        for (r, &live) in rs_slot_ids.iter().enumerate() {
+            let f = rs_flags.get(r).copied().unwrap_or(0);
+            if f & driver_api::local::PIE_RS_FLAG_FOLD == 0 {
+                continue;
+            }
+            let (lo, hi) = match (rs_buffer_indptr.get(r), rs_buffer_indptr.get(r + 1)) {
+                (Some(&lo), Some(&hi)) => (lo as usize, hi as usize),
+                _ => continue,
+            };
+            // A device-resolved length is CLAMPED to the row's replay
+            // length, which the ABI names as the bound. The port itself
+            // is not read yet, so a device row folds its whole replay —
+            // the conservative answer, and the one a non-speculative
+            // fire produces anyway.
+            let span = hi.saturating_sub(lo);
+            let want = if f & driver_api::local::PIE_RS_FLAG_FOLD_LEN_DEVICE != 0 {
+                span
+            } else {
+                rs_fold_lens.get(r).copied().unwrap_or(0) as usize
+            };
+            let take = want.min(span);
+            if take == 0 {
+                continue;
+            }
+            let Some(&src_slot) = rs_buffer_slot_ids.get(lo + take - 1) else { continue };
+            for slab in gdn_state.slabs.iter().flatten() {
+                use cudarc::runtime::sys::{cudaError, cudaMemcpyAsync, cudaMemcpyKind};
+                let conv_bytes = gdn_state.conv_stride_elems as usize * 2;
+                let st_bytes =
+                    gdn_state.state_stride_elems as usize * gdn_state.state_elem_bytes;
+                for (buf, stride) in [(&slab.0, conv_bytes), (&slab.1, st_bytes)] {
+                    let code = unsafe {
+                        cudaMemcpyAsync(
+                            buf.as_ptr().cast::<u8>().add(live as usize * stride).cast(),
+                            buf.as_ptr()
+                                .cast::<u8>()
+                                .add(src_slot as usize * stride)
+                                .cast_const()
+                                .cast(),
+                            stride,
+                            cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                            stream.as_ref().as_raw().cast(),
+                        )
+                    };
+                    if code != cudaError::cudaSuccess {
+                        return Err(PIE_STATUS_DRIVER_ERROR);
+                    }
+                }
+            }
+        }
+        let bytes: Vec<u8> = slot_ids_h.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let mut sbuf = alloc.alloc(bytes.len().max(4)).map_err(|_| PIE_STATUS_EXHAUSTED)?;
+        sbuf.copy_from_host(&bytes, stream.as_ref())
+            .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        let to_i32 = |v: u32| i32::try_from(v).unwrap_or(0);
+        let _ = to_i32;
+        gdn_ctx = Some(GdnCtx {
+            k_h: shape.k_h,
+            v_h: shape.v_h,
+            k_d: shape.k_d,
+            v_d: shape.v_d,
+            conv_dim: shape.conv_dim,
+            conv_k: shape.conv_k,
+            n_groups: 0,
+            conv_state: gdn_state
+                .slabs
+                .iter()
+                .map(|sl| sl.as_ref().map_or(0, |(c, _)| c.as_ptr() as u64))
+                .collect(),
+            conv_stride_elems: gdn_state.conv_stride_elems,
+            recurrent_state: gdn_state
+                .slabs
+                .iter()
+                .map(|sl| sl.as_ref().map_or(0, |(_, r)| r.as_ptr() as u64))
+                .collect(),
+            state_stride_elems: gdn_state.state_stride_elems,
+            slot_ids_d: sbuf.as_ptr().cast(),
+            write_state: true,
+        });
+        _slot_ids_buf = Some(sbuf);
+    }
+    Ok((gdn_ctx, _slot_ids_buf))
+}
+
+
+/// Size the KV pools for this fire and describe them per layer.
+///
+/// `step_impl`'s KV phase. It touches ONE field of the shell — `kv` — and
+/// bumps the array epoch when it grows, which is the second reason it is
+/// worth being a function: growth MOVES base addresses, so every capture
+/// that recorded one is stale, and the bump is what says so. Keeping that
+/// pair in one place is what keeps a reader from having to notice it.
+///
+/// # Per-layer geometry, and the layers that own no pool
+///
+/// A family may share one layer's cache with another — gemma-4's trailing
+/// layers project no KV of their own — so `kv_source(l)` says whose pool a
+/// layer reads and only the SOURCES get an allocation. The views then
+/// point every layer at its source's pages, which is why the returned
+/// vector is as long as the layer count and the pool vector is not.
+///
+/// # What growth does not do
+///
+/// It REPLACES the pools without migrating pages. Decode continuity holds
+/// while page demand is stable, which is the single-frame world; page
+/// migration rides with `resize_pool`.
+#[cfg(feature = "abi")]
+#[allow(clippy::too_many_arguments)]
+fn kv_pools_for(
+    kv: &mut Option<KvState>,
+    epoch: &mut u64,
+    family: &dyn PlannedFamily,
+    model: &LoadedModel,
+    need_pages: u32,
+    page_size: i32,
+    alloc: &crate::cuda::Allocator,
+    stream: &crate::cuda::OwnedStream,
+    format: crate::store::KvCacheFormat,
+) -> Result<Vec<crate::launch::KvCacheLayerView>, i32> {
+    let (kv_heads_i, head_dim_i) =
+        (model.hf.num_key_value_heads, model.hf.head_dim_kernel.max(model.hf.head_dim));
+    let head_dim_u = u32::try_from(head_dim_i).unwrap_or(0);
+    let n = family.layers();
+    // Per-layer geometry, family-decided: gemma-4's two layer kinds
+    // disagree on head dim, and its trailing layers own NO pages (they
+    // attend through their source's — the load-time decision).
+    let per_layer = crate::store::kv_cache::PerLayer {
+        head_dim: (0..n).map(|l| family.head_dim_of(l, head_dim_u) as i32).collect(),
+        kv_source_layer: (0..n).map(|l| family.kv_source(l).unwrap_or(l) as i32).collect(),
+        num_kv_heads: vec![kv_heads_i; n as usize],
+    };
+    // One set of pages has ONE shape, so a layer that reads through
+    // another's must have that layer's dims. gemma-4 holds this without
+    // trying — `kv_source` searches by the same predicate `head_dim_of`
+    // keys on — but that is an invariant spread across two functions in
+    // another crate. A violation would not crash: every shared layer
+    // would read its source's pages at its own stride and emit plausible
+    // tokens. It matters HERE because `layer_view` reports an aliased
+    // layer's dims as its SOURCE's.
+    per_layer.check_sharing().map_err(|_| PIE_STATUS_INVALID_ARGUMENT)?;
+
+    let grow = !matches!(&(*kv), Some(kv) if kv.num_pages >= need_pages);
+    if grow {
+        let layout = crate::store::kv_cache::KvCacheLayout::plan_per_layer(
+            n as i32,
+            need_pages as i32,
+            page_size,
+            kv_heads_i,
+            per_layer,
+            format,
+            false,
+        )
+        .map_err(|_| PIE_STATUS_INVALID_ARGUMENT)?;
+
+        let mut ops = crate::store::kv_cache_live::LiveKvCacheOps::new(
+            stream.as_ref().as_raw().cast(),
+            alloc,
+        );
+        let cache = crate::store::kv_cache_live::KvCache::materialize(layout, &mut ops)
+            .map_err(|_| PIE_STATUS_EXHAUSTED)?;
+        let mut held = ops.into_held();
+        // `materialize` does not zero, and the C++ did not either — but
+        // the shell's hand-built pools did, and a page read before its
+        // first write is otherwise whatever the allocator last had.
+        for b in &mut held {
+            b.memset(0, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        }
+
+        // NOTE: growth REPLACES the pages without migrating them — decode
+        // continuity holds while the page demand is stable, which is the
+        // single-frame smoke's world. Page migration rides with resize_pool.
+        //
+        // AND IT MOVES BASE ADDRESSES, so every capture that recorded one is
+        // stale. Same rule as `FireArrays`' own growth, and the same bump:
+        // stale means recapture rather than a replay into freed pages.
+        (*kv) = Some(KvState { cache, _held: held, num_pages: need_pages });
+        *epoch += 1;
+    }
+    Ok((*kv).as_ref().expect("just ensured").views())
 }
 
 
@@ -3595,14 +4613,27 @@ fn step_impl(
 ) -> Result<(), i32> {
     use crate::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use crate::model::executor::{
-        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, Frame, GdnCtx, PrefillPlan, Resolver,
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, Frame, PrefillPlan, Resolver,
         run,
     };
-    use model_compiler::lower::{Arg, Row};
+    use model_compiler::lower::Arg;
     use model_compiler::trace::ValueId;
 
     let t_head = std::time::Instant::now();
-    let (Admitted { class, rows, requests }, family) = admit(state, step)?;
+    let (Admitted { class, rows, requests, fire_rows }, family) = admit(state, step)?;
+    // THE MUTATION FIRST, AND THEN THE BORROWS. `ready_device_state` takes
+    // `&mut Shell`, so every shared borrow this function goes on to hold —
+    // `model`, the lowering, the stream, the allocator — has to be taken
+    // after it. Reading the layer count out as a NUMBER rather than
+    // keeping `model` alive across the call is the whole of what that
+    // costs, and it is what lets the phase be a function at all.
+    let layers = state
+        .model
+        .as_ref()
+        .ok_or(PIE_STATUS_INVALID_ARGUMENT)?
+        .hf
+        .num_hidden_layers;
+    ready_device_state(state)?;
     let model = state.model.as_ref().ok_or(PIE_STATUS_INVALID_ARGUMENT)?;
     let token_ids = slice_of(step.token_ids.ptr, step.token_ids.len);
     let position_ids = slice_of(step.position_ids.ptr, step.position_ids.len);
@@ -3618,19 +4649,19 @@ fn step_impl(
     // Everything between here and `DispatchPlan` is a pure function of the
     // key, and it costs ~3.3 ms on a 0.6B decode. See `Shell::lowerings`.
     let key = LoweringKey {
-        model_id: u64::from(model.hf.num_hidden_layers.unsigned_abs()),
+        model_id: u64::from(layers.unsigned_abs()),
         class,
         rows: u32::try_from(rows).unwrap_or(0),
+        rows_digest: digest_rows(&fire_rows),
         union_asked: supergraph_enabled() && !family.recurrent(),
     };
     if !state.lowerings.contains_key(&key) {
-        let built = build_lowering(family.as_ref(), class, rows, key.union_asked)?;
+        let built = build_lowering(family.as_ref(), class, &fire_rows, key.union_asked)?;
         state.lowerings.insert(key, built);
     }
     let LoweredFire { plan, lowered, dplan, union } =
         state.lowerings.get(&key).expect("just built");
     let union = *union;
-    let fire_rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
     sg_trace(|| format!("  lowering {:?}", t_low.elapsed()));
     let mut phase = std::time::Instant::now();
     let mut lap = |what: &str| {
@@ -3638,53 +4669,6 @@ fn step_impl(
         phase = std::time::Instant::now();
     };
 
-    // ── Device state, and all of it PERSISTENT now. ──
-    //
-    // The stream and the allocator used to be built here, per fire. The
-    // stream because nothing needed it to outlive the call, and the
-    // allocator because it was convenient — but an allocator that POOLS
-    // and is rebuilt every fire has no pool, so every buffer a fire
-    // wanted was a fresh `cudaMalloc`.
-    //
-    // Both are the shell's now. That is a saving on its own and it is the
-    // precondition for run-ahead: a second fire cannot queue behind the
-    // first onto a stream that dies with the first call.
-    if state.fire_stream.is_none() {
-        state.fire_stream =
-            Some(crate::cuda::OwnedStream::new(0).map_err(|_| PIE_STATUS_DRIVER_ERROR)?);
-    }
-    if state.fire_alloc.is_none() {
-        state.fire_alloc = Some(crate::cuda::Allocator::new());
-    }
-    // RECLAIM WHAT HAS FINISHED, AND ONLY WAIT WHEN THE QUEUE IS FULL.
-    //
-    // A fire's scratch cannot be freed while it runs and cannot be freed
-    // from the callback, so it is freed here. What matters is WHEN.
-    //
-    // This used to hold exactly one and `synchronize()` on it, which is a
-    // run-ahead that never runs ahead: the call that would queue fire n+1
-    // blocked until fire n had finished. It cost nothing to notice while
-    // issuing a fire took longer than running one — which is what the first
-    // measurements on this branch said — and it is the whole game now that
-    // issue is 0.81 ms against 2.9 ms of work.
-    //
-    // So: drop everything already retired, without asking the driver to
-    // wait, and wait only when the queue is at depth. `RUNAHEAD_DEPTH` is
-    // the backpressure — the driver runs at most that many fires ahead of
-    // the GPU, which bounds the scratch it is holding rather than the time.
-    while state
-        .in_flight
-        .front()
-        .is_some_and(|f| f.done.is_complete().unwrap_or(true))
-    {
-        let done = state.in_flight.pop_front().expect("just checked");
-        retire(done);
-    }
-    while state.in_flight.len() >= RUNAHEAD_DEPTH {
-        let oldest = state.in_flight.pop_front().expect("nonempty");
-        oldest.done.synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        retire(oldest);
-    }
     let stream = state.fire_stream.as_ref().expect("just ensured");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = state.fire_alloc.as_ref().expect("just ensured");
@@ -3693,87 +4677,24 @@ fn step_impl(
         kv_indices.iter().copied().max().map_or(1, |m| m + 1),
     );
     let page_size: i32 = 16;
+    // Re-derived here as well as inside `kv_pools_for`, because the
+    // attention plans below want the same two numbers and returning them
+    // would make the phase's result a tuple whose second half is a
+    // restatement of its arguments.
     let (kv_heads_i, head_dim_i) =
         (model.hf.num_key_value_heads, model.hf.head_dim_kernel.max(model.hf.head_dim));
-    let head_dim_u = u32::try_from(head_dim_i).unwrap_or(0);
-    // Per-layer pool geometry, family-decided: gemma-4's two layer kinds
-    // disagree on head dim and its trailing layers own NO pool (they
-    // attend through their source's pages — the load-time decision). A
-    // `None` row is a shared layer; its VIEW mirrors the source below.
-    let layer_geom: Vec<Option<(i32, u32)>> = (0..family.layers())
-        .map(|l| {
-            // A layer that attends through another's pages owns no pool;
-            // its VIEW mirrors the source below.
-            family
-                .kv_source(l)
-                .is_none()
-                .then(|| (family.head_dim_of(l, head_dim_u) as i32, l))
-        })
-        .collect();
-    let grow = !matches!(&state.kv, Some(kv) if kv.num_pages >= need_pages);
-    if grow {
-        let mut pools = Vec::new();
-        for g in &layer_geom {
-            let Some((d, _)) = g else {
-                pools.push(None);
-                continue;
-            };
-            let bytes = need_pages as usize
-                * page_size as usize
-                * kv_heads_i as usize
-                * *d as usize
-                * 2;
-            let mut k = alloc.alloc(bytes).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-            let mut v = alloc.alloc(bytes).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-            k.memset(0, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            v.memset(0, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            pools.push(Some((k, v)));
-        }
-        // NOTE: growth REPLACES the pools without migrating pages — decode
-        // continuity holds while the page demand is stable, which is the
-        // single-frame smoke's world. Page migration rides with resize_pool.
-        //
-        // AND IT MOVES BASE ADDRESSES, so every capture that recorded one is
-        // stale. Same rule as `FireArrays`' own growth, and the same bump:
-        // stale means recapture rather than a replay into freed pages.
-        state.kv = Some(KvState { pools, num_pages: need_pages });
-        state.fire_arrays.epoch += 1;
-    }
-    let kv = state.kv.as_ref().expect("just ensured");
-    let kv_source_of = |i: usize| -> usize {
-        family.kv_source(u32::try_from(i).unwrap_or(0)).map_or(i, |s| s as usize)
-    };
-    let layers: Vec<crate::launch::KvCacheLayerView> = (0..kv.pools.len())
-        .map(|i| {
-            let src = kv_source_of(i);
-            let (k, v) = kv.pools[src].as_ref().map_or(
-                (core::ptr::null_mut(), core::ptr::null_mut()),
-                |(k, v)| (k.as_ptr(), v.as_ptr()),
-            );
-            let d = family.head_dim_of(u32::try_from(i).unwrap_or(0), head_dim_u) as i32;
-            crate::launch::KvCacheLayerView {
-                layer: i as i32,
-                source_layer: src as i32,
-                num_pages: kv.num_pages as i32,
-                page_size,
-                num_kv_heads: kv_heads_i,
-                head_dim: d,
-                scheme: crate::launch::KvCacheScheme::Native,
-                storage_dtype: crate::dtype::DType::Bf16,
-                block_size: 0,
-                k_pages: k,
-                v_pages: v,
-                k_scales: core::ptr::null_mut(),
-                v_scales: core::ptr::null_mut(),
-                k_bf16_pages: k,
-                v_bf16_pages: v,
-                k_env_min: core::ptr::null_mut(),
-                k_env_max: core::ptr::null_mut(),
-                hnd_layout: false,
-                native_bf16: true,
-            }
-        })
-        .collect();
+    let kv_format = state.kv_format;
+    let layers = kv_pools_for(
+        &mut state.kv,
+        &mut state.fire_arrays.epoch,
+        family.as_ref(),
+        model,
+        need_pages,
+        page_size,
+        alloc,
+        stream,
+        kv_format,
+    )?;
 
     // The fire's descriptor arrays, POOLED like the arena and for the same
     // reason: a capture bakes an address, so the buffer has to be the same
@@ -3787,6 +4708,7 @@ fn step_impl(
     const S_QO: usize = 5;
     const S_W_PAGE: usize = 6;
     const S_W_OFF: usize = 7;
+    const S_SAMPLED: usize = 8;
     let d_ids = state.fire_arrays.upload_u32(&alloc, S_IDS, token_ids, stream.as_ref())?;
     let d_pos = state.fire_arrays.upload_u32(&alloc, S_POS, position_ids, stream.as_ref())?;
     let d_kv_indices =
@@ -3796,6 +4718,23 @@ fn step_impl(
     let d_kv_lens =
         state.fire_arrays.upload_u32(&alloc, S_KV_LENS, kv_lens, stream.as_ref())?;
     let d_qo = state.fire_arrays.upload_u32(&alloc, S_QO, qo_indptr, stream.as_ref())?;
+    // WHICH ROWS the epilogue gathers, from the rows the step described.
+    // Derived here rather than taken from `sampling_indices` directly, so
+    // the pointer and the guard that produced it cannot disagree: the
+    // lowering states a gather exactly when `sampled < window.len()`, and
+    // it counts the same `Row::samples` this reads.
+    let sampled_rows: Vec<u32> = fire_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.samples.then_some(u32::try_from(i).unwrap_or(0)))
+        .collect();
+    let d_sampled = if sampled_rows.len() == rows {
+        // Every row sampled means no gather is stated, and a pointer for
+        // a launch nobody makes is one more thing to keep in step.
+        core::ptr::null()
+    } else {
+        state.fire_arrays.upload_u32(&alloc, S_SAMPLED, &sampled_rows, stream.as_ref())?
+    };
 
     // Write targets: each request appends its NEW tokens at the CSR tail.
     // Decode appends one token at `len - 1`; prefill appends its whole
@@ -3848,43 +4787,47 @@ fn step_impl(
         .iter()
         .any(|k| k == "attn::dispatch_attention_flashinfer_decode");
     ws.begin_plan_update(&mut sops).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+    // EVERY PLAN THE GEOMETRY PERMITS, not just the one this fire's text
+    // states. Under `GuardMode::Union` both arms of an attention guard are
+    // recorded, and a capture that walks an arm whose plan was never
+    // raised is abandoned — so prepared state belongs to the bucket rather
+    // than to the arm (`.wiki/driver/graph.md` §5 ①). It is also the
+    // precondition for §4.1: a merged Decode/Prefill graph needs BOTH
+    // classes' plans standing whenever either is captured.
+    //
+    // The cost is plan-raise time. It is not runtime waste — the arm a
+    // fire does not take is skipped by the conditional, not executed.
+    let planless_prefill = family.planless_prefill();
     let decode_plan_full_ptr = if let Some((d_sliding, d_full)) = family.decode_plan_head_dims() {
-        if states_decode_dispatch {
-            // TWO decode plans, one per layer kind — the C++'s
-            // `decode_plan_sliding` / `decode_plan_full` pair, because
-            // the kinds disagree on head dim and the planner bakes it in.
-            decode_plan.plan_decode_variant(
-                kv_indptr,
-                model.hf.num_attention_heads,
-                kv_heads_i,
-                d_sliding as i32,
-                page_size,
-                ws.view(),
-                raw_stream,
-                false,
-                false,
-                -1,
-            );
-            decode_plan_full.plan_decode_variant(
-                kv_indptr,
-                model.hf.num_attention_heads,
-                kv_heads_i,
-                d_full as i32,
-                page_size,
-                ws.view(),
-                raw_stream,
-                false,
-                true,
-                -1,
-            );
-            decode_plan_full.as_ptr()
-        } else {
-            // gemma-4's prefill is PLANLESS (it plans internally per
-            // fire, off the host CSR mirrors) and its 512-wide layers
-            // take the naive kernel — nothing to pre-plan.
-            core::ptr::null_mut()
-        }
-    } else if states_decode_dispatch {
+        // TWO decode plans, one per layer kind — the C++'s
+        // `decode_plan_sliding` / `decode_plan_full` pair, because
+        // the kinds disagree on head dim and the planner bakes it in.
+        decode_plan.plan_decode_variant(
+            kv_indptr,
+            model.hf.num_attention_heads,
+            kv_heads_i,
+            d_sliding as i32,
+            page_size,
+            ws.view(),
+            raw_stream,
+            false,
+            false,
+            -1,
+        );
+        decode_plan_full.plan_decode_variant(
+            kv_indptr,
+            model.hf.num_attention_heads,
+            kv_heads_i,
+            d_full as i32,
+            page_size,
+            ws.view(),
+            raw_stream,
+            false,
+            true,
+            -1,
+        );
+        decode_plan_full.as_ptr()
+    } else {
         decode_plan.plan_decode(
             kv_indptr,
             model.hf.num_attention_heads,
@@ -3897,7 +4840,12 @@ fn step_impl(
             -1,
         );
         core::ptr::null_mut()
-    } else {
+    };
+    // gemma-4's prefill is PLANLESS (it plans internally per fire, off the
+    // host CSR mirrors) and its 512-wide layers take the naive kernel —
+    // there is nothing to pre-plan, so it is the one plan that stays
+    // unraised.
+    if !planless_prefill {
         prefill_plan.plan_prefill(
             qo_indptr,
             kv_indptr,
@@ -3911,8 +4859,7 @@ fn step_impl(
             false,
             -1,
         );
-        core::ptr::null_mut()
-    };
+    }
     ws.end_plan_update(&mut sops, raw_stream);
 
     let arena_bytes = lowered.arena_bytes.max(64);
@@ -3938,136 +4885,94 @@ fn step_impl(
         // simply leave half the pin unread.
         state.fire_arrays.named(&alloc, v, rows * w as usize * 4, stream.as_ref())?;
     }
-    // NO SCORE SINK, deliberately, and this is what makes the capture
-    // path safe rather than merely optional.
+    // THE SCORE SINK IS UNCONDITIONAL, and that is a reversal.
     //
-    // A fire that wants no scores prepares no score path: no plan raised
-    // for the full-attention variant, no folded-row layout, no
-    // observation window. The score-capturing dispatch needs all three,
-    // and its launcher REFUSES by throwing — which the generated shim
-    // prints and then aborts on, because an exception crossing the C ABI
-    // has nowhere else to go.
+    // It used to be null on purpose: a fire that wants no scores prepares
+    // no score path, the capturing dispatch refuses without one, and
+    // refusing before the launcher is reached beats an exception crossing
+    // the C ABI with nowhere to go. Sound — but it makes the union decline
+    // every lowering that so much as MENTIONS `_capture`, which is the one
+    // case the union was built for. `WantsAttnScore` is a FOLDED
+    // predicate: one exec is supposed to serve the fire that wants scores
+    // and the fire that does not, and under `GuardMode::Union` both arms
+    // are recorded whether or not this fire takes either.
     //
-    // So the arm has to refuse before the launcher is reached, and a null
-    // sink is how it knows to. `run_captured` then returns a refusal, the
-    // capture is abandoned, and the fire runs eagerly — the same answer
-    // ungrouped LoRA gets. Publishing a plausible-looking empty sink
-    // instead would put the decision inside a launcher that can only
-    // answer by killing the process.
-    let d_score_indptr: *const u32 = core::ptr::null();
-    let d_scores: *mut std::ffi::c_void = core::ptr::null_mut();
+    // So the question is not "what does this fire need" but "what could
+    // any arm need", and the answer is published every time. The cost is
+    // resident memory and plan-raise time; it is NOT runtime waste,
+    // because the arm a fire does not take is skipped by the conditional
+    // rather than executed. `.wiki/driver/graph.md` §5 ①.
+    let score_window = if states_decode_dispatch {
+        1
+    } else {
+        crate::model::attn_score::default_attn_score_window()
+    };
+    let sink = crate::model::attn_score::plan_score_sink(
+        kv_indptr,
+        kv_lens,
+        page_size,
+        u32::try_from(model.hf.num_attention_heads).unwrap_or(0),
+        score_window,
+    );
+    let (d_scores, d_folded, d_score_indptr) = match sink {
+        // A sink too large to publish (the prefill window grows with the
+        // context) keeps the old answer: null, and the capturing arm
+        // declines exactly as it did.
+        None => (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null()),
+        Some(p) => {
+            let base = state.fire_arrays.score(&alloc, &p, stream.as_ref())?;
+            (
+                base,
+                unsafe { base.cast::<u8>().add(p.folded_offset) }.cast::<std::ffi::c_void>(),
+                unsafe { base.cast::<u8>().add(p.indptr_offset) }.cast::<i32>().cast_const(),
+            )
+        }
+    };
+
+    // THE CUSTOM MASK, likewise unconditional. `HasCustomMask` is folded
+    // too, so the `_custom` arm has to be recordable whether or not this
+    // fire stages a mask. The resident form is plain causal — the same
+    // answer the unmasked arm computes — so taking the arm with nothing
+    // staged is correct rather than merely safe. A real staged mask
+    // overwrites these bytes; the addresses do not move.
+    let (d_mask, d_mask_indptr) = match crate::model::page_mask::element_mask::plan_causal(
+        qo_indptr,
+        kv_indptr,
+        kv_lens,
+        page_size,
+    ) {
+        None => (core::ptr::null(), core::ptr::null()),
+        Some(p) => {
+            let base = state.fire_arrays.mask(&alloc, &p, stream.as_ref())?;
+            (
+                base.cast::<u8>().cast_const(),
+                unsafe { base.cast::<u8>().add(p.indptr_offset) }.cast::<i32>().cast_const(),
+            )
+        }
+    };
+
+    // The driver-owned attention landing, resolved BEFORE `named_bufs`
+    // borrows the map: a fire whose op join names no output slot lands
+    // here instead of losing its graph. Null when the family states its
+    // attention output as an SSA arg (gemma-4 does).
+    let d_attn_out = if family.pins_attention_values() {
+        state.fire_arrays.attn_out(
+            &alloc,
+            rows * model.hf.num_attention_heads as usize
+                * usize::try_from(model.hf.head_dim).unwrap_or(0)
+                * 2,
+        )?
+    } else {
+        core::ptr::null_mut()
+    };
 
     let named_bufs = &state.fire_arrays.named;
 
     lap("attn-plan");
     // ── The hybrid's GDN context: driver-owned slabs, instance slots. ──
-    let mut gdn_ctx: Option<GdnCtx> = None;
-    let mut _slot_ids_buf: Option<crate::cuda::DeviceBuffer> = None;
-    if let Some(shape) = family.gdn_shape() {
-        let (conv_stride, state_stride, state_elem) =
-            (shape.conv_stride, shape.state_stride, shape.state_elem);
-        const GDN_SLOTS: u32 = 8;
-        if state.gdn.is_none() {
-            let mut slabs = Vec::new();
-            for l in 0..shape.layers {
-                if !shape.linear_layers.contains(&l) {
-                    slabs.push(None);
-                    continue;
-                }
-                let mut c = alloc
-                    .alloc(GDN_SLOTS as usize * conv_stride * 2)
-                    .map_err(|_| PIE_STATUS_EXHAUSTED)?;
-                let mut r = alloc
-                    .alloc(GDN_SLOTS as usize * state_stride * state_elem)
-                    .map_err(|_| PIE_STATUS_EXHAUSTED)?;
-                c.memset(0, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-                r.memset(0, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-                slabs.push(Some((c, r)));
-            }
-            state.gdn = Some(GdnState {
-                slabs,
-                num_slots: GDN_SLOTS,
-                conv_stride_elems: i64::try_from(conv_stride).unwrap_or(0),
-                state_stride_elems: i64::try_from(state_stride).unwrap_or(0),
-                state_elem_bytes: state_elem,
-            });
-        }
-        let gdn_state = state.gdn.as_mut().expect("just ensured");
-        // The ENGINE assigns slots: `rs_slot_ids`, one per request. The
-        // flags this shell executes are RESET (zero the slot before the
-        // fire); the fold/buffer machinery is spec-decode's and refuses.
-        let rs_slot_ids = slice_of(step.rs_slot_ids.ptr, step.rs_slot_ids.len);
-        let rs_flags = slice_of(step.rs_slot_flags.ptr, step.rs_slot_flags.len);
-        if rs_slot_ids.len() != requests {
-            eprintln!("[driver-cuda-new] launch: hybrid fire without rs_slot_ids");
-            return Err(PIE_STATUS_INVALID_ARGUMENT);
-        }
-        if rs_flags.iter().any(|f| f & !driver_api::local::PIE_RS_FLAG_RESET != 0) {
-            eprintln!("[driver-cuda-new] launch: rs fold/buffer flags await spec-decode");
-            return Err(PIE_STATUS_UNSUPPORTED);
-        }
-        let need_slots = rs_slot_ids.iter().copied().max().map_or(1, |m| m + 1);
-        gdn_state.ensure_slots(need_slots, &alloc, &stream)?;
-        for (r, &slot) in rs_slot_ids.iter().enumerate() {
-            if rs_flags.get(r).copied().unwrap_or(0) & driver_api::local::PIE_RS_FLAG_RESET
-                == 0
-            {
-                continue;
-            }
-            // Zero the slot's conv + recurrent regions on every slab.
-            for slab in gdn_state.slabs.iter().flatten() {
-                use cudarc::runtime::sys::{cudaError, cudaMemsetAsync};
-                let conv_bytes = gdn_state.conv_stride_elems as usize * 2;
-                let st_bytes =
-                    gdn_state.state_stride_elems as usize * gdn_state.state_elem_bytes;
-                for (buf, stride) in [(&slab.0, conv_bytes), (&slab.1, st_bytes)] {
-                    let code = unsafe {
-                        cudaMemsetAsync(
-                            buf.as_ptr().cast::<u8>().add(slot as usize * stride).cast(),
-                            0,
-                            stride,
-                            stream.as_ref().as_raw().cast(),
-                        )
-                    };
-                    if code != cudaError::cudaSuccess {
-                        return Err(PIE_STATUS_DRIVER_ERROR);
-                    }
-                }
-            }
-        }
-        let slot_ids_h: Vec<i32> =
-            rs_slot_ids.iter().map(|&u| i32::try_from(u).unwrap_or(0)).collect();
-        let bytes: Vec<u8> = slot_ids_h.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let mut sbuf = alloc.alloc(bytes.len().max(4)).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-        sbuf.copy_from_host(&bytes, stream.as_ref())
-            .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        let to_i32 = |v: u32| i32::try_from(v).unwrap_or(0);
-        let _ = to_i32;
-        gdn_ctx = Some(GdnCtx {
-            k_h: shape.k_h,
-            v_h: shape.v_h,
-            k_d: shape.k_d,
-            v_d: shape.v_d,
-            conv_dim: shape.conv_dim,
-            conv_k: shape.conv_k,
-            n_groups: 0,
-            conv_state: gdn_state
-                .slabs
-                .iter()
-                .map(|sl| sl.as_ref().map_or(0, |(c, _)| c.as_ptr() as u64))
-                .collect(),
-            conv_stride_elems: gdn_state.conv_stride_elems,
-            recurrent_state: gdn_state
-                .slabs
-                .iter()
-                .map(|sl| sl.as_ref().map_or(0, |(_, r)| r.as_ptr() as u64))
-                .collect(),
-            state_stride_elems: gdn_state.state_stride_elems,
-            slot_ids_d: sbuf.as_ptr().cast(),
-            write_state: true,
-        });
-        _slot_ids_buf = Some(sbuf);
-    }
+    let (gdn_ctx, _slot_ids_buf) =
+        gdn_context(&mut state.gdn, family.as_ref(), step, requests, alloc, stream)?;
+
     let lse = alloc
         .alloc(rows * model.hf.num_attention_heads as usize * 4)
         .map_err(|_| PIE_STATUS_EXHAUSTED)?;
@@ -4076,7 +4981,7 @@ fn step_impl(
     // The guard-owned attention values, discovered from the lowering as
     // the smokes discovered them. gemma-4 has NONE: both its attention
     // forms state [q, o] as SSA args, so the pins stay null.
-    let (q_pin, o_off) = if !family.pins_attention_values() {
+    let (q_pin, o_off): (Option<ValueId>, Option<usize>) = if !family.pins_attention_values() {
         (None, None)
     } else {
         let dispatch_name = if states_decode_dispatch {
@@ -4125,14 +5030,21 @@ fn step_impl(
         // Positional is what breaks under `Union` — every guard arm is
         // present, so the launch after the dispatch belongs to some other
         // body — which is why the join is tried first rather than second.
-        let Some(o_off) = attention_landing(&lowered, &dplan, fi) else {
-            eprintln!(
-                "[driver-cuda-new] launch: {dispatch_name} states no arena \
-                 output, and the launch after it is not one either"
-            );
-            return Err(PIE_STATUS_UNSUPPORTED);
-        };
-        (q_pin, Some(o_off))
+        // A JOIN THAT NAMES NO SLOT IS NOT A REFUSAL any more.
+        //
+        // This used to return `PIE_STATUS_UNSUPPORTED`, and before the
+        // union it also fell back to the neighbour read -- "the launch
+        // after the dispatch is the o_proj, so its input is the slot the
+        // dispatch wrote". That is a fact read off where a statement SITS,
+        // and it is false under `GuardMode::Union`, where every arm is
+        // present and the neighbour belongs to some other body.
+        //
+        // But `AttnCtx::o_out` is a DRIVER-owned pointer -- the whole
+        // reason it exists is that the region's launches record no SSA
+        // output of their own. So a fire whose join names no slot gets a
+        // driver-owned landing buffer, and keeps its graph
+        // (`.wiki/driver/graph.md` §5 (2)).
+        (q_pin, attention_landing(&lowered, &dplan, fi))
     };
 
     struct LiveResolver<'a> {
@@ -4165,12 +5077,17 @@ fn step_impl(
             .and_then(|v| named_bufs.get(&v).map(|b| b.as_ptr()))
             .unwrap_or(core::ptr::null_mut()),
         score_out: d_scores.cast(),
+        folded_out: d_folded.cast(),
         score_indptr_d: d_score_indptr.cast(),
-        o_out: o_off
-            .map_or(core::ptr::null_mut(), |off| unsafe {
-                arena_ptr.cast::<u8>().add(off)
-            }
-            .cast()),
+        mask_d: d_mask,
+        mask_indptr_d: d_mask_indptr,
+        o_out: match o_off {
+            Some(off) => unsafe { arena_ptr.cast::<u8>().add(off) }.cast(),
+            // No stated slot: the driver's own landing buffer, sized to
+            // the fire's attention output and pooled like the rest so a
+            // capture that baked its address keeps addressing something.
+            None => d_attn_out,
+        },
         kv_page_indices_d: d_kv_indices.cast(),
         kv_page_indptr_d: d_kv_indptr.cast(),
         kv_last_page_lens_d: d_kv_lens.cast(),
@@ -4210,22 +5127,46 @@ fn step_impl(
     // answers with empties.
     let FamilyTables { theta_by_layer, rotary_by_layer, softcap, ple_dim, scales } =
         family.tables(model);
-    // The peel window word, uploaded before the walk so a tail region's
-    // `_devwin` launch reads a split rather than whatever was there. The
-    // engine does not yet mark rows, so the window is the whole fire —
-    // which is what an unpeeled fire means and what the lowering's own
-    // prefix/tail split degenerates to.
+    // THE PEEL WINDOW, and this is where layer 3 stops being vocabulary.
+    //
+    // It used to be `set(0, rows)` on every fire — "start 0, count ALL",
+    // which is the word for NO SPLIT. Nothing ever computed a boundary, so
+    // the per-row polymorphism the `_devwin` kernels exist for had never
+    // once executed (`.wiki/driver/graph.md` §2, §5 ③).
+    //
+    // Worse than unused: WRONG whenever a peel did lower. `lower::split_at`
+    // computes the real boundary from the fire's rows and gives the tail
+    // region the rectangle `[split, N)` — but a `_devwin` launch ignores
+    // `bound.rows.start` by contract and reads this word instead. Saying
+    // "all rows" therefore ran the tail's program over the PREFIX rows
+    // too, silently, on every peeled fire.
+    //
+    // The window is read off the lowering rather than re-derived, because
+    // the lowering already answered: the tail rectangle IS the window its
+    // launches want, and two derivations of one split is how they drift.
     if state.peel_win.is_none() {
         state.peel_win = Some(
             crate::cuda::PeelWindowWord::new(alloc).map_err(|_| PIE_STATUS_EXHAUSTED)?,
         );
     }
     let peel_win = state.peel_win.as_mut().expect("just ensured");
-    peel_win.set(0, u32::try_from(rows).unwrap_or(0));
+    let (peel_start, peel_count) = lowered
+        .launches
+        .iter()
+        .find(|l| l.peel.is_some_and(|p| p.tail))
+        .map_or_else(
+            // No peel lowered: the whole fire is one region, which is what
+            // an unpeeled fire means.
+            || (0, u32::try_from(rows).unwrap_or(0)),
+            |l| (l.rows.start, l.rows.end.saturating_sub(l.rows.start)),
+        );
+    peel_win.set(peel_start, peel_count);
     peel_win.upload(stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
     let peel_window_ptr = peel_win.device_ptr();
 
     let ctx = DispatchCtx {
+        sampling_indices: d_sampled.cast::<i32>(),
+        sampled_rows: i32::try_from(sampled_rows.len()).unwrap_or(0),
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: model.hf.rms_norm_eps,
@@ -4327,28 +5268,108 @@ fn step_impl(
     // runtime waited forever on a frame the driver had finished.
     let mut debt = owes.map(|(completion, cells)| FireDebt {
         staging: None,
-        channel: None,
+        readouts: Vec::new(),
         vocab: usize::try_from(model.hf.vocab_size).unwrap_or(0),
-        last_row: rows.saturating_sub(1),
         cells,
         completion,
         notify: state.notify,
         notify_ctx: state.notify_ctx,
     });
 
-    deliver_logits(
-        &state.instances,
-        &state.channels,
-        &mut state.logits_staging,
-        frame,
-        model,
-        lowered,
-        dplan,
-        named_bufs,
-        stream.as_ref(),
-        rows,
-        &mut debt,
-    )?;
+    // ── Sampling: the instance's PROGRAM, if it has one. ──
+    //
+    // Before the delivery below and not after, because a program that
+    // published is a fire whose answer has already gone out — top-p,
+    // top-k, temperature and argmax are its stages, and handing the
+    // caller raw logits beside them would deliver twice and disagree
+    // with itself.
+    //
+    // Everything about this degrades to the old behaviour: no program, a
+    // program that declines, inputs not ready, or channels this shell
+    // does not hold all return `false` and fall through to the raw
+    // logits. That is what the driver did before this existed, so the
+    // worst case is the status quo rather than a broken fire.
+    // A FRESH borrow of the allocator, not the one from the top of the
+    // fire. The capture above takes `&mut state.fire_alloc` — deliberately,
+    // since a capture must be opened on the allocator that owns what the
+    // fire frees — and reusing the earlier binding here would extend a
+    // shared borrow across it. Re-deriving is one line and says where the
+    // mutable window ended.
+    let alloc = state.fire_alloc.as_ref().expect("the fire allocator exists");
+    let vocab = u32::try_from(model.hf.vocab_size).unwrap_or(0);
+    let readout = (0..lowered.launches.len()).rev().find_map(|i| {
+        dplan.spec(i).outs.first().and_then(|a| match a {
+            Arg::Named { value, .. } => Some(*value),
+            Arg::Arena { .. } | Arg::Weight(_) => None,
+        })
+    });
+    let logits_base = readout
+        .and_then(|v| named_bufs.get(&v))
+        .map_or(0, |b| b.as_ptr() as u64);
+    // EVERY REQUEST, each over its OWN row.
+    //
+    // This used to fire only `instance_ids.first()`, and then let a
+    // successful publish suppress `deliver_logits` for the whole frame —
+    // so a two-request batch sampled request 0 and returned request 1
+    // NOTHING AT ALL: no sample, because its program never ran, and no
+    // logits, because request 0's had.
+    //
+    // A request's logits row is the last row of its token span, which is
+    // what `qo_indptr` states: request `r` owns `qo_indptr[r]
+    // ..qo_indptr[r + 1]`, so its row is `qo_indptr[r + 1] - 1`. On a
+    // decode that is `r`; on a prefill it is not, and the difference is
+    // the whole reason to read the indptr rather than count.
+    //
+    // Still one lane per fire — `ptir::fire`'s grouping is unbuilt — so
+    // this is N single-lane fires rather than one N-lane fire. Slower and
+    // correct, which is the right order.
+    let instance_ids = slice_of(frame.instance_ids.ptr, frame.instance_ids.len);
+    // Which requests still need raw logits: the ones whose program did
+    // not publish. A frame can be MIXED — one request bound to a sampling
+    // program and another not — and each half has to be served, which is
+    // why this is a set rather than a flag.
+    let mut unsampled: Vec<usize> = Vec::new();
+    for (r, &iid) in instance_ids.iter().enumerate() {
+        let Some(&end) = qo_indptr.get(r + 1) else { break };
+        let row = (end as usize).saturating_sub(1).min(rows.saturating_sub(1));
+        if run_program(
+            &state.instances,
+            &state.channels,
+            &state.ptir_programs,
+            &mut state.ptir_control,
+            &mut state.ptir_sessions,
+            state.ptir.disk(),
+            state.device_ordinal,
+            iid,
+            (logits_base, vocab, vocab),
+            rows,
+            row,
+            alloc,
+            stream,
+        )? {
+            continue;
+        }
+        unsampled.push(r);
+    }
+    lap("sample");
+
+    if !unsampled.is_empty() {
+        deliver_logits(
+            &state.instances,
+            &state.channels,
+            &mut state.logits_staging,
+            frame,
+            model,
+            lowered,
+            dplan,
+            named_bufs,
+            stream.as_ref(),
+            rows,
+            qo_indptr,
+            &unsampled,
+            &mut debt,
+        )?;
+    }
 
     // The debt goes last in stream order, so it runs after every
     // launch and after the D2H above.
@@ -4543,8 +5564,13 @@ pub fn pie_cuda_encode(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(desc) = (unsafe { encode.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+        let desc = match checked(
+            encode,
+            |d| unsafe { driver_api::local::validate_encode_desc(d) },
+            "encode",
+        ) {
+            Ok(d) => d,
+            Err(status) => return status,
         };
         let Some(model) = state.model.as_ref() else {
             return PIE_STATUS_INVALID_ARGUMENT;
@@ -4745,8 +5771,9 @@ pub fn pie_cuda_copy_kv(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(desc) = (unsafe { copy.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+        let desc = match checked(copy, driver_api::local::validate_kv_copy_desc, "copy_kv") {
+            Ok(d) => d,
+            Err(status) => return status,
         };
         let host_src = desc.src_domain != PIE_MEMORY_DOMAIN_CUDA_DEVICE;
         let host_dst = desc.dst_domain != PIE_MEMORY_DOMAIN_CUDA_DEVICE;
@@ -4779,11 +5806,7 @@ pub fn pie_cuda_copy_kv(
         // strides; a wrong-sized host page is corruption, not degradation.
         {
             let kv_ref = state.kv.as_ref().expect("checked");
-            let uniform = kv_ref
-                .pools
-                .iter()
-                .all(|p| p.as_ref().is_some_and(|(k, _)| k.len() == page_bytes * kv_ref.num_pages as usize));
-            if !uniform && (host_src || host_dst) {
+            if !kv_ref.uniform_stride(page_bytes) && (host_src || host_dst) {
                 eprintln!("[driver-cuda-new] copy_kv: host swap awaits per-layer strides");
                 return PIE_STATUS_UNSUPPORTED;
             }
@@ -4843,14 +5866,13 @@ pub fn pie_cuda_copy_kv(
             {
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
-            for (l, pools) in kv_ref.pools.iter().enumerate() {
+            for l in 0..kv_ref.layers() {
                 // A layer that owns no pages has none to move.
-                let Some((k, v)) = pools.as_ref() else { continue };
-                // THIS layer's page bytes — the pool's own stride, so the
-                // two-head-dim families move the right amount per layer.
-                let pb = k.len() / kv_ref.num_pages as usize;
+                let (Some((k, v)), Some(pb)) = (kv_ref.owned(l), kv_ref.page_bytes(l)) else {
+                    continue;
+                };
                 for (plane, pool) in [k, v].into_iter().enumerate() {
-                    let dev = pool.as_ptr().cast::<u8>();
+                    let dev = pool.cast::<u8>();
                     let (dst, src, kind) = if host_dst {
                         (
                             state.swap.as_ref().expect("ensured").page(l, plane, *d_id),
@@ -4898,16 +5920,13 @@ pub fn pie_cuda_copy_kv(
                 (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
                 _ => return PIE_STATUS_EXHAUSTED,
             };
-            for (i, pools) in kv_ref.pools.iter().enumerate() {
-                let Some((k, v)) = pools.as_ref() else { continue };
-                // THIS layer's head dim, derived from its own pool — the
-                // two-head-dim families' rows disagree and the stride must
-                // follow the pool, not the config's single number.
-                let d = (k.len()
-                    / kv_ref.num_pages as usize
-                    / page_size as usize
-                    / kv_heads.max(1) as usize
-                    / 2) as i32;
+            // Only the layers that OWN pages: a shared layer's cells live
+            // in its source's pool, so visiting it too would copy them
+            // twice.
+            for i in 0..kv_ref.layers() {
+                let (Some((k, v)), Some(d)) = (kv_ref.owned(i), kv_ref.head_dim(i)) else {
+                    continue;
+                };
                 let layer = crate::launch::KvCacheLayerView {
                     layer: i as i32,
                     source_layer: i as i32,
@@ -4918,12 +5937,12 @@ pub fn pie_cuda_copy_kv(
                     scheme: crate::launch::KvCacheScheme::Native,
                     storage_dtype: crate::dtype::DType::Bf16,
                     block_size: 0,
-                    k_pages: k.as_ptr(),
-                    v_pages: v.as_ptr(),
+                    k_pages: k,
+                    v_pages: v,
                     k_scales: core::ptr::null_mut(),
                     v_scales: core::ptr::null_mut(),
-                    k_bf16_pages: k.as_ptr(),
-                    v_bf16_pages: v.as_ptr(),
+                    k_bf16_pages: k,
+                    v_bf16_pages: v,
                     k_env_min: core::ptr::null_mut(),
                     k_env_max: core::ptr::null_mut(),
                     hnd_layout: false,
@@ -4967,9 +5986,11 @@ pub fn pie_cuda_copy_state(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(desc) = (unsafe { copy.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
+        let desc =
+            match checked(copy, driver_api::local::validate_state_copy_desc, "copy_state") {
+                Ok(d) => d,
+                Err(status) => return status,
+            };
         let Some(gdn) = state.gdn.as_mut() else {
             // No recurrent family is loaded — the C++ shape: state copies
             // only mean something once the rs cache exists.
@@ -5040,9 +6061,11 @@ pub fn pie_cuda_resize_pool(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let Some(desc) = (unsafe { resize.as_ref() }) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
+        let desc =
+            match checked(resize, driver_api::local::validate_pool_resize_desc, "resize_pool") {
+                Ok(d) => d,
+                Err(status) => return status,
+            };
         let Ok(target) = u32::try_from(desc.target_pages) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
@@ -5055,7 +6078,6 @@ pub fn pie_cuda_resize_pool(
         let (kv_heads, head_dim) =
             (model.hf.num_key_value_heads, model.hf.head_dim_kernel.max(model.hf.head_dim));
         let page_size: usize = 16;
-        let page_bytes = page_size * kv_heads as usize * head_dim as usize * 2;
 
         let stream = match crate::cuda::OwnedStream::new(0) {
             Ok(s) => s,
@@ -5072,51 +6094,111 @@ pub fn pie_cuda_resize_pool(
         let n_layers = model.hf.num_hidden_layers as usize;
         let first_shared =
             n_layers.saturating_sub(usize::try_from(model.hf.num_kv_shared_layers).unwrap_or(0));
-        let layer_page_bytes = |i: usize| -> Option<usize> {
-            if let Some(old_kv) = &old {
-                return old_kv.pools[i]
-                    .as_ref()
-                    .map(|(k, _)| k.len() / old_kv.num_pages.max(1) as usize);
+
+        // A resize changes the page COUNT and nothing else, so an existing
+        // cache states its own geometry and the config is never re-read.
+        // Before any cache exists there is nothing to ask, and the config
+        // decides: gemma-4 by its layer kinds and shared tail, every other
+        // family uniformly.
+        let layout = match old.as_ref().map(|o| o.cache.layout().with_num_pages(target as i32)) {
+            Some(Ok(l)) => l,
+            Some(Err(_)) => return PIE_STATUS_INVALID_ARGUMENT,
+            None => {
+                let per = crate::store::kv_cache::PerLayer {
+                    head_dim: (0..n_layers)
+                        .map(|i| {
+                            if !is_gemma4 {
+                                return head_dim as i32;
+                            }
+                            let full = model
+                                .hf
+                                .layer_types
+                                .get(i)
+                                .is_some_and(|t| t == "full_attention");
+                            if full {
+                                model.hf.gemma4_global_head_dim.max(model.hf.head_dim)
+                            } else {
+                                model.hf.head_dim
+                            }
+                        })
+                        .collect(),
+                    // gemma-4's tail attends through the last earlier layer
+                    // of its own kind; every other family owns its pages.
+                    kv_source_layer: (0..n_layers)
+                        .map(|i| {
+                            if !is_gemma4 || i < first_shared {
+                                return i as i32;
+                            }
+                            let mine = model
+                                .hf
+                                .layer_types
+                                .get(i)
+                                .is_some_and(|t| t == "full_attention");
+                            (0..first_shared)
+                                .rev()
+                                .find(|&j| {
+                                    model
+                                        .hf
+                                        .layer_types
+                                        .get(j)
+                                        .is_some_and(|t| t == "full_attention")
+                                        == mine
+                                })
+                                .unwrap_or(i) as i32
+                        })
+                        .collect(),
+                    num_kv_heads: vec![kv_heads; n_layers],
+                };
+                if per.check_sharing().is_err() {
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                }
+                let f = state.kv_format;
+                match crate::store::kv_cache::KvCacheLayout::plan_per_layer(
+                    n_layers as i32,
+                    target as i32,
+                    page_size as i32,
+                    kv_heads,
+                    per,
+                    f,
+                    false,
+                ) {
+                    Ok(l) => l,
+                    Err(_) => return PIE_STATUS_INVALID_ARGUMENT,
+                }
             }
-            if !is_gemma4 {
-                return Some(page_bytes);
-            }
-            if i >= first_shared {
-                return None;
-            }
-            let full = model.hf.layer_types.get(i).is_some_and(|t| t == "full_attention");
-            let d = if full {
-                model.hf.gemma4_global_head_dim.max(model.hf.head_dim)
-            } else {
-                model.hf.head_dim
-            };
-            Some(page_size * kv_heads as usize * d as usize * 2)
         };
-        let mut pools = Vec::new();
-        for i in 0..n_layers {
-            let Some(pb) = layer_page_bytes(i) else {
-                pools.push(None);
-                continue;
-            };
-            let Ok(mut k) = alloc.alloc(target as usize * pb) else {
-                return PIE_STATUS_EXHAUSTED;
-            };
-            let Ok(mut v) = alloc.alloc(target as usize * pb) else {
-                return PIE_STATUS_EXHAUSTED;
-            };
-            if k.memset(0, stream.as_ref()).is_err() || v.memset(0, stream.as_ref()).is_err() {
+
+        let mut ops = crate::store::kv_cache_live::LiveKvCacheOps::new(
+            stream.as_ref().as_raw().cast(),
+            &alloc,
+        );
+        let Ok(cache) = crate::store::kv_cache_live::KvCache::materialize(layout, &mut ops) else {
+            return PIE_STATUS_EXHAUSTED;
+        };
+        let mut held = ops.into_held();
+        for b in &mut held {
+            if b.memset(0, stream.as_ref()).is_err() {
                 return PIE_STATUS_DRIVER_ERROR;
             }
-            if let Some(old_kv) = &old
-                && let Some((ok_, ov)) = &old_kv.pools[i]
-            {
+        }
+        let fresh = KvState { cache, _held: held, num_pages: target };
+
+        // Carry over what still fits. A layer that owns no pages has none
+        // to carry, and a shrink keeps the low pages.
+        if let Some(old_kv) = &old {
+            use cudarc::runtime::sys::{cudaError, cudaMemcpyAsync, cudaMemcpyKind};
+            for i in 0..fresh.layers() {
+                let (Some((nk, nv)), Some((ok_, ov)), Some(pb)) =
+                    (fresh.owned(i), old_kv.owned(i), fresh.page_bytes(i))
+                else {
+                    continue;
+                };
                 let keep = old_kv.num_pages.min(target) as usize * pb;
-                use cudarc::runtime::sys::{cudaError, cudaMemcpyAsync, cudaMemcpyKind};
-                for (dst, src) in [(&mut k, ok_), (&mut v, ov)] {
+                for (dst, src) in [(nk, ok_), (nv, ov)] {
                     let code = unsafe {
                         cudaMemcpyAsync(
-                            dst.as_ptr(),
-                            src.as_ptr().cast_const(),
+                            dst,
+                            src.cast_const(),
                             keep,
                             cudaMemcpyKind::cudaMemcpyDeviceToDevice,
                             stream.as_ref().as_raw(),
@@ -5127,12 +6209,11 @@ pub fn pie_cuda_resize_pool(
                     }
                 }
             }
-            pools.push(Some((k, v)));
         }
         if stream.as_ref().synchronize().is_err() {
             return PIE_STATUS_DRIVER_ERROR;
         }
-        state.kv = Some(KvState { pools, num_pages: target });
+        state.kv = Some(fresh);
         // A RESIZE MOVES THE KV PAGES, and a captured graph baked their old
         // addresses into every attention launch. Bumping the epoch is what tells
         // `SupergraphCache` to recapture instead of replaying into memory the
@@ -5155,6 +6236,10 @@ pub fn pie_cuda_close_instance(driver: *mut PieDriver, instance_id: u64) -> i32 
             return PIE_STATUS_INVALID_ARGUMENT;
         };
         state.instances.remove(&instance_id);
+        // The rings go with it. They are the instance's, and holding them
+        // past its close is a device allocation nothing can reach — the
+        // channel ids that named it are gone with the entry above.
+        state.ptir_sessions.remove(&instance_id);
         PIE_STATUS_OK
     })
 }
@@ -5184,6 +6269,86 @@ pub fn pie_cuda_close_channel(driver: *mut PieDriver, channel_id: u64) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use super::{ChannelState, InstanceEntry, instance_ring_shapes};
+
+    /// A registered channel becomes the ring shape the device wants, and
+    /// the bool case is the one that could not be derived any other way.
+    ///
+    /// `cell_bytes` is WIRE bytes, and for bools that is
+    /// `numel.div_ceil(8)` — so one lane and eight lanes are both one
+    /// byte, and a device ring sized from the width would be eight times
+    /// too small for the eight-lane case. That is why `numel` and `dtype`
+    /// are stored rather than recomputed, and this is the test that says
+    /// so out loud.
+    #[test]
+    fn a_bool_channels_ring_shape_cannot_be_derived_from_its_wire_width() {
+        use driver::tensor_ir::DType;
+
+        let chan = |numel: usize, dtype: DType, capacity: u32| ChannelState {
+            mirror: std::ptr::null_mut(),
+            words: std::ptr::null_mut(),
+            mirror_bytes: 0,
+            cell_bytes: crate::ptir::bridge::wire_cell_bytes(dtype, numel),
+            ring: capacity + 1,
+            host_role: 0,
+            numel,
+            dtype,
+        };
+
+        let one = chan(1, DType::Bool, 1);
+        let eight = chan(8, DType::Bool, 1);
+        assert_eq!(one.cell_bytes, eight.cell_bytes, "one wire byte either way");
+        assert_eq!(one.shape().numel, 1);
+        assert_eq!(eight.shape().numel, 8, "the shape knows what the width cannot");
+        assert_eq!(eight.shape().cell_bytes(), 8, "native is a byte per lane");
+
+        // And the capacity survives the `ring = capacity + 1` round trip,
+        // which is the one place the two vocabularies disagree.
+        assert_eq!(chan(4, DType::F32, 7).shape().capacity, 7);
+    }
+
+    /// An instance's ring shapes come back in the order the program
+    /// indexes them, and a channel it names but this shell lacks is a
+    /// refusal rather than a shorter list.
+    ///
+    /// Skipping would RENUMBER every channel after the gap, so a program
+    /// that meant `chan 1` would read channel 2 — a wrong answer that
+    /// looks like a working fire, which is the class this whole driver
+    /// keeps choosing to refuse instead.
+    #[test]
+    fn a_channel_an_instance_names_and_this_shell_lacks_refuses_the_whole_list() {
+        use driver::tensor_ir::DType;
+
+        let mut channels = std::collections::BTreeMap::new();
+        for (id, numel) in [(10u64, 4usize), (20, 9)] {
+            channels.insert(id, ChannelState {
+                mirror: std::ptr::null_mut(),
+                words: std::ptr::null_mut(),
+                mirror_bytes: 0,
+                cell_bytes: numel * 4,
+                ring: 2,
+                host_role: 0,
+                numel,
+                dtype: DType::F32,
+            });
+        }
+        let inst = |ids: Vec<u64>| InstanceEntry {
+            program_id: 1,
+            geometry_class: 0,
+            channel_ids: ids,
+        };
+
+        // The list is the INSTANCE's order, not the map's.
+        let shapes = instance_ring_shapes(&inst(vec![20, 10]), &channels).expect("all present");
+        assert_eq!(shapes.len(), 2);
+        assert_eq!(shapes[0].numel, 9, "channel 20 is index 0 because it is listed first");
+        assert_eq!(shapes[1].numel, 4);
+
+        assert!(
+            instance_ring_shapes(&inst(vec![10, 99]), &channels).is_none(),
+            "an unknown channel refuses rather than shortening the list"
+        );
+    }
     /// The boot-TOML extraction, isolated: the exact chain `create` runs.
     #[test]
     fn the_boot_descriptor_extracts() {

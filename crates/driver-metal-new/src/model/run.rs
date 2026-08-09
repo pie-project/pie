@@ -205,11 +205,48 @@ pub struct InFlight {
     /// The timeline value this fire signals.
     pub value: u64,
     /// Where its activations landed. Read it after the fire retires.
-    pub arena: Handle,
+    ///
+    /// A LEASE: the region goes back to the pool when this drops, which is
+    /// what makes the next fire of this shape reuse the same address.
+    pub arena: crate::metal::Lease,
     /// Held for the GPU, not for the caller.
     _table: ArgumentTable,
     _params: Params,
 }
+
+/// Everything a driver keeps ACROSS fires.
+///
+/// Five things, and what they have in common is the reason they are one
+/// struct: each is wrong to rebuild per fire, and each was wrong in its own
+/// way before it was held.
+///
+/// * `stepper` — the timeline and the allocator ring. A fresh one has no
+///   value to compare against and no allocator to alternate, so it cannot
+///   pipeline even in principle.
+/// * `scratch` — the fire's regions. A fresh region per fire leaks into the
+///   residency set permanently (nothing removes) and moves an address that
+///   is one of only three differing between two fires of one shape.
+/// * `pipelines` — the compile cache. Rebuilding it recompiles every shader.
+/// * `context`, `compiler` — the device and its shader compiler.
+///
+/// Grouped rather than passed as five parameters because they travel
+/// together and always will: a caller that has one has all of them, and the
+/// list was already at clippy's argument limit when `scratch` joined it.
+#[derive(Debug)]
+pub struct Machine<'c, 's> {
+    /// The device.
+    pub context: &'c Context,
+    /// Its shader compiler.
+    pub compiler: &'c Compiler,
+    /// The compiled-pipeline cache.
+    pub pipelines: &'c mut Pipelines,
+    /// The command timeline and allocator ring.
+    pub stepper: &'c mut Stepper<'s>,
+    /// The reusable fire regions.
+    pub scratch: &'c crate::metal::Scratch,
+}
+
+
 
 /// Plan, encode and COMMIT one fire, without waiting for it.
 ///
@@ -229,15 +266,31 @@ pub struct InFlight {
 ///
 /// As [`run`], plus a wedged stepper.
 pub fn submit<R: Resolver>(
-    context: &Context,
-    compiler: &Compiler,
-    pipelines: &mut Pipelines,
-    stepper: &mut Stepper,
+    machine: &mut Machine<'_, '_>,
     lowered: &Lowered,
     geometry: Geometry,
     resolver: &mut R,
 ) -> Result<InFlight> {
-    let arena = allocate(
+    let Machine {
+        context,
+        compiler,
+        pipelines,
+        stepper,
+        scratch,
+    } = machine;
+    // LEASED, and `scratch` must be the caller's -- the same one across
+    // fires, like `stepper`. Two things follow from reuse, and both are
+    // measured in `.wiki/driver/graph-metal.md`:
+    //
+    // * `ring::allocate` adds every buffer to the residency set and NOTHING
+    //   removes it, so a fresh region per fire leaks permanently. Fifty
+    //   allocate-and-drop cycles leave fifty allocations and 52 MB resident.
+    //   A serving driver does three per fire.
+    // * the arena's address is one of only three things that differ between
+    //   two fires of one shape, and it is what stands between this driver and
+    //   recording its command buffer once instead of re-encoding 424
+    //   dispatches per fire -- 76.4% of a decode.
+    let arena = scratch.take(
         context,
         (lowered.arena_bytes as u64).max(1),
         "activation arena",
@@ -253,7 +306,7 @@ pub fn submit<R: Resolver>(
         },
     };
     let dispatches = plan(lowered, table(), frame, geometry, resolver).map_err(refusal)?;
-    let params = Params::stage(context, &dispatches)?;
+    let params = Params::stage_in(context, scratch, &dispatches)?;
     let table = ArgumentTable::new(context, table_width(&dispatches))?;
     pipelines.ensure(context, compiler, &dispatches)?;
     let value =

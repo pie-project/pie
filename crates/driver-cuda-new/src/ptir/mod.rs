@@ -43,6 +43,10 @@
 //!   write, and the four cursors the control kernels advance. Native bytes on
 //!   the device, bit-packed on the wire, and the difference is invisible until
 //!   the first bool channel.
+//! * [`bridge`] — where that difference LANDS: the copy between the pinned
+//!   host mirror the engine polls and the device rings the kernels use. The
+//!   two planes are different memory by construction, so a fire pulls its
+//!   inputs across and pushes its outputs back.
 //! * [`runtime`] — the three tiers and the negative cache, assembled past the
 //!   last failure so a program that fails halfway installs nothing.
 //!
@@ -57,6 +61,7 @@
 //! that uses it. The single-lane epilogue runs, which is the shape every
 //! decode loop has.
 
+pub mod bridge;
 pub mod control;
 pub mod disk;
 pub mod fire;
@@ -65,6 +70,7 @@ pub mod module;
 pub mod nvrtc;
 pub mod params;
 pub mod ring;
+pub mod session;
 pub mod runtime;
 
 pub use control::{Control, MAX_RING};

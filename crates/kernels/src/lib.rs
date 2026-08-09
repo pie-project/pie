@@ -808,6 +808,46 @@ pub enum Source {
     /// is exactly that operand's element count. A product the table has
     /// no arithmetic for, read off a value that already is it.
     InElements(u8),
+    /// A field of the fire's ATTENTION context: the device-resident page
+    /// CSRs, the write descriptors, the request count, the planned
+    /// caches.
+    ///
+    /// The same shape as [`Source::Gdn`] and for the same reason — a
+    /// different struct, and an OPTIONAL one, since a fire with no
+    /// attention carries none. Thirteen hand arms open with
+    /// `let a = attn.ok_or(NoAttnCtx)?;`, and the four that need ONLY
+    /// this and [`Source::KvLayerView`] are the ones a row can reach.
+    ///
+    /// The other nine are not blocked on vocabulary and this does not
+    /// pretend they are: the flashinfer dispatches serve three arities,
+    /// select between two planned caches on the layer's window, and read
+    /// a guard-owned output when the trace states none. That is per-call
+    /// form, which is what a hand arm is FOR.
+    Attn(&'static str),
+    /// An attention-context field a fire leaves NULL to say "not
+    /// published" — the write descriptors, which only a fire that
+    /// computed them carries.
+    ///
+    /// [`Source::CtxNonZero`]'s test on the other struct, and the hand
+    /// arm it replaces made exactly this check by hand and returned
+    /// `NoAttnCtx` with a message saying so. A generated branch declines
+    /// instead and the fallthrough reports, which is the same answer one
+    /// layer earlier.
+    AttnNonZero(&'static str),
+    /// The KV cache view for the layer this statement runs in, BY VALUE.
+    ///
+    /// The reason `attn` is the largest hand-written block in the table.
+    /// [`Source::KvKeys`] and [`Source::KvValues`] spell a cache as two
+    /// device pointers, which is Metal's shape; CUDA's launchers take a
+    /// `KvCacheLayerView` whole, so a CUDA row stating the pointer pair
+    /// is one the emitter refuses rather than mis-bind. This is the
+    /// spelling CUDA can answer.
+    ///
+    /// Indexed by the statement's own layer, like [`Source::CtxByLayer`],
+    /// and guarded on the fire holding one there: a rolled trace states a
+    /// span and an unrolled one states a layer, and both reach the same
+    /// lookup.
+    KvLayerView,
     /// A field of the fire's GDN context, which is the hybrids' recurrent
     /// geometry: head counts, conv width, group count, slab strides.
     ///
@@ -1080,6 +1120,28 @@ pub struct KernelSig {
     /// separately authored. When that changes, the axis is already spelled
     /// here.
     pub axes: &'static [Axis],
+    /// Which stated scalar carries this row's GRID extent, when the fire's
+    /// geometry cannot answer it.
+    ///
+    /// A rule evaluates against `Dims`, which a driver fills from the FIRE —
+    /// one `rotary_dims`, one `head_dim`, one of everything. That is right
+    /// until a deployment states the number PER LAYER, and gemma-4 does:
+    /// `partial_rotary_factor: 0.25` on its full-attention layers means they
+    /// rotate 128 of their 512 channels while its sliding layers rotate all
+    /// 256 of theirs. One fire-wide `rotary_dims` cannot be both, and
+    /// rotating the wrong count returns fluent text rather than failing.
+    ///
+    /// So the row says where to look instead: `Some(i)` means *"my rule's
+    /// extent is the statement's param `i`, not the fire's geometry"*. The
+    /// scalar rides the channel that already exists — `Launch::params` — and
+    /// the only new thing is that the driver may READ one for the grid rather
+    /// than only forwarding it to the kernel.
+    ///
+    /// Stated on the row rather than matched on in the driver deliberately.
+    /// A `if rule == Rope { ... }` arm beside the dispatcher is the shape
+    /// this family's north star calls a bug report against a table row; this
+    /// is the row answering.
+    pub grid_param: Option<u8>,
 }
 
 impl KernelSig {
@@ -1195,6 +1257,7 @@ macro_rules! kernel {
                 operands: &[],
                 returns: "",
                 axes: &[],
+                grid_param: None,
             }
         }
     };

@@ -433,9 +433,6 @@ fn every_launch_of_the_hybrid_deployment_binds() {
 const HYBRID_CORPUS: &[(FireClass, usize)] = &[
     (FireClass::Decode, 4),
     (FireClass::Prefill, 7),
-    (FireClass::CommitAdvance, 7),
-    (FireClass::StateOnly, 7),
-    (FireClass::FrozenVerify, 7),
 ];
 
 /// The hybrid's dispatchability claim — same as the anchor's, separate

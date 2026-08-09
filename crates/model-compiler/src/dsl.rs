@@ -567,13 +567,6 @@ fn class_word(class: FireClass) -> &'static str {
     match class {
         FireClass::Decode => "decode",
         FireClass::Prefill => "prefill",
-        // The service classes belong to a text that declares an MTP repair
-        // pass, and such a text composes its own trace rather than going
-        // through `M`. A caller that reaches here has asked a whole-model
-        // prologue/epilogue for a class it has no shape for.
-        FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify => {
-            panic!("the {class:?} service class has no whole-model form here")
-        }
     }
 }
 
@@ -2279,11 +2272,12 @@ pub mod metal {
         theta: f32,
         scale: f32,
         head_dim: u32,
+        rotary_dim: u32,
         table: bool,
     ) -> (Val, Val) {
         (
-            rope_one(q, multi_batch, theta, scale, head_dim, table),
-            rope_one(k, multi_batch, theta, scale, head_dim, table),
+            rope_one(q, multi_batch, theta, scale, head_dim, rotary_dim, table),
+            rope_one(k, multi_batch, theta, scale, head_dim, rotary_dim, table),
         )
     }
 
@@ -2307,6 +2301,7 @@ pub mod metal {
         theta: f32,
         scale: f32,
         head_dim: u32,
+        rotary_dim: u32,
         table: bool,
     ) -> Val {
         // IN PLACE, and the statement has to say so. Every `neox` entrypoint
@@ -2336,7 +2331,14 @@ pub mod metal {
                 "neox_freqs_decode_bfloat16".to_string(),
                 // Scale, head width, and YaRN's `mscale` -- one for llama-3,
                 // whose rescaling lives entirely in the frequencies.
-                vec![scale.to_bits(), head_dim, 1.0f32.to_bits()],
+                // The rotary WIDTH last, and the row says so with
+                // `grid_param`. The kernel does not read it -- its operand
+                // list stops before it -- but the DRIVER does, because
+                // `Rule::Rope`'s grid is half this number and gemma-4 states
+                // it per layer type. A statement that carries it is the
+                // alternative to a fire-wide `rotary_dims` that cannot be two
+                // things at once.
+                vec![scale.to_bits(), head_dim, 1.0f32.to_bits(), rotary_dim],
             )
         } else {
             let stem = if multi_batch { "neox_mb_bfloat16" } else { "neox_decode_bfloat16" };
@@ -2346,7 +2348,8 @@ pub mod metal {
                 // base is `log2(theta)` because the shader raises two to it --
                 // `rope_neox_geometric_body` -- and handing it theta rotates
                 // by a frequency ladder wrong from the second channel on.
-                vec![scale.to_bits(), theta.log2().to_bits(), head_dim],
+                // The rotary WIDTH last -- see the table form above.
+                vec![scale.to_bits(), theta.log2().to_bits(), head_dim, rotary_dim],
             )
         };
         with_params(

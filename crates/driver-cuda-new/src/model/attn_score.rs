@@ -257,6 +257,89 @@ struct DecodeScoreCsrTotals {
     folded_total: u64,
 }
 
+/// One fire's score sink, carved but not yet allocated — the shape a fire
+/// publishes UNCONDITIONALLY so that a score-capturing arm can be
+/// RECORDED whether or not this fire takes it.
+///
+/// The old shell published a null sink on purpose, and the reasoning was
+/// sound for the world it was written in: the capturing dispatch refuses
+/// without a sink, and refusing before the launcher is reached beats
+/// throwing across the C ABI. But it makes the union decline every
+/// lowering that so much as mentions `_capture` — which is the case the
+/// union exists for, since `WantsAttnScore` is a folded predicate and one
+/// exec is meant to serve both answers. Under `GuardMode::Union` every
+/// arm is recorded, so "the state this fire happens to need" is the wrong
+/// question; the right one is "the state ANY arm could need."
+///
+/// See `.wiki/driver/graph.md` §5 ①. The cost is resident memory and
+/// plan-raise time, not runtime: the arm a fire does not take is skipped
+/// by the conditional rather than executed.
+#[derive(Debug, Clone)]
+pub struct ScoreSinkPlan {
+    /// Bytes the whole slot needs — raw, folded and CSR, each aligned.
+    pub bytes: usize,
+    /// Byte offset of the folded rows within the slot.
+    pub folded_offset: usize,
+    /// Byte offset of the device CSR within the slot.
+    pub indptr_offset: usize,
+    /// The RAW-offset CSR, in elements, as the kernels index it.
+    pub indptr: Vec<i32>,
+}
+
+/// Plan a fire's score sink from its KV geometry.
+///
+/// `window` is the observation window — 1 for a decode capture (one query
+/// row per request), [`default_attn_score_window`] for a prefill one. The
+/// two forms differ only in that factor, so one planner serves both.
+///
+/// `None` when the sink would be empty (no rows to score) or larger than
+/// [`MAX_SCORE_BYTES`], which is a refusal to publish rather than a
+/// refusal to fire: the sink stays null and the capturing arm declines as
+/// it always did.
+#[must_use]
+pub fn plan_score_sink(
+    kv_page_indptr_h: &[u32],
+    kv_last_page_lens_h: &[u32],
+    page_size: i32,
+    num_q_heads: u32,
+    window: u32,
+) -> Option<ScoreSinkPlan> {
+    let requests = kv_page_indptr_h.len().checked_sub(1)?;
+    if requests == 0 || window == 0 {
+        return None;
+    }
+    let mut indptr = vec![0i32; requests + 1];
+    let mut raw_total: u64 = 0;
+    let mut folded_total: u64 = 0;
+    for r in 0..requests {
+        let pages = kv_page_indptr_h[r + 1].saturating_sub(kv_page_indptr_h[r]);
+        let kv_len = if pages == 0 {
+            0
+        } else {
+            (pages - 1) * u32::try_from(page_size.max(0)).unwrap_or(0)
+                + kv_last_page_lens_h.get(r).copied().unwrap_or(0)
+        };
+        indptr[r] = i32::try_from(raw_total).ok()?;
+        raw_total += u64::from(kv_len) * u64::from(num_q_heads) * u64::from(window);
+        folded_total += u64::from(kv_len);
+    }
+    indptr[requests] = i32::try_from(raw_total).ok()?;
+    if raw_total == 0 || raw_total > 0x7fff_ffff || raw_total * 4 > MAX_SCORE_BYTES {
+        return None;
+    }
+    let carve = score_slot_layout(
+        usize::try_from(raw_total).ok()? * 4,
+        usize::try_from(folded_total).ok()? * 4,
+        (requests + 1) * 4,
+    );
+    Some(ScoreSinkPlan {
+        bytes: carve.total,
+        folded_offset: carve.folded_offset,
+        indptr_offset: carve.indptr_offset,
+        indptr,
+    })
+}
+
 /// Fill the decode capture's scratch CSRs from the fire's KV geometry.
 /// Shared by the capture constructor and [`prepare_decode_score_capture`],
 /// as in the C++ — both sites must compute byte-identical contents into

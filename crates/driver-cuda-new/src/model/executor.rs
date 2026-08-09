@@ -769,6 +769,19 @@ pub struct DispatchCtx {
     /// the state outlives the fire on the caller's side (the plan
     /// state's `lora_staged` slot) and the ctx carries no lifetime.
     pub lora: Option<(*const super::lora::LoraFireState, *mut c_void)>,
+    /// WHICH ROWS this fire samples, device-resident `[sampled_rows]` i32.
+    ///
+    /// A prefill's readout is one distribution per request and its stream
+    /// is one row per token, so something has to pick — and the epilogue's
+    /// gather is what picks. Null when the fire samples every row, which
+    /// is the decode case and the case where the lowering states no
+    /// gather at all.
+    ///
+    /// A device pointer on the ctx for the same reason `peel_window` is
+    /// one: the launcher takes it loose, and no text can state it.
+    pub sampling_indices: *const i32,
+    /// How many rows that is.
+    pub sampled_rows: i32,
 }
 
 #[cfg(feature = "bridge")]
@@ -855,8 +868,25 @@ pub struct AttnCtx {
     /// "arena-stable device CSR base" — and these are where its answer
     /// reaches the arm.
     pub score_out: *mut f32,
+    /// The FOLDED rows' base, distinct from [`Self::score_out`].
+    ///
+    /// The prefill capture writes raw scores and their per-request fold to
+    /// different extents, and this used to pass `score_out` for both — safe
+    /// only because the sink was always null and an empty CSR made both
+    /// zero-length. A real sink has to name the two separately or the fold
+    /// overwrites the rows it is folding.
+    pub folded_out: *mut f32,
     /// See [`Self::score_out`].
     pub score_indptr_d: *const i32,
+    /// The custom attention mask and its per-request base, one byte per
+    /// `(q, kv)` pair. Published on every fire for the same reason the
+    /// score sink is: `HasCustomMask` is a folded predicate, so the arm
+    /// has to be RECORDABLE whether or not this fire takes it. The
+    /// resident form is plain causal — the same answer the unmasked arm
+    /// computes — until a program stages a real one.
+    pub mask_d: *const u8,
+    /// See [`Self::mask_d`].
+    pub mask_indptr_d: *const i32,
     /// The attention output slot the o_proj reads — guard-owned like
     /// `q_out`, and one arena slot reused by every layer (liveness).
     pub o_out: *mut c_void,
@@ -989,6 +1019,7 @@ fn dispatch_generated<R: Resolver>(
     b: &BoundLaunch<'_>,
     spec: &LaunchSpec,
     ctx: &DispatchCtx,
+    attn: Option<&AttnCtx>,
     gdn: Option<&GdnCtx>,
     resolver: &mut R,
     rows: i32,
@@ -1080,6 +1111,24 @@ fn dispatch_generated<R: Resolver>(
     /// bug is in the emitter's guard and nowhere near this line.
     fn g_of<'a>(g: Option<&'a GdnCtx>) -> &'a GdnCtx {
         g.expect("a generated branch binding a GDN field is guarded on gdn.is_some()")
+    }
+
+    /// `Source::Attn`'s reach into the fire's attention context.
+    fn a_of<'a>(a: Option<&'a AttnCtx>) -> &'a AttnCtx {
+        a.expect("a generated branch binding an attention field is guarded on attn.is_some()")
+    }
+
+    /// `Source::KvLayerView`'s test, and its read.
+    ///
+    /// Two functions rather than one returning an `Option`, because the
+    /// generator emits the test into the branch GUARD and the read into
+    /// the argument list, and a guard cannot bind. The pair is what makes
+    /// the read total.
+    fn has_kv_layer(a: Option<&AttnCtx>, layer: usize) -> bool {
+        a.is_some_and(|a| a.layers.len() > layer)
+    }
+    fn kv_view(a: Option<&AttnCtx>, layer: usize) -> crate::launch::KvCacheLayerView {
+        a_of(a).layers[layer]
     }
 
     /// `cast_const` for a pointer that is ALREADY const.
@@ -1178,7 +1227,7 @@ pub fn dispatch<R: Resolver>(
     // needs no arm, and the branch for it is emitted from the row — so
     // the hand-written match below is what is LEFT, not what is normal.
     // It shrinks as rows state their sources, which is a row's work.
-    if dispatch_generated(bound, spec, ctx, gdn, resolver, rows) {
+    if dispatch_generated(bound, spec, ctx, attn, gdn, resolver, rows) {
         return Ok(());
     }
 
@@ -1502,88 +1551,6 @@ pub fn dispatch<R: Resolver>(
                 );
             }
         }
-        // args: [k_curr, v_curr]; the layer view, the CSRs and the fire
-        // scalars are the fire's.
-        // args: [k_curr, v_curr]. The write-descriptor spelling: the fire
-        // steers a graph replay, so the destination page and offset of
-        // every row are DESCRIPTORS the host published rather than
-        // something the kernel derives from the CSRs. `HasWriteDesc` is
-        // the guard that picks it, and `AttnCtx` already carried the three
-        // descriptor arrays — the arm was simply never written, because
-        // nothing in the corpus set the mark.
-        "attn::write_kv_explicit_bf16" => {
-            need(2)?;
-            let a = attn
-                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
-            let layer = a
-                .layers
-                .get(bound.layers.start as usize)
-                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
-            if a.w_page_d.is_null() || a.w_off_d.is_null() {
-                return Err(DispatchRefusal::NoAttnCtx(format!(
-                    "{}: the fire published no write descriptors",
-                    bound.kernel
-                )));
-            }
-            let (k_curr, v_curr) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_attn_write_kv_explicit_bf16(
-                    *layer,
-                    k_curr.ptr,
-                    v_curr.ptr,
-                    a.w_page_d,
-                    a.w_off_d,
-                    rows,
-                    ctx.stream,
-                    a.row_valid_d,
-                );
-            }
-        }
-        "attn::write_kv_to_pages" => {
-            need(2)?;
-            let a = attn
-                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
-            let layer = a
-                .layers
-                .get(bound.layers.start as usize)
-                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
-            let (k_curr, v_curr) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_attn_write_kv_to_pages(
-                    *layer,
-                    k_curr.ptr,
-                    v_curr.ptr,
-                    a.qo_indptr_d,
-                    a.kv_page_indices_d,
-                    a.kv_page_indptr_d,
-                    a.kv_last_page_lens_d,
-                    rows,
-                    a.num_requests,
-                    ctx.stream,
-                    a.row_valid_d,
-                    a.first_token,
-                );
-            }
-        }
-        // args: [] — everything is the fire's. A no-op on a native cache,
-        // and the arm still fires it: the launch is stated, so it runs.
-        "attn::dequant_kv_cache_layer_to_bf16_active" => {
-            need(0)?;
-            let a = attn
-                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
-            let layer = a
-                .layers
-                .get(bound.layers.start as usize)
-                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
-            unsafe {
-                ffi::pie_k_attn_dequant_kv_cache_layer_to_bf16_active(
-                    *layer,
-                    a.kv_page_indices_d,
-                    a.num_pages_in_batch,
-                    ctx.stream,
-                );
-            }
-        }
         // args: [q]; o is guard-owned ([`AttnCtx::o_out`]); the pages are
         // the layer's bf16 MIRRORS — the native alias, the decode lesson.
         // The prefill sibling of the score-capturing decode dispatch, and
@@ -1635,7 +1602,7 @@ pub fn dispatch<R: Resolver>(
                     a.workspace,
                     ctx.stream,
                     a.score_out,
-                    a.score_out,
+                    a.folded_out,
                     a.score_indptr_d,
                     // The OBSERVATION window, not the attention one. The
                     // launcher refuses `<= 0`, and `window_left` is -1 on
@@ -1681,6 +1648,56 @@ pub fn dispatch<R: Resolver>(
                     a.kv_page_indices_d,
                     a.kv_page_indptr_d,
                     a.kv_last_page_lens_d,
+                    a.workspace,
+                    ctx.stream,
+                    a.logits_soft_cap,
+                    a.sm_scale,
+                    a.lse_out_d,
+                );
+            }
+        }
+        // args: [q] with the output guard-owned, or [q, o] as SSA. The
+        // custom-mask arm: `HasCustomMask` selects it, and the mask rides
+        // the ctx rather than the statement for the same reason the score
+        // sink does — the predicate is folded, so one exec serves the fire
+        // that stages a mask and the fire that does not, and the address
+        // recorded now has to still be right when it goes true.
+        "attn::dispatch_attention_flashinfer_prefill_custom" => {
+            let a = attn
+                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
+            let layer = a
+                .layers
+                .get(bound.layers.start as usize)
+                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
+            if a.mask_d.is_null() || a.mask_indptr_d.is_null() {
+                return Err(DispatchRefusal::NoAttnCtx(format!(
+                    "{}: the fire published no attention mask",
+                    bound.kernel
+                )));
+            }
+            let (q, o) = match bound.args.len() {
+                1 => (bound.args[0], a.o_out),
+                2 => (bound.args[0], bound.args[1].ptr),
+                got => {
+                    return Err(DispatchRefusal::ArgCount {
+                        kernel: bound.kernel.to_string(),
+                        expected: 1,
+                        got,
+                    });
+                }
+            };
+            unsafe {
+                ffi::pie_k_attn_dispatch_attention_flashinfer_prefill_custom(
+                    a.prefill_plan.cast_const(),
+                    q.ptr,
+                    *layer,
+                    o,
+                    a.qo_indptr_d,
+                    a.kv_page_indices_d,
+                    a.kv_page_indptr_d,
+                    a.kv_last_page_lens_d,
+                    a.mask_d,
+                    a.mask_indptr_d,
                     a.workspace,
                     ctx.stream,
                     a.logits_soft_cap,
@@ -3162,6 +3179,22 @@ pub fn run_captured<R: Resolver>(
             .map_err(|e| {
             RunRefusal { launch: i, kernel: kernel.clone(), why: RunRefusalKind::Dispatch(e) }
         })?;
+        // RETAIN THE NODE this launch became.
+        //
+        // `.wiki/driver/graph.md` §6.2: "what is missing is bookkeeping,
+        // not capability". Grid and block dims ARE updatable on an
+        // instantiated graph, and two fires of the same shape family
+        // differing only in row count have IDENTICAL topology — so the
+        // update is legal and costs tens of microseconds against a
+        // recapture's milliseconds. What stopped it was that a capture
+        // retained nothing, so there was no handle to update and no way to
+        // say which launch a handle belonged to.
+        //
+        // Recorded by INDEX, so `nodes[i]` is launch `i`. A dispatch that
+        // issues more than one kernel records its last, which is the one
+        // whose grid the row count moves; a dispatch that issues none
+        // records nothing and leaves a gap.
+        builder.retain_node(i);
     }
 
     // Unwind whatever the last launch left open.

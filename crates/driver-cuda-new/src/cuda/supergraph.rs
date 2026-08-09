@@ -62,9 +62,9 @@ use crate::error::{Error, Result};
 
 /// How many predicate slots the device word holds.
 ///
-/// Sized by the wire vocabulary below, not by a guess: seven `GuardPred`
+/// Sized by the wire vocabulary below, not by a guess: eight `GuardPred`
 /// wire numbers plus the two Peel endpoint bits.
-pub const PRED_SLOTS: usize = 9;
+pub const PRED_SLOTS: usize = 10;
 
 /// `GuardPred::HasWriteDesc` — wire 0.
 pub const SLOT_HAS_WRITE_DESC: u32 = 0;
@@ -80,14 +80,17 @@ pub const SLOT_HAS_CUSTOM_MASK: u32 = 4;
 pub const SLOT_HAS_STAGE_HOOKS: u32 = 5;
 /// `GuardPred::HasLora` — wire 6.
 pub const SLOT_HAS_LORA: u32 = 6;
+/// `GuardPred::WindowOne` — wire 7. The predicate `FireClass::Decode`
+/// used to be (`.wiki/driver/graph.md` §4.1).
+pub const SLOT_WINDOW_ONE: u32 = 7;
 /// A Peel whose whole fire took the fast endpoint (`fast_rows == N`).
 ///
 /// Above the `GuardPred` wire range because a Peel is not a guard: it is a
 /// REGION the lowering produced, and its endpoint is a property of the fire
 /// rather than of a statement.
-pub const SLOT_PEEL_ALL_FAST: u32 = 7;
+pub const SLOT_PEEL_ALL_FAST: u32 = 8;
 /// A Peel whose whole fire took the hooked endpoint (`fast_rows == 0`).
-pub const SLOT_PEEL_ALL_HOOKED: u32 = 8;
+pub const SLOT_PEEL_ALL_HOOKED: u32 = 9;
 
 /// The device-resident predicate word: one byte per slot.
 ///
@@ -228,6 +231,15 @@ unsafe extern "C" {
         slot: i32,
         stream: *mut c_void,
     ) -> i32;
+
+    /// See `csrc/supergraph.cu`. Arms a SWITCH handle from a slot read as
+    /// a body INDEX. Returns a `cudaError_t` as an int.
+    fn pie_supergraph_set_switch(
+        handle: u64,
+        preds: *const u8,
+        slot: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// What CUDA's capture state says about a stream, at one instant.
@@ -360,6 +372,42 @@ impl Cond {
     }
 }
 
+/// A SWITCH node opened during capture and the bodies it selects among.
+/// See [`SupergraphBuilder::open_switch`].
+#[cfg(feature = "bridge")]
+#[derive(Debug, Clone)]
+pub struct Switch {
+    node: cudaGraphNode_t,
+    bodies: Vec<cudaGraph_t>,
+}
+
+#[cfg(feature = "bridge")]
+impl Switch {
+    /// The node, to name as a dependency.
+    pub const fn node(&self) -> cudaGraphNode_t {
+        self.node
+    }
+
+    /// One arm's body graph, to capture into.
+    #[must_use]
+    pub fn body(&self, index: usize) -> Option<cudaGraph_t> {
+        self.bodies.get(index).copied()
+    }
+
+    /// How many arms this switch selects among.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Whether the switch has no arms. Never true — `open_switch` refuses
+    /// a zero-body switch — but clippy asks for the pair.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+}
+
 /// The capture-time builder: a stack of body captures over a depth-indexed
 /// stream pool.
 ///
@@ -376,6 +424,14 @@ pub struct SupergraphBuilder<'a> {
     pool: Vec<OwnedStream>,
     /// The capture stack, innermost last. `active[0]` is always the root.
     active: Vec<cudaStream_t>,
+    /// The graph node each retained launch became, by LAUNCH INDEX.
+    ///
+    /// `.wiki/driver/graph.md` §6.2: `cudaGraphExecKernelNodeSetParams`
+    /// can retune an instantiated graph's grids without recapturing, but
+    /// only if something remembers which node came from which launch. A
+    /// capture used to retain nothing, which is why `tokens` and
+    /// `requests` are still bucket-key axes.
+    nodes: Vec<Option<cudaGraphNode_t>>,
 }
 
 #[cfg(feature = "bridge")]
@@ -388,7 +444,37 @@ impl<'a> SupergraphBuilder<'a> {
             preds: preds.device_ptr(),
             pool: Vec::new(),
             active: vec![capture_stream.as_raw()],
+            nodes: Vec::new(),
         }
+    }
+
+    /// Record the node the launch just issued became, under `index`.
+    ///
+    /// Read out of the capture's own dependency set: after a kernel
+    /// launch on a capturing stream, the stream's dependency list is
+    /// exactly the node that launch created. A launch that created none
+    /// (a dispatch arm that declined) leaves the slot empty rather than
+    /// aliasing its predecessor -- an update applied to the wrong node is
+    /// a wrong grid on a kernel nobody asked about.
+    pub fn retain_node(&mut self, index: usize) {
+        if self.nodes.len() <= index {
+            self.nodes.resize(index + 1, None);
+        }
+        let Ok(info) = (unsafe { capture_info(self.raw_stream()) }) else { return };
+        if info.status != cudaStreamCaptureStatus::cudaStreamCaptureStatusActive
+            || info.ndeps != 1
+            || info.deps.is_null()
+        {
+            return;
+        }
+        // SAFETY: `ndeps == 1` and `deps` is non-null.
+        self.nodes[index] = Some(unsafe { *info.deps });
+    }
+
+    /// The nodes retained so far, by launch index.
+    #[must_use]
+    pub fn nodes(&self) -> &[Option<cudaGraphNode_t>] {
+        &self.nodes
     }
 
     /// The stream launches should currently target: the root at depth 0, the
@@ -490,6 +576,91 @@ impl<'a> SupergraphBuilder<'a> {
         let else_body = with_else.then(|| unsafe { *out.add(1) });
 
         Ok(Cond { node, if_body, else_body })
+    }
+
+    /// Insert a SWITCH keyed on `pred_slot`, with `bodies` arms.
+    ///
+    /// `.wiki/driver/graph.md` §6.1, and the cheapest win the document
+    /// names. [`Self::open_cond`] is a boolean IF and they NEST, so an
+    /// axis with more than two options — attention is
+    /// `plain / capture / custom / xqa` — costs nesting depth and arm
+    /// pairs it should not. A switch reaches every arm from one node,
+    /// selected by the INDEX the arming kernel writes.
+    ///
+    /// The predicate word needs no new storage: it is already a byte per
+    /// slot, and a slot holding a kernel index rather than 0/1 is the same
+    /// byte read differently. `pie_supergraph_set_switch` is the whole
+    /// device-side difference.
+    ///
+    /// An index past `bodies` selects NO body, which is CUDA's rule and is
+    /// left as-is: a fire whose predicate names an arm the switch does not
+    /// have is a lowering/driver disagreement, and running arm 0 instead
+    /// would answer with the wrong program rather than with nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the slot is out of range, if `bodies` is zero, if the current
+    /// stream is not capturing, or if any CUDA call refuses.
+    pub fn open_switch(&mut self, pred_slot: u32, bodies: u32) -> Result<Switch> {
+        if pred_slot as usize >= PRED_SLOTS {
+            return Err(Error::invalid("supergraph", "pred slot out of range"));
+        }
+        if bodies == 0 {
+            return Err(Error::invalid("supergraph", "a switch with no bodies selects nothing"));
+        }
+        let s = self.raw_stream();
+        let info = unsafe { capture_info(s) }?;
+        if info.status != cudaStreamCaptureStatus::cudaStreamCaptureStatusActive {
+            return Err(Error::invalid("supergraph", "open_switch outside a capture"));
+        }
+        let mut handle: cudaGraphConditionalHandle = 0;
+        check_rt(
+            unsafe { cudaGraphConditionalHandleCreate(&raw mut handle, info.graph, 0, 0) },
+            "cudaGraphConditionalHandleCreate",
+        )?;
+        // The arming kernel FIRST, so the switch node picks it up as a
+        // capture dependency and the index is written before it is read.
+        let rc = unsafe {
+            pie_supergraph_set_switch(
+                handle,
+                self.preds,
+                i32::try_from(pred_slot).unwrap_or(0),
+                s.cast::<c_void>(),
+            )
+        };
+        if rc != 0 {
+            return Err(Error::invalid(
+                "pie_supergraph_set_switch",
+                "the set-switch launch failed",
+            ));
+        }
+        let info = unsafe { capture_info(s) }?;
+        let mut params: cudaGraphNodeParams = unsafe { std::mem::zeroed() };
+        params.type_ = cudarc::runtime::sys::cudaGraphNodeType::cudaGraphNodeTypeConditional;
+        params.__bindgen_anon_1.conditional = cudarc::runtime::sys::cudaConditionalNodeParams {
+            handle,
+            type_: cudarc::runtime::sys::cudaGraphConditionalNodeType::cudaGraphCondTypeSwitch,
+            size: bodies,
+            phGraph_out: std::ptr::null_mut(),
+        };
+        let mut node: cudaGraphNode_t = std::ptr::null_mut();
+        check_rt(
+            unsafe {
+                add_node(&raw mut node, info.graph, info.deps, info.ndeps, &raw mut params)
+            },
+            "cudaGraphAddNode",
+        )?;
+        let out = unsafe { params.__bindgen_anon_1.conditional.phGraph_out };
+        if out.is_null() {
+            return Err(Error::invalid(
+                "cudaGraphAddNode",
+                "the driver returned no body graphs for the switch node",
+            ));
+        }
+        // SAFETY: on success CUDA has pointed `phGraph_out` at an array of
+        // exactly `bodies` graphs, owned by the capturing graph.
+        let bodies = unsafe { std::slice::from_raw_parts(out, bodies as usize) }.to_vec();
+        Ok(Switch { node, bodies })
     }
 
     /// Capture into an arm's body graph (push).

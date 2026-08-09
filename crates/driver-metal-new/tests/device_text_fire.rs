@@ -721,30 +721,36 @@ fn two_whole_text_fires_are_in_flight_at_once() {
     // allocator ring to alternate, so it could not pipeline even in
     // principle.
     let mut stepper = driver_metal_new::metal::Stepper::new(&context).expect("a stepper");
+    // ONE pool too, for the same reason: reuse across fires is what makes an
+    // address stable, and a fresh pool per fire is the allocation it replaces.
+    let scratch = driver_metal_new::metal::Scratch::new();
 
-    let first = driver_metal_new::model::run::submit(
-        &context,
-        &compiler,
-        &mut pipelines,
-        &mut stepper,
-        &lowered,
-        geometry(),
-        &mut store,
-    )
-    .expect("the first fire commits");
+    let mut machine = driver_metal_new::model::run::Machine {
+        context: &context,
+        compiler: &compiler,
+        pipelines: &mut pipelines,
+        stepper: &mut stepper,
+        scratch: &scratch,
+    };
+    let first =
+        driver_metal_new::model::run::submit(&mut machine, &lowered, geometry(), &mut store)
+            .expect("the first fire commits");
 
     // Committed, not waited for. The second is planned, staged, bound and
     // committed with the first still outstanding.
-    let second = driver_metal_new::model::run::submit(
-        &context,
-        &compiler,
-        &mut pipelines,
-        &mut stepper,
-        &lowered,
-        geometry(),
-        &mut store,
-    )
-    .expect("the second fire commits while the first is outstanding");
+    let second =
+        driver_metal_new::model::run::submit(&mut machine, &lowered, geometry(), &mut store)
+            .expect("the second fire commits while the first is outstanding");
+
+    // TWO regions, not one. The pool must not hand the second fire the arena
+    // the first is still executing over -- `ALLOCATOR_COUNT = 2` bounds the
+    // depth at two, so two arenas is exactly right and one would be a
+    // use-after-free that a green run does not show.
+    assert_ne!(
+        first.arena.gpu_address(),
+        second.arena.gpu_address(),
+        "a fire in flight still owns its arena"
+    );
 
     assert_eq!(
         second.value,

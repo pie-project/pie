@@ -4272,7 +4272,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -4395,41 +4395,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 0
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 0
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        9
-      ],
       "outputs": [],
       "layer": 0
     },
@@ -4741,7 +4706,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -4864,41 +4829,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 1
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 1
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        25
-      ],
       "outputs": [],
       "layer": 1
     },
@@ -5210,7 +5140,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -5333,41 +5263,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 2
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 2
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        41
-      ],
       "outputs": [],
       "layer": 2
     },
@@ -5679,7 +5574,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -5802,41 +5697,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 3
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 3
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        57
-      ],
       "outputs": [],
       "layer": 3
     },
@@ -6148,7 +6008,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -6271,41 +6131,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 4
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 4
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        73
-      ],
       "outputs": [],
       "layer": 4
     },
@@ -6617,7 +6442,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -6740,41 +6565,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 5
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 5
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        89
-      ],
       "outputs": [],
       "layer": 5
     },
@@ -7086,7 +6876,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -7209,41 +6999,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 6
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 6
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        105
-      ],
       "outputs": [],
       "layer": 6
     },
@@ -7555,7 +7310,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -7678,41 +7433,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 7
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 7
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        121
-      ],
       "outputs": [],
       "layer": 7
     },
@@ -8024,7 +7744,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -8147,41 +7867,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 8
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 8
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        137
-      ],
       "outputs": [],
       "layer": 8
     },
@@ -8493,7 +8178,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -8616,41 +8301,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 9
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 9
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        153
-      ],
       "outputs": [],
       "layer": 9
     },
@@ -8962,7 +8612,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -9085,41 +8735,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 10
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 10
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        169
-      ],
       "outputs": [],
       "layer": 10
     },
@@ -9431,7 +9046,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -9554,41 +9169,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 11
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 11
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        185
-      ],
       "outputs": [],
       "layer": 11
     },
@@ -9900,7 +9480,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -10023,41 +9603,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 12
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 12
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        201
-      ],
       "outputs": [],
       "layer": 12
     },
@@ -10369,7 +9914,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -10492,41 +10037,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 13
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 13
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        217
-      ],
       "outputs": [],
       "layer": 13
     },
@@ -10838,7 +10348,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -10961,41 +10471,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 14
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 14
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        233
-      ],
       "outputs": [],
       "layer": 14
     },
@@ -11307,7 +10782,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -11430,41 +10905,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 15
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 15
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        249
-      ],
       "outputs": [],
       "layer": 15
     },
@@ -11776,7 +11216,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -11899,41 +11339,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 16
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 16
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        265
-      ],
       "outputs": [],
       "layer": 16
     },
@@ -12245,7 +11650,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -12368,41 +11773,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 17
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 17
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        281
-      ],
       "outputs": [],
       "layer": 17
     },
@@ -12714,7 +12084,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -12837,41 +12207,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 18
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 18
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        297
-      ],
       "outputs": [],
       "layer": 18
     },
@@ -13183,7 +12518,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -13306,41 +12641,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 19
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 19
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        313
-      ],
       "outputs": [],
       "layer": 19
     },
@@ -13652,7 +12952,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -13775,41 +13075,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 20
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 20
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        329
-      ],
       "outputs": [],
       "layer": 20
     },
@@ -14121,7 +13386,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -14244,41 +13509,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 21
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 21
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        345
-      ],
       "outputs": [],
       "layer": 21
     },
@@ -14590,7 +13820,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -14713,41 +13943,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 22
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        361
-      ],
       "outputs": [],
       "layer": 22
     },
@@ -15059,7 +14254,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -15182,41 +14377,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 23
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        377
-      ],
       "outputs": [],
       "layer": 23
     },
@@ -15528,7 +14688,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -15651,41 +14811,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 24
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 24
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        393
-      ],
       "outputs": [],
       "layer": 24
     },
@@ -15997,7 +15122,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -16120,41 +15245,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 25
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 25
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        409
-      ],
       "outputs": [],
       "layer": 25
     },
@@ -16466,7 +15556,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -16589,41 +15679,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 26
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 26
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        425
-      ],
       "outputs": [],
       "layer": 26
     },
@@ -16935,7 +15990,7 @@
               "ops": 6
             }
           ],
-          "else_ops": 6
+          "else_ops": 4
         }
       },
       "inputs": [],
@@ -17058,41 +16113,6 @@
         }
       },
       "inputs": [],
-      "outputs": [],
-      "layer": 27
-    },
-    {
-      "kind": {
-        "Guard": {
-          "arms": [
-            {
-              "pred": "WantsAttnScore",
-              "ops": 1
-            }
-          ],
-          "else_ops": 1
-        }
-      },
-      "inputs": [],
-      "outputs": [],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-          "state": {
-            "store": "KvCache",
-            "layer": 27
-          },
-          "params": [
-            4294967295
-          ]
-        }
-      },
-      "inputs": [
-        441
-      ],
       "outputs": [],
       "layer": 27
     },
@@ -17279,7 +16299,7 @@
     {
       "seam": "attn.out",
       "layer": 0,
-      "op": 25,
+      "op": 23,
       "values": [
         9
       ]
@@ -17287,7 +16307,7 @@
     {
       "seam": "attn.qv",
       "layer": 1,
-      "op": 34,
+      "op": 32,
       "values": [
         19,
         21
@@ -17296,7 +16316,7 @@
     {
       "seam": "attn.q",
       "layer": 1,
-      "op": 44,
+      "op": 42,
       "values": [
         25
       ]
@@ -17304,7 +16324,7 @@
     {
       "seam": "attn.out",
       "layer": 1,
-      "op": 49,
+      "op": 47,
       "values": [
         25
       ]
@@ -17312,7 +16332,7 @@
     {
       "seam": "attn.q",
       "layer": 1,
-      "op": 50,
+      "op": 48,
       "values": [
         25
       ]
@@ -17320,7 +16340,7 @@
     {
       "seam": "attn.out",
       "layer": 1,
-      "op": 55,
+      "op": 51,
       "values": [
         25
       ]
@@ -17328,7 +16348,7 @@
     {
       "seam": "attn.qv",
       "layer": 2,
-      "op": 64,
+      "op": 60,
       "values": [
         35,
         37
@@ -17337,7 +16357,23 @@
     {
       "seam": "attn.q",
       "layer": 2,
-      "op": 74,
+      "op": 70,
+      "values": [
+        41
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 75,
+      "values": [
+        41
+      ]
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 76,
       "values": [
         41
       ]
@@ -17351,28 +16387,28 @@
       ]
     },
     {
-      "seam": "attn.q",
-      "layer": 2,
-      "op": 80,
+      "seam": "attn.qv",
+      "layer": 3,
+      "op": 88,
       "values": [
-        41
+        51,
+        53
+      ]
+    },
+    {
+      "seam": "attn.q",
+      "layer": 3,
+      "op": 98,
+      "values": [
+        57
       ]
     },
     {
       "seam": "attn.out",
-      "layer": 2,
-      "op": 85,
-      "values": [
-        41
-      ]
-    },
-    {
-      "seam": "attn.qv",
       "layer": 3,
-      "op": 94,
+      "op": 103,
       "values": [
-        51,
-        53
+        57
       ]
     },
     {
@@ -17386,23 +16422,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 109,
-      "values": [
-        57
-      ]
-    },
-    {
-      "seam": "attn.q",
-      "layer": 3,
-      "op": 110,
-      "values": [
-        57
-      ]
-    },
-    {
-      "seam": "attn.out",
-      "layer": 3,
-      "op": 115,
+      "op": 107,
       "values": [
         57
       ]
@@ -17410,7 +16430,7 @@
     {
       "seam": "attn.qv",
       "layer": 4,
-      "op": 124,
+      "op": 116,
       "values": [
         67,
         69
@@ -17419,7 +16439,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 134,
+      "op": 126,
       "values": [
         73
       ]
@@ -17427,7 +16447,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 139,
+      "op": 131,
       "values": [
         73
       ]
@@ -17435,7 +16455,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 140,
+      "op": 132,
       "values": [
         73
       ]
@@ -17443,7 +16463,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 145,
+      "op": 135,
       "values": [
         73
       ]
@@ -17451,7 +16471,7 @@
     {
       "seam": "attn.qv",
       "layer": 5,
-      "op": 154,
+      "op": 144,
       "values": [
         83,
         85
@@ -17460,7 +16480,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 164,
+      "op": 154,
       "values": [
         89
       ]
@@ -17468,7 +16488,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 169,
+      "op": 159,
       "values": [
         89
       ]
@@ -17476,7 +16496,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 170,
+      "op": 160,
       "values": [
         89
       ]
@@ -17484,7 +16504,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 175,
+      "op": 163,
       "values": [
         89
       ]
@@ -17492,7 +16512,7 @@
     {
       "seam": "attn.qv",
       "layer": 6,
-      "op": 184,
+      "op": 172,
       "values": [
         99,
         101
@@ -17501,7 +16521,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 194,
+      "op": 182,
       "values": [
         105
       ]
@@ -17509,7 +16529,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 199,
+      "op": 187,
       "values": [
         105
       ]
@@ -17517,7 +16537,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 200,
+      "op": 188,
       "values": [
         105
       ]
@@ -17525,7 +16545,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 205,
+      "op": 191,
       "values": [
         105
       ]
@@ -17533,7 +16553,7 @@
     {
       "seam": "attn.qv",
       "layer": 7,
-      "op": 214,
+      "op": 200,
       "values": [
         115,
         117
@@ -17542,7 +16562,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 224,
+      "op": 210,
       "values": [
         121
       ]
@@ -17550,7 +16570,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 229,
+      "op": 215,
       "values": [
         121
       ]
@@ -17558,7 +16578,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 230,
+      "op": 216,
       "values": [
         121
       ]
@@ -17566,7 +16586,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 235,
+      "op": 219,
       "values": [
         121
       ]
@@ -17574,7 +16594,7 @@
     {
       "seam": "attn.qv",
       "layer": 8,
-      "op": 244,
+      "op": 228,
       "values": [
         131,
         133
@@ -17583,7 +16603,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 254,
+      "op": 238,
       "values": [
         137
       ]
@@ -17591,7 +16611,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 259,
+      "op": 243,
       "values": [
         137
       ]
@@ -17599,7 +16619,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 260,
+      "op": 244,
       "values": [
         137
       ]
@@ -17607,7 +16627,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 265,
+      "op": 247,
       "values": [
         137
       ]
@@ -17615,7 +16635,7 @@
     {
       "seam": "attn.qv",
       "layer": 9,
-      "op": 274,
+      "op": 256,
       "values": [
         147,
         149
@@ -17624,7 +16644,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 284,
+      "op": 266,
       "values": [
         153
       ]
@@ -17632,7 +16652,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 289,
+      "op": 271,
       "values": [
         153
       ]
@@ -17640,7 +16660,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 290,
+      "op": 272,
       "values": [
         153
       ]
@@ -17648,7 +16668,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 295,
+      "op": 275,
       "values": [
         153
       ]
@@ -17656,7 +16676,7 @@
     {
       "seam": "attn.qv",
       "layer": 10,
-      "op": 304,
+      "op": 284,
       "values": [
         163,
         165
@@ -17665,7 +16685,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 314,
+      "op": 294,
       "values": [
         169
       ]
@@ -17673,7 +16693,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 319,
+      "op": 299,
       "values": [
         169
       ]
@@ -17681,7 +16701,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 320,
+      "op": 300,
       "values": [
         169
       ]
@@ -17689,7 +16709,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 325,
+      "op": 303,
       "values": [
         169
       ]
@@ -17697,7 +16717,7 @@
     {
       "seam": "attn.qv",
       "layer": 11,
-      "op": 334,
+      "op": 312,
       "values": [
         179,
         181
@@ -17706,7 +16726,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 344,
+      "op": 322,
       "values": [
         185
       ]
@@ -17714,7 +16734,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 349,
+      "op": 327,
       "values": [
         185
       ]
@@ -17722,7 +16742,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 350,
+      "op": 328,
       "values": [
         185
       ]
@@ -17730,7 +16750,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 355,
+      "op": 331,
       "values": [
         185
       ]
@@ -17738,7 +16758,7 @@
     {
       "seam": "attn.qv",
       "layer": 12,
-      "op": 364,
+      "op": 340,
       "values": [
         195,
         197
@@ -17747,7 +16767,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 374,
+      "op": 350,
       "values": [
         201
       ]
@@ -17755,7 +16775,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 379,
+      "op": 355,
       "values": [
         201
       ]
@@ -17763,7 +16783,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 380,
+      "op": 356,
       "values": [
         201
       ]
@@ -17771,7 +16791,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 385,
+      "op": 359,
       "values": [
         201
       ]
@@ -17779,7 +16799,7 @@
     {
       "seam": "attn.qv",
       "layer": 13,
-      "op": 394,
+      "op": 368,
       "values": [
         211,
         213
@@ -17788,7 +16808,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 404,
+      "op": 378,
       "values": [
         217
       ]
@@ -17796,7 +16816,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 409,
+      "op": 383,
       "values": [
         217
       ]
@@ -17804,7 +16824,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 410,
+      "op": 384,
       "values": [
         217
       ]
@@ -17812,7 +16832,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 415,
+      "op": 387,
       "values": [
         217
       ]
@@ -17820,7 +16840,7 @@
     {
       "seam": "attn.qv",
       "layer": 14,
-      "op": 424,
+      "op": 396,
       "values": [
         227,
         229
@@ -17829,7 +16849,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 434,
+      "op": 406,
       "values": [
         233
       ]
@@ -17837,7 +16857,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 439,
+      "op": 411,
       "values": [
         233
       ]
@@ -17845,7 +16865,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 440,
+      "op": 412,
       "values": [
         233
       ]
@@ -17853,7 +16873,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 445,
+      "op": 415,
       "values": [
         233
       ]
@@ -17861,7 +16881,7 @@
     {
       "seam": "attn.qv",
       "layer": 15,
-      "op": 454,
+      "op": 424,
       "values": [
         243,
         245
@@ -17870,7 +16890,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 464,
+      "op": 434,
       "values": [
         249
       ]
@@ -17878,7 +16898,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 469,
+      "op": 439,
       "values": [
         249
       ]
@@ -17886,7 +16906,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 470,
+      "op": 440,
       "values": [
         249
       ]
@@ -17894,7 +16914,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 475,
+      "op": 443,
       "values": [
         249
       ]
@@ -17902,7 +16922,7 @@
     {
       "seam": "attn.qv",
       "layer": 16,
-      "op": 484,
+      "op": 452,
       "values": [
         259,
         261
@@ -17911,7 +16931,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 494,
+      "op": 462,
       "values": [
         265
       ]
@@ -17919,7 +16939,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 499,
+      "op": 467,
       "values": [
         265
       ]
@@ -17927,7 +16947,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 500,
+      "op": 468,
       "values": [
         265
       ]
@@ -17935,7 +16955,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 505,
+      "op": 471,
       "values": [
         265
       ]
@@ -17943,7 +16963,7 @@
     {
       "seam": "attn.qv",
       "layer": 17,
-      "op": 514,
+      "op": 480,
       "values": [
         275,
         277
@@ -17952,7 +16972,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 524,
+      "op": 490,
       "values": [
         281
       ]
@@ -17960,7 +16980,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 529,
+      "op": 495,
       "values": [
         281
       ]
@@ -17968,7 +16988,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 530,
+      "op": 496,
       "values": [
         281
       ]
@@ -17976,7 +16996,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 535,
+      "op": 499,
       "values": [
         281
       ]
@@ -17984,7 +17004,7 @@
     {
       "seam": "attn.qv",
       "layer": 18,
-      "op": 544,
+      "op": 508,
       "values": [
         291,
         293
@@ -17993,7 +17013,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 554,
+      "op": 518,
       "values": [
         297
       ]
@@ -18001,7 +17021,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 559,
+      "op": 523,
       "values": [
         297
       ]
@@ -18009,7 +17029,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 560,
+      "op": 524,
       "values": [
         297
       ]
@@ -18017,7 +17037,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 565,
+      "op": 527,
       "values": [
         297
       ]
@@ -18025,7 +17045,7 @@
     {
       "seam": "attn.qv",
       "layer": 19,
-      "op": 574,
+      "op": 536,
       "values": [
         307,
         309
@@ -18034,7 +17054,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 584,
+      "op": 546,
       "values": [
         313
       ]
@@ -18042,7 +17062,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 589,
+      "op": 551,
       "values": [
         313
       ]
@@ -18050,7 +17070,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 590,
+      "op": 552,
       "values": [
         313
       ]
@@ -18058,7 +17078,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 595,
+      "op": 555,
       "values": [
         313
       ]
@@ -18066,7 +17086,7 @@
     {
       "seam": "attn.qv",
       "layer": 20,
-      "op": 604,
+      "op": 564,
       "values": [
         323,
         325
@@ -18075,7 +17095,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 614,
+      "op": 574,
       "values": [
         329
       ]
@@ -18083,7 +17103,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 619,
+      "op": 579,
       "values": [
         329
       ]
@@ -18091,7 +17111,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 620,
+      "op": 580,
       "values": [
         329
       ]
@@ -18099,7 +17119,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 625,
+      "op": 583,
       "values": [
         329
       ]
@@ -18107,7 +17127,7 @@
     {
       "seam": "attn.qv",
       "layer": 21,
-      "op": 634,
+      "op": 592,
       "values": [
         339,
         341
@@ -18116,7 +17136,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 644,
+      "op": 602,
       "values": [
         345
       ]
@@ -18124,7 +17144,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 649,
+      "op": 607,
       "values": [
         345
       ]
@@ -18132,7 +17152,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 650,
+      "op": 608,
       "values": [
         345
       ]
@@ -18140,7 +17160,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 655,
+      "op": 611,
       "values": [
         345
       ]
@@ -18148,7 +17168,7 @@
     {
       "seam": "attn.qv",
       "layer": 22,
-      "op": 664,
+      "op": 620,
       "values": [
         355,
         357
@@ -18157,7 +17177,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 674,
+      "op": 630,
       "values": [
         361
       ]
@@ -18165,7 +17185,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 679,
+      "op": 635,
       "values": [
         361
       ]
@@ -18173,7 +17193,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 680,
+      "op": 636,
       "values": [
         361
       ]
@@ -18181,7 +17201,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 685,
+      "op": 639,
       "values": [
         361
       ]
@@ -18189,7 +17209,7 @@
     {
       "seam": "attn.qv",
       "layer": 23,
-      "op": 694,
+      "op": 648,
       "values": [
         371,
         373
@@ -18198,7 +17218,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 704,
+      "op": 658,
       "values": [
         377
       ]
@@ -18206,7 +17226,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 709,
+      "op": 663,
       "values": [
         377
       ]
@@ -18214,7 +17234,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 710,
+      "op": 664,
       "values": [
         377
       ]
@@ -18222,7 +17242,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 715,
+      "op": 667,
       "values": [
         377
       ]
@@ -18230,7 +17250,7 @@
     {
       "seam": "attn.qv",
       "layer": 24,
-      "op": 724,
+      "op": 676,
       "values": [
         387,
         389
@@ -18239,7 +17259,7 @@
     {
       "seam": "attn.q",
       "layer": 24,
-      "op": 734,
+      "op": 686,
       "values": [
         393
       ]
@@ -18247,7 +17267,7 @@
     {
       "seam": "attn.out",
       "layer": 24,
-      "op": 739,
+      "op": 691,
       "values": [
         393
       ]
@@ -18255,7 +17275,7 @@
     {
       "seam": "attn.q",
       "layer": 24,
-      "op": 740,
+      "op": 692,
       "values": [
         393
       ]
@@ -18263,7 +17283,7 @@
     {
       "seam": "attn.out",
       "layer": 24,
-      "op": 745,
+      "op": 695,
       "values": [
         393
       ]
@@ -18271,7 +17291,7 @@
     {
       "seam": "attn.qv",
       "layer": 25,
-      "op": 754,
+      "op": 704,
       "values": [
         403,
         405
@@ -18280,7 +17300,7 @@
     {
       "seam": "attn.q",
       "layer": 25,
-      "op": 764,
+      "op": 714,
       "values": [
         409
       ]
@@ -18288,7 +17308,7 @@
     {
       "seam": "attn.out",
       "layer": 25,
-      "op": 769,
+      "op": 719,
       "values": [
         409
       ]
@@ -18296,7 +17316,7 @@
     {
       "seam": "attn.q",
       "layer": 25,
-      "op": 770,
+      "op": 720,
       "values": [
         409
       ]
@@ -18304,7 +17324,7 @@
     {
       "seam": "attn.out",
       "layer": 25,
-      "op": 775,
+      "op": 723,
       "values": [
         409
       ]
@@ -18312,7 +17332,7 @@
     {
       "seam": "attn.qv",
       "layer": 26,
-      "op": 784,
+      "op": 732,
       "values": [
         419,
         421
@@ -18321,7 +17341,7 @@
     {
       "seam": "attn.q",
       "layer": 26,
-      "op": 794,
+      "op": 742,
       "values": [
         425
       ]
@@ -18329,7 +17349,7 @@
     {
       "seam": "attn.out",
       "layer": 26,
-      "op": 799,
+      "op": 747,
       "values": [
         425
       ]
@@ -18337,7 +17357,7 @@
     {
       "seam": "attn.q",
       "layer": 26,
-      "op": 800,
+      "op": 748,
       "values": [
         425
       ]
@@ -18345,7 +17365,7 @@
     {
       "seam": "attn.out",
       "layer": 26,
-      "op": 805,
+      "op": 751,
       "values": [
         425
       ]
@@ -18353,7 +17373,7 @@
     {
       "seam": "attn.qv",
       "layer": 27,
-      "op": 814,
+      "op": 760,
       "values": [
         435,
         437
@@ -18362,7 +17382,7 @@
     {
       "seam": "attn.q",
       "layer": 27,
-      "op": 824,
+      "op": 770,
       "values": [
         441
       ]
@@ -18370,7 +17390,7 @@
     {
       "seam": "attn.out",
       "layer": 27,
-      "op": 829,
+      "op": 775,
       "values": [
         441
       ]
@@ -18378,7 +17398,7 @@
     {
       "seam": "attn.q",
       "layer": 27,
-      "op": 830,
+      "op": 776,
       "values": [
         441
       ]
@@ -18386,7 +17406,7 @@
     {
       "seam": "attn.out",
       "layer": 27,
-      "op": 835,
+      "op": 779,
       "values": [
         441
       ]

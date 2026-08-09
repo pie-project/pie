@@ -156,6 +156,13 @@ const UNSTATED_ROWS: &[&str] = &[
     // (the fused landing, waiting on a guard whose arms produce a PAIR)
     // and `dist::all_gather_bf16` (no text gathers; column-parallel
     // outputs here are consumed shard-local).
+    // The epilogue's row gather has no `dsl::cuda` wrapper because no
+    // model text states it: `lower::epilogue` emits it when the fire
+    // samples fewer rows than it computes (a prefill reads one
+    // distribution per request out of a stream of one row per token).
+    // A statement the LOWERING makes is real without a text stating it,
+    // which is precisely what this list is for.
+    "layout::gather_bf16_rows",
     "rope::rope_partial_bf16_position_delta",
 ];
 
@@ -334,8 +341,30 @@ fn the_depth_axis_derives_from_the_layer_tag() {
         .ops
         .iter()
         .any(|op| prefill.depth_windowed(op)));
+    // Asked of the LOWERED form, not the traced one, and that is the
+    // window-class merge (`.wiki/driver/graph.md` §4.1): the trace now
+    // carries BOTH window classes as arms of a `GuardPred::WindowOne`
+    // guard, so a prefill TRACE does contain the planned decode
+    // dispatch — it is the arm this fire will not take. Which arm runs
+    // is a lowering answer, and `Resolve` is where it is given.
+    let prefill_rows = vec![
+        model_compiler::lower::Row { multi_token: true, ..Default::default() };
+        7
+    ];
+    let lowered = model_compiler::lower::lower_with(
+        &prefill,
+        &prefill_rows,
+        model_compiler::lower::Fire::default(),
+        model_compiler::lower::GuardMode::Resolve,
+    )
+    .expect("a prefill fire lowers");
     assert_eq!(
-        prefill.ops.iter().filter(|op| prefill.depth_prefix_plan(op)).count(),
+        lowered
+            .launches
+            .iter()
+            .filter(|l| lowered.kernels[l.kernel as usize]
+                == "attn::dispatch_attention_flashinfer_decode")
+            .count(),
         0,
         "a prefill fire runs no planned decode dispatch, so nothing swaps"
     );
@@ -409,9 +438,6 @@ fn live_traces_satisfy_the_table() {
     for class in [
         FireClass::Decode,
         FireClass::Prefill,
-        FireClass::StateOnly,
-        FireClass::CommitAdvance,
-        FireClass::FrozenVerify,
     ] {
         plans.push(model::qwen_3_5::forward::qwen3_5_hybrid_cuda(
             &Qwen35HybridFacts::qwen3_5_0_8b(),

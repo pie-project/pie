@@ -102,17 +102,41 @@ pub static KERNELS: &[KernelSig] = &[
             num_q_heads: I32, num_kv_heads: I32, head_dim: I32, page_size: I32,
             hnd_layout: Bool, theta: F32, eps: F32, stream: Stream,
         ]),
+    // The EXPLICIT append: the fire states each token's destination page
+    // and offset instead of deriving them from the CSR. Only a fire that
+    // computed those carries them, which is what `AttnNonZero` tests —
+    // the hand arm made the same null check and returned `NoAttnCtx`
+    // saying "the fire published no write descriptors".
     kernel!(write_kv_explicit "attn::write_kv_explicit_bf16",
         operands = operands![
-            layer: KvCacheLayerView, k_curr: Buf, v_curr: Buf, w_page: U32s,
-            w_off: U32s, B: I32, stream: Stream, row_valid: U8s,
+            layer: KvCacheLayerView <- Source::KvLayerView,
+            k_curr: Buf <- Source::In(0),
+            v_curr: Buf <- Source::In(1),
+            w_page: U32s <- Source::AttnNonZero("w_page_d"),
+            w_off: U32s <- Source::AttnNonZero("w_off_d"),
+            B: I32 <- Source::Rows,
+            stream: Stream <- Source::Ctx("stream"),
+            row_valid: U8s <- Source::Attn("row_valid_d"),
         ]),
+    // The paged KV append, fired once per layer of every fire — and the
+    // first row to bind a `KvCacheLayerView`. `Source::KvKeys` and
+    // `KvValues` spell a cache as two device pointers, which is METAL's
+    // shape and which this emitter refuses; CUDA's launcher takes the
+    // view whole, so `Source::KvLayerView` is the spelling it can answer.
     kernel!(write_kv_to_pages "attn::write_kv_to_pages",
         operands = operands![
-            layer: KvCacheLayerView, k_curr: Buf, v_curr: Buf, qo_indptr: U32s,
-            kv_page_indices: U32s, kv_page_indptr: U32s, kv_last_page_lens: U32s,
-            total_tokens: I32, num_requests: I32, stream: Stream, row_valid: U8s,
-            first_token: I32,
+            layer: KvCacheLayerView <- Source::KvLayerView,
+            k_curr: Buf <- Source::In(0),
+            v_curr: Buf <- Source::In(1),
+            qo_indptr: U32s <- Source::Attn("qo_indptr_d"),
+            kv_page_indices: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens: U32s <- Source::Attn("kv_last_page_lens_d"),
+            total_tokens: I32 <- Source::Rows,
+            num_requests: I32 <- Source::Attn("num_requests"),
+            stream: Stream <- Source::Ctx("stream"),
+            row_valid: U8s <- Source::Attn("row_valid_d"),
+            first_token: I32 <- Source::Attn("first_token"),
         ]),
     kernel!(qkv_decode_fused_devwin "attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin",
         whole = true, sink = Some("kv.pages"),
@@ -516,9 +540,13 @@ pub static KERNELS: &[KernelSig] = &[
             target_hidden: Buf, pending_hidden: BufMut, qo_indptr: U32s,
             slot_ids: I32s, num_requests: I32, hidden_size: I32, stream: Stream,
         ]),
+    // Reads and writes the cache and states no operand at all: every
+    // argument is the layer's view or the fire's page table.
     kernel!(dequant "attn::dequant_kv_cache_layer_to_bf16_active",
         operands = operands![
-            layer: KvCacheLayerView, kv_page_indices: U32s,
-            num_pages_in_batch: I32, stream: Stream,
+            layer: KvCacheLayerView <- Source::KvLayerView,
+            kv_page_indices: U32s <- Source::Attn("kv_page_indices_d"),
+            num_pages_in_batch: I32 <- Source::Attn("num_pages_in_batch"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
 ];

@@ -60,39 +60,90 @@ pub trait KvCacheDeviceOps {
 /// `escape_arena`/`restore_arena` are no-ops here, and that is a statement
 /// about THIS impl rather than a shortcut: the C++ escapes because a global
 /// arena allocator is installed and envelope storage must not live in
-/// elastic (uncommitted) VA. This impl's `alloc_tensor` is raw `cudaMalloc`
-/// unconditionally, so every tier is already outside the arena. The moment
-/// an arena-backed `alloc_tensor` exists, the escape stops being a no-op —
-/// the pair stays on the trait so that impl has somewhere to put it.
+/// elastic (uncommitted) VA. This impl allocates through the driver's own
+/// [`Allocator`](crate::cuda::Allocator), which is already outside the
+/// arena. The moment an arena-backed `alloc_tensor` exists, the escape
+/// stops being a no-op — the pair stays on the trait so that impl has
+/// somewhere to put it.
+///
+/// # It owns what it allocates
+///
+/// [`KvCache`] holds raw `*mut c_void` and has no `Drop`, because it is a
+/// port of a C++ type whose tiers were freed by an arena that outlived it.
+/// In Rust that shape leaks: `abi_shell`'s `kv_pools_for` REPLACES its
+/// pools on every growth, and a replaced tier with no owner is simply
+/// gone. So the ops object keeps the [`DeviceBuffer`](crate::cuda::DeviceBuffer)s
+/// — each one holds an `Arc` on the allocator and frees itself — and the
+/// caller keeps the ops object alongside the cache it materialised.
+///
+/// Which is why this is no longer `Copy`: a copy would have been a second
+/// owner of the same tiers, and dropping either would have freed them
+/// under the other.
 #[cfg(feature = "bridge")]
-#[derive(Debug, Clone, Copy)]
-pub struct LiveKvCacheOps {
+#[derive(Debug)]
+pub struct LiveKvCacheOps<'a> {
     stream: *mut c_void,
+    alloc: &'a crate::cuda::Allocator,
+    held: Vec<crate::cuda::DeviceBuffer>,
 }
 
 #[cfg(feature = "bridge")]
-impl LiveKvCacheOps {
-    /// Ops ordered on `stream` — the materialize-time stream, which the
-    /// C++ takes from the engine's context.
+impl<'a> LiveKvCacheOps<'a> {
+    /// Ops ordered on `stream`, allocating from `alloc`.
+    ///
+    /// `alloc` is borrowed, not held: [`Allocator`](crate::cuda::Allocator)
+    /// is deliberately not `Clone`, because a second handle would be a
+    /// second way to call `alloc` that `begin_capture`'s `&mut self`
+    /// borrow does not cover. So this object is transient — build it,
+    /// materialise a cache with it, and take the buffers out with
+    /// [`Self::into_held`].
+    ///
+    /// The stream is the materialize-time one, which the C++ takes from
+    /// the engine's context.
     #[must_use]
-    pub const fn new(stream: *mut c_void) -> Self {
-        Self { stream }
+    pub const fn new(stream: *mut c_void, alloc: &'a crate::cuda::Allocator) -> Self {
+        Self { stream, alloc, held: Vec::new() }
+    }
+
+    /// Bytes this object has allocated.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.held.iter().map(crate::cuda::DeviceBuffer::len).sum()
+    }
+
+    /// The buffers backing the cache this materialised, for the caller
+    /// to keep alongside it.
+    ///
+    /// [`KvCache`] holds raw `*mut c_void` and has no `Drop`, because it
+    /// is a port of a C++ type whose tiers were freed by an arena that
+    /// outlived it. In Rust that shape leaks — `abi_shell`'s
+    /// `kv_pools_for` REPLACES its pools on every growth, and a replaced
+    /// tier with no owner is simply gone. Keeping these beside the cache
+    /// makes the cache's lifetime the buffers', which is what the shell's
+    /// hand-built pools already got right.
+    #[must_use]
+    pub fn into_held(self) -> Vec<crate::cuda::DeviceBuffer> {
+        self.held
     }
 }
 
 #[cfg(feature = "bridge")]
-impl KvCacheDeviceOps for LiveKvCacheOps {
+impl KvCacheDeviceOps for LiveKvCacheOps<'_> {
     fn alloc_tensor(&mut self, dtype: DType, shape: &[i64]) -> *mut c_void {
-        use cudarc::runtime::sys::{cudaError, cudaMalloc};
         let elems: i64 = shape.iter().product();
         let bytes = usize::try_from(elems).unwrap_or(0) * dtype.size_bytes();
         if bytes == 0 {
             // The C++ allocator's own convention, and what `empty()` tests.
             return std::ptr::null_mut();
         }
-        let mut p: *mut c_void = std::ptr::null_mut();
-        let ok = unsafe { cudaMalloc(&mut p, bytes) } == cudaError::cudaSuccess;
-        if ok { p } else { std::ptr::null_mut() }
+        let Ok(buf) = self.alloc.alloc(bytes) else {
+            // The C++ returns null on failure and `materialize` checks it,
+            // so exhaustion stays a refusal rather than a panic.
+            return std::ptr::null_mut();
+        };
+        let p = buf.as_ptr();
+        self.held.push(buf);
+        p
     }
 
     fn escape_arena(&mut self) {}
@@ -139,6 +190,28 @@ pub trait ElasticPool {
     fn trim_fraction(&mut self, used: usize, capacity: usize);
     /// Bytes currently committed.
     fn committed_bytes(&self) -> usize;
+}
+
+/// A cache whose pages are all resident.
+///
+/// [`ElasticPool`] has no other implementor: [`Arena`](crate::cuda::vmm::Arena)
+/// is the driver's elastic allocator and speaks `ensure_committed(bytes)`
+/// rather than `ensure_fraction(used, capacity)`, so nothing yet bridges
+/// the two. Until something does, every cache the driver builds is this
+/// one, and a caller still has to name a type parameter — so it is named
+/// here rather than re-declared at each call site.
+///
+/// `materialize` leaves `elastic` as `None` regardless, so this affects
+/// only what the type reads as, not what it does.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AllResident;
+
+impl ElasticPool for AllResident {
+    fn ensure_fraction(&mut self, _used: usize, _capacity: usize) {}
+    fn trim_fraction(&mut self, _used: usize, _capacity: usize) {}
+    fn committed_bytes(&self) -> usize {
+        0
+    }
 }
 
 /// One tier's device pointers, slot-aligned with the layout.

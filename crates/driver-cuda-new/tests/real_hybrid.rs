@@ -430,6 +430,9 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         layers,
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         q_out: named_bufs[&q_pin_value].as_ptr(),
         o_out,
         kv_page_indices_d: csr_indices.as_ptr().cast(),
@@ -456,6 +459,10 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         driver_cuda_new::cuda::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
             .expect("cublas");
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-6,

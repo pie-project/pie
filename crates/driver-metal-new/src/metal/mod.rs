@@ -45,7 +45,10 @@ mod memory;
 mod pipeline;
 mod pool;
 mod program;
+mod recording;
+mod regions;
 mod ring;
+mod scratch;
 mod runtime;
 mod storage;
 mod tables;
@@ -75,7 +78,10 @@ pub use program::{
     FusedExecutable, GroupedExecutable, ProgramExecutable, ProgramStage, Pso, RegionExecutable,
     StageExecutable,
 };
+pub use recording::{Recording, record};
+pub use regions::Regions;
 pub use ring::{Ring, allocate};
+pub use scratch::{Lease, Scratch};
 pub use runtime::{
     MAX_FUSED_CHANNELS, MAX_REGIONS_PER_PROGRAM, MAX_REGIONS_PER_STAGE, ORDINAL_BASE, Runtime,
 };

@@ -429,6 +429,19 @@ impl Compiler {
         // tracing has nothing else to report: a pipeline is an opaque object
         // and the DAG ordinal names a position rather than a kernel.
         pipeline_descriptor.setLabel(Some(&name));
+        // USABLE FROM AN INDIRECT COMMAND BUFFER, and it has to be stated at
+        // compile time -- a pipeline set on an `MTLIndirectComputeCommand`
+        // without it does not fail, it FAULTS. Measured: SIGSEGV inside the
+        // recording loop, before anything executes.
+        //
+        // Stated for every pipeline rather than for the ones a caller intends
+        // to record, because the alternative is two caches keyed by intent and
+        // a fire that faults when it takes the wrong one. Apple documents the
+        // flag as costing the compiler some freedom; nothing here has measured
+        // a difference, and a fault is not a trade.
+        pipeline_descriptor.setSupportIndirectCommandBuffers(
+            objc2_metal::MTL4IndirectCommandBufferSupportState::Enabled,
+        );
 
         self.compiler
             .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(

@@ -240,8 +240,35 @@ fn widths<'a>(lowered: &'a Lowered, launch: &Launch) -> impl DoubleEndedIterator
 }
 
 /// The dims one launch evaluates its rule at.
+///
+/// `sig` is the launch's own row, and it is here for one reason: a row may
+/// say that its rule's extent comes from the STATEMENT rather than from the
+/// fire. See [`kernels::KernelSig::grid_param`] — gemma-4 rotates a quarter
+/// of each full-attention head and all of each sliding one, and one
+/// fire-wide `rotary_dims` cannot be both.
 #[must_use]
-pub fn dims_of(lowered: &Lowered, launch: &Launch, geometry: Geometry) -> Dims {
+pub fn dims_of(
+    sig: &kernels::KernelSig,
+    lowered: &Lowered,
+    launch: &Launch,
+    geometry: Geometry,
+) -> Dims {
+    // What the ROW says its extent is, when it says anything. Read out of the
+    // statement's own scalar run, which is the channel the trace already
+    // carries — the only new thing is that the driver reads one for the GRID
+    // instead of only forwarding it to the kernel.
+    //
+    // A row naming a param the statement does not carry falls back to the
+    // fire's geometry rather than to zero: a grid of zero launches nothing at
+    // all, which is a silent no-op, and the fire-wide number is right for
+    // every deployment that states one shape.
+    let stated = sig.grid_param.and_then(|i| {
+        let at = launch.params.start as usize + i as usize;
+        (at < launch.params.end as usize)
+            .then(|| lowered.params.get(at).copied())
+            .flatten()
+            .filter(|n| *n > 0)
+    });
     Dims {
         rows: launch.rows.end - launch.rows.start,
         width: sizing_width(lowered, launch),
@@ -249,7 +276,7 @@ pub fn dims_of(lowered: &Lowered, launch: &Launch, geometry: Geometry) -> Dims {
         q_heads: geometry.q_heads,
         kv_heads: geometry.kv_heads,
         head_dim: geometry.head_dim,
-        rotary_dims: geometry.rotary_dims,
+        rotary_dims: stated.unwrap_or(geometry.rotary_dims),
         n_experts: geometry.n_experts,
         experts_per_token: geometry.experts_per_token,
     }
@@ -290,7 +317,7 @@ pub fn plan_one<'a, S: Resolver>(
         symbol: symbol.clone(),
         op: launch.op,
     })?;
-    let grid = eval(sig.launch, dims_of(lowered, launch, geometry)).map_err(|why| {
+    let grid = eval(sig.launch, dims_of(sig, lowered, launch, geometry)).map_err(|why| {
         Undispatchable::Ungeometric {
             symbol: symbol.clone(),
             op: launch.op,
@@ -723,7 +750,12 @@ mod tests {
             head_dim: 128,
             ..Geometry::default()
         };
-        let dims = dims_of(&low, &low.launches[0], geometry);
+        // A row that names no `grid_param` takes the fire's geometry, which
+        // is every row but the rope's.
+        let sig = kernels::sig_in(kernels_metal::KERNELS, "rms_norm_bf16")
+            .or_else(|| kernels_metal::KERNELS.first())
+            .expect("the table has rows");
+        let dims = dims_of(sig, &low, &low.launches[0], geometry);
         assert_eq!(dims.rows, 5, "the rectangle states the rows");
         assert_eq!(dims.width, 64, "the operand states the width");
         assert_eq!(dims.q_heads, 16, "the fire states the rest");

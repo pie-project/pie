@@ -37,7 +37,57 @@ unsafe extern "C" fn bump_fires(ctx: *mut std::ffi::c_void, _wait_id: u64, _epoc
     }
 }
 
+/// The runtime callbacks a driver is created with in the real world.
+///
+/// `driver-api`'s `validate_runtime_callbacks` requires a non-null
+/// `notify`, and the engine always supplies one
+/// (`engine/src/driver/backend/cuda.rs:44-52` hands over a
+/// `CompletionBroker`'s). These tests used `..Default::default()`, which
+/// leaves it `None` — a descriptor no caller sends — and so were
+/// exercising a shape the shell now refuses at the door.
+///
+/// The refusal is the POINT: a driver created without a way to notify has
+/// no way to retire a fire, and until the entry points ran the shared
+/// validators nothing said so.
+fn engine_runtime() -> PieRuntimeCallbacks {
+    unsafe extern "C" fn ignore(_ctx: *mut std::ffi::c_void, _wait: u64, _epoch: u64) {}
+    PieRuntimeCallbacks {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        reserved0: 0,
+        ctx: std::ptr::null_mut(),
+        notify: Some(ignore),
+    }
+}
+
 /// A fire counter with a stable address, for `PieRuntimeCallbacks::ctx`.
+/// The cached Qwen3-0.6B snapshot, if this box has one.
+///
+/// Extracted because a second test needed it and the first had it inline
+/// — two copies of a path search is two places for a skip to stop
+/// working, and a test that silently stops running is worse than one that
+/// fails.
+fn qwen3_snapshot() -> Option<std::path::PathBuf> {
+    let root = std::path::PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+    )
+    .join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
+    std::fs::read_dir(root).ok().and_then(|rd| {
+        rd.filter_map(std::result::Result::ok).find_map(|e| {
+            let p = e.path();
+            p.join("model.safetensors").is_file().then_some(p)
+        })
+    })
+}
+
+/// The generated descriptor beside it.
+fn qwen3_descriptor() -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(
+        "/tmp/claude-0/-root--patissier-work-tart-alpha/7460e4c3-f305-45df-9603-2298b0c0c60e/scratchpad",
+    )
+    .join("qwen3_descriptor.json");
+    p.is_file().then_some(p)
+}
+
 fn fire_counter() -> Box<AtomicU64> {
     Box::new(AtomicU64::new(0))
 }
@@ -95,9 +145,11 @@ fn a_tensor_parallel_group_is_refused_rather_than_answered_wrongly() {
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(d.is_null(), "tp_size = 2 must refuse; there is no all-reduce to serve it");
 
     // And one rank still boots, so the refusal is about the GROUP and not
@@ -106,9 +158,11 @@ fn a_tensor_parallel_group_is_refused_rather_than_answered_wrongly() {
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: solo.as_ptr(), len: solo.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null(), "one rank is the served configuration");
     unsafe { driver_cuda_new::abi_shell::pie_cuda_destroy(d) };
 }
@@ -134,9 +188,11 @@ fn a_panicking_request_does_not_take_the_process_down() {
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
 
     // No model is loaded, so this refuses long before it can panic — which is
@@ -202,9 +258,11 @@ fn load_model_answers_capabilities_an_engine_can_parse() {
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -289,8 +347,11 @@ fn the_shell_answers_the_engines_own_declarations() {
     assert!(d.is_null(), "a mismatched ABI version must refuse");
 
     // The real version creates, hands back live caps, and destroys.
-    let desc =
-        PieDriverCreateDesc { abi_version: PIE_DRIVER_ABI_VERSION, ..Default::default() };
+    let desc = PieDriverCreateDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        runtime: engine_runtime(),
+        ..Default::default()
+    };
     let mut caps = PieDriverCaps { json_bytes: std::ptr::null(), json_len: 0 };
     let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null(), "create with the pinned ABI version");
@@ -353,9 +414,11 @@ fn load_model_loads_a_real_snapshot_through_the_abi() {
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
 
     let snap_str = snap.to_string_lossy().into_owned();
@@ -387,9 +450,13 @@ fn load_model_loads_a_real_snapshot_through_the_abi() {
 fn the_registries_run_the_id_lifecycle() {
     use driver_api::local::{PieInstanceBinding, PieInstanceDesc, PieProgramDesc};
 
-    let desc =
-        PieDriverCreateDesc { abi_version: PIE_DRIVER_ABI_VERSION, ..Default::default() };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let desc = PieDriverCreateDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        runtime: engine_runtime(),
+        ..Default::default()
+    };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
 
     let prog = PieProgramDesc { program_hash: 0xC3C3, ..Default::default() };
@@ -413,10 +480,14 @@ fn the_registries_run_the_id_lifecycle() {
         "an unregistered program refuses the bind"
     );
 
+    // `geometry_class: 7` here for years, and nothing looked: it is not a
+    // `GeometryClass` and never was. The shared validators caught it the
+    // first time an entry point ran them, which is the whole argument for
+    // running them.
     let inst = PieInstanceDesc {
         program_id: id1,
         requested_instance_id: 42,
-        geometry_class: 7,
+        geometry_class: driver_api::local::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE,
         ..Default::default()
     };
     assert_eq!(
@@ -424,7 +495,11 @@ fn the_registries_run_the_id_lifecycle() {
         PIE_STATUS_OK
     );
     assert_eq!(binding.instance_id, 42, "the requested id is honored");
-    assert_eq!(binding.geometry_class, 7, "the geometry echoes");
+    assert_eq!(
+        binding.geometry_class,
+        driver_api::local::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE,
+        "the geometry echoes"
+    );
 
     assert_eq!(
         unsafe { driver_cuda_new::abi_shell::pie_cuda_bind_instance(d, &inst, &mut binding) },
@@ -513,7 +588,8 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
         },
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null(), "{what}: the driver creates");
 
     let snap_str = snap.to_string_lossy().into_owned();
@@ -709,7 +785,8 @@ fn an_unserveable_gqa_ratio_is_refused_at_load() {
         },
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -779,7 +856,8 @@ fn a_real_decode_frame_launches_through_the_abi() {
         },
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
 
     let snap_str = snap.to_string_lossy().into_owned();
@@ -872,14 +950,20 @@ fn channels_bind_the_ring_contract() {
         PIE_CHANNEL_DTYPE_BOOL, PieChannelDesc, PieChannelEndpointBinding, PieU32Slice,
     };
 
-    let desc =
-        PieDriverCreateDesc { abi_version: PIE_DRIVER_ABI_VERSION, ..Default::default() };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let desc = PieDriverCreateDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        runtime: engine_runtime(),
+        ..Default::default()
+    };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
 
     let shape: [u32; 2] = [4, 8]; // 32 elements
     let ch = PieChannelDesc {
         channel_id: 5,
+        reader_wait_id: 11,
+        writer_wait_id: 12,
         shape: PieU32Slice { ptr: shape.as_ptr(), len: 2 },
         capacity: 7,
         ..Default::default()
@@ -906,6 +990,8 @@ fn channels_bind_the_ring_contract() {
     );
     let boolch = PieChannelDesc {
         channel_id: 6,
+        reader_wait_id: 13,
+        writer_wait_id: 14,
         shape: PieU32Slice { ptr: shape.as_ptr(), len: 2 },
         dtype: PIE_CHANNEL_DTYPE_BOOL,
         capacity: 1,
@@ -985,7 +1071,8 @@ fn logits_come_back_through_the_ring() {
         runtime: runtime_for(&fires),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -1001,6 +1088,8 @@ fn logits_come_back_through_the_ring() {
     let shape: [u32; 1] = [VOCAB as u32];
     let ch = PieChannelDesc {
         channel_id: 77,
+        reader_wait_id: 155,
+        writer_wait_id: 156,
         shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
@@ -1036,8 +1125,29 @@ fn logits_come_back_through_the_ring() {
         .map(|v| v.as_u64().expect("id") as u32).collect();
     let tokens = prompt.len();
     let positions: Vec<u32> = (0..tokens as u32).collect();
-    let roster_rows: Vec<u32> = vec![0; tokens];
-    let sub_batch_indptr: [u32; 2] = [0, tokens as u32];
+    // ONE ROSTER ROW PER REQUEST, not per token. These said `vec![0;
+    // tokens]` — a prefill's token count, every entry zero — which the
+    // shared validator reads as N requests all claiming roster index 0,
+    // and refuses for the duplicates. The engine builds this with
+    // `Vec::with_capacity(instance_ids.len())`
+    // (`scheduler/batch.rs:388`), so one entry is what a caller sends.
+    // The shell never read the field, which is why it went unnoticed.
+    let roster_rows: Vec<u32> = vec![0];
+    // The CSR partitions ROSTER ROWS by sub-batch, not tokens: the engine
+    // pushes `group.len()` (`scheduler/batch.rs:384`), and
+    // `validate_csr` checks the last value against `roster_rows.len`.
+    // One request, one row, one entry.
+    let sub_batch_indptr: [u32; 2] = [0, 1];
+    // AND A TERMINAL CELL PER REQUEST. These fixtures stated none, which
+    // the validator refuses with `allow_empty = false`: a step with no
+    // cell has nowhere to report an outcome, and the engine sends one per
+    // request. Never read here — the fires below take their answer off
+    // the ring — but a caller's shape is a caller's shape.
+    let mut launch_cell = driver_api::local::PieTerminalCell {
+        outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+        reserved0: 0,
+    };
+    let launch_cell_ptr: *mut driver_api::local::PieTerminalCell = &mut launch_cell;
     let sub_batch_class: [u32; 1] = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
     let kv_page_indices: [u32; 1] = [0];
     let kv_page_indptr: [u32; 2] = [0, 1];
@@ -1048,6 +1158,10 @@ fn logits_come_back_through_the_ring() {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
         sub_batch_class: u32s(&sub_batch_class),
+        terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+            ptr: &launch_cell_ptr,
+            len: 1,
+        },
         token_ids: u32s(&prompt),
         position_ids: u32s(&positions),
         kv_page_indices: u32s(&kv_page_indices),
@@ -1143,7 +1257,8 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         runtime: runtime_for(&fires),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -1158,6 +1273,8 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
     let shape: [u32; 1] = [VOCAB as u32];
     let ch = PieChannelDesc {
         channel_id: 9,
+        reader_wait_id: 19,
+        writer_wait_id: 20,
         shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 7,
@@ -1190,9 +1307,30 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
     // Step 1: prefill the prompt. Step 2: decode the argmax token at
     // position n against the same page.
     let positions1: Vec<u32> = (0..n as u32).collect();
-    let roster1: Vec<u32> = vec![0; n];
-    let sbi1: [u32; 2] = [0, n as u32];
+    // One request, so one roster row and one CSR entry — `n` is the TOKEN
+    // count and belongs to `qo_indptr`, which partitions tokens.
+    let roster1: [u32; 1] = [0];
+    let sbi1: [u32; 2] = [0, 1];
     let cls: [u32; 1] = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
+    // ONE CELL PER STEP, and they must be DISTINCT — the validator says
+    // so and it is right: two steps sharing a cell would overwrite each
+    // other's outcome, and the frame would report whichever finished
+    // last as the answer for both.
+    let mut ms_cells = [
+        driver_api::local::PieTerminalCell {
+            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+            reserved0: 0,
+        },
+        driver_api::local::PieTerminalCell {
+            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+            reserved0: 0,
+        },
+    ];
+    let (first, second) = ms_cells.split_at_mut(1);
+    let ms_ptr1: *mut driver_api::local::PieTerminalCell = &mut first[0];
+    let ms_ptr2: *mut driver_api::local::PieTerminalCell = &mut second[0];
+    let cells1 = driver_api::local::PieTerminalCellPtrSlice { ptr: &ms_ptr1, len: 1 };
+    let cells2 = driver_api::local::PieTerminalCellPtrSlice { ptr: &ms_ptr2, len: 1 };
     let pages: [u32; 1] = [0];
     let indptr: [u32; 2] = [0, 1];
     let lens1: [u32; 1] = [n as u32];
@@ -1201,6 +1339,7 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         roster_rows: u32s(&roster1),
         sub_batch_indptr: u32s(&sbi1),
         sub_batch_class: u32s(&cls),
+        terminal_cells: cells1,
         token_ids: u32s(&prompt),
         position_ids: u32s(&positions1),
         kv_page_indices: u32s(&pages),
@@ -1219,6 +1358,7 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         roster_rows: u32s(&roster2),
         sub_batch_indptr: u32s(&sbi2),
         sub_batch_class: u32s(&cls),
+        terminal_cells: cells2,
         token_ids: u32s(&tok2),
         position_ids: u32s(&pos2),
         kv_page_indices: u32s(&pages),
@@ -1370,7 +1510,8 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
             runtime: runtime_for(&fires),
             ..Default::default()
         };
-        let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+        let mut caps = driver_api::local::PieDriverCaps::default();
+        let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
         assert!(!d.is_null());
         let snap_str = snap.to_string_lossy().into_owned();
         let load = PieModelLoadDesc {
@@ -1384,6 +1525,8 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
         let shape: [u32; 1] = [VOCAB as u32];
         let ch = PieChannelDesc {
             channel_id: 1,
+            reader_wait_id: 3,
+            writer_wait_id: 4,
             shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
             host_role: PIE_CHANNEL_HOST_ROLE_READER,
             capacity: 3,
@@ -1427,13 +1570,25 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
             let indptr: [u32; 2] = [0, pages_used];
             let lens: [u32; 1] = [kv_len - (pages_used - 1) * PAGE];
             let qo: [u32; 2] = [0, qo_end];
-            let roster: Vec<u32> = vec![0; tokens.len()];
-            let sbi: [u32; 2] = [0, tokens.len() as u32];
+            // One request: one roster row, one CSR entry, one cell. The
+            // token count belongs to `qo_indptr`, which partitions TOKENS;
+            // these three partition REQUESTS.
+            let roster: [u32; 1] = [0];
+            let sbi: [u32; 2] = [0, 1];
             let cls: [u32; 1] = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
+            let mut loop_cell = driver_api::local::PieTerminalCell {
+                outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+                reserved0: 0,
+            };
+            let loop_cell_ptr: *mut driver_api::local::PieTerminalCell = &mut loop_cell;
             let step = PieStepDesc {
                 roster_rows: u32s(&roster),
                 sub_batch_indptr: u32s(&sbi),
                 sub_batch_class: u32s(&cls),
+                terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+                    ptr: &loop_cell_ptr,
+                    len: 1,
+                },
                 token_ids: u32s(tokens),
                 position_ids: u32s(positions),
                 kv_page_indices: u32s(indices),
@@ -1564,9 +1719,11 @@ fn the_711_fire_soak_holds_steady() {
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -1580,6 +1737,8 @@ fn the_711_fire_soak_holds_steady() {
     let shape: [u32; 1] = [VOCAB as u32];
     let ch = PieChannelDesc {
         channel_id: 1,
+        reader_wait_id: 3,
+        writer_wait_id: 4,
         shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
@@ -1617,13 +1776,25 @@ fn the_711_fire_soak_holds_steady() {
             let indptr: [u32; 2] = [0, pages_used];
             let lens: [u32; 1] = [kv_len - (pages_used - 1) * PAGE];
             let qo: [u32; 2] = [0, tokens.len() as u32];
-            let roster: Vec<u32> = vec![0; tokens.len()];
-            let sbi: [u32; 2] = [0, tokens.len() as u32];
+            // One request: one roster row, one CSR entry, one cell. The
+            // token count belongs to `qo_indptr`, which partitions TOKENS;
+            // these three partition REQUESTS.
+            let roster: [u32; 1] = [0];
+            let sbi: [u32; 2] = [0, 1];
             let cls: [u32; 1] = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
+            let mut loop_cell = driver_api::local::PieTerminalCell {
+                outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+                reserved0: 0,
+            };
+            let loop_cell_ptr: *mut driver_api::local::PieTerminalCell = &mut loop_cell;
             let step = PieStepDesc {
                 roster_rows: u32s(&roster),
                 sub_batch_indptr: u32s(&sbi),
                 sub_batch_class: u32s(&cls),
+                terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+                    ptr: &loop_cell_ptr,
+                    len: 1,
+                },
                 token_ids: u32s(tokens),
                 position_ids: u32s(positions),
                 kv_page_indices: u32s(indices),
@@ -1765,7 +1936,8 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         runtime: runtime_for(&fires),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -1782,6 +1954,8 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     let shape: [u32; 1] = [VOCAB as u32];
     let ch = PieChannelDesc {
         channel_id: 88,
+        reader_wait_id: 177,
+        writer_wait_id: 178,
         shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
@@ -1831,8 +2005,29 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         .map(|v| v.as_u64().expect("id") as u32).collect();
     let tokens = prompt.len();
     let positions: Vec<u32> = (0..tokens as u32).collect();
-    let roster_rows: Vec<u32> = vec![0; tokens];
-    let sub_batch_indptr: [u32; 2] = [0, tokens as u32];
+    // ONE ROSTER ROW PER REQUEST, not per token. These said `vec![0;
+    // tokens]` — a prefill's token count, every entry zero — which the
+    // shared validator reads as N requests all claiming roster index 0,
+    // and refuses for the duplicates. The engine builds this with
+    // `Vec::with_capacity(instance_ids.len())`
+    // (`scheduler/batch.rs:388`), so one entry is what a caller sends.
+    // The shell never read the field, which is why it went unnoticed.
+    let roster_rows: Vec<u32> = vec![0];
+    // The CSR partitions ROSTER ROWS by sub-batch, not tokens: the engine
+    // pushes `group.len()` (`scheduler/batch.rs:384`), and
+    // `validate_csr` checks the last value against `roster_rows.len`.
+    // One request, one row, one entry.
+    let sub_batch_indptr: [u32; 2] = [0, 1];
+    // AND A TERMINAL CELL PER REQUEST. These fixtures stated none, which
+    // the validator refuses with `allow_empty = false`: a step with no
+    // cell has nowhere to report an outcome, and the engine sends one per
+    // request. Never read here — the fires below take their answer off
+    // the ring — but a caller's shape is a caller's shape.
+    let mut launch_cell = driver_api::local::PieTerminalCell {
+        outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+        reserved0: 0,
+    };
+    let launch_cell_ptr: *mut driver_api::local::PieTerminalCell = &mut launch_cell;
     let sub_batch_class: [u32; 1] = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
     let kv_page_indices: [u32; 1] = [0];
     let kv_page_indptr: [u32; 2] = [0, 1];
@@ -1844,6 +2039,10 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
         sub_batch_class: u32s(&sub_batch_class),
+        terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+            ptr: &launch_cell_ptr,
+            len: 1,
+        },
         token_ids: u32s(&prompt),
         position_ids: u32s(&positions),
         kv_page_indices: u32s(&kv_page_indices),
@@ -1911,10 +2110,15 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         let dec_lens: [u32; 1] = [tokens as u32 + 1];
         let dec_qo: [u32; 2] = [0, 1];
         let dec_slots: [u32; 1] = [slot];
+        let dec_flags: [u8; 1] = [0];
         let step = PieStepDesc {
             roster_rows: u32s(&dec_roster),
             sub_batch_indptr: u32s(&dec_sbi),
             sub_batch_class: u32s(&sub_batch_class),
+            terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+                ptr: &launch_cell_ptr,
+                len: 1,
+            },
             token_ids: u32s(&dec_ids),
             position_ids: u32s(&dec_pos),
             kv_page_indices: u32s(&kv_page_indices),
@@ -1922,6 +2126,14 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
             kv_last_page_lens: u32s(&dec_lens),
             qo_indptr: u32s(&dec_qo),
             rs_slot_ids: u32s(&dec_slots),
+            // The FLAGS beside the ids. `validate_frame_desc` requires the
+            // two to match in length, and it is right to: a slot with no
+            // flag is a recurrent state the driver cannot know whether to
+            // reset or continue.
+            rs_slot_flags: driver_api::local::PieU8Slice {
+                ptr: dec_flags.as_ptr(),
+                len: dec_flags.len(),
+            },
             ..Default::default()
         };
         assert_eq!(fire(&step, wait), PIE_STATUS_OK, "the decode fires (slot {slot})");
@@ -2015,7 +2227,8 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
         runtime: runtime_for(&fires),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -2032,6 +2245,8 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
     let shape: [u32; 1] = [VOCAB as u32];
     let ch = PieChannelDesc {
         channel_id: 44,
+        reader_wait_id: 89,
+        writer_wait_id: 90,
         shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
@@ -2081,8 +2296,29 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
         .map(|v| v.as_u64().expect("id") as u32).collect();
     let tokens = prompt.len();
     let positions: Vec<u32> = (0..tokens as u32).collect();
-    let roster_rows: Vec<u32> = vec![0; tokens];
-    let sub_batch_indptr: [u32; 2] = [0, tokens as u32];
+    // ONE ROSTER ROW PER REQUEST, not per token. These said `vec![0;
+    // tokens]` — a prefill's token count, every entry zero — which the
+    // shared validator reads as N requests all claiming roster index 0,
+    // and refuses for the duplicates. The engine builds this with
+    // `Vec::with_capacity(instance_ids.len())`
+    // (`scheduler/batch.rs:388`), so one entry is what a caller sends.
+    // The shell never read the field, which is why it went unnoticed.
+    let roster_rows: Vec<u32> = vec![0];
+    // The CSR partitions ROSTER ROWS by sub-batch, not tokens: the engine
+    // pushes `group.len()` (`scheduler/batch.rs:384`), and
+    // `validate_csr` checks the last value against `roster_rows.len`.
+    // One request, one row, one entry.
+    let sub_batch_indptr: [u32; 2] = [0, 1];
+    // AND A TERMINAL CELL PER REQUEST. These fixtures stated none, which
+    // the validator refuses with `allow_empty = false`: a step with no
+    // cell has nowhere to report an outcome, and the engine sends one per
+    // request. Never read here — the fires below take their answer off
+    // the ring — but a caller's shape is a caller's shape.
+    let mut launch_cell = driver_api::local::PieTerminalCell {
+        outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+        reserved0: 0,
+    };
+    let launch_cell_ptr: *mut driver_api::local::PieTerminalCell = &mut launch_cell;
     let sub_batch_class: [u32; 1] = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
     let kv_page_indices: [u32; 1] = [0];
     let kv_page_indptr: [u32; 2] = [0, 1];
@@ -2092,6 +2328,10 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
         sub_batch_class: u32s(&sub_batch_class),
+        terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+            ptr: &launch_cell_ptr,
+            len: 1,
+        },
         token_ids: u32s(&prompt),
         position_ids: u32s(&positions),
         kv_page_indices: u32s(&kv_page_indices),
@@ -2132,6 +2372,10 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
         roster_rows: u32s(&dec_roster),
         sub_batch_indptr: u32s(&dec_sbi),
         sub_batch_class: u32s(&sub_batch_class),
+        terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+            ptr: &launch_cell_ptr,
+            len: 1,
+        },
         token_ids: u32s(&next),
         position_ids: u32s(&dec_pos),
         kv_page_indices: u32s(&kv_page_indices),
@@ -2195,9 +2439,11 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
@@ -2220,6 +2466,11 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
     let patch_positions: [u32; 18] =
         [0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
     let anchors: [u32; 1] = [0];
+    // The PATCH-UNIT grid `(t, h, w)`, three per image, which is what the
+    // engine sends (`engine/src/driver/abi.rs:323`) and what
+    // `validate_encode_desc` requires. These fixtures omitted it, so the
+    // validator could not be adopted until they said what a caller says.
+    let grids: [u32; 3] = [1, 3, 3];
 
     let run = |tag: &str| -> Vec<u16> {
         let mut out_rows = vec![0x7777u16; (OUT_LEN + 1) * TEXT_HIDDEN];
@@ -2237,7 +2488,8 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
                 ptr: patch_positions.as_ptr(),
                 len: 18,
             },
-            image_anchor_rows: driver_api::local::PieU32Slice {
+            image_grids: driver_api::local::PieU32Slice { ptr: grids.as_ptr(), len: 3 },
+        image_anchor_rows: driver_api::local::PieU32Slice {
                 ptr: anchors.as_ptr(),
                 len: 1,
             },
@@ -2322,9 +2574,11 @@ fn gemma4_audio_encodes_real_weights_through_the_abi() {
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
@@ -2343,6 +2597,11 @@ fn gemma4_audio_encodes_real_weights_through_the_abi() {
         (0..N_FRAMES * N_MEL).map(|i| ((i % 89) as f32 / 88.0) - 0.5).collect();
     let feat_indptr: [u32; 2] = [0, (features.len() * 4) as u32];
     let anchors: [u32; 1] = [0];
+    // The PATCH-UNIT grid `(t, h, w)`, three per image, which is what the
+    // engine sends (`engine/src/driver/abi.rs:323`) and what
+    // `validate_encode_desc` requires. These fixtures omitted it, so the
+    // validator could not be adopted until they said what a caller says.
+    let grids: [u32; 3] = [1, 3, 3];
     const MAX_OUT: usize = 16;
 
     let run = |tag: &str| -> (Vec<u16>, u32) {
@@ -2447,9 +2706,11 @@ fn gemma4_mixed_media_encodes_through_one_call() {
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
@@ -2472,6 +2733,7 @@ fn gemma4_mixed_media_encodes_through_one_call() {
     let patch_positions: [u32; 18] =
         [0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
     let img_anchors: [u32; 1] = [0];
+    let grids: [u32; 3] = [1, 3, 3];
     let features: Vec<f32> =
         (0..N_FRAMES * N_MEL).map(|i| ((i % 89) as f32 / 88.0) - 0.5).collect();
     let feat_indptr: [u32; 2] = [0, (features.len() * 4) as u32];
@@ -2490,6 +2752,7 @@ fn gemma4_mixed_media_encodes_through_one_call() {
             ptr: patch_positions.as_ptr(),
             len: 18,
         },
+        image_grids: driver_api::local::PieU32Slice { ptr: grids.as_ptr(), len: 3 },
         image_anchor_rows: driver_api::local::PieU32Slice {
             ptr: img_anchors.as_ptr(),
             len: 1,
@@ -2603,9 +2866,11 @@ fn gemma4_vision_encode_matches_hf_cosine() {
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
@@ -2619,6 +2884,11 @@ fn gemma4_vision_encode_matches_hf_cosine() {
 
     let pixel_indptr: [u32; 2] = [0, (pixels.len() * 4) as u32];
     let anchors: [u32; 1] = [0];
+    // The PATCH-UNIT grid `(t, h, w)`, three per image, which is what the
+    // engine sends (`engine/src/driver/abi.rs:323`) and what
+    // `validate_encode_desc` requires. These fixtures omitted it, so the
+    // validator could not be adopted until they said what a caller says.
+    let grids: [u32; 3] = [1, 3, 3];
     let mut out_rows = vec![0u16; out_len * text_hidden];
     let mut out_indptr = [u32::MAX; 2];
     let e = PieEncodeDesc {
@@ -2631,6 +2901,7 @@ fn gemma4_vision_encode_matches_hf_cosine() {
             ptr: positions.as_ptr(),
             len: positions.len(),
         },
+        image_grids: driver_api::local::PieU32Slice { ptr: grids.as_ptr(), len: 3 },
         image_anchor_rows: driver_api::local::PieU32Slice { ptr: anchors.as_ptr(), len: 1 },
         output_rows: driver_api::local::PieMutBytes {
             ptr: out_rows.as_mut_ptr().cast(),
@@ -2730,9 +3001,11 @@ fn gemma4_audio_encode_matches_hf_cosine() {
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: engine_runtime(),
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
@@ -2746,6 +3019,11 @@ fn gemma4_audio_encode_matches_hf_cosine() {
 
     let feat_indptr: [u32; 2] = [0, (features.len() * 4) as u32];
     let anchors: [u32; 1] = [0];
+    // The PATCH-UNIT grid `(t, h, w)`, three per image, which is what the
+    // engine sends (`engine/src/driver/abi.rs:323`) and what
+    // `validate_encode_desc` requires. These fixtures omitted it, so the
+    // validator could not be adopted until they said what a caller says.
+    let grids: [u32; 3] = [1, 3, 3];
     let mut out_rows = vec![0u16; out_len * text_hidden];
     let mut out_indptr = [u32::MAX; 2];
     let e = PieEncodeDesc {
@@ -2878,7 +3156,8 @@ fn a_quantized_checkpoint_loads_through_the_abi() {
         },
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null(), "create");
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -2981,7 +3260,8 @@ fn a_launch_returns_before_its_fire_retires() {
         },
         ..Default::default()
     };
-    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
@@ -3194,4 +3474,464 @@ fn a_launch_returns_before_its_fire_retires() {
          stream-ordered callback — fact 1 alone would then only mean the \
          fire was too small to observe"
     );
+}
+
+/// `kv_cache_dtype` is read, and an unserveable one is refused.
+///
+/// `store/kv_format.rs` has carried nine spellings and their scale
+/// layouts since the port, `KvCacheLayout` plans their scale planes, and
+/// `kv_paged.cu` switches on the scheme to WRITE them. None of it was
+/// reachable: the shell built its pages by hand and could only build
+/// bf16, so the format was a capability with no way to ask for it.
+///
+/// It is a boot key now. The refusal is the other half, and it is about
+/// reading rather than writing: the fire path's prefill and decode are
+/// FlashInfer's `_bf16` entry points, which take the `KvCacheLayerView`
+/// and ignore its scheme. A quantized cache would therefore be appended
+/// correctly and attended to as though the bytes were bf16 — plausible
+/// logits from a model that had silently lost its context.
+///
+/// So the driver refuses to start rather than answering that way. What
+/// lifts it is a scheme-aware attention fast path, which is a kernel
+/// change; the plumbing should not have waited for it, and the refusal is
+/// what lets it not wait.
+#[test]
+fn a_kv_cache_dtype_is_read_and_an_unreadable_one_is_refused() {
+    use driver_api::local::PieBytes;
+
+    let _gpu = gpu_guard();
+    let create = |boot: &str| {
+        let desc = PieDriverCreateDesc {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+            runtime: engine_runtime(),
+            ..Default::default()
+        };
+        let mut caps = driver_api::local::PieDriverCaps::default();
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) }
+    };
+
+    // A spelling that is not in the catalogue at all: refused, rather than
+    // quietly defaulted to bf16. A caller who typed `fp8` and got bf16
+    // would see only a memory figure that did not move.
+    let d = create("[driver]\nkv_cache_dtype = \"fp8_e4m3_typo\"\n");
+    assert!(d.is_null(), "an uncatalogued kv_cache_dtype must refuse");
+
+    // A real format the write path supports and the read path does not.
+    for name in ["fp8_e4m3", "int8_per_token_head", "nvfp4"] {
+        let d = create(&format!("[driver]\nkv_cache_dtype = \"{name}\"\n"));
+        assert!(
+            d.is_null(),
+            "{name} can be appended but not attended to; starting would mean \
+             wrong logits rather than a slower model"
+        );
+    }
+
+    // The served ones still boot, so the refusal is about the format and
+    // not about the key being present.
+    for name in ["bf16", "bfloat16", "auto", "BF16"] {
+        let d = create(&format!("[driver]\nkv_cache_dtype = \"{name}\"\n"));
+        assert!(!d.is_null(), "{name} is native bf16 and must boot");
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_destroy(d) };
+    }
+
+    // And no key at all is still the default.
+    let d = create("[driver]\nrunahead = false\n");
+    assert!(!d.is_null(), "an absent kv_cache_dtype means bf16");
+    unsafe { driver_cuda_new::abi_shell::pie_cuda_destroy(d) };
+}
+
+/// Two requests in one frame each get their OWN logits.
+///
+/// `deliver_logits` took `instance_ids.first()` and `rows - 1`: the
+/// roster's FIRST instance, and the fire's LAST row. So a frame with a
+/// roster of two published request 0's vocabulary into request 0's ring
+/// and returned request 1 nothing at all — no error anywhere, just a
+/// request that never got an answer.
+///
+/// Every fixture in this file sends one request, which is exactly why it
+/// survived: single-request is the batch where `first()` and `rows - 1`
+/// are both correct.
+///
+/// This sends two prefills of DIFFERENT prompts into separate rings, and
+/// the second one's prompt is the reference's — so if delivery published
+/// one answer to both rings, or read the wrong row, the argmax check on
+/// request 1 fails rather than coincides.
+#[test]
+fn every_request_in_a_frame_gets_its_own_logits() {
+    let _gpu = gpu_guard();
+    let fires = fire_counter();
+    use driver_api::local::{
+        PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc, PieChannelEndpointBinding,
+        PieCompletion, PieFrameDesc, PieInstanceBinding, PieInstanceDesc, PieModelLoadDesc,
+        PieProgramDesc, PieStepDesc, PieU32Slice, PieU64Slice,
+    };
+
+    let Some(snap) = qwen3_snapshot() else {
+        eprintln!("skipped: no cached Qwen3-0.6B");
+        return;
+    };
+    let Some(descriptor) = qwen3_descriptor() else {
+        eprintln!("skipped: no generated descriptor");
+        return;
+    };
+    let reference: serde_json::Value =
+        serde_json::from_str(include_str!("oracle/real_decode/reference.json"))
+            .expect("reference");
+
+    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let desc = PieDriverCreateDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: runtime_for(&fires),
+        ..Default::default()
+    };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
+    assert!(!d.is_null());
+    let snap_str = snap.to_string_lossy().into_owned();
+    let load = PieModelLoadDesc {
+        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_load_model(d, &load, std::ptr::null_mut()) },
+        PIE_STATUS_OK
+    );
+
+    const VOCAB: usize = 151_936;
+    let shape: [u32; 1] = [VOCAB as u32];
+    let prog = PieProgramDesc { program_hash: 0xF13F, ..Default::default() };
+    let mut program_id = 0u64;
+    assert_eq!(
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_register_program(d, &prog, &mut program_id) },
+        PIE_STATUS_OK
+    );
+
+    // One reader ring and one instance per request.
+    let mut rings = Vec::new();
+    let mut instance_ids = Vec::new();
+    for r in 0..2u64 {
+        let ch = PieChannelDesc {
+            channel_id: 880 + r,
+            reader_wait_id: 900 + r * 2,
+            writer_wait_id: 901 + r * 2,
+            shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+            host_role: PIE_CHANNEL_HOST_ROLE_READER,
+            capacity: 3,
+            ..Default::default()
+        };
+        let mut chb = PieChannelEndpointBinding::default();
+        assert_eq!(
+            unsafe { driver_cuda_new::abi_shell::pie_cuda_register_channel(d, &ch, &mut chb) },
+            PIE_STATUS_OK
+        );
+        let ids: [u64; 1] = [880 + r];
+        let inst = PieInstanceDesc {
+            program_id,
+            channel_ids: PieU64Slice { ptr: ids.as_ptr(), len: 1 },
+            ..Default::default()
+        };
+        let mut binding = PieInstanceBinding::default();
+        assert_eq!(
+            unsafe { driver_cuda_new::abi_shell::pie_cuda_bind_instance(d, &inst, &mut binding) },
+            PIE_STATUS_OK
+        );
+        rings.push(chb);
+        instance_ids.push(binding.instance_id);
+    }
+
+    // Request 0 is a short throwaway; request 1 is the reference prompt.
+    // Putting the checked one SECOND is deliberate: `rows - 1` would land
+    // inside request 1's span, so a delivery that ignored `qo_indptr`
+    // would still be right for it — and wrong for request 0, which is the
+    // one whose ring must not hold request 1's answer.
+    let reference_prompt: Vec<u32> = reference["prompt_ids"]
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let first: Vec<u32> = vec![reference_prompt[0], reference_prompt[1]];
+    let mut tokens: Vec<u32> = first.clone();
+    tokens.extend_from_slice(&reference_prompt);
+    let positions: Vec<u32> = (0..first.len() as u32)
+        .chain(0..reference_prompt.len() as u32)
+        .collect();
+
+    let roster_rows: [u32; 2] = [0, 1];
+    let sub_batch_indptr: [u32; 2] = [0, 2];
+    let sub_batch_class: [u32; 1] = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
+    let mut cells = [
+        driver_api::local::PieTerminalCell {
+            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+            reserved0: 0,
+        },
+        driver_api::local::PieTerminalCell {
+            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+            reserved0: 0,
+        },
+    ];
+    let cell_ptrs: [*mut driver_api::local::PieTerminalCell; 2] =
+        [&mut cells[0], &mut cells[1]];
+    // A page each.
+    let kv_page_indices: [u32; 2] = [0, 1];
+    let kv_page_indptr: [u32; 3] = [0, 1, 2];
+    let kv_last_page_lens: [u32; 2] = [first.len() as u32, reference_prompt.len() as u32];
+    let qo_indptr: [u32; 3] = [0, first.len() as u32, tokens.len() as u32];
+    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let step = PieStepDesc {
+        roster_rows: u32s(&roster_rows),
+        sub_batch_indptr: u32s(&sub_batch_indptr),
+        sub_batch_class: u32s(&sub_batch_class),
+        terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+            ptr: cell_ptrs.as_ptr(),
+            len: 2,
+        },
+        token_ids: u32s(&tokens),
+        position_ids: u32s(&positions),
+        kv_page_indices: u32s(&kv_page_indices),
+        kv_page_indptr: u32s(&kv_page_indptr),
+        kv_last_page_lens: u32s(&kv_last_page_lens),
+        qo_indptr: u32s(&qo_indptr),
+        ..Default::default()
+    };
+    let frame = PieFrameDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 2 },
+        required_kv_pages: 2,
+        steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
+        ..Default::default()
+    };
+    let completion =
+        PieCompletion { wait_id: 2, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    assert_eq!(fire_and_wait(d, &frame, completion, &fires), PIE_STATUS_OK);
+
+    // BOTH rings advanced. The one that used to stay at zero is request 1's.
+    for (r, chb) in rings.iter().enumerate() {
+        let words = unsafe { std::slice::from_raw_parts(chb.word_base as *const u64, 4) };
+        assert_eq!(
+            words[1], 1,
+            "request {r}'s ring did not advance — delivery served only the roster's \
+             first instance, so every other request in a frame got nothing"
+        );
+    }
+
+    // And request 1's cell is the REFERENCE's answer, so it read its own
+    // row rather than inheriting request 0's or the frame's last.
+    let cell = unsafe { std::slice::from_raw_parts(rings[1].mirror_base as *const f32, VOCAB) };
+    let hf_argmax = reference["argmax"].as_u64().expect("argmax") as usize;
+    let (mut best_t, mut best_v) = (0usize, f32::NEG_INFINITY);
+    for (t, &v) in cell.iter().enumerate() {
+        if v > best_v {
+            (best_t, best_v) = (t, v);
+        }
+    }
+    assert_eq!(best_t, hf_argmax, "request 1 got ITS OWN logits (top {best_v})");
+
+    // Request 0 prefilled two tokens of the same prompt, so its answer is
+    // a different distribution. Same argmax would mean one answer went to
+    // both rings.
+    let other = unsafe { std::slice::from_raw_parts(rings[0].mirror_base as *const f32, VOCAB) };
+    assert!(
+        other.iter().any(|v| v.is_finite() && *v != 0.0),
+        "request 0's ring holds a real distribution, not zeros"
+    );
+    assert!(
+        other[..VOCAB] != cell[..VOCAB],
+        "the two requests got the SAME vocabulary — one answer was published to both rings"
+    );
+
+    unsafe { driver_cuda_new::abi_shell::pie_cuda_destroy(d) };
+}
+
+/// The shell reads the step's REGION TABLE, and a table that does not
+/// describe its rows is refused.
+///
+/// The seriation's output is stated once, on the step: `region_sig[r]` is
+/// the axis bitset that decides whether a row carries an adapter, a
+/// custom mask, attention hooks or a depth truncation. This shell read it
+/// ZERO times — it built `vec![Row { samples: true, ..default() }; rows]`
+/// and never looked — so `HasLora`, `HasCustomMask`, `HasStageHooks` and
+/// the truncation could not hold no matter what the engine sent.
+///
+/// That is why LoRA looked like a missing feature. It is supplied through
+/// the forward's adapter hook — `fwd.adapter(site, |x, y| …)` lowers to a
+/// pass-wide `lora` sink and the engine marks the carrying rows with
+/// `PIE_REGION_SIG_LORA` — and the wire had been carrying the bit the
+/// whole time into a driver that never asked.
+///
+/// A refusal is the only observable a black-box test has for "it read
+/// the field": a table that does not tile its rows is drift, and drift is
+/// refused rather than degraded. If the shell went back to ignoring the
+/// table this launch would succeed.
+#[test]
+fn a_region_table_that_does_not_describe_its_rows_is_refused() {
+    let _gpu = gpu_guard();
+    let fires = fire_counter();
+    use driver_api::local::{
+        PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc, PieChannelEndpointBinding,
+        PieCompletion, PieFrameDesc, PieInstanceBinding, PieInstanceDesc, PieModelLoadDesc,
+        PieProgramDesc, PieStepDesc, PieU32Slice, PieU64Slice,
+    };
+
+    let (Some(snap), Some(descriptor)) = (qwen3_snapshot(), qwen3_descriptor()) else {
+        eprintln!("skipped: no cached Qwen3-0.6B or descriptor");
+        return;
+    };
+    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let desc = PieDriverCreateDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: runtime_for(&fires),
+        ..Default::default()
+    };
+    let mut caps = driver_api::local::PieDriverCaps::default();
+    let d = unsafe { driver_cuda_new::abi_shell::pie_cuda_create(&desc, &mut caps) };
+    assert!(!d.is_null());
+    let snap_str = snap.to_string_lossy().into_owned();
+    let load = PieModelLoadDesc {
+        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_load_model(d, &load, std::ptr::null_mut()) },
+        PIE_STATUS_OK
+    );
+
+    const VOCAB: usize = 151_936;
+    let shape: [u32; 1] = [VOCAB as u32];
+    let ch = PieChannelDesc {
+        channel_id: 991,
+        reader_wait_id: 1001,
+        writer_wait_id: 1002,
+        shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+        host_role: PIE_CHANNEL_HOST_ROLE_READER,
+        capacity: 3,
+        ..Default::default()
+    };
+    let mut chb = PieChannelEndpointBinding::default();
+    assert_eq!(
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_register_channel(d, &ch, &mut chb) },
+        PIE_STATUS_OK
+    );
+    let prog = PieProgramDesc { program_hash: 0xF140, ..Default::default() };
+    let mut program_id = 0u64;
+    assert_eq!(
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_register_program(d, &prog, &mut program_id) },
+        PIE_STATUS_OK
+    );
+    let ids: [u64; 1] = [991];
+    let inst = PieInstanceDesc {
+        program_id,
+        channel_ids: PieU64Slice { ptr: ids.as_ptr(), len: 1 },
+        ..Default::default()
+    };
+    let mut binding = PieInstanceBinding::default();
+    assert_eq!(
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_bind_instance(d, &inst, &mut binding) },
+        PIE_STATUS_OK
+    );
+
+    // A four-token prefill, one request, one page.
+    let tokens: [u32; 4] = [1, 2, 3, 4];
+    let positions: [u32; 4] = [0, 1, 2, 3];
+    let roster_rows: [u32; 1] = [0];
+    let sub_batch_indptr: [u32; 2] = [0, 1];
+    let sub_batch_class: [u32; 1] = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
+    let mut cell = driver_api::local::PieTerminalCell {
+        outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+        reserved0: 0,
+    };
+    let cell_ptr: *mut driver_api::local::PieTerminalCell = &mut cell;
+    let kv_page_indices: [u32; 1] = [0];
+    let kv_page_indptr: [u32; 2] = [0, 1];
+    let kv_last_page_lens: [u32; 1] = [4];
+    let qo_indptr: [u32; 2] = [0, 4];
+    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let instance_ids: [u64; 1] = [binding.instance_id];
+    let completion =
+        PieCompletion { wait_id: 3, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+
+    // A table whose one region covers rows 0..2 and leaves 2..4 to
+    // nobody. Every other field is a valid four-token prefill, so the
+    // ONLY thing that can refuse this is the region read.
+    let bad_indptr: [u32; 2] = [0, 2];
+    let bad_sig: [u32; 1] = [0];
+    let bad_k: [u32; 1] = [u32::MAX];
+    let mut step = PieStepDesc {
+        roster_rows: u32s(&roster_rows),
+        sub_batch_indptr: u32s(&sub_batch_indptr),
+        sub_batch_class: u32s(&sub_batch_class),
+        terminal_cells: driver_api::local::PieTerminalCellPtrSlice { ptr: &cell_ptr, len: 1 },
+        token_ids: u32s(&tokens),
+        position_ids: u32s(&positions),
+        kv_page_indices: u32s(&kv_page_indices),
+        kv_page_indptr: u32s(&kv_page_indptr),
+        kv_last_page_lens: u32s(&kv_last_page_lens),
+        qo_indptr: u32s(&qo_indptr),
+        region_row_indptr: u32s(&bad_indptr),
+        region_sig: u32s(&bad_sig),
+        region_k: u32s(&bad_k),
+        ..Default::default()
+    };
+    let frame = PieFrameDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        required_kv_pages: 1,
+        steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_launch(d, &frame, completion) },
+        PIE_STATUS_INVALID_ARGUMENT,
+        "a region table that leaves rows unclaimed is drift between the \
+         scheduler's tables and the step; a shell that ignored the table \
+         would launch this happily"
+    );
+
+    // A tiling table whose region carries an ADAPTER is refused too, and
+    // for a different reason: the bit reaches the `HasLora` guard now, so
+    // the trace states `pie_lora_qkv_correction` — and the executor's arm
+    // for it is a NO-OP while nothing stages the table, which it must be
+    // for union captures to record it. Running the fire would apply no
+    // correction and return tokens that look like a slightly worse model.
+    //
+    // `caps.has_lora` is false, so a well-behaved engine does not send
+    // this; advertising a capability as absent and then silently ignoring
+    // a request for it is the pattern this driver refuses over.
+    let good_indptr: [u32; 2] = [0, 4];
+    let lora_sig: [u32; 1] = [driver_api::local::PIE_REGION_SIG_LORA];
+    step.region_row_indptr = u32s(&good_indptr);
+    step.region_sig = u32s(&lora_sig);
+    let frame = PieFrameDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        required_kv_pages: 1,
+        steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { driver_cuda_new::abi_shell::pie_cuda_launch(d, &frame, completion) },
+        PIE_STATUS_UNSUPPORTED,
+        "an adapter this driver cannot stage is refused, not dropped"
+    );
+
+    // The SAME step without the bit launches — so the refusal is about
+    // what the region SAYS, not about the table being present.
+    step.region_sig = u32s(&bad_sig);
+    let frame = PieFrameDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        required_kv_pages: 1,
+        steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
+        ..Default::default()
+    };
+    assert_eq!(
+        fire_and_wait(d, &frame, completion, &fires),
+        PIE_STATUS_OK,
+        "a table that tiles its rows is the served case"
+    );
+
+    unsafe { driver_cuda_new::abi_shell::pie_cuda_destroy(d) };
 }

@@ -109,6 +109,102 @@ impl Stage {
 pub struct Compiled {
     /// The stages, in plan order.
     pub stages: Arc<Vec<Stage>>,
+    /// The stage plans these were compiled FROM, in the same order.
+    ///
+    /// Carried rather than looked up, and that is the point: firing needs
+    /// the plan — its ops say which channels the stage reads and puts, its
+    /// value types size the scratch — and a driver that kept the two in
+    /// separate tables keyed by the same id would have two things to keep
+    /// in step. A compiled program that could disagree with the plan it
+    /// came from is exactly the drift `Compiled` exists to make
+    /// impossible.
+    pub plans: Arc<Vec<LaunchStagePlan>>,
+    /// Each stage's ATTACHMENT POINT — `PieLaunchStage::kind`: Prologue
+    /// 0, OnAttnProj 1, OnAttn 2, Epilogue 3.
+    ///
+    /// Carried because `LaunchStagePlan` has no `kind` field and the
+    /// package's `stages` table is not kept: the driver could see how
+    /// many stages a program had and not what any of them WAS. It fired
+    /// `plans.first()`, which is the epilogue only by the accident that
+    /// no program in the tree has a prologue — the moment one does
+    /// (`fwd.adapter` puts its `lora` sink there), `first()` is the
+    /// adapter and the sampler never runs.
+    pub kinds: Arc<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use std::sync::Arc;
+
+    use super::{Compiled, Stage, stage_kind};
+
+    fn compiled(kinds: &[u8]) -> Compiled {
+        Compiled {
+            stages: Arc::new(
+                kinds
+                    .iter()
+                    .map(|_| Stage { signature_hash: 0, regions: Arc::new(Vec::new()) })
+                    .collect(),
+            ),
+            plans: Arc::new(
+                kinds
+                    .iter()
+                    .map(|_| driver::driver_api::plan::LaunchStagePlan::default())
+                    .collect(),
+            ),
+            kinds: Arc::new(kinds.to_vec()),
+        }
+    }
+
+    /// A program's stages are found by what they ARE, not by position.
+    ///
+    /// `run_program` fired `plans.first()` because `Compiled` had no
+    /// kinds to ask. That is the epilogue only while no program has a
+    /// prologue — and `fwd.adapter` puts its `lora` sink in one, so the
+    /// first adapter-carrying program would have fired its ADAPTER as
+    /// the sampler and never run the sampler at all.
+    #[test]
+    fn a_stage_is_found_by_its_attachment_point() {
+        // The shape that breaks position: prologue FIRST.
+        let both = compiled(&[stage_kind::PROLOGUE, stage_kind::EPILOGUE]);
+        assert_eq!(
+            both.stage_of_kind(stage_kind::EPILOGUE),
+            Some(1),
+            "the sampler is the epilogue, and it is not stage 0 here"
+        );
+        assert_eq!(both.stage_of_kind(stage_kind::PROLOGUE), Some(0));
+        assert_eq!(
+            both.stage_of_kind(stage_kind::ON_ATTN),
+            None,
+            "a kind the program does not carry is absent, not stage 0"
+        );
+
+        // Today's shape: one epilogue, where position and kind agree —
+        // which is exactly why the bug was invisible.
+        let one = compiled(&[stage_kind::EPILOGUE]);
+        assert_eq!(one.stage_of_kind(stage_kind::EPILOGUE), Some(0));
+    }
+}
+
+/// The attachment points a stage can have, as `PieLaunchStage::kind`
+/// numbers them.
+pub mod stage_kind {
+    /// Runs before the forward; where `fwd.adapter`'s `lora` sink lands.
+    pub const PROLOGUE: u8 = 0;
+    /// Per-layer, on the projected query.
+    pub const ON_ATTN_PROJ: u8 = 1;
+    /// Per-layer, on the attention output.
+    pub const ON_ATTN: u8 = 2;
+    /// Runs after the forward; where sampling lands.
+    pub const EPILOGUE: u8 = 3;
+}
+
+impl Compiled {
+    /// The index of the first stage with this attachment point.
+    #[must_use]
+    pub fn stage_of_kind(&self, kind: u8) -> Option<usize> {
+        self.kinds.iter().position(|&k| k == kind)
+    }
 }
 
 /// What a compile needs to know that it cannot read off the program.
@@ -143,6 +239,17 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// The cache this runtime compiles into.
+    ///
+    /// `Control::compile` wants one too, and it must be the SAME one: the
+    /// control kernels and the program kernels are cached by the same
+    /// key scheme, so a second directory would recompile both on every
+    /// boot and neither would ever hit.
+    #[must_use]
+    pub fn disk(&self) -> &Disk {
+        &self.disk
+    }
+
     /// A runtime backed by `disk`.
     #[must_use]
     pub fn new(disk: Disk) -> Self {
@@ -178,7 +285,7 @@ impl Runtime {
         &mut self,
         program_hash: u64,
         plan: &ExecPlan,
-        kernels: &[driver_api::EmittedKernel],
+        kernels: &[driver::EmittedKernel],
         versions: Versions,
         target: Target,
     ) -> Result<Compiled, Failure> {
@@ -224,7 +331,7 @@ impl Runtime {
     fn build(
         &mut self,
         plan: &ExecPlan,
-        kernels: &[driver_api::EmittedKernel],
+        kernels: &[driver::EmittedKernel],
         versions: Versions,
         target: Target,
     ) -> Result<Compiled, Failure> {
@@ -288,6 +395,12 @@ impl Runtime {
         }
         Ok(Compiled {
             stages: Arc::new(stages),
+            plans: Arc::new(plan.package.plans.clone()),
+            // `plans` is parallel to `package.stages` — the plans are the
+            // stages' own, in the same order — so the kinds index the
+            // same way. A missing entry would be a package whose two
+            // tables disagree, which `adopt_launch_package` refuses.
+            kinds: Arc::new(plan.package.stages.iter().map(|s| s.kind).collect()),
         })
     }
 

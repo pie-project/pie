@@ -24,7 +24,7 @@ use objc2_metal::MTLComputePipelineState;
 
 use crate::error::{Error, Result};
 use crate::metal::Context;
-use crate::metal::{ArgumentTable, Compiler, Handle, StepEncoder, allocate};
+use crate::metal::{ArgumentTable, Compiler, StepEncoder};
 use crate::region::Region as _;
 use crate::shader::Request;
 
@@ -39,7 +39,11 @@ use super::dispatch::{Dispatch, pipelines_needed};
 /// same region. A buffer per dispatch would allocate 367 times for a fire
 /// whose scalars total a few dozen bytes.
 pub struct Params {
-    region: Handle,
+    /// LEASED, not allocated. See `metal::scratch`: allocating this per fire
+    /// leaks it into the residency set permanently and moves its address, and
+    /// the address is one of only three things that vary between two fires of
+    /// one shape.
+    region: crate::metal::Lease,
     /// Byte offset of each dispatch's run, parallel to the dispatch list.
     offsets: Vec<u64>,
 }
@@ -59,6 +63,23 @@ impl Params {
     ///
     /// The allocation, or a write past it.
     pub fn stage(context: &Context, dispatches: &[Dispatch<'_>]) -> Result<Self> {
+        Self::stage_in(context, &crate::metal::Scratch::new(), dispatches)
+    }
+
+    /// The same, out of a pool the caller keeps.
+    ///
+    /// The pooled form is the one a serving path wants: `stage` above makes a
+    /// throwaway pool, which allocates every time and is right only for a
+    /// caller that fires once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::stage`].
+    pub fn stage_in(
+        context: &Context,
+        scratch: &crate::metal::Scratch,
+        dispatches: &[Dispatch<'_>],
+    ) -> Result<Self> {
         // Each dispatch's run is as wide as its layout says, because a row
         // may widen a scalar: `sdpa_vector_decode` reads its strides as
         // `size_t`, eight bytes, from a channel whose values are `u32`.
@@ -86,7 +107,13 @@ impl Params {
         // zero-length allocation has no address to bind, and an unbound slot
         // is a kernel reading whatever the last step left there.
         let bytes = total.max(size_of::<u64>()) as u64;
-        let region = allocate(context, bytes, "launch params")?;
+        let region = scratch.take(context, bytes, "launch params")?;
+        // A REUSED region holds the last fire's scalars, and a dispatch whose
+        // run is shorter than its predecessor's would read the tail of that
+        // one. Zeroed for the same reason the arena is.
+        //
+        // SAFETY: leased exclusively; nothing is encoded against it yet.
+        unsafe { region.zero(0, region.len())? };
         let mut offsets = Vec::with_capacity(dispatches.len());
         let mut at = 0u64;
         for d in dispatches {
@@ -122,6 +149,15 @@ impl Params {
             at += (run.len().div_ceil(8) * 8) as u64;
         }
         Ok(Self { region, offsets })
+    }
+
+    /// The region the scalars live in.
+    ///
+    /// For `metal::record`, which has to turn a scalar's ADDRESS back into
+    /// the buffer holding it — a recorded command binds a buffer.
+    #[must_use]
+    pub fn region(&self) -> &crate::metal::Handle {
+        &self.region
     }
 
     /// The GPU address of dispatch `index`'s scalars.

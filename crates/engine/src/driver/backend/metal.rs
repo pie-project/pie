@@ -53,6 +53,11 @@ pub struct MetalDriver {
     /// stepper beside the `Context` it borrows is a self-reference; sharing
     /// the context is what lets one outlive a call.
     stepper: driver_metal_new::metal::Stepper<'static>,
+    /// Reusable fire regions, held ACROSS frames for the same reason the
+    /// stepper is. A fresh region per fire leaks it into the residency set
+    /// permanently -- nothing removes -- and moves an address that is one of
+    /// only three things differing between two fires of one shape.
+    scratch: driver_metal_new::metal::Scratch,
     registry: driver_metal_new::pipeline::Registry,
     device_facts: ::driver_api::DeviceFacts,
     /// The checkpoint, once one is loaded. Held because every address in its
@@ -157,6 +162,7 @@ impl MetalDriver {
             Self {
                 context: context.clone(),
                 stepper,
+                scratch: driver_metal_new::metal::Scratch::new(),
                 registry: driver_metal_new::pipeline::Registry::new(),
                 device_facts: device_facts.clone(),
                 model: None,
@@ -710,11 +716,15 @@ impl MetalDriver {
                     // answers zero, and a zero seq stride is every step of the
                     // scan reading the same token.
                     .with_pool(pool.shape());
+            let mut machine = driver_metal_new::model::run::Machine {
+                context: &self.context,
+                compiler: &self.compiler,
+                pipelines: &mut self.pipelines,
+                stepper: &mut self.stepper,
+                scratch: &self.scratch,
+            };
             let fire = driver_metal_new::model::run::submit(
-                &self.context,
-                &self.compiler,
-                &mut self.pipelines,
-                &mut self.stepper,
+                &mut machine,
                 &lowered,
                 geometry,
                 &mut store,

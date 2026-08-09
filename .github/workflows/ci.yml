@@ -157,6 +157,15 @@ jobs:
       - name: kernel vocabulary audit
         run: python3 scripts/kernel-vocabulary-audit.py
 
+      # A file no `mod` declares is INVISIBLE, not dead. rustc never reads
+      # it, so clippy does not lint it, no test covers it, and nothing
+      # reports it — `a86d6478d` deleted 886 lines of `metal/bind.rs` that
+      # the compiler had never once seen, left behind when a module list
+      # was trimmed. Dead code the compiler CAN see is already a warning;
+      # this is the other half.
+      - name: module reachability audit
+        run: python3 scripts/mod-reachability-audit.py
+
       - name: kernel table (every symbol carries its family)
         run: cargo test -p model --features forward --test kernels_table
 
@@ -201,6 +210,19 @@ jobs:
         run: |
           cargo test -p driver-cuda-new --features cuda-12
           cargo test -p driver-cuda-new --features cuda-13
+
+      # The one test that cannot live beside the driver. It registers a REAL
+      # PTIR program through `pie_cuda_register_program` and fires it, which
+      # needs the producer half — `tensor_compiler`'s bind/compile/emit chain
+      # and `engine`'s `ProgramDescBorrow` to lower the result into the C
+      # records the entry point reads. A dev-dependency the other way would
+      # be a cycle, so it lives in `engine`.
+      #
+      # It skips without a device or without the cached Qwen3-0.6B, like
+      # every GPU-touching test here — but it compiles everywhere, which is
+      # what this step is for on a runner with no card.
+      - name: cargo test (the PTIR program path, through the ABI)
+        run: cargo test -p engine --features driver-cuda-new --test ptir_shell
 
   metal-kernel-table:
     name: metal kernel table (shaders vs entrypoints.generated.txt)

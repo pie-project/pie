@@ -693,6 +693,12 @@ fn llama_like_metal_text(
                 metal.rope_theta_at(l),
                 1.0,
                 head_dim,
+                // The rotation's EXTENT, which is not always the head. gemma-4
+                // rotates a quarter of each full-attention head and all of
+                // each sliding one, so this is per layer like the shape above
+                // -- and it reaches the GRID rather than the kernel, through
+                // the row's `grid_param`.
+                metal.rotary_dim_at(l, f.head_dim),
                 metal.rope_freq_table,
             );
             // A shared layer appends nothing: its source already did.
@@ -1172,7 +1178,28 @@ fn llama_like_cuda_text(
                 // class a PER-ROW operand and this match a region table.
                 FireClass::Decode | FireClass::Prefill => {
                     let c = cuda;
-                    let window_one = class == FireClass::Decode;
+                    // THE WINDOW CLASS IS A GUARD, not a class.
+                    //
+                    // `let window_one = class == FireClass::Decode` was
+                    // the whole of what separated Decode from Prefill —
+                    // one body, one boolean, and the goldens pinning the
+                    // collapse as byte-identical. Directive 4.1 of
+                    // `.wiki/driver/graph.md` names the destination and
+                    // the retired masked/hooked classes (A1/A2) are the
+                    // precedent: a delta this local belongs at op
+                    // granularity, which is what a guard is.
+                    //
+                    // So every site below that asked the class now states
+                    // `GuardPred::WindowOne` instead, and both arms lower
+                    // into ONE graph. A mixed fire answers false and takes
+                    // the ragged arm, which serves a one-token request as
+                    // its degenerate case — the property that makes the
+                    // merge sound rather than merely tidy.
+                    //
+                    // The `c.*` tests that remain are DEPLOYMENT
+                    // constants (padded head dims, XQA, the GQA ratio
+                    // that forces the prefill path), not fire facts, so
+                    // they stay host-side branches.
                     // ORDER IS LOAD-BEARING: `guarded_value` OPENS the
                     // chain, and every op recorded after it counts into
                     // the first arm's region. The non-fused deployments'
@@ -1214,9 +1241,10 @@ fn llama_like_cuda_text(
                     // so the trace never states a split prepare refuses
                     // to plan.
                     let masked_attention = |q: &Val| {
-                        if c.head_dim_padded || (window_one && c.xqa_decode) {
-                            cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left);
-                        } else {
+                        // The peeled form: the deployment's causal
+                        // dispatch over the unmasked prefix, the custom
+                        // one over the masked suffix.
+                        let peeled = |q: &Val| {
                             dsl::by_rows(m.trace(), Some(l), None, |r| {
                                 r.arm(dsl::RowPred::Unmasked, || {
                                     // The prefix states THE DEPLOYMENT'S
@@ -1230,7 +1258,14 @@ fn llama_like_cuda_text(
                                     // dispatch (same staging) on ragged
                                     // fires: any mix of prefill and
                                     // plain-decode requests, ragged qo.
-                                    if window_one && !c.force_prefill_path {
+                                    if c.force_prefill_path {
+                                        cuda::dequant_only(&w.kv);
+                                        cuda::attention_flashinfer_prefill(
+                                            q, &w.kv, window_left,
+                                        );
+                                    } else {
+                                        dsl::guarded(m.trace())
+                                            .arm(GuardPred::WindowOne, || {
                                         // hook×mask: the prefix decode IS
                                         // the paged decode path and the
                                         // hooked rows live in it (the
@@ -1254,44 +1289,89 @@ fn llama_like_cuda_text(
                                                     q, &w.kv, window_left,
                                                 );
                                             });
-                                    } else {
-                                        cuda::dequant_only(&w.kv);
-                                        cuda::attention_flashinfer_prefill(
-                                            q, &w.kv, window_left,
-                                        );
+                                            })
+                                            .otherwise(|| {
+                                                cuda::dequant_only(&w.kv);
+                                                cuda::attention_flashinfer_prefill(
+                                                    q, &w.kv, window_left,
+                                                );
+                                            });
                                     }
                                 });
                                 r.rest(|| {
                                     cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left);
                                 });
                             });
+                        };
+                        if c.head_dim_padded {
+                            // The split's row offsets are logical-width
+                            // and the padded staging is not, so this
+                            // deployment keeps the fire-level word.
+                            cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left);
+                        } else if c.xqa_decode {
+                            // XQA's prepare is fire-wide (R-shaped), so a
+                            // window-one fire cannot peel; a ragged one
+                            // never reaches XQA and can.
+                            dsl::guard(
+                                m.trace(),
+                                GuardPred::WindowOne,
+                                || {
+                                    cuda::attention_flashinfer_prefill_custom(
+                                        q, &w.kv, window_left,
+                                    );
+                                },
+                                || peeled(q),
+                            );
+                        } else {
+                            peeled(q);
                         }
                     };
                     let attn_with_sites = |q: &Val| {
                         dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[q], Some(l));
-                        if !window_one {
-                            // Ragged fires are row-uniform: dequant,
-                            // then the score-guarded causal dispatch.
-                            cuda::dequant_only(&w.kv);
-                            dsl::guarded(m.trace())
-                                .arm(GuardPred::WantsAttnScore, || {
-                                    cuda::attention_flashinfer_prefill_capture(q, &w.kv, window_left);
-                                })
-                                .otherwise(|| {
-                                    cuda::attention_flashinfer_prefill(q, &w.kv, window_left);
-                                });
-                        } else if c.xqa_decode {
+                        if c.xqa_decode {
+                            // XQA has no capture variant and no ragged
+                            // form: the deployment states it or it does
+                            // not, and a score-wanting program under XQA
+                            // fails loudly PTIR-side.
                             cuda::attention_xqa_decode(q, &w.kv, window_left);
                         } else if c.force_prefill_path {
+                            // The GQA ratio sits outside the decode
+                            // kernel's set, so BOTH window classes take
+                            // the prefill dispatch — there is nothing
+                            // left for a guard to choose between.
                             cuda::dequant_only(&w.kv);
                             cuda::attention_flashinfer_prefill(q, &w.kv, window_left);
                         } else {
                             dsl::guarded(m.trace())
-                                .arm(GuardPred::WantsAttnScore, || {
-                                    cuda::attention_flashinfer_decode_capture(q, &w.kv, window_left);
+                                .arm(GuardPred::WindowOne, || {
+                                    dsl::guarded(m.trace())
+                                        .arm(GuardPred::WantsAttnScore, || {
+                                            cuda::attention_flashinfer_decode_capture(
+                                                q, &w.kv, window_left,
+                                            );
+                                        })
+                                        .otherwise(|| {
+                                            cuda::attention_flashinfer_decode(
+                                                q, &w.kv, window_left,
+                                            );
+                                        });
                                 })
                                 .otherwise(|| {
-                                    cuda::attention_flashinfer_decode(q, &w.kv, window_left);
+                                    // Ragged fires are row-uniform:
+                                    // dequant, then the score-guarded
+                                    // causal dispatch.
+                                    cuda::dequant_only(&w.kv);
+                                    dsl::guarded(m.trace())
+                                        .arm(GuardPred::WantsAttnScore, || {
+                                            cuda::attention_flashinfer_prefill_capture(
+                                                q, &w.kv, window_left,
+                                            );
+                                        })
+                                        .otherwise(|| {
+                                            cuda::attention_flashinfer_prefill(
+                                                q, &w.kv, window_left,
+                                            );
+                                        });
                                 });
                         }
                         dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[q], Some(l));
@@ -1380,9 +1460,6 @@ fn llama_like_cuda_text(
                         .otherwise(|| attn_with_sites(q));
                     }
                     a
-                }
-                FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify => {
-                    unreachable!("llama_like refuses the service classes at trace start")
                 }
             };
             // 2c: the STRIP. The attention wrote at the kernel width;

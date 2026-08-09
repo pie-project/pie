@@ -77,7 +77,8 @@ fn a_driver_internal_binding_seeds_the_envelope_tier() {
     d_min.memset(0, stream.as_ref()).expect("zero min");
     d_max.memset(0, stream.as_ref()).expect("zero max");
 
-    let mut ops = LiveKvCacheOps::new(stream.as_ref().as_raw().cast());
+    let alloc = driver_cuda_new::cuda::Allocator::new();
+    let mut ops = LiveKvCacheOps::new(stream.as_ref().as_raw().cast(), &alloc);
     ops.envelope_seed(d_min.as_ptr().cast(), d_max.as_ptr().cast(), 2, 2, 4);
     ops.stream_synchronize();
 
@@ -301,6 +302,10 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-6,
@@ -901,6 +906,9 @@ fn zero_weight_decode(leg: Leg) {
         q_out: named_bufs[&q_pin_value].as_ptr(),
         score_out: scores.as_ptr().cast(),
         score_indptr_d: score_indptr.as_ptr().cast(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         o_out: unsafe { arena.as_ptr().cast::<u8>().add(o_off) }.cast(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -933,6 +941,9 @@ fn zero_weight_decode(leg: Leg) {
         first_token: split as i32,
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         o_out: unsafe {
             arena.as_ptr().cast::<u8>().add(o_off + split * HIDDEN * 2)
         }
@@ -965,6 +976,10 @@ fn zero_weight_decode(leg: Leg) {
     stream.as_ref().synchronize().expect("the window lands");
 
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-6,
@@ -1420,6 +1435,9 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         q_out: core::ptr::null_mut(),
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         o_out: unsafe { arena.as_ptr().cast::<u8>().add(o_off) }.cast(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -1443,6 +1461,10 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-6,
@@ -1883,6 +1905,9 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         layers,
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         q_out: named_bufs[&q_pin_value].as_ptr(),
         o_out,
         kv_page_indices_d: csr_indices.as_ptr().cast(),
@@ -1909,6 +1934,10 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-6,
@@ -2340,6 +2369,9 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         layers,
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         q_out: named_bufs[&q_pin_value].as_ptr(),
         o_out,
         kv_page_indices_d: csr_indices.as_ptr().cast(),
@@ -2364,6 +2396,10 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-6,
@@ -2733,6 +2769,9 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         layers,
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         q_out,
         o_out,
         kv_page_indices_d: csr_indices.as_ptr().cast(),
@@ -2757,6 +2796,10 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-6,
@@ -3720,6 +3763,9 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         q_out: core::ptr::null_mut(),
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         o_out: core::ptr::null_mut(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -3743,6 +3789,10 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-6,
@@ -4060,6 +4110,9 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         q_out: core::ptr::null_mut(),
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
         o_out: core::ptr::null_mut(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -4083,6 +4136,10 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
     let ctx = DispatchCtx {
+        // Every row sampled, so no compaction is stated and the gather
+        // has no index list to read.
+        sampling_indices: core::ptr::null(),
+        sampled_rows: 0,
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: 1e-5,

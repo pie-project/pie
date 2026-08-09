@@ -158,6 +158,13 @@ pub struct DecodeGeometry {
     /// one shape everywhere. Four on the 31b against sixteen sliding, two on
     /// the 26b against eight. See [`Self::global_head_dim`].
     pub global_kv_heads: u32,
+    /// What fraction of each FULL-attention head the rotation covers, or zero
+    /// for a deployment that rotates the whole head.
+    ///
+    /// gemma-4's `partial_rotary_factor: 0.25`. The extent reaches the GRID
+    /// rather than the kernel — `Rule::Rope` launches half of it — through
+    /// the rope rows' `grid_param`.
+    pub full_partial_rotary: f32,
     /// The rotary base a SLIDING layer takes, when the config states a second
     /// one, or zero for a stack whose layers all share [`Self::rope_theta`].
     ///
@@ -294,6 +301,7 @@ impl Default for DecodeGeometry {
             final_logit_softcap: 0.0,
             global_head_dim: 0,
             global_kv_heads: 0,
+            full_partial_rotary: 0.0,
             rope_theta_sliding: 0.0,
             gemma: false,
             per_layer_emb_dim: 0,

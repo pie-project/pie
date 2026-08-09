@@ -278,7 +278,9 @@ fn a_rectangles_dims_come_from_the_rectangle_and_the_fire_and_nowhere_else() {
         let low = lowered(class, rows as usize);
         for launch in &low.launches {
             let symbol = low.kernels[launch.kernel as usize].as_str();
-            let dims = dims_of(&low, launch, geometry());
+            let sig = kernels::sig_in(driver_metal_new::model::run::table(), symbol)
+                .expect("every symbol this text states has a row");
+            let dims = dims_of(sig, &low, launch, geometry());
             assert_eq!(dims.rows, rows, "`{symbol}` at {rows} rows");
             assert_eq!(dims.q_heads, geometry().q_heads, "the fire states the rest");
             assert!(
@@ -624,4 +626,82 @@ mod state {
         // it does not read, which is where most of the sixteen go.
         assert_eq!(d.args.len(), 16, "and every other slot is still in place");
     }
+}
+
+/// A rule may take its extent from the STATEMENT, not only from the fire.
+///
+/// `Dims` is filled from the fire's geometry — one `rotary_dims`, one
+/// `head_dim`, one of everything — which is right until a deployment states
+/// the number per layer. gemma-4 does: `partial_rotary_factor: 0.25` means
+/// its full-attention layers rotate 128 of their 512 channels while its
+/// sliding layers rotate all 256 of theirs. One fire-wide number cannot be
+/// both, and rotating the wrong count returns fluent text rather than
+/// failing.
+///
+/// The rope rows answer it with `grid_param`, naming which of the statement's
+/// own scalars carries the extent. This asserts the grid actually moves —
+/// a row-level declaration that produced one grid everywhere would be
+/// decorative.
+#[test]
+fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
+    let facts = LlamaLikeFacts {
+        layers: 12,
+        q_heads: 32,
+        kv_heads: 16,
+        head_dim: 256,
+        ..LlamaLikeFacts::qwen3_0_6b()
+    };
+    // gemma-4's shape: one full-attention layer in six, twice as wide per
+    // head, rotating a quarter of it.
+    let metal = LlamaLikeMetalFacts {
+        global_head_dim: 512,
+        global_kv_heads: 4,
+        full_partial_rotary: 0.25,
+        window_left: (0..12).map(|l| if (l + 1) % 6 == 0 { -1 } else { 1024 }).collect(),
+        ..LlamaLikeMetalFacts::synthetic()
+    };
+    let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
+    let low = lower(&plan, &[Row { samples: true, ..Row::default() }], Fire {
+        captures_across_splits: false,
+    })
+    .expect("the gemma-shaped text lowers");
+
+    let table = driver_metal_new::model::run::table();
+    let geometry = Geometry {
+        q_heads: 32,
+        kv_heads: 16,
+        head_dim: 256,
+        // The FIRE's number, which is the sliding layers' and which the full
+        // layers must NOT take.
+        rotary_dims: 256,
+        ..Geometry::default()
+    };
+    let mut by_layer: BTreeSet<(u16, u32)> = BTreeSet::new();
+    for launch in &low.launches {
+        let symbol = &low.kernels[launch.kernel as usize];
+        if !symbol.starts_with("neox") {
+            continue;
+        }
+        let sig = kernels::sig_in(table, symbol).expect("a rope row");
+        by_layer.insert((
+            launch.layers.start,
+            dims_of(sig, &low, launch, geometry).rotary_dims,
+        ));
+    }
+    assert!(!by_layer.is_empty(), "the text states rope launches");
+    for (layer, rotary) in &by_layer {
+        let full = (layer + 1) % 6 == 0;
+        assert_eq!(
+            *rotary,
+            if full { 128 } else { 256 },
+            "layer {layer} (full={full}) rotates {rotary} channels"
+        );
+    }
+    // And both answers are present, or the declaration proved nothing.
+    let widths: BTreeSet<u32> = by_layer.iter().map(|(_, r)| *r).collect();
+    assert_eq!(
+        widths,
+        BTreeSet::from([128, 256]),
+        "one extent everywhere means the statement's scalar was not read"
+    );
 }

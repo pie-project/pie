@@ -535,15 +535,26 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         | Source::KvPageSize
         | Source::KvWritePage
         | Source::KvWriteOffset
-        | Source::RopeFrequencies
-        | Source::SamplingIndices
-        | Source::RequestCount => return None,
+        | Source::RopeFrequencies => return None,
+        // NOT in the decline above, and the difference is the launcher's
+        // signature rather than the source's kind. The epilogue's gather
+        // takes `const int32_t* row_indices` LOOSE — it is the one CUDA
+        // launcher that wants a fire table as a bare pointer — so the
+        // driver holds the pair on the ctx exactly as it holds
+        // `peel_window`, and the row can say so.
+        Source::SamplingIndices => "ctx.sampling_indices".to_string(),
+        Source::RequestCount => "ctx.sampled_rows".to_string(),
         Source::Ctx(f) | Source::CtxNonZero(f) => format!("ctx.{f}"),
         // `g_of` is the driver's unwrap, and the guard below is what
         // makes it total: a branch binding a GDN field is emitted with
         // `gdn.is_some()` in its guard, so the only way here is through
         // that test.
         Source::Gdn(f) => format!("g_of(gdn).{f}"),
+        // Both total by the same construction `g_of` is: the guard below
+        // proves the context is there, and `kv_view` also proves the
+        // layer is in range.
+        Source::Attn(f) | Source::AttnNonZero(f) => format!("a_of(attn).{f}"),
+        Source::KvLayerView => "kv_view(attn, b.layers.start as usize)".to_string(),
         // A NULL is returned fully typed and skips the cast step below:
         // that step turns a slot into the row's pointee, and a null has
         // no slot to turn. `null_mut().cast::<i32>()` leaves the original
@@ -741,6 +752,27 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // is what makes `g_of`'s unwrap total.
         if k.operands.iter().any(|o| matches!(o.source, Source::Gdn(_))) {
             guard.push_str(" && gdn.is_some()");
+        }
+        // A FIRE WITH NO ATTENTION CARRIES NO ATTENTION CONTEXT, and a
+        // statement may name a layer the fire holds no cache for. Both
+        // are tested here so `a_of` and `kv_view` are total.
+        if k
+            .operands
+            .iter()
+            .any(|o| matches!(o.source, Source::Attn(_) | Source::AttnNonZero(_)))
+        {
+            guard.push_str(" && attn.is_some()");
+        }
+        // AFTER `attn.is_some()`, and that order is load-bearing: `&&`
+        // short-circuits left to right, so `a_of` is only reached once
+        // the context is known to be there.
+        for o in k.operands {
+            if let Source::AttnNonZero(f) = o.source {
+                guard.push_str(&format!(" && is_set(a_of(attn).{f})"));
+            }
+        }
+        if k.operands.iter().any(|o| o.source == Source::KvLayerView) {
+            guard.push_str(" && has_kv_layer(attn, b.layers.start as usize)");
         }
         // A field a family zeroes to say "not mine" — and a divisor,
         // which is the same test for a different reason: a width divided

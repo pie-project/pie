@@ -47,6 +47,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
+    MTLIndirectCommandBuffer,
     MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder,
     MTL4UpdateSparseBufferMappingOperation, MTL4VisibilityOptions, MTLBuffer,
     MTLComputePipelineState, MTLDevice, MTLHeap, MTLSharedEvent, MTLSize,
@@ -240,6 +241,49 @@ impl StepEncoder<'_> {
                 depth: threadgroup[2],
             },
         );
+        Ok(())
+    }
+
+    /// Execute `range` of a pre-recorded indirect command buffer.
+    ///
+    /// The replay half of `.wiki/driver/graph-metal.md` §5②. Where
+    /// [`Self::dispatch`] costs a pipeline set, a table set and a bind per
+    /// operand — about 5 000 Objective-C messages for one fire's 424
+    /// dispatches, which is 47.5 % of a prefill and **76.4 % of a decode** —
+    /// this costs one message for the whole recording.
+    ///
+    /// What an ICB may hold is stated by its descriptor at creation, and the
+    /// only field that has to be `ConcurrentDispatch` for this crate is
+    /// `commandTypes`; the commands' own pipelines, buffers, grids and
+    /// barriers are all per-command and all rewritable.
+    ///
+    /// # Errors
+    ///
+    /// An empty range, which encodes nothing and is more likely a caller that
+    /// lost its command count than an intent.
+    pub fn execute_commands(
+        &mut self,
+        commands: &ProtocolObject<dyn MTLIndirectCommandBuffer>,
+        range: core::ops::Range<usize>,
+    ) -> Result<()> {
+        if range.is_empty() {
+            return Err(Error::Create {
+                what: "indirect execute",
+                message: "an empty command range runs nothing".to_string(),
+            });
+        }
+        // SAFETY: the caller owns `commands` for the life of this encoder, and
+        // the range is checked against emptiness above; Metal bounds it
+        // against the buffer's own command count.
+        unsafe {
+            self.encoder.executeCommandsInBuffer_withRange(
+                commands,
+                objc2_foundation::NSRange {
+                    location: range.start,
+                    length: range.len(),
+                },
+            );
+        }
         Ok(())
     }
 

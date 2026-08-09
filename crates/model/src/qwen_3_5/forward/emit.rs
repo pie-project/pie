@@ -116,9 +116,6 @@ pub fn emit_qwen35_cuda_inc(
 ) -> String {
     let decode = qwen3_5_hybrid_cuda(facts, cuda, FireClass::Decode);
     let prefill = qwen3_5_hybrid_cuda(facts, cuda, FireClass::Prefill);
-    let commit = qwen3_5_hybrid_cuda(facts, cuda, FireClass::CommitAdvance);
-    let state_only = qwen3_5_hybrid_cuda(facts, cuda, FireClass::StateOnly);
-    let frozen = qwen3_5_hybrid_cuda(facts, cuda, FireClass::FrozenVerify);
     let digest = facts_digest(facts, cuda);
     let mut out = String::new();
     out.push_str(&format!(
@@ -149,29 +146,9 @@ pub fn emit_qwen35_cuda_inc(
         &format!("generated_qwen35_prefill_{tag}"),
         false,
     ));
-    out.push('\n');
-    out.push_str(&emit_class_fn(
-        &state_only,
-        facts,
-        cuda,
-        &format!("generated_qwen35_state_only_{tag}"),
-        false,
-    ));
-    out.push('\n');
-    out.push_str(&emit_class_fn(
-        &frozen,
-        facts,
-        cuda,
-        &format!("generated_qwen35_frozen_verify_{tag}"),
-        false,
-    ));
-    out.push('\n');
-    out.push_str(&emit_class_fn_commit(
-        &commit,
-        facts,
-        cuda,
-        &format!("generated_qwen35_commit_advance_{tag}"),
-    ));
+    // The three SERVICE passes are not emitted: `.wiki/driver/graph.md`
+    // §4.2 retired them. A speculative decode buffers its tokens and folds
+    // only the accepted prefix, so there is no repair to generate.
     out
 }
 

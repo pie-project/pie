@@ -184,18 +184,22 @@ pub enum FireClass {
     /// mixed fires as one qo_indptr-windowed prefill, a decode row being
     /// an `Nr == 1` window).
     Prefill,
-    /// The spec-decode repair pass (qwen3_5 MTP): ONLY each linear
-    /// layer's conv+prep+recurrence over the confirmed prefix, fed from
-    /// the verify stash — no embed, attention, MLP or epilogue. A
-    /// genuinely different pass, so a genuinely different trace.
-    CommitAdvance,
-    /// The speculative repair's whole-backbone flavor: everything except
-    /// the final-norm/lm_head epilogue.
-    StateOnly,
-    /// The frozen-verify service (qwen3_5 MTP): the prefill body plus a
-    /// verify-stash STORE per linear layer. Reserved by the rung-5
-    /// geometry; its trace is the next qwen3_5 slice.
-    FrozenVerify,
+    // THE REPAIR CLASSES ARE GONE (`.wiki/driver/graph.md` §4.2).
+    //
+    // `CommitAdvance`, `StateOnly` and `FrozenVerify` were spec-decode's
+    // repair passes, and they existed only because the driver refused the
+    // ABI mechanism that makes repair unnecessary. A speculative decode
+    // writes its tokens into a BUFFER and folds only the accepted prefix
+    // into the linear state; a rejected token is never folded, so nothing
+    // is ever wrong and nothing needs repairing. `FrozenVerify` was
+    // "prefill plus a verify-stash store" — the buffer IS the stash.
+    // `CommitAdvance` was "replay the confirmed prefix" — the fold length
+    // IS that prefix. `StateOnly` was the backbone with the epilogue cut
+    // off, which is a readout question, not a pass.
+    //
+    // The driver accepts `PIE_RS_FLAG_FOLD` / `_BUFFER_WRITE` /
+    // `_FOLD_LEN_DEVICE` now, so all three lost their reason to exist.
+    //
     // The masked classes (wire 5/6) and the hooked classes (wire 7/8)
     // are RETIRED (A1/A2, the class-collapse amendment): a custom mask
     // is a GuardPred::HasCustomMask arm and attached stage hooks are a
@@ -260,6 +264,24 @@ pub enum GuardPred {
     /// to the paged cache, so there is nothing to correct into) must
     /// not run. Wire kind 6, payload unused.
     HasLora,
+    /// EVERY ROW IS A ONE-TOKEN QUERY WINDOW — what `FireClass::Decode`
+    /// used to mean, said as a property of the rows instead of as a class.
+    ///
+    /// This is directive 4.1 of `.wiki/driver/graph.md`. Decode and
+    /// Prefill were already ONE body whose only difference was
+    /// `let window_one = class == FireClass::Decode`, and the goldens
+    /// pinned the collapse as byte-identical; the class survived only
+    /// because nothing else could carry the boolean. A guard can, and a
+    /// guard is what the masked and hooked classes were already retired
+    /// into (A1/A2, the class-collapse amendment).
+    ///
+    /// A MIXED fire — some rows one token, some many — answers false and
+    /// takes the ragged arm, which is correct: a ragged qo window serves a
+    /// one-token request as the degenerate case. That is the property
+    /// that makes the merge sound rather than merely convenient.
+    ///
+    /// Wire kind 7, payload unused.
+    WindowOne,
 }
 
 impl GuardPred {
@@ -273,6 +295,7 @@ impl GuardPred {
             GuardPred::HasCustomMask => (4, 0),
             GuardPred::HasStageHooks => (5, 0),
             GuardPred::HasLora => (6, 0),
+            GuardPred::WindowOne => (7, 0),
         }
     }
 }

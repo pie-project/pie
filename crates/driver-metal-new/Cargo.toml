@@ -135,6 +135,12 @@ features = [
     "MTLBuffer",
     "MTLHeap",
     "MTLResidencySet",
+    # Indirect command buffers: a fire RECORDED once and replayed, rather than
+    # re-encoded every step. `.wiki/driver/graph-metal.md` measures what that
+    # is worth here -- host encode is 47.5% of a prefill and 76.4% of a decode
+    # -- and corrects this tree's older claim that Metal has no such API.
+    "MTLIndirectCommandBuffer",
+    "MTLIndirectCommandEncoder",
     "MTLEvent",
     "MTLLibrary",
     "MTLComputePipeline",

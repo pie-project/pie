@@ -729,6 +729,16 @@ pub struct LlamaLikeMetalFacts {
     /// one shape everywhere. See [`Self::global_head_dim`].
     #[serde(default)]
     pub global_kv_heads: u32,
+    /// What fraction of each FULL-attention head the rotation covers, or zero
+    /// for a deployment that rotates the whole head.
+    ///
+    /// gemma-4's `partial_rotary_factor: 0.25`: its full layers rotate 128 of
+    /// their 512 channels and leave the rest, while its sliding layers rotate
+    /// all 256 of theirs. The rotation's extent is therefore a per-layer-type
+    /// fact like the head shape, and it reaches the grid rather than the
+    /// kernel — `Rule::Rope` launches half of it.
+    #[serde(default)]
+    pub full_partial_rotary: f32,
     /// Whether the FULL-attention layers take V from the K projection.
     ///
     /// PER LAYER, and measured: `mlx-community/gemma-4-26b-a4b-it-4bit` ships
@@ -926,6 +936,23 @@ impl LlamaLikeMetalFacts {
         }
     }
 
+    /// How many of this layer's channels the rotation covers.
+    ///
+    /// The whole head everywhere but gemma-4's full-attention layers, which
+    /// state `partial_rotary_factor` and rotate a fraction. Rounded DOWN to
+    /// an even number because the rotation pairs channels — `Rule::Rope`
+    /// launches `rotary/2` and an odd width would leave a lane without its
+    /// partner.
+    pub fn rotary_dim_at(&self, l: u32, head_dim: u32) -> u32 {
+        let dim = self.head_dim_at(l, head_dim);
+        if self.full_partial_rotary <= 0.0 || !self.is_full_attention(l) {
+            return dim;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        let want = (f64::from(dim) * f64::from(self.full_partial_rotary)) as u32;
+        (want.min(dim) / 2 * 2).max(2)
+    }
+
     /// A SYNTHETIC fixture, not a measurement — see the struct comment.
     /// These are the driver's own defaults as its source reads them.
     pub fn synthetic() -> Self {
@@ -963,9 +990,11 @@ impl LlamaLikeMetalFacts {
             rope_theta: 1_000_000.0,
             // qwen3 states ONE base for every layer, which is what zero means.
             rope_theta_sliding: 0.0,
-            // And ONE attention shape for every layer, likewise.
+            // And ONE attention shape for every layer, likewise, rotating
+            // the whole head.
             global_head_dim: 0,
             global_kv_heads: 0,
+            full_partial_rotary: 0.0,
             // qwen3's mixture replaces its dense MLP rather than sitting
             // beside it, and it has no per-layer embeddings or scalar and
             // shares no KV.

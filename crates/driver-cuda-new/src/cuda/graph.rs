@@ -36,9 +36,10 @@ use std::marker::PhantomData;
 use cudarc::runtime::sys::{
     cudaConditionalNodeParams, cudaGraphConditionalHandle,
     cudaGraphConditionalHandleCreate, cudaGraphConditionalNodeType, cudaGraphDestroy,
-    cudaGraphExecDestroy, cudaGraphExec_t, cudaGraphInstantiate, cudaGraphLaunch,
+    cudaGraphExecDestroy, cudaGraphExecKernelNodeSetParams, cudaGraphExec_t,
+    cudaGraphInstantiate, cudaGraphKernelNodeGetParams, cudaGraphLaunch,
     cudaGraphConditionalHandleFlags, cudaGraphNodeParams, cudaGraphNodeType, cudaGraphNode_t,
-    cudaGraphUpload, cudaGraph_t,
+    cudaGraphUpload, cudaGraph_t, cudaKernelNodeParams,
 };
 
 use crate::cuda::stream::StreamRef;
@@ -224,6 +225,73 @@ impl Graph {
         Ok(ConditionalIf { node, body, handle, _parent: PhantomData })
     }
 
+    /// A SWITCH node: one conditional that branches on an INTEGER index.
+    ///
+    /// `.wiki/driver/graph.md` §6.1. Every `GuardPred` is a boolean IF
+    /// today and they NEST, which costs depth and arm pairs on any axis
+    /// with more than two options — attention is
+    /// `plain / capture / custom / xqa`, four bodies reached through three
+    /// nested pairs. `cudaGraphCondTypeSwitch` reaches all four in one
+    /// node, selected by the index the device writes into the handle.
+    ///
+    /// It is also what makes the merged Decode/Prefill graph achievable
+    /// rather than aspirational: `cudaGraphExecUpdate` cannot ADD nodes,
+    /// so two topologies cannot be one updatable exec — but a SWITCH
+    /// selects among CHILD GRAPHS, and a child graph is a topology.
+    ///
+    /// `bodies` is how many arms; the device writes `0..bodies` and an
+    /// out-of-range value runs none. There is no default-value flag on a
+    /// switch — the handle is always written by the arming kernel, which
+    /// is the same discipline `add_conditional_if` uses with `None`.
+    ///
+    /// # Errors
+    ///
+    /// If the handle or the node cannot be created, or if the driver
+    /// returns no body array.
+    pub fn add_conditional_switch(
+        &mut self,
+        deps: &[cudaGraphNode_t],
+        bodies: u32,
+    ) -> Result<ConditionalSwitch<'_>> {
+        if bodies == 0 {
+            return Err(Error::invalid(
+                "cudaGraphAddNode",
+                "a switch with no bodies selects nothing",
+            ));
+        }
+        let mut handle: cudaGraphConditionalHandle = 0;
+        check_rt(
+            unsafe { cudaGraphConditionalHandleCreate(&mut handle, self.raw, 0, 0) },
+            "cudaGraphConditionalHandleCreate",
+        )?;
+        let mut params: cudaGraphNodeParams = unsafe { std::mem::zeroed() };
+        params.type_ = cudaGraphNodeType::cudaGraphNodeTypeConditional;
+        params.__bindgen_anon_1.conditional = cudaConditionalNodeParams {
+            handle,
+            type_: cudaGraphConditionalNodeType::cudaGraphCondTypeSwitch,
+            size: bodies,
+            phGraph_out: std::ptr::null_mut(),
+        };
+        let mut node: cudaGraphNode_t = std::ptr::null_mut();
+        check_rt(
+            unsafe {
+                add_node(&raw mut node, self.raw, deps.as_ptr(), deps.len(), &raw mut params)
+            },
+            "cudaGraphAddNode",
+        )?;
+        let out = unsafe { params.__bindgen_anon_1.conditional.phGraph_out };
+        if out.is_null() {
+            return Err(Error::invalid(
+                "cudaGraphAddNode",
+                "the driver returned no body graphs for the switch node",
+            ));
+        }
+        // SAFETY: on success CUDA has pointed `phGraph_out` at an array of
+        // exactly `bodies` graphs, owned by the parent.
+        let graphs = unsafe { std::slice::from_raw_parts(out, bodies as usize) }.to_vec();
+        Ok(ConditionalSwitch { node, bodies: graphs, handle, _parent: PhantomData })
+    }
+
     /// Instantiate into a launchable graph.
     ///
     /// The trailing `0` is the flags word. CUDA 12 replaced the older
@@ -285,6 +353,52 @@ impl ConditionalIf<'_> {
     }
 }
 
+/// A SWITCH node added to a [`Graph`] and the handle that selects which of
+/// its bodies runs. See [`Graph::add_conditional_switch`].
+///
+/// Borrows the parent graph for the same reason [`ConditionalIf`] does:
+/// the body graphs are the parent's to destroy.
+#[derive(Debug, Clone)]
+pub struct ConditionalSwitch<'g> {
+    node: cudaGraphNode_t,
+    bodies: Vec<cudaGraph_t>,
+    handle: cudaGraphConditionalHandle,
+    _parent: PhantomData<&'g Graph>,
+}
+
+impl ConditionalSwitch<'_> {
+    /// The node itself, to name as a dependency of a later node.
+    pub const fn node(&self) -> cudaGraphNode_t {
+        self.node
+    }
+
+    /// One body graph, by index. Owned by the parent graph; do not
+    /// destroy it.
+    #[must_use]
+    pub fn body(&self, index: usize) -> Option<cudaGraph_t> {
+        self.bodies.get(index).copied()
+    }
+
+    /// How many bodies this switch selects among.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Whether the switch has no bodies. Never true — the constructor
+    /// refuses a zero-body switch — but clippy asks for the pair.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+
+    /// The conditional handle. Its consumer writes an INDEX rather than a
+    /// boolean; see `pie_supergraph_set_switch` in `csrc/supergraph.cu`.
+    pub const fn handle(&self) -> cudaGraphConditionalHandle {
+        self.handle
+    }
+}
+
 /// An instantiated graph, ready to launch.
 #[derive(Debug)]
 pub struct GraphExec {
@@ -309,6 +423,44 @@ impl GraphExec {
     /// Launch onto `stream`.
     pub fn launch(&self, stream: StreamRef<'_>) -> Result<()> {
         check_rt(unsafe { cudaGraphLaunch(self.raw, stream.as_raw()) }, "cudaGraphLaunch")
+    }
+
+    /// Retune ONE node's launch rectangle on this instantiated graph,
+    /// without recapturing.
+    ///
+    /// `.wiki/driver/graph.md` §6.2, and the axis it removes from
+    /// [`crate::model::supergraph::BucketKey`]. Grid and block dims are
+    /// updatable on an instantiated graph; the kernel function pointer and
+    /// the topology are not. For two fires of the same `(model)` differing
+    /// only in row count the launch LIST is identical and only the
+    /// rectangles move — topology preserved, so the update is legal. It
+    /// costs tens of microseconds per graph against a recapture's
+    /// milliseconds, and it avoids the alternative of making every kernel
+    /// `_devwin`-shaped and always launching the maximum grid, which pays
+    /// empty warps on every small fire.
+    ///
+    /// The existing parameters are read back off the NODE (the recorded
+    /// graph's, not the exec's) so that the function pointer, the shared
+    /// memory and the argument array are carried over untouched. Only the
+    /// grid moves.
+    ///
+    /// # Errors
+    ///
+    /// If the node is not a kernel node, or if the update is rejected —
+    /// which is how CUDA reports a change the instantiated graph cannot
+    /// absorb, and is the caller's cue to recapture rather than to
+    /// continue.
+    pub fn set_kernel_grid(&self, node: cudaGraphNode_t, grid_x: u32) -> Result<()> {
+        let mut params: cudaKernelNodeParams = unsafe { std::mem::zeroed() };
+        check_rt(
+            unsafe { cudaGraphKernelNodeGetParams(node, &raw mut params) },
+            "cudaGraphKernelNodeGetParams",
+        )?;
+        params.gridDim.x = grid_x;
+        check_rt(
+            unsafe { cudaGraphExecKernelNodeSetParams(self.raw, node, &raw const params) },
+            "cudaGraphExecKernelNodeSetParams",
+        )
     }
 }
 

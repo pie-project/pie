@@ -66,6 +66,6 @@ pub use supergraph::{Cond, SupergraphBuilder};
 pub use supergraph::{
     PRED_SLOTS, PeelWindowWord, PredicateWord, SLOT_HAS_CUSTOM_MASK, SLOT_HAS_LORA, SLOT_HAS_STAGE_HOOKS,
     SLOT_HAS_WRITE_DESC, SLOT_PEEL_ALL_FAST, SLOT_PEEL_ALL_HOOKED, SLOT_TOKENS_GT,
-    SLOT_TOKENS_LE, SLOT_WANTS_ATTN_SCORE,
+    SLOT_TOKENS_LE, SLOT_WANTS_ATTN_SCORE, SLOT_WINDOW_ONE,
 };
 pub use vmm::{Arena, PhysicalPool, PoolBudget, LOGICAL_PAGE_BYTES, pages_for_bytes};

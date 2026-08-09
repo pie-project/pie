@@ -27,6 +27,7 @@
 //! That is every step the engine takes, with nothing stubbed.
 
 use driver_cuda_new::cuda::{Allocator, OwnedStream};
+use driver_cuda_new::ptir;
 use driver_cuda_new::ptir::{
     ChannelShape, Control, Disk, Prepared, Rings, Runtime, Target, launch_control, nvrtc,
 };
@@ -164,8 +165,36 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
 
     // Readiness first: the input must hold a value and the output must have
     // room. A fire launched without asking would read the zeroed cell.
-    let ready = launch_control::readiness(&control, &rings, &[0], &[1], &alloc, stream.as_ref())
-        .expect("readiness");
+    //
+    // The four index sets are DERIVED from the plan rather than written
+    // here, and this test is where that derivation is checked against a
+    // real compiled program: it used to hardcode `&[0]` and `&[1]`, which
+    // is right for this two-channel epilogue and says nothing about a
+    // program whose local slots and global indices differ.
+    let sets = ptir::bridge::stage_channels(stage_plan).expect("the plan binds its slots");
+    assert_eq!(sets.need_full, vec![0], "the seeded input");
+    assert_eq!(sets.need_empty, vec![1], "the reader");
+    assert_eq!(sets.put, vec![1]);
+    // AND `taken` IS EMPTY, which is where the derivation disagrees with
+    // what stood here. These programs use `Op::ChanRead` — "peek: full →
+    // copy, stays full" — and the hardcoded `&[0]` passed the input as
+    // TAKEN, which advances its head and consumes a value the program
+    // only looked at. Unobservable here because each case fires once; on a
+    // decode loop it is one seeded value dropped per fire.
+    assert!(
+        sets.taken.is_empty(),
+        "a chan_read consumes nothing, so no head advances: {:?}",
+        sets.taken
+    );
+    let ready = launch_control::readiness(
+        &control,
+        &rings,
+        &sets.need_full,
+        &sets.need_empty,
+        &alloc,
+        stream.as_ref(),
+    )
+    .expect("readiness");
     assert!(ready, "a seeded input and an empty output is a ready pass");
 
     let extents = Extents {
@@ -194,8 +223,8 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
     launch_control::commit(
         &control,
         &rings,
-        &[0],
-        &[1],
+        &sets.taken,
+        &sets.put,
         committed,
         &alloc,
         stream.as_ref(),
@@ -380,4 +409,281 @@ fn a_put_commits_which_means_its_sink_size_reached_the_kernel() {
     );
     let device = f32::from_le_bytes(answers.device[..4].try_into().expect("four bytes"));
     assert_eq!(device, 8.0, "and the cell must hold the value, not zeros");
+}
+
+/// The five intrinsic side tables reach the device with what the emitted
+/// kernel reads out of them, and each LANE reads its own row.
+///
+/// `Prepared::build` allocates them zeroed and, until `bind_intrinsic`,
+/// nothing filled them — so a program that read `logits` read address ZERO.
+/// Sampling is what a PTIR program is FOR (top-p, top-k, temperature and
+/// argmax are stages, not driver flags), which makes an unbound intrinsic
+/// the difference between a program that samples and one that cannot.
+///
+/// The claim is a ROUND TRIP through device memory, not a host-side
+/// arithmetic check: the tables are strided `lane * INTRINSIC_SLOTS + intr`,
+/// so the failure this catches is a write that lands on the fifteen slots
+/// beside the one it meant — which no host assertion about the arguments
+/// would see.
+///
+/// The row offsets are the half that matters most. One buffer, one layout,
+/// and each lane reading a different row of it; a binding that gave every
+/// lane row 0 would sample the first request N times and look exactly like
+/// a correct fire. That is not hypothetical — it is the shape of a defect
+/// this driver already shipped once, as `bind_intrinsic`'s doc records.
+#[test]
+fn every_lane_binds_its_own_row_of_the_logits() {
+    use driver::tensor_ir::op::IntrinsicId;
+
+    let _gpu = gpu_guard();
+    let Some(_device) = device_or_skip("PTIR intrinsic binding") else {
+        return;
+    };
+    let stream = OwnedStream::new(0).expect("stream");
+    let alloc = Allocator::new();
+
+    let container = epilogue(
+        IrDType::F32,
+        vec![
+            Op::ChanRead(0),
+            Op::ReduceSum(0),
+            Op::ChanPut { chan: 1, value: 1 },
+        ],
+    );
+    let bound = bind(container, profile()).expect("the container binds");
+    let stages = compile_bound(&bound);
+    let package = tensor_compiler::codegen::launch::build(&bound, &stages);
+    let plan = adopt_launch_package(package).expect("adopt");
+    let stage_plan = plan.package.plans.first().expect("one stage");
+
+    let shapes = [
+        ChannelShape { numel: LANES as usize, dtype: DType::F32, capacity: 1 },
+        ChannelShape { numel: 1, dtype: DType::F32, capacity: 1 },
+    ];
+    let rings = Rings::new(&alloc, &shapes, stream.as_ref()).expect("rings");
+
+    let extents = Extents {
+        row_count: 4,
+        token_count: 4,
+        sampled_rows: 4,
+        ..Extents::default()
+    };
+    let mut prepared =
+        Prepared::build(&alloc, stage_plan, &rings, extents, stream.as_ref()).expect("prepare");
+
+    // Unbound is address zero, which is the state this test exists to end.
+    let (base, ..) = prepared
+        .intrinsic_binding(IntrinsicId::Logits, 0, stream.as_ref())
+        .expect("read back");
+    assert_eq!(base, 0, "an unbound intrinsic points at nothing");
+
+    let vocab: u32 = 128;
+    let logits = alloc.alloc(vocab as usize * 4 * 4).expect("a logits buffer");
+    let address = logits.as_ptr() as u64;
+    prepared
+        .bind_intrinsic(
+            IntrinsicId::Logits,
+            address,
+            DType::F32,
+            vocab,
+            vocab,
+            // `lane + 3`, NOT the identity, and that is the point at one
+            // lane: `row_of(0) == 0` is indistinguishable from a binding
+            // that hardcodes zero, so the identity would let exactly the
+            // defect this guards — every lane reading row 0 — pass. An
+            // offset the lane index cannot produce by accident is what
+            // makes the claim falsifiable before grouping lands.
+            |lane| lane + 3,
+            stream.as_ref(),
+        )
+        .expect("bind");
+    stream.as_ref().synchronize().expect("sync");
+
+    // Over the lanes the fire ACTUALLY has, which is one today — multi-lane
+    // grouping is the first thing `ptir::fire`'s header says it does not do.
+    // Written against `lanes()` rather than a constant so that the day
+    // grouping lands, this covers it instead of passing for the wrong
+    // reason.
+    for lane in 0..prepared.lanes() {
+        let (base, mode, width, stride, offset) = prepared
+            .intrinsic_binding(IntrinsicId::Logits, lane, stream.as_ref())
+            .expect("read back");
+        assert_eq!(base, address, "lane {lane} points at the logits");
+        assert_eq!(mode, DType::F32 as u8 as u32, "lane {lane} dtype");
+        assert_eq!(width, vocab, "lane {lane} width is the vocabulary");
+        assert_eq!(stride, vocab, "lane {lane} row stride");
+        assert_eq!(offset, lane + 3, "lane {lane} reads ITS row, not row 0");
+    }
+
+    // A lane past the fire's is refused rather than read out of the next
+    // allocation, which is the whole reason the pitch is a constant.
+    assert!(
+        prepared
+            .intrinsic_binding(IntrinsicId::Logits, prepared.lanes(), stream.as_ref())
+            .is_err(),
+        "a lane past the fire's has no binding"
+    );
+}
+
+/// A compiled program fires through `ptir::Session`, taking its input from
+/// a HOST mirror and publishing back into one.
+///
+/// The other cases in this file drive the pieces directly — seed the
+/// device ring, launch, read the device cell. This one goes through the
+/// plane the engine actually uses: a pinned-style host mirror with four
+/// control words, exactly what `pie_cuda_register_channel` hands over. So
+/// it is the first test in which a value crosses BOTH planes, which is
+/// what `ptir_programs` having no reader has meant all along.
+///
+/// The program is an argmax over eight lanes with a tie, chosen because
+/// the observable is an INDEX: `PARITY-INTERP.md`'s tolerance contract
+/// admits one ulp on magnitudes and no slack at all on an argmax, so a
+/// disagreement here cannot be rounding.
+#[test]
+fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
+    use driver_cuda_new::ptir::bridge::{HostChannel, stage_channels};
+    use driver_cuda_new::ptir::session::{Fired, Session};
+
+    let _gpu = gpu_guard();
+    let Some(device) = device_or_skip("PTIR session") else {
+        return;
+    };
+    let (major, minor) = device.compute_capability().expect("compute capability");
+    let stream = OwnedStream::new(0).expect("stream");
+    let alloc = Allocator::new();
+
+    let seed: [f32; LANES as usize] = [2.0, 7.0, 1.0, 7.0, 0.5, 7.0, -3.0, 6.0];
+    let container = epilogue(
+        IrDType::I32,
+        vec![
+            Op::ChanRead(0),
+            Op::ReduceArgmax(0),
+            Op::ChanPut { chan: 1, value: 1 },
+        ],
+    );
+
+    let bound = bind(container, profile()).expect("binds");
+    let stages = compile_bound(&bound);
+    let package = tensor_compiler::codegen::launch::build(&bound, &stages);
+    let emitted = emit_program(Backend::Cuda, &stages, &bound);
+    let kernels: Vec<driver_api::plan::EmittedKernel> = emitted
+        .iter()
+        .map(|k| driver_api::plan::EmittedKernel {
+            kind: k.kind,
+            stage_index: k.stage_index,
+            region_index: k.region_index,
+            entry_name: k.entry_name.clone(),
+            source: k.source.clone(),
+            error: k.error.clone(),
+        })
+        .collect();
+    let plan = adopt_launch_package(package).expect("adopts");
+    assert!(plan.executable, "the plan must be executable");
+
+    let directory = std::env::temp_dir().join(format!("pie-ptir-session-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let disk = Disk::at(&directory);
+    let architecture = nvrtc::arch_flag(major, minor);
+    let mut runtime = Runtime::new(disk.clone());
+    let compiled = runtime
+        .compile(
+            0x5E5,
+            &plan,
+            &kernels,
+            Versions::mirrored(Backend::Cuda.emitter_version()),
+            Target {
+                major,
+                minor,
+                device: u64::try_from(device.ordinal()).unwrap_or(0),
+                nvrtc: nvrtc::version().expect("nvrtc"),
+            },
+        )
+        .unwrap_or_else(|f| panic!("compiles: {}", f.reason()));
+    let control = Control::compile(&disk, &architecture, "session-test").expect("control");
+    let stage_plan = plan.package.plans.first().expect("one stage");
+
+    // ── The HOST plane, as `register_channel` lays it out. ──
+    let shapes = [
+        ChannelShape { numel: LANES as usize, dtype: DType::F32, capacity: 1 },
+        ChannelShape { numel: 1, dtype: DType::I32, capacity: 1 },
+    ];
+    let mut mirrors: Vec<Vec<u8>> = shapes
+        .iter()
+        .map(|s| vec![0u8; s.cell_bytes() * s.ring().expect("ring") as usize])
+        .collect();
+    let mut words: Vec<Vec<u64>> = vec![vec![0u64; 4], vec![0u64; 4]];
+
+    let mut session = Session::new(&alloc, &shapes, stream.as_ref()).expect("session");
+    let sets = stage_channels(stage_plan).expect("sets");
+
+    // The engine's side: publish the seed into the input's host mirror.
+    {
+        let mut host: Vec<HostChannel> = mirrors
+            .iter_mut()
+            .zip(words.iter_mut())
+            .zip(shapes.iter())
+            .map(|((m, w), s)| unsafe {
+                HostChannel::new(
+                    m.as_mut_ptr().cast(),
+                    w.as_mut_ptr().cast(),
+                    s.cell_bytes(),
+                    s.ring().expect("ring"),
+                )
+            })
+            .collect();
+        let bytes: Vec<u8> = seed.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert!(host[0].publish(&bytes), "the engine publishes the seed");
+        assert_eq!(host[0].depth(), 1);
+    }
+
+    let outcome = {
+        let mut host: Vec<HostChannel> = mirrors
+            .iter_mut()
+            .zip(words.iter_mut())
+            .zip(shapes.iter())
+            .map(|((m, w), s)| unsafe {
+                HostChannel::new(
+                    m.as_mut_ptr().cast(),
+                    w.as_mut_ptr().cast(),
+                    s.cell_bytes(),
+                    s.ring().expect("ring"),
+                )
+            })
+            .collect();
+        session
+            .fire(
+                &compiled,
+                stage_plan,
+                &control,
+                &mut host,
+                // This program reads no intrinsic, so a null base is
+                // honest rather than a placeholder — `bind_intrinsic` is
+                // skipped and nothing reads address zero.
+                (0, 0, 0),
+                |lane| lane,
+                Extents { row_count: 1, token_count: 1, sampled_rows: 1, ..Extents::default() },
+                &alloc,
+                stream.as_ref(),
+            )
+            .expect("the fire completes")
+    };
+    assert_eq!(outcome, Fired::Committed { published: 1 }, "one cell published");
+
+    // ── And the engine reads its answer out of the host mirror. ──
+    let mut host: Vec<HostChannel> = mirrors
+        .iter_mut()
+        .zip(words.iter_mut())
+        .zip(shapes.iter())
+        .map(|((m, w), s)| unsafe {
+            HostChannel::new(
+                m.as_mut_ptr().cast(),
+                w.as_mut_ptr().cast(),
+                s.cell_bytes(),
+                s.ring().expect("ring"),
+            )
+        })
+        .collect();
+    let cell = host[1].take().expect("the reader has a value");
+    let got = i32::from_le_bytes(cell[..4].try_into().expect("four bytes"));
+    assert_eq!(got, 1, "argmax over a tie takes the FIRST maximum, on both planes");
 }

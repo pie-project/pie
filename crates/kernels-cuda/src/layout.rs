@@ -81,6 +81,31 @@ pub static KERNELS: &[KernelSig] = &[
             i: I32,
             stream: Stream,
         ]),
+    // THE EPILOGUE'S GATHER. A prefill streams one row per token and reads
+    // one distribution per request, so the rows that are actually sampled
+    // have to be collected before the final norm and the head — and they
+    // are not a contiguous run, which is why this is a gather rather than
+    // a slice.
+    //
+    // It had no row and no arm, and the reason it was never missed is
+    // worth keeping: `driver-cuda-new`'s shell built every fire row as
+    // `samples: true`, so `sampled < window.len()` was false on every
+    // fire and `lower::epilogue` never stated the gather. The moment the
+    // shell read the step's real readout list, every prefill asked for
+    // this and got `NoArm`.
+    //
+    // The last operand is the row WIDTH, not a vocabulary: the header
+    // names it `vocab` but the caller passes `H`, because this gathers
+    // hidden rows on their way INTO the head.
+    kernel!(gather_rows "layout::gather_bf16_rows",
+        operands = operands![
+            src: U16s <- Source::In(0),
+            row_indices: I32s <- Source::SamplingIndices,
+            dst: U16sMut <- Source::Out(0),
+            num_dst_rows: I32 <- Source::Rows,
+            width: I32 <- Source::OutWidth(0),
+            stream: Stream <- Source::Ctx("stream"),
+        ]),
     // A vocab-sharded embedding: the rank holds `[local_vocab, hidden]` from
     // `vocab_offset` and writes zeros elsewhere, and the all-reduce after it
     // makes the row whole. The shard is a property of the WEIGHT, not of the

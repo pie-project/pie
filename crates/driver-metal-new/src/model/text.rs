@@ -391,6 +391,9 @@ pub fn facts_from_with(
         // full.
         global_head_dim: geometry.global_head_dim,
         global_kv_heads: geometry.global_kv_heads,
+        // The rotation's extent on those layers, which reaches the GRID
+        // through the rope rows' `grid_param` rather than the kernel.
+        full_partial_rotary: geometry.full_partial_rotary,
         // Whether the ladder is RESCALED, in which case no base expresses it
         // and the driver hands over a table instead.
         rope_freq_table: geometry.rope_freq_factor > 0.0,

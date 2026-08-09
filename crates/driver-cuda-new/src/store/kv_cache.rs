@@ -117,6 +117,53 @@ pub struct PerLayer {
     pub num_kv_heads: Vec<i32>,
 }
 
+impl PerLayer {
+    /// Refuse a table where a sharer's geometry differs from its source's.
+    ///
+    /// One set of pages has ONE shape — `page_size x kv_heads x
+    /// head_dim` — so a layer that reads through another's pages must
+    /// have that layer's dims. gemma-4 gets this right without trying:
+    /// `kv_source` searches for an earlier layer with the same
+    /// `is_full_attn`, which is the same predicate `head_dim_of` keys
+    /// on. That is one invariant spread across two functions in another
+    /// crate, and nothing was checking it.
+    ///
+    /// # Why this is not inside [`KvCacheLayout::plan_per_layer`]
+    ///
+    /// Because the C++ `plan_per_layer` accepts the inconsistent table,
+    /// and `tests/kv_cache_live_parity.rs` pins the port to the C++
+    /// oracle's own transcript hash — including a case built precisely
+    /// to disagree, as the probe that distinguishes a `layer_view`
+    /// reading the source's dims from one reading the layer's. Refusing
+    /// it there would break the parity the port rests on to fix a defect
+    /// the port cannot produce.
+    ///
+    /// So this is the SHELL's check: whoever builds a `PerLayer` from a
+    /// model's facts calls it, and the ported constructor stays
+    /// byte-identical to the thing it was ported from.
+    pub fn check_sharing(&self) -> Result<()> {
+        for (i, &src) in self.kv_source_layer.iter().enumerate() {
+            let s = usize::try_from(src).unwrap_or(usize::MAX);
+            if s == i {
+                continue;
+            }
+            for (what, v) in [("head_dim", &self.head_dim), ("num_kv_heads", &self.num_kv_heads)] {
+                let (Some(&mine), Some(&theirs)) = (v.get(i), v.get(s)) else { continue };
+                if mine != theirs {
+                    return Err(Error::invalid(
+                        "kv_cache",
+                        format!(
+                            "layer {i} reads through layer {src}'s pages but its {what} is \
+                             {mine} against their {theirs}; one set of pages cannot have two shapes"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The complete allocation manifest for a KV cache.
 #[derive(Debug, Clone)]
 pub struct KvCacheLayout {
@@ -439,6 +486,26 @@ impl KvCacheLayout {
     #[must_use]
     pub fn slots(&self) -> &[LayerSlot] {
         &self.slots
+    }
+
+    /// The same stack with a different page count.
+    ///
+    /// A resize changes how many pages there are and nothing else, so
+    /// re-deriving the per-layer geometry from a config would be a second
+    /// chance to get it wrong — and the config cannot state it: the
+    /// families with two head dims and a shared tail encode that in their
+    /// facts, not in `hf.json`.
+    pub fn with_num_pages(&self, num_pages: i32) -> Result<Self> {
+        Self::build(
+            self.num_layers,
+            num_pages,
+            self.page_size,
+            self.num_kv_heads,
+            self.head_dim,
+            self.format.clone(),
+            self.per_layer.clone(),
+            self.envelopes,
+        )
     }
 
     /// Whether the envelope tier was allocated.
