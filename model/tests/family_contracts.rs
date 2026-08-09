@@ -28,9 +28,9 @@ use pie_loader::types::{
 };
 use pie_loader::verify::ContractView;
 
+use pie_model::contract::author;
 use pie_model_common::facts::ModelFacts;
 use pie_model_common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
-use pie_model::contract::author;
 
 // ── fixture machinery ───────────────────────────────────────────────
 
@@ -76,8 +76,8 @@ impl Checkpoint {
         ));
         if std::fs::metadata(&path).map(|meta| meta.len()).ok() != Some(self.offset) {
             let staging = path.with_extension(format!("{:?}.partial", std::thread::current().id()));
-            std::fs::write(&staging, vec![0u8; self.offset as usize])
-                .expect("write fixture checkpoint");
+            let file = std::fs::File::create(&staging).expect("create fixture checkpoint");
+            file.set_len(self.offset).expect("size fixture checkpoint");
             std::fs::rename(&staging, &path).expect("publish fixture checkpoint");
         }
         CheckpointMetadata {
@@ -1156,21 +1156,52 @@ fn deepseek_v4_checkpoint() -> CheckpointMetadata {
 }
 
 fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
-    // Match the pinned Flash import's E8M0 scales at H=4096 and I=2048.
+    // The import preserves typed E8M0 scales; safetensors presents them as U8.
     let (hidden, intermediate) = (4096, 2048);
     let mut ck = Checkpoint::new();
-    ck.push("embed_tokens.weight", &[128, hidden], bf16());
+    ck.push("embed.weight", &[129280, hidden], bf16());
+    ck.push("head.weight", &[129280, hidden], bf16());
+    ck.push("hc_head_base", &[4], f32enc());
+    ck.push("hc_head_fn", &[4, 16384], f32enc());
+    ck.push("hc_head_scale", &[1], f32enc());
     let p = "layers.0.";
+    ck.push(&format!("{p}attn_norm.weight"), &[hidden], bf16());
+    ck.push(&format!("{p}ffn_norm.weight"), &[hidden], bf16());
+    ck.push(&format!("{p}attn.attn_sink"), &[64], f32enc());
+    ck.push(&format!("{p}attn.q_norm.weight"), &[1024], bf16());
+    ck.push(&format!("{p}attn.kv_norm.weight"), &[512], bf16());
+    for (name, weight, scale) in [
+        ("attn.wq_a", [1024, 4096], [8, 32]),
+        ("attn.wq_b", [32768, 1024], [256, 8]),
+        ("attn.wkv", [512, 4096], [4, 32]),
+        ("attn.wo_a", [8192, 4096], [64, 32]),
+        ("attn.wo_b", [4096, 8192], [32, 64]),
+        ("ffn.shared_experts.w1", [2048, 4096], [16, 32]),
+        ("ffn.shared_experts.w2", [4096, 2048], [32, 16]),
+        ("ffn.shared_experts.w3", [2048, 4096], [16, 32]),
+    ] {
+        ck.push(
+            &format!("{p}{name}.weight"),
+            &weight,
+            Encoding::Raw(DType::F8E4M3),
+        );
+        ck.push(
+            &format!("{p}{name}.scale"),
+            &scale,
+            Encoding::Raw(DType::E8M0),
+        );
+    }
+    ck.push(&format!("{p}ffn.gate.weight"), &[256, hidden], bf16());
     ck.push(
-        &format!("{p}attn.wq.weight"),
-        &[64, 64],
-        Encoding::Raw(DType::F8E4M3),
+        &format!("{p}ffn.gate.tid2eid"),
+        &[129280, 6],
+        Encoding::Raw(DType::I64),
     );
-    ck.push(
-        &format!("{p}attn.wq.scale"),
-        &[2, 2],
-        Encoding::Raw(DType::E8M0),
-    );
+    for stem in ["hc_attn", "hc_ffn"] {
+        ck.push(&format!("{p}{stem}_base"), &[24], f32enc());
+        ck.push(&format!("{p}{stem}_fn"), &[24, 16384], f32enc());
+        ck.push(&format!("{p}{stem}_scale"), &[3], f32enc());
+    }
     for expert in 0..2 {
         let e = format!("{p}ffn.experts.{expert}.");
         for half in ["w1", "w3"] {
@@ -1196,21 +1227,168 @@ fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
             Encoding::Raw(DType::E8M0),
         );
     }
+
+    // The C4 indexer and both compressor shapes are separate real header
+    // classes even though they are outside the one-layer expert fixture.
+    for (layer, ape, width) in [(2, [4, 1024], 1024), (3, [128, 512], 512)] {
+        let a = format!("layers.{layer}.attn.compressor.");
+        ck.push(&format!("{a}ape"), &ape, f32enc());
+        ck.push(&format!("{a}norm.weight"), &[512], bf16());
+        ck.push(&format!("{a}wgate.weight"), &[width, hidden], bf16());
+        ck.push(&format!("{a}wkv.weight"), &[width, hidden], bf16());
+    }
+    let indexer = "layers.2.attn.indexer.";
+    ck.push(
+        &format!("{indexer}weights_proj.weight"),
+        &[64, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{indexer}wq_b.weight"),
+        &[8192, 1024],
+        Encoding::Raw(DType::F8E4M3),
+    );
+    ck.push(
+        &format!("{indexer}wq_b.scale"),
+        &[64, 8],
+        Encoding::Raw(DType::E8M0),
+    );
+    let ic = format!("{indexer}compressor.");
+    ck.push(&format!("{ic}ape"), &[4, 256], f32enc());
+    ck.push(&format!("{ic}norm.weight"), &[128], bf16());
+    ck.push(&format!("{ic}wgate.weight"), &[256, hidden], bf16());
+    ck.push(&format!("{ic}wkv.weight"), &[256, hidden], bf16());
+    ck.push("layers.3.ffn.gate.bias", &[256], f32enc());
+
+    // MTP is not bound by the decoder, but its block-FP8 pairs still pass
+    // through the family-wide scale normalizer.
+    let m = "mtp.0.";
+    for (name, weight, scale) in [
+        ("attn.wq_a", [1024, 4096], [8, 32]),
+        ("attn.wq_b", [32768, 1024], [256, 8]),
+        ("attn.wkv", [512, 4096], [4, 32]),
+        ("attn.wo_a", [8192, 4096], [64, 32]),
+        ("attn.wo_b", [4096, 8192], [32, 64]),
+        ("e_proj", [4096, 4096], [32, 32]),
+        ("h_proj", [4096, 4096], [32, 32]),
+        ("ffn.shared_experts.w1", [2048, 4096], [16, 32]),
+        ("ffn.shared_experts.w2", [4096, 2048], [32, 16]),
+        ("ffn.shared_experts.w3", [2048, 4096], [16, 32]),
+    ] {
+        ck.push(
+            &format!("{m}{name}.weight"),
+            &weight,
+            Encoding::Raw(DType::F8E4M3),
+        );
+        ck.push(
+            &format!("{m}{name}.scale"),
+            &scale,
+            Encoding::Raw(DType::E8M0),
+        );
+    }
+    for name in [
+        "attn_norm.weight",
+        "ffn_norm.weight",
+        "enorm.weight",
+        "hnorm.weight",
+        "norm.weight",
+    ] {
+        ck.push(&format!("{m}{name}"), &[hidden], bf16());
+    }
+    ck.push(&format!("{m}attn.q_norm.weight"), &[1024], bf16());
+    ck.push(&format!("{m}attn.kv_norm.weight"), &[512], bf16());
+    ck.push(&format!("{m}attn.attn_sink"), &[64], f32enc());
+    ck.push(&format!("{m}ffn.gate.weight"), &[256, hidden], bf16());
+    ck.push(&format!("{m}ffn.gate.bias"), &[256], f32enc());
+    for half in ["w1", "w3"] {
+        ck.push(
+            &format!("{m}ffn.experts.0.{half}.weight"),
+            &[intermediate, hidden / 2],
+            Encoding::Raw(DType::I8),
+        );
+        ck.push(
+            &format!("{m}ffn.experts.0.{half}.scale"),
+            &[intermediate, hidden / 32],
+            Encoding::Raw(DType::E8M0),
+        );
+    }
+    ck.push(
+        &format!("{m}ffn.experts.0.w2.weight"),
+        &[hidden, intermediate / 2],
+        Encoding::Raw(DType::I8),
+    );
+    ck.push(
+        &format!("{m}ffn.experts.0.w2.scale"),
+        &[hidden, intermediate / 32],
+        Encoding::Raw(DType::E8M0),
+    );
+    for stem in ["hc_attn", "hc_ffn"] {
+        ck.push(&format!("{m}{stem}_base"), &[24], f32enc());
+        ck.push(&format!("{m}{stem}_fn"), &[24, 16384], f32enc());
+        ck.push(&format!("{m}{stem}_scale"), &[3], f32enc());
+    }
+    ck.push(&format!("{m}hc_head_base"), &[4], f32enc());
+    ck.push(&format!("{m}hc_head_fn"), &[4, 16384], f32enc());
+    ck.push(&format!("{m}hc_head_scale"), &[1], f32enc());
     ck.push("norm.weight", &[hidden], bf16());
     ck.finish("deepseek_v4_imported")
 }
 
 fn assert_imported_block_scale_decodes(contract: &pie_loader::contract::ModelContract) {
-    let scale = contract
-        .tensors
-        .iter()
-        .find(|tensor| tensor.name == "layers.0.attn.wq.scale")
-        .expect("the imported block scale is published");
-    assert_eq!(scale.encoding, Encoding::Raw(DType::U8));
-    assert_eq!(
-        scale.scales.as_ref().map(|scales| scales.form),
-        Some(ScaleForm::F32Factors)
-    );
+    let expected = [
+        "layers.0.attn.wq_a.scale",
+        "layers.0.attn.wq_b.scale",
+        "layers.0.attn.wkv.scale",
+        "layers.0.attn.wo_a.scale",
+        "layers.0.attn.wo_b.scale",
+        "layers.0.ffn.shared_experts.w1.scale",
+        "layers.0.ffn.shared_experts.w2.scale",
+        "layers.0.ffn.shared_experts.w3.scale",
+        "layers.2.attn.indexer.wq_b.scale",
+        "mtp.0.attn.wq_a.scale",
+        "mtp.0.attn.wq_b.scale",
+        "mtp.0.attn.wkv.scale",
+        "mtp.0.attn.wo_a.scale",
+        "mtp.0.attn.wo_b.scale",
+        "mtp.0.e_proj.scale",
+        "mtp.0.h_proj.scale",
+        "mtp.0.ffn.shared_experts.w1.scale",
+        "mtp.0.ffn.shared_experts.w2.scale",
+        "mtp.0.ffn.shared_experts.w3.scale",
+    ];
+    for name in expected {
+        let scale = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .unwrap_or_else(|| panic!("imported block scale '{name}' is published"));
+        assert_eq!(scale.encoding, Encoding::Raw(DType::U8), "{name}");
+        assert_eq!(
+            scale.scales.as_ref().map(|scales| scales.form),
+            Some(ScaleForm::F32Factors),
+            "{name}"
+        );
+        let weight_name = format!("{}.weight", name.trim_end_matches(".scale"));
+        let weight = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == weight_name)
+            .unwrap_or_else(|| panic!("block scale '{name}' keeps its companion weight"));
+        assert_eq!(weight.encoding, Encoding::Raw(DType::F8E4M3), "{name}");
+    }
+
+    // The MTP routed experts are not decoder groups, but they prove that the
+    // companion-type guard does not reinterpret MXFP4 scales as FP8 factors.
+    for half in ["w1", "w2", "w3"] {
+        let name = format!("mtp.0.ffn.experts.0.{half}.scale");
+        let scale = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .unwrap_or_else(|| panic!("routed scale '{name}' is published"));
+        assert_eq!(scale.encoding, Encoding::Raw(DType::E8M0), "{name}");
+        assert!(scale.scales.is_none(), "{name}");
+    }
 }
 
 #[test]
@@ -1358,16 +1536,32 @@ fn llama_bf16_checkpoint() -> CheckpointMetadata {
     let p = "model.layers.0.";
     ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
     for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-        ck.push(&format!("{p}self_attn.{proj}.weight"), &[hidden, hidden], bf16());
+        ck.push(
+            &format!("{p}self_attn.{proj}.weight"),
+            &[hidden, hidden],
+            bf16(),
+        );
     }
     ck.push(
         &format!("{p}post_attention_layernorm.weight"),
         &[hidden],
         bf16(),
     );
-    ck.push(&format!("{p}mlp.gate_proj.weight"), &[intermediate, hidden], bf16());
-    ck.push(&format!("{p}mlp.up_proj.weight"), &[intermediate, hidden], bf16());
-    ck.push(&format!("{p}mlp.down_proj.weight"), &[hidden, intermediate], bf16());
+    ck.push(
+        &format!("{p}mlp.gate_proj.weight"),
+        &[intermediate, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.up_proj.weight"),
+        &[intermediate, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.down_proj.weight"),
+        &[hidden, intermediate],
+        bf16(),
+    );
     ck.push("model.norm.weight", &[hidden], bf16());
     ck.finish("llama_bf16")
 }
@@ -1419,9 +1613,14 @@ fn metal_refuses_a_requantization_it_cannot_encode() {
                     ..mlx_policy()
                 },
             )
-            .expect_err(&format!("{family} runtime_quant={quant:?} should be refused"));
+            .expect_err(&format!(
+                "{family} runtime_quant={quant:?} should be refused"
+            ));
             let text = err.to_string();
-            assert!(text.contains("no encoder here"), "{family} {quant:?}: {text}");
+            assert!(
+                text.contains("no encoder here"),
+                "{family} {quant:?}: {text}"
+            );
             assert!(
                 text.contains("int4"),
                 "{family} {quant:?} refusal names the alternative: {text}"
@@ -1551,7 +1750,10 @@ fn an_mlx_checkpoint_is_not_requantized_by_int4() {
             tensor.encoding
         );
     }
-    assert!(seen >= 7, "fixture should carry every projection, saw {seen}");
+    assert!(
+        seen >= 7,
+        "fixture should carry every projection, saw {seen}"
+    );
 }
 
 fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {
