@@ -1386,8 +1386,14 @@ if(PIE_LOADER_STATICLIB)
   pie_add_cuda_target(test_model_registry
     SOURCES tests/model_registry_test.cpp
     LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
+  # Real DeepSeek-V4 binder, metadata-only borrowed tensors: proves the eager
+  # gate_up/down pair remains bindable without touching a CUDA device.
+  pie_add_cuda_target(test_deepseek_v4_expert_binding
+    SOURCES tests/deepseek_v4_expert_binding_test.cpp
+    LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
 else()
   message(STATUS
-    "test_model_registry: skipped (no libpie_loader_capi.a; build one with "
+    "test_model_registry and test_deepseek_v4_expert_binding: skipped "
+    "(no libpie_loader_capi.a; build one with "
     "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()
