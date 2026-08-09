@@ -90,7 +90,6 @@ impl RemoteDriver {
         }
     }
 
-
     fn ensure_connected(&self) -> Result<()> {
         ensure!(
             self.connected.load(Ordering::Acquire),
@@ -259,17 +258,6 @@ impl RemoteDriver {
             }
         });
     }
-
-
-
-
-
-
-
-
-
-
-
 }
 
 impl Driver for RemoteDriver {
@@ -316,10 +304,7 @@ impl Driver for RemoteDriver {
         Ok(program_id)
     }
 
-    fn register_channel(
-        &mut self,
-        desc: &ChannelRegistrationPlan,
-    ) -> Result<RegisteredChannel> {
+    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
         if self.channels.contains_key(&desc.channel_id) {
             return Err(anyhow!(
                 "remote local channel {} is already registered",

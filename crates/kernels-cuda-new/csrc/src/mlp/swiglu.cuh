@@ -81,10 +81,19 @@
 // launcher asks for `ceil(((I + 1) / 2) / BLOCK)` tiles -- a HALF-WIDTH grid.
 // No `LaunchRule` states that, and inventing one to fit three kernels would
 // put a geometry in the vocabulary that only these three mean. They stay here
-// because the device half of a file belongs in the device half of a file, and
-// `swiglu.cu`'s launcher still picks between them at run time on `I > 10000`
-// and on the parity of `row_stride` -- run-time predicates over an operand's
-// VALUE, which is the other half of why no row can name them.
+// because the device half of a file belongs in the device half of a file.
+//
+// NOTHING LAUNCHES THEM ANY MORE. `swiglu.cu`'s launcher picked between them
+// and their scalar twins at run time on `I > 10000` and on the parity of
+// `row_stride` -- run-time predicates over an operand's VALUE, which is the
+// other half of why no row can name them -- and that launcher is deleted
+// (§54), along with the whole of `kernels-cuda/csrc/src/mlp/`. It had already
+// stopped being CALLED before it was deleted: every `table::mlp` row is in
+// `device::JIT_DISPATCHED`, so the fire resolves to the scalar
+// `chunked_swiglu` template on `LaunchRule::ElementwiseRows` at every `I`.
+// These three are kept, uninstantiated, because the arithmetic is the record
+// of what the vectorised path DID; see `families::mlp`'s header for what
+// re-landing it would have to measure first.
 //
 // They are templates all the same, with a `static_assert` naming the single
 // instantiation they have: `bf16x2` is a bf16 PAIR, and the packed path is

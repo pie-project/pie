@@ -218,8 +218,11 @@ impl crate::fire::sideband_arena::DeviceMemory for LiveLoraOps {
 impl LoraOps for LiveLoraOps {
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn cast_fp32_to_bf16(&mut self, src: *const c_void, dst: *mut c_void, elems: usize) {
+        // SAFETY: the caller holds `self.stream` live across the launch —
+        // the same assertion this method made when it handed the stream to
+        // `ffi::pie_k_quant_cast_fp32_to_bf16`, which put it in a `<<<>>>`.
         unsafe {
-            crate::bind::abi::ffi::pie_k_quant_cast_fp32_to_bf16(src, dst, elems, self.stream);
+            super::dtype_cast::cast_fp32_to_bf16(src, dst, elems, self.stream);
         }
     }
 
@@ -733,7 +736,7 @@ impl LoraFireState {
         xa_scratch: *mut c_void,
         stream: *mut c_void,
     ) {
-        use crate::bind::abi::ffi;
+        use crate::fire::gemm::act_x_wt_bf16;
         let layer_u = usize::try_from(layer).unwrap_or(0);
         for lane in &self.lanes {
             if lane.grouped {
@@ -757,9 +760,14 @@ impl LoraFireState {
             );
             let x = bf16_row(qkv_in, v.token_start, h);
             unsafe {
-                ffi::pie_k_gemm_act_x_wt_bf16(cublas, x, a_l, xa_scratch, t, r, h, 0.0);
+                // `gemm::act_x_wt_bf16` is `fire::gemm::act_x_wt_bf16` now —
+                // the dense autotuner, in Rust. It used to be
+                // `ffi::pie_k_gemm_act_x_wt_bf16`; that shim entry is gone,
+                // because the row is on `execution::RUST_SERVED` and
+                // `emit_c_shim` skips it.
+                act_x_wt_bf16(cublas, x, a_l, xa_scratch, t, r, h, 0.0);
                 if v.sites_bits & LORA_SITE_Q != 0 {
-                    ffi::pie_k_gemm_act_x_wt_bf16(
+                    act_x_wt_bf16(
                         cublas,
                         xa_scratch.cast_const(),
                         b_l,
@@ -771,7 +779,7 @@ impl LoraFireState {
                     );
                 }
                 if v.sites_bits & LORA_SITE_V != 0 {
-                    ffi::pie_k_gemm_act_x_wt_bf16(
+                    act_x_wt_bf16(
                         cublas,
                         xa_scratch.cast_const(),
                         b_l,
@@ -849,9 +857,12 @@ impl LoraFireState {
                 u32::try_from(layer_u).unwrap_or(0),
                 i32::try_from(v.d_out).unwrap_or(0),
             );
+            // SAFETY: `stream` is the fire's and live across both launches —
+            // the assertion this block already made when the two calls were
+            // `ffi::pie_k_quant_scale_rows_bf16`.
             unsafe {
                 if v.sites_bits & LORA_SITE_Q != 0 {
-                    ffi::pie_k_quant_scale_rows_bf16(
+                    super::dtype_cast::scale_rows_bf16(
                         bf16_row(q_out.cast_const(), v.token_start, hq).cast_mut(),
                         l_l,
                         t,
@@ -860,7 +871,7 @@ impl LoraFireState {
                     );
                 }
                 if v.sites_bits & LORA_SITE_V != 0 {
-                    ffi::pie_k_quant_scale_rows_bf16(
+                    super::dtype_cast::scale_rows_bf16(
                         bf16_row(v_out.cast_const(), v.token_start, hk).cast_mut(),
                         l_l,
                         t,

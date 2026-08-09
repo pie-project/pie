@@ -40,9 +40,25 @@ pub mod jit;
 /// is the consumer that makes the classification cost the C++ its body.
 pub mod service;
 
+/// Stage C, the quantized half: `gemm/gemm.cpp`'s router on the weight's
+/// dtype and the four cuBLASLt recipes behind it, in Rust. Separated from
+/// [`service`] because it is machinery — a per-device cuBLASLt context, six
+/// growable scratches and a dequantized-weight cache — where `service` is
+/// argument assembly. The three entry points stay in `service` because
+/// `execution::RUST_SERVED`'s spelling test reads that file.
+pub mod quant_gemm;
+
 /// Tier A: the arithmetic a stated [`kernels::LaunchRule`] names — what
 /// the C++ launchers computed inside `<<<>>>`.
 pub mod launch;
+
+/// The driver's answer to `kernels_cuda_new::x::Facts` — the fire's facts,
+/// as a bind body beside a `.cuh` may read them.
+///
+/// `.wiki/kernel-x/northstar.md` §3.3. The reads are
+/// [`dispatch_generated`]'s scaffolding promoted out of a generated file
+/// and given a name.
+pub mod facts;
 
 use std::ffi::c_void;
 
@@ -852,8 +868,11 @@ pub struct DispatchCtx {
     ///
     /// It is a GEOMETRY axis — [`kernels_cuda_new::Dims::experts_per_token`]
     /// — and a grid is opened before an operand is read, so a rule that needs
-    /// it needs it as a fact about the run. `dequant_fp4.cu:56` opens
-    /// `dim3 grid(num_tokens * top_k, ..)`, `dequant_wna16.cu` the same: the
+    /// it needs it as a fact about the run. `dequant_fp4.cu:56` opened
+    /// `dim3 grid(num_tokens * top_k, ..)`, `dequant_wna16.cu` the same,
+    /// until §43 deleted both launchers as unreached; the kernels still take
+    /// their route off `blockIdx.x` (`quant/dequant_fp4.cuh:232`,
+    /// `quant/dequant_wna16.cuh:295`), so the reading is unchanged: the
     /// fanout MULTIPLIES the row axis, so getting it wrong is not a wrong
     /// scalar in a correct grid, it is the wrong number of blocks.
     ///
@@ -1839,25 +1858,100 @@ pub fn dispatch<R: Resolver>(
     attn: Option<&AttnCtx>,
     gdn: Option<&GdnCtx>,
 ) -> Result<(), DispatchRefusal> {
-    use crate::bind::abi::ffi;
-
     let rows = i32::try_from(bound.rows.end - bound.rows.start).expect("rows fit i32");
 
     // GENERATED FIRST. A row that states where its arguments come from
     // needs no arm, and the branch for it is emitted from the row — so
     // the hand-written match below is what is LEFT, not what is normal.
     // It shrinks as rows state their sources, which is a row's work.
-    if dispatch_generated(bound, spec, frame, ctx, attn, gdn, resolver, rows, Arms::Whole) {
+    if dispatch_generated(
+        bound,
+        spec,
+        frame,
+        ctx,
+        attn,
+        gdn,
+        resolver,
+        rows,
+        Arms::Whole,
+    ) {
         return Ok(());
+    }
+
+    // THE fn-WORLD REGISTRY, second.
+    //
+    // `.wiki/kernel-x/northstar.md` §5 step 3. A family that has crossed
+    // into fn-world has no rows to generate an arm from and no hand-written
+    // arm below — its host programs live beside the `.cuh` they fire, in
+    // `kernels_cuda_new::x::<family>`, and `x::entry` is the symbol lookup
+    // over every one of them.
+    //
+    // # Why here and not first
+    //
+    // The two sets are DISJOINT by construction: a ported family's
+    // contracts state no `operands`, so `emit_rust_dispatch` cannot emit an
+    // arm for one, and its symbol is deleted from every row table in the
+    // same change that ports it. Order is therefore not a precedence
+    // question and this is not a fallback — it is the second of two
+    // registries, and a symbol that is in both is a bug in the port rather
+    // than a case this line resolves. It sits after the generated call so
+    // that the ONE unported thing stays cheapest, which is the fire that
+    // has not been migrated yet.
+    //
+    // # Why a linear probe, and what replaces it
+    //
+    // §5 step 4 interns a `&'static Entry` on the lowered launch at MODEL
+    // LOAD, at which point the symbol string is never compared at fire
+    // time again and every refusal below is made once, before the first
+    // token. This probe is what stands in until then, and it is the whole
+    // of the difference: the same `Entry`, found by a scan instead of by a
+    // pointer already in hand.
+    //
+    // # A refusal is not a fallthrough
+    //
+    // A symbol the registry HOLDS is dispatched here or not at all. If its
+    // bind refuses, that is the answer — `DispatchRefusal::NoArm` carrying
+    // the sentence the bind wrote, not a walk down to a hand arm that
+    // would fire it with different arithmetic. The four rope symbols with
+    // no bind refuse with the reason their row carried, which is the
+    // property §0 asks for: *"every refusal the system can make is made at
+    // model load"*, and until step 4 lands, made here with the same words.
+    if let Some(entry) = kernels_cuda_new::x::entry(bound.kernel) {
+        // Resolved before the `Cx` exists, because a `Resolver` is `&mut`
+        // and `Facts` is not: a bind body that could consult the weight
+        // store could also make it answer differently the second time.
+        let w_named: *const c_void = spec
+            .weight
+            .as_deref()
+            .and_then(|n| resolver.weight(n))
+            .unwrap_or(core::ptr::null());
+        let w_named2: *const c_void = spec
+            .weight2
+            .as_deref()
+            .and_then(|n| resolver.weight(n))
+            .unwrap_or(core::ptr::null());
+        let fire = facts::Fire {
+            bound,
+            spec,
+            ctx,
+            attn,
+            gdn,
+            rows,
+            w_named,
+            w_named2,
+        };
+        return entry
+            .call(&kernels_cuda_new::x::Cx::new(&fire), ctx.stream)
+            .map_err(|r| DispatchRefusal::NoArm(format!("{}: {r}", bound.kernel)));
     }
 
     // The GDN arms' shared reads: the ctx itself, and the launch's state
     // layer's slab out of one of its per-layer vectors.
-    let gdn_ctx = || -> Result<&GdnCtx, DispatchRefusal> {
+    let _gdn_ctx = || -> Result<&GdnCtx, DispatchRefusal> {
         gdn.ok_or_else(|| DispatchRefusal::NoGdnCtx(bound.kernel.to_string()))
     };
 
-    let rows = i32::try_from(bound.rows.end - bound.rows.start).expect("row count fits i32");
+    let _rows = i32::try_from(bound.rows.end - bound.rows.start).expect("row count fits i32");
     // The op join's output placements: what a guard-region launch binds
     // for the value the GUARD owns (the recurrence three-way's core out).
     // The join's placements window with the args, or a launch reads its

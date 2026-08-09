@@ -641,6 +641,187 @@ fn tile_header_mismatch(log: &str) -> Option<String> {
     )
 }
 
+/// Assemble Tile IR into a loadable cubin, by running `tileiras`.
+///
+/// # Why this exists but nothing calls it
+///
+/// A tile kernel does not compile to SASS. NVRTC hands back **Tile IR**, and
+/// [`unassembled_tile_ir`] refuses that image because it would load and then
+/// answer `cuModuleGetFunction` with NOT_FOUND. This is the other half: the
+/// step that turns the refused image into a real one.
+///
+/// Whether [`compile_under`] should shell out to a subprocess in the middle
+/// of a compile is a policy question -- it changes what a cache miss costs,
+/// what a sandbox must allow, and what a deployment must ship. That decision
+/// belongs to whoever owns the runtime. What should NOT belong to them is
+/// rediscovering the recipe, which took a day and three wrong turns, so the
+/// recipe is here, measured, with every trap it has.
+///
+/// # It is exactly what nvcc does, and the cubin runs
+///
+/// Verified end to end on an L40S with the tree's own
+/// `sample/argmax_tile.cuh`:
+///
+/// ```text
+///   nvcc --tilebc ...              2,632 bytes of Tile IR
+///   tileiras --gpu-name=sm_89      cubin with .text._ZN15pie...
+///   cuModuleLoadData               ok
+///   cuModuleGetFunction            ok
+///   launch, 8 rows x 151,936       exact against a CPU gold
+/// ```
+///
+/// and the result is **byte-identical** to `nvcc --tilecubin` for the same
+/// source and arch. There is no extra step and no hidden flag: `--tilecubin`
+/// IS `--tilebc` plus this. The in-tree and CUDA_ROOT invocations also
+/// produce identical bytes, so the trap below costs correctness nothing once
+/// it is avoided -- it is purely a matter of the assembler finding a toolkit
+/// at all.
+///
+/// There is no fixture for that transcript in the test below and deliberately
+/// so: a checked-in `.tilebc` is arch- and toolkit-version-specific and would
+/// rot into a false failure. The live test covers the half that does not rot
+/// -- that a real assembler is reached, and that it blames the input rather
+/// than the environment when the input is bad.
+///
+/// # The trap, stated precisely
+///
+/// `tileiras` needs to find its toolkit. It does that from `argv[0]` when it
+/// lives inside one, and from `CUDA_ROOT` when it does not. Measured, same
+/// input, same binary:
+///
+/// ```text
+///   invoked at <toolkit>/bin/tileiras, no CUDA_ROOT   ->  ok
+///   copied to /tmp/iso/tileiras,       no CUDA_ROOT   ->  FAILS
+///   copied to /tmp/iso/tileiras,       CUDA_ROOT set  ->  ok
+/// ```
+///
+/// and the failure is the entire message:
+///
+/// ```text
+///   error: failed to compile Tile IR program
+/// ```
+///
+/// No mention of a toolkit, a root, or a path. That message is also what a
+/// genuinely malformed input produces, so it cannot be told apart after the
+/// fact -- which is why this function checks the environment BEFORE running
+/// and says which of the two it is.
+///
+/// The copied-binary case is not hypothetical: it is the normal shape of a
+/// pip install, where `tileiras` arrives in its own wheel
+/// (`nvidia-cuda-tileiras`) and gets symlinked or copied next to whatever
+/// else is on `PATH`.
+///
+/// # Getting the Tile IR in the first place
+///
+/// `nvrtcGetTileIR` / `nvrtcGetTileIRSize`, which `cudarc` 0.19 does **not**
+/// bind -- it exposes `nvrtcGetCUBIN`, `nvrtcGetPTX`, `nvrtcGetLTOIR` and
+/// `nvrtcGetOptiXIR`, and stops there. Wiring this up therefore needs a raw
+/// declaration of those two entry points against the already-loaded
+/// `libnvrtc`, which is a small piece of unsafe code and the reason this
+/// function takes bytes rather than an [`Program`]: the byte-producing half
+/// is a binding question, and the byte-consuming half is this, which is a
+/// process question. They fail differently and are worth separating.
+pub fn assemble_tile_ir(
+    tile_ir: &[u8],
+    arch: &str,
+    tileiras: &std::path::Path,
+) -> Result<Vec<u8>, CompileError> {
+    use std::io::Write as _;
+
+    if !tileiras.exists() {
+        return Err(CompileError::Refused(format!(
+            "`tileiras` not found at {}. It ships in its own wheel, \
+             `nvidia-cuda-tileiras`, versioned independently of nvcc, nvrtc \
+             and the runtime headers -- nothing cross-checks the four",
+            tileiras.display()
+        )));
+    }
+
+    // The toolkit rule, checked before running rather than guessed at after.
+    // `tileiras` reports a malformed input and a missing toolkit with the
+    // same one-line message, so the only way to tell them apart is to know
+    // which one was possible.
+    let in_tree = tileiras
+        .parent()
+        .and_then(|bin| bin.parent())
+        .is_some_and(|root| root.join("include").is_dir() || root.join("nvvm").is_dir());
+    if !in_tree && std::env::var_os("CUDA_ROOT").is_none() {
+        return Err(CompileError::Refused(format!(
+            "`tileiras` at {} is not inside a CUDA toolkit and CUDA_ROOT is \
+             unset, so it cannot find one. It would fail with `error: failed \
+             to compile Tile IR program` and nothing else -- the same message \
+             a malformed input gets. Set CUDA_ROOT to the toolkit root, or \
+             run the copy that lives in it",
+            tileiras.display()
+        )));
+    }
+
+    let stem = std::env::temp_dir().join(format!(
+        "pie-tileir-{}-{:p}",
+        std::process::id(),
+        tile_ir.as_ptr()
+    ));
+    let input = stem.with_extension("tilebc");
+    let output = stem.with_extension("cubin");
+    let cleanup = || {
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+    };
+
+    let write = std::fs::File::create(&input).and_then(|mut f| f.write_all(tile_ir));
+    if let Err(e) = write {
+        cleanup();
+        return Err(CompileError::Refused(format!(
+            "could not stage Tile IR at {}: {e}. `tileiras` reads a file and \
+             offers no stdin, so a writable temp directory is a requirement \
+             of this path rather than a convenience",
+            input.display()
+        )));
+    }
+
+    let run = std::process::Command::new(tileiras)
+        .arg(format!("--gpu-name={arch}"))
+        .arg("-o")
+        .arg(&output)
+        .arg(&input)
+        .output();
+
+    let run = match run {
+        Ok(r) => r,
+        Err(e) => {
+            cleanup();
+            return Err(CompileError::Refused(format!(
+                "could not run {}: {e}",
+                tileiras.display()
+            )));
+        }
+    };
+
+    if !run.status.success() {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        cleanup();
+        return Err(CompileError::Refused(format!(
+            "`tileiras` refused the Tile IR for {arch}: {stderr}. With the \
+             toolkit reachable -- checked above -- this is the input, not the \
+             environment"
+        )));
+    }
+
+    let cubin = std::fs::read(&output);
+    cleanup();
+    let cubin = cubin.map_err(|e| {
+        CompileError::Refused(format!(
+            "`tileiras` reported success and left nothing readable at {}: {e}",
+            output.display()
+        ))
+    })?;
+
+    // The whole point of the step. A success that still hands back Tile IR
+    // would otherwise reach `cuModuleGetFunction` and fail there.
+    unassembled_tile_ir("assembled tile ir", &cubin)?;
+    Ok(cubin)
+}
+
 /// The compile options, in the order NVRTC is handed them.
 ///
 /// # The real architecture, not a virtual one
@@ -1110,6 +1291,127 @@ Compilation aborted."#;
         assert!(
             tile_header_mismatch(clear).is_none(),
             "an error that already names its own fix must be left alone"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tile_assembly {
+    use super::{CompileError, assemble_tile_ir};
+    use std::path::{Path, PathBuf};
+
+    fn refusal(e: CompileError) -> String {
+        match e {
+            CompileError::Refused(m) => m,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A missing assembler must say WHICH of the four wheels is missing. The
+    /// four version independently and nothing cross-checks them, so "not
+    /// found" without a package name is a scavenger hunt.
+    #[test]
+    fn a_missing_assembler_names_its_wheel() {
+        let e = refusal(
+            assemble_tile_ir(b"", "sm_89", Path::new("/nonexistent/tileiras")).unwrap_err(),
+        );
+        assert!(
+            e.contains("nvidia-cuda-tileiras"),
+            "the refusal must name the wheel: {e}"
+        );
+        assert!(
+            e.contains("nothing cross-checks the four"),
+            "and must say why the version is not obvious: {e}"
+        );
+    }
+
+    /// The trap this function exists to make impossible: an assembler outside
+    /// a toolkit with no CUDA_ROOT fails with a message that cannot be told
+    /// apart from a bad input. It must be refused BEFORE running, not after.
+    #[test]
+    fn an_unrooted_assembler_is_refused_before_it_can_lie() {
+        let dir = std::env::temp_dir().join(format!("pie-unrooted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let fake = dir.join("tileiras");
+        std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").expect("write");
+
+        // SAFETY-adjacent: this test is the only reader of CUDA_ROOT here and
+        // the value is restored before it returns.
+        let saved = std::env::var_os("CUDA_ROOT");
+        unsafe { std::env::remove_var("CUDA_ROOT") };
+        let got = assemble_tile_ir(b"not really tile ir", "sm_89", &fake);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("CUDA_ROOT", v) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let e = refusal(got.unwrap_err());
+        assert!(
+            e.contains("CUDA_ROOT is \nunset") || e.contains("CUDA_ROOT is unset"),
+            "the refusal must name CUDA_ROOT: {e}"
+        );
+        assert!(
+            e.contains("the same message \na malformed input gets")
+                || e.contains("the same message a malformed input gets"),
+            "and must say why this is checked up front rather than reported \
+             from the exit code: the two failures are indistinguishable \
+             afterwards. Got: {e}"
+        );
+    }
+
+    /// Find a real `tileiras`, or `None`. Deliberately not a hard-coded path:
+    /// this must work on a box that has one and skip on a box that does not,
+    /// without either outcome being a false PASS.
+    fn real_tileiras() -> Option<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(r) = std::env::var_os("CUDA_ROOT") {
+            roots.push(PathBuf::from(r));
+        }
+        roots.push(PathBuf::from("/usr/local/cuda"));
+        for r in roots {
+            let p = r.join("bin/tileiras");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).map(|d| d.join("tileiras")).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|p| p.exists())
+    }
+
+    /// Garbage in must be refused, and the refusal must say it is the input.
+    /// This is the half that only means something with a REAL assembler --
+    /// with a stub it would pass while proving nothing.
+    #[test]
+    fn a_real_assembler_refuses_garbage_and_blames_the_input() {
+        let Some(tileiras) = real_tileiras() else {
+            // A skipped test that reports `ok` is a false PASS, and this one
+            // skipped silently the first time it was written -- on a box that
+            // HAD a `tileiras`, just not where the test looked. So the skip is
+            // loud, and a CI that means to cover this path sets the variable
+            // and gets a failure instead of a green tick.
+            assert!(
+                std::env::var_os("PIE_REQUIRE_TILEIRAS").is_none(),
+                "PIE_REQUIRE_TILEIRAS is set and no `tileiras` was found on \
+                 CUDA_ROOT, /usr/local/cuda or PATH. Either it is missing or \
+                 it is somewhere this test does not look -- both are worth a \
+                 failure when the path is meant to be covered"
+            );
+            eprintln!(
+                "SKIPPED (no tileiras on CUDA_ROOT, /usr/local/cuda or PATH). \
+                 Set PIE_REQUIRE_TILEIRAS to make this a failure."
+            );
+            return;
+        };
+        let e = refusal(
+            assemble_tile_ir(b"this is not tile bytecode", "sm_89", &tileiras).unwrap_err(),
+        );
+        assert!(
+            e.contains("this is the input, not the \nenvironment")
+                || e.contains("this is the input, not the environment"),
+            "with the toolkit reachable the refusal must point at the input: {e}"
         );
     }
 }

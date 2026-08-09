@@ -472,7 +472,7 @@ struct Narrow2<bf16> {
 /// The fp16 destination for the compiler that has a REAL `__half`, and the KEY
 /// TYPE is the finding.
 ///
-/// Under NVRTC there is nothing to add: `kernels-cuda-new/csrc/src/cuda_fp16.h`
+/// Under NVRTC there is nothing to add: `kernels-cuda-new/csrc/shim/cuda_fp16.h`
 /// opens with `using __half = ::pie_cuda_driver::kernels::device::f16;`, so
 /// `Narrow2<__half>` above IS `Narrow2<device::f16>` — one type, one
 /// specialisation, and a second one is a REDEFINITION that fails to compile.

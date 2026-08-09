@@ -450,6 +450,88 @@ pub unsafe fn read_raw_span(
     )
 }
 
+/// A device-to-device copy between two RAW spans.
+///
+/// [`read_raw_span`]'s sibling, added for the same reason and by the same
+/// rule: `tower::qwen3_vl`'s scatter writes each image's merged tokens into
+/// the fire's hidden rows at `hidden + anchor * out_hidden`, and into the
+/// deepstack scratch at `scratch + d * n_rows * out_hidden + anchor *
+/// out_hidden`. Neither destination is a [`DeviceBuffer`] this crate holds —
+/// both arrive as a base pointer from the fire — so [`DeviceBuffer::write_at`]
+/// cannot express the copy, and §7's *"`device/` is the only place vendor
+/// vocabulary is correct"* says the operation is OFFERED here rather than
+/// spelled with a `cudaMemcpyAsync` in a `tower/` module.
+///
+/// The C++ this replaces is `qwen3_vl_tower.cu:505-509`'s two
+/// `cudaMemcpyAsync(..., cudaMemcpyDeviceToDevice, S)`.
+///
+/// # Safety
+///
+/// `src` must name at least `bytes` readable device bytes and `dst` at least
+/// `bytes` writable ones, both for the duration of the copy, and `stream`
+/// must outlive it. The two spans must not overlap — `cudaMemcpyAsync` is not
+/// a `memmove`.
+///
+/// # Errors
+///
+/// The copy faulted.
+pub unsafe fn copy_raw_span(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+    stream: StreamRef<'_>,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    check_rt(
+        unsafe {
+            cudaMemcpyAsync(
+                dst,
+                src,
+                bytes,
+                cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.as_raw(),
+            )
+        },
+        "cudaMemcpyAsync (copy_raw_span)",
+    )
+}
+
+/// A byte fill over a RAW span.
+///
+/// [`copy_raw_span`]'s reason, on the other side of the same call:
+/// `tower::qwen3_vl`'s scatter zeroes the WHOLE deepstack scratch
+/// (`qwen3_vl_tower.cu:397`) so the decoder can add it into the hidden rows
+/// as a plain whole-tensor residual — non-image rows contribute zero — and
+/// that buffer is the fire's, not one of ours.
+///
+/// Prefer [`DeviceBuffer::memset`] and [`DeviceBuffer::memset_at`], which
+/// check the span against a length they own.
+///
+/// # Safety
+///
+/// `dst` must name at least `bytes` writable device bytes for the duration of
+/// the fill, and `stream` must outlive it.
+///
+/// # Errors
+///
+/// The fill faulted.
+pub unsafe fn fill_raw_span(
+    dst: *mut c_void,
+    value: u8,
+    bytes: usize,
+    stream: StreamRef<'_>,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    check_rt(
+        unsafe { cudaMemsetAsync(dst, i32::from(value), bytes, stream.as_raw()) },
+        "cudaMemsetAsync (fill_raw_span)",
+    )
+}
+
 impl DeviceBuffer {
     /// The device address, for a launcher argument.
     pub const fn as_ptr(&self) -> *mut c_void {

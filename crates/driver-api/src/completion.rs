@@ -68,7 +68,6 @@ pub struct CompletionTarget {
 unsafe impl Send for CompletionTarget {}
 unsafe impl Sync for CompletionTarget {}
 
-
 /// Keeps an instance's wait slots alive while a completion is in flight.
 pub trait CompletionLease: Send + Sync {
     fn is_closed(&self) -> bool;
@@ -367,7 +366,10 @@ impl CompletionBroker {
     /// Mint a completion for a control verb, with the terminal cell the
     /// driver publishes its outcome into.
     #[must_use]
-    pub fn control_completion(&self, target_epoch: u64) -> (CompletionTarget, SubmissionCompletion) {
+    pub fn control_completion(
+        &self,
+        target_epoch: u64,
+    ) -> (CompletionTarget, SubmissionCompletion) {
         let completion = self.submission_completion(target_epoch);
         let target = CompletionTarget {
             wait_id: completion.wait_id(),
@@ -908,7 +910,6 @@ impl Drop for WorkItemCompletion {
         WakerTable::global().free(self.state.slot);
     }
 }
-
 
 #[cfg(test)]
 mod tests {

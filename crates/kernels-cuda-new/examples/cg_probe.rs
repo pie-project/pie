@@ -18,7 +18,7 @@
 //! `cg::this_thread_block()`, `block.sync()`, and one
 //! `numeric_limits<float>::infinity()`.
 //!
-//! So `csrc/src/cooperative_groups.h` and `csrc/src/cuda/std/limits` were
+//! So `csrc/shim/cooperative_groups.h` and `csrc/shim/cuda/std/limits` were
 //! written — carrying NVIDIA's own spellings, so the upstream source is
 //! compiled unmodified — and this example is the claim being cashed. It
 //! proves three things, and the third is the one that decays if nobody
@@ -53,9 +53,9 @@ use kernels_cuda_new::source::{Header, as_nvrtc_arrays};
 const SHIM: &[Header] = &[
     Header {
         name: "cooperative_groups.h",
-        text: include_str!("../csrc/src/cooperative_groups.h"),
+        text: include_str!("../csrc/shim/cooperative_groups.h"),
     },
-    Header { name: "cuda/std/limits", text: include_str!("../csrc/src/cuda/std/limits") },
+    Header { name: "cuda/std/limits", text: include_str!("../csrc/shim/cuda/std/limits") },
 ];
 
 /// What CCCL costs, measured on this box with `du -sb` and `find | wc -l`

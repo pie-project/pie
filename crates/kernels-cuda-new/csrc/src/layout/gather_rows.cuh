@@ -1,9 +1,15 @@
 //===-- gather_rows.cuh - row gathers, the NLD/LND transpose, the ----===//
 //===-- scaled embed-concat -------------------------------------------===//
 //
-// Four `__global__`s. `gather_rows.cu` includes this file and keeps its three
-// launchers, so exactly ONE definition of each kernel exists in the tree -- a
-// split and not a copy. Two copies agree the day they are written and each
+// Four `__global__`s and NO host launcher left in the tree. `gather_rows.cu`
+// used to include this file and hold three; §43 deleted the file whole --
+// `layout::gather_bf16_rows` and `layout::transpose_bf16_nld_to_lnd` are in
+// `device::JIT_DISPATCHED` so the shim emitted no entry for either, and
+// `embed_scaled_concat_bf16` never had a row at all. The rows still name the
+// kernels below and NVRTC still compiles them out of this file, so nothing
+// stopped launching; what went is host text. There was exactly ONE definition
+// of each kernel before and there is exactly one now -- a split and not a
+// copy. Two copies agree the day they are written and each
 // stays right for whichever half of the tests exercises it;
 // `norm/altup_aux` shipped a release that way.
 //

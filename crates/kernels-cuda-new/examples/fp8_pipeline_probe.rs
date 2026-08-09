@@ -3,7 +3,7 @@
 //!
 //! # The question this answers, and why compiling is not it
 //!
-//! Four files in `csrc/src` wear NVIDIA's filenames so that unmodified
+//! Four files in `csrc/shim` wear NVIDIA's filenames so that unmodified
 //! FlashInfer source resolves them under NVRTC, where there is no include
 //! path on disk and `examples/header_probe.rs` measured **0 of 31** external
 //! directives answered against an empty header set. Every one of the four is
@@ -41,7 +41,7 @@
 //! The fp16 and bf16 types the fp8 classes convert through are supplied by
 //! THIS FILE on the NVRTC side, as a nine-line ABI-compatible prelude, and by
 //! `<cuda_fp16.h>`/`<cuda_bf16.h>` on the nvcc side. That is not a shortcut:
-//! `csrc/src/cuda_fp16.h` and `cuda_bf16.h` belong to other work in this
+//! `csrc/shim/cuda_fp16.h` and `cuda_bf16.h` belong to other work in this
 //! crate, and the prelude here stands in for them so that
 //! `__nv_fp8_e4m3(__half)` can be gated TODAY rather than after that lands.
 //! The layouts are `unsigned short` on both sides, which is the whole of what
@@ -105,17 +105,17 @@ mod probe {
     /// `include_str!` and not a read: the bytes gated here are the bytes that
     /// ship, so a probe that passed against a file on disk while the binary
     /// carried something else would be measuring the wrong header.
-    const CUDA_FP8: &str = include_str!("../csrc/src/cuda_fp8.h");
-    const CUDA_FP4: &str = include_str!("../csrc/src/cuda_fp4.h");
-    const CUDA_CMATH: &str = include_str!("../csrc/src/cuda/cmath");
-    const CUDA_PIPELINE: &str = include_str!("../csrc/src/cuda/pipeline");
+    const CUDA_FP8: &str = include_str!("../csrc/shim/cuda_fp8.h");
+    const CUDA_FP4: &str = include_str!("../csrc/shim/cuda_fp4.h");
+    const CUDA_CMATH: &str = include_str!("../csrc/shim/cuda/cmath");
+    const CUDA_PIPELINE: &str = include_str!("../csrc/shim/cuda/pipeline");
 
     /// The two shims this set already had, for the size table only. They are
     /// not under test here -- `cg_probe.rs` and the closure gate those -- but
     /// the CCCL comparison is a claim about the SET, and a set of two is a
     /// different claim from a set of four.
-    const COOPERATIVE_GROUPS: &str = include_str!("../csrc/src/cooperative_groups.h");
-    const CUDA_STD_LIMITS: &str = include_str!("../csrc/src/cuda/std/limits");
+    const COOPERATIVE_GROUPS: &str = include_str!("../csrc/shim/cooperative_groups.h");
+    const CUDA_STD_LIMITS: &str = include_str!("../csrc/shim/cuda/std/limits");
 
     /// CCCL as the toolkit ships it, measured on this machine at
     /// `/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl`. Constants
@@ -143,7 +143,7 @@ mod probe {
     /// borrows, as its own banner says. The macros are the ones NVIDIA's
     /// headers define and the ones the shim's interop is guarded on, so
     /// defining them here compiles exactly the blocks that would otherwise
-    /// wait for `csrc/src/cuda_fp16.h` to exist.
+    /// wait for `csrc/shim/cuda_fp16.h` to exist.
     const FP16_PRELUDE: &str = concat!(
         "#define __CUDA_FP16_TYPES_EXIST__\n",
         "#define __CUDA_BF16_TYPES_EXIST__\n",
@@ -276,7 +276,7 @@ mod probe {
     ///
     /// `cooperative_groups::this_thread_block()` on both sides, spelled the
     /// same, because both header sets have it: the toolkit's, and this
-    /// crate's own `csrc/src/cooperative_groups.h`.
+    /// crate's own `csrc/shim/cooperative_groups.h`.
     const BODY_PIPE: &str = concat!(
         "#define STAGES 2\n",
         "#define TILE 256\n",
@@ -681,7 +681,8 @@ mod probe {
     ///
     /// The table above holds four headers to bit-parity against the vendor.
     /// This asks the other question: does the tree that includes them
-    /// actually compile? It walks `csrc/src` and `csrc/vendor` off disk,
+    /// actually compile? It walks `csrc/shim`, `csrc/src` and `csrc/vendor`
+    /// off disk,
     /// hands NVRTC every file under both its path-relative and its bare name,
     /// and includes the fifteen closure roots.
     ///
@@ -717,10 +718,18 @@ mod probe {
 
         let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         // In priority order, and the order is the point: this crate's own
-        // shims answer first, the vendored tree second, and the AOT crate's
-        // `pie_*.cuh` last -- the same three sources `src/source.rs` draws
-        // `DEVICE_HEADERS` from, and the same precedence.
+        // shims answer first, then its device text, then the vendored tree,
+        // and the AOT crate's `pie_*.cuh` last -- the same sources
+        // `src/source.rs` draws `DEVICE_HEADERS` from, and the same
+        // precedence.
+        //
+        // `csrc/shim` is a fourth root since `csrc/` was cut by role, and
+        // dropping it would not read as an omission: the walk would find no
+        // `cuda_fp16.h` at all and every closure root that reaches for one
+        // would fail to resolve, which is a red row this function is
+        // explicitly not supposed to produce.
         let roots = [
+            crate_dir.join("csrc/shim"),
             crate_dir.join("csrc/src"),
             crate_dir.join("csrc/vendor"),
             crate_dir.join("../kernels-cuda/csrc/src"),
@@ -1406,18 +1415,18 @@ mod probe {
         let four = CUDA_FP8.len() + CUDA_FP4.len() + CUDA_CMATH.len() + CUDA_PIPELINE.len();
         let set = four + COOPERATIVE_GROUPS.len() + CUDA_STD_LIMITS.len();
         println!("\nwhat the four headers cost:\n");
-        println!("  csrc/src/cuda_fp8.h                    {:>10} B", thousands(CUDA_FP8.len()));
-        println!("  csrc/src/cuda_fp4.h                    {:>10} B", thousands(CUDA_FP4.len()));
-        println!("  csrc/src/cuda/cmath                    {:>10} B", thousands(CUDA_CMATH.len()));
-        println!("  csrc/src/cuda/pipeline                 {:>10} B", thousands(CUDA_PIPELINE.len()));
+        println!("  csrc/shim/cuda_fp8.h                   {:>10} B", thousands(CUDA_FP8.len()));
+        println!("  csrc/shim/cuda_fp4.h                   {:>10} B", thousands(CUDA_FP4.len()));
+        println!("  csrc/shim/cuda/cmath                   {:>10} B", thousands(CUDA_CMATH.len()));
+        println!("  csrc/shim/cuda/pipeline                {:>10} B", thousands(CUDA_PIPELINE.len()));
         println!("  {:<38} {:>10} B", "", "----------");
         println!("  these four                             {:>10} B", thousands(four));
         println!(
-            "  csrc/src/cooperative_groups.h          {:>10} B",
+            "  csrc/shim/cooperative_groups.h         {:>10} B",
             thousands(COOPERATIVE_GROUPS.len())
         );
         println!(
-            "  csrc/src/cuda/std/limits               {:>10} B",
+            "  csrc/shim/cuda/std/limits              {:>10} B",
             thousands(CUDA_STD_LIMITS.len())
         );
         println!("  the whole shim set                     {:>10} B", thousands(set));

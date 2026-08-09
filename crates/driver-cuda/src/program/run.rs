@@ -539,7 +539,7 @@ impl Prepared {
         let mut base = [0u8; 8];
         self.intrinsic_bases
             .read_at(at * size_of::<u64>(), &mut base, stream)?;
-        let mut word = |buf: &DeviceBuffer| -> Result<u32> {
+        let word = |buf: &DeviceBuffer| -> Result<u32> {
             let mut b = [0u8; 4];
             buf.read_at(at * size_of::<u32>(), &mut b, stream)?;
             Ok(u32::from_le_bytes(b))

@@ -1,0 +1,69 @@
+//===-- cstddef - `std::size_t`, and only because we are the ones who ------===//
+//===-- spelled it qualified                                          ------===//
+//
+// This is what `#include <cstddef>` resolves to when the compiler is NVRTC and
+// the include path is a header set carried in the binary rather than a
+// directory on a disk. `csrc/shim/cstdint` makes the general argument at
+// length and this file is the same rule applied to one more standard header;
+// what is worth writing down here is why the two files disagree about `std`.
+//
+// # Measured, not assumed
+//
+// The FA2 lattice's root (`csrc/src/attn/fa2.cuh`) reaches
+// `attn/attention_score_capture.cuh`, whose line 27 is `#include <cstddef>`.
+// Without this file that include is a **catastrophic error: cannot open source
+// file "cstddef"** and the compile stops before it has parsed a single
+// FlashInfer template -- so the failure arrives with no useful diagnostic
+// about anything else. Found with a `/tmp` `libnvrtc` probe against the real
+// header, which is the only way it could have been found before a GPU run:
+// `tests/layers.rs::every_include_reachable_from_a_unit_resolves` walks QUOTED
+// includes and this one is angle-bracketed.
+//
+// # Why `std` here and not in `cstdint`
+//
+// `csrc/shim/cstdint` deliberately omits the `std::` half, and its reason is
+// specific: FlashInfer spells `uint32_t` and its relatives unqualified at all
+// 2928 sites, so `namespace std` there would be dead text.
+//
+// The inverse holds for this file. `<cstddef>` is included by
+// `attention_score_capture.cuh`, which is **ours**, and which writes
+// `std::size_t` at five sites (`:108`, `:177`, `:191-193`). NVRTC's built-in
+// preamble declares `size_t` in the GLOBAL namespace and nowhere else, so the
+// qualified spelling is exactly what is missing and exactly what this file
+// supplies. Neither shim is guessing at a standard library surface; each
+// carries the names its actual includers write.
+//
+// The alternative was to unqualify those five sites. It was rejected because
+// the direction is wrong: a shim exists so that source compiles unmodified,
+// and reaching into a header to change how it spells a standard name to suit
+// the impersonator is the habit that ends with a source tree shaped by its
+// build. `attention_score_capture.cuh` is also compiled by nvcc today, where
+// `std::size_t` is simply correct.
+//
+// # What is deliberately NOT here
+//
+// `offsetof`, `NULL`, `max_align_t`, `std::byte`. A grep over everything that
+// reaches this file names none of them. `csrc/shim/cstdint` argues the
+// discipline: a shim that grows to the standard's surface becomes a second set
+// of promises to disagree with the first, and the disagreement is silent.
+//
+// `size_t` and `ptrdiff_t` are NOT typedef'd here either -- NVRTC's preamble
+// already declares both in the global namespace, and naming them again would
+// be a redefinition rather than a courtesy. This file only re-exports them.
+
+#ifndef PIE_NVRTC_CSTDDEF_
+#define PIE_NVRTC_CSTDDEF_
+
+namespace std {
+
+// Re-exports, not declarations. `using` rather than `typedef` so that
+// `std::size_t` and `::size_t` are the SAME type by construction: a typedef
+// would name the same underlying integer today and could be edited into a
+// second opinion, and a mismatch between the two spellings is the kind of
+// error that surfaces as a template deduction failure a hundred frames deep.
+using ::ptrdiff_t;
+using ::size_t;
+
+}  // namespace std
+
+#endif  // PIE_NVRTC_CSTDDEF_

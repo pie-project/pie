@@ -42,7 +42,20 @@
 # to four lines: `ops/tuning_cache.hpp` wanted `cache_dir()`, the mutable
 # global the config loader publishes and every on-disk cache reads. Those four
 # lines are `src/cache_root.hpp` here, and `config.hpp` includes them from
-# here. Nor did the NCCL comm in `distributed.*`, nor `custom_all_reduce`,
+# here.
+#
+# BOTH OF THOSE HEADERS ARE NOW DELETED. `src/tuning_cache.hpp` (142 lines)
+# and `src/cache_root.hpp` (43) came out with `src/gemm/gemm.cpp`, which was
+# their last includer once `moe/flashinfer_moe.cu`'s host half became
+# `driver-cuda/src/fire/flashinfer_moe.rs`. Sweep for `#include
+# "tuning_cache.hpp"` under `csrc/` and it returns nothing. The file format
+# they described is not lost -- it is spelled out twice in Rust, in
+# `driver-cuda/src/fire/gemm.rs` (`DiskCache`, `tuning_hash`, `cache_path`)
+# and in `fire/flashinfer_moe.rs`, and the XDG-then-`$HOME/.cache` derivation
+# that was `cache_root.hpp`'s whole content is `fire::gemm::cache_path`. If
+# `config.hpp` on the shell side still includes `cache_root.hpp`, it is
+# including a path that no longer resolves and wants its own `cache_dir()`.
+# Nor did the NCCL comm in `distributed.*` come, nor `custom_all_reduce`,
 # which is not a compute kernel but the device half of that comm and now sits
 # beside it in the shell's `src/comm/`.
 #
@@ -301,9 +314,19 @@ endif()
 # the launcher needs in order to compile.
 #
 # This takes nothing away from sm_80/86/89. `src/ssm/flashinfer_mamba.cu` only
-# enters FlashInfer's SSU at all when the device's major version is >= 9, and
+# entered FlashInfer's SSU at all when the device's major version was >= 9, and
 # FlashInfer's own selector independently sends sm_major < 9 to kSimple, so
 # these kernels were unreachable on those architectures before this patch.
+#
+# THAT FILE IS NOW DELETED (see `PIE_CUDA_GRAPH_KERNEL_SOURCES` below), so this
+# patch and the `FLASHINFER_MAMBA_ENABLE_SM90` define below now guard a header
+# that no translation unit in this repository includes. Both stay deliberately.
+# The FATAL_ERROR and the asserted site count are load-bearing for the CHECKOUT
+# rather than for the include: `driver-cuda` shares this CPM fetch, and a
+# FlashInfer bump that moves or reshapes this header must still be loud here
+# rather than silently reading as "nothing to patch". Deleting the patch is a
+# separate change with its own evidence, and it is cheaper to make after the
+# fetch itself has an owner.
 #
 # The site COUNT is asserted, not just the presence of the text: a FlashInfer
 # bump that adds or drops a guard would otherwise patch a different set and
@@ -484,18 +507,101 @@ endif()
 # both lived in one archive; the grouping was about build cost, not about
 # ownership, so it did not survive the split.
 set(PIE_CUDA_GRAPH_KERNEL_SOURCES
-  src/norm/altup.cu
-  src/attn/dsa_indexer.cu
-  src/attn/dsv4_compress.cu
-  src/norm/dsv4_hc.cu
-  src/moe/dsv4_routing.cu
-  src/mlp/gaussian_topk.cu
-  src/attn/kimi_mla.cu
-  src/attn/mla_paged.cu
-  src/ssm/nemotron_h.cu
-  src/attn/page_compact.cu
-  src/attn/attention_mla.cu
-  src/ssm/flashinfer_mamba.cu)
+  # `src/attn/dsa_indexer.cu` was here and IS DELETED, with
+  # `attn/dsa_indexer.hpp`. Three `<<<>>>` -- the key norm+rope, the query
+  # rope and the causal top-k mask -- now `driver-cuda/src/fire/dsa_indexer.rs`.
+  # All three `Execution::Walk` with `Control::Supplies` and named in
+  # `execution::RUST_SERVED`. Two device rows were renamed `_dev` (§60.6) and
+  # a THIRD was written: `index_q_rope` had no row at all, its block being
+  # `round_up(n_heads, 32)` with a one-warp floor, which no `LaunchRule`
+  # states. `dsa_index_topk_mask`'s row is fully sourced, so that one moves a
+  # live dispatch from the C shim to `bind::service`.
+  # `src/attn/dsv4_compress.cu` was here and IS DELETED, with
+  # `attn/dsv4_compress.hpp`. Four `<<<>>>` left in it -- the output combine,
+  # the two boundary-meta forms and the compressed paged attention -- now
+  # `driver-cuda/src/fire/dsv4_compress.rs`. All four `Execution::Walk` with
+  # `Control::Supplies`, all four in `execution::RUST_SERVED`, all four rows
+  # unsourced so this took the shim entries and nothing else (§60.7). Three
+  # device rows were renamed `_dev` (§60.6); a fourth was WRITTEN for
+  # `combine_attn_outputs`, deliberately `LaunchRule::Unstated` because the
+  # launcher clamps its block to 256 where `PerHeadElementwise` clamps to 128
+  # and the disagreement would be a slower kernel rather than a wrong answer.
+  # `src/norm/dsv4_hc.cu` was here and IS DELETED with `norm/dsv4_hc.hpp`.
+  # Its four launchers -- `hc_pre_postprocess_bf16`, `hc_post_bf16`,
+  # `hc_head_postprocess_bf16`, `hc_rmsnorm_to_f32` -- are
+  # `execution::RUST_SERVED`, so `abi::emit_c_shim` emits no entry for any of
+  # them; the host programs are `driver-cuda/src/fire/dsv4_hc.rs` and the
+  # `__global__`s are unmoved in `kernels-cuda-new/csrc/src/norm/dsv4_hc.cuh`.
+  # `src/moe/dsv4_routing.cu` was here and IS DELETED with
+  # `moe/dsv4_routing.hpp`. Its one surviving launcher, `hash_route_lookup`,
+  # is `execution::RUST_SERVED`, so `abi::emit_c_shim` emits no
+  # `pie_k_moe_hash_route_lookup` and the shim entry was the whole consumer
+  # set: zero C++ callers across all four extensions, no hand-written
+  # `ffi::pie_k_*` arm, and `model-compiler/src/dsl.rs:4700`'s
+  # `hash_route_lookup` wrapper has no caller in `crates/model/src` --
+  # `deepseek_v4/spec.rs:95` names the symbol in PROSE only. The row is
+  # unsourced in `table::moe`, so `emit_rust_dispatch` writes no arm either;
+  # the host program is `driver-cuda/src/fire/dsv4_routing.rs` and the two
+  # `__global__`s are unmoved in
+  # `kernels-cuda-new/csrc/src/moe/dsv4_routing.cuh`, where the device row is
+  # named `moe::hash_route_lookup_dev`.
+  # `src/attn/kimi_mla.cu` was here and the file is DELETED with
+  # `attn/kimi_mla.hpp`. Its last launcher, `kimi_split_q_b_bf16`, went the
+  # way its sibling `kimi_split_kv_a_norm_bf16` already had:
+  # `attn::kimi_split_q_b_bf16` is named in `device::JIT_DISPATCHED`, so
+  # `abi::emit_c_shim` emits no `pie_k_attn_kimi_split_q_b_bf16` and the shim
+  # entry was the whole consumer set. Both `__global__`s are unmoved in
+  # `kernels-cuda-new/csrc/src/attn/kimi_mla.cuh` and are fired through
+  # `LaunchRule::Elementwise` and `LaunchRule::Rms`.
+  # `src/attn/mla_paged.cu` was here and IS DELETED, with
+  # `attn/mla_paged.hpp`. Two `<<<>>>` — `mla_prepare<256>` over
+  # `dim3(total_tokens, 1 + q_blocks)` and `write_mla` at `<<<total_tokens,
+  # 256>>>` — now `driver-cuda/src/fire/mla_paged.rs`. Both symbols are
+  # `Execution::Walk` with `Control::Supplies` and named in
+  # `execution::RUST_SERVED`, which is what drops their shim entries; both
+  # `table::attn` rows were unsourced on every operand and so never generated
+  # a dispatch arm, which is §60.7's case. The file's third function,
+  # `write_mla_to_pages_bf16`, was dead on all five channels and is deleted
+  # rather than ported.
+  # `src/ssm/nemotron_h.cu` was here and IS DELETED with `ssm/nemotron_h.hpp`,
+  # and `csrc/src/ssm/` is gone with it. Its last two launchers,
+  # `build_nemotron_moe_ptrs_aligned_bf16` and
+  # `build_nemotron_moe_ptrs_decode_batched_bf16`, are
+  # `execution::RUST_SERVED`, so `abi::emit_c_shim` emits no entry and the
+  # shim entry was the whole consumer set -- no `.cu`, `.cpp` or hand-written
+  # `ffi::pie_k_*` arm named either. Their `table::ssm` rows STAY unbound:
+  # §52.3's missing `Source::Scratch(name, extent)` still has no word for a
+  # slab this driver allocated, so no model trace reaches them and
+  # `driver-cuda/src/fire/nemotron_h.rs` is reached by hand.
+  # `src/attn/page_compact.cu` was here and IS DELETED, with
+  # `attn/page_compact.hpp`. Two `<<<num_requests, kBlock>>>` on one stream,
+  # the second reading the `scratch_counts` buffer the first fills: now
+  # `driver-cuda/src/fire/page_compact.rs`. `attn::compact_page_csr` was
+  # already `Execution::Composed` -- the composition that fires end to end --
+  # and `execution::RUST_SERVED` is what took the row and the shim entry.
+  # This was the only file in the tree that reached into CCCL; the CUB
+  # measurement travels in the Rust module header.
+  src/attn/attention_mla.cu)
+# `src/ssm/flashinfer_mamba.cu` was here and the file is DELETED, which
+# re-lands `new-horizon.md` §43. The row `ssm::flashinfer_mamba_ssu_bf16` went
+# with `dsl::cuda::flashinfer_mamba_ssu`, no model text ever stated it, and
+# `flashinfer_mamba_ssu_enabled()` required sm90 besides. §43 deleted the two
+# files under a sweep grant, an upstream merge handed them back, and this
+# re-lands the deletion.
+#
+# It held ZERO `__global__` and zero `<<<>>>`: every kernel it reached was a
+# template inside `flashinfer::mamba::invokeSelectiveStateUpdate`. So there was
+# no device text to keep, and the host half it did hold -- four `#define`d
+# shape constants and a refusal for anything that did not match them -- had no
+# caller to serve. Nothing to lift into `kernels-cuda-new/csrc/src` and nothing
+# to rewrite in Rust; the whole file was the dead row's launcher.
+#
+# `kernels-cuda-new/examples/vendor_probe.rs`'s MAMBA candidate is the path
+# back and does not depend on this file: its `roots` name the upstream header
+# `flashinfer/mamba/selective_state_update.cuh`, and its `launcher:` field has
+# read "deleted by new-horizon.md §43" since that sweep. The probe measured the
+# text compiling under NVRTC at 396,128 B with 9 of 9 symbols resolving, which
+# is what makes re-stating the row cheap.
 
 # ---- pie_kernels_cuda ------------------------------------------------------
 # The kernel archive. `driver-cuda` links it; nothing else does. Every
@@ -530,85 +636,452 @@ foreach(_pie_hd_src IN LISTS _pie_hd_stubs)
 endforeach()
 
 
-# The custom P2P all-reduce, arch-gated. It wraps FlashInfer's vllm-style
-# kernel and FUSES a residual add and an RMSNorm into the reduction -- the
-# unfused halves of which are `norm/`'s -- so it is a compute kernel that
-# happens to be collective, not comm machinery. What it needs from the
-# collective is one bootstrap all-gather, taken as a callback
-# (`HostAllgather`) rather than an `NcclComm&`.
+# The custom P2P all-reduce WAS arch-gated here, and both of its files are
+# DELETED, which empties `src/comm/`.
 #
-# Blackwell (sm100/120) has no kernel yet; the stub keeps the entry points.
-if(PIE_HAS_SM100 OR PIE_HAS_SM120)
-  set(PIE_KERNELS_CUSTOM_ALL_REDUCE_SOURCE src/comm/custom_all_reduce_stub.cpp)
-  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
-else()
-  set(PIE_KERNELS_CUSTOM_ALL_REDUCE_SOURCE src/comm/custom_all_reduce.cu)
-endif()
+# It wrapped FlashInfer's vllm-style kernel and FUSED a residual add and an
+# RMSNorm into the reduction -- the unfused halves of which are `norm/`'s --
+# so it was a compute kernel that happened to be collective, not comm
+# machinery. What it needed from the collective was one bootstrap all-gather,
+# taken as a callback (`HostAllgather`) rather than an `NcclComm&`.
+#
+# `src/comm/custom_all_reduce.cu` was then MEASURED: 664 lines, **zero
+# `__global__` and zero `<<<>>>`**. It was a host program wearing a `.cu`
+# extension for linkage -- lifecycle, IPC exchange, allocation arithmetic, an
+# NCCL crossover query and a template dispatch -- and two calls into
+# CPM-fetched flashinfer headers this tree does not vendor. All of the first
+# is `driver-cuda/src/fire/all_reduce.rs`; the two calls are refusals that
+# name the exact template point they want. Both symbols are
+# `kernels_cuda_new::execution::RUST_SERVED`, so the generated shim declares
+# neither and nothing here needs an entry point.
+#
+# `src/comm/custom_all_reduce_stub.cpp` -- the sm100/sm120 substitute -- went
+# with it, under §48.3: a stub goes when the thing it stands in for goes. It
+# could not have compiled if it had ever been selected (its ctor still took
+# `NcclComm&`, which the header had replaced with `HostAllgather`), and a
+# JIT unit that is never selected costs nothing to not compile, which is
+# exactly what an AOT archive cannot do.
 
 add_library(pie_kernels_cuda STATIC
-  src/layout/split_gate_up.cu
-  src/moe/topk_sigmoid.cu
   # vision/ -- the multimodal towers, bridged at TOWER granularity (one
   # launcher per tower; the walk and its host prep stay C++ — see the
   # provenance headers and the retirement wiki's VL judgment).
-  ${PIE_KERNELS_CUSTOM_ALL_REDUCE_SOURCE}
-  src/tensor.cpp
+  # `src/tensor.cpp` WAS NAMED HERE. It is deleted, and it is worth saying
+  # what it held because four of its six entry points had NO consumer
+  # anywhere in this repository: `alloc_logging_enabled`,
+  # `sample_memory_callback`, `set_device_memory_allocator` and
+  # `set_device_tensor_memory_callback` -- the whole allocator-BINDING API,
+  # whose entire purpose is to let a host bind an allocator, with nothing
+  # binding one. The other two, `allocate_device_memory` and
+  # `free_device_memory`, were called only from `gemm/gemm.cpp`'s quantized
+  # arms, and `DeviceTensor::allocate` / `::view` / `::free_` were called
+  # from nowhere at all (the hits under `driver-cuda/tests/oracle/**` are
+  # stubs that define their OWN copies, not consumers of this one).
+  #
+  # So it did not need porting: `bind::quant_gemm` allocates its scratches
+  # with `cudarc::runtime::sys::cudaMalloc` directly, which is what the
+  # default allocator did once the unbound indirection is removed. The
+  # 256-byte alignment argument went with it -- `cudaMalloc` already returns
+  # at least 256-byte-aligned memory on every CUDA device, which is why all
+  # four call sites passed 256 and the default allocator never read it.
+  #
+  # `src/tensor.hpp` STAYS: it carries `DType`, `DeviceMemoryBlock` and the
+  # `DeviceTensor` declaration that `weight_view.hpp` and the vision headers
+  # name. A declaration with no definition is legal until something ODR-uses
+  # it, and nothing does.
   # ops/ -- attention / GEMM / MoE / SSM wrappers
-  src/attn/attention_flashinfer.cu
+  #
+  # `src/attn/attention_flashinfer.cu` was named here and IS NOT ON DISK. It
+  # was moved to `crates/driver-cuda/csrc/attn/` by the pass before this one,
+  # which did not update this list -- so `cmake` configure fails on a
+  # nonexistent source and `tests/sources.rs::every_cu_in_the_build_is_on_disk`
+  # is red on the same fact. Removing the entry is the smaller half of the
+  # repair; the larger half is that the file should not be C++ in either crate.
+  # It is a host dispatch over FlashInfer templates, and its home is Rust in
+  # `driver-cuda/src/fire/`. Its `AttnHd<HD>::dispatch_decode_capture` is a
+  # host `cudaError_t` static member that NVRTC cannot compile, which is an
+  # argument for rewriting the host half, not for relocating it.
   ${PIE_ATTENTION_HEAD_DIM_SOURCES}
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
   # Unconditional, and not part of PIE_CUDA_FLASHINFER_HOPPER_SOURCE above:
   # the decode KV-split path reaches the state merge on every architecture,
   # so it cannot ride the sm90 prefill's stub/real switch.
   src/attn/attention_merge_states.cu
-  src/attn/attention_naive.cu
+  # `src/attn/attention_naive.cu` was here and IS DELETED, with
+  # `attn/attention_naive.hpp`. Two `<<<>>>` left in it -- the MTP state
+  # pair, `mtp_shift_hidden<bf16>` at `<<<total_tokens, 256>>>` and
+  # `mtp_update_pending_hidden<bf16>` at `<<<num_requests, 256>>>` -- now
+  # `driver-cuda/src/fire/attention_naive.rs`. Both are `Execution::Walk`
+  # with `Control::Supplies` and named in `execution::RUST_SERVED`; both
+  # `table::attn` rows were unsourced, so this took the shim entries and
+  # nothing else (§60.7). The device rows were renamed `_dev` in the same
+  # change (§60.6), because §52.11 forbids walking a symbol a unit hosts.
+  # The deleted three launchers' host `if` on `max_global_tokens +
+  # history_steps > 8192` is restated in the Rust module header.
   src/attn/attention_naive_paged.cu
   src/attn/attention_xqa.cu
   src/attn/attention_xqa_gqa2.cu
   src/attn/attention_xqa_gqa2_p16.cu
   src/attn/attention_xqa_gqa4.cu
   src/attn/attention_xqa_gqa8.cu
-  src/gemm/gemm.cpp
-  # The plan caches' extern "C" lifecycle (`pie_x_*`). Beside the plan
-  # types rather than in the driver, which is `cuda.md` §5.E5's second exit
-  # — the first (move it to Rust) is closed by the `unique_ptr` with a
-  # custom deleter that is the whole reason these entries exist.
-  src/attn/plan_lifecycle.cpp
+  # `src/gemm/gemm.cpp` WAS HERE AND IS DELETED, with `gemm/gemm.hpp`, and
+  # `src/gemm/` goes with them -- they were the last two files in it.
+  #
+  # It was the largest `.cpp` in the archive and it held **zero
+  # `__global__` and zero `<<<>>>`** from the first day anyone measured it.
+  # That is the whole finding: it was never a kernel file, it was a HOST
+  # PROGRAM -- a shape ladder, a cuBLASLt plan cache, a private-stream
+  # autotuner and an on-disk tactic memo -- wearing a translation unit for
+  # linkage reasons. What condemned it is not that kernels compile through
+  # NVRTC but the stronger rule: every piece of CPU-side code is Rust.
+  #
+  # Where it went, in the order it left:
+  #
+  #   * the four pure-cuBLAS bodies (`act_x_wt_bf16_out_fp32`,
+  #     `grouped_act_x_wt_bf16`, the two MLA absorbs) ->
+  #     `driver-cuda/src/bind/service.rs`, through `cudarc`.
+  #   * the quantized router -- `act_x_w`'s seven-arm switch on `w.dtype`,
+  #     the FP8 blockwise W8A8 path, the INT8 W8A8 path, the MXFP4 Marlin
+  #     path and their dequant caches -> `driver-cuda/src/bind/quant_gemm.rs`.
+  #   * the DENSE autotuner and `gemm_bf16_impl` itself, plus
+  #     `gemm_batched_bf16_impl` and the grouped-batched capture memo ->
+  #     `driver-cuda/src/fire/gemm.rs`.
+  #   * `CublasHandle` -> `driver-cuda/src/device/cublas.rs`, which predates
+  #     this deletion; `tests/cublas_handle_parity.rs` holds the golden.
+  #
+  # The rows are carried by `execution::RUST_SERVED`, which is what drops
+  # their shim entries, and each is classified in `execution::SERVED`,
+  # `COMPOSED` or `WALKED` first.
+  #
+  # It was already UNCOMPILABLE when it was deleted: `gemm.cpp:22` still had
+  # `#include "gemm/gemv.hpp"` and `src/gemm/gemv.{cu,hpp}` had gone with the
+  # NVRTC port below. So this entry named a file that could not have built.
+  #
+  # `tests/oracle/cublas_handle/run.sh` compiled the real `gemm.cpp` over a
+  # cuBLAS declaration stub to regenerate that golden. It cannot any more,
+  # and `cublas_handle_parity.rs` says so where a reader will meet it: the
+  # transcript is now a permanent record of behaviour that can be READ but
+  # not re-derived. (`tests/oracle/memory_planner/` is unaffected -- it
+  # includes its own `stub/gemm/gemm.hpp`, not this one.)
+  # `src/attn/plan_lifecycle.cpp` was named here and IS NOT ON DISK either --
+  # same pass, same omission. Its comment used to argue that the plan caches'
+  # `extern "C"` lifecycle belongs beside the plan types rather than in the
+  # driver, citing `cuda.md` §5.E5's second exit because the first (move it to
+  # Rust) was "closed by the `unique_ptr` with a custom deleter". That is no
+  # longer an exit: a `unique_ptr` with a custom deleter is host code, and host
+  # code is Rust. The lifecycle wants to be a Rust type owning a raw plan
+  # pointer with `Drop`, not a `.cpp` in any crate.
   # kernels/ -- fused kernels
-  src/norm/add_bias.cu
-  src/sample/argmax.cu
-  src/layout/graph_pad.cu
-  src/ssm/causal_conv1d.cu
-  src/layout/deinterleave.cu
-  src/quant/dequant_fp4.cu
-  src/quant/dequant_fp8.cu
-  src/quant/dequant_wna16.cu
-  src/quant/dtype_cast.cu
-  src/layout/embed.cu
-  src/layout/envelope.cu
-  src/ssm/gated_delta_net.cu
-  src/ssm/kda.cu
-  src/layout/gather_rows.cu
-  src/gemm/gemv.cu
-  src/layout/gather_tokens.cu
-  src/layout/geometry.cu
-  src/attn/head_dim_pad.cu
+  # `src/sample/argmax.cu` was here and IS DELETED with `sample/argmax.hpp` --
+  # the last two files under `src/sample/`, so the directory went too. It held
+  # one launcher, `sample::lm_head_gemv_argmax_int8`, and that launcher is the
+  # clearest case in the archive of the owner's second clause: *where host
+  # code is needed to compose kernels, because kernels produce intermediate
+  # results or because device-specific tuning is involved, that host code is
+  # all Rust.* Both halves are true of it at once -- an occupancy query sets
+  # `grid.x`, and a growable `static` device buffer carries the first kernel's
+  # per-tile pairs to the second, which the row's operand list does not
+  # mention. It is now `execution::WALKED` + `execution::RUST_SERVED`, with
+  # the program in `driver-cuda/src/fire/lm_head_argmax.rs` firing two rows of
+  # `kernels-cuda-new`'s `sample/argmax` unit. §43 had already taken eight of
+  # this file's twelve launchers and `gemm.cpp`'s `lm_head_argmax_chunked`
+  # (zero callers anywhere) took two more.
+  # `src/ssm/causal_conv1d.cu` was here and IS DELETED with
+  # `ssm/causal_conv1d.hpp`. Two launchers: `causal_conv1d_update_batched_bf16`
+  # is in `device::JIT_DISPATCHED` (`families::ssm` states its geometry as
+  # `LaunchRule::SplitPacked` and `abi::emit_c_shim` emits no entry), and
+  # `causal_conv1d_prefill_batched_bf16` is `execution::RUST_SERVED` with its
+  # host program in `driver-cuda/src/fire/causal_conv1d.rs`. Both
+  # `__global__`s are unmoved in
+  # `kernels-cuda-new/csrc/src/ssm/causal_conv1d.cuh`, and the prefill's host
+  # `if (R >= 8)` — a channel-tiled kernel against a block-per-channel one —
+  # survives as `Control::Switch`. It is NOT the shape §30 deletes: the two
+  # arms open on different indices, so each is correct only under its own grid
+  # and there is no shape at which they agree.
+  # `src/layout/deinterleave.cu` was here and IS DELETED with
+  # `layout/deinterleave.hpp`. Four launchers: `split_q_gate_bf16` is in
+  # `device::JIT_DISPATCHED` (NVRTC compiles it out of
+  # `kernels-cuda-new/csrc/src/layout/deinterleave.cuh` and the shim forwards
+  # to nothing), and `deinterleave_rows_bf16`, `deinterleave_vec_bf16` and
+  # `concat_bf16_rows` had NO consumer in any language -- no `crates/model`
+  # caller of either the symbol or its `dsl::cuda` wrapper, no C++ caller, no
+  # hand-written `ffi::pie_k_*` arm. Their `table::layout` rows and their four
+  # DSL wrappers went with the file; see `new-horizon.md` §54.
+  # `src/quant/dequant_fp4.cu`, `src/quant/dequant_fp8.cu` and
+  # `src/quant/dequant_wna16.cu` were here and are ALL DELETED with their
+  # `.hpp`s. Every launcher in the three is in `device::JIT_DISPATCHED` --
+  # `quant::dequant_mxfp4_to_bf16`; `quant::dequant_fp8_e4m3_to_bf16`,
+  # `..._per_channel`, `..._per_group` and `quant::bf16_to_fp16`;
+  # `quant::dequant_wna16_int4b8_to_bf16` -- so `abi::emit_c_shim` emits no
+  # entry for any of them, and the shim entry was the whole consumer set. The
+  # `norm/rmsnorm.cu:64` call on `dequant_wna16` that the migration notes
+  # recorded went with that file, which was deleted a round earlier.
+  # `src/quant/dtype_cast.cu` was here and IS DELETED with
+  # `quant/dtype_cast.hpp`. Both of its launchers -- `cast_fp32_to_bf16` and
+  # `scale_rows_bf16` -- are in `device::JIT_DISPATCHED`, and the two
+  # hand-written `ffi::pie_k_quant_*` call sites that held them (in
+  # `driver-cuda/src/fire/lora.rs`) now fire the rows through NVRTC via
+  # `driver-cuda/src/fire/dtype_cast.rs`. Both geometries were already stated
+  # as `LaunchRule`s, so nothing was invented.
+  # `src/layout/embed.cu` was here and IS DELETED, with `layout/embed.hpp`.
+  # With it, `csrc/src/layout/` is EMPTY — the whole directory has left this
+  # build. Two `<<<>>>`, one template with two instantiations, chosen from a
+  # host alignment test: now `driver-cuda/src/fire/embed.rs`.
+  # `layout/embed.cuh` is a NVRTC unit again (`families/layout.rs`' `EMBED`),
+  # which it had to become — the `.cu` was the only thing compiling the flat
+  # gather. The `layout::embed_bf16` row moved from `table::driver_internal`
+  # to `table::layout` so `execution::RUST_SERVED` could take it; the move is
+  # justified by `model-compiler/src/lower.rs:1462`, which lowers `Embed` to
+  # that symbol from a statement.
+  # `src/layout/envelope.cu` was here and IS DELETED, with
+  # `layout/envelope.hpp`. Five `<<<>>>` — three launchers, one of which fired
+  # one kernel or two on `num_tokens <= kEnvelopeFuseMaxTokens`. The whole
+  # quest envelope tier is `driver-cuda/src/fire/envelope.rs` now, firing
+  # `families::layout::ENVELOPE`'s five `LaunchRule::Unstated` rows through a
+  # driver-owned `kernels::Launch`; `kernels-cuda-new/csrc/src/layout/
+  # envelope.cuh` is unchanged and is that unit's root.
+  #
+  # CONSUMERS, all five channels. `crates/model/src` and
+  # `model-compiler/src/dsl.rs`: none possible — the two rows lived in
+  # `table::driver_internal`, which is deliberately not in `TABLES`, so
+  # `dsl::cuda` never generated a wrapper. Hand `ffi::pie_k_*` arms in
+  # `driver-cuda/src`: one, `bind::abi::seed_envelopes_empty`, rewired to
+  # `fire::envelope::seed_empty` with its own signature unchanged. C++:
+  # `attn/kv_paged.cu` called two of the three, and both of ITS callers moved
+  # to Rust in the same change. The three
+  # `driver-cuda/tests/oracle/*/stub/layout/envelope.hpp` files define their
+  # own `inline` logging bodies and shadow the real header, so they never
+  # linked against this and do not notice it left.
+  # `src/ssm/gated_delta_net.cu` and `src/ssm/kda.cu` were here and BOTH ARE
+  # DELETED with `ssm/gated_delta_net.hpp` and `ssm/kda.hpp`. Between them
+  # they held 21 of the archive's 109 `<<<>>>`.
+  #
+  # `gated_delta_net.cu`: nine launchers, and only four had reachable bodies
+  # left. Five were already routed through `device::JIT_DISPATCHED`
+  # (`recurrent_gated_delta_step_batched{,_state_bf16,_gqa}` and
+  # `chunk_gated_delta_prefill_batched_warp_tiled_gqa{,_state_bf16}`); the
+  # four that remained — `qwen_gdn_post_conv_prep_bf16`, the GQA decode step
+  # and the two prefill pairs — are `execution::RUST_SERVED`, with the host
+  # program in `driver-cuda/src/fire/gated_delta_net.rs`.
+  #
+  # EIGHT OF ITS SEVENTEEN `<<<>>>` WERE UNREACHABLE. Three `constexpr bool`
+  # selectors in its anonymous namespace — `qwen_gdn_gqa_ilp2_enabled`,
+  # `qwen_gdn_k_last_state_enabled` and `qwen_gdn_fused_step_enabled` — were
+  # all `false`, so every `_fused` launch and every `KLast = true`
+  # instantiation sat behind a branch no build reached. None is ported and
+  # none gets a row: a row for an unreachable kernel is a contract with an
+  # empty consumer set.
+  #
+  # Its file-local `gdn_raise_shmem_cap` went too, and NOT into the driver:
+  # the cached prefill asks for `K_d * V_d * sizeof(float)` = 65,536 bytes
+  # against CUDA's 48 KiB default, and the opt-in is now
+  # `runtime::module::raise_dynamic_smem_cap`, called from
+  # `KernelModule::fire` for ANY launch over the cap rather than for this one.
+  #
+  # `kda.cu`: four launchers. `kda_gate_beta_bf16` and `kda_o_norm_gated_bf16`
+  # are in `device::JIT_DISPATCHED`; `kda_recurrent_step_batched` and
+  # `kda_prefill_batched` are `execution::RUST_SERVED` with their program in
+  # `driver-cuda/src/fire/kda.rs`. Those two rows are DELIBERATELY UNSOURCED —
+  # `state_base` is a driver-owned slab and `Source` has no `Scratch`, which
+  # `new-horizon.md` §52.3 counts as one of ten such rows — so
+  # `emit_rust_dispatch` writes no arm for either and they are unreachable
+  # from a model trace. Listing them in `RUST_SERVED` is still what drops the
+  # shim entries, which is what let this file go. The prefill's block width,
+  # `min(32, D) * 32`, carries a measurement that survives in the Rust: 2.2x
+  # at T=2048, 26.2 ms -> 12.0 ms per layer at K3's widths.
+  # `src/gemm/gemv.cu` was here and IS DELETED. Its two `__global__`
+  # templates are `kernels-cuda-new/csrc/src/gemm/gemv.cuh`, which NVRTC
+  # compiles; its host launcher `gemv_bf16` -- the compute-capability read,
+  # the `N <= 4096` threshold, the `K % 8` / 16-byte refusal and the grid
+  # arithmetic -- is `driver-cuda/src/fire/gemv.rs`. `gemm.cpp` still calls
+  # `gemv_bf16` and its `#include "gemm/gemv.hpp"` no longer resolves; that
+  # call site belongs to the cuBLAS rewrite and is repointed there.
+  # `src/layout/gather_tokens.cu` was here and IS DELETED with
+  # `layout/gather_tokens.hpp`. The header declared NOTHING: the file's only
+  # content was an anonymous-namespace `launch()`, which no other translation
+  # unit can name and which nothing in its own called. A `static` function
+  # with no caller in its own TU is a translation unit that compiles two
+  # kernels and launches neither.
+  # `src/attn/head_dim_pad.cu` was here and the file is DELETED with
+  # `attn/head_dim_pad.hpp`. Both its launchers -- `pad_head_dim_bf16` and
+  # `strip_head_dim_bf16` -- are named in `device::JIT_DISPATCHED`, so
+  # `abi::emit_c_shim` emits no entry for either and the two entries were the
+  # whole consumer set: no `.cu`/`.cuh`/`.cpp`/`.hpp` included the header and
+  # `driver-cuda` has no hand-written `ffi::pie_k_attn_*_head_dim_bf16` arm.
+  # The file's own banner still said "Neither has a row"; the rows landed and
+  # the launchers did not follow. `LaunchRule::PerHead` states the
+  # `dim3(num_heads, num_tokens)` grid at `device::kPadBlock` threads, which
+  # is the geometry that was here.
   src/attn/kv_paged.cu
-  src/moe/moe_dispatch.cu
-  src/moe/moe_grouped_gemm.cu
-  src/quant/mxfp4_marlin.cu
-  src/attn/pack_dense_mask.cu
-  src/quant/quant_bf16_to_fp8.cu
-  src/quant/quant_bf16_to_mxfp4.cu
-  src/norm/residual_add.cu
-  src/norm/rmsnorm.cu
-  src/rope/rope.cu
-  src/attn/qkv_fused.cu
-  src/layout/slot_ops.cu
-  src/attn/split_packed.cu
-  src/mlp/swiglu.cu
-  src/moe/topk_softmax.cu
-  src/quant/transcode.cu
+  # `src/moe/moe_dispatch.cu` was here and IS DELETED with
+  # `moe/moe_dispatch.hpp`. Its last three launchers --
+  # `scatter_add_weighted_bf16`, `moe_bucket_exact` and
+  # `add_moe_route_bias_bf16` -- joined the five already gone, and all eight
+  # are `execution::RUST_SERVED`, so `abi::emit_c_shim` emits no entry for
+  # any of them. For the last three the shim entry was the whole consumer
+  # set: zero C++ callers across all four extensions, no hand-written
+  # `ffi::pie_k_*` arm, and their `model-compiler/src/dsl.rs` wrappers
+  # (`:5669`, `:4995`, `:4174`) have no caller in `crates/model/src`. All
+  # three `table::moe` rows are unsourced, so `emit_rust_dispatch` writes no
+  # arm either. The host program is
+  # `driver-cuda/src/fire/moe_dispatch.rs`; the `__global__`s are unmoved in
+  # `kernels-cuda-new/csrc/src/moe/moe_dispatch.cuh` and their device rows
+  # carry `_dev` names, because `execution`'s `a_walk_is_only_a_walk` refuses
+  # a walked symbol that a unit hosts.
+  #
+  # The header's `moe_aligned_block()` had no C++ caller and went with it:
+  # the function, `kMoeAlignedBlockMin`/`Max` and the kimi26-mini batch-128
+  # measurement behind the cap are `fire::moe_dispatch::moe_aligned_block`.
+  # `crates/model/src/{glm_5/spec.rs:63,qwen_3_5/forward/mod.rs:12}` and
+  # `kernels-cuda-new/csrc/src/moe/moe_grouped_gemm_tile.cuh:79` name it in
+  # prose and now point at the Rust.
+  #
+  # `src/moe/` is left holding `flashinfer_moe.cu` alone, below, which is now
+  # ONLY the CUTLASS instantiation seam. That makes this target the LAST
+  # ahead-of-time CUDA compilation in the family, which is a state and not a
+  # settlement: the principle has no exception any more (no nvcc under any
+  # circumstances), so this target, PIE_FLASHINFER_MOE_GENERATED_SOURCES, the
+  # `_SM90_`/`_SM100_` lists and the CPM fetch that feeds them all have to go
+  # -- and that is no longer blocked on an unmeasured question. A concrete
+  # sm90 ptr-array grouped GEMM compiles under NVRTC at compute_90a: 1,245,452
+  # B of PTX, exactly one `.entry`. The gap was three names in namespace `std`
+  # (`is_pointer_v`, `void_t`, `max`), three specific cub includes instead of
+  # `cub/cub.cuh`, and two `griddepcontrol` asm lines -- NOT §13.6's "patch
+  # set plus ~39 intrinsics", which was priced for FA2. What is still open is
+  # `GemmKernel::Params`, which is host-side and which no probe touched.
+  # `driver-cuda/src/fire/flashinfer_moe.rs` carries the probe table. Its
+  # 817-line host half (workspace
+  # query, arch probe, autotuner, tactic cache, dispatch; 0 `__global__`, 0
+  # `<<<`, 0 `__device__`)
+  # is `driver-cuda/src/fire/flashinfer_moe.rs`, and the symbol is
+  # `execution::RUST_SERVED`'s `moe::flashinfer_cutlass_moe_bf16`. Five
+  # `extern "C"` entries remain because `CutlassMoeFCRunner<__nv_bfloat16,
+  # __nv_bfloat16>` is a class template no other language can name.
+  # `src/moe/moe_grouped_gemm.cu` was here and IS DELETED with
+  # `moe/moe_grouped_gemm.hpp`. Its one launcher is
+  # `execution::RUST_SERVED`'s `moe::moe_grouped_gemm_bf16`, so
+  # `abi::emit_c_shim` emits no entry for it and the body is
+  # `driver-cuda/src/fire/moe.rs` — the first Rust service in that list whose
+  # body is a `__global__` of ours rather than a library call. The device
+  # text is unmoved: `kernels-cuda-new/csrc/src/moe/moe_grouped_gemm.cuh`,
+  # which is now also the `MOE_GROUPED_GEMM` NVRTC unit's root. The host
+  # support predicate went with the launcher and is
+  # `fire::moe::supported`.
+  # `src/quant/mxfp4_marlin.cu` was here and IS DELETED with
+  # `quant/mxfp4_marlin.hpp`. Its one launcher,
+  # `mxfp4_scales_to_marlin_e8m0`, is in `device::JIT_DISPATCHED`. The host
+  # VALIDATION it carried (the `row_select` check, the group/stride checks and
+  # the `total % 64 != 0` refusal, all `std::runtime_error`) was already lost
+  # when the row was routed, not by this deletion; it is written down on the
+  # row in `kernels-cuda-new/src/families/quant.rs` and in `new-horizon.md`
+  # §54 so that a future guard has a specification to be written from.
+  # `src/attn/pack_dense_mask.cu` was here and IS DELETED, with
+  # `attn/pack_dense_mask.hpp`. Two `<<<>>>` — `pack_dense_mask` at `<<<B,
+  # 128>>>` and `pack_structured_mask` at the same — and an EMPTY CONSUMER
+  # SET on all five channels: no `crates/model/src` hit for either symbol or
+  # a DSL wrapper (none can exist, both rows were `table::driver_internal`
+  # and that table is not in `TABLES`), nothing in `model-compiler`, no hand
+  # `ffi::pie_k_*` arm, and no C++ caller — the three `.cuh` hits are device
+  # text in `kernels-cuda-new`. Deleted rather than ported, per §60.1: a port
+  # of a launcher with an empty consumer set is a contract nobody signed.
+  # The two DEVICE rows (`families/attn.rs:1206`, `:1222`) stay.
+  # `src/quant/quant_bf16_to_fp8.cu` was here and IS DELETED with
+  # `quant/quant_bf16_to_fp8.hpp`, which empties `csrc/src/quant/`.
+  #
+  # THIS IS THE FILE THE THREE HAND-WRITTEN `ffi::pie_k_quant_*` ARMS HELD
+  # ALIVE, and they are invisible to every check that reads generated text:
+  # `bind/quant_gemm.rs` called `pie_k_quant_quantize_bf16_to_int8_per_token`,
+  # `pie_k_quant_dequant_int32_w8a8_to_bf16` (twice) and
+  # `pie_k_quant_quantize_bf16_to_fp8_e4m3_per_token_group`. All three now
+  # call `driver-cuda/src/fire/quant_int8.rs`, and the three
+  # `table/driver_internal.rs` rows that existed only to give them a shim
+  # entry are deleted with them.
+  #
+  # Of the file's four launchers, three ported and one was DEAD:
+  # `launch_dequant_int8_to_bf16_per_channel` had no caller in any language --
+  # no `.cu`, `.cpp`, `.cuh` or `.hpp`, no `table::quant` row, no hand arm --
+  # so it is deleted rather than ported. Its `__global__` keeps its
+  # `LaunchRule::Elementwise` row in `families::quant`.
+  # `src/quant/quant_bf16_to_mxfp4.cu` was here and IS DELETED with
+  # `quant/quant_bf16_to_mxfp4.hpp`. Its one launcher,
+  # `quantize_bf16_to_mxfp4_e2m1_per_block`, is in `device::JIT_DISPATCHED`
+  # and `model-loader` reaches it through the generated dispatch.
+  # `src/norm/residual_add.cu` was here and IS DELETED with
+  # `norm/residual_add.hpp`, which empties `csrc/src/norm/`.
+  # `src/norm/rmsnorm.cu` was here and IS DELETED with `norm/rmsnorm.hpp`.
+  # Three of its five launchers are `device::JIT_DISPATCHED`
+  # (`rmsnorm_bf16`, `rmsnorm_strided_bf16`, `rmsnorm_gated_fp32_in_bf16`)
+  # and two are `execution::RUST_SERVED` (`rmsnorm_bf16_with_fp16`,
+  # `rmsnorm_residual_add_scale_rmsnorm_bf16`), so the shim emits nothing for
+  # the file. `driver-cuda/src/fire/rmsnorm.rs` is the host program.
+  #
+  # `src/norm/residual_add.cu` above IS DELETED, and the sentence that used to
+  # stand here is why it took a round longer than the rest of `norm/`: it read
+  # *"STAYS: `gemm/gemm.cpp:1990` calls `residual_add_bf16` from the INT8
+  # `beta != 0` arm, and §10.10 is that a launcher goes when its WHOLE
+  # consumer set has gone."* That call site is now
+  # `bind::jit::fire("norm::residual_add_bf16", ...)` in
+  # `driver-cuda/src/bind/quant_gemm.rs`, the row is in
+  # `device::JIT_DISPATCHED`, and the consumer set is empty in both languages.
+  # The `__global__` is unmoved in
+  # `kernels-cuda-new/csrc/src/norm/residual_add.cuh` and the geometry was
+  # already `LaunchRule::Elementwise`, so nothing was invented.
+  #
+  # `src/rope/rope.cu` was here and IS DELETED. Three of its twelve
+  # launchers are `device::JIT_DISPATCHED` and nine are
+  # `execution::RUST_SERVED`; `driver-cuda/src/fire/rope.rs` is the host
+  # program and the `__global__`s are unmoved in
+  # `kernels-cuda-new/csrc/src/rope/rope.cuh`. `rope/rope.hpp` SURVIVES the
+  # `.cu` on purpose and declares functions nothing now defines --
+  # `driver-cuda/tests/launch_abi.rs` is the ABI pilot and reads that header
+  # from disk by a hard-coded path. Nothing includes it, so nothing can fail
+  # to link; retiring the pilot is what deletes it.
+  # `src/attn/qkv_fused.cu` was here and IS DELETED, with
+  # `attn/qkv_fused.hpp`. It was the LAST `attn` dispatch, and the one whose
+  # host `if` chain no `Specialisation` could state: `head_dim` picks the warp
+  # form at 64/128/256 and falls THROUGH to the block form otherwise, and the
+  # two forms have different `LaunchRule`s, which `Specialisation::agrees`
+  # forbids. `families::attn` had already written that refusal; this change
+  # answers it with a host program. Four `<<<>>>` -> the eight instantiations
+  # of `driver-cuda/src/fire/qkv_fused.rs`. FOUR device rows were WRITTEN for
+  # the `_d64`/`_d256` warp expansions the unit never had -- the absence this
+  # file's own header named as what blocked its port. `Execution::Walk` with
+  # `Control::Switch` + `execution::RUST_SERVED`; the row is FULLY SOURCED
+  # (23/23), so this one moves a LIVE dispatch off the generated C shim.
+  # `src/layout/slot_ops.cu` was here and IS DELETED with
+  # `layout/slot_ops.hpp`. Its one launcher, `copy_if_valid_slot`, had no
+  # consumer in any language. The `table::layout` row and the `dsl::cuda`
+  # wrapper went with it; the DEVICE row in `families::layout` STAYS, because
+  # it is the only witness `kernels-cuda-new/tests/launch_rules.rs` has for
+  # `LaunchRule::Single` and that test resolves through `unit_of`, not through
+  # the table.
+  # `src/attn/split_packed.cu` was here and IS DELETED, with
+  # `attn/split_packed.hpp`. One `<<<dim3(xblocks, n_max), 256>>>` of
+  # `split_qkv_devwin<bf16>`: now `driver-cuda/src/fire/split_packed.rs`.
+  # `families/attn.rs` argued that no `LaunchRule` may state that geometry --
+  # `grid.y` is the fire's lane count and not the statement's rectangle, and
+  # the four buffers are base pointers the JIT binder would window twice --
+  # and both clauses are answered by a driver-owned `Launch` plus
+  # `fire::hand::fire`, which binds what it is given. The row moved from
+  # `table::driver_internal` to `table::attn` so `RUST_SERVED` could take it;
+  # `model-compiler/src/lower.rs:1503` names the symbol from a statement.
+  # `src/mlp/swiglu.cu` was here and IS DELETED with `mlp/swiglu.hpp`, and
+  # `src/mlp/` is now an empty directory. Its one remaining launcher,
+  # `sigmoid_gate_inplace_bf16`, is in `device::JIT_DISPATCHED`, as are all
+  # twelve `table::mlp` rows; the header declared that one function and
+  # nothing else.
+  # `src/moe/topk_softmax.cu` WAS HERE and IS DELETED with
+  # `moe/topk_softmax.hpp`. All three of its launchers were unreachable:
+  # `topk_softmax_bf16` and `apply_per_expert_scale_bf16` are named by
+  # `device::JIT_DISPATCHED`, so `abi::emit_c_shim` emitted no entry for
+  # either; `topk_softmax_bf16_form` had no `table::moe` row at all, so it
+  # never had an entry to lose. No `.cu`, `.cuh`, `.cpp` or `.hpp` in either
+  # archive called any of the three. The nine templates are unchanged in
+  # `kernels-cuda-new/csrc/src/moe/topk_softmax.cuh`, which is what the
+  # `TOPK_SOFTMAX` unit compiles. The WARP LADDER the deleted launcher chose
+  # between is recorded on `families::moe`'s `topk_softmax` row and specified
+  # in `new-horizon.md` §52 — it is a host decision that has not been
+  # re-landed, not one that was thrown away.
   # ...and the graph-heavy ones a model implementation launches by name.
   ${PIE_CUDA_GRAPH_KERNEL_SOURCES}
 )
@@ -641,6 +1114,30 @@ target_include_directories(pie_kernels_cuda
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
+# WHICH `flashinfer/` TREE ANSWERS, since there are two and the spelling of an
+# `#include <flashinfer/...>` does not say.
+#
+# `crates/kernels-cuda-new/csrc/vendor/flashinfer/` carries five of the twelve
+# distinct headers this archive's C++ names: `attention/cascade.cuh`,
+# `attention/mla.cuh`, `attention/scheduler.cuh`, `layout.cuh` and
+# `fastdiv.cuh`. It carries none of the other seven --
+# `attention/hopper/default_params.cuh`, `attention/hopper/prefill_sm90.cuh`,
+# `cutlass_utils.cuh`, `comm/trtllm_allreduce.cuh`,
+# `comm/trtllm_allreduce_fusion.cuh`, `comm/vllm_custom_all_reduce.cuh` and
+# `mamba/selective_state_update.cuh`.
+#
+# The C++ takes the CPM copy for ALL TWELVE, including the five that are also
+# vendored. The list above is the whole reason: `${flashinfer_SOURCE_DIR}` is
+# the CPM checkout and `csrc/vendor` appears nowhere in it, in any
+# configuration, on any branch of this file. There is no `-I` in this
+# repository that puts the vendored tree in front of a C++ compiler.
+#
+# The vendored copies are NVRTC's alone. They are reachable only through
+# `Headers::LibraryAndVendor`, and `kernels-cuda-new/src/unit.rs`'s `DEMANDS`
+# table is empty -- no unit asks for it -- so `ALL_HEADERS` is referenced by
+# that crate's tests and by `examples/vendor_probe.rs` and by nothing on the
+# JIT path. `csrc/vendor` therefore has ZERO consumers on either side today,
+# and deleting this archive is not what unblocks deleting it.
 
 set_target_properties(pie_kernels_cuda PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
@@ -682,6 +1179,31 @@ set_target_properties(pie_kernels_cuda PROPERTIES
 # would be more stable than that.
 set(PIE_JIT_DEVICE_HEADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../kernels-cuda-new/csrc/src")
+# The impersonating headers -- `cuda_fp16.h`, `cuda_bf16.h`, `cuda_fp8.h`,
+# `cuda_fp4.h`, `cooperative_groups.h`, `cstdint`, `type_traits`, `bit`,
+# `cuda.h`, `cuda_runtime.h`, `cuda/{cmath,pipeline,std/limits}` -- moved out
+# of that tree when `csrc/` was re-cut by role. They are a SECOND `-iquote`
+# and not an addition to the first, and this is load-bearing rather than
+# tidy: the traffic crosses in both directions. Two files under `csrc/src`
+# reach the shim by QUOTED include (`pie_fp8.cuh` says `#include
+# "cuda_fp16.h"` and `#include "cuda_fp8.h"`; `pie_half2.cuh` says the
+# first), and both `shim/cuda_fp16.h` and `shim/cuda_bf16.h` come back the
+# other way with `#include "pie_device.cuh"`. All five resolved BESIDE the
+# includer while the two trees were one. The inward direction fails loudly if
+# this is missed -- there is no other `pie_device.cuh`. The outward direction
+# does not: a quoted `"cuda_fp16.h"` that misses falls through to the real
+# toolkit header, `__half` stops being `device::f16`, and the build SUCCEEDS
+# -- the silent 17,744-vs-15,088-byte divergence
+# `kernels-cuda-new/src/source.rs` measures.
+set(PIE_JIT_SHIM_HEADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../kernels-cuda-new/csrc/shim")
+if(NOT EXISTS "${PIE_JIT_SHIM_HEADERS}/cuda_fp16.h")
+  message(FATAL_ERROR
+    "the impersonating headers are not at ${PIE_JIT_SHIM_HEADERS}. Three "
+    "files under csrc/src reach them by quoted include, and a quoted include "
+    "that misses resolves to the real toolkit header WITHOUT a diagnostic, so "
+    "this fails now rather than shipping two incompatible __half types.")
+endif()
 if(NOT EXISTS "${PIE_JIT_DEVICE_HEADERS}/pie_device.cuh")
   message(FATAL_ERROR
     "the kernel headers are not at ${PIE_JIT_DEVICE_HEADERS}. Every .cu here "
@@ -710,7 +1232,8 @@ endif()
 # text in a host translation unit is a layering mistake, and a build that
 # quietly resolved it would be how the mistake survives review.
 target_compile_options(pie_kernels_cuda PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-iquote,${PIE_JIT_DEVICE_HEADERS}>)
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-iquote,${PIE_JIT_DEVICE_HEADERS}>
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-iquote,${PIE_JIT_SHIM_HEADERS}>)
 
 # ---- FlashInfer generated CUTLASS MoE (vendored) ---------------------------
 # Pre-generated FlashInfer CUTLASS grouped-GEMM MoE launchers, vendored under
@@ -785,7 +1308,9 @@ endif()
 # COMPILE_HOPPER_TMA_GROUPED_GEMMS and these launchers, `getWorkspaceSize` walks
 # the TMA warp-specialized configs, finds none with a compiled launcher for
 # sm_90, and throws "Could not find valid config when calculating workspace
-# size". flashinfer_cutlass_moe_workspace_bytes catches that and reports zero,
+# size". That throw is the ARCH PROBE, not an error: `pie_moe_cutlass_
+# workspace_size` catches it (nothing may cross the C ABI) and reports a
+# nonzero status, `fire::flashinfer_moe::workspace_bytes` turns that into 0,
 # so callers leave `cutlass_ws` empty and EVERY MoE model silently takes the
 # unfused expert path.
 #

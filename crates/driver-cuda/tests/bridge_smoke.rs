@@ -9,6 +9,15 @@
 //! compiled against the real headers, the archive linked, and a launcher
 //! this crate did not write ran device code on this crate's stream.
 //!
+//! **That first test now proves a different chain, and deliberately.**
+//! `quant::cast_fp32_to_bf16` is in `device::JIT_DISPATCHED`, so
+//! `emit_c_shim` emits no `pie_k_quant_cast_fp32_to_bf16` and
+//! `quant/dtype_cast.cu` is deleted; the launcher is
+//! `driver_cuda::fire::dtype_cast::cast_fp32_to_bf16`, which fires the row
+//! through NVRTC. The round trip it smokes is therefore the JIT one — unit
+//! compiled, `Args::bind` agreed with the row, `cuLaunchKernel` ran on this
+//! crate's stream — and it is the same claim about the same bytes.
+//!
 //! Skipped without a device, like every GPU test here.
 
 use driver_cuda::bind::abi::ffi;
@@ -70,7 +79,7 @@ fn a_generated_binding_reaches_a_real_kernel() {
     let d_dst = alloc.alloc(src.len() * 2).expect("dst alloc");
 
     unsafe {
-        ffi::pie_k_quant_cast_fp32_to_bf16(
+        driver_cuda::fire::dtype_cast::cast_fp32_to_bf16(
             d_src.as_ptr(),
             d_dst.as_ptr(),
             src.len(),
@@ -3536,16 +3545,27 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     cublas.release(&mut cublas_ops);
 }
 
-/// The qwen3_vl vision TOWER through its bridge row — the first live fire
-/// of the tower-granularity VL judgment. A tiny synthetic tower (depth 1,
-/// hidden 128 / head_dim 64 — flashinfer's real instantiation — merge 2×2,
-/// one 4-patch image → ONE merged token) with ALL-ZERO weights: the patch
-/// projection, the block, the merger and the pos-embed table are zeros, so
-/// the tower's merged token is exactly zero — and the SCATTER must
-/// OVERWRITE the anchor row of a hidden buffer pre-filled with a nonzero
-/// pattern. Zeroed anchor row + untouched neighbor row = the whole
-/// pipeline (host prep, tower, merger, scatter) ran and landed exactly
-/// where the anchors say.
+/// The qwen3_vl vision TOWER, and **THE WALK IS RUST** — the same live fire
+/// the tower-granularity VL judgment got through its bridge row, now through
+/// `driver_cuda::tower::qwen3_vl::scatter` directly. There is no row and no
+/// `ffi::pie_k_vision_qwen3vl_scatter`: `driver-cuda/csrc/vision/` is deleted,
+/// so a shim entry would forward to a launcher that does not exist. What the
+/// test asserts is unchanged, which is the point of keeping it.
+///
+/// A tiny synthetic tower (depth 1, hidden 128 / head_dim 64 — flashinfer's
+/// real instantiation — merge 2×2, one 4-patch image → ONE merged token) with
+/// ALL-ZERO weights: the patch projection, the block, the merger and the
+/// pos-embed table are zeros, so the tower's merged token is exactly zero —
+/// and the SCATTER must OVERWRITE the anchor row of a hidden buffer
+/// pre-filled with a nonzero pattern. Zeroed anchor row + untouched neighbor
+/// row = the whole pipeline (host prep, tower, merger, scatter) ran and landed
+/// exactly where the anchors say.
+///
+/// The pixels are BYTES here where the row took `*const f32`. The bytes are
+/// the same bytes and the division is gone: `pixel_indptr` was always a BYTE
+/// indptr, and the C++ divided it by four to get an element count it then
+/// multiplied back. `tower::gemma4_vision`'s test made the same change for
+/// the same reason.
 #[test]
 fn the_qwen3vl_tower_fires_through_the_bridge() {
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
@@ -3590,8 +3610,11 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
     let deepstack_w: Vec<*const std::ffi::c_void> = vec![z; 3 * 6];
     let deepstack_layers: [i32; 3] = [0, 0, 0];
 
-    // The image: 4 patches of f32 pixels (host), grid (t,h,w) = (1,2,2).
-    let pixels = vec![0.25f32; N_PATCH * PATCH_DIM];
+    // The image: 4 patches of f32 pixels (host, as bytes), grid (t,h,w) =
+    // (1,2,2).
+    let pixels: Vec<u8> = std::iter::repeat_n(0.25f32.to_le_bytes(), N_PATCH * PATCH_DIM)
+        .flatten()
+        .collect();
     let pixel_indptr: [u32; 2] = [0, (N_PATCH * PATCH_DIM * 4) as u32];
     let grids: [u32; 3] = [1, 2, 2];
     let anchors: [u32; 1] = [0];
@@ -3620,42 +3643,46 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
         .expect("h2d");
     stream.as_ref().synchronize().expect("sync");
 
+    let weights = driver_cuda::tower::qwen3_vl::Weights::from_flat(
+        z,
+        core::ptr::null(),
+        pos_tbl.as_ptr().cast_const(),
+        &block_w,
+        1,
+        &merger_w,
+        &deepstack_w,
+        &deepstack_layers,
+        HIDDEN,
+        HEADS,
+        INTER,
+        PATCH,
+        T_PATCH,
+        MERGE,
+        IN_CH,
+        OUT_HIDDEN,
+        NUM_POS,
+        1e-6,
+        1e4,
+    )
+    .expect("the flat tables marshal");
+
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
-    unsafe {
-        ffi::pie_k_vision_qwen3vl_scatter(
-            z,
-            core::ptr::null(),
-            pos_tbl.as_ptr().cast_const(),
-            block_w.as_ptr(),
-            1,
-            merger_w.as_ptr(),
-            deepstack_w.as_ptr(),
-            deepstack_layers.as_ptr(),
-            HIDDEN,
-            HEADS,
-            INTER,
-            PATCH,
-            T_PATCH,
-            MERGE,
-            IN_CH,
-            OUT_HIDDEN,
-            NUM_POS,
-            1e-6,
-            1e4,
-            pixels.as_ptr(),
-            pixel_indptr.as_ptr(),
-            grids.as_ptr(),
-            anchors.as_ptr(),
-            1,
-            hidden_rows.as_ptr(),
-            N_ROWS as i32,
-            ds_scratch.as_ptr(),
-            3,
-            cublas.handle().expect("created").cast(),
-            raw_stream,
-        );
-    }
+    let walked = driver_cuda::tower::qwen3_vl::scatter(
+        &weights,
+        &pixels,
+        &pixel_indptr,
+        &grids,
+        &anchors,
+        hidden_rows.as_ptr(),
+        N_ROWS as i32,
+        ds_scratch.as_ptr(),
+        3,
+        cublas.handle().expect("created").cast(),
+        stream.as_ref(),
+    );
+    cublas.release(&mut cublas_ops);
+    walked.expect("the tower walks");
     stream.as_ref().synchronize().expect("the tower retires");
 
     let mut ds_back = vec![0u8; ds_pattern.len()];
@@ -3685,8 +3712,6 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
         );
         assert_eq!(at(1, c), bf16(3.0), "guard row col {c} must stay untouched");
     }
-
-    cublas.release(&mut cublas_ops);
 }
 
 /// gemma-4's STANDALONE vision tower through its encode row — host
@@ -3723,56 +3748,72 @@ fn the_gemma4_vision_tower_encodes_through_the_bridge() {
     let layer_w: Vec<*const std::ffi::c_void> = vec![z; 41];
 
     let pixel_dim = 3 * PATCH * PATCH;
-    let pixels = vec![0.5f32; N_PATCH * pixel_dim];
+    // BYTES, not floats: the encode ABI's `image_pixels` is a byte buffer
+    // whose indptr is in bytes, and the Rust walk takes it as it arrives
+    // instead of re-typing it at the boundary the way the C shim had to.
+    let pixels: Vec<u8> = (0..N_PATCH * pixel_dim).flat_map(|_| 0.5f32.to_ne_bytes()).collect();
     let pixel_indptr: [u32; 2] = [0, (N_PATCH * pixel_dim * 4) as u32];
     // (x, y) per patch, the 3×3 grid.
     let patch_positions: [u32; 18] = [0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
-    let anchors: [u32; 1] = [0];
 
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
     // Host output rows: OUT_LEN real + 2 guard rows, pattern-filled.
-    let mut out_rows = vec![bf16(7.0); (OUT_LEN + 2) * TEXT_HIDDEN as usize];
+    let mut out_rows: Vec<u8> = (0..(OUT_LEN + 2) * TEXT_HIDDEN as usize)
+        .flat_map(|_| bf16(7.0).to_ne_bytes())
+        .collect();
     let mut out_indptr = [u32::MAX; 2];
 
-    unsafe {
-        ffi::pie_k_vision_gemma4_vision_encode(
-            z,
-            z,
-            z,
-            layer_w.as_ptr(),
-            1,
-            HIDDEN,
-            HEADS,
-            INTER,
-            POS_TABLE,
-            TEXT_HIDDEN,
-            POOL,
-            1e-6,
-            100.0,
-            pixels.as_ptr(),
-            pixel_indptr.as_ptr(),
-            patch_positions.as_ptr(),
-            anchors.as_ptr(),
-            1,
-            out_rows.as_mut_ptr(),
-            out_rows.len() * 2,
-            out_indptr.as_mut_ptr(),
-            raw_stream,
-        );
-    }
+    // THE WALK IS RUST. `pie_k_vision_gemma4_vision_encode` stood here and
+    // does not exist: the shim entry went with the `driver_internal` row and
+    // the row went with `gemma4_vision.cu`. What the binding used to reach
+    // through one `extern "C"` call is now two Rust calls — marshal the flat
+    // table, then walk it — and this test reaches them directly, which is
+    // strictly more of the program under test than the C ABI was.
+    let weights = driver_cuda::tower::gemma4_vision::Weights::from_flat(
+        z,
+        z,
+        z,
+        &layer_w,
+        1,
+        HIDDEN,
+        HEADS,
+        INTER,
+        POS_TABLE,
+        TEXT_HIDDEN,
+        POOL,
+        1e-6,
+        100.0,
+    )
+    .expect("the flat table marshals");
+
+    let mut cublas_ops = driver_cuda::device::cublas::LiveCublas;
+    let mut cublas = driver_cuda::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
+        .expect("cublas");
+    let walked = driver_cuda::tower::gemma4_vision::encode(
+        &weights,
+        &pixels,
+        &pixel_indptr,
+        &patch_positions,
+        &mut out_rows,
+        &mut out_indptr,
+        cublas.handle().expect("created").cast(),
+        stream.as_ref(),
+    );
+    cublas.release(&mut cublas_ops);
+    walked.expect("the encode walks");
     stream.as_ref().synchronize().expect("the encode retires");
 
+    let at = |row: usize, col: usize| -> u16 {
+        let o = (row * TEXT_HIDDEN as usize + col) * 2;
+        u16::from_ne_bytes([out_rows[o], out_rows[o + 1]])
+    };
     assert_eq!(out_indptr[0], 0, "the CSR starts at zero");
     assert_eq!(out_indptr[1], OUT_LEN as u32, "one image, one soft token");
-    for (c, v) in out_rows.iter().enumerate().take(TEXT_HIDDEN as usize) {
-        assert_eq!(*v, 0, "soft-token col {c}: the zero tower lands zero");
+    for c in 0..TEXT_HIDDEN as usize {
+        assert_eq!(at(0, c), 0, "soft-token col {c}: the zero tower lands zero");
     }
     for c in 0..TEXT_HIDDEN as usize {
-        assert_eq!(
-            out_rows[(OUT_LEN + 1) * TEXT_HIDDEN as usize + c],
-            bf16(7.0),
-            "guard row col {c} must stay untouched"
-        );
+        assert_eq!(at(OUT_LEN + 1, c), bf16(7.0), "guard row col {c} must stay untouched");
     }
 }
 
@@ -4270,8 +4311,7 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
 
     use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda::bind::{
-        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind,
-        dispatch,
+        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
     };
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
@@ -4665,8 +4705,7 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
 
     use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda::bind::{
-        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind,
-        dispatch,
+        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
     };
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;

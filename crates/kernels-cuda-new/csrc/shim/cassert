@@ -1,0 +1,79 @@
+//===-- cassert - the header XQA opens and takes nothing out of ----------===//
+//
+// `#include <cassert>`, answered. It declares nothing, and that is the whole
+// finding: NVRTC's built-in preamble already supplies `assert`, so the only
+// thing missing was a file by that name for the directive to resolve to.
+//
+// # Why it is here — measured, not assumed
+//
+// FlashInfer's XQA closure (`xqa/`, 25 files, the source
+// `attn/attention_xqa*.cu` compile through `#include <xqa/mha.cu>`) opens it
+// from two places, neither guarded:
+//
+// ```text
+// xqa/barriers.cuh:19   #include <cassert>
+// xqa/utils.h:5         #include <cassert>
+// ```
+//
+// `barriers.cuh` is on the device closure whenever `USE_CUSTOM_BARRIER=1`,
+// which every one of the six archive units sets
+// (`attn/attention_xqa.cu:37` and its five siblings). With the header set as
+// it stood, the whole compile stopped on the first line of it:
+//
+// ```text
+// probe: NVRTC 13.0, compute_89, GENERATE_CUBIN=1, USE_CUSTOM_BARRIER=1
+//   xqa/barriers.cuh(19): catastrophic error:
+//     cannot open source file "cassert"
+//   1 catastrophic error detected
+// ```
+//
+// A catastrophic error is not one of forty-seven diagnostics to work through
+// — it ends the compile where it stands, so this one absence hid every other
+// question about XQA behind it. That is the reason a file this empty is worth
+// carrying: it is not making `assert` work, it is making the next error
+// visible.
+//
+// # Why it defines nothing
+//
+// NVRTC's preamble declares `assert` itself — the same preamble that supplies
+// `size_t`, `ptrdiff_t`, `nullptr_t`, `printf` and `memcpy`, as
+// `csrc/shim/cstdint`'s header records. Defining `assert` here would be a
+// second spelling of a macro the compiler already has, and the two would be
+// free to disagree. So this file declares nothing at all and exists only to
+// be found.
+//
+// The closure spells bare `assert(...)` 154 times across `xqa/*.{cu,cuh,h}`,
+// overwhelmingly inside `__device__` code. All 154 are compiled away: every
+// unit sets `NDEBUG=1` (`attn/attention_xqa.cu:33`), which is what the
+// preamble's `assert` keys on. So the count measures how many sites would
+// break on the missing header, not how many need a working macro.
+//
+// `static_assert` is a keyword and reaches none of this.
+//
+// # The name is the trick, as it is for `cstdint`
+//
+// NVRTC matches the directive's LITERAL spelling against `includeNames[]`, so
+// an entry named `cassert` answers `#include <cassert>` from source we do not
+// own, and the source stays unmodified. `csrc/shim/cooperative_groups.h`
+// argues this at length for CCCL; `csrc/shim/cstdint` applies it to the C++
+// standard library; this is the smallest instance of the same rule.
+//
+// # What is deliberately NOT here
+//
+// `<assert.h>`. The C spelling resolves by a different literal and no source
+// in either tree writes it — a grep over `csrc/` and over the XQA closure
+// found `<cassert>` twice and `<assert.h>` never. A second file would be a
+// second place for the same absence to be right or wrong.
+//
+// `NDEBUG`. Defining it here would decide for every unit what belongs in the
+// option set, which is the field `crate::unit::Unit::options` exists to hold
+// — and every XQA unit already carries `-DNDEBUG=1` there, cited to the `.cu`
+// line it came from.
+
+#ifndef PIE_NVRTC_CASSERT_
+#define PIE_NVRTC_CASSERT_
+
+// Intentionally empty. See the header comment: NVRTC's preamble supplies
+// `assert`, and this file supplies the name `<cassert>`.
+
+#endif  // PIE_NVRTC_CASSERT_

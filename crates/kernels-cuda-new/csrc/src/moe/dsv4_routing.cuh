@@ -1,8 +1,13 @@
 //===-- dsv4_routing.cuh - DeepSeek-V4's two routers ----------------------===//
 //
 // Two `__global__` templates and the one `__device__` helper they share. No
-// launcher: `dsv4_routing.cu` includes this file and keeps the `<<<>>>`, so
-// the kernels have a single definition that nvcc and NVRTC both read.
+// launcher, and no second compiler: `dsv4_routing.cu` used to include this
+// file and keep the `<<<>>>`, so the kernels had a single definition that
+// nvcc and NVRTC both read. That `.cu` is DELETED —
+// `topk_sqrtsoftplus_bf16`'s launcher went in §43.9 and `hash_route_lookup`'s
+// is `driver-cuda/src/fire/dsv4_routing.rs` — so NVRTC is the only reader
+// left. `hash_route_lookup` is fired by name as `moe::hash_route_lookup_dev`;
+// `families::moe` says why the name has a suffix.
 //
 // # Why both kernels are here and not one each
 //

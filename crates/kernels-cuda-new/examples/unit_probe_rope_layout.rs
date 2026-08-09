@@ -109,7 +109,7 @@ mod probe {
         println!("architecture:  {arch}");
         println!("header set:    {} carried headers\n", DEVICE_HEADERS.len());
 
-        let units: Vec<&Unit> = kernels_cuda_new::families::rope::UNITS
+        let units: Vec<&Unit> = kernels_cuda_new::x::rope::UNITS
             .iter()
             .chain(kernels_cuda_new::families::layout::UNITS)
             .collect();

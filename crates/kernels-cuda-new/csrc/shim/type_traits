@@ -1,0 +1,177 @@
+//===-- type_traits - the eight traits a dtype dispatch is written in ----===//
+//
+// `std::is_same_v`, `std::conditional_t`, and the six names they are built
+// out of. This is what `#include <type_traits>` resolves to when the compiler
+// is NVRTC and the include path is a header set carried in the binary.
+//
+// # Why this is not a guard, either
+//
+// For the same reason `cstdint` in this directory is not: the names are used
+// by device code, so guarding the directive away with `#ifndef __CUDACC_RTC__`
+// deletes the include and leaves the uses. Measured over FlashInfer 0.6.15's
+// attention closure: `std::is_same_v` 40 times, `std::conditional_t` 18,
+// `std::is_same` 8, and one `std::void_t` / `std::declval` pair inside
+// `utils.cuh`'s `DEFINE_HAS_MEMBER`, which `decode.cuh` expands at namespace
+// scope on its first line of code. Every one of them is a compile-time
+// question asked by a `__device__` template about its own dtype parameter.
+//
+// NVRTC answers none of them: `namespace "std" has no member "is_same"` with
+// an empty header set, and the same with the real CUDA device headers in it.
+//
+// # The list is the measurement, not the standard's surface
+//
+// A real `<type_traits>` is some seventy traits. This is eight, because eight
+// is what the closure names, and the file must not grow into the other one:
+// a second standard library is a second set of promises to disagree with the
+// first. When a FlashInfer bump reaches for a ninth, the compile says so by
+// name and the entry is one line -- which is a better failure than a
+// half-right `is_convertible` nobody reads.
+//
+// `std::min` is deliberately absent, and its absence is the interesting one:
+// `std::max` and `std::min` appear 58 times in FlashInfer's closure, and every
+// one of those sites is inside a HOST dispatch function --
+// `BatchDecodeWithPagedKVCacheDispatched` and its relatives -- which the
+// vendored copies guard away wholesale under `__CUDACC_RTC__`, because under
+// the JIT the launch is `cuLaunchKernel` from Rust and the host half of
+// FlashInfer is exactly the half we replace. **That measurement stands and is
+// why `min` is still not here.** `max` is below for a reason that has nothing
+// to do with it and does not generalise to `min`; see its own entry.
+//
+// # §62.7: the three names CUTLASS asks for, added 2026-08-14
+//
+// Measured, not guessed. `nvrtcCompileProgram` on CUTLASS 3.x's grouped-GEMM
+// stack at `compute_90a` produced SEVEN errors and they were three names:
+//
+// ```text
+//   sm90_epilogue_array_tma_warpspecialized.hpp:497   std::is_pointer_v
+//   sm100_epilogue_array_tma_warpspecialized.hpp:242  std::max
+//   linear_combination_bias_elementwise.h:77          std::void_t
+// ```
+//
+// A six-line prelude supplying those three closed all seven, and the concrete
+// sm90 ptr-array grouped GEMM then compiled to 1,245,452 B of PTX with exactly
+// one `.entry`. **CUTLASS needs a row in this file, not a patch set** -- which
+// is a different order of cost from FA2's, and §13.6's price must not be
+// quoted at it.
+//
+// `void_t` was already here (FlashInfer's `DEFINE_HAS_MEMBER` asks for it), so
+// the addition is two names. All three sites are places where UPSTREAM wrote
+// `std::` where the file's own convention is `cute::` or
+// `cutlass::platform::`; from NVRTC's side they are indistinguishable from
+// any other missing trait, and the eight-not-seventy rule this file states is
+// unchanged -- the compile named them, and each entry is one line.
+
+#ifndef PIE_NVRTC_TYPE_TRAITS_
+#define PIE_NVRTC_TYPE_TRAITS_
+
+namespace std {
+
+/// The compile-time constant every trait below is a specialisation of.
+template <class T, T v>
+struct integral_constant {
+  static constexpr T value = v;
+  using value_type = T;
+  using type = integral_constant;
+  __host__ __device__ constexpr operator value_type() const noexcept { return value; }
+  __host__ __device__ constexpr value_type operator()() const noexcept { return value; }
+};
+
+/// `integral_constant<bool, true>`, spelled as the standard spells it.
+using true_type = integral_constant<bool, true>;
+/// `integral_constant<bool, false>`.
+using false_type = integral_constant<bool, false>;
+
+/// Whether two types are the same type, ignoring nothing.
+template <class T, class U>
+struct is_same : false_type {};
+template <class T>
+struct is_same<T, T> : true_type {};
+/// The variable form, which is how the closure spells it 40 times out of 48.
+template <class T, class U>
+inline constexpr bool is_same_v = is_same<T, U>::value;
+
+/// `B ? T : F`, over types.
+template <bool B, class T, class F>
+struct conditional {
+  using type = T;
+};
+template <class T, class F>
+struct conditional<false, T, F> {
+  using type = F;
+};
+/// The alias form, which is the only form the closure uses.
+template <bool B, class T, class F>
+using conditional_t = typename conditional<B, T, F>::type;
+
+/// SFINAE's discard: any type list, collapsed to `void`.
+///
+/// Two callers, one from each vendored library: FlashInfer's
+/// `utils.cuh::DEFINE_HAS_MEMBER`, and CUTLASS's
+/// `epilogue/thread/linear_combination_bias_elementwise.h:77`, which spells
+/// `struct ElementwiseOpDispatcher<T, std::void_t<typename T::Arguments>>`.
+template <class...>
+using void_t = void;
+
+/// Whether `T` is a pointer type.
+///
+/// One caller, and it is a `__CUTE_REQUIRES` constraint rather than a trait
+/// used for dispatch: `cutlass/epilogue/collective/
+/// sm90_epilogue_array_tma_warpspecialized.hpp:497` writes
+/// `__CUTE_REQUIRES(std::is_pointer_v<TensorMapC>)` on the ptr-array
+/// epilogue's tensormap parameter. Under NVRTC the failure is three errors
+/// from one line -- the missing name, then *"type name is not allowed"* and
+/// *"expected an expression"* as the constraint falls apart -- so the
+/// diagnostic overstates the gap by a factor of three, which is worth knowing
+/// before anyone counts errors as a measure of distance.
+template <class T>
+struct is_pointer : false_type {};
+template <class T>
+struct is_pointer<T*> : true_type {};
+template <class T>
+struct is_pointer<T* const> : true_type {};
+template <class T>
+struct is_pointer<T* volatile> : true_type {};
+template <class T>
+struct is_pointer<T* const volatile> : true_type {};
+/// The variable form, which is the only form CUTLASS uses.
+template <class T>
+inline constexpr bool is_pointer_v = is_pointer<T>::value;
+
+/// The larger of two values, `constexpr`.
+///
+/// **Read the note above about `std::min` before adding to this.** `min` is
+/// absent on a measurement -- 58 sites, all in host dispatch functions that
+/// the vendored FlashInfer guards away -- and that measurement is not what
+/// puts `max` here. This one has a single caller and it is a compile-time
+/// constant in a class body, not a host launcher:
+///
+/// ```text
+/// cutlass/epilogue/collective/sm100_epilogue_array_tma_warpspecialized.hpp:242
+///   constexpr static uint32_t NumTmaDescriptorsPerSm =
+///       IsGroupedGemmKernel ? (NumMaxSchedulerPipelineStageCount
+///           + std::max(StagesC, (ReuseSmemC ? StagesC : StagesD)) + 2) : 1;
+/// ```
+///
+/// It is reached from the sm90 path too, because `collective_builder.hpp`
+/// pulls every architecture's epilogue header and this is a class-scope
+/// initialiser that must be parsed whether or not the specialisation is
+/// selected. So it is not optional on an sm90-only carried set, and guarding
+/// it away is not available: it is upstream text under a name we impersonate.
+///
+/// Declared for `const T&` and not by value because that is the overload the
+/// standard names and the one a `constexpr static` initialiser binds to
+/// without a copy. `min` still does not exist and a caller that wants it
+/// should arrive with its own measurement.
+template <class T>
+__host__ __device__ constexpr const T& max(const T& a, const T& b) {
+  return a < b ? b : a;
+}
+
+/// A value of `T` in an unevaluated context. Declared and never defined, as
+/// the standard requires -- calling it is the diagnostic.
+template <class T>
+T&& declval() noexcept;
+
+}  // namespace std
+
+#endif  // PIE_NVRTC_TYPE_TRAITS_

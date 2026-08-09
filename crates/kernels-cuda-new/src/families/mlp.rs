@@ -48,14 +48,32 @@
 //! divides a half-WIDTH by `BLOCK` and caps nothing, and the two agree at no
 //! input. The host predicates below are untouched by any of them.
 //!
-//! `swiglu.cuh` carries three vectorised kernels and `swiglu.cu` still
-//! launches them. Their grid is `ceil(((I + 1) / 2) / BLOCK)` — a HALF-WIDTH
-//! extent no `LaunchRule` states — and the launcher picks between them and
-//! their scalar twins on `I > 10000` and on the parity of `row_stride`, which
-//! are predicates over an operand's VALUE rather than a place a `Source` can
-//! name. Inventing a rule for three kernels would put a geometry in the
-//! vocabulary that only those three mean, so they are carried as device text
-//! and left unmigrated.
+//! `swiglu.cuh` carries three vectorised kernels and NOTHING LAUNCHES THEM.
+//! Their grid is `ceil(((I + 1) / 2) / BLOCK)` — a HALF-WIDTH extent no
+//! `LaunchRule` states — and `swiglu.cu`'s launcher used to pick between them
+//! and their scalar twins on `I > 10000` and on the parity of `row_stride`,
+//! which are predicates over an operand's VALUE rather than a place a
+//! `Source` can name. Inventing a rule for three kernels would put a geometry
+//! in the vocabulary that only those three mean, so they are carried as
+//! device text and left unmigrated.
+//!
+//! **§54 deleted `mlp/swiglu.{cu,hpp}` and the whole of `csrc/src/mlp/`, and
+//! it did NOT delete the fork — routing did, earlier, and the difference
+//! matters.** Every one of this family's twelve table rows is in
+//! `device::JIT_DISPATCHED`, so `abi::emit_c_shim` has emitted no entry for
+//! any of them for some time and no fire has reached that launcher since:
+//! `mlp::chunked_swiglu_bf16` resolves to the SCALAR `chunked_swiglu`
+//! template on `LaunchRule::ElementwiseRows`, at every `I`. The vectorised
+//! path stopped running when the row was routed; deleting the C++ only
+//! stopped it being compiled. **What is owed is a measurement, not a
+//! restoration**: nobody has measured what `I > 10000` was worth, the
+//! threshold has no citation anywhere in the tree, and re-landing a
+//! two-element-per-thread path on the strength of a constant whose origin
+//! nobody can name is how a vocabulary grows for nothing. If it is worth
+//! having, it is worth having as a driver-owned `Launch` in
+//! `driver-cuda/src/fire/`, chosen by host code that can read `I` — the
+//! shape `fire::gemv` and `fire::lm_head_argmax` already have — with the
+//! two arms compared on the shapes that cross 10000.
 //!
 //! # A row is a contract naming a SYMBOL, and that is why the ROW went
 //!
@@ -64,8 +82,9 @@
 //! `mlp::sigmoid_scalar_gate_strided_add_bf16`, and that reading was
 //! overturned: `norm_device`'s bijection is between that one table and its
 //! kernels, nothing tree-wide forbids two rows naming one instantiation, and
-//! `rope::device::rotate_partial<device::bf16>` is named by three
-//! [`crate::families::rope::ROPE_ROWS`] entries. That argument still stands
+//! `rope::device::rotate_partial<device::bf16>` is named by three of what
+//! were `families::rope`'s `ROPE_ROWS` entries (and are now
+//! [`crate::x::rope`]'s `unit!` instantiations). That argument still stands
 //! and it is not what removed the symbol. What removed it is the answer to
 //! the question one level up — **does anything write this symbol into a
 //! trace?** — and §28.9 measured the answer as no, for both spellings, with

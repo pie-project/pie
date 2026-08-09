@@ -73,7 +73,11 @@ pub struct Unsupported {
 
 impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the {} driver does not serve `{}`", self.driver, self.verb)
+        write!(
+            f,
+            "the {} driver does not serve `{}`",
+            self.driver, self.verb
+        )
     }
 }
 
@@ -124,6 +128,24 @@ pub trait Driver: Send + Sync {
     /// sites regardless of the driver it was for, which any driver that
     /// checks the tag refuses on every prefix-cache hit and every swap.
     fn device_domain(&self) -> DeviceDomain;
+
+    /// Which backend's kernels this driver wants the HOST to generate, or
+    /// `None` when it generates its own (or needs none).
+    ///
+    /// A driver's own answer, and it has to be: the alternative is a caller
+    /// deriving it from something adjacent. It was a `match` in `engine`
+    /// (`Self::Cuda(_) => Some("cuda"), _ => None`), and when that `match`
+    /// became `Driver::kind()` the derivation broke — `"metal"` parses as a
+    /// codegen backend, so a Metal driver started being handed host-generated
+    /// Metal kernels it has no path for, silently. `kind` answers WHICH
+    /// DEVICE this is; that is not the same question.
+    ///
+    /// `DriverCapabilities::codegen_backend` is the same fact on the load
+    /// handshake, and every driver currently leaves it empty — so this is the
+    /// live one until a driver fills that in.
+    fn codegen_backend(&self) -> Option<&'static str> {
+        None
+    }
 
     /// The KV pages this driver can hand to another node, if any.
     ///

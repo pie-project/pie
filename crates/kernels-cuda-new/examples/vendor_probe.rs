@@ -94,7 +94,7 @@ mod imp {
 
     use cudarc::driver::sys as dr;
     use cudarc::nvrtc::sys as nv;
-    use kernels_cuda_new::source::{self, ALL_HEADERS, LIBRARY, VENDOR};
+    use kernels_cuda_new::source::{self, ALL_HEADERS, LIBRARY, SHIM, VENDOR};
 
     // -----------------------------------------------------------------------
     // the candidates
@@ -127,7 +127,7 @@ mod imp {
     /// a guard is an edit to SOMEBODY ELSE'S source that a strip reverses, and
     /// `MODIFICATIONS` counts it against the rebase budget. A shim patch is an
     /// edit to a file this crate wrote, which costs nothing on a rebase and
-    /// everything in review — `csrc/vendor/cstdint`'s own header argues at
+    /// everything in review — `csrc/shim/cstdint`'s own header argues at
     /// length that its macro surface is *"deliberately NOT here"*, so a line
     /// added to it is a decision, not a typo fix.
     struct ShimPatch {
@@ -270,12 +270,21 @@ namespace fm = ::flashinfer::mamba;
     /// **Row 2.** Multi-GPU, staged from upstream.
     ///
     /// `AllReduceFusionPattern::kARResidualRMSNorm` and `fp32_acc = true` are
-    /// what `custom_all_reduce.cu:656-661` sets; `NRanks` is a template
-    /// argument the launcher takes from `world_size_`, and 2 is the smallest
-    /// value the dispatch instantiates.
+    /// what the launcher set; `NRanks` is a template argument taken from the
+    /// world size, and 2 is the smallest value the dispatch instantiates.
+    ///
+    /// The C++ that stated all of this is DELETED — `custom_all_reduce.cu`
+    /// held zero `__global__` and is `driver-cuda/src/fire/all_reduce.rs`
+    /// now, where the same four values are
+    /// `fire::all_reduce::REACHED` and the cross product is
+    /// `UPSTREAM_POINTS` / `AOT_POINTS_AFTER_PRUNING`. **This probe is
+    /// unaffected**: what it asks is whether the vendored tree can compile
+    /// upstream's kernels, and that question is about
+    /// `flashinfer/comm/trtllm_allreduce_fusion.cuh`, which `csrc/vendor/`
+    /// still does not carry.
     const TRTLLM: Candidate = Candidate {
         row: "comm::all_reduce_residual_rmsnorm_bf16",
-        launcher: "kernels-cuda/csrc/src/comm/custom_all_reduce.cu:153-158, :623",
+        launcher: "driver-cuda/src/fire/all_reduce.rs::CustomAllReduce::all_reduce_residual_rmsnorm_bf16",
         roots: &["flashinfer/comm/trtllm_allreduce_fusion.cuh"],
         source: r#"
 #include <cuda_bf16.h>
@@ -283,13 +292,14 @@ namespace fm = ::flashinfer::mamba;
 namespace fa = ::flashinfer::trtllm_allreduce_fusion;
 "#,
         wanted: || {
-            // `kernels.def` fixes the pattern at `kARResidualRMSNorm` -- pie
-            // reaches exactly one of upstream's ten -- and `custom_all_reduce.
-            // cu:184-197` turns `fp32_acc` into `Fp32Acc`. `NRanks` stays
-            // fully instantiated because TP world size is a deployment choice,
-            // and `TriggerCompletionAtEnd` is upstream's own default-true axis
+            // The pattern is fixed at `kARResidualRMSNorm` -- pie reaches
+            // exactly one of upstream's ten -- and `fp32_acc` becomes the
+            // `Fp32Acc` template argument. `NRanks` stays fully instantiated
+            // because TP world size is a deployment choice, and
+            // `TriggerCompletionAtEnd` is upstream's own default-true axis
             // that `allreduce_fusion_kernel_launcher` picks from
-            // `launch_with_pdl`.
+            // `launch_with_pdl`. All four axes are
+            // `fire::all_reduce::{INSTANTIATED, NRANKS, Leaf}` now.
             let mut out = Vec::new();
             for nranks in [2u32, 4, 8, 16] {
                 for acc in ["false", "true"] {
@@ -1270,8 +1280,9 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
         println!("NVRTC version:  {}", version());
         println!("architecture:   {arch}");
         println!(
-            "carried set:    {} headers ({} library + {} vendored), {} bytes",
+            "carried set:    {} headers ({} shim + {} library + {} vendored), {} bytes",
             ALL_HEADERS.len(),
+            SHIM.len(),
             LIBRARY.len(),
             VENDOR.len(),
             ALL_HEADERS.iter().map(|h| h.text.len()).sum::<usize>()

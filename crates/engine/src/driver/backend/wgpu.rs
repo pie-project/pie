@@ -145,7 +145,11 @@ impl WgpuDriver {
     /// asking here means a deployment finds out from its configuration rather
     /// than from its first request.
     pub fn create(config_bytes: &[u8]) -> Result<Self> {
-        let kv_pages = boot_kv_pages(config_bytes);
+        // ONE READER of the document, in `crate::driver::boot`. The default
+        // stays HERE because it is this backend's: see `DEFAULT_KV_PAGES`.
+        let kv_pages = crate::driver::BootConfig::parse(config_bytes)
+            .kv_pages
+            .unwrap_or(DEFAULT_KV_PAGES);
 
         let device = driver_wgpu::device::Device::open()
             .map_err(|e| anyhow!("driver-wgpu: no adapter: {e}"))?;
@@ -183,8 +187,6 @@ impl WgpuDriver {
         })
     }
 
-
-
     /// The shell, or a message saying which verb was called before a load.
     fn shell(&mut self, what: &'static str) -> Result<&mut driver_wgpu::shell::Shell> {
         self.shell.as_mut().ok_or_else(|| {
@@ -195,17 +197,6 @@ impl WgpuDriver {
             )
         })
     }
-
-
-
-
-
-
-
-
-
-
-
 
     /// A driver with no adapter behind it, for the verbs that do not need one.
     ///
@@ -329,68 +320,21 @@ impl Driver for WgpuDriver {
                 .hold(&name, &bytes)
                 .map_err(|e| anyhow!("driver-wgpu: `{name}` would not stage: {e}"))?;
         }
-        let shape = shell.shape();
-        self.shell = Some(shell);
-        Ok(::driver_api::DriverCapabilities {
-            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
-            total_pages: shape.pages,
-            kv_page_size: shape.page_size,
-            // No swap pool and no recurrent-state cache: this driver has
-            // neither, and `copy_state` refuses by name for the same reason.
-            swap_pool_size: 0,
-            // Device to device, and only that. `Pool::copy_plan` moves whole
-            // pages and single rows inside the one KV buffer -- which is what a
-            // prefix-cache hit is -- and refuses any plan whose ends are not
-            // both this driver's own domain. Host directions stay off: there is
-            // no swap pool, so a device-to-host copy has nowhere to land.
-            kv_copy_domain_mask: ::driver_api::KV_COPY_DEVICE_TO_DEVICE,
-            rs_cache_required: false,
-            rs_cache_slots: 0,
-            rs_cache_slot_bytes: 0,
-            // Not elastic. `resize_pool` here reallocates the KV buffer whole,
-            // so nothing can be given back page-wise, and both numbers are zero
-            // together -- which is the condition `bootstrap` reads before it
-            // starts a trim task at all. WebGPU has no sparse binding, so
-            // unlike Vulkan this is not a declined optional feature: there is
-            // nothing to decline.
-            elastic_page_bytes: 0,
-            elastic_budget_pages: 0,
-            has_mtp_logits: false,
-            has_mtp_drafts: false,
-            has_value_head: false,
-            // Sinks this backend cannot honour. Every one of them would bind
-            // and then run as a silent no-op, which is worse than a refusal at
-            // the door.
-            has_kv_envelopes: false,
-            has_attn_score: false,
-            has_attn_page_mask: false,
-            has_lora: false,
-            model_site_summary: ::driver_api::ModelSiteSummary::default(),
-            device_geometry_port_mask: 0,
-            // The ceilings a batch is formed under. `Shell::open` sizes one
-            // fire's scratch from `Deployment::seam`, and a fire wider than
-            // this has nothing to run in.
-            max_forward_tokens: 4096,
-            max_forward_requests: 256,
-            max_page_refs: shape.pages,
-            // The row's answers, not a config's: the checkpoint was identified
-            // once and these come from that identification.
+        let facts = ::driver_api::ModelFacts {
+            // The row's answers, not a config's: the checkpoint was
+            // identified once, above, and these come from that
+            // identification. They are the ONLY half of the capabilities this
+            // side still authors -- the driver states the rest about itself.
             arch_name: deployment.advertised.arch.to_string(),
             model_id: row.id().to_string(),
             vocab_size: deployment.shape.vocab,
             max_model_len: deployment.advertised.max_model_len,
-            activation_dtype: "bf16".to_string(),
             hidden_size: deployment.shape.hidden,
-            // False about the BACKEND rather than about the row: there is no
-            // encode entry point here at all, so a model with a vision tower is
-            // served as its text half.
-            supports_media_encode: false,
             snapshot_dir: path.display().to_string(),
-            kv_handle: None,
-            // The shaders are in the rlib and `naga` compiles them; nothing
-            // upstream generates a kernel for this driver.
-            codegen_backend: String::new(),
-        })
+        };
+        let capabilities = shell.capabilities(&facts);
+        self.shell = Some(shell);
+        Ok(capabilities)
     }
 
     /// Register a PTIR program: its launch package and its emitted kernels.
@@ -418,10 +362,7 @@ impl Driver for WgpuDriver {
     /// # Errors
     ///
     /// A shape the registry will not serve, or a duplicate id.
-    fn register_channel(
-        &mut self,
-        desc: &ChannelRegistrationPlan,
-    ) -> Result<RegisteredChannel> {
+    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
         let binding = self
             .programs
             .register_channel(desc)
@@ -607,33 +548,6 @@ impl Driver for WgpuDriver {
         self.programs.close_channel(id);
         Ok(())
     }
-}
-
-/// How many KV pages the boot TOML asks for.
-///
-/// Its own function, deviceless, for the reason the Vulkan seam's `boot_of`
-/// gives beside it: this is a CONTRACT with the worker, which writes the
-/// document (`embedded_driver::wgpu_startup_toml`), and a contract with one
-/// reader and no test is one that gets discovered broken by a server booting
-/// at a pool size nobody asked for.
-///
-/// One number where Vulkan reads two, because there is no module directory to
-/// find -- the shaders are in the rlib. The BYTES are the document and not a
-/// path to it; `create_driver_backend` hands over the text for that reason,
-/// and `worker`'s `a_parsing_seam_is_handed_the_text_that_was_written` is the
-/// other end of the same claim.
-///
-/// A document that does not parse, or one that states no `[model] kv_pages`,
-/// gets [`DEFAULT_KV_PAGES`] rather than an error: a hand-written config is
-/// entitled to leave the number out, and zero pages is not a cache.
-fn boot_kv_pages(config_bytes: &[u8]) -> u32 {
-    std::str::from_utf8(config_bytes)
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|v| v.get("model")?.get("kv_pages")?.as_integer())
-        .and_then(|n| u32::try_from(n).ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_KV_PAGES)
 }
 
 /// The one rope base this shell can build a ladder at.
@@ -1139,44 +1053,6 @@ mod tests {
                 "`{id}` binds no embedding: {names:?}"
             );
         }
-    }
-
-    /// The boot document the worker writes is the boot document this seam
-    /// reads.
-    ///
-    /// Two crates, one document, and no shared type between them:
-    /// `worker`'s `wgpu_startup_toml` puts `kv_pages` under `[model]`, and
-    /// this reads it from there. Nothing in the compiler connects the two -- a
-    /// key moved to `[batching]`, which is where the Metal writer keeps its
-    /// page geometry and so the obvious thing to copy, would boot at this
-    /// seam's own default with no complaint, and an operator who asked for a
-    /// bigger cache would get 1024 pages and no sign the number was ignored.
-    ///
-    /// The literal TOML is that document's shape written out by hand on
-    /// purpose. Calling the worker's writer would be the same mistake as
-    /// sharing a type: the point is that the two agree, and a test that
-    /// derives one from the other cannot say so.
-    #[test]
-    fn the_boot_document_the_worker_writes_is_the_one_this_seam_reads() {
-        assert_eq!(
-            boot_kv_pages(
-                br#"[model]
-kv_pages = 4096
-"#
-            ),
-            4096
-        );
-        // The shapes that are NOT an error, each for its own reason: a
-        // hand-written config that says nothing, and a document that does not
-        // parse at all -- which is what a PATH looks like from in here, and
-        // the reason the worker hands over the text.
-        assert_eq!(boot_kv_pages(b"[model]\n"), DEFAULT_KV_PAGES);
-        assert_eq!(
-            boot_kv_pages(b"/home/someone/.pie/launch/0/driver.toml"),
-            DEFAULT_KV_PAGES
-        );
-        // And zero, which parses and is not a cache.
-        assert_eq!(boot_kv_pages(b"[model]\nkv_pages = 0\n"), DEFAULT_KV_PAGES);
     }
 
     /// The two targets this shell can sit on compile one load plan.

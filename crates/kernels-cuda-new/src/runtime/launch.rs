@@ -101,9 +101,12 @@
 //!
 //! [`Rule::RoutedQmv`] was on that list and has come off it. The reading that
 //! put it there was about dense projections and was never checked against the
-//! MoE decode path, where `quant/dequant_wna16.cu:74` launches
+//! MoE decode path, where `quant/dequant_wna16.cu:74` launched
 //! `dim3(routes, ceil(intermediate / 8))` at 256 — a grid that is a function
-//! of the rectangle and nothing else. A refusal citing the launcher it could
+//! of the rectangle and nothing else. That launcher has since been deleted as
+//! unreached (§43.9) and the rule outlived it, which is the ordinary way
+//! round here: the row is what fires now, and `quant/dequant_wna16.cuh:295`
+//! is where the axis assignment is read back. A refusal citing the launcher it could
 //! not find is cheap to overturn the day someone finds one, which is the
 //! whole of why they are written that way.
 //!
@@ -141,7 +144,9 @@
 //! [`Rule::RowsPackedHeads`], [`Rule::RowsPackedHeadsNarrow`] and
 //! [`Rule::WarpPackedHeads`] from `attn/qkv_fused.cu`,
 //! [`Rule::RoutedQmvTransposed`] from `quant/dequant_wna16.cu` and
-//! [`Rule::AltUpStreams`] from `norm/altup.cu`. **Two of them needed a
+//! [`Rule::AltUpStreams`] from `norm/altup.cu` — **both of those source
+//! launchers have since been deleted as unreached (§43), which is what a
+//! routed row is FOR; the rules and the kernels are untouched.** **Two of them needed a
 //! [`Dims`] field and both fields are DISTINCT QUANTITIES rather than second
 //! readings** — [`Dims::requests`] and [`Dims::altup_streams`], each of which
 //! says in its own doc which existing field it would otherwise have
@@ -707,8 +712,9 @@ const LAYERNORM_BLOCK: u32 = 128;
 /// pinned in three places at once.
 const PAGED_BLOCK: u32 = 128;
 
-/// AltUp's block — `csrc/src/norm/altup.cu`'s `constexpr int BLOCK = 128;`,
-/// spelled once above both launchers.
+/// AltUp's block — the deleted `csrc/src/norm/altup.cu`'s
+/// `constexpr int BLOCK = 128;`, which was spelled once above both launchers
+/// and is now spelled only here, because §43 took the file.
 ///
 /// A SIXTH 128, and the one that is purely a TILE: it divides the third grid
 /// axis and nothing else. The kernels stride nothing and share nothing — one
@@ -891,7 +897,9 @@ fn elementwise_in(n: u32) -> Launch {
 
 /// `ceil(rows / 256)` blocks of [`BLOCK`] — ONE THREAD per row.
 ///
-/// `moe/dsv4_routing.cu`, `hash_route_lookup_bf16`, at `57-60`:
+/// `moe/dsv4_routing.cu`, `hash_route_lookup_bf16`, at `39-40` of the file as
+/// it stood when DELETED (the citation used to read `57-60`, before §43.9
+/// took the sibling router's launcher out from above it):
 ///
 /// ```text
 /// // One thread per token, not one block: the kernel's whole body is a table
@@ -915,14 +923,29 @@ fn elementwise_in(n: u32) -> Launch {
 /// row is 256 times the blocks a thread-per-row grid asks for, correct only
 /// because these kernels bounds-check their own index.
 ///
-/// Three more launchers are this shape to the digit:
-/// `layout/geometry.cu`'s `derive_kv_len` at `29-31` and `resolve_slot_to_block`
-/// at `45-47`, both `<<<(n + kThreads - 1) / kThreads, kThreads>>>` with
-/// `kThreads = 256`, and `quant/quant_bf16_to_fp8.cu`'s `absmax_to_scale_inv`
-/// at `94-96` and `149-151`, `<<<(rows + BLOCK - 1) / BLOCK, BLOCK>>>`.
-/// The two in `layout/geometry.cu` stay rowless for a reason that is not
-/// geometry: they are composed by the driver from no statement, so there is
-/// nothing to state a rule ON.
+/// Three more launchers were this shape to the digit, and one pair has since
+/// gone: `layout/geometry.cu`'s `derive_kv_len` and `resolve_slot_to_block`,
+/// both `<<<(n + kThreads - 1) / kThreads, kThreads>>>` with
+/// `kThreads = 256`, were deleted with their file (§43) — they had no row, so
+/// no shim entry, and no C++ caller either. They stayed rowless for a reason
+/// that was never geometry: they are composed by the driver from no
+/// statement, so there was nothing to state a rule ON, and that is also why
+/// deleting them cost no row. `layout/geometry.cuh` still holds both
+/// `__global__`s, so the shape above is still readable there.
+/// The pair that remains is `quant/quant_bf16_to_fp8.cu`'s
+/// `absmax_to_scale_inv` at `94-96` and `149-151`,
+/// `<<<(rows + BLOCK - 1) / BLOCK, BLOCK>>>`.
+///
+/// # The one row this rule has, and where its host went
+///
+/// `moe::hash_route_lookup_dev` in [`crate::families::moe`] is the only real
+/// member, and its `.cu` is deleted: the host is
+/// `driver-cuda/src/fire/dsv4_routing.rs`, which states the same three
+/// numbers from the same `<<<>>>`. The rule STAYS on the row rather than
+/// being retired with the file. A rule and a Rust launcher stating one
+/// rectangle is a check and not a duplication — either can be read against
+/// the other, which is exactly what nothing could do while the transcription
+/// lived only in a `.cu` nobody diffed against it.
 fn rows_flat(rows: u32) -> Launch {
     Launch {
         grid: [rows.div_ceil(BLOCK), 1, 1],
@@ -934,7 +957,7 @@ fn rows_flat(rows: u32) -> Launch {
 /// A capped grid-stride slab — `min(ceil(units / 256), 1024)` blocks of
 /// [`BLOCK`], where `units` is the count of [`SLAB_VEC`]-wide loads.
 ///
-/// `quant/dequant_wna16.cu`, `bf16_to_fp16`, at `116-124`:
+/// `quant/dequant_wna16.cu`, `bf16_to_fp16`, at `63-75`:
 ///
 /// ```text
 /// constexpr int BS = 256;
@@ -1725,17 +1748,21 @@ fn rope(rows: u32, q_heads: u32, kv_heads: u32, head_dim: u32) -> Launch {
 ///
 /// So this serves the 64-wide routers and only those: `topk_softmax`,
 /// `router_topk_softmax` and both `topk_sigmoid_bias` instantiations.
-/// `moe/topk_sigmoid.cu`'s `topk_sigmoid` is 128 and `moe/dsv4_routing.cu`'s
-/// `topk_sqrtsoftplus` is 256 — same shape, different static arrays, and the
-/// vocabulary has no way to say "this rule at that width". They keep their
-/// launchers, and that is reported rather than approximated.
+/// `moe/topk_sigmoid.cu`'s `topk_sigmoid` was 128 and `moe/dsv4_routing.cu`'s
+/// `topk_sqrtsoftplus` 256 — same shape, different static arrays, and the
+/// vocabulary has no way to say "this rule at that width". Both launchers
+/// have since gone (§43): the rows are routed, so the shim held no entry for
+/// either and nothing else called them, and the widths now live only in
+/// `moe/topk_sigmoid.cuh` and `moe/dsv4_routing.cuh` where the JIT reads
+/// them. This rule still does not carry them, for the same reason.
 fn router_lane(rows: u32) -> Launch {
     Launch { grid: [rows, 1, 1], block: [ROUTER_BLOCK, 1, 1], smem: 0 }
 }
 
 /// ONE block, whatever the rows, with the sort's counters in shared memory.
 ///
-/// `moe/moe_dispatch.cu`, `moe_align_decode`:
+/// `moe/moe_dispatch.cu`, `moe_align_decode`, as it read before §43 deleted
+/// it as unreached — the row is routed and the kernel is unchanged:
 ///
 /// ```text
 /// constexpr int BS = 1024;
@@ -1764,6 +1791,13 @@ fn router_lane(rows: u32) -> Launch {
 /// extra words. This rule hands it 132 bytes it will not read, which is a
 /// dynamic allocation being larger than the kernel's use of it — legal, and
 /// the direction of the error that is not a silent one.
+///
+/// **That file is now DELETED and `moe_bucket_exact`'s host is
+/// `driver-cuda/src/fire/moe_dispatch.rs`, which states `(3E + 1) * 4`
+/// exactly.** The rule stays on the device row
+/// `moe::moe_bucket_exact_dev`, still over-allocating and still safe; the
+/// 33-word gap is what made that symbol a `Control::Supplies` walk rather
+/// than a row anyone could have finished sourcing.
 fn router_sort(n_experts: u32) -> Result<Launch, Ungeometric> {
     let words = n_experts
         .checked_mul(3)
@@ -1777,7 +1811,10 @@ fn router_sort(n_experts: u32) -> Result<Launch, Ungeometric> {
 /// experts_per_token, ceil(width / 8))` at [`BLOCK`] threads, one warp per
 /// output column.
 ///
-/// `quant/dequant_wna16.cu`, `wna16_moe_gate_up_decode_bf16`, at `70-75`:
+/// `quant/dequant_wna16.cu`'s `wna16_moe_gate_up_decode_bf16` **has since been
+/// deleted** (§43.9) — it was routed, so `abi::emit_c_shim` emitted no entry
+/// for it, and it had no C++ caller. What it read, transcribed here before it
+/// went, was:
 ///
 /// ```text
 /// const int routes = num_tokens * top_k;
@@ -1788,10 +1825,19 @@ fn router_sort(n_experts: u32) -> Result<Launch, Ungeometric> {
 /// device::wna16_gate_up_decode<<<grid, DECODE_BLOCK, 0, stream>>>(...);
 /// ```
 ///
-/// with `DECODE_BLOCK = 256`, so `GU_WARPS` is 8 and the divisor is the
-/// block's warp count. **This was refused for having no launcher and the
-/// refusal was stale**: the module header said *"this backend has no
-/// affine-quantized matvec `<<<>>>` at all"*, which is true of the DENSE
+/// with `DECODE_BLOCK = 256` — the one line of it that survives, at
+/// `quant/dequant_wna16.cu:23` — so `GU_WARPS` is 8 and the divisor is the
+/// block's warp count. The two guards are host facts and this rule keeps
+/// them: the `routes <= 0` arm is [`Ungeometric::Empty`], and the
+/// `hidden % 8` / `hidden % group_size` arm is the caller's, because a JIT
+/// fire has no early-return to fall into. The AXIS ASSIGNMENT — routes on
+/// `x`, intermediate tiles on `y` — is now witnessed by the kernel itself at
+/// `quant/dequant_wna16.cuh:295` and `:298`, which is what
+/// `tests/launch_rules.rs` pins.
+///
+/// **This was refused for having no launcher and the refusal was stale**: the
+/// module header said *"this backend has no affine-quantized matvec `<<<>>>`
+/// at all"*, which is true of the DENSE
 /// projections — cuBLAS and Marlin, a library call and a host heuristic — and
 /// was never true of the MoE decode path, whose grid is a function of the
 /// rectangle and nothing else. [`Rule::Qmv`] and [`Rule::Qmm`] stay refused
@@ -1820,18 +1866,23 @@ fn router_sort(n_experts: u32) -> Result<Launch, Ungeometric> {
 /// [`Ungeometric::Empty`] for one that does not.
 ///
 /// Three launchers this rule was asked to carry and does not — the fourth,
-/// `wna16_down_decode`, is [`Rule::RoutedQmvTransposed`] now:
+/// `wna16_down_decode`, is [`Rule::RoutedQmvTransposed`] now. All three were
+/// deleted with their host files in §43; the kernels they launched are still
+/// in `quant/dequant_fp4.cuh`, and the refusals are re-pinned there:
 ///
-/// * `quant/dequant_fp4.cu`'s `mxfp4_moe_gate_up_decode<4>` at `67-72` and
-///   `mxfp4_moe_down_decode<4>` at `152-158`, both `<<<grid, 128>>>` over a
-///   divisor of `warps * kPairs = 16`. Half the block and twice the tile, so
-///   one rule serving both would halve one grid or double the other.
-/// * `mxfp4_moe_gate_up_decode_grouped<kTok>` at `98-135`, whose `grid.x` is
-///   an EXPERT count (`dim3 grid(num_experts, ...)` at `102-103`) and whose
-///   `kTok` comes from `std::getenv("PIE_MXFP4_MOE_KTOK")` at `108-111`
-///   through a switch of four cases and a default of 4 at `122-135`. An
-///   environment variable is not an extent of the rectangle, and a rule that
-///   read one would state a grid that changes with the shell.
+/// * `quant/dequant_fp4.cu`'s `mxfp4_moe_gate_up_decode<4>` and
+///   `mxfp4_moe_down_decode<4>`, both `<<<grid, 128>>>` over a divisor of
+///   `warps * kPairs = 16`. Half the block and twice the tile, so one rule
+///   serving both would halve one grid or double the other. The three
+///   constants that state it survive at `dequant_fp4.cu:39`, `:42` and `:44`.
+/// * `mxfp4_moe_gate_up_decode_grouped<kTok>`, whose `grid.x` was an EXPERT
+///   count and whose `kTok` came from `std::getenv("PIE_MXFP4_MOE_KTOK")`
+///   through a switch of four cases and a default of 4. An environment
+///   variable is not an extent of the rectangle, and a rule that read one
+///   would state a grid that changes with the shell. The kernel reads its
+///   expert off `blockIdx.x` at `quant/dequant_fp4.cuh:471` and takes
+///   `kPairs = 2` at `:469`, so both halves of the refusal outlived the
+///   `getenv` that motivated it.
 fn routed_qmv(routes: u32, width: u32) -> Launch {
     Launch {
         grid: [routes, width.div_ceil(BLOCK / WARP), 1],
@@ -1913,7 +1964,9 @@ fn routed_qmv_quad(routes: u32, width: u32) -> Launch {
 /// [`routed_qmv`]'s two axes swapped — `dim3(ceil(width / 8), routes)` at
 /// [`BLOCK`] threads.
 ///
-/// `quant/dequant_wna16.cu:101-104`:
+/// `quant/dequant_wna16.cu:101-104`, as it read before §43.9 deleted the
+/// launcher as unreached — `quant/dequant_wna16.cuh:371` and `:374` are the
+/// surviving witness that this leg swaps the axes:
 ///
 /// ```text
 /// constexpr int BS = 256;
@@ -2312,7 +2365,9 @@ fn warp_packed_heads(rows: u32, packed_heads: u32) -> Result<Launch, Ungeometric
 /// A third grid axis over an ALTUP STREAM count — `dim3(rows, streams,
 /// ceil(hidden / 128))` at [`ALTUP_BLOCK`] threads, nothing shared.
 ///
-/// `csrc/src/norm/altup.cu`, both launchers, identical:
+/// `csrc/src/norm/altup.cu`, both launchers, identical — **as they read
+/// before §43 deleted the file**; `norm/altup.cuh:83-85` and `:113-115` are
+/// what witnesses the axis order now:
 ///
 /// ```text
 /// :18  const dim3 grid(T, K, (H + BLOCK - 1) / BLOCK);

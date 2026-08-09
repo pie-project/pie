@@ -2,7 +2,7 @@
 //!
 //! # The question this answers, and why compiling is not it
 //!
-//! `csrc/src/cuda_fp16.h` and `csrc/src/cuda_bf16.h` answer FlashInfer's
+//! `csrc/shim/cuda_fp16.h` and `csrc/shim/cuda_bf16.h` answer FlashInfer's
 //! `#include <cuda_fp16.h>` and `#include <cuda_bf16.h>` out of the header set
 //! carried in the binary, because NVRTC 13.0 was measured refusing all 31
 //! external includes of the attention closure and reading `$CUDA_HOME` at
@@ -121,8 +121,8 @@ mod probe {
     /// `include_str!` and not a read: the bytes compared here are the bytes
     /// that ship, so a probe that passed against a file on disk while the
     /// binary carried something else would be measuring the wrong header.
-    const CUDA_FP16: &str = include_str!("../csrc/src/cuda_fp16.h");
-    const CUDA_BF16: &str = include_str!("../csrc/src/cuda_bf16.h");
+    const CUDA_FP16: &str = include_str!("../csrc/shim/cuda_fp16.h");
+    const CUDA_BF16: &str = include_str!("../csrc/shim/cuda_bf16.h");
 
     /// The instruction the sensitivity check corrupts, and what it becomes.
     ///
@@ -383,7 +383,7 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
             return 1;
         };
 
-        println!("halftype_parity -- csrc/src/cuda_fp16.h and cuda_bf16.h against NVIDIA's\n");
+        println!("halftype_parity -- csrc/shim/cuda_fp16.h and cuda_bf16.h against NVIDIA's\n");
         println!("  device        {} ({arch})", device_name());
         println!("  NVRTC         {}", nvrtc_version());
         let Some(nvcc) = find_nvcc() else {

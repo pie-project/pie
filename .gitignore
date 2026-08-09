@@ -216,3 +216,5 @@ pie-tart
 
 # Staged by kernels-metal/build.rs from tensor-compiler; generated, not a source.
 crates/kernels-metal/kernels/ptir/ptir_rng.generated.metal
+/.recovered/
+/.orig_gemm.cpp

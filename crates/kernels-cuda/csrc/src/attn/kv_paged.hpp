@@ -16,49 +16,14 @@
 
 namespace pie_cuda_driver::kernels::attn {
 
-void write_kv_to_pages_bf16(
-    void* k_pages,                                 // NHD: [pages, page_size, h_kv, d]; HND: [pages, h_kv, page_size, d]
-    void* v_pages,
-    const void* k_curr,                            // [total_tokens, h_kv, d]
-    const void* v_curr,
-    const std::uint32_t* qo_indptr,                // [R+1]
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,           // [R+1]
-    const std::uint32_t* kv_last_page_lens,        // [R]
-    int total_tokens,
-    int num_requests,
-    int page_size,
-    int num_kv_heads,
-    int head_dim,
-    bool hnd_layout,
-    cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr,
-    // Skip the first `first_token` tokens (a fused QKV kernel already wrote
-    // their K/V — the hook-free fast prefix). Indexing stays absolute.
-    int first_token = 0);
+// `write_kv_to_pages_bf16` and `write_kv_to_pages` are DECLARED NOWHERE now,
+// because they are defined nowhere: both are Rust, in
+// `driver-cuda/src/fire/kv_paged.rs`. `attn::write_kv_to_pages` is still a
+// live `table::attn` row reached from model text -- what changed is that
+// `execution::RUST_SERVED` routes its generated arm to
+// `bind::service::attn_write_kv_to_pages` instead of to a `pie_k_` shim body
+// that called the launcher this declaration used to name.
 
-void write_kv_to_pages(
-    KvCacheLayerView layer,
-    const void* k_curr,                            // [total_tokens, h_kv, d]
-    const void* v_curr,
-    const std::uint32_t* qo_indptr,                // [R+1]
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,           // [R+1]
-    const std::uint32_t* kv_last_page_lens,        // [R]
-    int total_tokens,
-    int num_requests,
-    cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr,
-    // Non-zero only on the native-bf16 cache (throws otherwise): the skipped
-    // prefix is owned by the fused decode QKV kernel.
-    int first_token = 0);
-
-// Peel device-window variant (TAIL form) of the CSR-derived append: the
-// {start, len} token window rides in device memory; the grid spans every
-// token (`n_max`) and out-of-window rows early-out, so a captured launch
-// replays across row splits (the host form bakes the split as
-// `first_token` + a split-dependent grid). Indexing stays absolute.
-// Native-bf16 cache only; envelope maintenance not wired (throws).
 // `write_kv_to_pages_bf16_devwin` and `write_kv_to_pages_at_positions_bf16`
 // WERE declared here. Both launchers are deleted: nothing reachable called
 // either, and the kernels they fired are `attn/kv_paged.cuh`'s and are still
@@ -70,113 +35,43 @@ void dequant_kv_cache_layer_to_bf16_active(
     int num_pages_in_batch,
     cudaStream_t stream);
 
-// Explicit-descriptor KV write (the general WSlot/WOff lowering; formerly
-// write_kv_beam): each lane writes its ONE new-token K/V into an EXPLICIT
-// (physical page id `w_page[lane]`, offset `w_off[lane]`) target, consuming a
-// program's WSlot/WOff (write-offset separated from KvLen) rather than
-// re-deriving the position from the page-table + last_page_len. Single-cell per
-// lane → shared-page-safe (a sibling's mask hides this cell). Requires a
-// native-bf16 KV cache. `w_page` must already be PHYSICAL page ids (resolve
-// slot→physical before the call).
-// Peel device-window variant: the {start, len} row window rides in
-// device memory so a captured launch replays across row splits; grid
-// is the full lane count, out-of-window rows early-out. Envelope
-// (quest) maintenance is not wired on this variant yet.
-void write_kv_explicit_bf16_devwin(
-    KvCacheLayerView layer,
-    const void* k_curr,
-    const void* v_curr,
-    const std::uint32_t* w_page,
-    const std::uint32_t* w_off,
-    const std::uint32_t* win_d,
-    int n_max,
-    cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr);
+// `write_kv_explicit_bf16_devwin`'s declaration is GONE with its definition.
+// The Rust is `fire::kv_paged::write_kv_explicit_bf16_devwin`, reached
+// through `bind::service::attn_write_kv_explicit_bf16_devwin`; the DEVICE
+// rows it fires are `attn::write_kv_explicit_bf16_devwin_dev#hnd`/`#nhd`,
+// renamed by §60.6 for exactly the reason the sibling above was.
+//
+// The contract paragraph that stood here is not lost -- it is the doc comment
+// on the Rust, which reproduces both `throw` messages verbatim and both
+// `<<<>>>` lines by number. What it said: each lane writes its ONE new-token
+// K/V into an EXPLICIT (physical page id `w_page[lane]`, offset
+// `w_off[lane]`) target, consuming a program's WSlot/WOff rather than
+// re-deriving the position from the page table; single-cell per lane, so
+// shared-page-safe; requires a native-bf16 KV cache; `w_page` must already be
+// PHYSICAL page ids. The `_devwin` part: the `{start, len}` row window rides
+// in DEVICE memory so a captured launch replays across row splits, the grid
+// is the full lane count, and out-of-window rows early-out. Envelope (quest)
+// maintenance is not wired on this variant.
 
-void write_kv_explicit_bf16(
-    KvCacheLayerView layer,
-    const void* k_curr,                 // [LANES, h_kv, d]
-    const void* v_curr,
-    const std::uint32_t* w_page,        // [LANES] physical page id per lane
-    const std::uint32_t* w_off,         // [LANES] offset-in-page per lane
-    int B,
-    cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr);
+// `write_kv_explicit_bf16`'s declaration is GONE with its definition, for
+// the reason above and one more: its envelope merge was one of the two call
+// sites holding `layout/envelope.hpp` in `kv_paged.cu`. The Rust is
+// `fire::kv_paged::write_kv_explicit_bf16`; the DEVICE rows it fires are
+// `attn::write_kv_explicit_bf16_dev#hnd`/`#nhd`, renamed by §60.6 so the
+// ahead-of-time symbol a trace records could become a `Walk`.
 
-// Compaction primitive (Design-B lazy GC): move N token KV cells (single layer)
-// from explicit (src physical page, src offset) → (dst physical page, dst offset)
-// targets, for both K and V. Raw element copy — correct because the KV cache is
-// stored POST-RoPE (slot = pure storage; positions live in the per-beam mask).
-// Caller guarantees DISJOINT src/dst spans (in-place two-pointer) so one pass
-// needs no scratch. Invoke per layer to move all layers. Native-bf16 KV.
-void copy_kv_cells_bf16(
-    KvCacheLayerView layer,
-    const std::uint32_t* dst_page,      // [N] physical page id per cell
-    const std::uint32_t* dst_off,       // [N] offset-in-page per cell
-    const std::uint32_t* src_page,      // [N] physical page id per cell
-    const std::uint32_t* src_off,       // [N] offset-in-page per cell
-    int N,
-    cudaStream_t stream);
+// `copy_kv_cells_bf16`'s declaration is GONE with its definition; the
+// contract paragraph that stood here -- Design-B lazy GC, raw element copy
+// correct because the cache is stored POST-RoPE, caller guarantees DISJOINT
+// src/dst spans so one in-place two-pointer pass needs no scratch, invoke per
+// layer -- is carried verbatim on `fire::kv_paged::copy_kv_cells_bf16`, which
+// is what fires the two device rows now. `kv_paged.cu` has the consumer-set
+// evidence.
 
-// ── Sliding-window page trim ───────────────────────────────────────────
-// A paged decode kernel handed a `window_left` still WALKS every page it is
-// given and masks what falls outside; the window buys arithmetic, not traffic.
-// Measured on an H100 at gpt-oss's decode shape (8 kv heads, gqa 8, head_dim
-// 64, window 128), cost is perfectly linear in context -- 10.2us at 256, 136us
-// at 4096 -- for a window that never grows. The fix is to hand the kernel a
-// shorter page list, which is a PLAN-level change: a decode query sits at the
-// END of its range, so dropping whole pages off the FRONT leaves the last
-// `window+1` tokens exactly where they were and `window_left` keeps masking
-// correctly against the same absolute positions.
-//
-// Builds the trimmed page view ENTIRELY on the device: per request it keeps
-// the last `min(have, keep_pages)` page ids and writes the matching indptr.
-//
-// Device-side is the whole point. A host-computed page count is a constant by
-// the time it reaches a captured graph, and this decision is not constant: a
-// context crosses `keep_pages` as it grows, and graphs are shared between
-// requests of different lengths. Baking `keep` in and replaying it against a
-// shorter request underflows `src_end - keep` and reads wild memory.
-//
-// `dst_indices` must hold `R * keep_pages` entries -- the worst case, which
-// depends only on the batch shape.
-void build_window_page_view(
-    const std::uint32_t* src_indices,   // [src_indptr[R]] physical page ids
-    const std::uint32_t* src_indptr,    // [R+1] device
-    int keep_pages,
-    std::uint32_t* dst_indptr,          // [R+1] out
-    std::uint32_t* dst_indices,         // [R * keep_pages] out
-    int R,
-    cudaStream_t stream);
+// `build_window_page_view` was declared here and IS DELETED — the host program is
+// `driver-cuda/src/fire/kv_paged.rs::build_window_page_view`.
 
-// ── Full-attention KV split view ───────────────────────────────────────
-// Splits ONE request's page range into `splits` consecutive slices and emits
-// the indptr/last-page-length pair that describes them as `splits` separate
-// one-token requests. A decode query sits at the end of whatever range it is
-// handed, so a query fired against a slice attends to exactly that slice --
-// the partial a split wants -- and `MergeStates` folds them. That turns eight
-// CTAs (one per kv head) into `8 * splits`, which is the whole point: at one
-// request the decode kernel is nowhere near its bandwidth roofline because it
-// has nothing to fill the machine with.
-//
-// Slices are contiguous sub-ranges of `src_indices`, so no page ids are moved;
-// only the indptr is new. Slices that come out EMPTY (fewer pages than slices)
-// are given one page and a last-page length of ZERO, which is a kv_len of zero
-// rather than the `(0 - 1) * page_size` that an empty range would compute --
-// that expression is negative, and it faults.
-//
-// Everything is read from device memory for the same reason the window trim is:
-// one captured graph serves every context length, so a host-computed boundary
-// is a boundary frozen at capture time.
-void build_full_split_view(
-    const std::uint32_t* src_indptr,        // [2] device (single request)
-    const std::uint32_t* src_last_page_len, // [1] device
-    int splits,
-    int page_size,
-    std::uint32_t* dst_indptr,              // [splits+1] out
-    std::uint32_t* dst_indices,             // [splits + num_pages] out
-    std::uint32_t* dst_last,                // [splits] out
-    const std::uint32_t* src_indices,
-    cudaStream_t stream);
+// `build_full_split_view` was declared here and IS DELETED — the host program is
+// `driver-cuda/src/fire/kv_paged.rs::build_full_split_view`.
 
 }  // namespace pie_cuda_driver::kernels::attn

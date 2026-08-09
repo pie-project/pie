@@ -459,11 +459,11 @@ fn build_lowering(
             PIE_STATUS_UNSUPPORTED
         })
     };
-    let mut union = union_asked;
+    let union = union_asked;
     if !union {
         sg_trace(|| "union off at the gate".into());
     }
-    let mut lowered = lower_as(if union {
+    let lowered = lower_as(if union {
         GuardMode::Union
     } else {
         GuardMode::Resolve
@@ -2608,7 +2608,9 @@ fn peel_word(
 ///
 /// [`crate::bind::DispatchCtx::experts_per_token`] is a GEOMETRY axis — a
 /// routed decode opens `dim3 grid(num_tokens * top_k, ..)`
-/// (`dequant_fp4.cu:56`, `dequant_wna16.cu:71`) — and a grid is sized before
+/// (`quant/dequant_fp4.cuh:232`, `quant/dequant_wna16.cuh:295` — the host
+/// launchers that used to spell it were deleted as unreached in §43) — and a
+/// grid is sized before
 /// an operand is read, so it cannot arrive as an operand. It is also not in
 /// `model::deployment::Geometry`, which states hidden, heads, head width,
 /// intermediates and vocab and stops.

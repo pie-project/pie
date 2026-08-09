@@ -11,6 +11,7 @@
 //! cargo run -p kernels-cuda --example emit_device_typecheck > device_typecheck.cu
 //! nvcc -std=c++20 -arch=sm_89 -fatbin \
 //!      -Xcompiler=-iquote,crates/kernels-cuda-new/csrc/src \
+//!      -Xcompiler=-iquote,crates/kernels-cuda-new/csrc/shim \
 //!      device_typecheck.cu -o tier_a.fatbin
 //! ```
 //!

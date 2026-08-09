@@ -38,8 +38,8 @@
 //! remember. `shim()`'s doc has the measurement that forced it.
 //!
 //! Everything the shim compiles against is this crate's already — `csrc/src`'s
-//! per-family headers and the vendored Marlin wrapper — which is the same
-//! argument in the other direction.
+//! per-family headers, and nothing out of tree since §47 deleted the vendored
+//! Marlin wrapper — which is the same argument in the other direction.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -107,10 +107,33 @@ mod native {
     }
 
     /// The headers the shim compiles against: every family directory's
-    /// `.hpp`s, plus the vendored Marlin wrapper (`moe`'s one out-of-tree
-    /// row). The union of exactly the per-family lists the `launch_abi` tests
+    /// `.hpp`s. It used to say "plus the vendored Marlin wrapper (`moe`'s one
+    /// out-of-tree row)" — that row and both vendored trees are deleted (§47),
+    /// and the loop below never named a `third_party` path in the first place,
+    /// so the list is now exactly the family directories that still exist.
+    /// The union of exactly the per-family lists the `launch_abi` tests
     /// prove — each family's set compiles alone there, and the shim is where
     /// they have to compile TOGETHER.
+    ///
+    /// # A MISSING DIRECTORY IS A FINISHED FAMILY, NOT A BROKEN TREE
+    ///
+    /// This loop used to `panic!` on `read_dir`, and by the time it was
+    /// changed FIVE of the twelve names below no longer existed: `mlp` and
+    /// `sample` had gone before this round, and `norm`, `quant` and `ssm`
+    /// went with it — every launcher in each ported to `driver-cuda/src/fire`
+    /// and every `__global__` already NVRTC's out of `kernels-cuda-new`. The
+    /// panic was the right shape when a family disappearing meant something
+    /// had gone wrong; it is the wrong shape now that a family disappearing
+    /// is the migration finishing, and the end state of this crate is that
+    /// **all twelve are gone and this function returns an empty vector**.
+    ///
+    /// The name list is kept rather than replaced by a `read_dir` over
+    /// `csrc/src` for the reason §21 gives about textual gates: an explicit
+    /// list says what it looked at, so a family that comes BACK under a new
+    /// name is a header nothing includes rather than a silent addition to the
+    /// shim's translation unit. Nothing here covers the other direction —
+    /// a `.hpp` on disk in a directory not named — and nothing needs to:
+    /// `tests/sources.rs` walks the tree itself.
     fn includes() -> Vec<String> {
         let mut out = Vec::new();
         // `comm` joined when the fused all-reduce landing got a row. It is
@@ -119,12 +142,23 @@ mod native {
         // thing to ask for them — which is the failure mode the doc above
         // describes: a family's set compiling alone is not the shim
         // compiling, and here there was no alone-case either.
+        //
+        // `csrc/src/comm/` IS NOW GONE — `custom_all_reduce.{cu,hpp}` and
+        // `custom_all_reduce_stub.cpp` are deleted, the whole thing is
+        // `driver-cuda/src/fire/all_reduce.rs`, and both rows are
+        // `execution::RUST_SERVED` so the shim asks for nothing. The name
+        // stays in this list for the reason the doc above gives: the
+        // `read_dir` below already returns nothing for a missing directory,
+        // and an explicit list says what it LOOKED at. Six of the twelve are
+        // in that state now.
         for dir in [
             "attn", "rope", "norm", "mlp", "gemm", "moe", "ssm", "quant", "layout", "sample",
             "vision", "comm",
         ] {
-            let mut hs: Vec<String> = std::fs::read_dir(csrc_src().join(dir))
-                .unwrap_or_else(|e| panic!("csrc/src/{dir}: {e}"))
+            let Ok(entries) = std::fs::read_dir(csrc_src().join(dir)) else {
+                continue;
+            };
+            let mut hs: Vec<String> = entries
                 .filter_map(|e| {
                     let n = e.ok()?.file_name().into_string().ok()?;
                     n.ends_with(".hpp").then(|| format!("{dir}/{n}"))
@@ -279,7 +313,15 @@ mod native {
         // that is not rebuilt because nothing this script watches changed, and
         // a `.a` whose kernels are one revision behind the `.cuh` the JIT
         // compiles from the same bytes.
+        //
+        // Two directories since `csrc/` was cut by role, and the second is
+        // watched for a sharper version of the same reason: `csrc/shim` holds
+        // the headers that answer `<cuda_fp16.h>` and friends, so an edit
+        // there changes what `__half` MEANS in every translation unit the
+        // archive compiles. An archive built against the previous meaning
+        // links against the new one without complaint.
         println!("cargo:rerun-if-changed=../kernels-cuda-new/csrc/src");
+        println!("cargo:rerun-if-changed=../kernels-cuda-new/csrc/shim");
 
         let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
         shim(&out_dir);
@@ -289,8 +331,10 @@ mod native {
             "CMAKE_CUDA_COMPILER",
             "CMAKE_CUDA_ARCHITECTURES",
             "PIE_COMPILER_LAUNCHER",
-            "PIE_CUDA_BUILD_MARLIN",
-            "PIE_CUDA_BUILD_MARLIN_MOE",
+            // `PIE_CUDA_BUILD_MARLIN` and `PIE_CUDA_BUILD_MARLIN_MOE` were
+            // here. Both options are gone from `csrc/CMakeLists.txt` with the
+            // two vendored trees they gated (§47), so a rerun keyed on either
+            // is a rerun keyed on a variable no CMake line reads.
             "CPM_SOURCE_CACHE",
         ] {
             println!("cargo:rerun-if-env-changed={var}");
@@ -371,11 +415,79 @@ mod native {
         // So the whole block goes, and with it the `read_paths` call. Nothing
         // in the tree observes `pie_kernels_cuda_paths.txt` any more; CMake
         // may go on writing it.
+        //
+        // # ...and then two of them came back, with a reader
+        //
+        // `flashinfer` and `cccl`, and the sentence above is why they are
+        // worth re-deriving rather than reinstating: they now have a consumer
+        // and it is named. `new-horizon.md` §44 moved
+        // `attn/attention_flashinfer.cu` to `driver-cuda/csrc/attn/` -- its
+        // two score-capture dispatches are host WALKS, a `switch` over
+        // `src/kernels.def` head dims, and a host walk belongs to the driver
+        // -- and that translation unit includes
+        // `attn/attention_flashinfer_common.cuh`, which includes eleven
+        // FlashInfer headers and reaches CCCL through them.
+        //
+        // It reads them from HERE rather than fetching its own, because
+        // FlashInfer is fetched and PATCHED by `csrc/CMakeLists.txt`: a
+        // second `CPMAddPackage` on the cargo side would be a second clone, a
+        // second patch pass over the same shared CPM cache, and a second
+        // chance to disagree -- the generator's own words, one file over.
+        // Two copies of a header set that agree today are two copies that
+        // drift, which is §21.7's measurement wearing a different hat.
+        //
+        // Not the VENDORED tree in `kernels-cuda-new/csrc/vendor/flashinfer`
+        // either, which is the same library at v0.6.15 and would have been
+        // the shorter path. That directory also holds PIE-written files named
+        // `cuda.h`, `cuda_runtime.h`, `cstdint`, `type_traits` and `bit` --
+        // shims that exist so NVRTC has something to answer with -- and an
+        // `-I` at it is searched before the system directories, so the host
+        // compiler's `<cstdint>` would resolve to a device shim. That is the
+        // exact hazard `csrc/CMakeLists.txt` argues `-iquote` for at length.
+        read_flashinfer_paths(&build_dir);
 
         println!(
             "cargo:rustc-env=PIE_KERNELS_CUDA_BUILD_DIR={}",
             build_dir.display()
         );
+    }
+
+    /// Republish the two include-path keys `driver-cuda` compiles against.
+    ///
+    /// `DEP_PIE_KERNELS_CUDA_FLASHINFER` and `DEP_PIE_KERNELS_CUDA_CCCL`,
+    /// each a `:`-joined directory list, straight out of the
+    /// `pie_kernels_cuda_paths.txt` CMake generates.
+    ///
+    /// A hard panic on a missing file or a missing key, in the shape
+    /// `shim()`'s `expect` uses: the consumer is a `cc::Build` whose archive
+    /// is NAMED unconditionally on `driver-cuda`'s link line, so a silently
+    /// absent include path is not a missing optimisation -- it is
+    /// `attention_flashinfer_common.cuh` failing to find
+    /// `<flashinfer/attention/prefill.cuh>`, hundreds of lines into a
+    /// template, in another crate's build output.
+    fn read_flashinfer_paths(build_dir: &Path) {
+        let file = build_dir.join("pie_kernels_cuda_paths.txt");
+        println!("cargo:rerun-if-changed={}", file.display());
+        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+            panic!(
+                "{file:?} does not read ({e}). CMake writes it with `file(GENERATE)` at the \
+                 bottom of `csrc/CMakeLists.txt`, and `driver-cuda`'s `pie_attn_flashinfer` \
+                 target needs the `flashinfer=` and `cccl=` lines out of it to compile \
+                 `attn/attention_flashinfer_common.cuh` at all."
+            )
+        });
+        for key in ["flashinfer", "cccl"] {
+            let value = text
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{file:?} has no `{key}=` line. The `file(GENERATE)` block in \
+                         `csrc/CMakeLists.txt` and this list have to name the same keys."
+                    )
+                });
+            println!("cargo:{key}={value}");
+        }
     }
 
     /// Every directory under `build_dir` holding at least one static archive.

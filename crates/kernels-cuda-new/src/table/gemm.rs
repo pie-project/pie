@@ -62,6 +62,104 @@ pub static KERNELS: &[KernelSig] = &[
     // GUARD in the text, not a driver test: see `all_reduce_residual_rmsnorm`.
     // The P2P arm of the all-reduce, and the one a row can describe: a
     // kernels-side kernel reached through a kernels-side instance.
+    //
+    // WHAT THE RUST FORM OF THESE TWO NEEDS (`new-horizon.md` §50.6 in full).
+    // `comm/custom_all_reduce.cu` holds zero `__global__`, zero `__device__`
+    // and zero `<<<>>>` — the one `__global__` it ever had was the `_exact`
+    // twin, deleted with its row. Every kernel it reaches is a template in
+    // vLLM's or trtllm's headers, all four of which are CPM-fetched and none
+    // vendored. §43.4 records the reachability audit calling this lifecycle
+    // dead AND BEING WRONG; both rows below are live and
+    // `model/tests/tp_quantized_spec.rs` fires the second.
+    //
+    //  1. FIRES one of vLLM's one-shot/two-shot NVLink kernels via
+    //     `impl_->allreduce<__nv_bfloat16>`, or trtllm's
+    //     `allreduce_fusion_kernel_launcher<Pattern, T, NRanks, fp32_acc>`.
+    //     One fire per call.
+    //  2. INTERMEDIATES: none between kernels — but a lifecycle underneath
+    //     (`vllm::Signal` and `vllm::RankData` banks, three fusion buffers, a
+    //     Lamport region, the peer pointers). That is a Rust struct with
+    //     `Drop`, not a fire.
+    //  3. HOST DECIDES peer-access eligibility, `can_handle` on message size,
+    //     fusion-versus-plain, `fp32_acc`, and `NRanks` — a TEMPLATE ARGUMENT
+    //     taken from `world_size_`. That last is the `gemv` shape exactly:
+    //     one instantiation per rank count, chosen on a runtime fact, which
+    //     is what `Specialisation` says. A null `car` is a REFUSAL, and a
+    //     refusal stays a refusal.
+    //  4. MISSING: the by-value aggregate (`AllReduceFusionParams<T>` crosses
+    //     by value — see the note on `ArgValue` in `runtime/args.rs`), and a
+    //     `Source` binding one device address per rank. `Ty::BufArray` is
+    //     `const void* const*`, which is precisely that shape, and it already
+    //     exists — NO TABLE ROW USES IT YET. What is missing is the binding,
+    //     not the type.
+    //
+    // The lifecycle needs no vocabulary at all. `cudaIpcGetMemHandle`,
+    // `cudaIpcOpenMemHandle`, `cudaDeviceEnablePeerAccess` and `cudaMalloc`
+    // are all bound in `cudarc::driver::sys`, so the ctor, dtor,
+    // `register_buffer`, `register_graph_buffers` and `can_handle` become
+    // Rust without a single new `Source` — they are not fires and never
+    // needed a row.
+    //
+    // **THAT HAS HAPPENED.** `driver-cuda/src/fire/all_reduce.rs` is the
+    // whole lifecycle, and `custom_all_reduce.{cu,hpp}` and
+    // `custom_all_reduce_stub.cpp` are DELETED. The paragraph below was
+    // written when the fire and the lifecycle had to cross together; they did
+    // not, and the reason is the measurement that was taken afterwards:
+    // `custom_all_reduce.cu` held **zero `__global__` and zero `<<<>>>`**.
+    // There was no C++ launcher needing the C++ object — there was a 664-line
+    // host program and two calls into headers. So the lifecycle crossed
+    // alone, and the two calls became refusals that name what would satisfy
+    // them (`fire::all_reduce::Decline::NoDeviceText`, carrying the resolved
+    // template point's name expression).
+    //
+    // Both rows are on `execution::RUST_SERVED` as well as `execution::SERVED`
+    // — the first pair in the tree to be on both — so `abi::emit_c_shim` drops
+    // their shim entries and `bind::service` spells them. **They remain fully
+    // unsourced**, which is the honest state: no operand of either row has a
+    // `Source`, so `emit_rust_dispatch` skips them whole and always did. The
+    // mechanism that carries each row is therefore the shim entry, not a
+    // dispatch arm.
+    //
+    // THE REMAINING BLOCKER IS UNCHANGED, and it is only about the two
+    // launches now. NVRTC reads the vendored tree through
+    // `Headers::LibraryAndVendor`; the CPM checkout (`${flashinfer_SOURCE_DIR}`)
+    // is a C++ compiler include path and is on no NVRTC path.
+    // `kernels-cuda-new/csrc/vendor/flashinfer/` has **no `comm/` directory at
+    // all**, so both of the surviving headers —
+    // `comm/trtllm_allreduce_fusion.cuh` and `comm/vllm_custom_all_reduce.cuh`
+    // — are unreachable to NVRTC. There is no device text to carry, hence no
+    // unit, hence no row to fire. **The vendored tree must gain `comm/`
+    // first**, and that tree is `vendor-role`'s.
+    //
+    // So the dependency order for what is LEFT is: header, then unit, then
+    // row, then the by-value aggregate. The Rust that would fire it is
+    // already written and already computes every one of the launcher's
+    // arguments; what it does at the launch point is decline.
+    //
+    // See the same finding for the sm90 prefill in `families/attn.rs`, and
+    // `new-horizon.md` §50 for what the split between the vendored and the
+    // CPM-only headers turns out to mean.
+    //
+    // ITS STUB CARRIED A LATENT DEFECT, and this is the only place it is
+    // written down. `custom_all_reduce_stub.cpp` was selected on sm_100/sm_120;
+    // its ctor and `register_buffer` still took `NcclComm&`, while
+    // `custom_all_reduce.hpp` had replaced that parameter with
+    // `HostAllgather`. **The stub could not compile if it were ever
+    // selected.** It was invisible on this box — an L40S, sm_89, which took
+    // the real file — and it was pre-existing, not caused by any move.
+    // Whoever first built for Blackwell would have met it.
+    //
+    // The fix was not to repair the stub. Under §48.3 a stub goes when the
+    // thing it stands in for goes, and a stub's Rust form is not a file: an
+    // architecture stub exists because a real implementation cannot compile
+    // for the target, and in Rust that is `#[cfg]` or a runtime capability
+    // check, both of which the driver already does. A JIT unit that is never
+    // selected costs nothing to not compile — which is exactly what an AOT
+    // archive cannot do, since it must hold a symbol for every target it might
+    // run on. The stub was an artefact of ahead-of-time linking and did not
+    // survive the move to NVRTC. **It is deleted, along with the thing it
+    // stood in for**, and the arch-conditional `set()` in
+    // `kernels-cuda/csrc/CMakeLists.txt` went with it.
     kernel!(all_reduce_p2p "comm::all_reduce_bf16", whole = true,
         operands = operands![
             car: CustomAllReduce,
@@ -228,10 +326,14 @@ pub static KERNELS: &[KernelSig] = &[
     // The fused Q/K/V triple had a row here — `gemm::gemv3_bf16` — and it
     // is deleted. `cuda::gemv3` had no caller in any model text, and the
     // fusion this row names is three `matmul` statements a text already
-    // knows how to write (§27). `gemv.cu` keeps the launcher and its
-    // `__global__`: `gemm.cpp:544,962,2356` call the file's OTHER entry
-    // point, `gemv_bf16`, from the live `act_x_wt_bf16` path, so the file
-    // is left whole for the reason `families/gemm.rs` already gives.
+    // knows how to write (§27). `gemv.cu` is now deleted too, and no row
+    // moved to this table with it: its two `__global__` templates are
+    // `csrc/src/gemm/gemv.cuh` and their four rows are JIT rows in
+    // `families::gemm`, not AOT rows here. `gemv_bf16` — the launcher
+    // `gemm.cpp` calls from the live `act_x_wt_bf16` path — is Rust now
+    // (`driver-cuda/src/fire/gemv.rs`), which is why it never needed one:
+    // a row cannot state a `dim3(32, kWarps)` block and cannot DECLINE,
+    // and `gemv_bf16` does both.
     // The sink rescale, and the fp32 LSE it eats. The LSE has no row of
     // its own: it is a second OUTPUT of the decode dispatch, requested
     // by an argument, so the kernel that changes is none.

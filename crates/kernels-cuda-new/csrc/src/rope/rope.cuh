@@ -57,11 +57,24 @@
 // arithmetic -- all in `rope.cu`, because a launch rule is the ROW's
 // statement and a guard is the rule's (`LaunchRule::eval` refuses an empty
 // extent, so `Elementwise` over zero rows declines rather than launches).
-// Eight of these ten kernels have no row for exactly that reason: their
-// launchers state a two-dimensional `(token, head)` grid or a dynamic shared
-// allocation, and no `LaunchRule` says either. Inventing one would be a grid
-// nothing checks; the units in `kernels-cuda-new/src/families/rope.rs` name
-// what is migrated and the family module says why the rest is not.
+//
+// EIGHT OF THESE TEN KERNELS ONCE HAD NO ROW FOR EXACTLY THAT REASON, and
+// that sentence is now wrong in the good direction: all ten are named by a
+// row, and `LaunchRule::Rope` -- ported from `rope.cu:82-95`, two-dimensional
+// `(token, head)` grid and dynamic shared allocation together -- is what
+// states the three that looked unstateable. One row is `LaunchRule::Unstated`
+// and says so (`qk_rmsnorm_rotate_rounded`, whose grid is the FIRE's head
+// count and not the STATEMENT's), and six of the twelve rows are unsourced,
+// which is a different lack: they name the kernel and cannot yet fill its
+// arguments. A row is not a routing; `kernels-cuda-new/src/families/rope.rs`
+// carries the table of which is which, and every launcher in `rope.cu` is
+// still called.
+//
+// The host arithmetic above the `<<<>>>` is what most of the unsourcing costs:
+// `heads_per_block`, `cache_pairs` and the two YaRN ramps are computed by the
+// launcher from `head_dim` and the config, and arrive as ARGUMENTS of these
+// kernels. Inventing a `Source` for them would be a value nothing checks, in
+// the same way inventing a grid would be.
 //
 //===----------------------------------------------------------------------===//
 #pragma once
@@ -498,9 +511,15 @@ __global__ void qk_rmsnorm_rotate_mrope(
 // ── The fused norm+rope forms ───────────────────────────────────────────────
 //
 // All four reduce across a block per (token, head) and rotate in place. They
-// are `bf16` and not `T` because no row names them: their launchers state a
-// `dim3(num_tokens, total_heads)` grid, which is a geometry no `LaunchRule`
-// spells, and `new-horizon.md` §10.5 refuses an invented one.
+// are `bf16` and not `T` because no row asks for a second numeric format --
+// all four ARE named by rows now, each at bf16, and a template nothing
+// instantiates is text that has never been compiled pretending to be a
+// capability, which is the argument the opening paragraph makes for the other
+// six. The `dim3(num_tokens, total_heads)` grid three of them launch is
+// spelled after all, by `LaunchRule::RowsPackedHeadsNarrow`; the fourth,
+// `qk_rmsnorm_rotate_rounded`, is `LaunchRule::Unstated` for a reason that is
+// not the grid's SHAPE but whose `num_kv_heads` its second axis reads --
+// `families/rope.rs` states it at the row.
 
 // Peel device-window variant (the device-window campaign): the row
 // window rides in device memory; the grid spans the full lane count and
@@ -764,10 +783,12 @@ __global__ void rotate_partial(
 }
 
 // Rotates the LAST `rotary_dim` channels rather than the first, and its
-// YaRN ramp bounds are computed ON THE HOST -- which is why it has no row.
-// `low_dim`/`high_dim` arrive as arguments because the arithmetic that
-// derives them from `beta_fast`/`beta_slow` over `rotary_dim` is not a
-// `Source` any row could state.
+// YaRN ramp bounds are computed ON THE HOST -- which is why its row is
+// UNSOURCED. `low_dim`/`high_dim` arrive as arguments because the arithmetic
+// that derives them from `beta_fast`/`beta_slow` over `rotary_dim` is not a
+// `Source` any row could state. The row itself is `ROPE_SIGS[10]` at
+// `LaunchRule::RouteRows`, the one block per token `rope.cu:382-385`
+// launches: a grid this kernel HAS a rule for, and operands it does not.
 __global__ void rotate_partial_last(
     bf16* __restrict__ q,
     bf16* __restrict__ k,

@@ -296,6 +296,9 @@ impl Args {
                 Ty::F32 => matches!(value, ArgValue::F32(_)),
                 Ty::Usize => matches!(value, ArgValue::Usize(_)),
                 Ty::KvScheme | Ty::KvDType => matches!(value, ArgValue::U8(_)),
+                // `Ty::Fp8Kind` is four bytes and rides `U32`; see its doc in
+                // `kernels::Ty` for why the width is asserted and not assumed.
+                Ty::Fp8Kind => matches!(value, ArgValue::U32(_)),
                 ty => {
                     return Err(ArgError::Unsupported {
                         symbol: sig.symbol,

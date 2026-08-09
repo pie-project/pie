@@ -336,6 +336,12 @@ const fn crossing(ty: Ty) -> Option<Crossing> {
         Ty::I64 => Crossing::I64,
         Ty::Bool => Crossing::Bool,
         Ty::KvScheme | Ty::KvDType => Crossing::U8,
+        // A four-byte enumerator, so it rides the SAME crossing as any other
+        // 32-bit scalar. There is no `Crossing::U32Enum` and there must not
+        // be: a crossing says how many bytes go in the cell, a `Ty` says what
+        // they mean, and `emit_device_typecheck`'s function-pointer
+        // initialisation is what refuses a row that meant something else.
+        Ty::Fp8Kind => Crossing::U32,
         // `Args::bind`'s own catch-all, spelled the same way. A kind that
         // arrives in `kernels` and is handled by neither is refused by both,
         // which is the agreement that matters.
@@ -430,8 +436,12 @@ fn one(row: &'static DeviceKernel) -> String {
     // answer and the compilable one are the same answer.
     if sig.operands.is_empty() {
         return format!(
-            "// {}: not emitted -- the row states no operands, which is a row that has \
-             not been written rather than a kernel that takes none.\n\n",
+            "// {}: not emitted -- the row states no operands. For most rows that is a row \
+             that has not been written; for `crate::families::fa2`'s 460 it is the third way \
+             a row loses its shim entry, and deliberate: the `__global__` takes ONE by-value \
+             params struct, `Ty` has no variant for it, and a `Ty::Blob` would type-check \
+             every wrong struct as readily as the right one. Those fire through \
+             `KernelModule::fire_raw`.\n\n",
             sig.symbol
         );
     }

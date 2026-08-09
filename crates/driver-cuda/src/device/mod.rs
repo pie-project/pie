@@ -56,7 +56,7 @@ mod graph;
 mod stream;
 mod vmm;
 
-pub use alloc::{Allocator, CaptureScope, DeviceBuffer, read_raw_span};
+pub use alloc::{Allocator, CaptureScope, DeviceBuffer, copy_raw_span, fill_raw_span, read_raw_span};
 pub use device::{COMPILED_MAJOR, Device};
 #[cfg(feature = "bridge")]
 pub use graph::{Cond, SupergraphBuilder};

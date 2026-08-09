@@ -101,13 +101,6 @@ mod probe {
     /// whose tiled pair are transposes of each other; and `k_local_attn`,
     /// whose leading grid axis counts TILES at a width chosen for a 1 KiB
     /// per-thread local array.
-    const GEMMA4_AUDIO_UNROWED: Unit = Unit {
-        name: "vision/gemma4_audio",
-        root: include_str!("../csrc/src/vision/gemma4_audio.cuh"),
-        rows: GEMMA4_AUDIO_UNROWED_ROWS,
-        options: &[],
-    };
-
     /// `vision/qwen3_vl_tower`'s six — five of them DEAD, which is the
     /// largest single finding of the migration.
     const QWEN3_VL_UNROWED: Unit = Unit {
@@ -123,21 +116,35 @@ mod probe {
         elem: "device::bf16",
     }];
 
-    static GEMMA4_AUDIO_UNROWED_ROWS: &[DeviceKernel] = &[
-        DeviceKernel { sig: &UNROWED_SIGS[1], template_path: "vision::device::k_conv2d_s2", elem: "device::bf16" },
-        DeviceKernel { sig: &UNROWED_SIGS[2], template_path: "vision::device::k_chlast", elem: "device::bf16" },
-        DeviceKernel { sig: &UNROWED_SIGS[3], template_path: "vision::device::k_chfirst", elem: "device::bf16" },
-        DeviceKernel { sig: &UNROWED_SIGS[4], template_path: "vision::device::k_local_attn", elem: "device::bf16" },
-    ];
+    // `GEMMA4_AUDIO_UNROWED_ROWS` STOOD HERE with four entries, and it is
+    // empty rather than shortened: `k_conv2d_s2`, `k_chlast`, `k_chfirst` and
+    // `k_local_attn` are rows of `families::vision` now. The paragraph above
+    // said their grids were "three independent extents where `Dims` carries
+    // two" and "a leading grid axis that counts TILES", and both are still
+    // true -- what changed is that a row whose grid no rule states is a row
+    // with `LaunchRule::Unstated`, fired by a Rust caller that computes the
+    // grid itself. `driver-cuda/src/tower/gemma4_audio.rs` is that caller.
+    // The unit `vision/gemma4_audio` no longer appears in this probe at all.
 
     static QWEN3_VL_UNROWED_ROWS: &[DeviceKernel] = &[
-        DeviceKernel { sig: &UNROWED_SIGS[5], template_path: "vision::device::k_add_inplace", elem: "device::bf16" },
-        DeviceKernel { sig: &UNROWED_SIGS[6], template_path: "vision::device::k_split_qkv", elem: "device::bf16" },
-        DeviceKernel { sig: &UNROWED_SIGS[7], template_path: "vision::device::k_split_qkv_bias", elem: "device::bf16" },
-        DeviceKernel { sig: &UNROWED_SIGS[8], template_path: "vision::device::k_rope_vis", elem: "device::bf16" },
-        DeviceKernel { sig: &UNROWED_SIGS[9], template_path: "vision::device::k_rope_qk", elem: "device::bf16" },
-        DeviceKernel { sig: &UNROWED_SIGS[10], template_path: "vision::device::k_split_rope_qkv", elem: "device::bf16" },
+        DeviceKernel { sig: &UNROWED_SIGS[1], template_path: "vision::device::k_add_inplace", elem: "device::bf16" },
+        DeviceKernel { sig: &UNROWED_SIGS[2], template_path: "vision::device::k_split_qkv", elem: "device::bf16" },
+        DeviceKernel { sig: &UNROWED_SIGS[3], template_path: "vision::device::k_split_qkv_bias", elem: "device::bf16" },
+        DeviceKernel { sig: &UNROWED_SIGS[4], template_path: "vision::device::k_rope_vis", elem: "device::bf16" },
+        DeviceKernel { sig: &UNROWED_SIGS[5], template_path: "vision::device::k_rope_qk", elem: "device::bf16" },
     ];
+
+    // `k_split_rope_qkv` WAS the sixth entry here and is now
+    // `families::vision::QWEN3_VL_ROWS`' sixth row, `LaunchRule::Unstated`.
+    // It was the only one of the six that was ever alive -- the other five
+    // are superseded kernels nothing launches -- and the only one whose
+    // refusal was about geometry rather than deadness. The tower's Rust
+    // states `[NH, N, 1] x [HEAD/2, 1, 1]` off `qwen3_vl_tower.cu:249`, so
+    // the block-width decision the refusal was protecting is still the
+    // tower owner's and is no longer paid for with an absent row.
+    //
+    // Everything below this line is dead device text and nothing but this
+    // probe compiles it.
 
     /// The contracts these probe rows are written against.
     ///
@@ -148,7 +155,7 @@ mod probe {
     /// them so that promoting one is a move between two files and not a
     /// rename.
     ///
-    /// **Thirteen have made that move.** `Tile16`, `AxialRope` and
+    /// **Fourteen have made that move.** `Tile16`, `AxialRope` and
     /// `PerRowNarrow` (`new-horizon.md` §21.13) state the eleven 16x16 tiles,
     /// the axial rope's three-axis grid and the SSCP layernorm's 128-wide
     /// block, so `k_matmul`, `k_matmul_bias`, `k_addpos_grid2d`, `k_qk`,
@@ -158,37 +165,22 @@ mod probe {
     /// now and are instantiated by the first table above rather than this one.
     /// `vision/tower_naive_kernels` lost its last unrowed kernel with them and
     /// no longer appears here at all.
+    ///
+    /// The fourteenth is `k_split_rope_qkv`, and it moved on a different
+    /// argument: no rule states its launch and none was added. It is a row
+    /// with `LaunchRule::Unstated`, fired by a Rust tower walk that states
+    /// the grid itself. What is left below is dead device text only.
     #[rustfmt::skip]
-    static UNROWED_SIGS: [KernelSig; 11] = [
+    static UNROWED_SIGS: [KernelSig; 6] = [
         // DEAD. No `<<<>>>` -- `mlp::geglu_tanh_bf16` took its call site.
         kernel!(k_gelu_mul "vision::k_gelu_mul_bf16",
             file = Some("vision/gemma4_vision.cuh"),
             operands = operands![g: Buf, u: Buf, o: BufMut, t: Usize]),
-        // `dim3 g((Fo+15)/16, (To+15)/16, OC); <<<g, B2, 0, S>>>` -- `Tile16`'s
-        // grid with a channel count on `grid.z`. Three independent extents,
-        // and `Dims` carries two plus head counts.
-        kernel!(k_conv2d_s2 "vision::k_conv2d_s2_bf16",
-            file = Some("vision/gemma4_audio.cuh"),
-            operands = operands![input: Buf, w: Buf, out: BufMut,
-                                 ic: I32, t_in: I32, f_in: I32,
-                                 oc: I32, t_out: I32, f_out: I32]),
-        // `dim3 g((Fo+15)/16, (To+15)/16, OC); <<<g, B2, 0, S>>>`, and the
-        // transpose of `k_chfirst` -- so a rule taking `rows` and `width` off
-        // a statement would have to be told which of three axes each one is.
-        kernel!(k_chlast "vision::k_chlast_bf16",
-            file = Some("vision/gemma4_audio.cuh"),
-            operands = operands![input: Buf, out: BufMut, oc: I32, t_out: I32, f_out: I32]),
-        // `dim3 g((Fo+15)/16, (To+15)/16, OC); <<<g, B2, 0, S>>>`.
-        kernel!(k_chfirst "vision::k_chfirst_bf16",
-            file = Some("vision/gemma4_audio.cuh"),
-            operands = operands![input: Buf, out: BufMut, oc: I32, t_out: I32, f_out: I32]),
-        // `dim3 g((N+127)/128, H); <<<g, 128, 0, S>>>` -- a TILE count on the
-        // leading axis, where every ported rule puts a count of things, and a
-        // 128 fixed by a 1 KiB `float acc[256]` per thread.
-        kernel!(k_local_attn "vision::k_local_attn_bf16",
-            file = Some("vision/gemma4_audio.cuh"),
-            operands = operands![q: Buf, k: Buf, v: Buf, relk: Buf, out: BufMut,
-                                 n: I32, h: I32, hd: I32, p: I32, cap: F32]),
+        // FOUR STOOD HERE -- `k_conv2d_s2`, `k_chlast`, `k_chfirst` and
+        // `k_local_attn`. They are contracts in `families::vision` now, with
+        // the same operands in the same order and the same `dim3` quoted on
+        // each row, because that is what promoting one was always supposed to
+        // be: "a move between two files and not a rename".
         // DEAD, and byte-identical to `k_add`, `k_add_pe` and
         // `norm::device::residual_add`.
         kernel!(k_add_inplace "vision::k_add_inplace_bf16",
@@ -214,19 +206,6 @@ mod probe {
             file = Some("vision/qwen3_vl_tower.cuh"),
             operands = operands![q: BufMut, k: BufMut, pos: F32s, n: I32, nh: I32,
                                  head: I32, theta: F32]),
-        // The closest call in the family: `<<<dim3(NH, N), HEAD/2, 0, S>>>`.
-        // The grid IS `Rule::PerHead`'s `[heads, rows, 1]` and the kernel reads
-        // `blockIdx.x` as the head and `blockIdx.y` as the row exactly as
-        // `per_head` intends -- but `per_head` fixes `PAD_BLOCK = 128` and this
-        // launches `HEAD/2`. `PerRowNarrow` is the precedent for what a fix
-        // looks like -- a rule per block width -- and the reason this one has
-        // not been asked for is that widening the launch QUADRUPLES it at
-        // qwen3-vl's 32-wide half-head. Rule 3 wants agreement, not
-        // near-agreement.
-        kernel!(k_split_rope_qkv "vision::k_split_rope_qkv_bf16",
-            file = Some("vision/qwen3_vl_tower.cuh"),
-            operands = operands![qkv: Buf, b: Buf | null, q: BufMut, k: BufMut, v: BufMut,
-                                 pos: F32s, n: I32, nh: I32, head: I32, theta: F32]),
     ];
 
     /// Every `__global__` in the five vision headers, counted by hand off the
@@ -263,7 +242,7 @@ mod probe {
         table(&stated);
 
         println!("\nkernels no row names, instantiated anyway:\n");
-        let unrowed: Vec<Report> = [&GEMMA4_VISION_UNROWED, &GEMMA4_AUDIO_UNROWED, &QWEN3_VL_UNROWED]
+        let unrowed: Vec<Report> = [&GEMMA4_VISION_UNROWED, &QWEN3_VL_UNROWED]
             .into_iter()
             .map(|unit| probe(unit, arch))
             .collect();

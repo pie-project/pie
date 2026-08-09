@@ -29,47 +29,49 @@ pub static KERNELS: &[KernelSig] = &[
             v_h: I32 <- Source::OutWidth(0),
             stream: Stream <- Source::Ctx("stream"),
         ]),
-    // A copy that skips requests whose slot id is invalid: the launch happens
-    // for every request every time and the slot decides whether it does
-    // anything, so the dispatch is fixed and a CUDA graph replays.
-    kernel!(copy_if_valid_slot "layout::copy_if_valid_slot", whole = true,
-        operands = operands![
-            src: U8s,
-            dst: U8sMut,
-            bytes: Usize,
-            slot_ids: I32s,
-            request: Usize,
-            stream: Stream,
-        ]),
-    kernel!(concat_rows "layout::concat_bf16_rows",
-        operands = operands![
-            left: Buf,
-            right: Buf,
-            out: BufMut,
-            n: I32,
-            left_dim: I32,
-            right_dim: I32,
-            stream: Stream,
-        ]),
-    // gpt-oss interleaves gate and up ROW BY ROW, so splitting them is a
-    // parity deinterleave and not a slice. Weight-shaped, no token extent.
-    kernel!(deinterleave_rows "layout::deinterleave_rows_bf16",
-        operands = operands![
-            fused: Buf,
-            gate_out: BufMut,
-            up_out: BufMut,
-            i: I32,
-            h: I32,
-            stream: Stream,
-        ]),
-    kernel!(deinterleave_vec "layout::deinterleave_vec_bf16",
-        operands = operands![
-            fused: Buf,
-            gate_out: BufMut,
-            up_out: BufMut,
-            i: I32,
-            stream: Stream,
-        ]),
+    // ── FOUR ROWS WERE HERE AND ARE DELETED. §54's whole finding. ────────
+    //
+    // `layout::copy_if_valid_slot`, `layout::concat_bf16_rows`,
+    // `layout::deinterleave_rows_bf16` and `layout::deinterleave_vec_bf16`.
+    // Each had a JIT unit, migrated device text in
+    // `kernels-cuda-new/csrc/src/layout/*.cuh`, a `dsl::cuda` wrapper — and
+    // NO CALLER IN ANY LANGUAGE.
+    //
+    // The consumer sweep, all five doors, because a deletion is a claim
+    // about a whole consumer set and one door is not the set:
+    //
+    //   * `crates/model/src` — searched for the SYMBOL STRING and,
+    //     separately, for the wrapper name `dsl::cuda::{copy_if_valid_slot,
+    //     concat_rows, deinterleave_rows, deinterleave_vec}`. Two different
+    //     tokens; a sweep for one of them once reported a live symbol as
+    //     uncalled. Zero hits for either, for all four.
+    //   * `model-compiler/src/lower.rs::semantic()` — no mapping. (21 rows
+    //     reach production with no DSL wrapper at all, so this door has to
+    //     be checked even when the wrapper is dead.)
+    //   * hand-written `ffi::pie_k_*` arms in `driver-cuda/src` — the door
+    //     that is invisible to every check reading generated text. There are
+    //     eight such names in the whole crate and none of them is these.
+    //   * C++ — `.cu`, `.cuh`, `.cpp`, `.hpp` across the tree.
+    //   * the generated dispatch itself — all four carried `Source::Unbound`
+    //     operands, so `emit_rust_dispatch` skipped them WHOLE and no arm of
+    //     either kind was ever written for them. They could not have been
+    //     fired even if something had asked.
+    //
+    // §28's root cause, in its clearest surviving instance: the DSL surface
+    // was generated from launcher headers, so a wrapper existed for every
+    // launcher and READ AS DEMAND to any tool that stopped at it. Four rows
+    // looked live because four wrappers existed. The wrappers went with the
+    // rows — `model/tests/kernels_table.rs::the_table_covers_the_dsl_surface`
+    // asserts these two sets are equal, so deleting one side alone would
+    // have failed it and deleting both keeps it balanced.
+    //
+    // WHAT SURVIVED, AND IT IS NOT NOTHING. `families::layout`'s DEVICE rows
+    // stay. `copy_if_valid_slot`'s in particular is the only witness in the
+    // tree for `kernels::LaunchRule::Single` and is fired three times by
+    // `kernels-cuda-new/tests/launch_rules.rs`, which resolves through
+    // `unit::unit_of` and never through this table. Deleting a table row is
+    // a claim about who CALLS a symbol; it says nothing about whether the
+    // kernel exists, and here the kernel does.
     // THE EPILOGUE'S GATHER. A prefill streams one row per token and reads
     // one distribution per request, so the rows that are actually sampled
     // have to be collected before the final norm and the head — and they
@@ -86,6 +88,40 @@ pub static KERNELS: &[KernelSig] = &[
     // The last operand is the row WIDTH, not a vocabulary: the header
     // names it `vocab` but the caller passes `H`, because this gathers
     // hidden rows on their way INTO the head.
+    // ── `layout::embed_bf16`, MOVED HERE FROM `table::driver_internal` ────
+    //
+    // The first launch of every fire. It moved because
+    // `driver_internal`'s own module doc names the exit — *"a row leaves
+    // when a statement learns to say it"* — and a statement already said
+    // it: `model-compiler/src/lower.rs:1462` is
+    // `Embed { .. } => Semantic::Kernels(&["layout::embed_bf16"])`. The row
+    // sat in a table `table::TABLES` deliberately excludes, so
+    // `table::sig` did not resolve it and `check_plan` could not see the
+    // symbol the lowering names.
+    //
+    // The move is also what makes the C++ deletable.
+    // `execution::RUST_SERVED` is gated on `table::sig(symbol)` resolving
+    // with non-empty operands, so a `driver_internal` row can never be
+    // taken over — deletion is its only close, and deleting a row a
+    // lowering names is not available. Here, `RUST_SERVED` is, and
+    // `driver-cuda/src/fire/embed.rs` is the launcher.
+    //
+    // WHAT FORCED `WeightNamed`: a vocab table is not something a trace
+    // produces, so the embedding's weight is only ever the statement's own
+    // NAME and never a slot in the argument run. The sourcing is carried
+    // across unchanged — all seven operands, exactly as `driver_internal`
+    // stated them — because a move that edits the bindings is two changes
+    // wearing one diff.
+    kernel!(embed "layout::embed_bf16",
+        operands = operands![
+            token_ids: I32s <- Source::Ctx("token_ids"),
+            weight: Buf <- Source::WeightNamed,
+            y: BufMut <- Source::Out(0),
+            num_tokens: I32 <- Source::Rows,
+            hidden: I32 <- Source::OutWidth(0),
+            vocab: I32 <- Source::Ctx("vocab"),
+            stream: Stream <- Source::Ctx("stream"),
+        ]),
     kernel!(gather_rows "layout::gather_bf16_rows",
         operands = operands![
             src: U16s <- Source::In(0),

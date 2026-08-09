@@ -120,7 +120,10 @@ impl Dev {
         // zero-length allocation legal so a degenerate shape still has a
         // distinct, freeable pointer to hand cuBLAS.
         unsafe {
-            assert_eq!(cudaMalloc(&raw mut p, bytes.max(16)), cudaError::cudaSuccess);
+            assert_eq!(
+                cudaMalloc(&raw mut p, bytes.max(16)),
+                cudaError::cudaSuccess
+            );
             if bytes > 0 {
                 assert_eq!(
                     cudaMemcpy(p, src, bytes, cudaMemcpyKind::cudaMemcpyHostToDevice),
@@ -459,9 +462,15 @@ fn the_shapes_are_not_one_shape() {
     let ms: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.0).collect();
     let ns: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.1).collect();
     let ks: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.2).collect();
-    assert!(ms.len() >= 5 && ns.len() >= 5 && ks.len() >= 5, "M, N and K each move");
+    assert!(
+        ms.len() >= 5 && ns.len() >= 5 && ks.len() >= 5,
+        "M, N and K each move"
+    );
     assert!(ms.contains(&0), "M=0 is the empty rectangle");
-    assert!(ns.contains(&1) && ks.contains(&1), "N=1 and K=1 are degenerate axes");
+    assert!(
+        ns.contains(&1) && ks.contains(&1),
+        "N=1 and K=1 are degenerate axes"
+    );
     assert!(
         GROUPED.iter().any(|g| g.0.is_empty()),
         "group_count=0 is the archive's early return"
@@ -527,12 +536,22 @@ fn the_moved_cublas_calls_write_the_archives_bytes() {
 /// `out[n] = bf16(bf16(dot) + bias[n])` and *"the double rounding is
 /// intentional"*. That was prose. `tests/oracle/gemm_service/bias_fold.cu`
 /// runs the archive's own `gemv_bf16` both ways out of the real archive, on
-/// hostile input, and this reads the result.
+/// hostile input, and this reads the RECORDED result — `bias_fold.txt` is
+/// `include_str!`'d, so this test does not need the archive and still passes.
 ///
-/// A refusal is recorded, not skipped: `gemv_bf16` returns `false` on a shape
-/// or alignment it does not support and enqueues nothing, and the two
-/// unsupported K here (7 and 129, neither a multiple of 8) must be refused by
-/// BOTH sides or the two paths have already diverged before any arithmetic.
+/// **The recorder no longer runs, and that is not this test failing.** §45.5
+/// deleted `gemm/gemv.cu` and `gemm/gemv.hpp`: the kernels are now
+/// `kernels-cuda-new/csrc/src/gemm/gemv.cuh`, carrying that same sentence at
+/// both epilogues, and the host half is `driver_cuda::fire::gemv::gemv_bf16`.
+/// Re-recording `bias_fold.txt` means rewriting `bias_fold.cu` against the
+/// JIT unit — which is a Rust program now, not a `.cu`. The recorded bytes
+/// stand until then; the kernels they came from were carried verbatim.
+///
+/// A refusal is recorded, not skipped: `gemv_bf16` returned `false` on a shape
+/// or alignment it does not support and enqueued nothing (the Rust answers
+/// `Gemv::Declined` with the reason named), and the two unsupported K here
+/// (7 and 129, neither a multiple of 8) must be refused by BOTH sides or the
+/// two paths have already diverged before any arithmetic.
 #[test]
 fn the_lost_bias_fusion_cost_no_answer() {
     const FOLD: &str = include_str!("oracle/gemm_service/bias_fold.txt");
@@ -554,7 +573,7 @@ fn the_lost_bias_fusion_cost_no_answer() {
         assert_eq!(
             fused, split,
             "the fused epilogue and `gemv_bf16` + `add_bias_bf16` wrote \
-             DIFFERENT BYTES: {r}\n`gemv.hpp:25-28` says they are \
+             DIFFERENT BYTES: {r}\n`gemv.cuh`'s two epilogues say they are \
              bit-identical, and the composition in `bind::service` is built \
              on that sentence."
         );

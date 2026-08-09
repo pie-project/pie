@@ -182,22 +182,25 @@ pub use wgpu::WgpuDriver;
 
 struct DriverRegistration {
     spec: DriverSpec,
+    /// The driver, until a scheduler claims it.
+    ///
+    /// `Option` for the HANDOFF and not for a registration that never had one:
+    /// `register_driver_backend` always installs a driver, and
+    /// [`take_driver_backend`] moves it out exactly once, into the
+    /// `DriverLane` that owns it from then on. The spec stays behind because
+    /// [`get_spec`] is read after the claim.
+    ///
+    /// There used to be a second constructor — `register_driver(spec)` — that
+    /// installed `None` here, for a registration with a spec and no driver.
+    /// Nothing called it. It was defined, re-exported from `crate::driver`,
+    /// and had zero callers in the workspace, so the `None` it existed to
+    /// produce was a state the registry could describe and never reach.
     backend: Option<DriverBackend>,
 }
 
 fn registry() -> &'static RwLock<Vec<Option<DriverRegistration>>> {
     static REGISTRY: OnceLock<RwLock<Vec<Option<DriverRegistration>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
-}
-
-pub fn register_driver(spec: DriverSpec) -> usize {
-    let mut drivers = registry().write().unwrap();
-    let id = drivers.len();
-    drivers.push(Some(DriverRegistration {
-        spec,
-        backend: None,
-    }));
-    id
 }
 
 pub fn register_driver_backend(mut spec: DriverSpec, backend: DriverBackend) -> usize {

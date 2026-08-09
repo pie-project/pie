@@ -320,14 +320,92 @@ pub static KERNELS: &[KernelSig] = &[
     // half. Deleted by `new-horizon.md` §38: its whole consumer set was
     // `dsl::cuda::merge_attention_states`, which nothing called. The
     // launcher (`attn/attention_merge_states.cu:31`) stays — it holds no
-    // `<<<>>>` at all, it dispatches into the vendored
+    // `<<<>>>` and no `__global__` at all, it dispatches into
     // `flashinfer/attention/cascade.cuh`, and `examples/vendor_probe.rs:199`
     // cites it by file and line as the proof that that text compiles here
     // (96,176 B, 8 of 8 symbols). §31.4's precedent exactly: the probe is
     // what makes re-adding this row cheap, and the row was never how to get
     // there.
+    //
+    // NOT the vendored `cascade.cuh`, which this comment used to claim. This
+    // crate does carry `csrc/vendor/flashinfer/attention/cascade.cuh`, but no
+    // `-I` anywhere in the repository puts it in front of a C++ compiler:
+    // `kernels-cuda/csrc/CMakeLists.txt`'s include list names
+    // `${flashinfer_SOURCE_DIR}` — the CPM checkout — and never `csrc/vendor`.
+    // The launcher reads the fetched copy; the vendored copy is NVRTC's alone,
+    // reachable only through `Headers::LibraryAndVendor`, which `unit.rs`'s
+    // `DEMANDS` table asks for zero times. The two copies being
+    // byte-for-byte the same upstream text is what has kept the distinction
+    // invisible, and it is the distinction that decides whether deleting
+    // `kernels-cuda` frees `csrc/vendor` — it does not.
+    //
+    // WHAT THE RUST FORM NEEDS, if this row is ever re-added (`new-horizon.md`
+    // §50.3 in full). Fires exactly one of `MergeStatesLargeNumIndexSetsKernel`
+    // or `MergeStatesKernel` (`cascade.cuh:644-664`), never both and never in
+    // sequence, so there is no intermediate buffer. The host decides an
+    // empty-work guard and one arm — `num_index_sets >= seq_len` picks the
+    // large-index-set kernel. Shared memory is 8,704 B at head dim 64/128/256
+    // and 16,896 B at 512, all under 48 KB, so the `cudaFuncSetAttribute` at
+    // `:656` is a no-op nothing has to express.
+    //
+    // MISSING VOCABULARY: none. That is a retraction of two entries. The arm
+    // was written down as unstateable because it compares TWO operands while
+    // every `Term` is unary and `Source`'s combinators stop at `Ne`; and the
+    // geometry was written down as unstateable because both arms take a
+    // computed 2-D block `(HEAD_DIM / vec_size, bdy)`. Neither survives the
+    // rule that host composition is Rust: the comparison is host control flow,
+    // so the Rust reads both operands and picks which row to fire, and
+    // `Launch { grid, block, smem }` is a plain struct a composer fills in.
+    // A `LaunchRule` is for a table-driven row, not for a Rust walk.
+    //
+    // It is also the only one of the four FlashInfer host programs that does
+    // NOT hit the by-value aggregate gap — `MergeStates` takes four pointers
+    // and four `uint32_t`, every one of which `ArgValue` binds today. That
+    // makes it the cheapest available proof that the whole shape works.
+    //
+    // AND IT CLEARS THE HEADER GATE, which is what actually orders this work.
+    // NVRTC sees only the vendored tree (`Headers::LibraryAndVendor`); the CPM
+    // checkout is a C++ compiler include path and is on no NVRTC path.
+    // `csrc/vendor/flashinfer/attention/cascade.cuh` IS vendored, so this
+    // launcher's device text is carryable today — unlike the sm90 prefill and
+    // `comm/custom_all_reduce.cu`, whose headers are CPM-only and for which
+    // `csrc/vendor` has no `attention/hopper/` and no `comm/` directory at
+    // all. Combined with needing no aggregate, that leaves this the ONLY one
+    // of the four FlashInfer host programs blocked on nothing but demand:
+    // unit, row, Rust, in that order, with no prerequisite outside this crate.
+    //
+    // Which is also the argument for NOT re-adding it speculatively. §38
+    // deleted the row because the consumer set was empty and that is still
+    // true; `vendor_probe.rs` is what keeps the return trip cheap. This note
+    // records that the trip is short, not that it should be taken.
     // Rewrites `[R+1]` indptr arrays, so a row window would compact the wrong
     // requests' page lists.
+    // ── `attn::split_qkv_bf16_devwin`, MOVED HERE FROM
+    // `table::driver_internal` ──────────────────────────────────────────
+    //
+    // `model-compiler/src/lower.rs:1503` lowers the peel's tail region to
+    // this symbol, so a statement names it and `driver_internal`'s stated
+    // membership rule had stopped describing it. The move is also what makes
+    // `execution::RUST_SERVED` legal for the row, which is what frees
+    // `attn/split_packed.cu`. Every `Source` is carried across unchanged.
+    // The DEVICE-WINDOW twin. Its own stated symbol, so there is no
+    // ambiguity for a binder to resolve — the peel's tail region states
+    // this one and the plain body states the other. `CtxNonZero` on the
+    // window is the arm's null check: a fire that published no peel
+    // window is not one this launcher can run for.
+    kernel!(split_qkv_devwin "attn::split_qkv_bf16_devwin",
+        operands = operands![
+            packed: Buf <- Source::In(0),
+            q_out: BufMut <- Source::Out(0),
+            k_out: BufMut <- Source::Out(1),
+            v_out: BufMut <- Source::Out(2),
+            win_d: U32s <- Source::CtxNonZero("peel_window"),
+            n_max: I32 <- Source::Ctx("rows_total"),
+            q_dim: I32 <- Source::OutWidth(0),
+            kv_dim: I32 <- Source::OutWidth(1),
+            stream: Stream <- Source::Ctx("stream"),
+        ]),
+
     kernel!(compact_page_csr "attn::compact_page_csr", whole = true,
         operands = operands![
             page_indices_in: U32s, page_indptr_in: U32s, last_page_lens_in: U32s,
@@ -396,18 +474,39 @@ pub static KERNELS: &[KernelSig] = &[
     // Both walk `src_indptr[R+1]`. The window view is how sliding-window
     // attention is expressed without a second cache -- the window is a VIEW
     // over the same pages.
-    kernel!(build_window_page_view "attn::build_window_page_view", whole = true,
-        operands = operands![
-            src_indices: U32s, src_indptr: U32s, keep_pages: I32,
-            dst_indptr: U32sMut, dst_indices: U32sMut, R: I32, stream: Stream,
-        ]),
-    kernel!(build_full_split_view "attn::build_full_split_view", whole = true,
-        operands = operands![
-            src_indptr: U32s, src_last_page_len: U32s, splits: I32, page_size: I32,
-            dst_indptr: U32sMut, dst_indices: U32sMut, dst_last: U32sMut,
-            src_indices: U32s, stream: Stream,
-        ]),
-    // A SECOND KV cache beside the fine-grained one, holding one entry per
+    // ── `attn::build_window_page_view` AND `attn::build_full_split_view` ─────
+    //
+    // BOTH ROWS ARE DELETED, with their two `dsl::cuda` wrappers and the two
+    // launchers in `attn/kv_paged.cu`. The Rust is
+    // `driver-cuda/src/fire/kv_paged.rs::build_window_page_view` and
+    // `::build_full_split_view`.
+    //
+    // WHY DELETION AND NOT `RUST_SERVED`. Every operand of both rows was
+    // `Source::Unbound` — `src_indptr` is the page table's CSR, `keep_pages`
+    // is a model window divided by a page size, `splits` is a driver plan's
+    // piece count, and no model text names any of them — so `crate::abi`
+    // skipped each row WHOLE and neither ever generated a dispatch. §60.7
+    // establishes that `RUST_SERVED` on an unsourced row is legitimate, and
+    // it would work here; the reason it is not used is that it needs a
+    // classification first (`every_taken_over_row_was_classified_first`) and
+    // §58 says a single launch with no choice and no loop should carry none.
+    // A row nothing binds, with a wrapper nothing calls, is §54's case: the
+    // row and the wrapper go together.
+    //
+    // THE SWEEP. `crates/model/src`: no hit for either symbol string OR
+    // either wrapper name — the two tokens were swept separately, because a
+    // sweep for one has reported a live symbol as uncalled before.
+    // `model-compiler/src/dsl.rs`: the two wrappers, deleted in the same
+    // change. `lower.rs::semantic()`: no mapping. Hand `ffi::pie_k_*` arms:
+    // none. C++: the only hit is
+    // `kernels-cuda-new/csrc/src/attn/kv_paged.cuh`, which is the device text.
+    //
+    // The DEVICE rows stay — `LaunchRule::Single` and `SingleWarp`,
+    // `families/attn.rs` — because a family row is a claim about what a
+    // kernel IS. The warp-width argument for `SingleWarp` is carried into the
+    // Rust's doc comment rather than left behind here.
+
+      // A SECOND KV cache beside the fine-grained one, holding one entry per
     // `ratio` tokens. Every query attends both and the outputs are merged by
     // their log-sum-exps -- exact, not an approximation: the same algebra
     // flashinfer's own KV-split merge uses.
@@ -599,6 +698,55 @@ pub static KERNELS: &[KernelSig] = &[
     // No capture variant of this dispatch exists, so it cannot publish the
     // score matrix an `attn.out` observer asks for. It does publish an LSE,
     // which is a different thing and not what the capability names.
+    //
+    // WHAT ITS RUST FORM NEEDS (`new-horizon.md` §50.4 in full). The launcher
+    // `attn/attention_mla.cu` holds zero `__global__`, zero `__device__` and
+    // zero `<<<>>>`: every kernel it reaches is a template inside
+    // `flashinfer::mla::BatchMLAPagedAttention`, so there is no device text to
+    // migrate and the whole file is host program.
+    //
+    //  1. FIRES one `BatchMLAPagedAttention<MASK, 512, 64>` instantiation,
+    //     `MASK` being `kCausal` or `kNone`. The Blackwell arm fires the naive
+    //     paged kernels from `attention_mla_naive.cuh` instead — those are
+    //     ours and are already device text.
+    //  2. INTERMEDIATE: the plan. `MlaPlanCache` holds a `MLAPlanInfo` built
+    //     by an earlier host call and read back here, and the workspace's
+    //     `int_buffer`/`float_buffer` are re-based by byte offsets that plan
+    //     and dispatch must agree on. In Rust that is a driver allocation
+    //     owned across two calls — the "kernels produce intermediate results"
+    //     case, named exactly.
+    //  3. HOST DECIDES `MaskMode` (a bool operand, which `Term::Is` states
+    //     directly); a DEVICE QUERY — a `static` one-shot read of
+    //     `cudaDevAttrComputeCapabilityMajor`, taking the naive path at
+    //     `major >= 10`; and two shape refusals that `throw`. A device query
+    //     choosing among instantiations is not a wall, it is what
+    //     `Specialisation { base, arms }` is for. A refusal stays a refusal.
+    //  4. MISSING: the by-value aggregate. `BatchMLAPagedAttention(params,
+    //     num_blks_x, num_blks_y, stream)` passes ONE `MLAParams<DTypeQ,
+    //     DTypeKV, DTypeO, IdType>` by value, and two of its fields are
+    //     `flashinfer::uint_fastdiv` — a magic/shift pair the host computes
+    //     from `block_size` and `num_heads`. The arithmetic is easy in Rust;
+    //     carrying the struct is what `Ty`/`ArgValue` cannot do. See the note
+    //     on `ArgValue` in `runtime/args.rs`.
+    //
+    // `MlaPlanCacheDeleter::operator()` is not an obstacle: a `unique_ptr`
+    // with a custom deleter is host code, and its Rust form is a type owning
+    // the raw plan pointer with `Drop`.
+    //
+    // THE HEADER GATE: this row clears it. NVRTC sees only the vendored tree
+    // (`Headers::LibraryAndVendor`) — the CPM checkout is a C++ compiler
+    // include path and is on no NVRTC path — and all three of this launcher's
+    // headers (`attention/mla.cuh`, `attention/scheduler.cuh`, `fastdiv.cuh`)
+    // ARE vendored. So its device text is carryable today, which is not true
+    // of the sm90 prefill or of `comm/custom_all_reduce.cu`: `csrc/vendor` has
+    // no `attention/hopper/` and no `comm/` directory at all, so those two are
+    // blocked before a unit can even be written.
+    //
+    // That makes the order for this row: unit, row, THEN the by-value
+    // aggregate, then the Rust launcher in `driver-cuda/src/fire/`. It is
+    // second in the queue behind `merge_attention_states` — which needs no
+    // aggregate — and it is the first LIVE row that the aggregate unblocks.
+    // Until `ArgValue` can carry a struct, no amount of Rust here can fire it.
     kernel!(attention_mla "attn::dispatch_attention_mla_bf16",
         needs = Prepare::MlaPlan, lacks = &[Cap::Scores],
         operands = operands![

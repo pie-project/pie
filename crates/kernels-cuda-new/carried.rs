@@ -25,9 +25,9 @@
 //!
 //! NVRTC matches `includeNames[]` against the literal string in the `#include`
 //! directive, so an entry's name has to be exactly what the includer writes.
-//! Both trees are rooted so that this falls out:
+//! All three trees are rooted so that this falls out:
 //!
-//! * `csrc/src/cuda/std/limits` is carried as `cuda/std/limits`, which is what
+//! * `csrc/shim/cuda/std/limits` is carried as `cuda/std/limits`, which is what
 //!   FlashInfer's `#include <cuda/std/limits>` says.
 //! * `csrc/vendor/flashinfer/attention/decode.cuh` is carried as
 //!   `flashinfer/attention/decode.cuh`, which is what our own `.cu` files say.
@@ -36,13 +36,34 @@
 //! is source we do not own — `new-horizon.md` §13.4 is the rule — and the
 //! directory layout is how that decision is expressed rather than configured.
 //!
-//! # Two groups, because a compile should not carry what it cannot need
+//! # Three groups, because a compile should not carry what it cannot need
 //!
-//! `LIBRARY` goes to every unit. `VENDOR` is 1.7 MB of somebody else's
-//! attention library, and `nvrtcCreateProgram` copies every byte it is
+//! `SHIM` and `LIBRARY` go to every unit. `VENDOR` is 1.7 MB of somebody
+//! else's attention library, and `nvrtcCreateProgram` copies every byte it is
 //! handed, so a `norm` kernel does not get it. The split is by directory
 //! because that is a fact a walk can see; which units want `VENDOR` is stated
 //! by the units.
+//!
+//! `SHIM` is the newest of the three and is a cut by ROLE rather than by
+//! provenance. The impersonating headers used to be split between the other
+//! two trees by who wrote them — `cuda_fp16.h` and `cooperative_groups.h`
+//! under `csrc/src`, `cstdint` and `cuda_runtime.h` under `csrc/vendor` —
+//! which recorded a fact about history and none about what a compile needs.
+//! They do the same job, so they sit together. Nothing about the SET changed:
+//! same files, same names, same bytes, one more walk.
+//!
+//! It also closes a door that was propped open. `csrc/src` holds device text
+//! an offline compile reaches with `-iquote`, and while eight headers wearing
+//! NVIDIA's filenames sat inside it, one `-I` where an `-iquote` belonged
+//! put the impersonation ahead of the real toolkit — the failure
+//! `src/source.rs` measures at 17,744 B against 15,088 B with no diagnostic
+//! and two disjoint symbol sets. `-I csrc/src` cannot reach `csrc/shim` at
+//! all now; the shims answer to NVRTC's carried set, and to nvcc only through
+//! an `-iquote` that names them on purpose. That second `-iquote` is not
+//! optional and is not tidiness: `csrc/src/pie_fp8.cuh` and `pie_half2.cuh`
+//! reach the shims by QUOTED include and used to find them beside the
+//! includer, and a quoted name that misses falls through to the real toolkit
+//! header without a word. Four sites pass the pair.
 //!
 //! # It was three walks until the `.cuh` files moved here
 //!
@@ -101,9 +122,26 @@ pub fn generate(out: &Path) {
     // module exists for.
     println!("cargo:rerun-if-changed=csrc");
 
+    // `csrc/shim` is the impersonation layer: headers wearing NVIDIA's and
+    // the standard library's filenames, because the source that reaches for
+    // them is source we do not own and `new-horizon.md` §13.4 says the
+    // spelling is the contract. They are a third walk rather than part of
+    // either of the others because that is what they ARE -- neither our
+    // device text nor upstream's, but the answer to a name.
+    //
+    // They used to be split across the other two trees by where they came
+    // from: `cuda_fp16.h` and `cooperative_groups.h` under `csrc/src` because
+    // PIE wrote them, `cstdint` and `cuda_runtime.h` under `csrc/vendor`
+    // because they arrived with the vendoring. Same job, two directories,
+    // and the only thing the split recorded was provenance -- which is a fact
+    // about history and not about what a compile needs.
+    //
+    // Their NAMES do not change, which is why this was the first move: a
+    // header set is matched by literal include string, so a shim that moved
+    // and kept its name is a shim NVRTC cannot tell moved at all.
+    let shim = collect(&root.join("csrc/shim"));
     // `csrc/src` is the device text: every `__global__` template a unit
-    // compiles, the prelude they are written over, and the shims that answer
-    // the vendor spellings upstream source insists on. One tree, one walk --
+    // compiles and the prelude they are written over. One tree, one walk --
     // it was two until the kernels moved here from `../kernels-cuda/csrc/src`,
     // and the second walk went with the reach.
     let library = collect(&root.join("csrc/src"));
@@ -118,10 +156,13 @@ pub fn generate(out: &Path) {
     // The walk produces one for exactly one reason: it was pointed at a tree
     // that is not there. That was theoretical while the paths had been right
     // for years; it stopped being theoretical when the `.cuh` files moved
-    // into `csrc/src` and one of the two walks changed what it names.
-    for (group, tree, files) in
-        [("LIBRARY", "csrc/src", &library), ("VENDOR", "csrc/vendor", &vendor)]
-    {
+    // into `csrc/src` and one of the two walks changed what it names, and it
+    // is live again now that a third walk names a tree three days old.
+    for (group, tree, files) in [
+        ("SHIM", "csrc/shim", &shim),
+        ("LIBRARY", "csrc/src", &library),
+        ("VENDOR", "csrc/vendor", &vendor),
+    ] {
         assert!(
             !files.is_empty(),
             "{group} is empty: nothing was found under {}. A walk of a \
@@ -143,13 +184,15 @@ pub fn generate(out: &Path) {
              // what NVRTC matches `includeNames[]` against. Editing this is\n\
              // pointless: add or remove a FILE and the next build follows.\n\
              //\n\
-             // {} device headers and {} vendored, {} bytes of text, carried into\n\
-             // the binary by the `include_str!`s below.\n\n",
+             // {} shims, {} device headers and {} vendored, {} bytes of text,\n\
+             // carried into the binary by the `include_str!`s below.\n\n",
+            shim.len(),
             library.len(),
             vendor.len(),
-            library.iter().chain(&vendor).map(|(_, p)| file_len(p)).sum::<u64>()
+            shim.iter().chain(&library).chain(&vendor).map(|(_, p)| file_len(p)).sum::<u64>()
         ),
     );
+    emit(&mut text, "SHIM", &shim, "csrc/shim");
     emit(&mut text, "LIBRARY", &library, "csrc/src");
     emit(&mut text, "VENDOR", &vendor, "csrc/vendor");
 

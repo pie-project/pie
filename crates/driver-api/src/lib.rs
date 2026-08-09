@@ -46,9 +46,14 @@
 
 pub mod capabilities;
 pub mod channel;
+// The runtime half. See the `runtime` feature: the device crates want the
+// plain data below and nothing here, and one of them proves it.
+#[cfg(feature = "runtime")]
 pub mod completion;
+#[cfg(feature = "runtime")]
 pub mod driver;
 pub mod geometry;
+#[cfg(feature = "runtime")]
 pub mod instance;
 pub mod local;
 pub mod plan;
@@ -58,13 +63,13 @@ pub mod transfer;
 
 pub use capabilities::{
     DeviceFacts, DriverCapabilities, ExpertSiteSummary, KV_COPY_DEVICE_TO_DEVICE,
-    KV_COPY_DEVICE_TO_HOST, KV_COPY_HOST_TO_DEVICE, KV_COPY_HOST_TO_HOST, ModelLoadDesc,
-    ModelSiteSummary, Mxfp4MoeRequest,
+    KV_COPY_DEVICE_TO_HOST, KV_COPY_HOST_TO_DEVICE, KV_COPY_HOST_TO_HOST, ModelFacts,
+    ModelLoadDesc, ModelSiteSummary, Mxfp4MoeRequest,
 };
 pub use channel::{ChannelValue, RegisteredChannel};
-pub use completion::{
-    CompletionBroker, CompletionLease, SubmissionCompletion, WorkItemCompletion,
-};
+#[cfg(feature = "runtime")]
+pub use completion::{CompletionBroker, CompletionLease, SubmissionCompletion, WorkItemCompletion};
+#[cfg(feature = "runtime")]
 pub use driver::{Driver, FrameLaunchOutcome, Unsupported};
 pub use geometry::{
     GeometryClass, PIE_DECODE_ENVELOPE_PORTS, PIE_DEVICE_GEOMETRY_PORTS, PIE_DEVICE_PORT_ATTN_MASK,
@@ -74,6 +79,7 @@ pub use geometry::{
     PIE_DEVICE_PORT_RS_W_SLOT, PIE_DEVICE_PORT_W_OFF, PIE_DEVICE_PORT_W_SLOT,
     PIE_DEVICE_RS_BUFFER_PORTS,
 };
+#[cfg(feature = "runtime")]
 pub use instance::{BoundInstance, BoundWaitSlots, InstanceBindingPlan, InstanceId, ProgramId};
 pub use local::*;
 pub use plan::{

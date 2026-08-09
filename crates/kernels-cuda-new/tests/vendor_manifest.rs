@@ -41,6 +41,57 @@
 //! guard, forget the row), and the doc carries the one-time proof of the part
 //! that needs the internet.
 //!
+//! # The fourth column, and the blind spot it closes
+//!
+//! Three columns were `guards`, `added` and `lines`, and the sentence above
+//! — *"a drift that changes the vendored bytes changes at least one of them
+//! unless it is exactly line-count-neutral outside every guard"* — was
+//! stating a blind spot as if it were a corner case. It is not a corner
+//! case. Changing a constant, reflowing an expression, swapping two
+//! arguments: every one of those keeps the line count, and all three columns
+//! sit still while the file stops being upstream's.
+//!
+//! `bytes` is the fourth column. It is not a checksum and does not close the
+//! hole completely — a length-preserving edit still gets through — but it
+//! catches every edit that changes a file's LENGTH, which is nearly all of
+//! them, and it has a property a checksum does not: `wc -c` and
+//! [`str::len`] cannot disagree about the algorithm, so the number in the
+//! manifest and the number this test computes are produced by two
+//! implementations that have nothing to get wrong. A digest would be
+//! stronger and would need a hash function written here and a hash function
+//! run in a shell to agree, which is the failure mode this session has been
+//! collecting.
+//!
+//! # The second half of the transform, standing before it is needed
+//!
+//! `csrc/` is being re-cut by ROLE rather than by provenance: the shims that
+//! impersonate NVIDIA headers into `csrc/shim/`, the device stdlib into
+//! `csrc/device/`, the attention algorithms into `csrc/attn/`, so that a
+//! `norm` unit stops carrying somebody else's attention library and our own
+//! text stops pointing at somebody else's namespace to find a `mma.sync`
+//! wrapper.
+//!
+//! A vendored file that moves has to have its `#include` lines rewritten,
+//! and that is the exact moment vendoring turns into a fork. Upstream
+//! reaches its own siblings by relative path — 58 quoted directives across
+//! the closure, `"../cp_async.cuh"`, `"../utils.cuh"`, and **not one**
+//! `<flashinfer/…>` — so no move is spelling-neutral. Once the bytes on
+//! disk are not upstream's bytes, the `MODIFICATIONS` claim is prose again.
+//!
+//! So the claim gets a second step: strip the markers, then rewrite every
+//! `#include <pie/…>` back to what upstream wrote, and only THEN is the
+//! result byte-identical. [`PIE_INCLUDES`] is that map and
+//! [`denormalise_includes`] applies it.
+//!
+//! **The map is empty today and the step is the identity, and that is the
+//! point.** It is standing before the first file moves, because a transform
+//! written after the move is a transform derived from the thing it is meant
+//! to check. What makes it non-vacuous now is not the map — it is
+//! [`the_manifest_check_can_fail_on_every_drift_it_claims_to_catch`], which
+//! mutates the real vendored files and counts how many mutations the check
+//! rejects. A negative control whose discriminating-input count is unstated
+//! is a negative control nobody has checked.
+//!
 //! # Why the stripper lives in the test rather than the build
 //!
 //! Nothing in the crate needs it at run time. It exists to answer a question
@@ -53,12 +104,28 @@ fn csrc() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc")
 }
 
-/// One row of `MODIFICATIONS`: the three numbers it asserts about a file.
+/// One row of `MODIFICATIONS`: the four numbers it asserts about a file.
 #[derive(Debug, PartialEq, Eq)]
 struct Row {
     guards: usize,
     added: usize,
     lines: usize,
+    bytes: usize,
+}
+
+/// What a file measures, which is what its row has to say.
+///
+/// Extracted from the test that used to compute it inline, because the
+/// mutation battery has to run the same measurement over text that is not on
+/// disk. A check whose measurement exists only inside the passing path cannot
+/// be shown to fail.
+fn measure(text: &str) -> Row {
+    Row {
+        guards: text.lines().filter(|l| l.trim_start().starts_with("// PIE:")).count(),
+        added: strip(text).1,
+        lines: text.lines().count(),
+        bytes: text.len(),
+    }
 }
 
 /// Parse the table. The format is fixed-ish columns under a `---` rule, and
@@ -87,17 +154,17 @@ fn manifest() -> BTreeMap<String, Row> {
             continue;
         }
         let mut it = line.split_whitespace();
-        let (Some(file), Some(g), Some(a), Some(l)) =
-            (it.next(), it.next(), it.next(), it.next())
+        let (Some(file), Some(g), Some(a), Some(l), Some(b)) =
+            (it.next(), it.next(), it.next(), it.next(), it.next())
         else {
             continue;
         };
-        let (Ok(guards), Ok(added), Ok(lines)) =
-            (g.parse::<usize>(), a.parse::<usize>(), l.parse::<usize>())
+        let (Ok(guards), Ok(added), Ok(lines), Ok(bytes)) =
+            (g.parse::<usize>(), a.parse::<usize>(), l.parse::<usize>(), b.parse::<usize>())
         else {
-            panic!("MODIFICATIONS row is not three numbers: {line:?}");
+            panic!("MODIFICATIONS row is not four numbers: {line:?}");
         };
-        out.insert(file.to_string(), Row { guards, added, lines });
+        out.insert(file.to_string(), Row { guards, added, lines, bytes });
     }
     assert!(
         out.len() > 20,
@@ -106,6 +173,17 @@ fn manifest() -> BTreeMap<String, Row> {
         out.len()
     );
     out
+}
+
+/// The directive a `// PIE:` marker guards, in both spellings this tree uses.
+///
+/// One definition, called from [`strip`] and from the mutation battery. It
+/// was two — a closure inside `strip` and a copy inside the test — and two
+/// implementations of one rule that are never fed an input on which they
+/// could disagree is the defect this file was extended to stop shipping.
+fn is_rtc_guard(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("#ifndef __CUDACC_RTC__") || line.starts_with("#if !defined(__CUDACC_RTC__)")
 }
 
 /// The strip `MODIFICATIONS` describes: drop a `// PIE:` marker with its
@@ -140,12 +218,7 @@ fn strip(text: &str) -> (String, usize) {
             }
         }
         // the guard under it, if there is one
-        let is_open = |s: &str| {
-            let s = s.trim_start();
-            s.starts_with("#ifndef __CUDACC_RTC__")
-                || s.starts_with("#if !defined(__CUDACC_RTC__)")
-        };
-        if i < src.len() && is_open(src[i]) {
+        if i < src.len() && is_rtc_guard(src[i]) {
             i += 1;
             removed += 1;
             let mut depth = 1usize;
@@ -167,6 +240,106 @@ fn strip(text: &str) -> (String, usize) {
         }
     }
     (out.join("\n"), removed)
+}
+
+/// The path rewrite a role-cut move applies to a vendored file, written
+/// backwards so it can be undone.
+///
+/// `(file, the directive as it stands in the tree, the directive upstream
+/// wrote)`. Whole lines on both sides, not paths: upstream's spelling carries
+/// its bracket style and its indentation, and restoring
+/// `#include "../cp_async.cuh"` from `#include <pie/device/cp_async.cuh>`
+/// needs both. Matching whole lines also makes the map exact where a path map
+/// could not be — the same target is reached as `"../vec_dtypes.cuh"` from
+/// `attention/decode.cuh` and as `"vec_dtypes.cuh"` from a file one directory
+/// up, so the reverse of a canonical `<pie/device/vec.cuh>` is not a function
+/// of the target alone.
+///
+/// # Empty, on purpose, and early on purpose
+///
+/// Nothing has moved yet. Every vendored file still sits under
+/// `csrc/vendor/flashinfer/` reaching its siblings the way upstream wrote,
+/// so there is no `<pie/…>` anywhere and this map has nothing to say.
+///
+/// It is here anyway because of the order the work has to happen in. The
+/// first file to move out of this directory changes upstream's bytes — there
+/// is no way to move it without changing an `#include` — and at that instant
+/// the manifest's claim is either backed by a written-down transform or it is
+/// a sentence someone remembers being true. A map built after the move is
+/// derived from the move and agrees with it by construction, which is the
+/// shape of every check this session has had to throw away.
+///
+/// A row is added by the same commit that moves the file. A row whose file no
+/// longer holds that directive is a dead row and
+/// [`every_normalisation_row_is_used_and_no_pie_include_survives`] fails on
+/// it, in both directions.
+const PIE_INCLUDES: &[(&str, &str, &str)] = &[];
+
+/// Does this line reach for our namespace?
+///
+/// Spelled as a predicate over the directive rather than as a substring
+/// search, because `<pie/` appears in prose inside these files and a comment
+/// mentioning the new layout must not be mistaken for an include the map owes
+/// a row.
+fn is_pie_include(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix('#')
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix("include"))
+        .is_some_and(|rest| rest.trim_start().starts_with("<pie/"))
+}
+
+/// Step 2 of the transform: put upstream's `#include` lines back.
+///
+/// # Errors
+///
+/// A `#include <pie/…>` with no row in [`PIE_INCLUDES`]. **Refused, never
+/// passed through.** Passing it through would produce text that is not
+/// upstream's and claim it was — the manifest would go on describing a tree
+/// that had quietly become a fork, which is the one failure this whole file
+/// exists to make impossible. It is also the only way the map can be caught
+/// being incomplete: a move that forgets its row fails here, and nowhere
+/// else.
+fn denormalise_includes(name: &str, text: &str) -> Result<String, String> {
+    let mut out: Vec<&str> = Vec::new();
+    for (at, line) in text.lines().enumerate() {
+        if !is_pie_include(line) {
+            out.push(line);
+            continue;
+        }
+        let Some((_, _, upstream)) =
+            PIE_INCLUDES.iter().find(|(file, pie, _)| *file == name && *pie == line)
+        else {
+            return Err(format!(
+                "{name}:{}: `{}` has no row in PIE_INCLUDES, so this file cannot \
+                 be turned back into upstream's. Add \
+                 (\"{name}\", \"{}\", \"<the line upstream wrote>\") in the same \
+                 change that moved the file.",
+                at + 1,
+                line.trim(),
+                line
+            ));
+        };
+        out.push(*upstream);
+    }
+    Ok(out.join("\n"))
+}
+
+/// The whole transform `MODIFICATIONS` claims: strip, then denormalise.
+///
+/// Returns the recovered text and the line count the strip removed, which is
+/// the manifest's `added` column. The second step is line-count-neutral by
+/// construction — [`denormalise_includes`] pushes exactly one string per
+/// input line, so a rewrite cannot split a directive across two lines and
+/// move `lines` for every row at once, which would read as a manifest that
+/// had gone stale rather than as a transform that had.
+///
+/// # Errors
+///
+/// [`denormalise_includes`]'.
+fn normalise(name: &str, text: &str) -> Result<(String, usize), String> {
+    let (stripped, removed) = strip(text);
+    Ok((denormalise_includes(name, &stripped)?, removed))
 }
 
 /// Every vendored FlashInfer file, as `MODIFICATIONS` names it.
@@ -203,20 +376,27 @@ fn modifications_describes_the_vendored_tree() {
     let mut wrong = Vec::new();
     for (name, path) in &files {
         let text = std::fs::read_to_string(path).expect("read vendored file");
-        let guards = text.lines().filter(|l| l.trim_start().starts_with("// PIE:")).count();
-        let lines = text.lines().count();
-        let (_, added) = strip(&text);
+
+        // Step 2 of the claim, before the columns are compared: a file whose
+        // `#include <pie/…>` has no row cannot be turned back into upstream's,
+        // and three columns that agree about a file we can no longer recover
+        // are three columns describing a fork.
+        if let Err(why) = normalise(name, &text) {
+            wrong.push(why);
+            continue;
+        }
 
         let Some(row) = rows.get(name) else {
             wrong.push(format!("{name}: vendored but absent from MODIFICATIONS"));
             continue;
         };
-        let got = Row { guards, added, lines };
+        let got = measure(&text);
         if got != *row {
             wrong.push(format!(
-                "{name}: MODIFICATIONS says guards={} added={} lines={}, file has \
-                 guards={} added={} lines={}",
-                row.guards, row.added, row.lines, got.guards, got.added, got.lines
+                "{name}: MODIFICATIONS says guards={} added={} lines={} bytes={}, file has \
+                 guards={} added={} lines={} bytes={}",
+                row.guards, row.added, row.lines, row.bytes, got.guards, got.added,
+                got.lines, got.bytes
             ));
         }
     }
@@ -235,9 +415,9 @@ fn modifications_describes_the_vendored_tree() {
 
 /// The table's own totals row agrees with the rows above it.
 ///
-/// `28 files   33   206   18187` is a summary, and a summary is the line a
-/// reader takes on trust. It is also the line that survives a per-file edit
-/// unchanged, so it is the one most likely to go stale.
+/// `28 files   33   206   18187   798875` is a summary, and a summary is the
+/// line a reader takes on trust. It is also the line that survives a per-file
+/// edit unchanged, so it is the one most likely to go stale.
 #[test]
 fn the_totals_row_sums_the_table() {
     let text = std::fs::read_to_string(csrc().join("vendor/MODIFICATIONS")).expect("manifest");
@@ -249,17 +429,41 @@ fn the_totals_row_sums_the_table() {
         .split_whitespace()
         .filter_map(|w| w.parse().ok())
         .collect();
-    assert_eq!(n.len(), 4, "totals row is not four numbers: {totals:?}");
+    assert_eq!(n.len(), 5, "totals row is not five numbers: {totals:?}");
 
     let rows = manifest();
     let files = n[0];
-    let (guards, added, lines) = rows.values().fold((0, 0, 0), |(g, a, l), r| {
-        (g + r.guards, a + r.added, l + r.lines)
+    let (guards, added, lines, bytes) = rows.values().fold((0, 0, 0, 0), |(g, a, l, b), r| {
+        (g + r.guards, a + r.added, l + r.lines, b + r.bytes)
     });
     assert_eq!(
-        (files, n[1], n[2], n[3]),
-        (rows.len(), guards, added, lines),
+        (files, n[1], n[2], n[3], n[4]),
+        (rows.len(), guards, added, lines, bytes),
         "the totals row disagrees with the rows it summarises"
+    );
+}
+
+/// The prose's *"14 files are untouched"* is a count of the rows below it.
+///
+/// A sentence in the same file as the table it describes, and nothing tied
+/// the two together: vendor one more file with a guard and the sentence is
+/// wrong in a document whose entire purpose is being right about this tree.
+#[test]
+fn the_untouched_count_in_the_prose_is_the_table_s() {
+    let text = std::fs::read_to_string(csrc().join("vendor/MODIFICATIONS")).expect("manifest");
+    let words: Vec<&str> = text.split_whitespace().collect();
+    // `N files are untouched`, and not the totals row's `28 files`, which
+    // appears first and would answer with the wrong number.
+    let quoted: usize = words
+        .windows(3)
+        .find(|w| w[1] == "files" && w[2] == "are")
+        .and_then(|w| w[0].parse().ok())
+        .expect("MODIFICATIONS quotes `N files are untouched`");
+
+    let untouched = manifest().values().filter(|r| r.guards == 0).count();
+    assert_eq!(
+        quoted, untouched,
+        "MODIFICATIONS says {quoted} files are untouched, {untouched} rows have no guard"
     );
 }
 
@@ -332,7 +536,234 @@ tail";
     assert_eq!(removed, 3);
 }
 
-/// The counted claims `csrc/src/cooperative_groups.h` makes about the closure
+/// The second step refuses what it cannot recover, and only what it cannot.
+///
+/// Two directions, because a detector is wrong in two ways. A
+/// `#include <pie/…>` with no row must stop the check — passing it through
+/// would hand back text that is not upstream's while the manifest went on
+/// saying it was. And a *mention* of the new layout in a comment must not:
+/// these files acquire prose as the restructure proceeds, and a checker that
+/// demanded a map row for a sentence would be a checker somebody switched
+/// off.
+#[test]
+fn the_second_step_refuses_an_unmapped_include_and_nothing_else() {
+    let unmapped = "\
+#include <pie/device/vec.cuh>
+int x;";
+    let why = denormalise_includes("attention/decode.cuh", unmapped)
+        .expect_err("an unmapped `<pie/…>` must refuse");
+    assert!(why.contains("PIE_INCLUDES"), "the refusal must name the map: {why}");
+    assert!(why.contains("attention/decode.cuh"), "and the file: {why}");
+
+    // Indented, and with space after the `#` — both forms appear inside `#if`
+    // blocks in this tree, and a detector that only saw column zero would let
+    // the interesting half through.
+    assert!(is_pie_include("    #  include <pie/attn/fa2_decode.cuh>"));
+    assert!(is_pie_include("#include\t<pie/device/mma.cuh>"));
+
+    // ...and the four ways a line can look like one and not be.
+    assert!(!is_pie_include("// moved to <pie/device/vec.cuh> by the role cut"));
+    assert!(!is_pie_include(" * see <pie/device/math.cuh>"));
+    assert!(!is_pie_include("#include <flashinfer/attention/decode.cuh>"));
+    assert!(!is_pie_include("#define PIE_INCLUDE <pie/device/vec.cuh>"));
+
+    // The identity case, which is every file in the tree today.
+    let clean = "#include \"../cp_async.cuh\"\nint x;";
+    assert_eq!(
+        denormalise_includes("attention/decode.cuh", clean).expect("no pie includes"),
+        clean,
+        "a file with nothing to rewrite must come back unchanged, byte for byte"
+    );
+}
+
+/// Every row of the map is used, and nothing in the tree needs a row it has
+/// not got.
+///
+/// Both directions, for [`modifications_describes_the_vendored_tree`]'s
+/// reason. A dead row is a file that moved back, or a directive that was
+/// edited after its row was written, and it rots silently because the passing
+/// path never reads it. An unmapped directive is a fork.
+///
+/// With an empty map this asserts the tree holds no `<pie/…>` at all, which
+/// is the true statement about a tree where nothing has moved yet — and it is
+/// the assertion that flips the day the first file does.
+#[test]
+fn every_normalisation_row_is_used_and_no_pie_include_survives() {
+    let files = vendored();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for (name, path) in &files {
+        for line in std::fs::read_to_string(path).expect("read").lines() {
+            if is_pie_include(line) {
+                seen.push((name.clone(), line.to_string()));
+            }
+        }
+    }
+
+    let mut wrong = Vec::new();
+    for (file, pie, upstream) in PIE_INCLUDES {
+        if !seen.iter().any(|(f, l)| f.as_str() == *file && l.as_str() == *pie) {
+            wrong.push(format!(
+                "PIE_INCLUDES has a row for {file} -> {upstream:?} whose line {pie:?} is not \
+                 in that file any more"
+            ));
+        }
+        if !files.iter().any(|(n, _)| n.as_str() == *file) {
+            wrong.push(format!("PIE_INCLUDES names {file}, which is not vendored"));
+        }
+    }
+    for (file, line) in &seen {
+        if !PIE_INCLUDES
+            .iter()
+            .any(|(f, p, _)| *f == file.as_str() && *p == line.as_str())
+        {
+            wrong.push(format!("{file} spells {line:?} and PIE_INCLUDES has no row for it"));
+        }
+    }
+    assert!(wrong.is_empty(), "the normalisation map and the tree disagree:\n  {}", wrong.join("\n  "));
+
+    assert_eq!(
+        PIE_INCLUDES.len(),
+        seen.len(),
+        "one row per `<pie/…>` directive in the tree, and there are {} of them",
+        seen.len()
+    );
+}
+
+/// **The negative control, and the count of inputs on which it could fail.**
+///
+/// The three tests above walk the tree and compare it to a table written from
+/// the same tree. That is the shape this session has published three
+/// conclusions from and had to withdraw all three: a walk agreeing with a
+/// constant derived from the walk, two rule implementations agreeing across
+/// fifty-six files with no input on which they could have disagreed, and a
+/// file-count check blind to every in-place edit. Agreement is not evidence
+/// unless disagreement was possible, and *how possible* is a number.
+///
+/// So this mutates the real vendored files — not synthetic snippets — and
+/// requires the check to reject every mutant. **154 discriminating inputs**,
+/// in two families:
+///
+/// * **126 measurement mutants**, each of which must make [`measure`]
+///   disagree with the file's row: three per file over 28 files (append a
+///   line, drop the last line, pad a line without changing the line count)
+///   and three per guarded file over 14 (rename a marker, delete a marker
+///   line, insert a line inside a guard).
+/// * **28 recoverability mutants**, one per file: inject a
+///   `#include <pie/…>` with no map row, which [`normalise`] must refuse.
+///
+/// The 28 `pad_a_line` mutants are why the fourth column exists and are
+/// asserted as such: each is invisible to `guards`, `added` and `lines`
+/// together, and `bytes` alone catches it. Before the column, those 28 inputs
+/// were 28 ways for this file to be wrong and say nothing.
+///
+/// # What it still cannot catch
+///
+/// A length-preserving edit outside every guard — swap two arguments, change
+/// `1` to `2`. Four columns computed from the tree cannot see it, and no
+/// number of mutants makes them. That residue needs upstream's bytes and so
+/// needs the network; §23.8 records the one-time run.
+#[test]
+fn the_manifest_check_can_fail_on_every_drift_it_claims_to_catch() {
+    let rows = manifest();
+    let files = vendored();
+
+    let (mut measured, mut unrecoverable) = (0usize, 0usize);
+    let (mut with_markers, mut with_guards) = (0usize, 0usize);
+    let mut survived: Vec<String> = Vec::new();
+
+    for (name, path) in &files {
+        let text = std::fs::read_to_string(path).expect("read vendored file");
+        let row = rows.get(name).expect("every vendored file has a row");
+        let lines: Vec<&str> = text.lines().collect();
+
+        let mut mutants: Vec<(&str, String)> = Vec::new();
+
+        mutants.push(("append a line", format!("{text}// drift\n")));
+        mutants.push(("drop the last line", lines[..lines.len() - 1].join("\n")));
+
+        // Line-count-neutral and byte-count-changing: the class the first
+        // three columns are blind to. A space on the end of the first line —
+        // built from `text` rather than from a re-`join`, because a join of
+        // `lines()` silently drops the trailing newline and would cancel the
+        // byte this mutant is trying to add, leaving a mutant that proved the
+        // opposite of what it was written to prove. The first line of every
+        // vendored file is upstream's comment banner, so padding it cannot
+        // turn into a marker or a guard by accident.
+        mutants.push(("pad a line", text.replacen('\n', " \n", 1)));
+
+        if text.contains("// PIE:") {
+            with_markers += 1;
+            mutants.push(("rename a marker", text.replacen("// PIE:", "// PIE_DRIFT:", 1)));
+            let at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("// PIE:"))
+                .expect("contains() said there is one");
+            let mut cut = lines.clone();
+            cut.remove(at);
+            mutants.push(("delete a marker line", cut.join("\n")));
+        }
+        if let Some(at) = lines.iter().copied().position(is_rtc_guard) {
+            with_guards += 1;
+            let mut grown = lines.clone();
+            grown.insert(at + 1, "#include <drift.h>");
+            mutants.push(("grow a guard body", grown.join("\n")));
+        }
+
+        for (how, mutant) in &mutants {
+            let got = measure(mutant);
+            if got == *row {
+                survived.push(format!("{name}: `{how}` left every column unmoved"));
+            }
+            if *how == "pad a line" {
+                // The column's whole justification, asserted rather than
+                // asserted-about: this mutant is invisible to the other
+                // three, so if `bytes` did not move nothing would have.
+                assert_eq!(
+                    (got.guards, got.added, got.lines),
+                    (row.guards, row.added, row.lines),
+                    "{name}: `pad a line` was supposed to be invisible to the first three columns"
+                );
+                assert_ne!(got.bytes, row.bytes, "{name}: and visible to `bytes`");
+            }
+            measured += 1;
+        }
+
+        // Recoverability: a directive into our namespace that the map does
+        // not know. Indented, and at the top, so the detector is exercised
+        // somewhere other than column zero of the last line.
+        let mut injected = lines.clone();
+        injected.insert(0, "    #include <pie/device/vec.cuh>");
+        if normalise(name, &injected.join("\n")).is_ok() {
+            survived.push(format!("{name}: an unmapped `<pie/…>` was accepted"));
+        }
+        unrecoverable += 1;
+    }
+
+    assert!(
+        survived.is_empty(),
+        "the manifest check passed on {} mutated tree(s) — it is not checking what it says:\n  {}",
+        survived.len(),
+        survived.join("\n  ")
+    );
+
+    assert_eq!(
+        (measured, unrecoverable),
+        (3 * files.len() + 2 * with_markers + with_guards, files.len()),
+        "the battery lost inputs: {} files, {with_markers} with markers, {with_guards} with guards",
+        files.len()
+    );
+    assert_eq!(
+        measured + unrecoverable,
+        154,
+        "this control ran on {} inputs, and the number it is documented as running on is 154. \
+         If a FlashInfer bump changed the file count, update both this number and the doc \
+         comment above — a control whose input count nobody states is a control nobody has \
+         checked.",
+        measured + unrecoverable
+    );
+}
+
+/// The counted claims `csrc/shim/cooperative_groups.h` makes about the closure
 /// it replaces.
 ///
 /// That header justifies its own existence with a census — *"`cg::this_thread_block()`
@@ -443,7 +874,7 @@ fn transitive_includers(target: &str) -> Vec<String> {
     reach
 }
 
-/// `csrc/src/cuda_fp16.h` justifies an eight-line alias block with a cost.
+/// `csrc/shim/cuda_fp16.h` justifies an eight-line alias block with a cost.
 ///
 /// Its claim is a causal chain rather than a count: *"One missing alias, one
 /// file that uses it, seven files that include that file. An alias costs
@@ -466,7 +897,7 @@ fn the_fp16_alias_cost_still_holds() {
     );
 }
 
-/// `csrc/src/cuda_fp8.h` refuses the e8m0 family on a zero-use census.
+/// `csrc/shim/cuda_fp8.h` refuses the e8m0 family on a zero-use census.
 ///
 /// The refusal is the interesting half — the header declines to implement
 /// `__nv_fp8_e8m0` because nothing reaches it, and names the sites in the
@@ -599,7 +1030,7 @@ fn the_cutile_header_floor_is_written_down_where_a_build_can_find_it() {
 /// satisfied` — even carrying `__tile_builtin__`. A tile kernel must name
 /// NVIDIA's `__nv_bfloat16`.
 ///
-/// But `csrc/src/cuda_bf16.h` aliases that same name to `device::bf16`, so
+/// But `csrc/shim/cuda_bf16.h` aliases that same name to `device::bf16`, so
 /// FlashInfer stays byte-identical to upstream. The two cannot share a
 /// translation unit: `cuda_tile.h` forward-declares `struct __nv_bfloat16;`
 /// and a struct declaration cannot share a name with a type alias. Whichever
@@ -633,7 +1064,7 @@ fn the_tile_kernel_stays_out_of_the_adapter_headers() {
         includes.iter().any(|l| l.contains("<cuda_bf16.h>")),
         "the tile kernel no longer includes NVIDIA's <cuda_bf16.h>. It needs \
          the real type, and it needs NVIDIA's include directory to precede \
-         csrc/src so the angle-bracket include does not find the adapter. \
+         csrc/shim so the angle-bracket include does not find the adapter. \
          Includes are: {includes:?}"
     );
 }
@@ -1417,4 +1848,53 @@ fn print_reduction_counts() {
     for (k, v) in reduction_axis_counts() {
         println!("REDUCTION_COUNT {k} = {v}");
     }
+}
+
+/// The Tile IR assembly step is the one piece that turns nine measured
+/// kernels into kernels this crate could actually fire. It is deliberately
+/// not wired into `compile_under` -- that is a policy call about subprocesses
+/// in a compile path -- but the recipe and its traps must not be the next
+/// person's problem to rediscover.
+#[test]
+fn the_assembly_recipe_keeps_its_traps() {
+    let src = include_str!("../src/runtime/nvrtc.rs");
+
+    assert!(
+        src.contains("pub fn assemble_tile_ir"),
+        "the assembly step must stay public and callable; it is the whole \
+         point of separating it from the policy question"
+    );
+
+    // The trap, with the measurement that pins it. `CUDA_ROOT` is needed
+    // only when the binary is outside a toolkit, which is precisely the pip
+    // layout -- an earlier note said it was always needed and that is wrong.
+    assert!(
+        src.contains("no CUDA_ROOT   ->  ok")
+            && src.contains("no CUDA_ROOT   ->  FAILS"),
+        "the three-row experiment must stay: in-tree without CUDA_ROOT works, \
+         out-of-tree without it fails, out-of-tree with it works. Two of \
+         those rows are needed to state the rule and the third to bound it"
+    );
+    assert!(
+        src.contains("error: failed to compile Tile IR program"),
+        "the exact failure text must stay -- it is the only thing a searcher \
+         will have, and it names nothing that caused it"
+    );
+
+    // The byte-identity claim is what makes this safe to adopt.
+    assert!(
+        src.contains("byte-identical")
+            && src.contains("`--tilecubin`\n/// IS `--tilebc` plus this"),
+        "the equivalence with nvcc must stay stated; without it, adopting \
+         this step looks like inventing a build path rather than spelling \
+         out the one nvcc already runs"
+    );
+
+    // And the binding gap, which is the reason this takes bytes.
+    assert!(
+        src.contains("nvrtcGetTileIR") && src.contains("does **not**
+/// bind"),
+        "the cudarc binding gap must stay recorded -- it is why the \
+         byte-producing half is not here, and someone will look for it"
+    );
 }

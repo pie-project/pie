@@ -41,6 +41,51 @@ impl Mxfp4MoeRequest {
     }
 }
 
+/// What the CHECKPOINT is, for a driver that cannot read one.
+///
+/// # Why this exists
+///
+/// Every driver answers a [`DriverCapabilities`], and two thirds of that
+/// struct is a statement about the DEVICE — how many pages, which copy
+/// directions, which sinks it can honour, how wide a fire it can run. The
+/// remaining third is a statement about the checkpoint: its architecture, its
+/// vocabulary, how long a context it was published for.
+///
+/// `driver-metal` answers the whole thing itself, because it identifies the
+/// checkpoint and so knows both halves. `driver-vulkan` and `driver-wgpu`
+/// cannot: they keep `model` and `model-loader` as **dev**-dependencies, and
+/// `tests/pure.rs` asserts that closure — a driver that depended on a
+/// checkpoint FORMAT would be a driver that could not be handed bytes.
+///
+/// So the identification happens once, on the side that already reads
+/// catalogs, and its result crosses as this. What it replaced was worse than
+/// a missing type: the engine's seams built the ENTIRE `DriverCapabilities`
+/// on the driver's behalf — sixty lines each of `has_attn_score: false`,
+/// `kv_copy_domain_mask: ...`, `max_forward_tokens: 4096` — so a fact about
+/// what a device could do was written down by the crate that dispatches to
+/// it, in two copies that had already drifted (one said
+/// `PIE_DECODE_ENVELOPE_PORTS`, the other `0`).
+///
+/// That is the same shape `DriverSpec::device_domain` records as having cost
+/// a hardcoded `PIE_MEMORY_DOMAIN_CUDA_DEVICE` at nine sites, and the same
+/// one `Driver::kind` and `Driver::device_domain` fixed for the two facts
+/// that were `match`es in the engine. This is the third and largest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelFacts {
+    /// The architecture the catalog row advertises, e.g. `"llama"`.
+    pub arch_name: String,
+    /// The catalog row's id.
+    pub model_id: String,
+    /// Tokens in the vocabulary.
+    pub vocab_size: u32,
+    /// The longest context the row was published for.
+    pub max_model_len: u32,
+    /// The residual width.
+    pub hidden_size: u32,
+    /// Where the payload was read from, for diagnostics.
+    pub snapshot_dir: String,
+}
+
 /// Runtime-owned payload for the blocking model-load boot call.
 ///
 /// Carries the *request*, not a compiled plan: the driver compiles the load

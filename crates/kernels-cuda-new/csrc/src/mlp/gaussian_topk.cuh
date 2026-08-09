@@ -7,11 +7,14 @@
 //
 // # Why this file exists
 //
-// `gaussian_topk.cu` could not be handed to NVRTC: it includes
+// `gaussian_topk.cu` could not be handed to NVRTC: it included
 // `<cooperative_groups.h>`, and NVRTC on this machine answers 0 of 31
 // standard headers with no include path. The device half moved here, the
-// launcher stayed there, and the two now share ONE definition -- which is
-// the property `kernels-cuda`'s `tests/sources.rs::no_global_is_defined_twice`
+// launcher stayed there, and §43 has since deleted that file too -- the row
+// `mlp::gaussian_topk_bf16` is in `device::JIT_DISPATCHED`, so the shim held
+// no entry for the launcher and nothing else called it. The ONE definition
+// this arrangement was built to guarantee is still the property
+// `kernels-cuda`'s `tests/sources.rs::no_global_is_defined_twice`
 // exists to hold, after `norm/altup_aux` shipped two copies of a kernel for a
 // release.
 //
@@ -44,10 +47,11 @@
 
 namespace pie_cuda_driver::kernels::mlp::device {
 
-// The scalar layer is the PRELUDE's. Named here so `gaussian_topk.cu`'s
-// launcher -- which sits in `kernels::mlp` and says `device::bf16` on its
-// cast -- resolves that spelling through this namespace to the same type it
-// always meant.
+// The scalar layer is the PRELUDE's. Named here because `gaussian_topk.cu`'s
+// launcher -- which sat in `kernels::mlp` and said `device::bf16` on its
+// cast -- resolved that spelling through this namespace to the same type it
+// always meant. The launcher has gone (§43); the spelling stays, because the
+// row states `device::bf16` for the JIT on exactly the same reading.
 using ::pie_cuda_driver::kernels::device::bf16;
 using ::pie_cuda_driver::kernels::device::block_sum;
 using ::pie_cuda_driver::kernels::device::Elem;

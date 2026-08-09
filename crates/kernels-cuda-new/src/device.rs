@@ -341,15 +341,65 @@ impl DeviceKernel {
     /// therefore reaches its first TOKEN only -- see [`args`] for the eleven
     /// argument forms that were measured against that, and
     /// [`DeviceKernel::PLAIN`] for the twelfth, which is this branch.
+    ///
+    /// # The absolute escape, and the one thing it is for
+    ///
+    /// A field that already begins with `::` is ALREADY fully qualified and
+    /// is spliced verbatim -- no prefix on that field. Both fields take the
+    /// escape independently, so a row may state an absolute template path
+    /// with a relative element, or the reverse.
+    ///
+    /// This exists for exactly one lattice and would not have been added for
+    /// a smaller reason: **FA2**. Its `__global__`s are
+    /// `::flashinfer::BatchDecodeWithPagedKVCacheKernel` and
+    /// `::flashinfer::BatchPrefillWithPagedKVCacheKernel` -- vendored upstream
+    /// code, not ours, so they are not under `::pie_cuda_driver::kernels` and
+    /// no `using` declaration can put them there (a using-declaration would
+    /// fix the PATH, but see the next paragraph for why that is not enough).
+    /// Decode's parameter list is NINE arguments, seven of them integers a
+    /// host derivation computes ([`crate::fa2::DecodeGeometry`]); one `elem`
+    /// under one root cannot spell that, and the alternative -- a `__global__`
+    /// wrapper of ours taking a single config type -- is not available in
+    /// CUDA, because a `__global__` may not call another `__global__` and the
+    /// body is inline in upstream's kernel.
+    ///
+    /// So the FA2 rows state their whole argument list in `elem`:
+    ///
+    /// ```text
+    /// template_path  ::flashinfer::BatchDecodeWithPagedKVCacheKernel
+    /// elem           ::flashinfer::PosEncodingMode::kNone, 2, 1, 8, 16, 4, 2, ...
+    /// ```
+    ///
+    /// # Why this and not a fourth field
+    ///
+    /// A fifth `DeviceKernel` field is a change to every struct literal in
+    /// `crate::families` -- [`crate::unit`]'s own header records the cost of
+    /// the equivalent change to [`crate::unit::Unit`] as 45 literals. The
+    /// escape is backward compatible instead: **no existing row's
+    /// `template_path` or `elem` begins with `::`**, because until now every
+    /// one of them named something under our own root, and a row that starts
+    /// with `::` was previously a double-qualification bug rather than a
+    /// meaning. It is checked, not assumed -- see this module's
+    /// `absolute_escape_is_unused_by_relative_rows` test.
     #[must_use]
     pub fn instantiation(&self) -> String {
+        let path = Self::qualify(self.template_path);
         if self.is_plain() {
-            return format!("::pie_cuda_driver::kernels::{}", self.template_path);
+            return path;
         }
-        format!(
-            "::pie_cuda_driver::kernels::{}<::pie_cuda_driver::kernels::{}>",
-            self.template_path, self.elem
-        )
+        format!("{path}<{}>", Self::qualify(self.elem))
+    }
+
+    /// One field of an instantiation, with the root prefix applied unless the
+    /// field states its own.
+    ///
+    /// See [`DeviceKernel::instantiation`] for the argument; this is the two
+    /// lines of it that both fields share.
+    fn qualify(field: &str) -> String {
+        if field.starts_with("::") {
+            return field.to_owned();
+        }
+        format!("::pie_cuda_driver::kernels::{field}")
     }
 }
 
@@ -586,12 +636,28 @@ static ELEMENTWISE_SIGS: [KernelSig; 3] = [
 /// generated arm calls `bind::jit::fire` and its shim entry is not emitted —
 /// so the host launcher behind it has no consumer left.
 ///
-/// `norm::residual_add_bf16` is deliberately absent. Its launcher is called
-/// from `gemm.cpp` as a building block — C++ composing with C++, which no
-/// Rust dispatch can intercept — so deleting it would break a kernel that
-/// has not migrated. The rule is the one §10.2 found for shared headers, one
-/// level up: **a launcher goes when its whole consumer set has gone**, and
-/// the shim is only one consumer.
+/// `norm::residual_add_bf16` WAS deliberately absent, and this is the change
+/// that re-derived its consumer set and found it empty. The paragraph below
+/// said its launcher is called from `gemm.cpp` as a building block — C++
+/// composing with C++, which no Rust dispatch can intercept — and that was
+/// true until `gemm.cpp`'s three quantized `act_x_wt_*` rows became
+/// `execution::WALKED` + `RUST_SERVED` in `driver-cuda/src/bind/quant_gemm.rs`.
+/// The INT8 `beta != 0` arm that held it is Rust now and already fires the row
+/// through `bind::jit::fire`. A sweep of every `.cu`, `.cpp`, `.cuh` and
+/// `.hpp` in all three archives finds no other caller, `driver-cuda/src` has
+/// no hand-written arm for it, and `table::norm`'s row sources every operand,
+/// so the generated dispatch had an arm to convert rather than one to invent.
+/// `csrc/src/norm/residual_add.cu` is DELETED with this line, and `norm/` is
+/// gone with it.
+///
+/// The sentence that used to be here is kept below as written, because the
+/// rule it states is the one that let it be deleted:
+///
+/// > Its launcher is called from `gemm.cpp` as a building block — C++
+/// > composing with C++, which no Rust dispatch can intercept — so deleting
+/// > it would break a kernel that has not migrated. The rule is the one
+/// > §10.2 found for shared headers, one level up: **a launcher goes when
+/// > its whole consumer set has gone**, and the shim is only one consumer.
 ///
 /// This named `gemma4_vision.cu` as a second caller and that half is now
 /// **stale**: the tower converted to direct launches and calls
@@ -649,16 +715,36 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // and `deinterleave_vec_bf16` -- rows whose operands carry
     // `Source::Unbound`, which `emit_rust_dispatch` skips WHOLE, before it
     // ever reaches the JIT branch. They have no generated arm of either
-    // kind; a hand-written arm calls `ffi::pie_k_*` for them. Naming one
-    // here deletes the shim entry that hand arm links against, which is
-    // §22.1's link error rather than §22.1's fire-time lie -- the same
-    // defect from the other side.
+    // kind.
+    //
+    // THE NEXT SENTENCE USED TO SAY "a hand-written arm calls
+    // `ffi::pie_k_*` for them", AND IT WAS FALSE FOR ALL FOUR. §54 measured
+    // it: `driver-cuda/src` contains eight `pie_k_` names in total and none
+    // of them is these. The four had no caller in any language -- no
+    // `crates/model/src` use of the symbol or of its `dsl::cuda` wrapper, no
+    // `lower.rs::semantic()` mapping, no C++ caller, no hand arm -- and the
+    // only thing holding them live was that a wrapper existed, which is
+    // §28's root cause exactly. Their `table::layout` rows and their four
+    // DSL wrappers are DELETED. What stays is the device side:
+    // `families::layout`'s rows and the `.cuh` text, because
+    // `tests/launch_rules.rs` fires `copy_if_valid_slot` as the tree's only
+    // witness for `LaunchRule::Single`.
+    //
+    // The claim the false sentence made is still worth having, because it
+    // IS true of other rows and is the trap §22.1 cost a day to: naming a
+    // row here deletes the shim entry a hand arm links against, which is a
+    // LINK error rather than §22.1's fire-time lie -- the same defect from
+    // the other side. `quant::cast_fp32_to_bf16` and `quant::scale_rows_bf16`
+    // are the live instance; see BATCH 7, which named them while
+    // `fire/lora.rs` still called both by hand. §54 rewired that caller to
+    // `fire::dtype_cast`, which is the repair.
     //
     // So "migrated" and "routable" differ by more than a C++ caller: a row
-    // must also SAY WHERE ITS ARGUMENTS COME FROM. Four of layout's eight do
-    // not, and their doc comments already said so ("this row generates no
-    // dispatch and claims none") -- one page away from a list that would
-    // have broken on it.
+    // must also SAY WHERE ITS ARGUMENTS COME FROM. Four of layout's eight
+    // did not, and their doc comments already said so ("this row generates
+    // no dispatch and claims none") -- one page away from a list that would
+    // have broken on it. Being unable to say where an argument comes from
+    // and having no caller to ask turned out to be the same fact twice.
     "layout::gather_bf16_rows",
     "layout::split_bf16_rows",
     "layout::split_qwen_gdn_ba_bf16",
@@ -706,8 +792,19 @@ pub static JIT_DISPATCHED: &[&str] = &[
     //
     // Five of the unit's eight rows. `rmsnorm_bf16` and `rmsnorm_strided_bf16`
     // stay because `norm/rmsnorm.cu` still calls them from C++ —
-    // `rmsnorm_bf16_with_fp16` forwarding into both — and `add_bias_bf16` is
-    // held by `gemm.cpp`.
+    // `rmsnorm_bf16_with_fp16` forwarding into both.
+    //
+    // `add_bias_bf16` is NO LONGER HELD, and this list has not moved for it.
+    // The hold was `gemm.cpp:2393`, a GEMM followed by
+    // `kernels::norm::add_bias_bf16`; §45 moved that composition to
+    // `driver-cuda`'s `bind::service`, which fires the row through
+    // `jit::fire` precisely so it would not be a `pie_k_*` consumer, and §45's
+    // successor deleted the `#include "norm/add_bias.hpp"` the call had left
+    // behind. No `.cu`, `.cpp` or `.hpp` in either archive calls it now.
+    // Adding it here is a separate change with its own gates — the generated
+    // shim drops `pie_k_norm_add_bias_bf16` the moment it lands, and
+    // `norm/add_bias.cu`'s launcher and its one `<<<>>>` become deletable
+    // immediately after — so it is stated as available rather than taken.
     //
     // This sentence said "and `vision/gemma4_vision.cu`, six calls in the
     // vision tower alone" when the batch landed, which was true then and was
@@ -897,9 +994,13 @@ pub static JIT_DISPATCHED: &[&str] = &[
     "quant::mxfp4_moe_down_decode_bf16",
     "quant::wna16_gate_up_decode_bf16",
     "quant::wna16_down_decode_bf16",
-    "rope::rope_standard_table",
-    "rope::rope_partial_bf16",
-    "rope::qk_rmsnorm_rope_bf16",
+    // `rope`'s three stood here — `rope_standard_table`,
+    // `rope_partial_bf16` and `qk_rmsnorm_rope_bf16`. `rope` crossed into
+    // fn-world and nothing is ROUTED any more: a contract carries no
+    // `operands` and no `LaunchRule`, so there is no row for a dispatcher
+    // to switch on and no generated arm to name. `x::rope::ENTRIES` binds
+    // eight of the twelve directly, which is what this list was a
+    // hand-maintained approximation of.
     "ssm::repeat_interleave_heads_fp32",
     "ssm::recurrent_gated_delta_step_batched",
     "ssm::recurrent_gated_delta_step_batched_state_bf16",
@@ -912,6 +1013,107 @@ pub static JIT_DISPATCHED: &[&str] = &[
     "ssm::causal_conv1d_update_batched_bf16",
     "ssm::kda_gate_beta_bf16",
     "ssm::kda_o_norm_gated_bf16",
+
+    // BATCH: THE ROWS WHOSE UNIT AND SOURCES WERE BOTH ALREADY THERE.
+    //
+    // Not new work -- a JOIN. Three facts decide whether a migrated row can
+    // stop calling C++, and each was recorded in a different file, so no
+    // single reader ever saw a row satisfy all three:
+    //
+    //   1. some unit hosts its device text          -- `families/*.rs`
+    //   2. every operand states a `Source`          -- the same `kernel!` row
+    //   3. no C++ translation unit calls its host launcher  -- `csrc/**`
+    //
+    // Computed over the 126 rows still holding a shim entry: 55 have a unit,
+    // 25 of those source every operand, and 5 of those are still called from
+    // `gemm.cpp` or `rmsnorm.cu`. The 18 below are what is left, and every
+    // one of them could have been routed at any point since its unit landed.
+    //
+    // `norm::rmsnorm_bf16` and `norm::rmsnorm_strided_bf16` were deliberately
+    // absent while `rmsnorm.cu:42,59,63` still composed with them, which is
+    // §10.10 -- a launcher goes when its WHOLE consumer set has gone, and
+    // the shim is only one consumer. `quant::bf16_to_fp16` was absent for the
+    // same reason.
+    //
+    // **THE THREE ARE FREE AND ARE NAMED BELOW.** `norm/rmsnorm.cu` is
+    // deleted; its host program is `driver-cuda/src/fire/rmsnorm.rs`, and the
+    // two entry points that survive as symbols
+    // (`norm::rmsnorm_bf16_with_fp16`, whose middle arm made those calls, and
+    // `norm::rmsnorm_residual_add_scale_rmsnorm_bf16`) are
+    // `execution::WALKED` + `execution::RUST_SERVED`. Their internal calls
+    // are Rust firing JIT'd rows, which is the one thing a C++-to-C++ call
+    // could never be: interceptable.
+    //
+    // A sweep for each of the three -- symbol string AND DSL wrapper name,
+    // over `crates/model/src`, `model-compiler/src/dsl.rs`, the hand-written
+    // `ffi::pie_k_*` calls in `driver-cuda/src`, and every `.cu`, `.cuh`,
+    // `.cpp` and `.hpp` in both archives -- finds no consumer left outside
+    // the generated dispatch.
+    //
+    // `quant::bf16_to_fp16`'s own LAUNCHER lives in
+    // `quant/dequant_wna16.cu:63-75`, which is another directory's file and
+    // stays where it is: routing the row drops its shim entry, and the
+    // `<<<>>>` goes when that file's whole consumer set does. Its geometry is
+    // `LaunchRule::Slab`, which reproduces the launcher exactly -- 8 elements
+    // per thread, 256 threads, and the 1024-block cap.
+    //
+    // THE FOUR `quant::dequant_*` WERE HELD BY `gemm.cpp` AND ARE NOT ANY
+    // MORE. Its three quantized `act_x_wt_*` rows are `execution::WALKED` +
+    // `execution::RUST_SERVED` now, and the walk is
+    // `driver-cuda/src/bind/quant_gemm.rs`, which fires all four through
+    // `bind::jit::fire`. The four call sites that held them were
+    // `gemm.cpp:1679` (per_group), `:1686` (per_channel), `:1694` (plain)
+    // and `:2102` (mxfp4); `grep -rn` over every `.cu`, `.cpp`, `.hpp` and
+    // `.cuh` in both archives finds no other, which is §10.10 satisfied for
+    // the SHIM half. What it does not do is delete
+    // `quant/dequant_fp8.cu:20,30,44` and `quant/dequant_fp4.cu:23` -- those
+    // launchers now have an empty consumer set and are dead C++, and
+    // removing them is a separate change with its own census, deliberately
+    // not bundled here.
+    //
+    // `norm::residual_add_bf16` was held by the same file (`gemm.cpp:1990`,
+    // the INT8 `beta != 0` arm) and is freed with them -- but it is NOT
+    // named here, because its consumer set was never `gemm.cpp` alone and
+    // re-deriving it is that change's job, not this one's. That call is also
+    // why `csrc/src/norm/residual_add.cu` SURVIVES this change: three of the
+    // four files under `csrc/src/norm/` are deleted and that one is not,
+    // because a C++ translation unit still calls its launcher.
+    //
+    // **THAT CHANGE IS THE ONE THAT ADDED THE LINE BELOW.** The re-derivation
+    // it asked for was done: `gemm.cpp:1990` is Rust
+    // (`bind/quant_gemm.rs`, which already fired the row through
+    // `bind::jit::fire`), no other `.cu`/`.cpp`/`.cuh`/`.hpp` in any archive
+    // calls `residual_add_bf16`, `crates/model/src` reaches it only through
+    // `dsl::cuda::residual_add` and `lower.rs`'s `Semantic::Kernels`, and
+    // `driver-cuda/src` has no `pie_k_norm_residual_add_bf16` anywhere. The
+    // fourth file under `csrc/src/norm/` is deleted and the directory with
+    // it. The header above carries the full argument.
+    "attn::dsv4_compress_gather_paged_bf16",
+    "attn::dsv4_store_comp_entries_bf16",
+    "attn::kimi_split_q_b_bf16",
+    "attn::pad_head_dim_bf16",
+    "attn::split_qkv_bf16",
+    "attn::strip_head_dim_bf16",
+    "layout::split_q_gate_bf16",
+    "mlp::sigmoid_gate_inplace_bf16",
+    "moe::apply_per_expert_scale_bf16",
+    "moe::topk_softmax_bf16",
+    "norm::add_bias_bf16",
+    "norm::residual_add_bf16",
+    "norm::rmsnorm_bf16",
+    "norm::rmsnorm_gated_fp32_in_bf16",
+    "norm::rmsnorm_strided_bf16",
+    "quant::bf16_to_fp16",
+    "quant::cast_fp32_to_bf16",
+    "quant::dequant_fp8_e4m3_to_bf16",
+    "quant::dequant_fp8_e4m3_to_bf16_per_channel",
+    "quant::dequant_fp8_e4m3_to_bf16_per_group",
+    "quant::dequant_mxfp4_to_bf16",
+    "quant::dequant_wna16_int4b8_to_bf16",
+    "quant::mxfp4_scales_to_marlin_e8m0",
+    "quant::quantize_bf16_to_fp8_e4m3_per_channel",
+    "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
+    "quant::scale_rows_bf16",
 ];
 
 /// [`ELEMENTWISE`]'s rows that [`JIT_DISPATCHED`] names, as the emitters take
@@ -1766,6 +1968,9 @@ const fn scalar(ty: kernels::Ty) -> bool {
             // over one is refused for the same reason a null `head_dim` is.
             | Ty::KvScheme
             | Ty::KvDType
+            // Four bytes rather than one, and a scalar for the same reason:
+            // the cell holds a value, not an address.
+            | Ty::Fp8Kind
     )
 }
 

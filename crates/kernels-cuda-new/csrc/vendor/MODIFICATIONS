@@ -1,50 +1,80 @@
 MODIFICATIONS -- every vendored file, and how many guards it carries
 ===================================================================
 
-Generated from the tree, and kept honest by the property it asserts: strip
-every `// PIE:` marker, the `#ifndef __CUDACC_RTC__` under it and that
-directive's matching `#endif`, and each file below is byte-for-byte
-FlashInfer v0.6.15. That was checked per file before this list was written.
+Generated from the tree, and kept honest by the property it asserts.  Apply
+this transform to any file below and you get FlashInfer v0.6.15, byte for
+byte:
+
+    1. strip every `// PIE:` marker, its continuation comments, the
+       `#ifndef __CUDACC_RTC__` under it and that directive's matching
+       `#endif` -- keeping the guarded BODY, which is upstream's;
+    2. rewrite every `#include <pie/...>` back to the spelling upstream
+       wrote, using the map in `tests/vendor_manifest.rs`.
+
+Step 2 is new and is currently the identity: no vendored file has moved out
+of `csrc/vendor/flashinfer/` yet, so no vendored file spells `<pie/...>` and
+the map is empty.  It exists BEFORE the move rather than after it, because
+the thing it protects is the thing a move destroys.  `csrc/` is being cut by
+ROLE rather than by provenance -- a device-stdlib header belongs beside the
+other device-stdlib headers whoever wrote it -- and the whole risk of that cut
+is that vendoring quietly becomes a fork.  A file that moves must change its
+`#include` lines, because upstream reaches its siblings by RELATIVE path
+(`"../cp_async.cuh"`, `"../utils.cuh"`: 58 such directives, and not one
+`<flashinfer/...>` among them).  So the move edits upstream's bytes, and the
+only thing standing between "vendoring plus a mechanical transform" and "a
+fork" is a transform that is written down and checked.  A version bump stays
+re-fetch plus re-apply.
+
 `grep -rn "// PIE:" csrc/vendor/flashinfer/` finds all 33 markers.
 
-Columns: guards, added lines, file lines.
+Columns: guards, added lines, file lines, file bytes.
 
-file                                       guards   added    lines
------------------------------------------------------------------
-allocator.h                                     1       7      111
-attention/cascade.cuh                           0       0      791
-attention/decode.cuh                            1       8     1191
-attention/default_decode_params.cuh             0       0      279
-attention/default_prefill_params.cuh            4      26      474
-attention/heap.h                                1       6       72
-attention/mask.cuh                              0       0       30
-attention/mla.cuh                               1       7     1143
-attention/mla_params.cuh                        0       0       84
-attention/prefill.cuh                           0       0     4367
-attention/scheduler.cuh                         1      13     1840
-attention/state.cuh                             0       0       83
-attention/variant_helper.cuh                    0       0      104
-attention/variants.cuh                          0       0       97
-cp_async.cuh                                    0       0      265
-exception.h                                     1       9      115
-fastdiv.cuh                                     1       8       67
-fp16.h                                          1       7      184
-frag_layout_swizzle.cuh                         0       0       75
-layout.cuh                                      3      16      144
-math.cuh                                        1      12      284
-mma.cuh                                         0       0      705
-page.cuh                                        8      35      914
-permuted_smem.cuh                               0       0      191
-pos_enc.cuh                                     4      21     1653
-profiler.cuh                                    0       0      149
-utils.cuh                                       5      31      581
-vec_dtypes.cuh                                  0       0     2194
------------------------------------------------------------------
-28 files                                       33     206    18187
+`bytes` is the fourth column and the newest.  `lines` alone is blind to an
+in-place edit that keeps the line count -- change a constant, reflow an
+expression, and all three of the other columns are unmoved.  A byte count is
+not a checksum and does not catch a length-preserving edit either, but it
+catches everything that changes a file's LENGTH, which is nearly every real
+drift, and unlike a checksum it is computed identically by `wc -c` and by
+`str::len` so the two sides cannot disagree about the algorithm.  The residue
+-- a length-preserving edit outside every guard -- is what the network-side
+check covers; `.wiki/driver/new-horizon.md` §23.8 records it being run.
+
+file                                       guards   added    lines      bytes
+-----------------------------------------------------------------------------
+allocator.h                                      1       7      111       4038
+attention/cascade.cuh                            0       0      791      34376
+attention/decode.cuh                             1       8     1191      53167
+attention/default_decode_params.cuh              0       0      279       8705
+attention/default_prefill_params.cuh             4      26      474      15831
+attention/heap.h                                 1       6       72       2108
+attention/mask.cuh                               0       0       30        922
+attention/mla.cuh                                1       7     1143      54176
+attention/mla_params.cuh                         0       0       84       2251
+attention/prefill.cuh                            0       0     4367     223123
+attention/scheduler.cuh                          1      13     1840      87507
+attention/state.cuh                              0       0       83       2554
+attention/variant_helper.cuh                     0       0      104       5118
+attention/variants.cuh                           0       0       97       3223
+cp_async.cuh                                     0       0      265      10227
+exception.h                                      1       9      115       4194
+fastdiv.cuh                                      1       8       67       2385
+fp16.h                                           1       7      184       8049
+frag_layout_swizzle.cuh                          0       0       75       3481
+layout.cuh                                       3      16      144       5774
+math.cuh                                         1      12      284       8894
+mma.cuh                                          0       0      705      26618
+page.cuh                                         8      35      914      41255
+permuted_smem.cuh                                0       0      191       6692
+pos_enc.cuh                                      4      21     1653      74804
+profiler.cuh                                     0       0      149       6708
+utils.cuh                                        5      31      581      28134
+vec_dtypes.cuh                                   0       0     2194      74561
+-----------------------------------------------------------------------------
+28 files                                        33     206    18187     798875
 
 14 files are untouched. `LICENSE` is upstream's, copied and not counted.
 
-Not upstream, written by PIE, in this directory rather than in the tree:
+Not upstream, written by PIE, and NO LONGER IN THIS DIRECTORY:
 
     bit                          std::bit_cast, for fp16.h
     boost/math/ccmath/fabs.hpp   one constexpr fabs, for fp16.h
@@ -52,3 +82,24 @@ Not upstream, written by PIE, in this directory rather than in the tree:
     cuda.h                       CUDA_VERSION, derived from __CUDACC_VER_*
     cuda_runtime.h               ushort/uchar, and <cstdint>
     type_traits                  integral_constant and six things built on it
+
+These six sat here for a provenance reason -- they exist BECAUSE FlashInfer
+asks for them, so they were filed under FlashInfer.  That is the wrong axis.
+What they DO is impersonate a header this compiler does not ship, which is
+also what `cuda_fp16.h`, `cuda_bf16.h`, `cuda_fp8.h`, `cuda_fp4.h`,
+`cooperative_groups.h` and `cuda/{cmath,pipeline,std/limits}` do, and those
+eight sat under `csrc/src/` for the mirror-image reason: our own text asks for
+them too.  All fourteen are now in `csrc/shim/`, filed by role.
+
+The move cannot be seen from inside a compile.  NVRTC has no `-I`: it matches
+the literal string in the directive against the names in `includeNames[]`, and
+those names are unchanged, because for a shim THE NAME IS THE CONTRACT -- a
+file called `cuda_fp16.h` is answering for NVIDIA's `cuda_fp16.h` and cannot
+be renamed without ceasing to do its job.  nvcc needed one line: a second
+`-iquote` at each of the four sites that pass the first.
+
+Nothing in this table moved, and nothing in it changed.  The transform above
+still recovers upstream v0.6.15 byte for byte from every file listed, which is
+the point of doing the shim group first -- it is the one role whose files are
+neither vendored nor included by relative path from a vendored file, so it
+moves without editing a single upstream byte.

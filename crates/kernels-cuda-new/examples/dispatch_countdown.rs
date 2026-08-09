@@ -49,7 +49,11 @@ use kernels_cuda_new::{KernelSig, abi, device, table, unit};
 fn tables() -> Vec<&'static [KernelSig]> {
     vec![
         table::attn::KERNELS,
-        table::rope::KERNELS,
+        // `rope` crossed into fn-world; its twelve contracts derive their
+        // rows, and they state no operands, so every one of them counts
+        // as ARMLESS-by-design here rather than as a row awaiting a
+        // `Source`. Kept in the walk so the census still sees them.
+        kernels_cuda_new::x::rope::SIGS,
         table::norm::KERNELS,
         table::mlp::KERNELS,
         table::gemm::KERNELS,
@@ -80,7 +84,7 @@ fn tables() -> Vec<&'static [KernelSig]> {
 ///   `chunked_swiglu_strided_bf16` was deleted — a hold that was itself
 ///   unreachable, which `mlp/swiglu.cu:41` now calls "orphaned at one remove".
 /// * `norm::add_bias_bf16` lost its when the GEMM epilogue absorbed the
-///   addition; `gemm/gemm.cpp:2236` records that the second call *"is why it
+///   addition; `gemm/gemm.cpp:2167` records that the second call *"is why it
 ///   moved"*.
 /// * `norm::rmsnorm_bf16` was cited as seven calls across
 ///   `norm/rmsnorm.cu` and `vision/gemma4_vision.cu`. The vision tower's
@@ -93,16 +97,58 @@ fn tables() -> Vec<&'static [KernelSig]> {
 /// does not get wrong. A held row is a row this migration is not allowed to
 /// touch, so an entry that has quietly stopped being true costs the countdown
 /// a row it could have had.
+///
+/// **Third sweep, and this time the table did not shrink — the FILE moved
+/// under every one of its five `gemm.cpp` entries.** All five citations were
+/// off by 40 to 61 lines after `gemm.cpp` lost its dead chunked LM-head
+/// argmax (fifty lines, three functions, no caller anywhere) and two stale
+/// includes. Not one of the five symbols was freed by that; every line number
+/// naming them was wrong. That is the failure mode this table has now had
+/// twice in two directions — a citation can rot because the SYMBOL was freed,
+/// and it can rot because the FILE was edited fifty lines above it, and only
+/// the first of the two is progress. Both read identically here until
+/// [`the_citations_still_resolve`] separates them by asking whether any tree
+/// still calls the name.
+///
+/// **What the same edit DID free is not in this table and could not be**:
+/// `sample::argmax_accumulate_bf16` and `sample::argmax_finalize_bf16` have
+/// no row, so no countdown counts them, and the only record that they were
+/// held was a sentence in `sample/argmax.hpp`. Their launchers are deleted.
+/// A held launcher with no row is invisible to every gate in this crate,
+/// which is worth stating beside a table built to catch exactly this shape.
 const HELD: &[(&str, &str)] = &[
-    ("norm::residual_add_bf16", "gemm/gemm.cpp:2030,2124"),
-    ("norm::rmsnorm_bf16", "norm/rmsnorm.cu:59,63"),
-    ("norm::rmsnorm_strided_bf16", "norm/rmsnorm.cu:42"),
-    ("quant::bf16_to_fp16", "norm/rmsnorm.cu:64"),
-    ("quant::dequant_fp8_e4m3_to_bf16", "gemm/gemm.cpp:1732"),
-    ("quant::dequant_fp8_e4m3_to_bf16_per_channel", "gemm/gemm.cpp:1721"),
-    ("quant::dequant_fp8_e4m3_to_bf16_per_group", "gemm/gemm.cpp:1714"),
-    ("quant::dequant_mxfp4_to_bf16", "gemm/gemm.cpp:2163"),
-    ("quant::quantize_bf16_to_int8_per_channel", "quant/quant_bf16_to_fp8.cu:84"),
+    // EMPTY, AND THAT IS THE POINT OF THE TABLE ARRIVING.
+    //
+    // `norm::residual_add_bf16` was here, cited at `gemm/gemm.cpp:1990`. It
+    // is FREE: that call site is now
+    // `bind::jit::fire("norm::residual_add_bf16", ...)` in
+    // `driver-cuda/src/bind/quant_gemm.rs`, `norm/residual_add.cu` is
+    // deleted, and the row is in `device::JIT_DISPATCHED`.
+    //
+    // `norm::rmsnorm_bf16`, `norm::rmsnorm_strided_bf16` and
+    // `quant::bf16_to_fp16` WERE HERE, cited at `norm/rmsnorm.cu:59,63`,
+    // `:42` and `:64`. They are FREE: `norm/rmsnorm.cu` is deleted, its host
+    // program is `driver-cuda/src/fire/rmsnorm.rs`, and all three are in
+    // `device::JIT_DISPATCHED`.
+    //
+    // They were §49.1's three, and the shape is the one this table exists to
+    // make visible: each had a unit, each sourced every operand, and each was
+    // held by ONE C++ file that composed with them internally. C++ calling
+    // C++ is what no Rust dispatch can intercept, so no amount of routing
+    // elsewhere could reach them — the launcher had to become Rust first.
+    //
+    // The four `quant::dequant_*` rows (`gemm/gemm.cpp:1692`, `:1681`,
+    // `:1674`, `:2102`) and `quant::quantize_bf16_to_int8_per_channel`
+    // (`quant/quant_bf16_to_fp8.cu:84`) went in the same round: `gemm.cpp`'s
+    // quantized arms had already moved to
+    // `driver-cuda/src/bind/quant_gemm.rs`, and the last holder was
+    // `quant/quant_bf16_to_fp8.cu`'s own `quantize_bf16_to_int8_per_token`
+    // forwarder — one C++ launcher calling another, which is the exact shape
+    // above. Both files are deleted.
+    //
+    // A table that is empty is not a table that is unnecessary: the next
+    // launcher to compose with a routed row lands here, and
+    // [`the_citations_still_resolve`] is what stops it being a comment.
 ];
 
 /// Every [`HELD`] citation names a file that exists and a line that calls the
@@ -275,9 +321,11 @@ fn c_trees() -> Vec<std::path::PathBuf> {
 ///   of them having supplied the other's denominator.
 ///
 /// So a green gate here means the sweep looked and found nothing, not that it
-/// could not look. Today the towers call `gemm::act_x_wt_bf16`,
+/// could not look. The towers called `gemm::act_x_wt_bf16`,
 /// `attn::make_prefill_plan` and the two FlashInfer prefill entry points,
-/// none of which is a migrated row.
+/// none of which is a migrated row — and all three towers are Rust now, so
+/// `driver-cuda/csrc` holds only `attn/`. The second tree is still swept:
+/// the hole this closed was never about which files happened to be in it.
 fn no_c_caller_hides_outside_the_archive(migrated: &[&'static str]) -> Vec<String> {
     let trees = c_trees();
     let held: Vec<&str> = HELD.iter().map(|(s, _)| *s).collect();

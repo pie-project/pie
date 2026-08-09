@@ -256,8 +256,28 @@ fn allowlists() -> Allowlists {
             // when the kernel crate split, then into the family layout — and
             // both times `allowlisted_paths_still_exist` named the stale entry
             // instead of letting the guard fail somewhere unrelated.
-            "crates/kernels-cuda/csrc/src/gemm/gemm.cpp",
-            "crates/kernels-cuda/csrc/src/tuning_cache.hpp",
+            //
+            // THREE TIMES NOW, and the third is a language change rather than
+            // a move: `kernels-cuda/csrc/src/gemm/gemm.cpp` is deleted. It
+            // held zero `__global__` and zero `<<<>>>` — a host program, not a
+            // kernel file — and its dense autotuner, `tuning_hash` and all, is
+            // `driver-cuda/src/fire/gemm.rs`. Same word, same `tuning_cache`
+            // lineage, same non-transcription.
+            "crates/driver-cuda/src/fire/gemm.rs",
+            // The CUTLASS MoE tactic cache, which is the same `tuning_cache`
+            // format again — `moe/flashinfer_moe.cu` was a host program too,
+            // and its autotuner is `driver-cuda/src/fire/flashinfer_moe.rs`.
+            // Listed here for the reason the paragraph above gives: an entry
+            // that does not follow its magic is how this guard fails far from
+            // the change that caused it.
+            "crates/driver-cuda/src/fire/flashinfer_moe.rs",
+            // `crates/kernels-cuda/csrc/src/tuning_cache.hpp` WAS HERE and is
+            // DELETED, with `cache_root.hpp`, its only includer's only
+            // include. `gemm/gemm.cpp` was the last translation unit that
+            // included it, so the two headers were orphaned the moment that
+            // file went; the format they described is carried in full by the
+            // two Rust entries above, which are the only things that read and
+            // write the file now.
         ],
         mask: &["crates/grammar/src/brle.rs"],
         // The float conversion's shift is the weakest needle here: any 64-bit

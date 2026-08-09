@@ -32,8 +32,9 @@
 //!
 //! # `-Xcompiler=-iquote` and not `-I`, and it matters MOST here
 //!
-//! `csrc/src` holds five shims that shadow real toolkit headers, `cuda_fp16.h`
-//! among them, and that one opens with `using __half = device::f16`. Under
+//! `csrc/shim` holds fourteen headers that shadow real toolkit ones,
+//! `cuda_fp16.h` among them, and that one opens with
+//! `using __half = device::f16`. Under
 //! `-I` a `.cuh` reaching `<cuda_fp16.h>` finds the SHIM even under nvcc, and
 //! `new-horizon.md` §21.10 records the measurement: the same source under the
 //! two spellings both compiled cleanly and exported DIFFERENT mangled symbols
@@ -44,6 +45,12 @@
 //! rejected outright — which is why a probe reaches for `-I` and gets a quiet
 //! wrong answer — so the quote path is handed to the host compiler:
 //! `-Xcompiler=-iquote,<dir>`.
+//!
+//! Two directories since `csrc/` was cut by role: `csrc/src` for the kernel
+//! headers and `csrc/shim` for the impersonating ones. Both are passed, and
+//! dropping the second would not fail — it would resolve `<cuda_fp16.h>` and
+//! the quoted `"cuda_fp16.h"` in `pie_fp8.cuh` against the real toolkit and
+//! quietly re-manufacture the confusion this file exists to catch.
 //!
 //! # What runs where
 //!
@@ -555,8 +562,8 @@ fn refuses(
 
 /// Hand one generated translation unit to `nvcc`.
 ///
-/// `-Xcompiler=-iquote,<csrc/src>` and no `-I` anywhere: see this file's
-/// header. `-fatbin` rather than `-c`, so the instantiation is actually
+/// `-Xcompiler=-iquote,<csrc/src>` and `<csrc/shim>`, and no `-I` anywhere:
+/// see this file's header. `-fatbin` rather than `-c`, so the instantiation is actually
 /// CODE-GENERATED and the check is not merely a parse.
 fn compile(nvcc: &PathBuf, tag: &str, tu: &str) -> Result<(), String> {
     let dir = scratch();
@@ -574,9 +581,17 @@ fn compile(nvcc: &PathBuf, tag: &str, tu: &str) -> Result<(), String> {
     std::fs::write(&src, tu).map_err(|e| format!("cannot write {}: {e}", src.display()))?;
 
     let include = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("csrc/src");
+    // The impersonating headers, since `csrc/` was cut by role. A second
+    // `-iquote` and not an `-I`: `csrc/src/pie_fp8.cuh` and `pie_half2.cuh`
+    // reach `cuda_fp16.h` by quoted include, and this whole file exists to
+    // catch a `__half` that is not `device::f16` — a resolver that fell
+    // through to the toolkit header here would break the control rather than
+    // the code, which is the worse of the two.
+    let shim = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("csrc/shim");
     let out = Command::new(nvcc)
         .args(["-std=c++20", "-arch=sm_89", "-fatbin"])
         .arg(format!("-Xcompiler=-iquote,{}", include.display()))
+        .arg(format!("-Xcompiler=-iquote,{}", shim.display()))
         .arg(&src)
         .arg("-o")
         .arg(&obj)

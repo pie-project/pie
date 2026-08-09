@@ -799,6 +799,89 @@ impl Shell {
         &self.programs
     }
 
+    /// What this shell can do, now that a model is loaded.
+    ///
+    /// # Why the driver answers this and the engine used to
+    ///
+    /// Every field below except the six in [`ModelFacts`] is a statement
+    /// about the DEVICE — how many pages the pool holds, which copy
+    /// directions the pool serves, which sinks the kernels honour, how wide a
+    /// fire the scratch can run. `engine`'s seam built the whole struct on
+    /// this driver's behalf, which put a fact about WebGPU in the crate that
+    /// dispatches to WebGPU, in a copy that had already drifted from the
+    /// `driver-vulkan` one beside it — the two disagreed about
+    /// `device_geometry_port_mask` and neither file could see the other.
+    ///
+    /// The checkpoint half cannot be answered here and is handed in: this
+    /// crate keeps `model` and `model-loader` as dev-dependencies and
+    /// `tests/pure.rs` asserts that closure — a driver that depended on a
+    /// checkpoint FORMAT would be a driver that could not be handed bytes.
+    /// `driver-metal` answers both halves because it identifies the
+    /// checkpoint itself.
+    #[must_use]
+    pub fn capabilities(&self, model: &driver_api::ModelFacts) -> driver_api::DriverCapabilities {
+        let shape = self.shape();
+        driver_api::DriverCapabilities {
+            abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
+            total_pages: shape.pages,
+            kv_page_size: shape.page_size,
+            // No swap pool and no recurrent-state cache: this driver has
+            // neither, and `copy_state` refuses by name for the same reason.
+            swap_pool_size: 0,
+            // Device to device, and only that. `Pool::copy_plan` moves whole
+            // pages and single rows inside the one KV buffer -- which is what
+            // a prefix-cache hit is -- and refuses any plan whose ends are not
+            // both this driver's own domain. Host directions stay off: there
+            // is no swap pool, so a device-to-host copy has nowhere to land.
+            kv_copy_domain_mask: driver_api::KV_COPY_DEVICE_TO_DEVICE,
+            rs_cache_required: false,
+            rs_cache_slots: 0,
+            rs_cache_slot_bytes: 0,
+            // Not elastic. `resize_pool` here reallocates the KV buffer
+            // whole, so nothing can be given back page-wise, and both numbers
+            // are zero together -- which is the condition `bootstrap` reads
+            // before it starts a trim task at all. WebGPU has no sparse
+            // binding, so unlike Vulkan this is not a declined optional
+            // feature: there is nothing to decline.
+            elastic_page_bytes: 0,
+            elastic_budget_pages: 0,
+            has_mtp_logits: false,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            // Sinks this backend cannot honour. Every one of them would bind
+            // and then run as a silent no-op, which is worse than a refusal
+            // at the door.
+            has_kv_envelopes: false,
+            has_attn_score: false,
+            has_attn_page_mask: false,
+            has_lora: false,
+            model_site_summary: driver_api::ModelSiteSummary::default(),
+            device_geometry_port_mask: 0,
+            // The ceilings a batch is formed under. `Shell::open` sizes one
+            // fire's scratch from `Deployment::seam`, and a fire wider than
+            // this has nothing to run in.
+            max_forward_tokens: 4096,
+            max_forward_requests: 256,
+            max_page_refs: shape.pages,
+            // The row's answers, which this crate cannot read for itself.
+            arch_name: model.arch_name.clone(),
+            model_id: model.model_id.clone(),
+            vocab_size: model.vocab_size,
+            max_model_len: model.max_model_len,
+            hidden_size: model.hidden_size,
+            snapshot_dir: model.snapshot_dir.clone(),
+            activation_dtype: "bf16".to_string(),
+            // False about the BACKEND rather than about the row: there is no
+            // encode entry point here at all, so a model with a vision tower
+            // is served as its text half. `Shell::encode` refuses by name.
+            supports_media_encode: false,
+            kv_handle: None,
+            // The shaders are in the rlib and `naga` compiles them; nothing
+            // upstream generates a kernel for this driver.
+            codegen_backend: String::new(),
+        }
+    }
+
     /// The cache's shape.
     #[must_use]
     pub fn shape(&self) -> Shape {

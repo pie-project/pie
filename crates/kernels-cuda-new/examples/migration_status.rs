@@ -620,7 +620,10 @@ pub enum Class {
     /// has not been split into a `.cuh`, so there is nothing for a unit to
     /// compile. Nine `__global__`s remain in `kernels-cuda/csrc/src` outside
     /// `third_party` — four in `attn/attention_flashinfer.cu`, one in
-    /// `attn/attention_xqa.cu`, one in `comm/custom_all_reduce.cu` and three
+    /// `attn/attention_xqa.cu`, one in `comm/custom_all_reduce.cu` (**both
+    /// that `__global__` and that file are now DELETED** — the `_exact` twin
+    /// it backed had an empty caller set, and what was left was a host
+    /// program, now `driver-cuda/src/fire/all_reduce.rs`) and three
     /// in `gemm/gemv.cu` — and only the ones a TABLE ROW names are here. The
     /// other nine are internal helpers of a library dispatch, or `gemv.cu`'s
     /// three, whose file is left whole on purpose: `gemv3_bf16`'s row was
@@ -643,8 +646,9 @@ pub enum Class {
     /// This table was written with NINE entries. Two of them —
     /// `quant::mxfp4_moe_gate_up_decode_bf16` and
     /// `quant::mxfp4_moe_down_decode_bf16`, both called stale on the grounds
-    /// that `LaunchRule::RoutedQmvQuad` cites `quant/dequant_fp4.cu:67-70`
-    /// and `:152-156` by line — were rowed by the agent that owns
+    /// that `LaunchRule::RoutedQmvQuad` cited `quant/dequant_fp4.cu:67-70`
+    /// and `:152-156` by line (both since deleted with their launchers in
+    /// §43) — were rowed by the agent that owns
     /// `families/quant.rs` while this report was being written, and the
     /// `overtaken` block below is what noticed. They are gone from the table
     /// because the table describes REFUSED rows; the count they left behind
@@ -935,18 +939,28 @@ pub static CLASSIFIED: &[Refusal] = &[
     Refusal { symbol: "dist::all_gather_bf16", class: Class::Structural(Wall::Library),
         consumer: Consumer::Awaiting { cite: Cite { at: "crates/driver-cuda/tests/launch_abi.rs:1555", names: "dist::all_gather_bf16" } },
         why: "NCCL all-gather" },
-    // `comm/` DOES exist and holds one `__global__` — but it backs
-    // `all_reduce_residual_rmsnorm_bf16_exact`, which has NO TABLE ROW. Both
-    // rowed entry points take a `CustomAllReduce*` the driver owns and
-    // forward into headers this repo does not carry: `csrc/vendor/flashinfer`
-    // holds `attention/` only, and there is no in-repo copy of
-    // `flashinfer/comm/vllm_custom_all_reduce.cuh`.
+    // `comm/` IS GONE. `custom_all_reduce.cu` was measured at zero
+    // `__global__` and zero `<<<>>>` — a 664-line HOST PROGRAM — and it, its
+    // header and its sm100/sm120 stub are DELETED; the lifecycle is
+    // `driver-cuda/src/fire/all_reduce.rs`. Both rowed entry points still
+    // take a `CustomAllReduce*` the driver owns (a Rust struct behind an
+    // opaque handle now) and still forward into headers this repo does not
+    // carry: `csrc/vendor/flashinfer` holds `attention/` only, and there is
+    // no in-repo copy of `flashinfer/comm/vllm_custom_all_reduce.cuh` or
+    // `flashinfer/comm/trtllm_allreduce_fusion.cuh`.
+    //
+    // So both stay `Structural(Wall::Library)` and the class is unchanged —
+    // but the WALL moved. It used to be "the launcher is C++"; it is now
+    // exactly and only "the vendored tree has no `comm/`", which is
+    // `vendor-role`'s to close and is what `examples/vendor_probe.rs`'s
+    // `TRTLLM` candidate probes. Everything on this side of it is Rust, and
+    // the refusal names the resolved template point.
     Refusal { symbol: "comm::all_reduce_bf16", class: Class::Structural(Wall::Library),
         consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/shared/llama_like/forward/mod.rs:144", names: "all_reduce_p2p" }, goldens: 1 },
-        why: "`car->all_reduce_bf16` -> `impl_->allreduce<__nv_bfloat16>`, vLLM's NVLink kernel; `custom_all_reduce.cu:641-658`. A null `car` is a REFUSAL rather than a fallback" },
+        why: "`impl_->allreduce<__nv_bfloat16>`, vLLM's NVLink kernel; `fire/all_reduce.rs::CustomAllReduce::all_reduce_bf16`, header fetched not vendored. A null `car` is a REFUSAL rather than a fallback (`Decline::NoInstance`)" },
     Refusal { symbol: "comm::all_reduce_residual_rmsnorm_bf16", class: Class::Structural(Wall::Library),
         consumer: Consumer::TestOnly { cite: Cite { at: "crates/model/tests/tp_quantized_spec.rs:104", names: "all_reduce_residual_rmsnorm" } },
-        why: "`flashinfer::trtllm_allreduce_fusion`'s `kARResidualRMSNorm`; `custom_all_reduce.cu:661-700`. The one `__global__` in that file is the `_exact` twin, which has no row" },
+        why: "`flashinfer::trtllm_allreduce_fusion`'s `kARResidualRMSNorm` — 1 of 240 template points; `fire/all_reduce.rs::CustomAllReduce::all_reduce_residual_rmsnorm_bf16`. The `_exact` twin that held this file's one `__global__` was deleted with its empty caller set" },
 
     // ── A: the launcher declines ─────────────────────────────────────────
 
@@ -1232,6 +1246,31 @@ fn assert_total(refused: &BTreeSet<&str>, rows: usize, migrated: usize, library:
     //    level up. `execution::execution` has never heard of `CLASSIFIED`; it
     //    reads the unit tables and `SERVED`. A migrated row this file called
     //    an op, or a served row it called work, disagrees here.
+    //
+    //    ── KNOWN DRIFT: A WALK IS AN `Op` AND `Wall` CANNOT SAY SO ─────────
+    //
+    //    `Execution::Walk` answers `Kind::Op` (`execution.rs`'s `kind`), and
+    //    `kind_of` answers `Kind::Kernel` for anything not in `CLASSIFIED`.
+    //    So EVERY walked row that no unit hosts fails this assertion. That
+    //    was already true of two before the `norm/`+`rope/` port —
+    //    `moe::moe_grouped_gemm_bf16` and `sample::lm_head_gemv_argmax_int8`,
+    //    both walks, neither classified, and both fired under a device row
+    //    with a DIFFERENT name so `unit_of` is `None` — and the port made it
+    //    seventeen, because the fifteen launchers of `norm/rmsnorm.cu`,
+    //    `norm/dsv4_hc.cu` and `rope/rope.cu` became
+    //    `driver-cuda/src/fire/{rmsnorm,dsv4_hc,rope}.rs` and twelve of their
+    //    device rows were renamed for the same reason (`families/rope.rs`'s
+    //    `ROPE_SIGS` doc has the table).
+    //
+    //    What closes it is a `Wall` whose `kind_of_wall` is `Kind::Op` and
+    //    that is HONEST about these: not `SchemeSwitch` (four of the fifteen
+    //    do pick a scheme, eleven do not) and not `TwoLaunches` (all fifteen
+    //    are one launch). The shape they share is `Control::Supplies`: one
+    //    kernel, and a grid or a template argument the host computes from a
+    //    comparison the `Source` grammar cannot spell. That is a seventh
+    //    wall, and adding it is a `migration_status` edit, not a port edit —
+    //    left for whoever owns this report, with the count above as the
+    //    receipt for having measured it.
     for symbol in candidates() {
         let Some(how) = execution::execution(symbol) else { continue };
         assert_eq!(

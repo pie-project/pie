@@ -18,7 +18,7 @@
 //!
 //! # What it claims
 //!
-//! That a program registered through `pie_cuda_register_program` reaches
+//! That a program registered through `Shell::register_program` reaches
 //! the fire, reads a value the engine published into a channel, and
 //! publishes its answer back — so the caller gets the PROGRAM's output
 //! and not raw logits. That is the whole of what `ptir_programs` having
@@ -26,13 +26,10 @@
 
 #![cfg(feature = "driver-cuda")]
 
-use driver_api::local::{
-    PIE_DRIVER_ABI_VERSION, PIE_STATUS_OK, PieBytes, ChannelBinding, PieCompletion,
-    PieDriverCaps, PieDriverCreateDesc, InstanceBinding, PieInstanceDesc, PieModelLoadDesc,
-    PieRuntimeCallbacks, TerminalCell,
-};
+use driver_api::local::{ChannelBinding, TerminalCell};
 use driver_api::plan::{ChannelRegistrationPlan, ProgramRegistration};
-use engine::driver::abi::ChannelDescBorrow;
+use driver_api::{CompletionBroker, InstanceBindingPlan};
+use driver_cuda::serve::Shell;
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -46,7 +43,11 @@ const LANES: u32 = 8;
 
 /// Bumped by the driver's completion callback, so the test can wait for
 /// a fire that returns with work still on the stream.
-static FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// NO `FIRED` COUNTER. It was bumped by an `unsafe extern "C" fn` installed as
+// the driver's notify callback, because that was the only way a C++ shell
+// could reach back into the process that opened it. The shell is handed a
+// `CompletionBroker` now and the completion it mints IS the observable, so
+// this waits on the same thing the scheduler waits on.
 
 /// The cached Qwen3-0.6B snapshot and its generated descriptor.
 ///
@@ -89,33 +90,34 @@ fn qwen3_fixture() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 /// The same rule every GPU-touching test in this workspace follows: skip
 /// rather than fail, because a machine without a card is a machine that
 /// cannot answer the question rather than one that answers it wrong.
-fn driver_or_skip(
-    boot: &str,
-    caps: &mut PieDriverCaps,
-) -> Option<*mut driver_api::local::PieDriver> {
-    unsafe extern "C" fn bump(_ctx: *mut std::ffi::c_void, _wait: u64, _epoch: u64) {
-        FIRED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+fn driver_or_skip(boot: &str) -> Option<(Shell, CompletionBroker)> {
+    let broker = CompletionBroker::new();
+    match Shell::open(boot.as_bytes(), broker.clone()) {
+        Ok(shell) => Some((shell, broker)),
+        Err(status) => {
+            eprintln!("[ptir-shell] no CUDA device (status {status}); skipping");
+            None
+        }
     }
-    let desc = PieDriverCreateDesc {
-        abi_version: PIE_DRIVER_ABI_VERSION,
-        runtime: PieRuntimeCallbacks {
-            abi_version: PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
-            ctx: std::ptr::null_mut(),
-            notify: Some(bump),
-        },
-        config_bytes: PieBytes {
-            ptr: boot.as_ptr(),
-            len: boot.len(),
-        },
-        ..Default::default()
-    };
-    let driver = driver_cuda::serve::pie_cuda_create(&desc, caps);
-    if driver.is_null() {
-        eprintln!("[ptir-shell] no CUDA device; skipping");
-        return None;
+}
+
+/// Block until the frame's completion settles, or fail with what it said.
+///
+/// `SubmissionCompletion::check` is what the scheduler polls. It replaced a
+/// spin on a counter an `extern "C"` callback bumped.
+fn await_fire(completion: &driver_api::SubmissionCompletion, secs: u64, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(settled) = completion.check() {
+            settled.unwrap_or_else(|error| panic!("{what}: {error}"));
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: never completed"
+        );
+        std::thread::yield_now();
     }
-    Some(driver)
 }
 
 /// The one-stage epilogue this test registers: read the channel, take an
@@ -247,8 +249,8 @@ impl Endpoint {
 ///
 /// The chain is every step the engine takes and nothing stubbed: author a
 /// container, bind, compile, emit CUDA, lower to the C records,
-/// `pie_cuda_register_program`, `pie_cuda_register_channel` twice,
-/// `pie_cuda_bind_instance`, publish a seed into the writer's mirror, and
+/// `Shell::register_program`, `Shell::register_channel` twice,
+/// `Shell::bind_instance`, publish a seed into the writer's mirror, and
 /// read the argmax out of the reader's.
 #[test]
 fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
@@ -261,8 +263,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     // descriptor` reaches a driver for an HF snapshot whose descriptor
     // does not live inside the checkpoint.
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
-    let mut caps = PieDriverCaps::default();
-    let Some(driver) = driver_or_skip(&boot, &mut caps) else {
+    let Some((mut shell, broker)) = driver_or_skip(&boot) else {
         return;
     };
 
@@ -270,23 +271,19 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     // loaded, and `run_program` is called from inside the model fire, so
     // a program registered against an empty driver is never compiled and
     // never runs. ──
-    let snap_str = snap.to_string_lossy().into_owned();
-    let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes {
-            ptr: snap_str.as_ptr(),
-            len: snap_str.len(),
-        },
-        ..Default::default()
+    let load = driver_api::ModelLoadDesc {
+        snapshot_dir: snap.clone(),
+        runtime_quant: String::new(),
+        mxfp4_moe: driver_api::Mxfp4MoeRequest::Auto,
+        component: driver_api::ModelComponent::Full,
     };
-    let mut load_caps = PieDriverCaps::default();
-    let status = driver_cuda::serve::pie_cuda_load_model(driver, &load, &mut load_caps);
-    assert_eq!(status, PIE_STATUS_OK, "the snapshot loads");
+    shell.load_model(&load).expect("the snapshot loads");
 
     // ── Register the program. ──
     let program = registration(argmax_program());
-    let mut program_id = 0u64;
-    let status = driver_cuda::serve::pie_cuda_register_program(driver, &program, &mut program_id);
-    assert_eq!(status, PIE_STATUS_OK, "the program registers");
+    let program_id = shell
+        .register_program(&program)
+        .expect("the program registers");
 
     // ── Register its two channels, in the order the program indexes
     // them: 0 is what it takes, 1 is what it puts. ──
@@ -322,27 +319,24 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
             extern_dir: driver_api::local::PIE_CHANNEL_EXTERN_NONE,
             extern_name: Vec::new(),
         };
-        let borrow = ChannelDescBorrow::new(&plan);
-        let mut binding = ChannelBinding::default();
-        let status =
-            driver_cuda::serve::pie_cuda_register_channel(driver, borrow.as_raw(), &mut binding);
-        assert_eq!(status, PIE_STATUS_OK, "channel {index} registers");
+        let binding: ChannelBinding = shell
+            .register_channel(&plan)
+            .unwrap_or_else(|status| panic!("channel {index} registers: status {status}"));
         bindings.push(binding);
     }
 
     // ── Bind an instance over both, in that order. ──
     let channel_ids: Vec<u64> = bindings.iter().map(|b| b.channel_id).collect();
-    let inst = PieInstanceDesc {
+    let inst = InstanceBindingPlan {
+        driver_id: 0,
         program_id,
-        channel_ids: driver_api::local::PieU64Slice {
-            ptr: channel_ids.as_ptr(),
-            len: channel_ids.len(),
-        },
-        ..Default::default()
+        requested_instance_id: 0,
+        pacing_wait_id: 0,
+        channel_ids,
+        seed_values: Vec::new(),
+        geometry_class: driver_api::GeometryClass::Host,
     };
-    let mut instance = InstanceBinding::default();
-    let status = driver_cuda::serve::pie_cuda_bind_instance(driver, &inst, &mut instance);
-    assert_eq!(status, PIE_STATUS_OK, "the instance binds");
+    let instance = shell.bind_instance(&inst).expect("the instance binds");
 
     // ── The engine's side: publish the seed the program will take. ──
     let seed: [f32; LANES as usize] = [2.0, 7.0, 1.0, 7.0, 0.5, 7.0, -3.0, 6.0];
@@ -382,23 +376,11 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
         steps: vec![step],
         ..Default::default()
     };
-    let completion = PieCompletion {
-        wait_id: 0x5E5,
-        target_epoch: 1,
-        terminal_cell: std::ptr::null_mut(),
-    };
-    let status = driver_cuda::serve::pie_cuda_launch(driver, &frame, completion);
-    assert_eq!(status, PIE_STATUS_OK, "the frame launches");
+    let (target, completion) = broker.launch_completion(1);
+    shell.launch(&frame, target).expect("the frame launches");
 
     // Run-ahead means the call returns with the fire still queued.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while FIRED.load(std::sync::atomic::Ordering::Acquire) == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the fire never completed"
-        );
-        std::thread::yield_now();
-    }
+    await_fire(&completion, 30, "the fire");
 
     // ── THE CLAIM. The reader holds the PROGRAM's answer, and it is an
     // index rather than a vocabulary of logits. ──
@@ -410,7 +392,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     let got = i32::from_le_bytes(published[..4].try_into().expect("four bytes"));
     assert_eq!(got, 1, "argmax over the tie takes the FIRST maximum");
 
-    driver_cuda::serve::pie_cuda_destroy(driver);
+    drop(shell);
 }
 
 /// Two requests in one frame each get their OWN answer.
@@ -433,33 +415,22 @@ fn every_request_in_a_frame_samples_its_own_row() {
         return;
     };
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
-    let mut caps = PieDriverCaps::default();
-    let Some(driver) = driver_or_skip(&boot, &mut caps) else {
+    let Some((mut shell, broker)) = driver_or_skip(&boot) else {
         return;
     };
 
-    let snap_str = snap.to_string_lossy().into_owned();
-    let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes {
-            ptr: snap_str.as_ptr(),
-            len: snap_str.len(),
-        },
-        ..Default::default()
+    let load = driver_api::ModelLoadDesc {
+        snapshot_dir: snap.clone(),
+        runtime_quant: String::new(),
+        mxfp4_moe: driver_api::Mxfp4MoeRequest::Auto,
+        component: driver_api::ModelComponent::Full,
     };
-    let mut load_caps = PieDriverCaps::default();
-    assert_eq!(
-        driver_cuda::serve::pie_cuda_load_model(driver, &load, &mut load_caps),
-        PIE_STATUS_OK,
-        "the snapshot loads"
-    );
+    shell.load_model(&load).expect("the snapshot loads");
 
     let program = registration(argmax_program());
-    let mut program_id = 0u64;
-    assert_eq!(
-        driver_cuda::serve::pie_cuda_register_program(driver, &program, &mut program_id),
-        PIE_STATUS_OK,
-        "the program registers"
-    );
+    let program_id = shell
+        .register_program(&program)
+        .expect("the program registers");
 
     // Two instances of the SAME program, each over its own channel pair.
     let mut instances = Vec::new();
@@ -498,34 +469,24 @@ fn every_request_in_a_frame_samples_its_own_row() {
                 extern_dir: driver_api::local::PIE_CHANNEL_EXTERN_NONE,
                 extern_name: Vec::new(),
             };
-            let borrow = ChannelDescBorrow::new(&plan);
-            let mut binding = ChannelBinding::default();
-            assert_eq!(
-                driver_cuda::serve::pie_cuda_register_channel(
-                    driver,
-                    borrow.as_raw(),
-                    &mut binding
-                ),
-                PIE_STATUS_OK,
-                "request {req} channel {index} registers"
-            );
+            let binding: ChannelBinding = shell.register_channel(&plan).unwrap_or_else(|status| {
+                panic!("request {req} channel {index} registers: status {status}")
+            });
             bindings.push(binding);
         }
         let channel_ids: Vec<u64> = bindings.iter().map(|b| b.channel_id).collect();
-        let inst = PieInstanceDesc {
+        let inst = InstanceBindingPlan {
+            driver_id: 0,
             program_id,
-            channel_ids: driver_api::local::PieU64Slice {
-                ptr: channel_ids.as_ptr(),
-                len: channel_ids.len(),
-            },
-            ..Default::default()
+            requested_instance_id: 0,
+            pacing_wait_id: 0,
+            channel_ids,
+            seed_values: Vec::new(),
+            geometry_class: driver_api::GeometryClass::Host,
         };
-        let mut instance = InstanceBinding::default();
-        assert_eq!(
-            driver_cuda::serve::pie_cuda_bind_instance(driver, &inst, &mut instance),
-            PIE_STATUS_OK,
-            "instance {req} binds"
-        );
+        let instance = shell
+            .bind_instance(&inst)
+            .unwrap_or_else(|status| panic!("instance {req} binds: status {status}"));
         endpoints.push((Endpoint::of(&bindings[0]), Endpoint::of(&bindings[1])));
         instances.push(instance.instance_id);
     }
@@ -572,26 +533,11 @@ fn every_request_in_a_frame_samples_its_own_row() {
         steps: vec![step],
         ..Default::default()
     };
-    let before = FIRED.load(std::sync::atomic::Ordering::Acquire);
-    let completion = PieCompletion {
-        wait_id: 0x5E6,
-        target_epoch: 1,
-        terminal_cell: std::ptr::null_mut(),
-    };
-    assert_eq!(
-        driver_cuda::serve::pie_cuda_launch(driver, &frame, completion),
-        PIE_STATUS_OK,
-        "the two-request frame launches"
-    );
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while FIRED.load(std::sync::atomic::Ordering::Acquire) == before {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the fire never completed"
-        );
-        std::thread::yield_now();
-    }
+    let (target, completion) = broker.launch_completion(1);
+    shell
+        .launch(&frame, target)
+        .expect("the two-request frame launches");
+    await_fire(&completion, 60, "the two-request fire");
 
     // THE CLAIM: BOTH readers hold an answer, and each holds its own.
     for (req, (_, output)) in endpoints.iter().enumerate() {
@@ -607,5 +553,5 @@ fn every_request_in_a_frame_samples_its_own_row() {
         assert_eq!(got, expected[req], "request {req} sampled its OWN seed");
     }
 
-    driver_cuda::serve::pie_cuda_destroy(driver);
+    drop(shell);
 }

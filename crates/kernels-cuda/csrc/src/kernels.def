@@ -36,9 +36,6 @@
 #ifndef PIE_MOE_ACTIVATION
 #define PIE_MOE_ACTIVATION(name)
 #endif
-#ifndef PIE_AR_FUSION_PATTERN
-#define PIE_AR_FUSION_PATTERN(name)
-#endif
 
 // ---- attention: head_dim --------------------------------------------------
 // Checkpoint-derived, and pie accepts arbitrary HuggingFace repos
@@ -104,33 +101,48 @@ PIE_MOE_ACTIVATION(Geglu)     // gemma4 routed experts (fc1)
 // without the other throws at load time.
 PIE_MOE_ACTIVATION(Identity)  // second grouped GEMM (fc2) of every gated MoE
 
-// ---- all-reduce: fused residual+RMSNorm epilogue --------------------------
-// flashinfer's allreduce_fusion_op() turns four runtime values into one
-// compile-time cross product:
+// ---- all-reduce: fused residual+RMSNorm epilogue --- RETIRED --------------
+// This axis had exactly one consumer, `comm/custom_all_reduce.cu`, and that
+// file is DELETED. The axis is gone with it; nothing in CMake ever read it
+// (`pie_read_def_list` is called for PIE_ATTN_HEAD_DIM only), so removing it
+// reconciles nothing.
 //
-//   switch (nranks) {2,4,8,16} x switch (pattern) {10} x fp32_acc {2}
-//     x (oneshot x trigger_completion_at_end {2}, or twoshot {1})
+// The ARGUMENT it made is not retired, and it is now
+// `driver-cuda/src/fire/all_reduce.rs`, in Rust, as constants a test checks.
+// It read:
 //
-// which is 240 kernels -- 96% of every kernel in custom_all_reduce.cu, and
-// the reason that translation unit cost 111s (40s cicc + 44s ptxas).
+//   flashinfer's allreduce_fusion_op() turns four runtime values into one
+//   compile-time cross product:
 //
-// pie reaches exactly one pattern: kernels/custom_all_reduce.cu sets
-// kARResidualRMSNorm and nothing else. The other nine are FP8/FP4 quant
-// epilogues that no pie call site can select. As with MoE, pie's own code
-// fixes this rather than the checkpoint, so pruning is safe.
+//     switch (nranks) {2,4,8,16} x switch (pattern) {10} x fp32_acc {2}
+//       x (oneshot x trigger_completion_at_end {2}, or twoshot {1})
 //
-// This needs no vendored header and no CMake reconciliation:
-// allreduce_fusion_kernel_launcher is public, so custom_all_reduce.cu expands
-// the list below into its own dispatch switch and simply never calls
-// flashinfer's. That also means a missing entry surfaces as a runtime throw,
-// not a link error -- adding a pattern to a call site requires adding it here.
+//   which is 240 kernels -- 96% of every kernel in custom_all_reduce.cu, and
+//   the reason that translation unit cost 111s (40s cicc + 44s ptxas).
 //
-// nranks stays hand-written and fully instantiated: TP world size is a
-// deployment choice, not a checkpoint property, and {2,4,8,16} is upstream's
-// supported set rather than a pie-owned axis.
-PIE_AR_FUSION_PATTERN(kARResidualRMSNorm)
-
-#undef PIE_ATTN_HEAD_DIM
-#undef PIE_ATTN_DECODE_GQA
-#undef PIE_MOE_ACTIVATION
-#undef PIE_AR_FUSION_PATTERN
+//   pie reaches exactly one pattern: kARResidualRMSNorm. The other nine are
+//   FP8/FP4 quant epilogues that no pie call site can select.
+//
+//   allreduce_fusion_kernel_launcher is public, so custom_all_reduce.cu
+//   expanded this list into its own dispatch switch and never called
+//   flashinfer's. That also meant a missing entry surfaced as a RUNTIME
+//   THROW, not a link error.
+//
+//   nranks stayed hand-written and fully instantiated: TP world size is a
+//   deployment choice, not a checkpoint property, and {2,4,8,16} is
+//   upstream's supported set rather than a pie-owned axis.
+//
+// Three of those sentences change meaning on the other side and are restated
+// there rather than copied:
+//
+//  * `INSTANTIATED` is the one pattern, `NRANKS` is upstream's set, and
+//    `AOT_POINTS_AFTER_PRUNING` is the 24 this pruning actually built.
+//  * The 111s was an argument about an AHEAD-OF-TIME translation unit. Under
+//    NVRTC the unit of work is one instantiation, ~0.46s, compiled on first
+//    call and cached; the list stops being "which were BUILT" and becomes
+//    "which are REACHABLE", which is checkable before a fire instead of
+//    during one.
+//  * "A missing entry surfaces as a runtime throw" is the failure shape this
+//    migration converts. It is a `Decline::PatternNotInstantiated` now, and
+//    `#[must_use] enum AllReduce { Launched, Declined(_) }` is what stops it
+//    being spelled like a success.

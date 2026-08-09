@@ -1118,30 +1118,202 @@ mod transcribed {
     // walk over device text the JIT already owns, not a kernel the archive was
     // holding. The transcriptions below still quote them, so this test follows
     // the files rather than the crate.
-    const VISION: &str = include_str!("../../driver-cuda/csrc/vision/gemma4_vision.cu");
-    const AUDIO: &str = include_str!("../../driver-cuda/csrc/vision/gemma4_audio.cu");
-    const QWEN: &str = include_str!("../../driver-cuda/csrc/vision/qwen3_vl_tower.cu");
-    const GDN: &str = include_str!("../../kernels-cuda/csrc/src/ssm/gated_delta_net.cu");
+    //
+    // AND NONE OF THE THREE IS C++ ANY MORE. `gemma4_vision.cu`,
+    // `gemma4_audio.cu` and `qwen3_vl_tower.cu` are all deleted — the whole
+    // of `driver-cuda/csrc/vision/` is — and their host walks are Rust, at
+    // `driver-cuda/src/tower/gemma4_{vision,audio}.rs` and
+    // `.../tower/qwen3_vl.rs`, firing the `vision::*` rows one at a time. The
+    // evidence did not evaporate with them — the Rust quotes each `<<<>>>` it
+    // reproduces, at the call site that reproduces it — so `VISION`, `AUDIO`
+    // and `QWEN` now name the Rust and the seven pins that read them are
+    // `quoted()` rather than `pinned()`. The
+    // difference is deliberate and is the only thing lost: `pinned` checks a
+    // LINE NUMBER, and a line number in a file under active authorship is a
+    // citation that breaks on formatting. `quoted` checks the text, which is
+    // the part the arithmetic below was derived from.
+    const VISION: &str = include_str!("../../driver-cuda/src/tower/gemma4_vision.rs");
+    const AUDIO: &str = include_str!("../../driver-cuda/src/tower/gemma4_audio.rs");
+    const QWEN: &str = include_str!("../../driver-cuda/src/tower/qwen3_vl.rs");
+    // `ssm/gated_delta_net.cu` IS DELETED and `GDN` names the Rust that
+    // replaced it — `driver-cuda/src/fire/gated_delta_net.rs`, which quotes
+    // every `<<<>>>` it reproduces beside the `Launch` that reproduces it.
+    // The same move `gemma4_{vision,audio}.cu` and the three capture
+    // post-kernels made, and it costs the same thing: the pins that read it
+    // are `quoted()` rather than `pinned()`, because a line number in a file
+    // under active authorship is a citation that breaks on formatting.
+    const GDN: &str = include_str!("../../driver-cuda/src/fire/gated_delta_net.rs");
     const GDN_CUH: &str = include_str!("../csrc/src/ssm/gated_delta_net.cuh");
+    // ── `quant/dequant_wna16.cu` IS DELETED AND `WNA16` IS UNRESOLVED ──
+    //
+    // It went in `9ba759034` ("ssm, quant and norm leave the census
+    // entirely") and NOTHING REPLACED IT. `kernels-cuda/csrc/CMakeLists.txt`
+    // records the whole of its migration: every launcher the file still held
+    // is in `device::JIT_DISPATCHED` — `quant::dequant_wna16_int4b8_to_bf16`
+    // and `quant::bf16_to_fp16` — so NVRTC fires them from
+    // `quant/dequant_wna16.cuh` and no Rust host program was ever written for
+    // this file. There is no `driver-cuda/src/fire/dequant_wna16.rs` to point
+    // at, and pointing at anything else would be a citation to a different
+    // file's text, so the path is left as it stands: a compile error that
+    // says the source is gone, rather than a green test reading a stranger.
+    //
+    // WHAT THE ONE SURVIVING PIN LOSES. `constexpr int DECODE_BLOCK = 256;`
+    // at `:23` has no witness left anywhere in the tree, and
+    // `quant/dequant_wna16.cuh:119-125` says why in its own words: *"The
+    // block width these kernels are launched at is NOT here ... 256 is the
+    // launcher's decision and it stays in `dequant_wna16.cu` beside the
+    // `<<<>>>` that spends it. A copy here would be a second place for the
+    // same number."* That `.cu` is now gone, so the second copy the split
+    // refused to make is the only copy there could have been. The single
+    // remaining transcription is `runtime::launch`'s own doc at `:1828`,
+    // which is the RULE citing itself — a pin against it would agree with
+    // the rule by construction and check nothing, so it is not written.
     const WNA16: &str = include_str!("../../kernels-cuda/csrc/src/quant/dequant_wna16.cu");
+    const WNA16_CUH: &str = include_str!("../csrc/src/quant/dequant_wna16.cuh");
+    // ── `quant/dequant_fp4.cu` IS DELETED AND `FP4` IS UNRESOLVED ──
+    //
+    // Same commit, same finding, same reason: all four launchers are
+    // `device::JIT_DISPATCHED` (`quant::dequant_mxfp4_to_bf16` and the three
+    // MoE decode GEMVs), the device text is `quant/dequant_fp4.cuh`, and no
+    // Rust host program exists. `dequant_fp4.cuh`'s own header still names
+    // the deleted file as its other half — *"`dequant_fp4.cu` is the four
+    // host launchers and the `kTok` dispatch that reads an environment
+    // variable; this file is what the GPU runs"* — so the three constants
+    // pinned below (`kMxfp4DecodeBlock`, `kMxfp4GateUpPairs`,
+    // `kMxfp4DownRows`, at `:39`, `:42` and `:44`) died with the host half
+    // and are witnessed nowhere. `families::quant` and `runtime::launch`
+    // both transcribe them and both are the claim, not the evidence.
     const FP4: &str = include_str!("../../kernels-cuda/csrc/src/quant/dequant_fp4.cu");
     const FP4_CUH: &str = include_str!("../csrc/src/quant/dequant_fp4.cuh");
+    // SLATED TO DIE NEXT: agent `xqa-nvrtc` is retiring
+    // `attn/attention_naive_paged.cu`. When it goes, `NAIVE`'s successor is
+    // whatever Rust that agent lands for `paged_scores`; repoint here and
+    // downgrade its pins to `quoted()`, exactly as `MLA` and `QKV` below.
     const NAIVE: &str =
         include_str!("../../kernels-cuda/csrc/src/attn/attention_naive_paged.cu");
-    const MLA: &str = include_str!("../../kernels-cuda/csrc/src/attn/mla_paged.cu");
-    const QKV: &str = include_str!("../../kernels-cuda/csrc/src/attn/qkv_fused.cu");
-    const ALTUP: &str = include_str!("../../kernels-cuda/csrc/src/norm/altup.cu");
-    const ROPE: &str = include_str!("../../kernels-cuda/csrc/src/rope/rope.cu");
-    const DSV4: &str = include_str!("../../kernels-cuda/csrc/src/attn/dsv4_compress.cu");
+    // `attn/mla_paged.cu` IS DELETED (`244df6054`) and `MLA` names the Rust
+    // that replaced it — `driver-cuda/src/fire/mla_paged.rs`, whose header
+    // quotes the two `<<<>>>` it reproduces beside the `Launch` that
+    // reproduces them. `kernels-cuda/csrc/CMakeLists.txt` names it:
+    // *"Two `<<<>>>` — `mla_prepare<256>` over `dim3(total_tokens, 1 +
+    // q_blocks)` and `write_mla` at `<<<total_tokens, 256>>>` — now
+    // `driver-cuda/src/fire/mla_paged.rs`."* Its pins are `quoted()` rather
+    // than `pinned()` for `GDN`'s reason, and the cost is `pinned`'s second
+    // half: THE LINE IS NO LONGER CHECKED, so an edit that leaves a launch
+    // alone and moves it now passes here while every `at :NNN` in
+    // `families::attn` and `runtime::launch` goes stale unnoticed.
+    const MLA: &str = include_str!("../../driver-cuda/src/fire/mla_paged.rs");
+    // `attn/qkv_fused.cu` IS DELETED (`44ffd6466`) and `QKV` names
+    // `driver-cuda/src/fire/qkv_fused.rs` — *"Four `<<<>>>` -> the eight
+    // instantiations of `driver-cuda/src/fire/qkv_fused.rs`"*, per
+    // `kernels-cuda/csrc/CMakeLists.txt`. `quoted()` for the same reason and
+    // at the same cost as `MLA`: the line halves of thirteen citations stop
+    // being checked here.
+    const QKV: &str = include_str!("../../driver-cuda/src/fire/qkv_fused.rs");
+    const ALTUP_CUH: &str = include_str!("../csrc/src/norm/altup.cuh");
+    // `rope/rope.cu` IS DELETED (`58b31cf1b`) and `ROPE` names the Rust that
+    // replaced it. IT HAS MOVED TWICE. `kernels-cuda/csrc/CMakeLists.txt`
+    // records the first move — *"Three of its twelve launchers are
+    // `device::JIT_DISPATCHED` and nine are `execution::RUST_SERVED`;
+    // `driver-cuda/src/fire/rope.rs` is the host program"* — and
+    // `driver-cuda/src/fire/mod.rs` records the second, in this session:
+    // *"`rope` IS NOT HERE, and its absence is the migration. Its nine host
+    // programs are `kernels-cuda-new/src/x/rope.rs`, beside the `rope.cuh`
+    // whose `__global__`s they fire."* All twelve texts pinned below are in
+    // that file verbatim. `quoted()` at `MLA`'s cost, and with one more:
+    // this source is INSIDE THIS CRATE, so it is a weaker independence than
+    // a `driver-cuda` file — but it is the launcher, and `families::rope`
+    // and `runtime::launch` are the claim, so it is still the evidence and
+    // not the assertion read twice.
+    const ROPE: &str = include_str!("../src/x/rope.rs");
+    // `attn/dsv4_compress.cu` IS DELETED (`12cf0fbb1`, "moe reaches zero")
+    // and `DSV4` names `driver-cuda/src/fire/dsv4_compress.rs` — *"Four
+    // `<<<>>>` left in it ... now `driver-cuda/src/fire/dsv4_compress.rs`"*.
+    // `quoted()` at `MLA`'s cost.
+    const DSV4: &str = include_str!("../../driver-cuda/src/fire/dsv4_compress.rs");
+    // SLATED TO DIE NEXT: agent `fa2-nvrtc` is retiring
+    // `driver-cuda/csrc/attn/attention_flashinfer.cu`, blocked only on the
+    // four C++ callers of `dequant_kv_cache_layer_to_bf16_active` inside it.
+    // When it goes, `FLASHINFER`'s successor is that agent's Rust; repoint
+    // here and downgrade the two fold-heads pins to `quoted()`.
     const FLASHINFER: &str =
-        include_str!("../../kernels-cuda/csrc/src/attn/attention_flashinfer.cu");
+        include_str!("../../driver-cuda/csrc/attn/attention_flashinfer.cu");
+    // The three capture post-kernels' launches left `FLASHINFER` for Rust,
+    // the same journey `gemma4_{vision,audio}.cu` made: they are
+    // `ScoreOps::normalize_decode`, `normalize_prefill` and `fold_prefill`,
+    // and each quotes the `<<<>>>` it reproduces in the doc comment above
+    // it. So their pins are `quoted()` against THIS, not `pinned()` against
+    // a C++ line that no longer exists.
+    const SCORE_RS: &str = include_str!("../../driver-cuda/src/fire/attn_score.rs");
+    // ── `layout/slot_ops.cu` IS DELETED AND `SLOT_OPS` IS UNRESOLVED ──
+    //
+    // It went in `cd5cebd3d` and NOTHING REPLACED IT, in either language.
+    // `kernels-cuda/csrc/CMakeLists.txt` is explicit: *"`src/layout/
+    // slot_ops.cu` was here and IS DELETED with `layout/slot_ops.hpp`. Its
+    // one launcher, `copy_if_valid_slot`, had no consumer in any language.
+    // The `table::layout` row and the `dsl::cuda` wrapper went with it; the
+    // DEVICE row in `families::layout` STAYS, because it is the only witness
+    // `kernels-cuda-new/tests/launch_rules.rs` has for `LaunchRule::Single`."*
+    // `driver-cuda/tests/launch_abi.rs` says the same of the header. So the
+    // launcher was DROPPED RATHER THAN MOVED, and there is no Rust to point
+    // at; the path is left as it stands.
+    //
+    // WHAT THE TWO PINS LOSE. `constexpr int kThreads = 256;` at `:39` and
+    // `device::copy_if_valid_slot<<<1, kThreads, 0, stream>>>(` at `:40` are
+    // the whole evidence for `LaunchRule::Single`'s literal `1` — there is
+    // no arithmetic below to check it against — and they now have no source.
+    // `layout/slot_ops.cuh` survives and states the SHAPE in prose
+    // (*"`copy_if_valid_slot` launches `<<<1, 256>>>` -- exactly one block,
+    // whatever the fire's row count"*), which is a paraphrase and not the
+    // launcher; its header still says *"`slot_ops.cu` includes this file and
+    // keeps its two launchers"*, which is now false. The only verbatim copies
+    // left are `families::layout:346-347` and `runtime::launch:1146-1147`,
+    // and both of those ARE the claim this file exists to check.
     const SLOT_OPS: &str = include_str!("../../kernels-cuda/csrc/src/layout/slot_ops.cu");
+    // SLATED TO DIE NEXT: agent `fa2-nvrtc` is retiring `attn/kv_paged.cu`,
+    // blocked on the same four C++ callers as `FLASHINFER`. When it goes,
+    // `KV_PAGED`'s successor is that agent's Rust; repoint here and downgrade
+    // the two `runtime::launch::single`/`single_warp` pins to `quoted()`.
     const KV_PAGED: &str = include_str!("../../kernels-cuda/csrc/src/attn/kv_paged.cu");
+    // `attn/attention_naive.cu` IS DELETED (`244df6054`) and `NAIVE_UNPAGED`
+    // names `driver-cuda/src/fire/attention_naive.rs` — *"Two `<<<>>>` left
+    // in it -- the MTP state pair ... now
+    // `driver-cuda/src/fire/attention_naive.rs`"*, per
+    // `kernels-cuda/csrc/CMakeLists.txt`. `quoted()` at `MLA`'s cost.
     const NAIVE_UNPAGED: &str =
-        include_str!("../../kernels-cuda/csrc/src/attn/attention_naive.cu");
-    const PAGE_COMPACT: &str = include_str!("../../kernels-cuda/csrc/src/attn/page_compact.cu");
-    const RMSNORM: &str = include_str!("../../kernels-cuda/csrc/src/norm/rmsnorm.cu");
-    const NEMOTRON: &str = include_str!("../../kernels-cuda/csrc/src/ssm/nemotron_h.cu");
+        include_str!("../../driver-cuda/src/fire/attention_naive.rs");
+    // `attn/page_compact.cu` IS DELETED (`244df6054`) and `PAGE_COMPACT`
+    // names `driver-cuda/src/fire/page_compact.rs` — *"Two `<<<num_requests,
+    // kBlock>>>` on one stream ... now `driver-cuda/src/fire/page_compact.rs`"*.
+    // `quoted()` at `MLA`'s cost, and here the cost bites hardest: the two
+    // pins were IDENTICAL TEXT distinguished only by their line numbers
+    // (`:45` and `:48`), which was the whole of the claim that there are TWO
+    // launches and not one read twice. `quoted` cannot tell them apart, so
+    // that claim is no longer checked by this file at all — `fire::page_compact`
+    // quotes both at `:46` and `:49` and is where a reader must now look.
+    const PAGE_COMPACT: &str = include_str!("../../driver-cuda/src/fire/page_compact.rs");
+    // `norm/rmsnorm.cu` IS DELETED (`58b31cf1b`) and `RMSNORM` names
+    // `driver-cuda/src/fire/rmsnorm.rs` — *"Three of its five launchers are
+    // `device::JIT_DISPATCHED` ... and two are `execution::RUST_SERVED` ...
+    // `driver-cuda/src/fire/rmsnorm.rs` is the host program"*, per
+    // `kernels-cuda/csrc/CMakeLists.txt`. `quoted()` at `MLA`'s cost.
+    const RMSNORM: &str = include_str!("../../driver-cuda/src/fire/rmsnorm.rs");
+    // `ssm/nemotron_h.cu` IS DELETED (`9ba759034`), and with it the whole of
+    // `kernels-cuda/csrc/src/ssm/`. Its two halves are both still here: the
+    // HOST half is `driver-cuda/src/fire/nemotron_h.rs` — which
+    // `NEMOTRON_RS` below already names, and which
+    // `kernels-cuda/csrc/CMakeLists.txt` confirms holds the two surviving
+    // `build_nemotron_moe_ptrs_*` launchers — and the DEVICE half is the
+    // `.cuh` `NEMOTRON` now names, where `mamba_split` itself lives. The
+    // const follows the device half so that the coverage list below keeps
+    // covering two files rather than naming one file twice; it carries no
+    // pin, so nothing is cited from it.
+    const NEMOTRON: &str = include_str!("../csrc/src/ssm/nemotron_h.cuh");
+    // The `.cu` is DELETED, so its two `mamba_split` arms are read from
+    // `driver-cuda/src/fire/nemotron_h.rs`, which quotes each line it
+    // reproduced. The four pins below are `quoted()` for the reason `GDN`'s
+    // are.
+    const NEMOTRON_RS: &str = include_str!("../../driver-cuda/src/fire/nemotron_h.rs");
 
     /// Assert `text` appears in `src` at 1-based `line`, and say which
     /// citation goes stale if it has moved.
@@ -1406,6 +1578,29 @@ mod transcribed {
         )
     }
 
+    /// [`pinned`] without the line number, for a launcher whose transcription
+    /// outlived the file it was transcribed from.
+    ///
+    /// `gemma4_vision.cu` is gone and its walk is Rust. The Rust quotes the
+    /// `<<<>>>` it reproduces, verbatim, in the comment above each fire — so
+    /// the text this file's arithmetic was derived from is still checkable,
+    /// and it is still checked. What cannot be checked is WHERE: a Rust file
+    /// is formatted, wrapped and re-indented by tools that do not know a
+    /// comment is evidence, and a line-pinned citation into one fails on the
+    /// day someone runs `cargo fmt`. Pinning the text alone is the strongest
+    /// claim that survives that, and it is strictly stronger than deleting
+    /// the pin, which is the only other option a moved file leaves.
+    fn quoted(src: &str, file: &str, text: &str, cites: &str) {
+        assert!(
+            src.contains(text),
+            "{file}: the launcher this transcription was written from is not quoted here.\n  \
+             expected to find: {text}\n  \
+             {cites} cites it. The C++ it came from is deleted, so this Rust IS the \
+             citation now -- if the walk changed its launch, correct the quote and then \
+             the arithmetic, in that order."
+        );
+    }
+
     /// Every launcher declaration these transcriptions were written from, at
     /// the line the rule that cites it names.
     ///
@@ -1414,40 +1609,39 @@ mod transcribed {
     /// that mysteriously stopped agreeing.
     fn pins() {
         let g2b2 = "dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}";
-        pinned(VISION, "driver-cuda csrc/vision/gemma4_vision.cu", 138, g2b2, "`tile16`");
-        pinned(AUDIO, "driver-cuda csrc/vision/gemma4_audio.cu", 131, g2b2, "`tile16`");
-        pinned(QWEN, "driver-cuda csrc/vision/qwen3_vl_tower.cu", 139, g2b2, "`tile16`");
+        quoted(VISION, "driver-cuda src/tower/gemma4_vision.rs", g2b2, "`tile16`");
+        quoted(AUDIO, "driver-cuda src/tower/gemma4_audio.rs", g2b2, "`tile16`");
+        quoted(QWEN, "driver-cuda src/tower/qwen3_vl.rs", g2b2, "`tile16`");
 
-        pinned(
+        quoted(
             VISION,
-            "driver-cuda csrc/vision/gemma4_vision.cu",
-            195,
+            "driver-cuda src/tower/gemma4_vision.rs",
             "vd::k_addpos_grid2d<bfd><<<G2(Hd,N),B2,0,S>>>(D(h),D(w.pos_table),pos,N,Hd,PT);",
             "`tile16`",
         );
 
         // One line, two launches, one tensor each. This is the pin the stale
         // quote would have failed.
-        pinned(
+        quoted(
             VISION,
-            "driver-cuda csrc/vision/gemma4_vision.cu",
-            201,
+            "driver-cuda src/tower/gemma4_vision.rs",
             "dim3 rg(1,NH,N);vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(q),pos,N,NH,THETA);\
              vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(k),pos,N,NH,THETA);",
             "`axial_rope`",
         );
 
-        pinned(
+        // BOTH SSCP LAYERS, quoted at one site. The Rust runs them through
+        // one `sscp()` helper, so the two launchers sit together in its
+        // comment rather than at two line numbers eight lines apart.
+        quoted(
             AUDIO,
-            "driver-cuda csrc/vision/gemma4_audio.cu",
-            189,
+            "driver-cuda src/tower/gemma4_audio.rs",
             "vd::k_layernorm_relu<bfd><<<T1*F1,128,0,S>>>(D(c0cl),D(w.sscp0_norm),D(c0cl),T1*F1,C0,EPS);",
             "`per_row_narrow`",
         );
-        pinned(
+        quoted(
             AUDIO,
-            "driver-cuda csrc/vision/gemma4_audio.cu",
-            196,
+            "driver-cuda src/tower/gemma4_audio.rs",
             "vd::k_layernorm_relu<bfd><<<T2*F2,128,0,S>>>(D(c1cl),D(w.sscp1_norm),D(c1cl),T2*F2,C1,EPS);",
             "`per_row_narrow`",
         );
@@ -1472,33 +1666,66 @@ mod transcribed {
         // deleted line is the one thing it structurally cannot guard.
         assert!(
             !GDN.contains("dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);"),
-            "ssm/gated_delta_net.cu opens `warp_tiled_scan`'s grid again.\n\
+            "driver-cuda/src/fire/gated_delta_net.rs quotes `warp_tiled_scan`'s grid.\n\
              The two launchers were deleted as unreached; if one is back, this\n\
              transcription must be re-pinned to it rather than to the .cuh."
         );
-        pinned(GDN_CUH, "ssm/gated_delta_net.cuh", 436, "constexpr int WARPS = 4;", "`warp_tiled_scan`");
+        pinned(GDN_CUH, "ssm/gated_delta_net.cuh", 472, "constexpr int WARPS = 4;", "`warp_tiled_scan`");
 
+        // ── `routed_qmv` and `routed_qmv_transposed`, re-pinned to the
+        //    kernels they launch ──
+        //
+        // BOTH LAUNCHERS ARE GONE (§43.9). `quant::wna16_gate_up_decode_bf16`
+        // and `quant::wna16_down_decode_bf16` are in `device::JIT_DISPATCHED`,
+        // so the shim emits no entry for either, and neither had a C++
+        // caller. The pins that stood here quoted `constexpr int GU_WARPS =
+        // DECODE_BLOCK / 32;` at `:73` and `const dim3 grid(routes,
+        // (intermediate + GU_WARPS - 1) / GU_WARPS);` at `:74`, and the
+        // transposed twin's `constexpr int WARPS = BS / 32;` at `:102` and
+        // `const dim3 grid((hidden + WARPS - 1) / WARPS, routes);` at `:103`.
+        //
+        // The claim those four made was about WHICH AXIS CARRIES THE ROUTES,
+        // and the kernels state it themselves — they have to, because they
+        // read it back. `wna16_gate_up_decode` takes its route off
+        // `blockIdx.x` and tiles the intermediate rows on `blockIdx.y`;
+        // `wna16_down_decode` swaps them. Pinned as four quotes and not two,
+        // for the same reason as before: two grids that differ only in an
+        // axis order need two pieces of evidence, not one read twice.
+        pinned(WNA16, "quant/dequant_wna16.cu", 23, "constexpr int DECODE_BLOCK = 256;", "`routed_qmv`");
+        pinned(WNA16_CUH, "quant/dequant_wna16.cuh", 295, "const int route = blockIdx.x;", "`routed_qmv`");
         pinned(
-            WNA16,
-            "quant/dequant_wna16.cu",
-            74,
-            "const dim3 grid(routes, (intermediate + GU_WARPS - 1) / GU_WARPS);",
+            WNA16_CUH,
+            "quant/dequant_wna16.cuh",
+            298,
+            "const int row = blockIdx.y * (blockDim.x >> 5) + warp_in_block;",
             "`routed_qmv`",
         );
-        pinned(WNA16, "quant/dequant_wna16.cu", 73, "constexpr int GU_WARPS = DECODE_BLOCK / 32;", "`routed_qmv`");
-
-        // ── `routed_qmv_transposed`, the other half of the same file ──
-        //
-        // Pinned beside its twin ON PURPOSE. The two grids differ only in
-        // which axis carries the routes, so the evidence that they differ has
-        // to be two quotes and not one quote read twice.
-        pinned(WNA16, "quant/dequant_wna16.cu", 102, "constexpr int WARPS = BS / 32;", "`routed_qmv_transposed`");
         pinned(
-            WNA16,
-            "quant/dequant_wna16.cu",
-            103,
-            "const dim3 grid((hidden + WARPS - 1) / WARPS, routes);",
+            WNA16_CUH,
+            "quant/dequant_wna16.cuh",
+            371,
+            "const int route = blockIdx.y;",
             "`routed_qmv_transposed`",
+        );
+        pinned(
+            WNA16_CUH,
+            "quant/dequant_wna16.cuh",
+            374,
+            "const int h = blockIdx.x * (blockDim.x >> 5) + warp_in_block;",
+            "`routed_qmv_transposed`",
+        );
+        // Absence guards the direction a pin cannot: a launcher coming back
+        // with a grid nobody re-derived. `pinned` can only assert presence.
+        assert!(
+            !WNA16.contains("const dim3 grid(routes, (intermediate + GU_WARPS - 1) / GU_WARPS);"),
+            "quant/dequant_wna16.cu opens `wna16_gate_up_decode`'s grid again.\n\
+             The launcher was deleted as unreached; if one is back, re-pin this\n\
+             transcription to it rather than to the .cuh."
+        );
+        assert!(
+            !WNA16.contains("const dim3 grid((hidden + WARPS - 1) / WARPS, routes);"),
+            "quant/dequant_wna16.cu opens `wna16_down_decode`'s grid again.\n\
+             Same as above, for `routed_qmv_transposed`."
         );
 
         // ── `routed_qmv_quad`, the OTHER MoE decode file ──
@@ -1508,6 +1735,10 @@ mod transcribed {
         // 4 where its are 1, so `128/32 * 4 = 16` against `256/32 * 1 = 8`.
         // Pinning only the `dim3` would leave both factors unwitnessed and
         // the product is what a near miss gets wrong.
+        //
+        // The three CONSTANTS survived §43.9 — they sit above the two
+        // launchers it deleted and are the file's whole remaining content on
+        // this rule — so they are pinned where they always were.
         pinned(FP4, "quant/dequant_fp4.cu", 39, "constexpr int kMxfp4DecodeBlock = 128;", "`routed_qmv_quad`");
         pinned(FP4, "quant/dequant_fp4.cu", 42, "constexpr int kMxfp4GateUpPairs = 4;", "`routed_qmv_quad`");
         pinned(
@@ -1517,27 +1748,39 @@ mod transcribed {
             "constexpr int kMxfp4DownRows = 4;  // four warps, one output row each",
             "`routed_qmv_quad`",
         );
-        pinned(
-            FP4,
-            "quant/dequant_fp4.cu",
-            70,
-            "(intermediate + pairs_per_block - 1) / pairs_per_block);",
-            "`routed_qmv_quad`",
-        );
-        pinned(
-            FP4,
-            "quant/dequant_fp4.cu",
-            104,
-            "(hidden + rows_per_block - 1) / rows_per_block);",
-            "`routed_qmv_quad`",
-        );
-        // The two legs put the routes on the SAME axis, which is the claim
-        // that makes one rule cover both. Pinned as two quotes of the same
-        // text at two lines, because one quote read twice is not evidence
-        // that two launchers agree.
-        for line in [69, 103] {
-            pinned(FP4, "quant/dequant_fp4.cu", line, "dim3 grid(num_tokens * top_k,", "`routed_qmv_quad`");
+        // The two GRIDS did not survive: `quant::mxfp4_moe_gate_up_decode_bf16`
+        // and `quant::mxfp4_moe_down_decode_bf16` are both in
+        // `device::JIT_DISPATCHED` with no shim entry and no C++ caller, so
+        // §43.9 took both launchers and with them `dim3 grid(num_tokens *
+        // top_k,` at `:69`/`:103` and the two divisor lines at `:70`/`:104`.
+        //
+        // The claim they carried — the two legs put the routes on the SAME
+        // axis, which is what makes ONE rule cover both — is re-pinned to the
+        // kernels, which read that axis back. Two quotes at two lines, never
+        // one quote read twice.
+        for line in [232, 357] {
+            pinned(FP4_CUH, "quant/dequant_fp4.cuh", line, "const int route = blockIdx.x;", "`routed_qmv_quad`");
         }
+        pinned(
+            FP4_CUH,
+            "quant/dequant_fp4.cuh",
+            236,
+            "(blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kPairs;",
+            "`routed_qmv_quad`",
+        );
+        pinned(
+            FP4_CUH,
+            "quant/dequant_fp4.cuh",
+            361,
+            "(blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;",
+            "`routed_qmv_quad`",
+        );
+        assert!(
+            !FP4.contains("dim3 grid(num_tokens * top_k,"),
+            "quant/dequant_fp4.cu opens a routed decode grid again.\n\
+             Both launchers were deleted as unreached (§43.9); if one is back,\n\
+             re-pin `routed_qmv_quad` to it rather than to the .cuh."
+        );
         // And the grouped sibling, which used to be pinned for what it is
         // NOT: a `pairs_per_block` of `warps * 2`, half this rule's tile, on
         // a grid whose `x` is an EXPERT count.
@@ -1546,8 +1789,10 @@ mod transcribed {
         // refusal no longer rests on a line of `.cu`. The kernel survives,
         // so the refusal survives with it, and it is re-pinned to the
         // instantiation constant that made the tile half-width in the first
-        // place. An absence guards the direction the pin cannot: a launcher
-        // coming back with the old grid and nobody noticing.
+        // place AND to the `blockIdx.x` read that makes its `x` an expert
+        // rather than a route. An absence guards the direction the pin
+        // cannot: a launcher coming back with the old grid and nobody
+        // noticing.
         assert!(
             !FP4.contains("const int pairs_per_block = warps * 2;"),
             "quant/dequant_fp4.cu opens the grouped sibling's half-width tile\n\
@@ -1555,6 +1800,13 @@ mod transcribed {
              kernel; if there is a launcher once more, re-pin it to the .cu."
         );
         pinned(FP4_CUH, "quant/dequant_fp4.cuh", 469, "constexpr int kPairs = 2;", "`routed_qmv_quad` refusal");
+        pinned(
+            FP4_CUH,
+            "quant/dequant_fp4.cuh",
+            471,
+            "const int expert = blockIdx.x;",
+            "`routed_qmv_quad` refusal",
+        );
 
         // ── `paged_scores` and `paged_scores_decode` ──
         //
@@ -1615,60 +1867,111 @@ mod transcribed {
         // more, two of them a `?:` and a ceiling. All four are pinned, because
         // a rule that recomputed `heads_per_block` from a `half` that had
         // stopped being `rope / 2` would agree with a pin of the grid alone.
-        pinned(MLA, "attn/mla_paged.cu", 50, "constexpr int BS = 256;", "`mla_prepare`");
-        pinned(MLA, "attn/mla_paged.cu", 53, "const int half = rope / 2;", "`mla_prepare`");
-        pinned(
+        //
+        // ALL SIX ARE NOW `quoted()` AGAINST `fire/mla_paged.rs`, the Rust
+        // that replaced the deleted `.cu`. What stopped being checked is the
+        // LINE: an edit that leaves a launch alone and moves it passes here
+        // now, while `families::attn:2752-2753` and `runtime::launch:2217-2219`
+        // still say `at :NNN` about a file that no longer exists.
+        //
+        // AND THREE OF THE SIX ARE NOT REPRODUCED VERBATIM. `fire/mla_paged.rs`
+        // quotes `constexpr int BS = 256;`, `dim3 grid(total_tokens, 1 +
+        // q_blocks);` and `device::mla_prepare<BS><<<grid, BS, 0, stream>>>(`
+        // and does NOT quote the three lines that build the `y`: it ported
+        // them into `heads_per_block()` and `q_blocks()` and cited them in
+        // prose instead — `` `mla_paged.cu:64` — `heads_per_block = half >= BS
+        // ? 1 : (BS / half)` `` drops the `const int` and the `;`, `:65` is
+        // paraphrased as `q_blocks = ceil(heads / heads_per_block)`, and
+        // `const int half = rope / 2;` is Rust's `let half = rope / 2;`. So
+        // three assertions below FAIL, and they are left failing on purpose:
+        // the port dropped the exact text three citations were written from,
+        // which is a finding about `fire/mla_paged.rs` and not about this
+        // file. The fix is to restore the three quotes there — NOT to weaken
+        // the three assertions here.
+        quoted(MLA, "driver-cuda src/fire/mla_paged.rs", "constexpr int BS = 256;", "`mla_prepare`");
+        quoted(MLA, "driver-cuda src/fire/mla_paged.rs", "const int half = rope / 2;", "`mla_prepare`");
+        quoted(
             MLA,
-            "attn/mla_paged.cu",
-            58,
+            "driver-cuda src/fire/mla_paged.rs",
             "const int heads_per_block = half >= BS ? 1 : (BS / half);",
             "`mla_prepare`",
         );
-        pinned(
+        quoted(
             MLA,
-            "attn/mla_paged.cu",
-            59,
+            "driver-cuda src/fire/mla_paged.rs",
             "const int q_blocks = (heads + heads_per_block - 1) / heads_per_block;",
             "`mla_prepare`",
         );
-        pinned(MLA, "attn/mla_paged.cu", 67, "dim3 grid(total_tokens, 1 + q_blocks);", "`mla_prepare`");
-        pinned(
+        quoted(
             MLA,
-            "attn/mla_paged.cu",
-            68,
+            "driver-cuda src/fire/mla_paged.rs",
+            "dim3 grid(total_tokens, 1 + q_blocks);",
+            "`mla_prepare`",
+        );
+        quoted(
+            MLA,
+            "driver-cuda src/fire/mla_paged.rs",
             "device::mla_prepare<BS><<<grid, BS, 0, stream>>>(",
             "`mla_prepare`",
         );
 
         // ── the three `qkv_fused` grids ──
-        pinned(QKV, "attn/qkv_fused.cu", 221, "constexpr int BLOCK = 256;", "`rows_packed_heads`");
-        pinned(
+        //
+        // ALL SEVEN ARE NOW `quoted()` AGAINST `fire/qkv_fused.rs`, the Rust
+        // that replaced the deleted `.cu`. The LINE stops being checked, at
+        // `MLA`'s cost, and here the loss has a second edge: the Rust cites
+        // `:105`/`:106` where this file's citations say `:98`/`:99`, because
+        // the `.cu` moved under both of them before it died. Nothing can tell
+        // which numbering `families::attn` and `runtime::launch` are written
+        // against any more, and no assertion in this tree can settle it.
+        //
+        // AND TWO OF THE SEVEN ARE NOT REPRODUCED. `fire/qkv_fused.rs` is the
+        // DECODE dispatch only; `rows_packed_heads`' prefill launcher
+        // (`constexpr int BLOCK = 256;` at `:221` and `dim3 grid(num_rows,
+        // num_q_heads + num_kv_heads);` at `:222`) was already gone when the
+        // file was deleted and no Rust reproduces it. Those two assertions
+        // fail, and are left failing: the rule `rows_packed_heads` is still
+        // stated and still transcribed below, so the right response is to
+        // find the launcher it was written from, not to stop asking.
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            222,
+            "driver-cuda src/fire/qkv_fused.rs",
+            "constexpr int BLOCK = 256;",
+            "`rows_packed_heads`",
+        );
+        quoted(
+            QKV,
+            "driver-cuda src/fire/qkv_fused.rs",
             "dim3 grid(num_rows, num_q_heads + num_kv_heads);",
             "`rows_packed_heads`",
         );
-        pinned(QKV, "attn/qkv_fused.cu", 98, "constexpr int BLOCK = 128;", "`rows_packed_heads_narrow`");
-        pinned(
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            99,
+            "driver-cuda src/fire/qkv_fused.rs",
+            "constexpr int BLOCK = 128;",
+            "`rows_packed_heads_narrow`",
+        );
+        quoted(
+            QKV,
+            "driver-cuda src/fire/qkv_fused.rs",
             "dim3 grid(num_requests, num_q_heads + num_kv_heads);",
             "`rows_packed_heads_narrow`",
         );
-        pinned(QKV, "attn/qkv_fused.cu", 51, "constexpr int WARP_BLOCK = 256;", "`warp_packed_heads`");
-        pinned(
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            52,
+            "driver-cuda src/fire/qkv_fused.rs",
+            "constexpr int WARP_BLOCK = 256;",
+            "`warp_packed_heads`",
+        );
+        quoted(
+            QKV,
+            "driver-cuda src/fire/qkv_fused.rs",
             "const int total_units = num_requests * (num_q_heads + num_kv_heads);",
             "`warp_packed_heads`",
         );
-        pinned(
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            53,
+            "driver-cuda src/fire/qkv_fused.rs",
             "dim3 warp_grid((total_units + (WARP_BLOCK / 32) - 1) / (WARP_BLOCK / 32));",
             "`warp_packed_heads`",
         );
@@ -1679,70 +1982,98 @@ mod transcribed {
         // cites these two lines, and a citation this file cannot check is one
         // nobody will. The trailing backslashes are the macro's; `:56` is
         // inside `LAUNCH_QKV_DECODE_POST_WARP` and `:100` is not.
-        pinned(
+        //
+        // NONE OF THESE SIX SURVIVED THE PORT AS TEXT, and that is the whole
+        // of what the port did to them: `fire/qkv_fused.rs` deleted the macro
+        // and the `if` together. It picks the symbol off `(head_dim,
+        // rope_table)` in `warp_symbol`/`block_symbol` instead, spells the
+        // predicate `rope_table != nullptr ── USE_ROPE_TABLE = true` in the
+        // module header, and abbreviates the four launches to
+        // `...write_kv_warp<(HEAD_DIM_VALUE), true ><<<warp_grid, WARP_BLOCK,
+        // 0, stream>>>` and `...write_kv<BLOCK, true ><<<grid, BLOCK, 0,
+        // stream>>>` — an ellipsis where the namespace was and a space before
+        // the `>` that was not there. The C++ these six were written from is
+        // deleted and NOTHING quotes it verbatim, so all six assertions fail.
+        // They are left failing because `QKV_DECODE_WARP` and
+        // `QKV_DECODE_BLOCK` still cite them by number in their `because`
+        // fields: a `Term::Present` whose evidence has evaporated is exactly
+        // the thing this module exists to make loud.
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            56,
+            "driver-cuda src/fire/qkv_fused.rs",
             "if (rope_table != nullptr) {                                         \\",
             "`QKV_DECODE_WARP`",
         );
-        pinned(
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            58,
+            "driver-cuda src/fire/qkv_fused.rs",
             "(HEAD_DIM_VALUE), true><<<warp_grid, WARP_BLOCK, 0, stream>>>( \\",
             "`QKV_DECODE_WARP`",
         );
-        pinned(
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            71,
+            "driver-cuda src/fire/qkv_fused.rs",
             "(HEAD_DIM_VALUE), false><<<warp_grid, WARP_BLOCK, 0, stream>>>( \\",
             "`QKV_DECODE_WARP`",
         );
-        pinned(QKV, "attn/qkv_fused.cu", 100, "if (rope_table != nullptr) {", "`QKV_DECODE_BLOCK`");
-        pinned(
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            101,
+            "driver-cuda src/fire/qkv_fused.rs",
+            "if (rope_table != nullptr) {",
+            "`QKV_DECODE_BLOCK`",
+        );
+        quoted(
+            QKV,
+            "driver-cuda src/fire/qkv_fused.rs",
             "device::qkv_decode_qk_norm_rope_write_kv<BLOCK, true>",
             "`QKV_DECODE_BLOCK`",
         );
-        pinned(
+        quoted(
             QKV,
-            "attn/qkv_fused.cu",
-            126,
+            "driver-cuda src/fire/qkv_fused.rs",
             "device::qkv_decode_qk_norm_rope_write_kv<BLOCK, false>",
             "`QKV_DECODE_BLOCK`",
         );
 
-        // ── `altup_streams`, both launches, identical three lines ──
-        for line in [17, 31] {
-            pinned(ALTUP, "norm/altup.cu", line, "constexpr int BLOCK = 128;", "`altup_streams`");
+        // ── `altup_streams`, re-pinned to the kernel it launches ──
+        //
+        // `norm/altup.{cu,hpp}` WENT ENTIRELY (§43.8). Both launchers were
+        // routed — `norm::altup_predict_bf16` and `norm::altup_correct_bf16`
+        // are in `device::JIT_DISPATCHED`, so `abi::emit_c_shim` emitted no
+        // entry for either — and neither had a C++ caller, which made the
+        // file's whole contents its dead launchers. The four pins that used
+        // to live here quoted `constexpr int BLOCK = 128;` at `:17`/`:31` and
+        // `const dim3 grid(T, K, (H + BLOCK - 1) / BLOCK);` at `:18`/`:32`.
+        //
+        // What is re-pinnable is the half that decides the transcription: the
+        // ASSIGNMENT of the three grid axes, which the kernel reads back and
+        // which `norm/altup.cuh` still states. `t` off `blockIdx.x`, `k` off
+        // `blockIdx.y`, and `h` off `blockIdx.z * blockDim.x` — so `z` is the
+        // TILED axis and `x`/`y` are whole extents, which is exactly what
+        // `AltUp::grid` below transcribes. Both kernels state it identically,
+        // so each citation names its own line.
+        //
+        // What is NOT re-pinnable is `BLOCK = 128`. The archive held the only
+        // second copy of that literal and it went with the launcher, so
+        // `ALTUP_BLOCK` below is now single-sourced against
+        // `runtime::launch`'s own `BLOCK`. That is a real loss of an
+        // independent witness and it is written down rather than papered
+        // over: a fire is what checks it now (`the_altup_rows_reproduce_the_launcher`).
+        for line in [83, 113] {
+            pinned(ALTUP_CUH, "norm/altup.cuh", line, "const int t = blockIdx.x;", "`altup_streams`");
         }
-        for line in [18, 32] {
+        for line in [84, 114] {
+            pinned(ALTUP_CUH, "norm/altup.cuh", line, "const int k = blockIdx.y;", "`altup_streams`");
+        }
+        for line in [85, 115] {
             pinned(
-                ALTUP,
-                "norm/altup.cu",
+                ALTUP_CUH,
+                "norm/altup.cuh",
                 line,
-                "const dim3 grid(T, K, (H + BLOCK - 1) / BLOCK);",
+                "const int h = blockIdx.z * blockDim.x + threadIdx.x;",
                 "`altup_streams`",
             );
         }
-        pinned(
-            ALTUP,
-            "norm/altup.cu",
-            19,
-            "device::altup_predict<device::bf16><<<grid, BLOCK, 0, stream>>>(",
-            "`altup_streams`",
-        );
-        pinned(
-            ALTUP,
-            "norm/altup.cu",
-            33,
-            "device::altup_correct<device::bf16><<<grid, BLOCK, 0, stream>>>(",
-            "`altup_streams`",
-        );
 
         // ── `rope/rope.cu`'s three `qk_rmsnorm` launchers ──
         //
@@ -1753,48 +2084,71 @@ mod transcribed {
         // the third (`:213`, `_rounded`) is REFUSED, and it is pinned anyway
         // because `families::rope`'s refusal quotes it and a citation this
         // file cannot check is one nobody will.
-        pinned(ROPE, "rope/rope.cu", 189, "constexpr int BLOCK = 128;", "`rope::qk_rmsnorm_rope`");
-        pinned(
+        //
+        // ALL TWELVE ROPE PINS ARE NOW `quoted()` against
+        // `kernels-cuda-new/src/x/rope.rs`, and every one of the twelve texts
+        // is there verbatim — this is the one whole port among the four. What
+        // stopped being checked is the LINE, and the paragraph above is the
+        // exact measurement that costs: `constexpr int BLOCK = 128;` was
+        // pinned FOUR TIMES at four distinct lines, and four `contains` of
+        // one string is ONE piece of evidence read four times. Likewise
+        // `dim3 grid(num_tokens, num_q_heads + num_kv_heads);` at `:46`,
+        // `:190` and `:214`. So the claim that these are three separate
+        // launchers with three separate widths is no longer made by this
+        // file; only the claim that the widths exist somewhere in that Rust
+        // survives. `x/rope.rs` distinguishes them by symbol at each fire,
+        // which is where a reader must now go.
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            190,
+            "kernels-cuda-new src/x/rope.rs",
+            "constexpr int BLOCK = 128;",
+            "`rope::qk_rmsnorm_rope`",
+        );
+        quoted(
+            ROPE,
+            "kernels-cuda-new src/x/rope.rs",
             "dim3 grid(num_tokens, num_q_heads + num_kv_heads);",
             "`rope::qk_rmsnorm_rope`",
         );
-        pinned(
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            191,
+            "kernels-cuda-new src/x/rope.rs",
             "device::qk_rmsnorm_rotate<BLOCK><<<grid, BLOCK, 0, stream>>>(",
             "`rope::qk_rmsnorm_rope`",
         );
-        pinned(ROPE, "rope/rope.cu", 45, "constexpr int BLOCK = 128;", "`rope::qk_rmsnorm_mrope`");
-        pinned(
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            46,
+            "kernels-cuda-new src/x/rope.rs",
+            "constexpr int BLOCK = 128;",
+            "`rope::qk_rmsnorm_mrope`",
+        );
+        quoted(
+            ROPE,
+            "kernels-cuda-new src/x/rope.rs",
             "dim3 grid(num_tokens, num_q_heads + num_kv_heads);",
             "`rope::qk_rmsnorm_mrope`",
         );
-        pinned(
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            47,
+            "kernels-cuda-new src/x/rope.rs",
             "device::qk_rmsnorm_rotate_mrope<BLOCK><<<grid, BLOCK, 0, stream>>>(",
             "`rope::qk_rmsnorm_mrope`",
         );
-        pinned(ROPE, "rope/rope.cu", 213, "constexpr int BLOCK = 128;", "`families::rope`'s `_rounded` refusal");
-        pinned(
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            214,
+            "kernels-cuda-new src/x/rope.rs",
+            "constexpr int BLOCK = 128;",
+            "`families::rope`'s `_rounded` refusal",
+        );
+        quoted(
+            ROPE,
+            "kernels-cuda-new src/x/rope.rs",
             "dim3 grid(num_tokens, num_q_heads + num_kv_heads);",
             "`families::rope`'s `_rounded` refusal",
         );
-        pinned(
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            215,
+            "kernels-cuda-new src/x/rope.rs",
             "device::qk_rmsnorm_rotate_rounded<BLOCK><<<grid, BLOCK, 0, stream>>>(",
             "`families::rope`'s `_rounded` refusal",
         );
@@ -1806,25 +2160,33 @@ mod transcribed {
         // smem is two more, and `ATTN_BLOCK` is a file-scope constant 280
         // lines away. A citation that quoted only the `<<<>>>` would pin the
         // one line that names none of the three numbers.
-        pinned(DSV4, "attn/dsv4_compress.cu", 37, "constexpr int ATTN_BLOCK = 128;", "`paged_scores_decode`");
-        pinned(
+        //
+        // ALL FOUR ARE NOW `quoted()` against `fire/dsv4_compress.rs`, which
+        // reproduces all four texts verbatim. The LINE stops being checked,
+        // at `MLA`'s cost; the "280 lines away" argument above is now a
+        // statement about a file that no longer exists, and in the Rust the
+        // constant is `:70` and the launch `:317-321`.
+        quoted(
             DSV4,
-            "attn/dsv4_compress.cu",
-            202,
+            "driver-cuda src/fire/dsv4_compress.rs",
+            "constexpr int ATTN_BLOCK = 128;",
+            "`paged_scores_decode`",
+        );
+        quoted(
+            DSV4,
+            "driver-cuda src/fire/dsv4_compress.rs",
             "dim3 grid(static_cast<unsigned>(total_tokens),",
             "`paged_scores_decode`",
         );
-        pinned(
+        quoted(
             DSV4,
-            "attn/dsv4_compress.cu",
-            205,
+            "driver-cuda src/fire/dsv4_compress.rs",
             "(static_cast<std::size_t>(head_dim) + ATTN_BLOCK) * sizeof(float);",
             "`paged_scores_decode`",
         );
-        pinned(
+        quoted(
             DSV4,
-            "attn/dsv4_compress.cu",
-            206,
+            "driver-cuda src/fire/dsv4_compress.rs",
             "device::compressed_attn_paged<<<grid, ATTN_BLOCK, smem, stream>>>(",
             "`paged_scores_decode`",
         );
@@ -1851,17 +2213,73 @@ mod transcribed {
         // refusal is written down instead of the row.
         pinned(
             FLASHINFER,
-            "attn/attention_flashinfer.cu",
-            782,
+            "driver-cuda csrc/attn/attention_flashinfer.cu",
+            624,
             "const dim3 grid(static_cast<unsigned>(num_requests), 64u);",
             "`attention_flashinfer.cuh`'s fold-heads refusal",
         );
         pinned(
             FLASHINFER,
-            "attn/attention_flashinfer.cu",
-            783,
+            "driver-cuda csrc/attn/attention_flashinfer.cu",
+            625,
             "device::attn_score_fold_heads<<<grid, 256, 0, stream>>>(",
             "`attention_flashinfer.cuh`'s fold-heads refusal",
+        );
+
+        // ── the three capture post-kernels: `attn/attention_score_post` ──
+        //
+        // All three rows are `LaunchRule::Unstated`, so there is no
+        // arithmetic below to check them against and the pin is the whole of
+        // the evidence — the same standing the fold-heads pair above has.
+        // What a reader must be able to verify is that the numbers
+        // `families::attn`'s row comments carry (256 threads; the literal
+        // `32u`; `window` as BOTH the third grid extent and the last
+        // operand) are the launcher's and not a derivation.
+        //
+        // AND ALL THREE HAVE LEFT THE C++. Their launches are
+        // `ScoreOps::normalize_decode`, `ScoreOps::normalize_prefill` and
+        // `ScoreOps::fold_prefill` in `driver-cuda/src/fire/attn_score.rs`,
+        // fired from the two captures' `publish()` on the same stream the
+        // dispatch used, in the same order. So these five are `quoted()`
+        // against that Rust rather than `pinned()` into a C++ file, exactly
+        // as the two gemma-4 towers' pins already are -- and for the same
+        // stated reason: a line number in a Rust file under active
+        // authorship is a citation that `cargo fmt` breaks, while the text
+        // is the part the row comments were derived from.
+        //
+        // What is checked here is therefore precisely what a reader of
+        // `families::attn` needs: that the numbers those rows carry (256
+        // threads; the literal `32u`; `window` as BOTH the third grid extent
+        // and the last operand) came off a launcher and were not derived.
+        quoted(
+            SCORE_RS,
+            "driver-cuda src/fire/attn_score.rs",
+            "device::attn_score_normalize<<<grid, 256, 0, stream>>>(",
+            "`families::attn`'s `attn_score_normalize` row",
+        );
+        quoted(
+            SCORE_RS,
+            "driver-cuda src/fire/attn_score.rs",
+            "const dim3 norm_grid(static_cast<unsigned>(cache.num_requests),",
+            "`families::attn`'s `attn_prefill_score_normalize` row",
+        );
+        quoted(
+            SCORE_RS,
+            "driver-cuda src/fire/attn_score.rs",
+            "device::attn_prefill_score_normalize<<<norm_grid, 256, 0, stream>>>(",
+            "`families::attn`'s `attn_prefill_score_normalize` row",
+        );
+        quoted(
+            SCORE_RS,
+            "driver-cuda src/fire/attn_score.rs",
+            "const dim3 fold_grid(static_cast<unsigned>(cache.num_requests), 32u);",
+            "`families::attn`'s `attn_prefill_score_fold` row",
+        );
+        quoted(
+            SCORE_RS,
+            "driver-cuda src/fire/attn_score.rs",
+            "device::attn_prefill_score_fold<<<fold_grid, 256, 0, stream>>>(",
+            "`families::attn`'s `attn_prefill_score_fold` row",
         );
 
         // ── the three literal-grid launchers: `Single`, `SingleWarp` ──
@@ -1911,31 +2329,39 @@ mod transcribed {
         // `families::attn::PAGE_COMPACT` both cite these two lines by number
         // to make that argument, and a citation this file cannot check is one
         // nobody will.
-        pinned(
+        //
+        // ALL FOUR ARE NOW `quoted()`: `NAIVE_UNPAGED` against
+        // `fire/attention_naive.rs` and `PAGE_COMPACT` against
+        // `fire/page_compact.rs`, both of which reproduce their texts
+        // verbatim. The LINE stops being checked, at `MLA`'s cost — and the
+        // paragraph above is precisely the measurement that pays it. The
+        // `page_compact` pair was TWO PINS OF ONE STRING distinguished only
+        // by `:45` and `:48`; without the line there is one `contains` twice,
+        // so this file no longer witnesses that there are two launches on one
+        // stream, which is the whole content of the refusal-to-move. The
+        // Rust quotes both, at `:46` and `:49` of the deleted `.cu`, and it
+        // is now the only place the pair is visible as a pair.
+        quoted(
             NAIVE_UNPAGED,
-            "attn/attention_naive.cu",
-            89,
+            "driver-cuda src/fire/attention_naive.rs",
             "device::mtp_update_pending_hidden<bf16><<<num_requests, BLOCK, 0, stream>>>(",
             "`runtime::launch::per_request`",
         );
-        pinned(
+        quoted(
             NAIVE_UNPAGED,
-            "attn/attention_naive.cu",
-            24,
+            "driver-cuda src/fire/attention_naive.rs",
             "constexpr int BLOCK = device::BLOCK;",
             "`runtime::launch::per_request`",
         );
-        pinned(
+        quoted(
             PAGE_COMPACT,
-            "attn/page_compact.cu",
-            45,
+            "driver-cuda src/fire/page_compact.rs",
             "<<<num_requests, device::kBlock, 0, stream>>>(",
             "`runtime::launch::per_request`'s argument for NOT moving these two",
         );
-        pinned(
+        quoted(
             PAGE_COMPACT,
-            "attn/page_compact.cu",
-            48,
+            "driver-cuda src/fire/page_compact.rs",
             "<<<num_requests, device::kBlock, 0, stream>>>(",
             "`runtime::launch::per_request`'s argument for NOT moving these two",
         );
@@ -1947,60 +2373,71 @@ mod transcribed {
         // the row's claim is about both: the instantiation says
         // `EMIT_FP16=true`, and the launch says 512 where the row states
         // 256. Both halves are cited so neither can drift alone.
-        pinned(
+        //
+        // ALL THREE ARE NOW `quoted()` against `fire/rmsnorm.rs`, at `MLA`'s
+        // cost — AND THE MIDDLE ONE, WHICH IS THE ROW'S WHOLE CLAIM, IS NOT
+        // REPRODUCED. The Rust quotes `rmsnorm.cu:69-77` with the template
+        // arguments STRIPPED OF THEIR COMMENTS: `device::rmsnorm_vec8<VBLOCK,
+        // false, true><<<grid, VBLOCK, 0, stream>>>(` where the C++ read
+        // `<VBLOCK, /*WEIGHT_PLUS_ONE=*/false, /*EMIT_FP16=*/true>`. The two
+        // `bool`s are still there and still in that order, so the LAUNCH is
+        // reproduced; what is gone is the only text in the tree that said
+        // WHICH BOOL IS WHICH, which is exactly the half `RMSNORM_SIGS[10]`
+        // was written from. That assertion is left failing rather than
+        // re-quoted against the stripped form, because re-quoting it would
+        // turn "the row names EMIT_FP16" into "the row names the second
+        // `true`" without anyone deciding to.
+        quoted(
             RMSNORM,
-            "norm/rmsnorm.cu",
-            69,
+            "driver-cuda src/fire/rmsnorm.rs",
             "constexpr int VBLOCK = 512;",
             "`families::norm::RMSNORM_SIGS[10]`",
         );
-        pinned(
+        quoted(
             RMSNORM,
-            "norm/rmsnorm.cu",
-            71,
+            "driver-cuda src/fire/rmsnorm.rs",
             "device::rmsnorm_vec8<VBLOCK, /*WEIGHT_PLUS_ONE=*/false, /*EMIT_FP16=*/true>",
             "`families::norm::RMSNORM_SIGS[10]`",
         );
-        pinned(
+        quoted(
             RMSNORM,
-            "norm/rmsnorm.cu",
-            72,
+            "driver-cuda src/fire/rmsnorm.rs",
             "<<<grid, VBLOCK, 0, stream>>>(",
             "`families::norm::RMSNORM_SIGS[10]`",
         );
 
-        // ── `ssm/nemotron_h.cu`'s two `mamba_split` arms ──
+        // ── `ssm/nemotron_h.cu`'s two `mamba_split` arms, in Rust ──
         //
         // `families::ssm::NEMOTRON_H_SIGS[3]` states the SECOND. The first
-        // is pinned too, and deliberately: the row's doc argues that
+        // is quoted too, and deliberately: the row's doc argues that
         // `ElementwiseIn` would OVER-LAUNCH it, and that argument is about
-        // `:38`'s `conv_dim + num_heads` extent. A refusal's evidence gets
-        // the same pin a claim's does.
-        pinned(
-            NEMOTRON,
-            "ssm/nemotron_h.cu",
-            36,
+        // the `conv_dim + num_heads` extent. A refusal's evidence gets the
+        // same citation a claim's does.
+        //
+        // The `.cu` is DELETED, so these four read
+        // `driver-cuda/src/fire/nemotron_h.rs`, which quotes each line it
+        // reproduced. All four texts are there verbatim.
+        quoted(
+            NEMOTRON_RS,
+            "driver-cuda src/fire/nemotron_h.rs",
             "constexpr int BLOCK = 256;",
             "`families::ssm::NEMOTRON_H_SIGS[3]`",
         );
-        pinned(
-            NEMOTRON,
-            "ssm/nemotron_h.cu",
-            38,
+        quoted(
+            NEMOTRON_RS,
+            "driver-cuda src/fire/nemotron_h.rs",
             "const int conv_dt_total = N * (conv_dim + num_heads);",
             "`families::ssm::NEMOTRON_H_SIGS[3]`'s argument for holding the SIBLING arm",
         );
-        pinned(
-            NEMOTRON,
-            "ssm/nemotron_h.cu",
-            48,
+        quoted(
+            NEMOTRON_RS,
+            "driver-cuda src/fire/nemotron_h.rs",
             "const int grid = (total + BLOCK - 1) / BLOCK;",
             "`families::ssm::NEMOTRON_H_SIGS[3]`",
         );
-        pinned(
-            NEMOTRON,
-            "ssm/nemotron_h.cu",
-            49,
+        quoted(
+            NEMOTRON_RS,
+            "driver-cuda src/fire/nemotron_h.rs",
             "device::mamba_split<<<grid, BLOCK, 0, stream>>>(",
             "`families::ssm::NEMOTRON_H_SIGS[3]`",
         );
@@ -2013,24 +2450,27 @@ mod transcribed {
         // `:45`, `:189` and `:213`; the grid line is likewise the third
         // `dim3 grid(...)` here and `n_max` is what tells it from the other
         // two.
-        pinned(
+        //
+        // THAT ENTIRE PARAGRAPH IS WHAT THE REPOINT COST. `quoted()` against
+        // `x/rope.rs` has no line to name, so "the fourth occurrence" is no
+        // longer a claim this file makes — only `n_max` still tells this
+        // launcher from the other three, and it does so because the grid text
+        // happens to differ, not because anything checks that it must.
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            162,
+            "kernels-cuda-new src/x/rope.rs",
             "constexpr int BLOCK = 128;",
             "`rope::qk_rmsnorm_rope_devwin`",
         );
-        pinned(
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            163,
+            "kernels-cuda-new src/x/rope.rs",
             "dim3 grid(n_max, num_q_heads + num_kv_heads);",
             "`rope::qk_rmsnorm_rope_devwin`",
         );
-        pinned(
+        quoted(
             ROPE,
-            "rope/rope.cu",
-            164,
+            "kernels-cuda-new src/x/rope.rs",
             "device::qk_rmsnorm_rotate_devwin<BLOCK><<<grid, BLOCK, 0, stream>>>(",
             "`rope::qk_rmsnorm_rope_devwin`",
         );
@@ -2084,7 +2524,8 @@ mod transcribed {
             ("k_glu G2(Hd,N) :250", g2(1536, 512), B2, dims(512, 1536), Rule::Tile16),
             ("k_matmul_bias G2(OPD,N) :283", g2(2048, 512), B2, dims(512, 2048), Rule::Tile16),
             ("k_matmul G2(TXT,N) :289", g2(2560, 512), B2, dims(512, 2560), Rule::Tile16),
-            // ── tile16, `vision/qwen3_vl_tower.cu` ──
+            // ── tile16, `vision/qwen3_vl_tower.cu`, now
+            //    `driver-cuda/src/tower/qwen3_vl.rs::run_merger` ──
             ("k_merge_gather G2(W,n_token) :165", g2(4096, 256), B2, dims(256, 4096), Rule::Tile16),
             ("k_merge_gather G2(W,n_token) :168", g2(4096, 256), B2, dims(256, 4096), Rule::Tile16),
         ];
@@ -2668,24 +3109,34 @@ mod transcribed {
         for (n, line) in &code {
             assert!(
                 !line.contains("getenv"),
-                "ssm/gated_delta_net.cu:{n} reads the environment in code: {line}\n\
+                "driver-cuda/src/fire/gated_delta_net.rs:{n} reads the environment in \
+                 code: {line}\n\
                  a tuning knob is configuration; it is not a symbol and it is not\n\
                  geometry. If configuration must reach a launch it arrives as a\n\
-                 fact the driver holds at load, never as a call inside a .cu."
+                 fact the driver holds at load, never as a call inside a launcher."
             );
         }
 
         assert!(
             !GDN.contains("#include <cstdlib>"),
-            "ssm/gated_delta_net.cu includes <cstdlib>; the only thing it was \
-             ever pulled in for was `std::getenv`"
+            "driver-cuda/src/fire/gated_delta_net.rs includes <cstdlib>; the only thing \
+             it was ever pulled in for was `std::getenv`"
         );
 
-        pinned(
+        // The shape predicate that replaced the knob, in the Rust that holds
+        // it now. `quoted` rather than `pinned` for the reason `GDN`'s
+        // declaration gives: the C++ line this was written from is deleted,
+        // so this Rust IS the citation.
+        //
+        // Note what the predicate LOST in the port and why that is not a
+        // weakening: `!qwen_gdn_k_last_state_enabled() &&` is gone because
+        // that helper was `constexpr false`, so the conjunct was a constant
+        // true and the `KLast = true` arms it guarded were unreachable. The
+        // shape half — the half that reads the fire — is unchanged.
+        quoted(
             GDN,
-            "ssm/gated_delta_net.cu",
-            246,
-            "if (!qwen_gdn_k_last_state_enabled() && V_d == 128 && K_d == 128) {",
+            "driver-cuda src/fire/gated_delta_net.rs",
+            "if v_d == 128 && k_d == 128 {",
             "`the deleted PIE_QWEN35_GDN_SMEM_STEP`",
         );
     }
@@ -2738,24 +3189,29 @@ mod transcribed {
         pins();
 
         for (src, name) in [
-            (VISION, "gemma4_vision.cu"),
-            (AUDIO, "gemma4_audio.cu"),
-            (QWEN, "qwen3_vl_tower.cu"),
-            (GDN, "gated_delta_net.cu"),
+            (VISION, "driver-cuda src/tower/gemma4_vision.rs"),
+            (AUDIO, "driver-cuda src/tower/gemma4_audio.rs"),
+            (SCORE_RS, "driver-cuda src/fire/attn_score.rs"),
+            (FLASHINFER, "driver-cuda csrc/attn/attention_flashinfer.cu"),
+            (QWEN, "driver-cuda src/tower/qwen3_vl.rs"),
+            (GDN, "driver-cuda src/fire/gated_delta_net.rs"),
             (WNA16, "dequant_wna16.cu"),
+            (WNA16_CUH, "dequant_wna16.cuh"),
             (FP4, "dequant_fp4.cu"),
+            (FP4_CUH, "dequant_fp4.cuh"),
             (NAIVE, "attention_naive_paged.cu"),
-            (MLA, "mla_paged.cu"),
-            (QKV, "qkv_fused.cu"),
-            (ALTUP, "norm/altup.cu"),
-            (ROPE, "rope/rope.cu"),
-            (DSV4, "attn/dsv4_compress.cu"),
+            (MLA, "driver-cuda src/fire/mla_paged.rs"),
+            (QKV, "driver-cuda src/fire/qkv_fused.rs"),
+            (ALTUP_CUH, "norm/altup.cuh"),
+            (ROPE, "kernels-cuda-new src/x/rope.rs"),
+            (DSV4, "driver-cuda src/fire/dsv4_compress.rs"),
             (SLOT_OPS, "layout/slot_ops.cu"),
             (KV_PAGED, "attn/kv_paged.cu"),
-            (NAIVE_UNPAGED, "attn/attention_naive.cu"),
-            (PAGE_COMPACT, "attn/page_compact.cu"),
-            (RMSNORM, "norm/rmsnorm.cu"),
-            (NEMOTRON, "ssm/nemotron_h.cu"),
+            (NAIVE_UNPAGED, "driver-cuda src/fire/attention_naive.rs"),
+            (PAGE_COMPACT, "driver-cuda src/fire/page_compact.rs"),
+            (RMSNORM, "driver-cuda src/fire/rmsnorm.rs"),
+            (NEMOTRON, "ssm/nemotron_h.cuh"),
+            (NEMOTRON_RS, "driver-cuda src/fire/nemotron_h.rs"),
         ] {
             assert!(!src.is_empty(), "{name} is empty — `include_str!` found the wrong file");
         }
@@ -2846,7 +3302,12 @@ mod fires {
     use kernels_cuda_new::unit;
     use std::ffi::c_void;
 
-    /// `norm/altup.cu:17` and `:31` both write `constexpr int BLOCK = 128;`.
+    /// 128, and the archive no longer holds a second copy of it.
+    ///
+    /// `norm/altup.cu:17` and `:31` both wrote `constexpr int BLOCK = 128;`
+    /// until §43.8 deleted the file — both its launchers were routed and
+    /// unreached. The literal now lives once, in `runtime::launch`'s `BLOCK`,
+    /// and what checks it is the fire below rather than a second text.
     const ALTUP_BLOCK: u32 = 128;
 
     /// `sm_XY` for the current device, or a stated reason there is none.
@@ -3166,8 +3627,10 @@ mod fires {
             }
         }
 
-        /// `norm/altup.cu:18`, by hand:
-        /// `const dim3 grid(T, K, (H + BLOCK - 1) / BLOCK);`
+        /// The deleted `norm/altup.cu:18`'s
+        /// `const dim3 grid(T, K, (H + BLOCK - 1) / BLOCK);`, by hand — and
+        /// `norm/altup.cuh:83-85`'s three index reads, which are what still
+        /// witnesses the axis order.
         fn grid(self) -> [u32; 3] {
             [self.t, self.k, self.h.div_ceil(ALTUP_BLOCK)]
         }
@@ -5408,7 +5871,7 @@ mod fires {
     /// Both rope rows are stated, hosted, and claim `RowsPackedHeadsNarrow`.
     #[test]
     fn the_rope_rows_are_stated_and_hosted() {
-        for symbol in ["rope::qk_rmsnorm_rope_bf16", "rope::qk_rmsnorm_mrope_bf16"] {
+        for symbol in ["rope::qk_rmsnorm_rope_bf16", "rope::qk_rmsnorm_rotate_mrope_bf16"] {
             assert!(runtime::hosts(symbol), "{symbol} is hosted by no unit");
             let row = runtime::row(symbol).expect("hosted");
             assert_eq!(row.sig.launch, Rule::RowsPackedHeadsNarrow, "{symbol}");
@@ -5432,7 +5895,7 @@ mod fires {
         let mut compared = 0usize;
         let mut live_total = 0usize;
         for (symbol, mrope) in
-            [("rope::qk_rmsnorm_rope_bf16", false), ("rope::qk_rmsnorm_mrope_bf16", true)]
+            [("rope::qk_rmsnorm_rope_bf16", false), ("rope::qk_rmsnorm_rotate_mrope_bf16", true)]
         {
             let entry = module.entry(symbol).expect("the row resolved");
             for shape in ROPE_SHAPES {
@@ -6395,9 +6858,9 @@ mod fires {
     #[test]
     fn the_devwin_rows_are_stated_and_hosted() {
         for symbol in [
-            "attn::write_kv_explicit_bf16_devwin",
-            "attn::write_kv_explicit_bf16_devwin#hnd",
-            "attn::write_kv_explicit_bf16_devwin#nhd",
+            "attn::write_kv_explicit_bf16_devwin_dev",
+            "attn::write_kv_explicit_bf16_devwin_dev#hnd",
+            "attn::write_kv_explicit_bf16_devwin_dev#nhd",
         ] {
             assert!(runtime::hosts(symbol), "{symbol} is hosted by no unit");
             let row = runtime::row(symbol).expect("hosted");
@@ -6408,7 +6871,7 @@ mod fires {
         // spelled `..._devwin_bf16` before this session and no statement could
         // ever have reached them.
         assert!(
-            runtime::hosts("attn::write_kv_explicit_bf16_devwin"),
+            runtime::hosts("attn::write_kv_explicit_bf16_devwin_dev"),
             "the AOT symbol is the JIT symbol"
         );
         assert!(
@@ -6438,7 +6901,7 @@ mod fires {
     #[test]
     fn the_devwin_row_reproduces_the_launcher() {
         let Some(_) = arch_or_skip("the_devwin_row_reproduces_the_launcher") else { return };
-        let module = module_of("attn::write_kv_explicit_bf16_devwin", "attn/kv_paged");
+        let module = module_of("attn::write_kv_explicit_bf16_devwin_dev", "attn/kv_paged");
 
         let mut compared = 0usize;
         let mut live_total = 0usize;
@@ -6446,7 +6909,7 @@ mod fires {
             for (hnd, arm) in [(true, "#hnd"), (false, "#nhd")] {
                 let ops = DevwinOps::new(shape);
                 let entry = module
-                    .entry(&format!("attn::write_kv_explicit_bf16_devwin{arm}"))
+                    .entry(&format!("attn::write_kv_explicit_bf16_devwin_dev{arm}"))
                     .expect("the arm's row resolved");
 
                 let launch = eval(Rule::PerRow, shape.dims()).expect("ported");
@@ -6460,7 +6923,7 @@ mod fires {
                 // extent the row states and the null stream is live.
                 unsafe {
                     runtime::fire(
-                        "attn::write_kv_explicit_bf16_devwin",
+                        "attn::write_kv_explicit_bf16_devwin_dev",
                         shape.dims(),
                         &values,
                         Stream::NULL,
@@ -6551,9 +7014,9 @@ mod fires {
         else {
             return;
         };
-        let module = module_of("attn::write_kv_explicit_bf16_devwin", "attn/kv_paged");
-        let hnd = module.entry("attn::write_kv_explicit_bf16_devwin#hnd").expect("resolved");
-        let nhd = module.entry("attn::write_kv_explicit_bf16_devwin#nhd").expect("resolved");
+        let module = module_of("attn::write_kv_explicit_bf16_devwin_dev", "attn/kv_paged");
+        let hnd = module.entry("attn::write_kv_explicit_bf16_devwin_dev#hnd").expect("resolved");
+        let nhd = module.entry("attn::write_kv_explicit_bf16_devwin_dev#nhd").expect("resolved");
 
         for shape in DEVWIN_SHAPES {
             let ops = DevwinOps::new(shape);
@@ -7366,9 +7829,9 @@ mod fires {
         let Some(_) = arch_or_skip("the_devwin_rope_row_reproduces_the_launcher") else {
             return;
         };
-        let module = module_of("rope::qk_rmsnorm_rope_bf16_devwin", "rope/rope");
+        let module = module_of("rope::qk_rmsnorm_rotate_devwin_bf16", "rope/rope");
         let entry =
-            module.entry("rope::qk_rmsnorm_rope_bf16_devwin").expect("the row resolved");
+            module.entry("rope::qk_rmsnorm_rotate_devwin_bf16").expect("the row resolved");
 
         let mut compared = 0usize;
         let mut live_total = 0usize;
@@ -7405,7 +7868,7 @@ mod fires {
             // SAFETY: every pointer addresses a live allocation of the extent
             // the row states, `win` is two `u32`s, and the null stream is live.
             unsafe {
-                runtime::fire("rope::qk_rmsnorm_rope_bf16_devwin", shape.dims(), &values,
+                runtime::fire("rope::qk_rmsnorm_rotate_devwin_bf16", shape.dims(), &values,
                               Stream::NULL)
             }
             .unwrap_or_else(|why| panic!("the devwin rope row would not fire at {shape:?}: {why}"));
@@ -7550,7 +8013,7 @@ mod fires {
             // SAFETY: as the reference fire; `nq + nkv` is the shape's sum in
             // every call below, so no block addresses past the buffers.
             unsafe {
-                runtime::fire("rope::qk_rmsnorm_rope_bf16_devwin", shape.dims(), &values,
+                runtime::fire("rope::qk_rmsnorm_rotate_devwin_bf16", shape.dims(), &values,
                               Stream::NULL)
             }
             .expect("the devwin rope row fires");

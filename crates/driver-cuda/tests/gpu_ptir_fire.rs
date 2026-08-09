@@ -29,7 +29,6 @@
 use driver::tensor_ir::DType;
 use driver::{Extents, Versions, adopt_launch_package};
 use driver_cuda::device::{Allocator, OwnedStream};
-use driver_cuda::program;
 use driver_cuda::program::run::Lane;
 use driver_cuda::program::{
     ChannelShape, Control, Disk, Prepared, Rings, Runtime, Target, compile, launch_control,
@@ -671,7 +670,7 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
     let mut words: Vec<Vec<u64>> = vec![vec![0u64; 4], vec![0u64; 4]];
 
     let mut session = Session::new(&alloc, &shapes, stream.as_ref()).expect("session");
-    let sets = stage_channels(stage_plan).expect("sets");
+    let _sets = stage_channels(stage_plan).expect("sets");
 
     // The engine's side: publish the seed into the input's host mirror.
     {

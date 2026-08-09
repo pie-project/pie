@@ -200,7 +200,7 @@
 //! `::pie_cuda_driver::kernels::` — the namespace
 //! `DeviceKernel::instantiation` prefixes BOTH halves of an instantiation
 //! with. That is true of nvcc and false of the compiler this crate actually
-//! uses: `csrc/src/cuda_fp16.h` opens the shim with `using __half =
+//! uses: `csrc/shim/cuda_fp16.h` opens the shim with `using __half =
 //! ::pie_cuda_driver::kernels::device::f16;`, so under NVRTC the two are ONE
 //! TYPE and `bf16_to_narrow<__half>` already is `bf16_to_narrow<device::f16>`.
 //! Adding a `Narrow2<device::f16>` specialisation to make it nameable made it
@@ -220,7 +220,7 @@
 //! vector width"* was the condition the old refusal set, and
 //! `runtime::launch::slab` states both — `min(ceil(units / 256), 1024)` with
 //! `units = n >= 8 ? n / 8 : n` — against this launcher by name, at
-//! `quant/dequant_wna16.cu:112-125`. The row is [`DEQUANT_WNA16_SIGS`]`[1]`.
+//! `quant/dequant_wna16.cu:63-75`. The row is [`DEQUANT_WNA16_SIGS`]`[1]`.
 //!
 //! That audit also repaired the ahead-of-time build, which was broken at
 //! `HEAD` before this commit. The split had rewritten `bf16_to_narrow`'s
@@ -334,9 +334,12 @@
 //!   PORTED rule with a second grid axis and it puts `ceil(width / 256)`
 //!   there, which is neither an expert count nor a warp slab.
 //!
-//!   [`kernels::LaunchRule::RoutedQmv`] landed against
+//!   [`kernels::LaunchRule::RoutedQmv`] landed against the then-live
 //!   `quant/dequant_wna16.cu:70-75` and states that first grid exactly:
 //!   `grid [rows * experts_per_token, ceil(intermediate / 8), 1]` at 256.
+//!   That launcher has since been deleted as unreached (§43.9) — a routed row
+//!   gets no shim entry — and the grid is now witnessed by the kernel itself
+//!   at `quant/dequant_wna16.cuh:295` and `:298`.
 //!   It unblocked a geometry and no row, for three stated reasons. **Two of
 //!   the three are now void and the third stands**, so the two
 //!   `wna16_*_decode` rows are written and the three `dequant_fp4` siblings
@@ -564,6 +567,29 @@ pub const DEQUANT_FP4: Unit = Unit {
 /// is `ElementwiseRows` outright, which is what the `.cu` beside it now says
 /// in as many words — so the header gets a unit, one row, and the compile
 /// that `examples/unit_probe_quant` had been giving it as a rootless text.
+///
+/// # THE LAUNCHER'S TWO GUARDS, WHICH THIS ROW DOES NOT MAKE
+///
+/// §54 deleted `dequant_wna16_int4b8_to_bf16` from
+/// `kernels-cuda/csrc/src/quant/dequant_wna16.cu` — routed, no C++ caller,
+/// no hand arm. It returned WITHOUT LAUNCHING on two conditions, and a
+/// rule-driven fire launches on both:
+///
+///   * `out_dim <= 0 || in_dim <= 0 || group_size <= 0`. The first two are
+///     the fire's empty rectangle and are harmless; `group_size <= 0` is
+///     not, because the kernel divides by it.
+///   * `in_dim % 8 != 0 || in_dim % group_size != 0`. The packing is eight
+///     4-bit weights per `int32`, so a row whose width is not a multiple of
+///     8 has a partial final word the kernel reads WHOLE — it dequantizes
+///     the padding lanes into real output columns. A `group_size` that does
+///     not divide `in_dim` puts a scale boundary inside a word, so the last
+///     group of each row is scaled by its neighbour's exponent.
+///
+/// Neither is a rectangle, so neither is statable as a `LaunchRule`. Every
+/// weight this driver has loaded satisfies both — compressed-tensors emits
+/// `group_size = 32` over `in_dim` that is always a multiple of 128 — which
+/// is why nothing has caught it, and is the same sentence §43.9 wrote when
+/// it took the two decode GEMVs and their identical guards out of that file.
 pub const DEQUANT_WNA16: Unit = Unit {
     name: "quant/dequant_wna16",
     root: include_str!("../../csrc/src/quant/dequant_wna16.cuh"),
@@ -1041,6 +1067,22 @@ pub static QUANT_BF16_TO_FP8_ROWS: &[DeviceKernel] = &[
         template_path: "quant::device::cast_per_channel",
         elem: "quant::device::int8_sym",
     },
+    // The two the header called "no rule and therefore no row". They have no
+    // rule STILL -- both are `LaunchRule::Unstated` -- and they have rows now
+    // because a row is what `runtime::cache` resolves a name expression
+    // through, and the geometry a rule cannot state is stated by
+    // `driver-cuda/src/fire/quant_int8.rs` instead. See the two `Unstated`
+    // sigs below for the argument, which is `fire/attn_score.rs`'s.
+    DeviceKernel {
+        sig: &QUANT_BF16_TO_FP8_SIGS[9],
+        template_path: "quant::device::w8a8_dequant",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &QUANT_BF16_TO_FP8_SIGS[10],
+        template_path: "quant::device::quant_act_fp8_per_group",
+        elem: DeviceKernel::PLAIN,
+    },
 ];
 
 /// The contracts, in [`QUANT_BF16_TO_FP8_ROWS`]' order.
@@ -1060,6 +1102,11 @@ pub static QUANT_BF16_TO_FP8_ROWS: &[DeviceKernel] = &[
 /// staged halves of the per-channel quantiser a tensor-parallel all-reduce
 /// has to run between. Each is named after the launcher that fires it, minus
 /// `launch_`, which is how a caller moving off the entry point finds it.
+///
+/// **Eleven now, and the two appended are the file's last two launchers.**
+/// `[9]` and `[10]` are `LaunchRule::Unstated` and carry their own argument
+/// where they sit; they arrived when `quant/quant_bf16_to_fp8.cu` was deleted
+/// and its host program became `driver-cuda/src/fire/quant_int8.rs`.
 ///
 /// # Five rows called a `const bf16*` by their tag, and two called an `i8*`
 /// unsigned
@@ -1087,7 +1134,7 @@ pub static QUANT_BF16_TO_FP8_ROWS: &[DeviceKernel] = &[
 /// unsigned where the kernel narrows to signed. `I8sMut` is the repair and
 /// it is `crates/kernels`', which is where the note said it belonged.
 #[rustfmt::skip]
-static QUANT_BF16_TO_FP8_SIGS: [KernelSig; 9] = [
+static QUANT_BF16_TO_FP8_SIGS: [KernelSig; 11] = [
     // `launch_quant_bf16_to_fp8_e4m3`, the one-shot cast with the scale
     // already known. NOT `quantize_bf16_to_fp8_e4m3_per_tensor`: that entry
     // point is absmax, a device-to-host copy, a stream sync and THEN this
@@ -1192,6 +1239,72 @@ static QUANT_BF16_TO_FP8_SIGS: [KernelSig; 9] = [
             scale_inv: F32s <- Source::In(1),
             cols: I32 <- Source::InWidth(0),
         ]),
+    // ── the two `Unstated` rows, and why they are rows at all ─────────────
+    //
+    // `table/driver_internal.rs` carried `quant::dequant_int32_w8a8_to_bf16`
+    // and `quant::quantize_bf16_to_fp8_e4m3_per_token_group` as AOT rows and
+    // wrote down what it would take to retire them:
+    //
+    //   *"Give those three grids rules and all three rows leave this table
+    //   for `families::quant`, `bind::quant_gemm` fires them through
+    //   `bind::jit::fire` instead of through `ffi::pie_k_*`, and
+    //   `quant/quant_bf16_to_fp8.cu` loses its last consumer."*
+    //
+    // Two of the three moved, and NOT by gaining rules. `new-horizon.md`
+    // §10.5 refuses vocabulary grown for one kernel, and each of these grids
+    // is one kernel:
+    //
+    //   * `w8a8_dequant` launches a 2-D BLOCK, `(32, 8)`. No rule in
+    //     `kernels::LaunchRule` states a two-dimensional block, and the only
+    //     kernel in either archive that wants one is this.
+    //   * `quant_act_fp8_per_group` launches `grid(ceil(k / group_size), m)`
+    //     -- a 2-D grid whose x axis is a COUNT OF GROUPS, which is `k`
+    //     divided by an operand. No `Term` divides by an operand, and adding
+    //     one would state this launcher and nothing else.
+    //
+    // So the escape hatch is the one `fire/attn_score.rs` uses and argues:
+    // the DRIVER states the rectangle, citing the `<<<>>>` it came from, and
+    // the row states only the contract. A row with `LaunchRule::Unstated`
+    // makes `runtime::launch` answer `Ungeometric::Unstated` if anything ever
+    // tries to derive a grid from it, which is the refusal that keeps an
+    // unstated geometry from being silently invented downstream.
+    //
+    // The third of the three, `quant::quantize_bf16_to_int8_per_token`, needed
+    // no row at all: it was a C++ forwarder onto
+    // `quantize_bf16_to_int8_per_channel`, which is `[7]` above and has had a
+    // `LaunchRule::Rms` row since this family landed.
+    //
+    // Both are `DeviceKernel::PLAIN`: neither `__global__` has a template
+    // parameter list, so its name IS its qualified path.
+    kernel!(dequant_int32_w8a8_to_bf16 "quant::dequant_int32_w8a8_to_bf16",
+        file = Some("quant/quant_bf16_to_fp8.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            acc: I32s,
+            act_scale_inv: F32s,
+            w_scale_inv: F32s,
+            out: BufMut,
+            m: I32,
+            n: I32,
+        ]),
+    // `n_groups` is `ceil(k / gs)` and crosses as an OPERAND as well as
+    // sizing `grid.x`: the kernel bounds `blockIdx.x` against it at
+    // `quant_bf16_to_fp8.cuh:340`. The launcher computed it once and used it
+    // twice, and so does the port -- two derivations of one quotient is how
+    // a grid and a guard come to disagree.
+    kernel!(quantize_bf16_to_fp8_e4m3_per_token_group
+        "quant::quantize_bf16_to_fp8_e4m3_per_token_group",
+        file = Some("quant/quant_bf16_to_fp8.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            act: Bf16s,
+            out: U8sMut,
+            scale_out: F32sMut,
+            m: I32,
+            k: I32,
+            gs: I32,
+            n_groups: I32,
+        ]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1233,6 +1346,35 @@ pub static MXFP4_MARLIN_ROWS: &[DeviceKernel] = &[
 /// being the row's own ELEMENT type appended to a contract that already
 /// named the format. The two `row_map_to_dense` rows take their names from
 /// the `bf16_row_map_to_dense` launcher beside them.
+/// # THE LAUNCHER'S FOUR REFUSALS, WHICH THIS ROW DOES NOT MAKE
+///
+/// `quant/mxfp4_marlin.cu` is deleted (§54) and its host half was not one
+/// `<<<>>>`: it `throw`ed `std::runtime_error` on four conditions before
+/// launching, and a rule-driven fire makes none of them. They are recorded
+/// here because a measurement a port drops is a measurement nobody can find
+/// again, and in `new-horizon.md` §54 with the same words:
+///
+///   1. `validate_row_select` — `row_select` outside `{Identity, Even, Odd}`
+///      threw. Here it is an `I32` from `Source::Param(6)` and the kernel's
+///      `select_row` `switch` has a `default` that falls through to the
+///      identity, so a bad value SILENTLY reads the wrong half of an
+///      interleaved gate/up bank. The three legal values are
+///      `quant/mxfp4_marlin.cuh:70-72`'s `kRowSelect*` and
+///      `driver-cuda/tests/launch_abi.rs` pins them against the Rust mirror.
+///   2. `source_row_offset + selected_rows * stride > source_rows` for the
+///      chosen parity — a slice that runs off the end of the source bank.
+///   3. `source_group_offset + target_groups > source_groups` — the same
+///      check on the group axis, which is where a tensor-parallel shard of
+///      the scale table is taken.
+///   4. `total % 64 != 0` — Marlin's E8M0 scale tile is 64 bytes wide and
+///      the kernel writes whole tiles, so a total that is not a multiple of
+///      64 leaves a partial tile of uninitialised scales that the GEMM then
+///      reads as exponents.
+///
+/// All four are HOST checks on operands, which is exactly the shape a
+/// `LaunchRule` cannot carry: a rule states a rectangle, not a predicate.
+/// Whoever wants them back writes them where the fire is composed — the
+/// caller that knows the shard — and not in a new rule.
 #[rustfmt::skip]
 static MXFP4_MARLIN_SIGS: [KernelSig; 3] = [
     // The table's `quant::mxfp4_scales_to_marlin_e8m0`. Operands diffed
@@ -1318,7 +1460,7 @@ pub static DEQUANT_FP4_ROWS: &[DeviceKernel] = &[
         template_path: "quant::device::dequant_mxfp4",
         elem: "device::f16",
     },
-    // `4` is `dequant_fp4.cu:40`'s `kMxfp4GateUpPairs` and `:42`'s
+    // `4` is `dequant_fp4.cu:42`'s `kMxfp4GateUpPairs` and `:44`'s
     // `kMxfp4DownRows`, and the two numbers are the SAME NUMBER by
     // coincidence rather than by contract — one counts gate/up PAIRS (so the
     // warp owns `2 * kPairs` packed rows) and the other counts output ROWS.
@@ -1357,15 +1499,19 @@ pub static DEQUANT_FP4_ROWS: &[DeviceKernel] = &[
 /// `mxfp4_moe_gate_up_decode_grouped<kTok>` stays without a row, and either
 /// reason alone would be sufficient:
 ///
-///  1. **Its `grid.x` is an EXPERT count.** `dequant_fp4.cu:102-103` opens
+///  1. **Its `grid.x` is an EXPERT count.** The deleted `dequant_fp4.cu:102-103`
+///     opened
 ///     `dim3 grid(num_experts, ceil(intermediate / pairs_per_block))` where
-///     both siblings open `num_tokens * top_k`. `Dims::n_experts` is the
+///     both siblings opened `num_tokens * top_k`, and the kernel still reads
+///     it that way at `quant/dequant_fp4.cuh:471`. `Dims::n_experts` is the
 ///     field that would serve it and `driver-cuda`'s `jit_dims` fills it with
 ///     zero — a fire-wide expert COUNT is not on `model::deployment::Geometry`
 ///     and is not on the wire the way the FANOUT is.
-///  2. **Its template argument comes from the ENVIRONMENT.**
-///     `dequant_fp4.cu:108-111` reads `std::getenv("PIE_MXFP4_MOE_KTOK")` and
-///     `:122-135` switches four cases with a default of 4. An environment
+///  2. **Its template argument came from the ENVIRONMENT.**
+///     `dequant_fp4.cu:108-111` read `std::getenv("PIE_MXFP4_MOE_KTOK")` and
+///     `:122-135` switched four cases with a default of 4 — that host text is
+///     gone with the launcher, and this reason is why no row inherited it. An
+///     environment
 ///     variable is not an extent of the rectangle: a row that named
 ///     `mxfp4_moe_gate_up_decode_grouped<4>` would be right on the machines
 ///     that do not set it and would silently name a different cubin entry
@@ -1401,7 +1547,7 @@ static DEQUANT_FP4_SIGS: [KernelSig; 4] = [
             out: BufMut <- Source::Out(0),
             in_dim: I32 <- Source::OutWidth(0),
         ]),
-    // `quant/dequant_fp4.cu:67-77` --
+    // The deleted `quant/dequant_fp4.cu:67-77` --
     //
     //     dim3 grid(num_tokens * top_k,
     //               (intermediate + pairs_per_block - 1) / pairs_per_block);
@@ -1448,9 +1594,9 @@ static DEQUANT_FP4_SIGS: [KernelSig; 4] = [
             hidden: I32 <- Source::InWidth(1),
             intermediate: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::Width(&Source::In(0))),
         ]),
-    // `quant/dequant_fp4.cu:152-162` -- the down leg, five lines of grid
-    // arithmetic that differ from the gate/up's only in which extent is
-    // slabbed:
+    // The deleted `quant/dequant_fp4.cu:152-162` -- the down leg, five lines
+    // of grid arithmetic that differed from the gate/up's only in which
+    // extent is slabbed:
     //
     //     dim3 grid(num_tokens * top_k,
     //               (hidden + rows_per_block - 1) / rows_per_block);
@@ -1505,7 +1651,7 @@ pub static DEQUANT_WNA16_ROWS: &[DeviceKernel] = &[
         elem: "device::bf16",
     },
     // `device::f16` and not `__half`, and they are the SAME TYPE here.
-    // `csrc/src/cuda_fp16.h` opens the NVRTC shim with `using __half =
+    // `csrc/shim/cuda_fp16.h` opens the NVRTC shim with `using __half =
     // ::pie_cuda_driver::kernels::device::f16;`, so the launcher's
     // `bf16_to_narrow<__half>` and this row's
     // `bf16_to_narrow<::pie_cuda_driver::kernels::device::f16>` name one
@@ -1606,7 +1752,7 @@ static DEQUANT_WNA16_SIGS: [KernelSig; 4] = [
         ]),
     // THE CAPPED GRID-STRIDE, and the row `Slab` was written for.
     //
-    // `quant/dequant_wna16.cu:112-125`:
+    // `quant/dequant_wna16.cu:63-75`:
     //
     // ```text
     // constexpr int BS = 256;
@@ -1671,7 +1817,8 @@ static DEQUANT_WNA16_SIGS: [KernelSig; 4] = [
             out_fp16: BufMut <- Source::Out(0),
             n: I64 <- Source::OutElements(0),
         ]),
-    // `quant/dequant_wna16.cu:73-75` --
+    // `quant/dequant_wna16.cu:73-75`, before §43.9 deleted this launcher as
+    // unreached — `quant/dequant_wna16.cuh:295`/`:298` is the live witness --
     //
     //     constexpr int GU_WARPS = DECODE_BLOCK / 32;                    // 8
     //     const dim3 grid(routes, (intermediate + GU_WARPS - 1) / GU_WARPS);
@@ -1721,9 +1868,10 @@ static DEQUANT_WNA16_SIGS: [KernelSig; 4] = [
             intermediate: I32 <- Source::OutWidth(0),
             group_size: I32 <- Source::Ctx("wna16_group_size"),
         ]),
-    // `quant/dequant_wna16.cu:101-104` -- THE TRANSPOSE, and the reason
-    // `RoutedQmvTransposed` exists rather than a second reading of the rule
-    // above.
+    // The deleted `quant/dequant_wna16.cu:101-104` -- THE TRANSPOSE, and the
+    // reason `RoutedQmvTransposed` exists rather than a second reading of the
+    // rule above. `quant/dequant_wna16.cuh:371`/`:374` still reads the two
+    // axes back the swapped way round.
     //
     //     constexpr int BS = 256;
     //     constexpr int WARPS = BS / 32;                                  // 8

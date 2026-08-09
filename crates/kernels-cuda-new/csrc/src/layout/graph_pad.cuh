@@ -1,7 +1,10 @@
 //===-- graph_pad.cuh - the graph-lattice pad lanes' CSR writer ------===//
 //
-// One `__global__`. `graph_pad.cu` includes this file and keeps its launcher,
-// so exactly one definition exists in the tree.
+// One `__global__`, and it is now JIT-ONLY. `graph_pad.cu` included this file
+// and held `launch_graph_pad_rows`; §43 deleted the file whole, because that
+// launcher had no row, therefore no shim entry, and no C++ caller either --
+// the driver composed it from no statement. Exactly one definition still
+// exists in the tree, and it is the one below.
 //
 // # Two spellings of the same integers
 //

@@ -61,7 +61,6 @@ pub mod mlp;
 pub mod moe;
 pub mod norm;
 pub mod quant;
-pub mod rope;
 pub mod sample;
 pub mod ssm;
 
@@ -87,8 +86,19 @@ pub static KERNELS: &[KernelSig] = &concat_tables();
 /// so they must not be `check_plan`-visible. The shim generator adds them
 /// back explicitly, because an entry point is what they need and a statement
 /// is not.
+///
+/// # `rope` is not a module here, and that is the migration
+///
+/// `crate::x::rope::SIGS` is the same list from the other world: twelve
+/// contracts, derived by `Contract::sig` rather than written. A row here
+/// carried a launcher's binding instructions; a contract carries only what a
+/// trace may say, so **the derived rows state no `operands`** — which is one
+/// of the three mechanisms by which a symbol loses its ahead-of-time C shim
+/// entry, and is the one every ported family uses. `check_plan` still
+/// refuses a symbol nothing declares, which is the whole reason this list
+/// keeps them.
 pub static TABLES: &[&[KernelSig]] = &[
-    attn::KERNELS, rope::KERNELS, norm::KERNELS, mlp::KERNELS, gemm::KERNELS,
+    attn::KERNELS, crate::x::rope::SIGS, norm::KERNELS, mlp::KERNELS, gemm::KERNELS,
     moe::KERNELS, ssm::KERNELS, quant::KERNELS, layout::KERNELS,
     sample::KERNELS, adapter::KERNELS,
 ];

@@ -357,8 +357,10 @@ pub enum LaunchRule {
     ///
     /// The same axis ORDER as [`LaunchRule::RoutedQmv`] — routes on `x`, the
     /// output width slabbed on `y` — and neither of that rule's two numbers,
-    /// nor its reading of the width. `quant/dequant_fp4.cu:67-70` and
-    /// `:152-156` spell the geometry twice:
+    /// nor its reading of the width. The now-deleted
+    /// `quant/dequant_fp4.cu:67-70` and `:152-156` spelled the geometry
+    /// twice; `quant/dequant_fp4.cuh:232` and `:357` read the route axis back
+    /// and are what witnesses it since §43 took the two launchers:
     ///
     /// ```text
     /// const int warps = kMxfp4DecodeBlock / 32;              // 128 / 32 = 4
@@ -805,6 +807,16 @@ pub enum Ty {
     /// landing was a METHOD, and a method has no address the generated
     /// ABI can forward to — the free form takes the instance first, and
     /// the row can then describe the call.
+    ///
+    /// **The instance is a Rust struct now** —
+    /// `driver_cuda::fire::all_reduce::CustomAllReduce`, after
+    /// `csrc/src/comm/custom_all_reduce.{cu,hpp}` were measured at zero
+    /// `__global__` and deleted. Nothing here changes, and that is the
+    /// design: both rows are `execution::RUST_SERVED`, so `emit_c_shim`
+    /// drops their entries and the C++ spelling below is never emitted for
+    /// them. The Rust spelling — `*mut c_void` — was always what crossed.
+    /// The C++ spelling stays because [`KernelSig`] is unchanged and a `Ty`
+    /// is not retired by its last consumer moving.
     CustomAllReduce,
     /// The element type a buffer is stored in — `DType`, a
     /// `std::uint8_t`-backed enum class.
@@ -854,6 +866,61 @@ pub enum Ty {
     /// enumeration with a different member list, declared in a different
     /// header. `naive_paged_attn` takes this one and the two do not convert.
     KvDType,
+    /// `__nv_fp8_interpretation_t` — WHICH fp8 encoding a byte-wide KV page
+    /// holds, `__NV_E4M3` or `__NV_E5M2`. CUDA's own, from `<cuda_fp8.h>`.
+    ///
+    /// # It was the largest single gap in `attn/`, and it was measured
+    ///
+    /// `attn/kv_paged.cuh:63-68` names this kind's absence as the reason two
+    /// kernels have no row: *"`dequant_fp8_pages_active` … has NO row,
+    /// because it takes `__nv_fp8_interpretation_t fp8_kind` and the `Ty`
+    /// vocabulary has no enum."* Six launches sat behind it.
+    ///
+    /// The header also records the alternative and why it is worse: *"Making
+    /// it a non-type template parameter with a default would be worse than
+    /// leaving it: `__NV_E5M2` pages would silently decode as `__NV_E4M3`,
+    /// which is a numerically plausible wrong answer."* `kv_paged.cu:40-43`
+    /// says the same from the host side and adds that both interpretations
+    /// are in the parity set. That is the failure this kind exists to keep
+    /// impossible: the value is a RUNTIME argument, and a row that could not
+    /// spell it could not be a row.
+    ///
+    /// # Why its crossing is four bytes and not one
+    ///
+    /// [`Ty::KvScheme`] and [`Ty::KvDType`] cross as a byte because their C++
+    /// *states* the underlying type — `enum class … : ::std::uint8_t` — so
+    /// the width is a fact of the declaration. This one is an **unscoped C
+    /// enum with no fixed underlying type**:
+    ///
+    /// ```text
+    /// typedef enum __nv_fp8_interpretation_t {
+    ///     __NV_E4M3,
+    ///     __NV_E5M2,
+    /// } __nv_fp8_interpretation_t;          // cuda_fp8.h:185-188
+    /// ```
+    ///
+    /// The implementation picks a type that holds `0..=1`, which on every
+    /// compiler this repo builds with is a four-byte `unsigned int` — but
+    /// that is an observation about a toolchain and not a promise the header
+    /// makes, and a `cuLaunchKernel` cell one byte wide against a four-byte
+    /// parameter mis-marshals every argument after it. So it is **asserted
+    /// rather than assumed**: `abi::emit_device_typecheck` emits
+    /// `static_assert(sizeof(::__nv_fp8_interpretation_t) == 4)` into the
+    /// same nvcc TU that instantiates the kernels, whenever a row names this
+    /// kind. That file's job is to fail the BUILD when a row is wrong rather
+    /// than the fire, which is exactly the question here.
+    ///
+    /// # Why it is not a widened [`Ty::U32`]
+    ///
+    /// [`Ty::Dtype`]'s reason, one step weaker and still sufficient. An
+    /// `enum class` admits no conversion from an integer in either direction;
+    /// an unscoped enum converts *to* an integer implicitly but **not from**
+    /// one, so a `U32` row against this parameter still fails
+    /// `emit_device_typecheck`'s function-pointer initialisation. What the
+    /// distinct kind buys on top of that is the read: a row saying `U32`
+    /// tells a reader the kernel takes a number, and this parameter is a
+    /// two-valued choice whose wrong answer is plausible rather than loud.
+    Fp8Kind,
     /// A host scalar spelled `long long` — the recurrent state's slot
     /// stride, which is an ELEMENT count into a multi-gigabyte arena and
     /// so was widened deliberately. Its own kind for `Ty::U32`'s reason:
@@ -980,6 +1047,12 @@ impl Ty {
             Ty::Dtype => "::pie_cuda_driver::DType",
             Ty::KvScheme => "::pie_cuda_driver::kernels::attn::device::KvScheme",
             Ty::KvDType => "::pie_cuda_driver::kernels::attn::device::KvDType",
+            // CUDA's own, and unqualified by anything of ours: `<cuda_fp8.h>`
+            // declares it at global scope. Every `.cuh` whose kernels take it
+            // includes that header already -- `attn/kv_paged.cuh` and
+            // `attn/attention_naive_paged.cuh` among them -- so the
+            // type-check TU has it through the templates it is built from.
+            Ty::Fp8Kind => "::__nv_fp8_interpretation_t",
             Ty::I64 => "long long",
             Ty::U32s => "const ::std::uint32_t*",
             Ty::U8s => "const ::std::uint8_t*",
@@ -1047,6 +1120,11 @@ impl Ty {
             // the crossing is a byte and no mirror is owed. `needs_mirror`
             // reads that off this spelling rather than off a list.
             Ty::KvScheme | Ty::KvDType => "u8",
+            // FOUR bytes, and the difference from the two above is the whole
+            // point: their width is stated in the C++ and this one's is not.
+            // See [`Ty::Fp8Kind`] -- `emit_device_typecheck` asserts it in
+            // the TU that instantiates the kernels rather than trusting it.
+            Ty::Fp8Kind => "u32",
             Ty::I64 => "::core::ffi::c_longlong",
             Ty::U32s => "*const u32",
             Ty::U8s => "*const u8",
@@ -1978,9 +2056,23 @@ impl KernelSig {
 /// Exported so the two backend tables can declare rows in the same words. It
 /// names [`KernelSig`], [`Prepare`] and [`Cap`] through `$crate`, so a table
 /// crate needs no `use` beyond the macro itself.
+///
+/// # `$symbol` is an `expr` and not a `literal`
+///
+/// Every call site but one passes a string literal, and `literal` is what this
+/// matched until the FA2 lattice arrived. That lattice is macro-generated —
+/// 56 units over four axes — so its symbols are built with `concat!` and
+/// `stringify!`, which produce a `&'static str` at compile time but are
+/// EXPRESSIONS to `macro_rules!` and will not match a `literal` fragment.
+///
+/// `expr` matches every literal too, so this widening changes nothing at the
+/// ~200 existing call sites; and `,` is in `expr`'s follow set, which is what
+/// comes next in the pattern. The field is still `&'static str`, so a
+/// non-const expression is a type error at the `KernelSig` rather than a
+/// silently late symbol.
 #[macro_export]
 macro_rules! kernel {
-    ($name:ident $symbol:literal $(, $key:ident = $value:expr)* $(,)?) => {
+    ($name:ident $symbol:expr $(, $key:ident = $value:expr)* $(,)?) => {
         $crate::KernelSig {
             name: stringify!($name),
             symbol: $symbol,

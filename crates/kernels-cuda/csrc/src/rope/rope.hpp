@@ -1,5 +1,54 @@
 #pragma once
 
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTHING DEFINES THESE ANY MORE. `rope/rope.cu` IS DELETED.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// All twelve launchers below are Rust. Three are `device::JIT_DISPATCHED`
+// (`rope_standard_table`, `qk_rmsnorm_rope_bf16`, `rope_partial_bf16`) and
+// nine are `execution::RUST_SERVED`, so `abi::emit_c_shim` emits no entry for
+// any of them; the host programs are `driver-cuda/src/fire/rope.rs` and the
+// `__global__`s are unmoved in `kernels-cuda-new/csrc/src/rope/rope.cuh`,
+// where NVRTC compiles them.
+//
+// # Why the header survived the file
+//
+// `driver-cuda/tests/launch_abi.rs` is the LAUNCH ABI PILOT and this header
+// is its subject. It reads this path from disk by a hard-coded `const
+// ROPE_HPP`, generates a shim from `table::rope::KERNELS`, and compiles it
+// with `g++ -fsyntax-only` so that C++ overload resolution — not a string
+// comparison — decides whether a row states its launcher's signature
+// exactly. Six of that file's tests reach this header, including
+// `a_wrong_row_does_not_compile`, the mutation suite that keeps the other
+// five honest.
+//
+// Deleting this header does not retire that pilot; it makes it panic in
+// `std::fs::read_to_string(...).expect("rope.hpp")`. Nothing `#include`s
+// this file any more, so no translation unit can fail to link against the
+// declarations, and the cost of keeping it is one header in an archive that
+// is being deleted whole.
+//
+// # What retiring the pilot costs, for whoever does it
+//
+// The pilot is ALREADY VACUOUS for the two tests that mattered, and not
+// because of this change: `rope::qk_rmsnorm_rope_bf16` is in
+// `device::JIT_DISPATCHED`, `rope_shim` passes `device::jit_dispatched()` to
+// `emit_c_shim`, and `emit_c_shim` SKIPS a row that list names. So the
+// single-row tables `a_wrong_row_does_not_compile` and
+// `renaming_an_operand_is_not_a_mistake` build now emit no `extern "C"` at
+// all, and an empty shim compiles whatever the row says.
+//
+// So retiring it is not "delete three tests". It is: move the mutation suite
+// to a family whose rows still hold shim entries, re-index its cases
+// (`retype(2, ..)`, `swap(6, 9)` and the rest are positions in
+// `qk_rmsnorm_rope_bf16`'s operand list), and delete
+// `every_launcher_the_header_declares_has_a_row` — whose claim, that the
+// table is COMPLETE with respect to a header, has no replacement and is the
+// half a generated shim cannot reach. `attn` is the obvious new subject: it
+// is 50 rows, its headers are globbed rather than pinned, and
+// `every_attn_row_states_its_launcher_exactly` already compiles them as one
+// shim.
+
 // RoPE (Rotary Position Embedding) — applied to Q and K in place.
 //
 // For each token n at position p, and each head h, the head_dim is split

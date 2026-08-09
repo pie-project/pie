@@ -76,7 +76,10 @@
 // nearly free and the kernel is near what a dense library achieves on the
 // live work alone — which is exactly what a grouped GEMM is for.
 //
-// At `kTileM = 64`, `moe_dispatch.hpp`'s `kMoeAlignedBlockMax`:
+// At `kTileM = 64`, `MOE_ALIGNED_BLOCK_MAX` — which was
+// `moe_dispatch.hpp`'s `kMoeAlignedBlockMax` until that header was deleted
+// and is now `driver-cuda/src/fire/moe_dispatch.rs`'s, next to the
+// measurement that sets it:
 //
 //     gate_up   0.659 ms      down   0.320 ms      (64 x 64, REG 218)
 //
@@ -133,7 +136,7 @@
 // constrains tile elements to the scalar types it knows, so this tree's own
 // `device::bf16` is refused — `template constraint not satisfied` — even
 // carrying `__tile_builtin__`. A tile kernel must name NVIDIA's
-// `__nv_bfloat16`. That collides with `csrc/src/cuda_bf16.h`, which aliases
+// `__nv_bfloat16`. That collides with `csrc/shim/cuda_bf16.h`, which aliases
 // that same name to `device::bf16` so FlashInfer stays byte-identical to
 // upstream, so the two can never share a translation unit and NVIDIA's
 // include directory must precede the tree's for this file. It includes
@@ -432,7 +435,7 @@
 // # The header collision, which is real and independent of all the above
 //
 // `cuda_tile.h` forward-declares `struct __nv_bfloat16;` at global scope.
-// This tree's `csrc/src/cuda_bf16.h` answers the same name with
+// This tree's `csrc/shim/cuda_bf16.h` answers the same name with
 // `using __nv_bfloat16 = device::bf16;`. A struct declaration and a type
 // alias cannot share a name in one translation unit, so `cuda_bf16.h`,
 // `pie_mma.cuh` and this file can never enter one unit. This file includes

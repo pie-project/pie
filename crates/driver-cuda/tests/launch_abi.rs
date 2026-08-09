@@ -1,4 +1,38 @@
-//! The launch ABI pilot: `rope`'s twelve launchers, proven by the C++ compiler.
+//! The launch ABI proof: a row's operand list, proven by the C++ compiler.
+//!
+//! # `rope` WAS THE PILOT AND IS NO LONGER HERE
+//!
+//! This file was written around `rope`'s twelve rows and named them in every
+//! case. `rope` has crossed into fn-world (`.wiki/kernel-x/northstar.md` §5
+//! step 3): its host programs are `kernels-cuda-new/src/x/rope.rs`, beside
+//! the `rope.cuh` they fire, and its contracts state no `operands` at all.
+//! There is no row left to emit a shim from, so six cases went with it —
+//! `every_rope_row_states_its_launcher_exactly`,
+//! `every_launcher_the_header_declares_has_a_row`,
+//! `an_unstated_row_is_skipped_rather_than_called_with_nothing`,
+//! `a_wrong_row_does_not_compile`, `renaming_an_operand_is_not_a_mistake`
+//! and `the_rust_bindings_name_the_symbols_the_shim_defines`, plus the
+//! `rope_shim` helper and the `ROPE_HPP` constant.
+//!
+//! **What replaces the proof for `rope`**: `kernels_cuda_new::x::abi`'s
+//! `typecheck_tu` emits a TU that names each declared device function
+//! through `Abi::CPP`, so the `__global__` and the Rust `raw::` stub are
+//! checked against each other by the same compiler for the same reason.
+//! §6.1 of the north star is the argument: *"nothing is written twice"*
+//! means *"nothing is written twice **unchecked**"*, and the typecheck TU is
+//! the oracle that holds the two sides together.
+//!
+//! **What is NOT replaced, and is a real loss**: `a_wrong_row_does_not_
+//! compile` was the mutation suite for `emit_c_shim` ITSELF, which still
+//! serves ten families. It was keyed on `rope::qk_rmsnorm_rope_bf16` by
+//! OPERAND INDEX (`retype(0, Ty::Buf)`, `retype(2, Ty::BufMut)`, two
+//! `swap`s), so re-keying it means choosing a row from a family that is
+//! neither `device::JIT_DISPATCHED` nor `execution::RUST_SERVED` — the two
+//! filters `emit_c_shim` applies — and reading its operand order. That is a
+//! choice that has to be made against a build, and this change was written
+//! without one. It is left undone deliberately rather than re-keyed on a
+//! guess: a mutation suite pointed at the wrong row passes and proves
+//! nothing, which is worse than an absent one.
 //!
 //! Every other area in this crate is proven by a differential oracle — build
 //! the C++, sweep both over a grid, require byte-identical output, pin the
@@ -14,7 +48,8 @@
 //! ## The proof
 //!
 //! `kernels_cuda_new::abi::emit_c_shim` generates one `extern "C"` function per
-//! row whose body CALLS the launcher, with the real `rope.hpp` in scope. The
+//! row whose body CALLS the launcher, with the family's real `.hpp` in scope.
+//! The
 //! generated translation unit is then compiled. A row that misstates an
 //! operand's type, constness, width, position, or the arity of the whole list
 //! does not compile, because C++ overload resolution is deciding — not a
@@ -26,10 +61,11 @@
 //! there is no grid and nothing to estimate. The compiler checks the entire
 //! signature or refuses the file.
 //!
-//! Consequently this file pins no hash and has no `mutate.sh`. What replaces
-//! them is [`a_wrong_row_does_not_compile`], which corrupts a row and
-//! requires the compile to FAIL — the same question a mutation suite asks
+//! Consequently this file pins no hash and has no `mutate.sh`. What replaced
+//! them was `a_wrong_row_does_not_compile`, which corrupted a row and
+//! required the compile to FAIL — the same question a mutation suite asks
 //! ("would the proof notice?"), answered exactly instead of statistically.
+//! See the note at the top of this header for where that case went.
 
 #![cfg(feature = "_cuda")]
 
@@ -42,7 +78,8 @@ use driver_cuda::bind::abi::{
     AttentionWorkspaceView, HopperPrefillPlan, KvCacheLayerView, MlaCacheLayerView,
     YarnOriginalParams,
 };
-use kernels::{KernelSig, Operand, Ty};
+// `Operand` and `Ty` left with the mutation suite — see the header.
+use kernels::KernelSig;
 use kernels_cuda_new::abi::Record;
 
 /// Where `kernels-cuda`'s sources are, relative to this crate.
@@ -50,13 +87,31 @@ fn csrc() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels-cuda/csrc/src")
 }
 
-/// The header the pilot's rows are declared in.
-const ROPE_HPP: &str = "rope/rope.hpp";
+/// Every tree that currently holds a `.cu` or `.cuh` launcher body.
+///
+/// TWO, AND THE SECOND ONE IS A HOLE THIS CLOSES rather than a place things
+/// belong. `csrc()` is the archive. `driver-cuda/csrc` holds
+/// `attn/attention_flashinfer.cu`, `attn/plan_lifecycle.cpp`,
+/// `supergraph.cu` and the three towers, which earlier passes moved out of the
+/// archive because they could not be compiled by NVRTC. That reasoning is
+/// right about NVRTC and wrong about the destination — host code is Rust, and
+/// C++ in this crate is staging awaiting a rewrite, not a home.
+///
+/// Either way the scans below have to read it. Every `Orphaned` claim in the
+/// exception list means NOTHING CALLS THIS, and it is checked by reading every
+/// `.cu` body and looking for a call. A scan that reads one tree while
+/// launchers live in two finds fewer callers than exist, so `Orphaned` gets
+/// easier to claim exactly as files move — and it fails SILENTLY, by passing.
+/// That is the opposite of what this list is for. Adding the second root costs
+/// nothing and removes the incentive.
+fn cu_roots() -> Vec<PathBuf> {
+    vec![csrc(), Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc")]
+}
 
 /// Compile a generated shim against the real headers.
 ///
 /// `-fsyntax-only`: nothing is linked, so this needs neither the built
-/// archive nor nvcc. And the only CUDA name `rope.hpp` uses is
+/// archive nor nvcc. And the only CUDA name these headers use is
 /// `cudaStream_t`, which `tests/oracle/launch_abi/stub/` supplies — so it needs
 /// no CUDA toolkit either, which is what the CI job that runs this crate
 /// promises. The stub directory is the ONLY include path added besides
@@ -144,15 +199,6 @@ fn compile_with(shim: &str, extra: &[PathBuf]) -> Result<(), String> {
     }
 }
 
-fn rope_shim(table: &'static [KernelSig]) -> String {
-    kernels_cuda_new::abi::emit_c_shim(
-        &[table],
-        &[ROPE_HPP],
-        &kernels_cuda_new::device::jit_dispatched(),
-    )
-    .expect("no entry-point collisions")
-}
-
 /// The headers `attn`'s rows are declared in.
 ///
 /// Every `attn/*.hpp`, plus `gemm/gemm.hpp` — two of `attn`'s rows are the MLA
@@ -192,7 +238,7 @@ fn norm_headers() -> Vec<String> {
     hs
 }
 
-/// `norm`'s rows, proven the same way `rope`'s and `attn`'s are.
+/// `norm`'s rows, proven the same way `attn`'s are.
 ///
 /// Twenty-eight launchers across seven headers, and the family every
 /// other one leans on: a wrong row here is a wrong argument in an arm
@@ -240,7 +286,14 @@ fn every_mlp_row_states_its_launcher_exactly() {
     );
     let shim = kernels_cuda_new::abi::emit_c_shim(
         &[table],
-        &["mlp/swiglu.hpp"],
+        // `mlp/swiglu.hpp` was here and is DELETED with `mlp/swiglu.cu` --
+        // the whole of `csrc/src/mlp/`. All twelve `table::mlp` rows are in
+        // `device::JIT_DISPATCHED`, so `emit_c_shim` skips every one of them
+        // and this shim is now a file of includes and no bodies. The
+        // assertion above it still bites: a row that stopped stating its
+        // operands would fail the count, and the count is what this test is
+        // actually for.
+        &[],
         &kernels_cuda_new::device::jit_dispatched(),
     )
     .expect("no entry-point collisions");
@@ -283,27 +336,67 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
         kernels_cuda_new::table::moe::KERNELS,
     ];
     let headers = [
-        "quant/dequant_fp4.hpp",
-        "quant/dequant_fp8.hpp",
-        "quant/dequant_wna16.hpp",
-        "quant/dtype_cast.hpp",
-        "quant/mxfp4_marlin.hpp",
-        // The two ENCODE-side quantizers. Their rows landed with the
-        // encode kernels; their header did not land here with them, so
-        // the shim named functions it had not been shown.
-        "quant/quant_bf16_to_fp8.hpp",
-        "quant/quant_bf16_to_mxfp4.hpp",
+        // `quant/dequant_fp4.hpp`, `quant/dequant_fp8.hpp` and
+        // `quant/dequant_wna16.hpp` were here and are DELETED with their
+        // `.cu` files -- every launcher in the three is
+        // `device::JIT_DISPATCHED`, so the shim emitted nothing for any of
+        // them and only the includes were left.
+        // `quant/dtype_cast.hpp` was here and is DELETED with
+        // `quant/dtype_cast.cu`. Both its launchers -- `cast_fp32_to_bf16`
+        // and `scale_rows_bf16` -- are `device::JIT_DISPATCHED` rows fired
+        // from `driver_cuda::fire::dtype_cast`, so the shim emitted nothing
+        // for them and only the include was left.
+        // `quant/mxfp4_marlin.hpp` and `quant/quant_bf16_to_mxfp4.hpp` went
+        // the same way with their `.cu` files.
+        // `quant/quant_bf16_to_fp8.hpp` was the last of them and is DELETED
+        // too, which empties `csrc/src/quant/` and takes every `quant`
+        // include out of this list. Its note read: *"The ENCODE-side
+        // quantizer whose header did land here: its rows arrived with the
+        // encode kernels and the shim named functions it had not been shown
+        // until this list gained the include."* Those rows were the three in
+        // `table/driver_internal.rs`, and they are deleted -- the driver
+        // reaches the kernels through `driver_cuda::fire::quant_int8` now.
+        // `table::quant::KERNELS` above stays in the table list: its rows are
+        // all routed, so the shim emits nothing and there is nothing left to
+        // include for them.
         "layout/embed.hpp",
-        "layout/slot_ops.hpp",
-        "layout/deinterleave.hpp",
+        // `layout/slot_ops.hpp` and `layout/deinterleave.hpp` were here and
+        // are DELETED with their `.cu` files. `copy_if_valid_slot` and
+        // `split_q_gate_bf16` are JIT rows; `concat_bf16_rows`,
+        // `deinterleave_rows_bf16` and `deinterleave_vec_bf16` had no
+        // consumer in any language and their `table::layout` rows went with
+        // the files -- see `new-horizon.md` §54.
         "gemm/gemm.hpp",
-        "gemm/gemv.hpp",
-        "comm/custom_all_reduce.hpp",
-        "moe/dsv4_routing.hpp",
-        "moe/moe_dispatch.hpp",
+        // `gemm/gemv.hpp` was here and is DELETED with `gemm/gemv.cu`: the
+        // kernels are NVRTC's now (`kernels-cuda-new`'s `gemm/gemv` unit)
+        // and the launcher is `driver_cuda::fire::gemv`. Nothing in
+        // `table::gemm::KERNELS` named it -- the shim only ever included it
+        // because the header list is written by hand -- so removing it
+        // changes no emitted declaration.
+        // `comm/custom_all_reduce.hpp` was here and is DELETED with
+        // `comm/custom_all_reduce.cu` and `comm/custom_all_reduce_stub.cpp`,
+        // which empties `csrc/src/comm/`. The `.cu` was a 664-line HOST
+        // PROGRAM -- zero `__global__`, zero `<<<>>>` -- and the whole
+        // lifecycle is `driver_cuda::fire::all_reduce`. Both its symbols are
+        // `execution::RUST_SERVED`, so `emit_c_shim` drops both entries and
+        // the include had nothing left to declare. `Ty::CustomAllReduce`
+        // survives in `kernels::Ty` unchanged: the rows still take an opaque
+        // `car` handle, and `KernelSig` is unchanged by design.
+        // `moe/dsv4_routing.hpp` and `moe/moe_dispatch.hpp` were here and are
+        // DELETED with their `.cu` files. All nine of their symbols are
+        // `execution::RUST_SERVED`, so `emit_c_shim` drops every entry and
+        // the two includes had nothing left to declare; the launchers are
+        // `driver_cuda::fire::dsv4_routing` and
+        // `driver_cuda::fire::moe_dispatch`. `moe_dispatch.hpp`'s one
+        // non-launcher export, `moe_aligned_block()`, had no C++ caller and
+        // is `fire::moe_dispatch::moe_aligned_block`.
         "moe/moe_grouped_gemm.hpp",
         "moe/flashinfer_moe.hpp",
-        "sample/argmax.hpp",
+        // `sample/argmax.hpp` was here and is DELETED with
+        // `sample/argmax.cu`, the whole of `csrc/src/sample/`. Its one
+        // surviving symbol is `execution::RUST_SERVED`, so `emit_c_shim`
+        // drops the entry and the include had nothing left to declare;
+        // `driver_cuda::fire::lm_head_argmax` is the launcher.
         "moe/topk_softmax.hpp",
     ];
     let shim = kernels_cuda_new::abi::emit_c_shim(
@@ -350,12 +443,23 @@ fn every_ssm_row_states_its_launcher_exactly() {
     );
     let shim = kernels_cuda_new::abi::emit_c_shim(
         &[table],
-        &[
-            "ssm/causal_conv1d.hpp",
-            "ssm/gated_delta_net.hpp",
-            "ssm/kda.hpp",
-            "ssm/nemotron_h.hpp",
-        ],
+        // NO HEADERS AT ALL, AND THAT IS THE END STATE RATHER THAN A GAP.
+        // The comment this replaces read: *"ONE header, and the eleven that
+        // used to need the other three are the reason there is one.
+        // `ssm/{causal_conv1d,gated_delta_net,kda}.hpp` are deleted with
+        // their `.cu`s: every launcher they declared is
+        // `execution::RUST_SERVED` now, `emit_c_shim` skips a `RUST_SERVED`
+        // row, and a header declaring nothing the shim calls is an include
+        // that can only break the build later."*
+        //
+        // `ssm/nemotron_h.hpp` has now gone the same way and `csrc/src/ssm/`
+        // with it, so this shim is EMPTY: every `table::ssm` row is either
+        // `device::JIT_DISPATCHED` or `execution::RUST_SERVED`. The test
+        // stays because it still makes a claim -- the `stated` assertion
+        // above is not vacuous, and an ssm row that ever comes back
+        // unrouted will emit a body with no header to declare it and fail
+        // here rather than at link.
+        &[] as &[&str],
         &kernels_cuda_new::device::jit_dispatched(),
     )
     .expect("no entry-point collisions");
@@ -363,18 +467,6 @@ fn every_ssm_row_states_its_launcher_exactly() {
         panic!(
             "the generated shim does not compile, so a row misstates its \
              launcher:\n{err}"
-        );
-    }
-}
-
-/// The pilot itself: every stated `rope` row describes its launcher exactly.
-#[test]
-fn every_rope_row_states_its_launcher_exactly() {
-    let shim = rope_shim(kernels_cuda_new::table::rope::KERNELS);
-    if let Err(err) = compile(&shim) {
-        panic!(
-            "the generated shim does not compile, so a row misstates its \
-             launcher:\n{err}\n--- shim ---\n{shim}"
         );
     }
 }
@@ -405,43 +497,6 @@ fn every_attn_row_states_its_launcher_exactly() {
              launcher:\n{err}"
         );
     }
-}
-
-/// Every launcher `rope.hpp` declares has a row.
-///
-/// The other half of the crate's invariant, and the half a generated shim
-/// cannot reach: emitting from the table proves each ROW is real, never that
-/// the table is complete. This is what the pilot found — twelve declarations
-/// against ten rows, with `rope_bf16` and `rope_partial_bf16_position_delta`
-/// present in the header, called by the driver, and named nowhere in the
-/// table the compiler plans against.
-#[test]
-fn every_launcher_the_header_declares_has_a_row() {
-    let text = std::fs::read_to_string(csrc().join(ROPE_HPP)).expect("rope.hpp");
-    let declared: Vec<String> = text
-        .lines()
-        .filter_map(|l| l.strip_prefix("void "))
-        .filter_map(|l| l.split_once('('))
-        .map(|(name, _)| name.trim().to_string())
-        .collect();
-    assert!(
-        declared.len() >= 12,
-        "the scan found {} declarations, so its shape assumption broke",
-        declared.len()
-    );
-
-    let missing: Vec<&String> = declared
-        .iter()
-        .filter(|d| {
-            !kernels_cuda_new::table::rope::KERNELS
-                .iter()
-                .any(|k| k.symbol == format!("rope::{d}"))
-        })
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "declared but not in the table: {missing:?}"
-    );
 }
 
 /// Why a launcher `attn`'s headers declare is allowed to have no row.
@@ -540,13 +595,35 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         ("plan_attention_flashinfer_prefill_bf16",      NoRow::Prepare),
         ("plan_attention_flashinfer_prefill_sm90_bf16", NoRow::Prepare),
         ("plan_attention_mla_bf16",                     NoRow::Prepare),
-        ("prepare_attention_xqa_decode_bf16",           NoRow::Prepare),
+        // `prepare_attention_xqa_decode_bf16` STOOD HERE and is gone, with
+        // the exception, because the launcher is gone. It is
+        // `driver-cuda/src/fire/xqa.rs::prepare_decode` now -- Rust firing
+        // `attn/attention_xqa.cuh` through NVRTC -- and its `__global__` was
+        // the last one the `kernels-cuda` archive held. The exception said
+        // `NoRow::Prepare`: no row names it because a `Prepare` is an
+        // obligation the TABLE states and the DRIVER discharges, and this is
+        // the first one where the driver actually does. Removed rather than
+        // retargeted: `mentions_word` below reads all of
+        // `crates/driver-cuda/src`, so leaving the name here while
+        // `fire/xqa.rs` cites it in a comment would fail the `Orphaned` arm
+        // for a launcher that is not orphaned but ported.
         ("set_decode_plan_int_base",                    NoRow::Prepare),
         ("split_qkv_bf16",                              NoRow::DriverInternal),
-        ("split_qkv_bf16_devwin",                       NoRow::DriverInternal),
-        ("pack_dense_mask",                             NoRow::DriverInternal),
-        ("pack_structured_mask",                        NoRow::DriverInternal),
-        ("copy_kv_cells_bf16",                          NoRow::DriverInternal),
+        // `split_qkv_bf16_devwin` stood here and is GONE with
+        // `attn/split_packed.cu`. Its row is no longer `driver_internal`
+        // either -- it moved to `table::attn` so `RUST_SERVED` could take it.
+        // `pack_dense_mask` and `pack_structured_mask` stood here and are
+        // GONE with `attn/pack_dense_mask.cu`, its `.hpp` and their two
+        // `table::driver_internal` rows. Empty consumer set on all five
+        // channels; not ported, per §60.1.
+        // `copy_kv_cells_bf16` STOOD HERE and is ported, so it is removed
+        // rather than retargeted — `set_decode_plan_int_base` above records
+        // the same rule and the same reason. `mentions_word` below reads all
+        // of `crates/driver-cuda/src`, and `fire/kv_paged.rs` both defines
+        // `copy_kv_cells_bf16` and cites the name in its doc, so leaving the
+        // entry here would fail the `Orphaned` arm for a launcher that is not
+        // orphaned but gone. Its `table/driver_internal.rs` row went in the
+        // same edit; that file carries the evidence.
         ("attention_flashinfer_prefill_bf16",           NoRow::KernelsInternal),
         // ORPHANED BY THIS SESSION'S OWN DELETION, and left standing on
         // purpose. `attention_flashinfer_prefill_custom_bf16` was
@@ -571,7 +648,11 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         ("attention_flashinfer_prefill_custom_bf16",    NoRow::KernelsInternal),
         ("dispatch_attention_flashinfer_decode_capture_bf16", NoRow::KernelsInternal),
         ("dispatch_attention_flashinfer_prefill_custom_bf16", NoRow::KernelsInternal),
-        ("write_mla_to_pages_bf16",                     NoRow::KernelsInternal),
+        // `write_mla_to_pages_bf16` stood here and is GONE with
+        // `attn/mla_paged.cu`. It was dead on all five channels and its only
+        // caller was the `write_mla_to_pages` forwarder in the same file;
+        // that forwarder is now `driver-cuda/src/fire/mla_paged.rs` and holds
+        // the `<<<>>>` directly.
         // ── §44's deletions ──────────────────────────────────────────
         // FOURTEEN entries stood here and are gone with their launchers.
         // Two `Warmup` (`xqa_decode_bf16_warmup_current_device` and its
@@ -606,7 +687,13 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         // `dsl.rs` had a caller. The four below are still reached from a
         // sibling `.cu`; the three under `Orphaned` are reached from
         // nowhere at all.
-        ("write_kv_to_pages_bf16",                      NoRow::KernelsInternal),
+        // `("write_kv_to_pages_bf16", NoRow::KernelsInternal)` WAS HERE and
+        // is deleted with the launcher. Same reason the list already records
+        // for `copy_kv_cells_bf16` and `set_decode_plan_int_base`:
+        // `mentions_word` reads all of `driver-cuda/src`, and
+        // `fire::kv_paged::write_kv_to_pages_bf16` is that word — a ported
+        // name left standing here fails the `Orphaned` arm for a launcher
+        // that is not orphaned but simply no longer C++.
         ("dispatch_attention_flashinfer_decode_bf16",   NoRow::KernelsInternal),
         ("dispatch_attention_flashinfer_prefill_sm90_bf16", NoRow::KernelsInternal),
         ("attention_naive_paged_bf16",                  NoRow::KernelsInternal),
@@ -642,8 +729,22 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     // fired on twenty honest deletions and said "the shape assumption broke"
     // about a change that broke nothing, which is the failure mode a floor
     // has instead of a bug.
+    //
+    // 55 -> 50, AND THE SENTENCE THAT PAYS FOR IT. The scan finds 53 now.
+    // Two of the five that left are not this pass's -- 55 was already above
+    // the tree when this pass started, because concurrent passes had taken
+    // declarations out of `attn/*.hpp` without lowering the number that
+    // counts them, so this assertion was RED AT HEAD and would have been
+    // blamed on whoever touched it next. One is this pass's:
+    // `prepare_attention_xqa_decode_bf16` left `attention_xqa.hpp` for
+    // `driver-cuda/src/fire/xqa.rs`. 50 rather than 53 deliberately: `attn/`
+    // is being emptied and a floor set flush against the current count is a
+    // floor that has to be edited by every deletion, which is how it came to
+    // be wrong. Three of headroom is the width of one more file's worth of
+    // launchers, and below 50 the right question really is whether the
+    // scanner still works.
     assert!(
-        declared.len() >= 55,
+        declared.len() >= 50,
         "the scan found {} declarations, so its shape assumption broke",
         declared.len()
     );
@@ -689,9 +790,7 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     );
     let wrong: Vec<&str> = exceptions
         .iter()
-        .filter(|(_, why)| {
-            *why == NoRow::KernelsInternal || matches!(why, NoRow::Orphaned(_))
-        })
+        .filter(|(_, why)| *why == NoRow::KernelsInternal || matches!(why, NoRow::Orphaned(_)))
         .map(|(n, _)| *n)
         .filter(|n| mentions_word(&driver_text, n))
         .collect();
@@ -707,7 +806,9 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     // the definition, or a string literal — is a failure, because a launcher
     // with a live caller is not orphaned, it is `KernelsInternal`.
     let mut cu_text = String::new();
-    collect_cu_bodies(&csrc(), &mut cu_text);
+    for root in cu_roots() {
+        collect_cu_bodies(&root, &mut cu_text);
+    }
     assert!(
         cu_text.len() > 100_000,
         "only {} bytes of .cu body found, so the orphan check is vacuous",
@@ -731,7 +832,9 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     // says what a deletion WOULD cost, and only the second is a number.
     let mut checked = 0;
     for (name, why) in exceptions {
-        let NoRow::Orphaned(keepers) = why else { continue };
+        let NoRow::Orphaned(keepers) = why else {
+            continue;
+        };
         assert!(
             !keepers.is_empty(),
             "`{name}` is `Orphaned` and names no keeper. Say what still holds it, or say \
@@ -808,14 +911,19 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     // catch the `Orphaned` column going empty of keepers while entries
     // remain, which would mean the second half of the claim had quietly
     // stopped being made. It is not a target.
-    assert!(checked >= 1, "only {checked} keeper(s) read, so the keeper check is vacuous");
+    assert!(
+        checked >= 1,
+        "only {checked} keeper(s) read, so the keeper check is vacuous"
+    );
 }
 
 /// The `.cu` body of a launcher: from its `void <name>(` line to the first
 /// line that is exactly `}`, which is how every launcher in this tree closes.
 fn cu_definition(name: &str) -> Option<(String, String)> {
     fn walk(dir: &Path, name: &str, out: &mut Option<(String, String)>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in rd.flatten() {
             let p = entry.path();
             if p.is_dir() {
@@ -832,10 +940,7 @@ fn cu_definition(name: &str) -> Option<(String, String)> {
                             .iter()
                             .position(|l| l.trim_end() == "}")
                             .map_or(lines.len(), |k| i + k + 1);
-                        *out = Some((
-                            p.display().to_string(),
-                            lines[i..end].join("\n"),
-                        ));
+                        *out = Some((p.display().to_string(), lines[i..end].join("\n")));
                         return;
                     }
                 }
@@ -843,7 +948,12 @@ fn cu_definition(name: &str) -> Option<(String, String)> {
         }
     }
     let mut out = None;
-    walk(&csrc(), name, &mut out);
+    for root in cu_roots() {
+        walk(&root, name, &mut out);
+        if out.is_some() {
+            break;
+        }
+    }
     out
 }
 
@@ -864,7 +974,9 @@ fn call_sites_in(body: &str, target: &str) -> usize {
 /// rather than believed.
 fn orphan_call_sites(target: &str) -> usize {
     let mut text = String::new();
-    collect_cu_bodies(&csrc(), &mut text);
+    for root in cu_roots() {
+        collect_cu_bodies(&root, &mut text);
+    }
     call_sites_in(&text, target)
 }
 
@@ -977,190 +1089,6 @@ fn mentions_word(hay: &str, needle: &str) -> bool {
     })
 }
 
-/// A row with no operands is not a row that takes none.
-///
-/// The distinction matters while the table is being filled a family at a
-/// time: emitting an unstated row as a nullary `extern "C"` would generate a
-/// call the compiler rejects for the wrong reason, and would make "this
-/// family is done" indistinguishable from "this family is empty".
-///
-/// Asked of a SYNTHETIC row rather than of whichever family happens to be
-/// empty today. It used to point at `attn`, and filling `attn` turned a
-/// passing test into a failing one without anything being wrong — the check
-/// is about `stated()`, so its subject should be too.
-#[test]
-fn an_unstated_row_is_skipped_rather_than_called_with_nothing() {
-    let stated = kernels_cuda_new::table::rope::KERNELS
-        .iter()
-        .find(|k| !k.operands.is_empty())
-        .expect("some rope row is stated");
-    let row: &'static [KernelSig] = Vec::leak(vec![KernelSig {
-        operands: &[],
-        ..*stated
-    }]);
-    let shim = rope_shim(row);
-    assert!(
-        !shim.contains("extern \"C\""),
-        "the row states no operands, so nothing should be emitted:\n{shim}"
-    );
-}
-
-/// Corrupting a row must break the build — the mutation suite, answered
-/// exactly.
-///
-/// Each case changes ONE thing a hand-written binding gets wrong, and every
-/// one of them has to be caught. The last two are the interesting ones: they
-/// are not type errors, they are an operand list of the right types in the
-/// wrong ORDER, which is precisely the failure a `void*`-flattened ABI cannot
-/// see and this one can.
-#[test]
-fn a_wrong_row_does_not_compile() {
-    let base = kernels_cuda_new::table::rope::KERNELS
-        .iter()
-        .find(|k| k.symbol == "rope::qk_rmsnorm_rope_bf16")
-        .expect("the pilot row");
-
-    // `q_weight`/`k_weight` are `const void*`; `positions` is `const i32*`;
-    // the extents are `int` and the two rates are `float`.
-    let ops = base.operands;
-    let swap = |i: usize, j: usize| {
-        let mut v: Vec<Operand> = ops.to_vec();
-        v.swap(i, j);
-        v
-    };
-    let retype = |i: usize, ty: Ty| {
-        let mut v: Vec<Operand> = ops.to_vec();
-        v[i].ty = ty;
-        v
-    };
-
-    let cases: Vec<(&str, Vec<Operand>)> = vec![
-        (
-            "a written buffer is claimed to be read-only",
-            retype(0, Ty::Buf),
-        ),
-        (
-            "a read-only weight is claimed to be written",
-            retype(2, Ty::BufMut),
-        ),
-        ("positions loses its element type", retype(4, Ty::Buf)),
-        ("an extent is widened to a float", retype(5, Ty::F32)),
-        ("a rate is narrowed to an int", retype(9, Ty::I32)),
-        ("the stream is dropped", ops[..ops.len() - 1].to_vec()),
-        ("an operand is invented", {
-            let mut v = ops.to_vec();
-            v.insert(
-                5,
-                Operand {
-                    name: "extra",
-                    ty: Ty::I32,
-                    nullable: false,
-                    source: kernels::Source::Unbound,
-                },
-            );
-            v
-        }),
-        ("q and k_weight trade places", swap(0, 3)),
-        ("an extent and a rate trade places", swap(6, 9)),
-    ];
-
-    for (what, operands) in cases {
-        let leaked: &'static [Operand] = Vec::leak(operands);
-        let row: &'static [KernelSig] = Vec::leak(vec![KernelSig {
-            name: base.name,
-            symbol: base.symbol,
-            whole: base.whole,
-            needs: base.needs,
-            lacks: base.lacks,
-            sink: base.sink,
-            in_place: base.in_place,
-            depth_prefix_plan: base.depth_prefix_plan,
-            publishes_aux: base.publishes_aux,
-            head_param: base.head_param,
-            heads_param: base.heads_param,
-            operands: leaked,
-            returns: base.returns,
-            axes: base.axes,
-            file: base.file,
-            launch: base.launch,
-            grid_param: base.grid_param,
-            lowered_as: base.lowered_as,
-        }]);
-        assert!(
-            compile(&rope_shim(row)).is_err(),
-            "a row where {what} still compiled, so the proof is not watching"
-        );
-    }
-}
-
-/// The control: a change that is NOT a mistake must still compile.
-///
-/// Without this the test above passes for a build that is broken for some
-/// unrelated reason, and every mutation registers as caught. Renaming an
-/// operand is the right control here because the name is prose — the table
-/// says so — so a rename must be invisible to the compiler while touching
-/// exactly the text the mutations touch.
-#[test]
-fn renaming_an_operand_is_not_a_mistake() {
-    let base = kernels_cuda_new::table::rope::KERNELS
-        .iter()
-        .find(|k| k.symbol == "rope::qk_rmsnorm_rope_bf16")
-        .expect("the pilot row");
-    let renamed: &'static [Operand] = Vec::leak(
-        base.operands
-            .iter()
-            .enumerate()
-            .map(|(i, o)| Operand {
-                name: Box::leak(format!("arg{i}").into_boxed_str()),
-                ..*o
-            })
-            .collect::<Vec<_>>(),
-    );
-    let row: &'static [KernelSig] = Vec::leak(vec![KernelSig {
-        name: base.name,
-        symbol: base.symbol,
-        whole: base.whole,
-        needs: base.needs,
-        lacks: base.lacks,
-        sink: base.sink,
-        in_place: base.in_place,
-        depth_prefix_plan: base.depth_prefix_plan,
-        publishes_aux: base.publishes_aux,
-        head_param: base.head_param,
-        heads_param: base.heads_param,
-        operands: renamed,
-        returns: base.returns,
-        axes: base.axes,
-        file: base.file,
-        launch: base.launch,
-        grid_param: base.grid_param,
-        lowered_as: base.lowered_as,
-    }]);
-    if let Err(err) = compile(&rope_shim(row)) {
-        panic!("the control failed to compile, so the mutations prove nothing:\n{err}");
-    }
-}
-
-/// The Rust bindings declare exactly what the C++ shim defines.
-///
-/// Both are generated from one row, so this cannot fail by drift; what it
-/// pins is that the two emitters agree on the ENTRY POINT spelling, which is
-/// the one string the linker matches on and the one thing neither compiler
-/// checks.
-#[test]
-fn the_rust_bindings_name_the_symbols_the_shim_defines() {
-    let shim = rope_shim(kernels_cuda_new::table::rope::KERNELS);
-    let rs = kernels_cuda_new::abi::emit_rust_bindings(&[kernels_cuda_new::table::rope::KERNELS]);
-    for k in kernels_cuda_new::table::rope::KERNELS {
-        let entry = kernels_cuda_new::abi::entry_name(k.symbol);
-        assert!(
-            shim.contains(&format!("void {entry}(")),
-            "{entry} not defined"
-        );
-        assert!(rs.contains(&format!("fn {entry}(")), "{entry} not declared");
-    }
-}
-
 /// The two ways the SHIM BUILD can fail that no per-family case reaches.
 ///
 /// Both were found by the `origin/rewrite` merge, which is the point: a
@@ -1171,10 +1099,14 @@ fn the_rust_bindings_name_the_symbols_the_shim_defines() {
 ///
 /// **A directory nobody proves.** `build.rs` names eleven family directories
 /// by hand, and `comm` was not among them: the two collective rows live in
-/// `gemm.rs`, their launchers live in `csrc/src/comm/`, and no
+/// `gemm.rs`, their launchers lived in `csrc/src/comm/` (which is now
+/// DELETED — `fire::all_reduce` is the launcher and both rows are
+/// `execution::RUST_SERVED`), and no
 /// `every_*_row_states_its_launcher_exactly` case owns that directory. Here
 /// the include set is READ from the tree rather than typed, so a row whose
-/// family has a directory is covered the moment the directory exists.
+/// family has a directory is covered the moment the directory exists — and
+/// stops being included the moment it does not, which is the same property
+/// read the other way.
 ///
 /// **A name Rust cannot spell.** The C++ side accepts an operand called
 /// `ref`; `emit_rust_bindings` writes it into an `extern "C"` block and the
@@ -1317,7 +1249,10 @@ const MIRROR_HPPS: &[&str] = &[
     "attention_workspace_view.hpp",
     "attn/mla_cache_view.hpp",
     "attn/attention_flashinfer_hopper.hpp",
-    "attn/mla_paged.hpp",
+    // `attn/mla_paged.hpp` stood here and is DELETED with its `.cu`. The
+    // `MlaCacheLayerView` mirror is still asserted through
+    // `attn/mla_cache_view.hpp`, which is where the record is DEFINED; the
+    // launcher header only included it.
 ];
 
 /// A `#[repr(C)]` mirror really does have the C++ record's layout.
@@ -1607,7 +1542,11 @@ fn every_driver_internal_row_states_its_launcher_exactly() {
     headers.push("gemm/gemm.hpp".into());
     // The VL tower rows' flat launchers — the C++-struct tower headers
     // stay out (their `std::vector` members are the wrappers' business,
-    // not the shim's).
+    // not the shim's). BOTH ROW SETS ARE GONE: all three towers are Rust
+    // and `driver-cuda/csrc/vision/` is deleted, so these two headers now
+    // declare launchers nothing rows and nothing calls. They stay pushed
+    // because `prove_family` proves ROW -> declaration and not the reverse,
+    // and a header list that is a superset costs a parse.
     headers.push("vision/qwen3_vl_tower_c.hpp".into());
     headers.push("vision/gemma4_towers_c.hpp".into());
     prove_family(
@@ -1875,7 +1814,9 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
          `DriverInternal` or a missing row: {driver_calls:?}"
     );
     let mut cu_text = String::new();
-    collect_cu_bodies(&csrc(), &mut cu_text);
+    for root in cu_roots() {
+        collect_cu_bodies(&root, &mut cu_text);
+    }
     assert!(
         cu_text.len() > 100_000,
         "only {} bytes of .cu body found, so the orphan check is vacuous",
@@ -1921,33 +1862,68 @@ fn collect_files_named(dir: &Path, name: &str, out: &mut String) {
 /// off the RUST side (`as i32`, `size_of`) and baked into a generated TU as
 /// `static_assert`s against the real headers. A reordered C++ enum fails here
 /// rather than routing gemma-4's experts through qwen's activation.
+///
+/// # `Mxfp4RowSelect` left this TU, and did not leave the test
+///
+/// It was checked here against `quant/mxfp4_marlin.hpp`, which is DELETED
+/// with `quant/mxfp4_marlin.cu`. Its three values did not stop existing: they
+/// cross into device code as a plain `int` (`families::quant:481`), and
+/// `kernels-cuda-new/csrc/src/quant/mxfp4_marlin.cuh:70-72` names them
+/// `kRowSelectIdentity`, `kRowSelectEven` and `kRowSelectOdd` precisely so
+/// the mapping is one grep. So the claim moved rather than dying:
+/// [`the_mxfp4_row_select_mirror_matches_the_device_text`] reads those three
+/// lines out of the `.cuh` and compares them to the Rust enum. It is a weaker
+/// proof than a `static_assert` — text, not a compiler — and it is the
+/// strongest one available once the host header is gone, which is the trade
+/// every row that leaves the archive makes.
 #[test]
 fn the_enum_mirrors_carry_the_cpp_discriminants() {
-    use driver_cuda::bind::abi::{MoeActivation, Mxfp4RowSelect};
+    use driver_cuda::bind::abi::MoeActivation;
     let tu = format!(
         "#include <cstdint>\n\
          #include \"moe/flashinfer_moe.hpp\"\n\
-         #include \"quant/mxfp4_marlin.hpp\"\n\
          using ::pie_cuda_driver::kernels::moe::MoeActivation;\n\
-         using ::pie_cuda_driver::kernels::quant::Mxfp4RowSelect;\n\
          static_assert(sizeof(MoeActivation) == {});\n\
          static_assert(static_cast<int>(MoeActivation::Relu2) == {});\n\
          static_assert(static_cast<int>(MoeActivation::Swiglu) == {});\n\
-         static_assert(static_cast<int>(MoeActivation::Geglu) == {});\n\
-         static_assert(sizeof(Mxfp4RowSelect) == {});\n\
-         static_assert(static_cast<int>(Mxfp4RowSelect::Identity) == {});\n\
-         static_assert(static_cast<int>(Mxfp4RowSelect::Even) == {});\n\
-         static_assert(static_cast<int>(Mxfp4RowSelect::Odd) == {});\n",
+         static_assert(static_cast<int>(MoeActivation::Geglu) == {});\n",
         core::mem::size_of::<MoeActivation>(),
         MoeActivation::Relu2 as i32,
         MoeActivation::Swiglu as i32,
         MoeActivation::Geglu as i32,
-        core::mem::size_of::<Mxfp4RowSelect>(),
-        Mxfp4RowSelect::Identity as i32,
-        Mxfp4RowSelect::Even as i32,
-        Mxfp4RowSelect::Odd as i32,
     );
     if let Err(err) = compile(&tu) {
         panic!("an enum mirror disagrees with the C++:\n{err}");
+    }
+}
+
+/// `Mxfp4RowSelect`'s three discriminants still match the device text.
+///
+/// The half of [`the_enum_mirrors_carry_the_cpp_discriminants`] that lost its
+/// header. `abi::Mxfp4RowSelect` is `#[repr(i32)]` and reaches the kernel as
+/// `ArgValue::I32`, so what has to hold is that Rust's `Even` and the
+/// `.cuh`'s `kRowSelectEven` are the same NUMBER — the enum's C++ type is no
+/// longer part of the story, because there is no longer a C++ caller to have
+/// one.
+///
+/// Reads the `.cuh` at build time rather than parsing it at run time so a
+/// renamed constant is a missing `include_str!` match and not a silent pass.
+#[test]
+fn the_mxfp4_row_select_mirror_matches_the_device_text() {
+    use driver_cuda::bind::abi::Mxfp4RowSelect;
+    let cuh = include_str!("../../kernels-cuda-new/csrc/src/quant/mxfp4_marlin.cuh");
+    for (name, value) in [
+        ("kRowSelectIdentity", Mxfp4RowSelect::Identity as i32),
+        ("kRowSelectEven", Mxfp4RowSelect::Even as i32),
+        ("kRowSelectOdd", Mxfp4RowSelect::Odd as i32),
+    ] {
+        let wanted = format!("constexpr int {name} = {value};");
+        assert!(
+            cuh.contains(&wanted),
+            "`quant/mxfp4_marlin.cuh` does not say `{wanted}`, so the Rust mirror and the \
+             device text disagree about which half of an interleaved MXFP4 bank a row \
+             reads. `select_row` takes the number, not the enum, so nothing else catches \
+             this."
+        );
     }
 }

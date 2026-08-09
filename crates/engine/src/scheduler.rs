@@ -486,15 +486,13 @@ fn rs_state_copy_plan(
     let slot_ranges = src_slots
         .into_iter()
         .zip(dst_slots)
-        .map(
-            |(src_slot_id, dst_slot_id)| ::driver_api::StateCopyRange {
-                src_slot_id,
-                dst_slot_id,
-                src_token_offset: 0,
-                dst_token_offset: 0,
-                token_count: 0,
-            },
-        )
+        .map(|(src_slot_id, dst_slot_id)| ::driver_api::StateCopyRange {
+            src_slot_id,
+            dst_slot_id,
+            src_token_offset: 0,
+            dst_token_offset: 0,
+            token_count: 0,
+        })
         .collect();
     Ok(Some(crate::driver::StateCopyPlan { slot_ranges }))
 }

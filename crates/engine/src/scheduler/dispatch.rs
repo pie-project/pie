@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use ::driver_api::{PIE_MEMORY_DOMAIN_HOST_PINNED, KvMoveCell, PoolRange, StateCopyRange};
+use ::driver_api::{KvMoveCell, PIE_MEMORY_DOMAIN_HOST_PINNED, PoolRange, StateCopyRange};
 use anyhow::Result;
 
 use crate::driver::{

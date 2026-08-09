@@ -436,6 +436,32 @@ pub fn emit_device_typecheck(rows: &[DeviceKernel]) -> Result<String, String> {
         out.push_str(&format!("#include \"{f}\"\n"));
     }
     out.push('\n');
+    // THE ONE OPERAND WHOSE WIDTH IS NOT STATED BY ITS DECLARATION.
+    //
+    // `Ty::KvScheme` and `Ty::KvDType` are `enum class … : ::std::uint8_t`,
+    // so their crossing is a byte because the C++ says so.
+    // `__nv_fp8_interpretation_t` is an UNSCOPED enum with no fixed
+    // underlying type (`cuda_fp8.h:185-188`), so its width is the
+    // implementation's choice — four bytes everywhere this repo builds, and
+    // nowhere promised. `emit::crossing` marshals it as `Crossing::U32`, and
+    // a cell one byte wide against a four-byte parameter does not fail: it
+    // mis-marshals every argument AFTER it, which is a wrong answer with no
+    // diagnostic anywhere.
+    //
+    // So it is asserted, here, in the only TU that has both the enum and the
+    // rows that name it — and only when a row does, so that a tree with no
+    // fp8 operand does not acquire a dependency on `<cuda_fp8.h>` through a
+    // generated file. The header arrives through the templates above:
+    // `attn/kv_paged.cuh` and `attn/attention_naive_paged.cuh` include it.
+    if rows.iter().any(|k| k.sig.operands.iter().any(|o| o.ty == kernels::Ty::Fp8Kind)) {
+        out.push_str(
+            "// `Ty::Fp8Kind` crosses as four bytes. See `kernels::Ty::Fp8Kind`.\n\
+             static_assert(sizeof(::__nv_fp8_interpretation_t) == 4,\n    \
+             \"__nv_fp8_interpretation_t is not four bytes: `emit::crossing` \
+             marshals `Ty::Fp8Kind` as `Crossing::U32`, and a narrower enum \
+             shifts every argument after it\");\n\n",
+        );
+    }
     out.push_str("namespace {\n\n");
 
     let mut seen: Vec<(String, &str)> = Vec::new();
@@ -690,10 +716,24 @@ mod tests {
     /// the C++ side proves a signature the Rust side does not call.
     #[test]
     fn both_halves_are_emitted_from_the_same_rows() {
-        let tables: &[&'static [KernelSig]] = &[crate::table::rope::KERNELS];
-        let c = emit_c_shim(tables, &["rope/rope.hpp"], &[]).expect("no collisions");
+        // `crate::table::rope::KERNELS` STOOD HERE. `rope` crossed into
+        // fn-world (`.wiki/kernel-x/northstar.md` §5 step 3) and its
+        // contracts state no `operands`, so `stated()` returns nothing for
+        // it and this test would assert over an empty set — which passes
+        // and proves nothing. `norm` is the nearest table that still has
+        // ahead-of-time rows.
+        //
+        // The `RUST_SERVED` filter is `emit_c_shim`'s own, hoisted here
+        // because the table it walks now has rows on that list: a row served
+        // by a Rust host program has no shim entry BY DESIGN, and asserting
+        // one exists would assert the opposite of what the emitter is for.
+        let tables: &[&'static [KernelSig]] = &[crate::table::norm::KERNELS];
+        let c = emit_c_shim(tables, &["norm/rmsnorm.hpp"], &[]).expect("no collisions");
         let rs = emit_rust_bindings(tables);
-        for k in stated(tables) {
+        for k in stated(tables)
+            .into_iter()
+            .filter(|k| !crate::execution::RUST_SERVED.contains(&k.symbol))
+        {
             let entry = entry_name(k.symbol);
             assert!(c.contains(&entry), "{entry} missing from the shim");
             assert!(rs.contains(&entry), "{entry} missing from the bindings");
@@ -948,6 +988,7 @@ fn arg_value_variant(ty: kernels::Ty) -> Option<&'static str> {
         // exist to catch is caught by `emit_device_typecheck`'s
         // function-pointer initialisation rather than by a marshalling kind.
         kernels::Ty::KvScheme | kernels::Ty::KvDType => "crate::bind::device::ArgValue::U8",
+        kernels::Ty::Fp8Kind => "crate::bind::device::ArgValue::U32",
         // AND THE POINTERS, LISTED. This was `_ => Ptr`, which is the same
         // sentence as "everything I have not thought about is an address" —
         // and the two scalars above are what that cost. The list is
@@ -1400,6 +1441,10 @@ fn cast_for(e: &str, ty: kernels::Ty) -> Option<String> {
         // not compile; a variant that renders here and not in one of those
         // fails at link or at launch. Five renderings, all five or none.
         kernels::Ty::KvScheme | kernels::Ty::KvDType => format!("({e}) as u8"),
+        // The fp8 interpretation is the sixth rendering of the rule above and
+        // was added in one edit across all of them: `Ty::cpp`, `Ty::rust`,
+        // `emit::crossing`, `runtime::args`, `bind::device` and here.
+        kernels::Ty::Fp8Kind => format!("({e}) as u32"),
         _ => e,
     })
 }
@@ -2424,7 +2469,8 @@ mod stated_rows {
             crate::table::moe::KERNELS,
             crate::table::norm::KERNELS,
             crate::table::quant::KERNELS,
-            crate::table::rope::KERNELS,
+            // `crate::table::rope::KERNELS` stood here; `rope` states no
+            // operands now and would contribute no row to this walk.
             crate::table::ssm::KERNELS,
         ];
         let mut missing = Vec::new();

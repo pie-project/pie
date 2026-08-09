@@ -18,7 +18,9 @@ fn the_metal_backend_opens_a_device_and_states_what_it_is() {
     assert_eq!(backend.kind(), "metal");
     // Off the CONTRACT rather than out of `create`'s second return value:
     // a driver states its own facts, so there is one copy of them.
-    let facts = backend.device_facts().expect("a local driver knows its device");
+    let facts = backend
+        .device_facts()
+        .expect("a local driver knows its device");
     assert_eq!(facts.backend, "metal");
     assert!(
         facts.unified_memory,

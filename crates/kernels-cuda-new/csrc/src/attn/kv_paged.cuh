@@ -60,11 +60,21 @@
 //   as unsigned, which is the kind of agreement that holds until a count goes
 //   negative for a reason nobody predicted. The row says `I64` and the gap is
 //   the binder's to close.
-// * `dequant_fp8_pages_active` is the same `Elementwise` shape and has NO
+// * `dequant_fp8_pages_active` is the same `Elementwise` shape and had NO
 //   row, because it takes `__nv_fp8_interpretation_t fp8_kind` and the `Ty`
-//   vocabulary has no enum. Making it a non-type template parameter with a
+//   vocabulary had no enum. Making it a non-type template parameter with a
 //   default would be worse than leaving it: `__NV_E5M2` pages would silently
 //   decode as `__NV_E4M3`, which is a numerically plausible wrong answer.
+//   **RETIRED, and the last sentence is the reason the fix is a `Ty` and not
+//   a default**: `kernels::Ty::Fp8Kind` states the enum, so the value stays a
+//   RUNTIME argument the host computes and the row is
+//   `families::attn::KV_PAGED_SIGS[24]`. Its width is four bytes and unlike
+//   `Ty::KvScheme` the C++ does not say so — `cuda_fp8.h:185-188` is an
+//   unscoped enum with no fixed underlying type — so `abi::emit_device_typecheck`
+//   emits a `static_assert(sizeof(::__nv_fp8_interpretation_t) == 4)` into
+//   the TU that instantiates these kernels rather than trusting the
+//   toolchain. Same for `write_kv_fp8_per_tensor`, which takes the same
+//   argument and is `KV_PAGED_SIGS[20]`.
 // * The six write forms and `write_kv_explicit_devwin` all launch
 //   `<<<rows, 256>>>` — one block per destination row, a fixed 256 threads,
 //   a stride loop over `h_kv * head_dim`. There is no rule for that shape.
@@ -73,9 +83,15 @@
 //   would launch a different geometry. Naming either would be inventing a
 //   rule under an existing name.
 // * `write_kv_per_token_head` launches `grid(tokens, h_kv)` with dynamic
-//   shared memory sized from `head_dim`; `write_kv_fp4_block` launches a
-//   three-axis grid at 32 threads. No ported rule has two meaningful grid
-//   axes or computes a shared-memory size.
+//   shared memory; `write_kv_fp4_block` launches a three-axis grid at 32
+//   threads. No ported rule has two meaningful grid axes or states a
+//   shared-memory size. **ROWED, NOT RULED**: all three are
+//   `LaunchRule::Unstated` (`KV_PAGED_SIGS[21..=23]`) and the driver states
+//   the geometry itself, which is `fire/attn_score.rs`' shape and what §10.5
+//   requires instead of a rule variant per kernel. The shared memory is
+//   `2 * (256 / 32) * sizeof(float)` = 64 bytes and is sized from the BLOCK,
+//   not from `head_dim` as this line said: two floats per warp for the K and
+//   V absmax reductions, the same 64 bytes at every geometry.
 // * `build_window_page_view` is `<<<1, 256>>>` and `build_full_split_view` is
 //   `<<<1, 32>>>` with the work on thread zero. A single block is a geometry
 //   no rule states, and `Elementwise` would launch `ceil(n/256)` of them —

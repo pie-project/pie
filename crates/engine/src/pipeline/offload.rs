@@ -1888,9 +1888,9 @@ mod tests {
         );
         let remote_driver_id = crate::driver::register_driver_backend(
             crate::driver::DriverSpec {
-                    // Overwritten by `register_driver_backend` from the
-                    // backend itself; see `DriverSpec::device_domain`.
-                    device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
+                // Overwritten by `register_driver_backend` from the
+                // backend itself; see `DriverSpec::device_domain`.
+                device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
                 num_kv_pages: 8,
                 limits: crate::driver::SchedulerLimits {
                     max_forward_requests: 8,
@@ -2024,9 +2024,9 @@ mod tests {
         );
         let remote_driver_id = crate::driver::register_driver_backend(
             crate::driver::DriverSpec {
-                    // Overwritten by `register_driver_backend` from the
-                    // backend itself; see `DriverSpec::device_domain`.
-                    device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
+                // Overwritten by `register_driver_backend` from the
+                // backend itself; see `DriverSpec::device_domain`.
+                device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
                 num_kv_pages: 8,
                 limits: crate::driver::SchedulerLimits {
                     max_forward_requests: 8,

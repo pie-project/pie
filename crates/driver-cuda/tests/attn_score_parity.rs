@@ -11,7 +11,8 @@
 //! included (here the pure `_from` form answers it).
 //!
 //! Run `tests/oracle/attn_score/run.sh` to regenerate [`GOLDEN_FNV1A64`].
-//! The pinned value is the **C++'s** hash.
+//! The pinned value is the **C++'s** hash — see that constant for why the
+//! regenerator no longer runs and what that costs.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -25,12 +26,46 @@ use driver_cuda::fire::attn_score::{
 use driver_cuda::fire::sideband_arena::{DeviceMemory, SidebandArena};
 
 /// FNV-1a 64 of the C++ oracle's transcript.
+///
+/// # This can no longer be regenerated, and that is a fact about the tree
+///
+/// `tests/oracle/attn_score/run.sh` compiles `driver-cuda/csrc/src/model/
+/// attn_score.cu` against `hook_sideband_arena.cpp`. **Neither file exists**:
+/// commit `4569b9e4b` ("Delete crates/driver-cuda") removed the whole
+/// directory, and the `driver-cuda` in the tree today is the Rust rewrite.
+/// `run.sh` starts `set -euo pipefail` and its first `cp` fails, so the
+/// script cannot produce a number for anyone.
+///
+/// The value below is therefore FROZEN. It is still worth having — it pins
+/// the port against the last C++ that existed, which is the whole claim the
+/// test makes — but it can only ever be *preserved*, never re-derived, and
+/// any change that adds a row to the transcript makes this test permanently
+/// red rather than one command stale.
+///
+/// **That is why the three capture post-kernels record nothing.** Their
+/// launches moved into `LayerScoreCapture::publish` and
+/// `LayerPrefillScoreCapture::publish` (see `fire::attn_score`'s header),
+/// but they were the tail of `attention_flashinfer.cu`'s capture dispatch —
+/// a translation unit this oracle never compiled and whose launches were
+/// never in this transcript. Recording them would compare the Rust against a
+/// C++ program that did not contain them, using a golden nobody can rebuild.
+/// So [`Recorder`]'s three new methods are silent, the omission is stated at
+/// each one, and the geometry those launches carry is pinned instead by
+/// `tests/attn_score_post_geometry.rs`, which needs no oracle because it is
+/// a transcription check rather than a behavioural one.
 const GOLDEN_FNV1A64: u64 = 0x132d0dce71b9a15c;
 
 /// Rows the transcript must contain, so a truncated sweep cannot pass.
 const GOLDEN_ROWS: usize = 68;
 
 const SEP: char = '\u{1f}';
+
+/// The fixture's device CSRs, matching [`Fire::obs`]'s literals. `QO_D` has
+/// no counterpart in the observation — the C++ capture dispatch took the
+/// query CSR as its own argument — so it is a fourth fixed address.
+const QO_D: *const u32 = 0x40 as *const u32;
+const KVPP_D: *const u32 = 0x20 as *const u32;
+const LENS_D: *const u32 = 0x30 as *const u32;
 
 /// The oracle's recorders: one region registry serving `where()`, shared
 /// by the arena's memory calls and the stream ops — which is why the port
@@ -114,6 +149,64 @@ impl ScoreOps for Recorder {
             .collect::<Vec<_>>()
             .join(",");
         self.note(&format!("upload dst={w} kind=1 csr=[{csr}]"));
+    }
+
+    // ── the three that record NOTHING, and why ────────────────────────
+    //
+    // These launches are new to `publish()`; they are not new to the driver.
+    // They were the tail of `attention_flashinfer.cu`'s two capture
+    // dispatches, and this oracle compiles `model/attn_score.cu` — a
+    // different translation unit, which never issued them. The golden is a
+    // transcript of THAT program and cannot be rebuilt (see
+    // `GOLDEN_FNV1A64`), so emitting a row here would not be a stale hash,
+    // it would be a permanent divergence from a frozen number.
+    //
+    // Recording nothing is therefore the honest reading of what this test
+    // claims: "the port reproduces the C++ transcript" is a claim about
+    // `attn_score.cu`, and these three were never in it. What is NOT claimed
+    // — that their operands and geometry are right — is claimed by
+    // `attn_score_post_geometry.rs` instead, and that file exists because
+    // this one cannot make the claim.
+
+    fn normalize_decode(
+        &mut self,
+        _scores: *mut f32,
+        _score_indptr_d: *const i32,
+        _kv_page_indptr_d: *const u32,
+        _kv_last_page_lens_d: *const u32,
+        _page_size: i32,
+        _num_requests: i32,
+        _num_q_heads: i32,
+    ) {
+    }
+
+    fn normalize_prefill(
+        &mut self,
+        _scores: *mut f32,
+        _score_indptr_d: *const i32,
+        _qo_indptr_d: *const u32,
+        _kv_page_indptr_d: *const u32,
+        _kv_last_page_lens_d: *const u32,
+        _page_size: i32,
+        _num_requests: i32,
+        _num_q_heads: i32,
+        _window: i32,
+    ) {
+    }
+
+    fn fold_prefill(
+        &mut self,
+        _scores: *const f32,
+        _folded: *mut f32,
+        _score_indptr_d: *const i32,
+        _qo_indptr_d: *const u32,
+        _kv_page_indptr_d: *const u32,
+        _kv_last_page_lens_d: *const u32,
+        _page_size: i32,
+        _num_requests: i32,
+        _num_q_heads: i32,
+        _window: i32,
+    ) {
     }
 
     fn fold_heads(
@@ -521,7 +614,10 @@ fn transcript() -> String {
         );
         r.note(&body);
         payload_row(&mut r, "pre-publish", cap.scores(), 3);
-        cap.publish();
+        // The four device arguments the C++ dispatch passed its own tail;
+        // the recorder is silent for both launches, so only the payload rows
+        // either side of them reach the transcript.
+        cap.publish(&mut r, QO_D, KVPP_D, LENS_D, 4);
         payload_row(&mut r, "published", cap.scores(), 3);
         cap.release(&mut arena, &mut scratch);
     }
@@ -595,7 +691,7 @@ fn transcript() -> String {
             4,
             true,
         );
-        pf.publish();
+        pf.publish(&mut r, QO_D, KVPP_D, LENS_D, 4);
         payload_row(&mut r, "prefill", pf.scores(), 3);
         {
             let mut dec = LayerScoreCapture::new(

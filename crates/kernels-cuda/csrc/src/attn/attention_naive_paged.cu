@@ -1,37 +1,62 @@
-// Paged reference-attention launchers.
+// THE ENUM MIRRORS, AND NOTHING ELSE. This translation unit holds no
+// launcher and no launch.
 //
 // The device text -- `naive_paged_attn<BLOCK>`, `naive_paged_decode<BLOCK>`,
 // the five helpers they call and the two enum mirrors -- moved to
 // `crates/kernels-cuda-new/csrc/src/attn/attention_naive_paged.cuh`, which
-// this file includes. There is ONE text: the ahead-of-time build compiles it
-// through this translation unit and NVRTC compiles the same header.
+// this file includes.
 //
-// Kept here: the four `<<<grid, block, smem, stream>>>`, the dynamic
-// shared-memory size, `KvCacheLayerView` unpacking, and
-// `check_head_dim_supported`, which THROWS and so can never cross.
-#include "attn/attention_naive_paged.hpp"
+// THE THREE LAUNCHERS ARE DELETED. `attn::attention_naive_paged` is named in
+// `kernels_cuda_new::device::JIT_DISPATCHED`, so `abi::emit_c_shim` skips its
+// row and no `pie_k_attn_attention_naive_paged` is generated; the shim entry
+// was the whole consumer set. `attention_naive_paged_bf16` had no row at all
+// and was called only by the sibling `attention_naive_paged` overload that
+// dequantised first, so the two died together, and with them this file's
+// `#include "attn/kv_paged.hpp"` -- the last archive caller of
+// `dequant_kv_cache_layer_to_bf16_active` outside `driver-cuda/csrc/`.
+//
+// WHAT WENT WITH THEM, recorded because a rule does not say it:
+//
+//   * `dim3 grid(num_requests, total_tokens, num_q_heads)` -- `total_tokens`
+//     standing in for the largest single-request `qo_len`, which the host
+//     does not have, with the kernel early-exiting when
+//     `qo_off >= qo_hi - qo_lo`. `LaunchRule::PagedScores` states exactly
+//     this rectangle, which is why the row could be routed at all.
+//   * `smem = (head_dim + BLOCK) * sizeof(float)`, stated by the same rule.
+//   * `check_head_dim_supported`, which THREW for `head_dim` outside
+//     `[1, kMaxHeadDim]`. A throw cannot cross the ABI, and the JIT path has
+//     no equivalent: `acc[]` in the kernel is sized
+//     `(kMaxHeadDim + BLOCK - 1) / BLOCK`, so a larger `head_dim` overruns it
+//     rather than being diagnosed. That is a REFUSAL with no home, and
+//     `.wiki/driver/new-horizon.md` §56 is where it is written down.
+//
+// WHY THE FILE STAYS. The `static_assert`s below are the only place the host
+// enums (`KvCacheScheme`, `DType`) and the device mirrors NVRTC reads
+// (`device::KvScheme`, `device::KvDType`) are compared. `mxfp4_marlin.cuh`
+// keeps its mirror in step with a comment, and a comment is one careless
+// renumbering away from decoding fp8 pages as int8. Deleting the launchers
+// does not make the mirrors agree, so the check outlives them --
+// `attn/attention_xqa.cu` is the precedent for a `.cu` that survives its last
+// `<<<>>>`.
 
-#include <cstddef>
 #include <cstdint>
-#include <stdexcept>
-#include <string>
 
 #include <cuda_runtime.h>
 
 #include "attn/attention_naive_paged.cuh"
 
-#include "cuda_check.hpp"
+#include "attn/kv_cache_view.hpp"
+#include "tensor.hpp"
 
-#include "attn/kv_paged.hpp"
 
 namespace pie_cuda_driver::kernels::attn {
 
 namespace {
 
-// The one block width instantiated anywhere. Both kernels are compiled
-// against it and every launch below opens `dim3 block(BLOCK)`; the two must
-// agree or the halving reduction folds through shared memory the launch never
-// wrote.
+// The one block width the two kernels are instantiated at, kept because the
+// `static_assert` below is about it: `acc[]` is sized against `BLOCK` and the
+// two must agree or the halving reduction folds through shared memory the
+// launch never wrote. `LaunchRule::PagedScores` states the same 128.
 constexpr int BLOCK = 128;
 constexpr int MAX_HEAD_DIM = device::kMaxHeadDim;
 static_assert(MAX_HEAD_DIM == BLOCK * 8,
@@ -70,160 +95,6 @@ PIE_DTYPE_MIRRORS_HOST(FP8_E5M2);
 PIE_DTYPE_MIRRORS_HOST(INT4_PACKED);
 #undef PIE_DTYPE_MIRRORS_HOST
 
-void check_head_dim_supported(int head_dim, const char* caller) {
-    if (head_dim > 0 && head_dim <= MAX_HEAD_DIM) return;
-    throw std::runtime_error(
-        std::string(caller) + ": head_dim must be in [1, " +
-        std::to_string(MAX_HEAD_DIM) + "]; got " + std::to_string(head_dim));
-}
-
 }  // namespace
-
-void attention_naive_paged_bf16(
-    const void* q,
-    const void* k_pages, const void* v_pages,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int total_tokens,
-    int num_requests,
-    int num_q_heads, int num_kv_heads,
-    int head_dim, int page_size,
-    cudaStream_t stream,
-    int window_left,
-    float sm_scale,
-    float logits_soft_cap,
-    float* lse_out)
-{
-    if (num_requests <= 0 || total_tokens <= 0) return;
-    check_head_dim_supported(head_dim, "attention_naive_paged_bf16");
-    // We launch one block per (request, qo_offset, q_head) — qo_offset
-    // is bounded by the largest single-request qo_len. We don't have
-    // that bound on hand at the host side, so use `total_tokens` as
-    // the conservative upper bound and let the kernel early-exit when
-    // `qo_off ≥ qo_hi - qo_lo`. This wastes blocks on small requests
-    // but keeps the launch shape uniform.
-    dim3 grid(num_requests, total_tokens, num_q_heads);
-    dim3 block(BLOCK);
-    const std::size_t smem = (head_dim + BLOCK) * sizeof(float);
-    device::naive_paged_attn<BLOCK><<<grid, block, smem, stream>>>(
-        static_cast<const device::bf16*>(q),
-        k_pages,
-        v_pages,
-        nullptr,
-        nullptr,
-        static_cast<device::bf16*>(o),
-        qo_indptr_d, kv_page_indices_d,
-        kv_page_indptr_d, kv_last_page_lens_d,
-        nullptr,
-        nullptr,
-        num_q_heads, num_kv_heads, head_dim, page_size,
-        device::KvScheme::Native,
-        device::KvDType::BF16,
-        0,
-        window_left, sm_scale, logits_soft_cap, lse_out);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-// `attention_naive_paged_decode` WAS HERE, and it is deleted.
-//
-// It had no row, and `driver-cuda/tests/launch_abi.rs` recorded it as
-// `NoRow::KernelsInternal` -- "only sibling `.cu` files call it". The audit
-// measured which ones: none that anything reaches. Its geometry survives it
-// and is stated where it belongs, on
-// `families::attn::ATTENTION_NAIVE_PAGED_ROWS`' second row as
-// `LaunchRule::PagedScoresDecode`, so the kernel `naive_paged_decode` is
-// still compiled and still fireable -- through the JIT, by a caller with a
-// `Dims`, rather than through eleven arguments and a `KvCacheLayerView`
-// nothing hands it.
-
-void attention_naive_paged(
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int total_tokens,
-    int num_requests,
-    int num_pages_in_batch,
-    int num_q_heads,
-    cudaStream_t stream,
-    int window_left,
-    float sm_scale,
-    float logits_soft_cap,
-    float* lse_out)
-{
-    (void)num_pages_in_batch;
-    if (num_requests <= 0 || total_tokens <= 0) return;
-    check_head_dim_supported(kv_layer.head_dim, "attention_naive_paged");
-    dim3 grid(num_requests, total_tokens, num_q_heads);
-    dim3 block(BLOCK);
-    const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);
-    device::naive_paged_attn<BLOCK><<<grid, block, smem, stream>>>(
-        static_cast<const device::bf16*>(q),
-        kv_layer.k_pages,
-        kv_layer.v_pages,
-        static_cast<const float*>(kv_layer.k_scales),
-        static_cast<const float*>(kv_layer.v_scales),
-        static_cast<device::bf16*>(o),
-        qo_indptr_d,
-        kv_page_indices_d,
-        kv_page_indptr_d,
-        kv_last_page_lens_d,
-        nullptr,
-        nullptr,
-        num_q_heads,
-        kv_layer.num_kv_heads,
-        kv_layer.head_dim,
-        kv_layer.page_size,
-        static_cast<device::KvScheme>(kv_layer.scheme),
-        static_cast<device::KvDType>(kv_layer.storage_dtype),
-        kv_layer.block_size,
-        window_left,
-        sm_scale,
-        logits_soft_cap,
-        lse_out);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-// `attention_naive_paged_custom` WAS HERE, and it is deleted for the same
-// reason and with the same survival: the masked prefill kernel it launched is
-// `naive_paged_attn`, which `ATTENTION_NAIVE_PAGED_ROWS`' first row states at
-// `LaunchRule::PagedScores` and which the DISPATCHED
-// `attention_naive_paged_bf16` above still reaches. What went is a second
-// spelling of one launch that differed only in taking a mask -- and the row
-// takes a mask.
-
-void attention_naive_paged(
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int total_tokens,
-    int num_requests,
-    int num_pages_in_batch,
-    int num_q_heads,
-    cudaStream_t stream,
-    int window_left,
-    float sm_scale)
-{
-    dequant_kv_cache_layer_to_bf16_active(
-        kv_layer, kv_page_indices_d, num_pages_in_batch, stream);
-    attention_naive_paged_bf16(
-        q,
-        kv_layer.k_bf16_pages,
-        kv_layer.v_bf16_pages,
-        o,
-        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-        total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
-        kv_layer.head_dim, kv_layer.page_size, stream, window_left, sm_scale);
-}
 
 }  // namespace pie_cuda_driver::kernels::attn

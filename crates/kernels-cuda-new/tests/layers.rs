@@ -82,14 +82,33 @@ fn every_include_reachable_from_a_unit_resolves() {
 /// disagree then a kernel is compiled by one unit and looked for in another,
 /// and the symptom is a missing entry rather than anything that names the
 /// mistake.
+///
+/// # A unit name is the file's stem, OR the stem plus a lattice suffix
+///
+/// Every unit was 1:1 with a `.cuh` until `crate::families::fa2`, which is 56
+/// units over ONE root: `attn/fa2.cuh` compiled at 56 different points of a
+/// four-axis instantiation lattice. The equality this test used to assert was
+/// a proxy for the real property, and the real property is checked by
+/// `a_symbol_belongs_to_one_unit` below — one symbol, at most one unit.
+///
+/// So the stem is derived from the ROW's file and the unit name must equal it
+/// or extend it with `_`. That admits `attn/fa2.cuh` under
+/// `attn/fa2_decode_hd128_g4` and still rejects a row from another file
+/// entirely, which is the mistake the test was written for. It does NOT
+/// admit a stem match by prefix alone: `attn/attention_flashinfer` matches its
+/// own file exactly and is not confused with `attn/attention.cuh`, because
+/// the stem comes from the file and not from splitting the name.
 #[test]
 fn a_row_lives_in_the_unit_that_compiles_it() {
     for u in unit::UNITS {
-        let expected = format!("{}.cuh", u.name);
         for row in u.rows {
-            assert_eq!(
-                row.sig.file,
-                Some(expected.as_str()),
+            let Some(file) = row.sig.file else {
+                panic!("{} is in unit {} and claims no file", row.sig.symbol, u.name);
+            };
+            let stem = file.strip_suffix(".cuh").unwrap_or(file);
+            let lattice = format!("{stem}_");
+            assert!(
+                u.name == stem || u.name.starts_with(&lattice),
                 "{} is in unit {} and claims {:?}",
                 row.sig.symbol,
                 u.name,
@@ -186,12 +205,26 @@ fn every_row_spells_a_qualified_instantiation() {
             );
         } else {
             templated += 1;
+            // The absolute-spelling escape: a `template_path` or `elem` that
+            // already begins with `::` is spliced verbatim, because it names
+            // something outside our namespace. `crate::families::fa2`'s 460
+            // rows are the reason the field grew that reading — upstream's
+            // `__global__` is `::flashinfer::BatchDecodeWithPagedKVCacheKernel`
+            // with nine template arguments, and there is no wrapper that could
+            // bring it under `::pie_cuda_driver::kernels::` (an alias template
+            // aliases types, and a `__global__` cannot call a `__global__`).
+            // See `device::DeviceKernel::instantiation` for the four
+            // alternatives and why each was rejected.
+            let qualify = |field: &str| {
+                if field.starts_with("::") {
+                    field.to_string()
+                } else {
+                    format!("::pie_cuda_driver::kernels::{field}")
+                }
+            };
             assert_eq!(
                 instantiation,
-                format!(
-                    "::pie_cuda_driver::kernels::{}<::pie_cuda_driver::kernels::{}>",
-                    row.template_path, row.elem
-                ),
+                format!("{}<{}>", qualify(row.template_path), qualify(row.elem)),
                 "{} is a template instantiation",
                 row.sig.symbol
             );
@@ -254,12 +287,13 @@ fn a_served_symbol_is_never_hosted() {
 /// The lookup answers the right ARM for every stated symbol, over the whole
 /// table rather than over the fourteen rows that are interesting.
 ///
-/// `None` is deliberate and is not a fourth arm: it means "an unmigrated
+/// `None` is deliberate and is not a fifth arm: it means "an unmigrated
 /// kernel", which is a fact about this migration's progress and not about how
 /// the symbol executes.
 #[test]
 fn the_lookup_agrees_with_the_tables_it_reads() {
-    let (mut jit, mut served, mut composed, mut pending) = (0usize, 0usize, 0usize, 0usize);
+    let (mut jit, mut served, mut composed, mut walked, mut pending) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
     for row in table::KERNELS {
         match execution::execution(row.symbol) {
             Some(execution::Execution::Jit(kernel)) => {
@@ -289,19 +323,56 @@ fn the_lookup_agrees_with_the_tables_it_reads() {
                     row.symbol
                 );
             }
+            Some(execution::Execution::Walk(walk)) => {
+                walked += 1;
+                assert_eq!(walk.symbol, row.symbol, "the walk table answers the wrong row");
+                assert!(
+                    unit::unit_of(row.symbol).is_none(),
+                    "{} answers `Walk` and a unit hosts it -- a walk is a HOST program whose \
+                     shape comes from the input, and `fire` takes a `Dims` that has no meaning \
+                     for one",
+                    row.symbol
+                );
+                assert!(
+                    execution::service(row.symbol).is_none(),
+                    "{} answers `Walk` and a service serves it",
+                    row.symbol
+                );
+                assert!(
+                    execution::composition(row.symbol).is_none(),
+                    "{} answers `Walk` and a composition states it -- a fixed sequence and an \
+                     input-shaped one are different claims about the same program, and at most \
+                     one of them is true",
+                    row.symbol
+                );
+            }
             None => pending += 1,
         }
     }
     assert_eq!(served, execution::SERVED.len(), "a served row is not a table row");
     assert_eq!(composed, execution::COMPOSED.len(), "a composed row is not a table row");
+    // Not `WALKED.len()`: three of the walks are `driver_internal` rows,
+    // which `table::KERNELS` deliberately does not hold (`table/mod.rs`'s
+    // `the_driver_internal_rows_are_not_statable`). The denominator is the
+    // walks a model text CAN state, and this loop is over exactly those.
+    // (It was "three of the five" until the `norm/` and `rope/` launchers
+    // became `driver-cuda/src/fire/{rmsnorm,rope,dsv4_hc}.rs`, which added
+    // fifteen statable walks at once; the filter is why that needed no edit
+    // here.)
+    // `execution::tests::every_walk_agrees_and_is_stated_once` is what checks
+    // the other three against the table that does hold them.
+    let statable_walks =
+        execution::WALKED.iter().filter(|w| table::sig(w.symbol).is_some()).count();
+    assert_eq!(walked, statable_walks, "a walked row is not a table row");
     assert_eq!(
-        jit + served + composed + pending,
+        jit + served + composed + walked + pending,
         table::KERNELS.len(),
         "the lookup is not total"
     );
     assert!(
-        jit > 100 && composed > 0 && pending > 0,
-        "the arms are not all exercised: {jit} jit, {composed} composed, {pending} pending"
+        jit > 100 && composed > 0 && walked > 0 && pending > 0,
+        "the arms are not all exercised: {jit} jit, {composed} composed, {walked} walked, \
+         {pending} pending"
     );
 }
 
@@ -564,15 +635,26 @@ fn the_three_kinds_are_all_reachable() {
         "the ORDER is the sequence, and it is the one fact a row could not state"
     );
 
-    // The whole point of the design, in one assertion: an op whose first step
-    // reaches something this crate does not execute is still an op, and the
-    // step does not know what executes it.
+    // The whole point of the design, in one assertion: a step names a SYMBOL
+    // and knows nothing about what executes it — so the executor can change
+    // underneath a composition without the composition changing a byte.
+    //
+    // This assertion used to read `execution("gemm::act_x_wt_bf16").is_none()`
+    // and called the first step *"an UNMIGRATED kernel — neither `Jit` nor
+    // `Service`"*. It was true for four arcs and it is the thing that
+    // changed: `gemm.cpp`'s dense autotuner is `driver-cuda/src/fire/gemm.rs`
+    // now, the row is `Execution::Walk`, and `COMPOSED`'s entry for
+    // `gemm::act_x_wt_bias_bf16` is byte-for-byte what it was. **That is the
+    // information hiding working**, and it is a stronger demonstration than
+    // the absence was: the step did not have to know, and it did not.
     let bias = execution::execution("gemm::act_x_wt_bias_bf16").expect("the demonstration case");
     assert_eq!(bias.kind(), Kind::Op);
+    let first = execution::execution("gemm::act_x_wt_bf16")
+        .expect("the demonstration case's first step is executed now");
     assert!(
-        execution::execution("gemm::act_x_wt_bf16").is_none(),
-        "the demonstration case's first step is an UNMIGRATED kernel — neither `Jit` nor \
-         `Service` — which is the information hiding one arm further out than the open \
-         question assumed"
+        matches!(first, Execution::Walk(_)),
+        "`gemm::act_x_wt_bf16` is a driver-owned host walk — a runtime autotuner over three \
+         kernel families — and neither `Jit` nor `Service` can say that"
     );
+    assert_eq!(first.kind(), Kind::Op);
 }

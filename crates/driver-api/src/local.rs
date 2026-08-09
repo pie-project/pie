@@ -223,7 +223,6 @@ pub const PIE_ELASTIC_POOL_KV: u64 = 0;
 pub const PIE_ELASTIC_POOL_STATE: u64 = 1;
 pub const PIE_ELASTIC_POOL_WORKSPACE: u64 = 2;
 
-
 /// Terminal completion outcome published by the native driver.
 pub type TerminalOutcome = u32;
 
@@ -294,7 +293,6 @@ impl TerminalCell {
     }
 }
 
-
 /// Stable driver-owned host endpoint returned by channel registration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChannelBinding {
@@ -310,7 +308,6 @@ pub struct ChannelBinding {
     pub poison_word_index: u32,
     pub closed_word_index: u32,
 }
-
 
 /// A single KV cell move expressed in physical page/token coordinates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,7 +335,6 @@ pub struct PoolRange {
     pub page_count: u64,
 }
 
-
 /// What an emitted kernel is for. The driver switches on this to decide which
 /// launch path a compiled entry belongs to, so it never has to re-derive from
 /// the plan what the host already decided.
@@ -348,12 +344,10 @@ pub const PIE_KERNEL_GROUPED: u32 = 2;
 pub const PIE_KERNEL_READINESS: u32 = 3;
 pub const PIE_KERNEL_COMMIT: u32 = 4;
 
-
 /// The region can be bound as a second-party region.
 pub const PIE_REGION_SECOND_PARTY_SUPPORTED: u32 = 1 << 0;
 /// The region is a well-formed generated region.
 pub const PIE_REGION_GENERATED_VALID: u32 = 1 << 1;
-
 
 // ── the launch package ──
 //
@@ -416,7 +410,6 @@ pub const PIE_STAGE_REQUIRES_MTP_ROWS: u32 = 1 << 5;
 pub const PIE_STAGE_GROUPED_VALID: u32 = 1 << 6;
 /// The stage writes the `lora` sink.
 pub const PIE_STAGE_REQUIRES_LORA: u32 = 1 << 7;
-
 
 /// Driver-assigned identity returned from `*_bind_instance`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -556,7 +549,6 @@ fn validate_reserved_zero(name: &'static str, value: u32) -> ValidationResult {
     }
 }
 
-
 /// Validates a driver-owned channel endpoint binding against the plan it
 /// answers.
 ///
@@ -628,4 +620,3 @@ pub fn validate_instance_binding(binding: &InstanceBinding) -> ValidationResult 
     validate_reserved_zero("instance binding reserved0 must be zero", binding.reserved0)?;
     Ok(())
 }
-

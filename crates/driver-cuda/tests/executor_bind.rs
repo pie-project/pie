@@ -1403,7 +1403,10 @@ fn every_lowered_symbol_has_an_arm() {
     let generated = kernels_cuda_new::abi::emit_rust_dispatch(
         &[
             kernels_cuda_new::table::attn::KERNELS,
-            kernels_cuda_new::table::rope::KERNELS,
+            // `rope`'s rows are derived from its `contract!` block now; they
+            // state no operands, so this walk sees them and emits nothing,
+            // which is the same answer as before for a different reason.
+            kernels_cuda_new::x::rope::SIGS,
             kernels_cuda_new::table::norm::KERNELS,
             kernels_cuda_new::table::mlp::KERNELS,
             kernels_cuda_new::table::gemm::KERNELS,

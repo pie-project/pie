@@ -131,6 +131,13 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
     # `CublasOps` behind `cuda::cublas::CublasHandle` makes the five handle
     # calls the C++ wrapper makes. Dynamically loaded like everything else.
     "cublas",
+    # The third: cuBLASLt, the mixed-precision matmul plane. `gemm/gemm.cpp`'s
+    # quantized arms — FP8-weight x bf16-activation, and DeepSeek's block-
+    # scaled W8A8 — are `cublasLtMatmul` and nothing else, and
+    # `bind::quant_gemm` issues them. Enabling this generates BINDINGS, not
+    # link flags: `fallback-dynamic-loading` still resolves every symbol with
+    # `dlopen` on first use, so a box with no CUDA toolkit still builds.
+    "cublaslt",
     # The second: PTIR's compile plane. The host emits ONE self-contained CUDA
     # translation unit per fused region and this driver carries no emitter, so
     # NVRTC is not an optimisation -- a program with a generated region cannot
@@ -381,6 +388,16 @@ cc = "1"
 [[test]]
 name = "attn_score_parity"
 required-features = ["_cuda"]
+
+# No `required-features`, and that is the point of it. It resolves the four
+# post-kernel symbols through `kernels_cuda_new::unit` — a static table, not
+# a CUDA call — and compares each row's operand list against the C++
+# `<<<>>>` the driver transcribed. So the check that the migrated launches
+# pass their arguments in the right order runs on a box with no toolkit,
+# which is the gate `driver-cuda` has always had to satisfy. See the file's
+# header for why `attn_score_parity` cannot make this claim itself.
+[[test]]
+name = "attn_score_post_geometry"
 
 [[test]]
 name = "attn_ws_parity"

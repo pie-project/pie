@@ -18,6 +18,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../../../.." && pwd)"
 SRC="$ROOT/crates/driver-cuda/csrc/src"
 KSRC="$ROOT/crates/kernels-cuda/csrc/src"
+NSRC="$ROOT/crates/kernels-cuda-new/csrc/src"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -31,14 +32,23 @@ cp "$KSRC/tensor.hpp" "$WORK/"
 cp "$HERE/../kv_cache/stub/tensor_recorder.cpp" "$WORK/"
 cp -r "$HERE/stub/." "$WORK/"
 
-# `kArgmaxAccumSlots` is taken from the real header rather than retyped into
-# the stub, so the oracle cannot keep using 32 after the kernel changes it.
-SLOTS="$(sed -n 's/^constexpr int kArgmaxAccumSlots = \([0-9]\+\);.*/\1/p' \
-    "$KSRC/sample/argmax.hpp")"
-if [[ -z "$SLOTS" ]]; then
-    echo "could not read kArgmaxAccumSlots from $KSRC/sample/argmax.hpp" >&2
+# `kArgmaxAccumSlots` is taken from the real device text rather than retyped
+# into the stub, so the oracle cannot keep using 32 after the kernel changes
+# it. §54 deleted `kernels-cuda/csrc/src/sample/argmax.hpp`, which is where
+# this used to be read from: the launchers in it became
+# `driver-cuda/src/fire/lm_head_argmax.rs` and the header went with them. The
+# surviving authority is the kernel's own block width — the deleted header's
+# `kArgmaxAccumSlots` existed to publish `device::kAccumWarps` to callers, and
+# a `static_assert` in the deleted `.cu` tied the two — so this reads
+# `kAccumThreads` out of the NVRTC text and divides, which is `kAccumWarps`'s
+# definition verbatim.
+ACCUM_THREADS="$(sed -n 's/^constexpr i32 kAccumThreads = \([0-9]\+\);.*/\1/p' \
+    "$NSRC/sample/argmax.cuh")"
+if [[ -z "$ACCUM_THREADS" ]]; then
+    echo "could not read kAccumThreads from $NSRC/sample/argmax.cuh" >&2
     exit 1
 fi
+SLOTS=$(( ACCUM_THREADS / 32 ))
 
 g++ -std=c++20 -O1 -Wall -Wextra -Wno-unused-parameter \
     -DPIE_ARGMAX_ACCUM_SLOTS="$SLOTS" \

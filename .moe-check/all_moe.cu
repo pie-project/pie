@@ -1,0 +1,6 @@
+#include "pie_device.cuh"
+#include "moe/moe_dispatch.cuh"
+#include "moe/moe_grouped_gemm.cuh"
+#include "moe/topk_softmax.cuh"
+#include "moe/topk_sigmoid.cuh"
+#include "moe/dsv4_routing.cuh"

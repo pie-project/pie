@@ -1,7 +1,11 @@
 //===-- split_gate_up.cuh - the halves split of a packed gate/up bank -===//
 //
-// One `__global__` template. `split_gate_up.cu` includes this file and keeps
-// its launcher, so exactly one definition exists in the tree.
+// One `__global__` template, and no host launcher anywhere. `split_gate_up.cu`
+// included this file and held `split_gate_up_bf16`; §43 deleted the file whole
+// -- the launcher had no row, so no shim entry, and no C++ caller. Exactly one
+// definition still exists in the tree and it is the one below. The refusal
+// recorded here still stands, because it was always about the KERNEL's
+// indexing and not about the launcher that has gone.
 //
 // # The rule it was said to want, and the rule it actually states
 //

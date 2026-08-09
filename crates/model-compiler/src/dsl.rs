@@ -120,8 +120,16 @@ pub enum WeightRepr {
 /// constructor anywhere in the workspace outside this file, and no checkpoint
 /// format in the tree could have grown one without the loader growing a
 /// granularity first. It is deleted rather than left as a route nothing can
-/// take. The C++ entry point stays in `kernels-cuda/csrc/src/gemm/gemm.hpp`,
-/// so re-stating it is a variant, an arm and a row.
+/// take. The entry point it named was `gemm::act_x_wt_tensor_scaled` in
+/// `kernels-cuda/csrc/src/gemm/gemm.hpp`, and THAT FILE IS DELETED TOO — the
+/// whole 2,216-line host program is `driver-cuda/src/fire/gemm.rs` now, and
+/// the PerTensor arm went with it because nothing constructed it. So
+/// re-stating this variant is no longer "a variant, an arm and a row": it is
+/// a variant, an arm, a row, AND a Rust body in `fire::gemm`, plus a loader
+/// granularity for a checkpoint to state it in. Read `fire::gemm`'s FP8
+/// notes first — the `returned == 0` heuristic latch that reached the FP8
+/// PerTensor path is recorded there, and is why this was never one more
+/// enum arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ScaleLayout {
     PerChannel,
@@ -3746,7 +3754,11 @@ pub mod cuda {
     }
 
     /// `kernels::layout::split_bf16_rows`: split `[N, l+r]` into `[N, l]` and
-    /// `[N, r]`. The inverse of [`Self::concat_rows`].
+    /// `[N, r]`.
+    ///
+    /// Its inverse, `concat_rows`, was deleted in §54 — it had no caller and
+    /// no dispatch arm, and this one has both. An operation being half of a
+    /// pair is not a reason to keep the other half.
     pub fn split_rows(src: &Val, left_dim: u32, right_dim: u32) -> (Val, Val) {
         let outs = record_many(
             &src.t,
@@ -3851,27 +3863,30 @@ pub mod cuda {
         );
     }
 
-    /// `kernels::layout::copy_if_valid_slot`: a copy that skips requests
-    /// whose slot id is invalid.
-    ///
-    /// The graph-safe shape: the launch happens for every request every
-    /// time, and the slot id decides whether it does anything -- so the
-    /// dispatch is fixed and a CUDA graph replays.
-    pub fn copy_if_valid_slot(src: &Val, l: u32, width: u32) -> Val {
-        record(
-            &src.t,
-            Some(l),
-            "layout::copy_if_valid_slot",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![src.id],
-            Some((Shape(vec![Dim::Requests, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the copy produces its value")
-    }
+    // ── FOUR WRAPPERS WERE HERE AND ARE DELETED. §54. ──────────────
+    //
+    // `copy_if_valid_slot`, `concat_rows`, `deinterleave_rows` and
+    // `deinterleave_vec`, for `layout::copy_if_valid_slot`,
+    // `layout::concat_bf16_rows`, `layout::deinterleave_rows_bf16` and
+    // `layout::deinterleave_vec_bf16`. Each had zero callers in
+    // `crates/model/src`, and so did the four symbols they recorded.
+    //
+    // They are recorded here rather than simply removed because their
+    // existence was the BUG, not an accident of it. §28: this surface was
+    // generated from launcher headers, so a wrapper existed for every
+    // launcher whether or not any model wanted one -- and a wrapper reads as
+    // demand to every tool that stops at it. Four `table::layout` rows were
+    // held live by nothing but these four functions. The rows went in the
+    // same edit, because `model/tests/kernels_table.rs::
+    // the_table_covers_the_dsl_surface` asserts this surface and that table
+    // are the same set, and half the edit fails it.
+    //
+    // If a model ever wants one of them back, the kernel is still there:
+    // `families::layout`'s device rows and the `.cuh` text are untouched,
+    // and `kernels-cuda-new/tests/launch_rules.rs` still fires
+    // `copy_if_valid_slot` three times as the tree's only witness for
+    // `LaunchRule::Single`. What has to come back is a row and a wrapper
+    // TOGETHER, with a caller.
 
     // ── qwen3_5: the rest ──────────────────────────────────────────
 
@@ -3937,24 +3952,6 @@ pub mod cuda {
             Some((Shape(vec![aligned, Dim::Const(width)]), DType::BF16)),
         )
         .expect("the gemm produces its value")
-    }
-
-    /// `kernels::layout::concat_bf16_rows`: join two row-aligned tensors
-    /// along the channel axis.
-    pub fn concat_rows(left: &Val, right: &Val, left_dim: u32, right_dim: u32) -> Val {
-        record(
-            &left.t,
-            left.layer,
-            "layout::concat_bf16_rows",
-            vec![],
-            None,
-            vec![left.id, right.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(left_dim + right_dim)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the concat produces its value")
     }
 
     /// `kernels::sample::lm_head_gemv_argmax_int8`: the readout and the argmax
@@ -4195,96 +4192,15 @@ pub mod cuda {
         .expect("the bias add produces its value")
     }
 
-    /// `kernels::attn::build_window_page_view`: a page view keeping only the
-    /// last `keep_pages` of each request.
-    ///
-    /// How sliding-window attention is expressed without a second cache: the
-    /// window is a VIEW over the same pages. `whole` -- it walks
-    /// `src_indptr[R+1]`.
-    pub fn build_window_page_view(t: &Trace, l: u32, keep_pages: u32) -> Val {
-        record(
-            t,
-            Some(l),
-            "attn::build_window_page_view",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![],
-            Some((
-                Shape(vec![Dim::Requests, Dim::Const(keep_pages)]),
-                DType::I32,
-            )),
-        )
-        .expect("the view produces its value")
-    }
+    // `build_window_page_view` and `build_full_split_view` WERE HERE and both
+    // wrappers are DELETED, with their `table::attn` rows and the two
+    // launchers in `kernels-cuda/csrc/src/attn/kv_paged.cu`. Nothing in
+    // `crates/model/src` named either wrapper or either symbol; both rows had
+    // `Source::Unbound` on every operand, so no dispatch was ever generated
+    // from them. The kernels are untouched and still have device rows in
+    // `kernels-cuda-new::families::attn`; `driver-cuda/src/fire/kv_paged.rs`
+    // is the host program now.
 
-    /// `kernels::attn::build_full_split_view`: describe one request's page
-    /// range as `splits` separate one-token requests.
-    ///
-    /// The KV-split decode shape: the same pages, presented as several
-    /// requests so the attention kernel parallelises over them, with the
-    /// partials merged afterwards by [`Self::combine_attn_outputs`].
-    pub fn build_full_split_view(t: &Trace, l: u32, splits: u32) -> Val {
-        record(
-            t,
-            Some(l),
-            "attn::build_full_split_view",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![],
-            Some((Shape(vec![Dim::Const(splits + 1)]), DType::I32)),
-        )
-        .expect("the view produces its value")
-    }
-
-    /// `kernels::layout::deinterleave_rows_bf16`: split a fused `[2·I, H]`
-    /// weight into its gate and up halves BY PARITY.
-    ///
-    /// A weight-layout fact: gpt-oss interleaves the two projections row by
-    /// row, so this is not the same as slicing the tensor in half. No token
-    /// extent — it transforms a weight.
-    pub fn deinterleave_rows(t: &Trace, l: u32, w: &str, i: u32, h: u32) -> (Val, Val) {
-        let outs = record_many(
-            t,
-            Some(l),
-            "layout::deinterleave_rows_bf16",
-            vec![w.to_string()],
-            vec![],
-            vec![
-                (Shape(vec![Dim::Const(i), Dim::Const(h)]), DType::BF16),
-                (Shape(vec![Dim::Const(i), Dim::Const(h)]), DType::BF16),
-            ],
-        );
-        let mut it = outs.into_iter();
-        let gate = it.next().expect("the split states two outputs");
-        let up = it.next().expect("the split states two outputs");
-        (gate, up)
-    }
-
-    /// `kernels::layout::deinterleave_vec_bf16`: the same, for the fused
-    /// per-expert bias vector.
-    pub fn deinterleave_vec(t: &Trace, l: u32, w: &str, i: u32) -> (Val, Val) {
-        let outs = record_many(
-            t,
-            Some(l),
-            "layout::deinterleave_vec_bf16",
-            vec![w.to_string()],
-            vec![],
-            vec![
-                (Shape(vec![Dim::Const(i)]), DType::BF16),
-                (Shape(vec![Dim::Const(i)]), DType::BF16),
-            ],
-        );
-        let mut it = outs.into_iter();
-        let gate = it.next().expect("the split states two outputs");
-        let up = it.next().expect("the split states two outputs");
-        (gate, up)
-    }
 
     /// `kernels::gemm::gemv3_bf16`: three GEMVs against one activation, in
     /// one launch.
@@ -4408,23 +4324,34 @@ pub mod cuda {
         .expect("the transpose produces its value")
     }
 
-    /// `marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16`: the Marlin W4A16
-    /// grouped MoE GEMM.
-    ///
-    /// Namespaced in the symbol because it lives in the vendored `marlin_moe`
-    /// tree, the same way `ops::` entries do.
-    pub fn mxfp4_moe_gemm_w4a16(act: &Val, sorted_route_ids: &Val, width: u32) -> Val {
-        record(
-            &act.t,
-            act.layer,
-            "marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16",
-            vec![],
-            None,
-            vec![act.id, sorted_route_ids.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the gemm produces its value")
-    }
+    // `pub fn mxfp4_moe_gemm_w4a16` WAS HERE, and it was the last live
+    // reference in this workspace to a tree that no longer exists.
+    //
+    // It recorded the symbol `marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16`,
+    // and its doc said the name was namespaced "because it lives in the
+    // vendored `marlin_moe` tree, the same way `ops::` entries do". §47
+    // deleted that tree — both `csrc/third_party/marlin` and
+    // `csrc/third_party/marlin_moe`, 656 KB, with their CMake `option()`s,
+    // their `target_sources`/`target_include_directories`/
+    // `target_compile_definitions`, the `kernels.def`/`marlin.cu` shape
+    // reconciliation and the `PIE_CUDA_HAS_MARLIN_MOE` capability in
+    // `kernels_manifest.hpp`.
+    //
+    // Nothing called this builder. `table::moe`'s row went first (its
+    // `KernelSig::operands` was EMPTY, so no fire could ever have bound it),
+    // `driver-cuda/tests/launch_abi.rs:1538-1544` records the row's removal
+    // and states plainly that "nothing called `dsl::cuda::mxfp4_moe_gemm_w4a16`",
+    // and `weights/plan.rs`'s `native_mxfp4_moe = false` is a hard-coded
+    // constant in both constructors, so no plan ever reaches the lowering it
+    // served. A grep for `mxfp4_moe_gemm_w4a16` over every `.rs` in the
+    // workspace returns this comment and the `launch_abi` note.
+    //
+    // Left as prose rather than silently dropped because a DSL builder that
+    // records a symbol no table row and no C++ function backs is not a
+    // compile error — it is a `record()` that would produce a program the
+    // binder cannot lower, discovered at run time by whoever wrote the first
+    // call. That failure mode is exactly what the emptiness above rules out,
+    // and it is worth one paragraph to say the emptiness was measured.
 
     // ── deepseek_v4: hyper-connections ─────────────────────────────
     //

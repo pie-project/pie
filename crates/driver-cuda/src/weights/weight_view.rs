@@ -30,13 +30,22 @@
 //! run down to the mechanism that makes them safe rather than reported.
 //!
 //! 1. **[`WeightView::raw`] leaves `nbytes` at 0.** The only reader of
-//!    `nbytes` is `validate_quant_weight_view` (`gemm/gemm.cpp:1318`), which
-//!    is gated behind `scale_data != nullptr` — and `raw` leaves that null
-//!    too, so a raw view throws "quant scale data is null" before the size
-//!    check can compare against a bogus zero. That is a load-bearing agreement
+//!    `nbytes` is `validate_quant_weight_view`, which is gated behind
+//!    `scale_data != nullptr` — and `raw` leaves that null too, so a raw view
+//!    throws "quant scale data is null" before the size check can compare
+//!    against a bogus zero. That is a load-bearing agreement
 //!    between two functions in different files, which is why the parity
 //!    transcript records every field of every factory rather than the ones
 //!    that looked interesting.
+//!
+//!    That reader was `gemm/gemm.cpp:1318`. **The file is deleted**, so the
+//!    line is quoted rather than cited — the guard was
+//!    `if (w.scale_data == nullptr) throw std::runtime_error(std::string(api)
+//!    + ": quant scale data is null");` ahead of the `w.nbytes >=
+//!    expected_weight_bytes` comparison, and the ordering IS the agreement.
+//!    It is [`crate::bind::quant_gemm::validate_quant_weight_view`] now
+//!    (`quant_gemm.rs:581`), which asserts in the same order for the same
+//!    reason; the note above binds that function, not a dead line number.
 //!
 //! 2. **A [`QuantMeta`] with no scale produces a view byte-identical to the
 //!    unquantized one**, because `scale_data == nullptr` *is* the dispatcher's

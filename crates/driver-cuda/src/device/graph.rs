@@ -20,16 +20,32 @@
 //! [`Graph::add_conditional_if`] is that sequence, once, behind a signature
 //! that cannot get the union arm wrong.
 //!
-//! # What cannot come to Rust, and why that is not a gap
+//! # What is device code here, and why that is not nvcc's
 //!
 //! `cudaGraphSetConditional` -- the call that sets the predicate -- is absent
-//! from the bindings, and correctly so: it is a `__device__` function. In the
-//! C++ shell it is called from inside `supergraph_set_cond_kernel`, a
-//! `__global__` that runs on the GPU and flips the branch for the next
-//! iteration. Device code is nvcc's by definition, so that kernel stays a
-//! `.cu` no matter how much of the host side moves. It belongs beside the
-//! graph that uses it, not in `kernels-cuda`, because its argument is a
-//! conditional handle -- a shell object -- rather than a tensor.
+//! from the bindings, and correctly so: it is a `__device__` function. It is
+//! called from inside `supergraph_set_cond`, a `__global__` that runs on the
+//! GPU and flips the branch for the next iteration.
+//!
+//! That kernel used to be `csrc/supergraph.cu`, compiled by nvcc into its own
+//! archive, under a header that called it *"the one device function the
+//! supergraph cannot express in Rust"* and a `build.rs` comment that said
+//! *"this needs nvcc"*. **Both were measured and are false.** `__device__` is
+//! a fact about where the call RUNS, not about which frontend may emit it:
+//! NVRTC compiles this kernel, emits `.extern .func cudaGraphSetConditional`
+//! plus a `call.uni`, and the driver resolves the symbol at
+//! `cuModuleLoadData` -- which it must, because the symbol is declared
+//! `extern __device__ __cudart_builtin__` with no definition in any toolkit
+//! header and no definition in `libcudadevrt.a`. nvcc's PTX for the same call
+//! was the same `.extern .func`; the two frontends share `cicc`.
+//!
+//! So the device text is a JIT unit like every other:
+//! `kernels-cuda-new/csrc/src/graph/supergraph.cuh`, fired by
+//! [`crate::fire::supergraph`], whose header carries the whole measurement
+//! and the one thing it does not show. It lives outside `kernels-cuda` for
+//! the reason it always did -- its argument is a conditional handle, a SHELL
+//! object, rather than a tensor -- which is now spelled as a family of its
+//! own, `graph`, rather than as a `.cu` beside this file.
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -421,7 +437,7 @@ impl ConditionalSwitch<'_> {
     }
 
     /// The conditional handle. Its consumer writes an INDEX rather than a
-    /// boolean; see `pie_supergraph_set_switch` in `csrc/supergraph.cu`.
+    /// boolean; see [`crate::fire::supergraph::set_switch`].
     pub const fn handle(&self) -> cudaGraphConditionalHandle {
         self.handle
     }
@@ -785,26 +801,6 @@ impl PeelWindowWord {
     }
 }
 
-#[cfg(feature = "bridge")]
-unsafe extern "C" {
-    /// See `csrc/supergraph.cu`. Returns a `cudaError_t` as an int.
-    fn pie_supergraph_set_cond(
-        handle: u64,
-        preds: *const u8,
-        slot: i32,
-        stream: *mut c_void,
-    ) -> i32;
-
-    /// See `csrc/supergraph.cu`. Arms a SWITCH handle from a slot read as
-    /// a body INDEX. Returns a `cudaError_t` as an int.
-    fn pie_supergraph_set_switch(
-        handle: u64,
-        preds: *const u8,
-        slot: i32,
-        stream: *mut c_void,
-    ) -> i32;
-}
-
 /// What CUDA's capture state says about a stream, at one instant.
 #[cfg(feature = "bridge")]
 struct CaptureInfo {
@@ -1109,20 +1105,7 @@ impl<'a> SupergraphBuilder<'a> {
         // The set-cond kernel FIRST, so that the conditional node picks it up
         // as a capture dependency below and the predicate is written before
         // the branch reads it.
-        let rc = unsafe {
-            pie_supergraph_set_cond(
-                handle,
-                self.preds,
-                i32::try_from(pred_slot).unwrap_or(0),
-                s.cast::<c_void>(),
-            )
-        };
-        if rc != 0 {
-            return Err(Error::invalid(
-                "pie_supergraph_set_cond",
-                "the set-cond launch failed",
-            ));
-        }
+        crate::fire::supergraph::set_cond(handle, self.preds, pred_slot, s.cast::<c_void>())?;
 
         // Re-read: the deps now include the kernel just launched.
         let info = unsafe { capture_info(s) }?;
@@ -1180,8 +1163,8 @@ impl<'a> SupergraphBuilder<'a> {
     ///
     /// The predicate word needs no new storage: it is already a byte per
     /// slot, and a slot holding a kernel index rather than 0/1 is the same
-    /// byte read differently. `pie_supergraph_set_switch` is the whole
-    /// device-side difference.
+    /// byte read differently. [`crate::fire::supergraph::set_switch`] is the
+    /// whole device-side difference.
     ///
     /// An index past `bodies` selects NO body, which is CUDA's rule and is
     /// left as-is: a fire whose predicate names an arm the switch does not
@@ -1217,20 +1200,7 @@ impl<'a> SupergraphBuilder<'a> {
         )?;
         // The arming kernel FIRST, so the switch node picks it up as a
         // capture dependency and the index is written before it is read.
-        let rc = unsafe {
-            pie_supergraph_set_switch(
-                handle,
-                self.preds,
-                i32::try_from(pred_slot).unwrap_or(0),
-                s.cast::<c_void>(),
-            )
-        };
-        if rc != 0 {
-            return Err(Error::invalid(
-                "pie_supergraph_set_switch",
-                "the set-switch launch failed",
-            ));
-        }
+        crate::fire::supergraph::set_switch(handle, self.preds, pred_slot, s.cast::<c_void>())?;
         let info = unsafe { capture_info(s) }?;
         let mut params: cudaGraphNodeParams = unsafe { std::mem::zeroed() };
         params.type_ = cudarc::runtime::sys::cudaGraphNodeType::cudaGraphNodeTypeConditional;

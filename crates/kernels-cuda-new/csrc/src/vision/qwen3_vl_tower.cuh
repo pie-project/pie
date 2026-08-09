@@ -42,8 +42,9 @@
 //   k_add_pe          Rule::Elementwise
 //   k_gelu_tanh       Rule::Elementwise
 //   k_gelu_bias       Rule::Elementwise
-//   k_split_rope_qkv  refused -- grid is PerHead's, block is not
-//   k_merge_gather    refused -- 2-D block
+//   k_split_rope_qkv  Unstated -- grid is PerHead's, block is not; the
+//                     tower's Rust states [NH,N,1] x [HEAD/2,1,1]
+//   k_merge_gather    Rule::Tile16
 //   k_add_inplace     refused -- DEAD; no launch to cite
 //   k_split_qkv       refused -- DEAD; no launch to cite
 //   k_split_qkv_bias  refused -- DEAD; no launch to cite
@@ -269,7 +270,8 @@ __global__ void k_rope_qk(T* q, T* k, const float* pos, int N, int NH, int HEAD,
 /// Fused split-QKV + bias + 2-D RoPE: read fused `qkv[N, 3H]` once, add the
 /// per-section bias, write `q,k,v[N,H]` with q and k already rotated.
 ///
-/// UNROWED, and this is the closest call in the family. The launch is
+/// ROWED `LaunchRule::Unstated`, and it was the closest call in the family.
+/// The launch is
 /// `k_split_rope_qkv<<<dim3(NH,N), HEAD/2, 0, S>>>`. The GRID is exactly
 /// `Rule::PerHead`'s `[heads, rows, 1]` and the kernel reads `blockIdx.x` as
 /// the head and `blockIdx.y` as the row, which is `per_head`'s own convention.
@@ -282,8 +284,16 @@ __global__ void k_rope_qk(T* q, T* k, const float* pos, int N, int NH, int HEAD,
 /// `for (j = threadIdx.x; j < half; j += blockDim.x)`, so 128 threads over a
 /// 32-wide half means 96 idle lanes and the same result -- correct, and four
 /// times the launch. Widening it is a performance decision for the tower's
-/// owner and not something a migration may take silently, which is what
-/// leaving the row out records.
+/// owner and not something a migration may take silently.
+///
+/// So the row states NO rule and the tower's Rust states the geometry, which
+/// leaves that decision exactly where it was. "No rule states this grid" and
+/// "this cannot be a row" were always different claims; only the first was
+/// ever measured here, and the second rested on an AOT dispatcher being the
+/// only thing that could fire a row. A driver states its own grids --
+/// `attn::attn_score_fold_heads` and `families::attn`'s `ATTN_SCORE_POST`
+/// are the precedents -- so the paragraphs above are now the row's
+/// rationale rather than its absence. See `families::vision::QWEN3_VL_ROWS`.
 template <class T>
 __global__ void k_split_rope_qkv(const T* qkv, const T* b, T* q, T* k, T* v,
                                  const float* pos, int N, int NH, int HEAD, float theta) {

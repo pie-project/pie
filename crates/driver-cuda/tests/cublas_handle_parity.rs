@@ -1,14 +1,31 @@
 //! Behavioural parity with the C++ `CublasHandle` — gate-cublas.
 //!
-//! The oracle in `tests/oracle/cublas_handle/` compiles the real
-//! `gemm/gemm.cpp` (dispatchers discarded by `--gc-sections`) and drives
+//! The oracle in `tests/oracle/cublas_handle/` compiled the real
+//! `gemm/gemm.cpp` (dispatchers discarded by `--gc-sections`) and drove
 //! the handle wrapper through construction, stream rebinding and both
 //! failure paths — including the math-mode failure that LEAKS the created
 //! handle, which the port reproduces. This test replays the same script
 //! and requires the transcripts to be byte-identical.
 //!
-//! Run `tests/oracle/cublas_handle/run.sh` to regenerate
-//! [`GOLDEN_FNV1A64`]. The pinned value is the **C++'s** hash.
+//! # `run.sh` CANNOT BE RUN AGAIN, and that is deliberate
+//!
+//! `crates/kernels-cuda/csrc/src/gemm/gemm.{cpp,hpp}` are **deleted**. They
+//! were the archive's largest `.cpp` and held zero `__global__` and zero
+//! `<<<>>>` — a host program, not a kernel file — so they fell to the rule
+//! that every piece of CPU-side code is Rust. `CublasHandle` went with them;
+//! [`driver_cuda::device::cublas::CublasHandle`] is what is left, and
+//! `crates/kernels-cuda/csrc/CMakeLists.txt` records where the rest went.
+//!
+//! So [`GOLDEN_FNV1A64`] is now a **permanent record of behaviour that can be
+//! read but not re-derived**, and `run.sh` is kept as the description of how
+//! it was taken rather than as a command anyone can issue. If this test ever
+//! fails, the fault is in the Rust — the C++ side of the comparison is a
+//! constant, and the twenty lines it summarises are quoted in
+//! `device/cublas.rs`. Recovering the oracle means `git show` on a commit
+//! before the deletion, not editing the golden to match.
+//!
+//! (`tests/oracle/memory_planner/` is unaffected: it includes its own
+//! `stub/gemm/gemm.hpp`, never the archive's.)
 
 use std::ffi::c_void;
 use std::fmt::Write as _;

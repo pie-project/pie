@@ -420,6 +420,24 @@ static GATED_DELTA_NET_PREP_ROWS: &[DeviceKernel] = &[
         template_path: "ssm::device::l2norm_scale",
         elem: "device::bf16, 128",
     },
+    // The two arms of `qwen_gdn_post_conv_prep_bf16` — which is not two arms
+    // at all but two launches in a fixed order, and the reason it is here
+    // rather than in `execution::COMPOSED` is written on the walk.
+    //
+    // Same `elem` shape as `l2norm_scale` above and the same reading of it:
+    // both kernels are `template <class T, int BLOCK>` and the launcher's
+    // `constexpr int BLOCK = 128` (`gated_delta_net.cu:150`) is the width it
+    // launches at. One number in both places.
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_PREP_SIGS[6],
+        template_path: "ssm::device::qwen_gdn_qk_norm",
+        elem: "device::bf16, 128",
+    },
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_PREP_SIGS[7],
+        template_path: "ssm::device::qwen_gdn_v_g_beta",
+        elem: "device::bf16, 128",
+    },
 ];
 
 /// The contracts, in [`GATED_DELTA_NET_PREP_ROWS`]'s order.
@@ -429,7 +447,7 @@ static GATED_DELTA_NET_PREP_ROWS: &[DeviceKernel] = &[
 /// `void**`, so it is not an operand and stating it as one was the shim's
 /// requirement rather than the kernel's (§4.2).
 #[rustfmt::skip]
-static GATED_DELTA_NET_PREP_SIGS: [KernelSig; 6] = [
+static GATED_DELTA_NET_PREP_SIGS: [KernelSig; 8] = [
     // `Elementwise` IS the launcher this replaces, line for line: the `if
     // (n == 0) return;` became `eval`'s refusal of a zero extent, and
     // `(n + 255) / 256` blocks of 256 became the rule's arithmetic. Nothing
@@ -599,10 +617,91 @@ static GATED_DELTA_NET_PREP_SIGS: [KernelSig; 6] = [
             scale: F32 <- Source::Lit(Lit::F32(1.0)),
             eps: F32 <- Source::Ctx("eps"),
         ]),
+    // ── the two halves of `qwen_gdn_post_conv_prep_bf16` ─────────────────
+    //
+    // `kernels-cuda/csrc/src/ssm/gated_delta_net.cu:139-175` — the whole
+    // launcher, quoted:
+    //
+    // ```text
+    // if (N <= 0 || K_h <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
+    // constexpr int BLOCK = 128;
+    // const float q_scale = rsqrtf(static_cast<float>(K_d));
+    // dim3 qk_grid(N, K_h);
+    // device::qwen_gdn_qk_norm<device::bf16, BLOCK><<<qk_grid, BLOCK, 0, stream>>>(
+    //     qkv_post, q_norm_kh, k_norm_kh, K_h, K_d, conv_dim, q_scale);
+    // dim3 vg_grid(N, V_h);
+    // device::qwen_gdn_v_g_beta<device::bf16, BLOCK><<<vg_grid, BLOCK, 0, stream>>>(
+    //     qkv_post, a, b, A_log, dt_bias,
+    //     v_fp32, g_log_out, beta_out, K_h, V_h, K_d, V_d, conv_dim);
+    // ```
+    //
+    // Two launches, a fixed order, no branch — which reads like an
+    // `execution::Composition` and is a `Walk` with `Control::Supplies`
+    // instead. The reason is `q_scale`. It is `rsqrtf(K_d)` computed on the
+    // host and handed to the FIRST kernel as an operand; a `Composition`'s
+    // `Step::Fire` binds every operand from the row's `Source` list, and the
+    // `Source` grammar has no square root. `Supplies`' own definition is "a
+    // VALUE the launch needs and no row can state, computed on the host",
+    // which is this to the word. §52.7 records the alternative — a
+    // `Source::Rsqrt(&Source::Gdn("k_d"))` would source it and make this a
+    // composition — and that vocabulary is not written; §10.5 forbids
+    // growing it for one kernel.
+    //
+    // # The two grids are DIFFERENT and neither is a rule
+    //
+    // `(N, K_h)` and `(N, V_h)`, on the same 128-wide block. Under GQA
+    // `V_h = repeat * K_h`, so one launch is a `repeat`-fold larger than the
+    // other and no single rule states both. `PerHeadElementwise` produces
+    // `[rows, q_heads]` on a block clamped to `[32, 128]` — it would state
+    // the first if `q_heads` meant `K_h`, and `Dims` calls the GDN key head
+    // count `kv_heads`. Rather than argue that mapping twice with opposite
+    // answers, the driver states both rectangles beside the lines above.
+    //
+    // # `conv_dim` is a STRIDE, not a width, and it is why `qkv_post` is one
+    // # buffer
+    //
+    // Both kernels index `qkv_post + n * conv_dim + <offset>`: the qk kernel
+    // takes `h * K_d` and the v/g/beta kernel takes `2 * K_dim + h * V_d`
+    // where `K_dim = K_h * K_d`. One post-convolution rectangle,
+    // `[N, conv_dim]`, cut into q, k and v spans by arithmetic the caller
+    // knows and the row does not. That is the second reason there is no
+    // honest `Source` here even for the pointers — `Source::In(0)` would
+    // bind the same buffer to both and say nothing about the cut.
+    kernel!(qwen_gdn_qk_norm "ssm::qwen_gdn_post_conv_prep_bf16#qk_norm",
+        file = Some("ssm/gated_delta_net_prep.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            qkv_post: Buf,
+            q_out: F32sMut,
+            k_out: F32sMut,
+            k_h: I32,
+            k_d: I32,
+            conv_dim: I32,
+            q_scale: F32,
+        ]),
+    kernel!(qwen_gdn_v_g_beta "ssm::qwen_gdn_post_conv_prep_bf16#v_g_beta",
+        file = Some("ssm/gated_delta_net_prep.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            qkv_post: Buf,
+            a: Buf,
+            b: Buf,
+            a_log: F32s,
+            dt_bias: Buf,
+            v_out: F32sMut,
+            g_log_out: F32sMut,
+            beta_out: F32sMut,
+            k_h: I32,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+            conv_dim: I32,
+        ]),
 ];
 
-/// The three Nemotron-H / Zamba preparations `csrc/src/ssm/nemotron_h.cuh`
-/// holds that a row can state.
+/// The Nemotron-H / Zamba kernels `csrc/src/ssm/nemotron_h.cuh` holds that a
+/// row states — three preparations, and the arms of the two launchers this
+/// driver walks.
 static NEMOTRON_H_ROWS: &[DeviceKernel] = &[
     DeviceKernel {
         sig: &NEMOTRON_H_SIGS[0],
@@ -631,11 +730,58 @@ static NEMOTRON_H_ROWS: &[DeviceKernel] = &[
         template_path: "ssm::device::mamba_split",
         elem: DeviceKernel::PLAIN,
     },
+    // The SIBLING arm, and `NEMOTRON_H_SIGS[3]`'s note that it "is still
+    // refused" is superseded here. What refused it was `ElementwiseIn`
+    // over-launching it by `N · intermediate` elements' worth of blocks —
+    // and that was an argument about a RULE. This row states no rule
+    // (`LaunchRule::Unstated`) because the driver states the grid:
+    // `ceil(N * (conv_dim + num_heads) / 256)`, the extent `Dims` cannot
+    // carry, written once in `driver-cuda/src/fire/nemotron_h.rs` beside the
+    // `<<<>>>` it came from.
+    DeviceKernel {
+        sig: &NEMOTRON_H_SIGS[4],
+        template_path: "ssm::device::mamba_split_conv_dt",
+        elem: DeviceKernel::PLAIN,
+    },
+    // The two arms of `nemotron_mamba_ssm_batched_bf16`. Both plain.
+    DeviceKernel {
+        sig: &NEMOTRON_H_SIGS[5],
+        template_path: "ssm::device::mamba_ssm_batched_prefill_reg",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &NEMOTRON_H_SIGS[6],
+        template_path: "ssm::device::mamba_ssm_batched_warp",
+        elem: DeviceKernel::PLAIN,
+    },
+    // The file's last two launchers, and what freed them was not a `Source`.
+    //
+    // `new-horizon.md` §52.3, §56 and §57.5 all record these as blocked on
+    // `Source::Scratch` — the six pointer arrays and the aligned staging they
+    // address are DRIVER slabs that no statement names, so `table::ssm`'s two
+    // rows source nothing and `abi::emit_rust_dispatch` writes no arm for
+    // either. That is still true and these rows do not change it. What it
+    // never blocked was the LAUNCHER: `driver-cuda/src/fire/nemotron_h.rs`
+    // fires both through `fire::hand`, which needs a unit and a contract and
+    // no `Source` at all. The block is on REACHABILITY FROM MODEL TEXT, and
+    // that is a different question from which language the `<<<>>>` is in.
+    //
+    // Both plain, both `LaunchRule::Unstated` — see the sigs.
+    DeviceKernel {
+        sig: &NEMOTRON_H_SIGS[7],
+        template_path: "ssm::device::build_nemotron_moe_ptrs_decode_batched",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &NEMOTRON_H_SIGS[8],
+        template_path: "ssm::device::build_nemotron_moe_ptrs_aligned",
+        elem: DeviceKernel::PLAIN,
+    },
 ];
 
 /// The contracts, in [`NEMOTRON_H_ROWS`]'s order.
 #[rustfmt::skip]
-static NEMOTRON_H_SIGS: [KernelSig; 4] = [
+static NEMOTRON_H_SIGS: [KernelSig; 9] = [
     // Three bf16 tables widened to fp32 once per layer. `ceil(num_heads /
     // 256)` blocks of 256 behind `h >= num_heads` is `Elementwise` exactly.
     //
@@ -822,21 +968,225 @@ static NEMOTRON_H_SIGS: [KernelSig; 4] = [
             num_heads: I32,
             total: I32,
         ]),
+    // `nemotron_h.cu:37-46`, the `gate == nullptr` arm:
+    //
+    //     const int conv_dt_total = N * (conv_dim + num_heads);
+    //     const int conv_dt_grid = (conv_dt_total + BLOCK - 1) / BLOCK;
+    //     device::mamba_split_conv_dt<<<conv_dt_grid, BLOCK, 0, stream>>>(
+    //         projected, conv_in, dt,
+    //         projection_dim, intermediate, conv_dim, num_heads,
+    //         conv_dt_total);
+    //
+    // **`gate` is not an operand at all**, where the sibling's `gate` is not
+    // `| null`. That is the whole arm said from the other side: a caller with
+    // no gate buffer does not pass a null into this kernel, it fires a kernel
+    // whose parameter list has no such slot. The projection is read at the
+    // same `[N, projection_dim]` stride and the `intermediate` span is
+    // SKIPPED (`nemotron_h.cuh:153-154`), which is why the extent is
+    // `N * (conv_dim + num_heads)` and not `N * projection_dim`.
+    //
+    // `LaunchRule::Unstated` and NOT `ElementwiseIn`, and `NEMOTRON_H_SIGS`
+    // `[3]`'s note is the argument: `ElementwiseIn` sizes on
+    // `rows · in_width`, which here is `N · projection_dim`, over-launching
+    // by `N · intermediate` elements' worth of blocks. Those blocks return
+    // on `i >= total` and the output is byte-identical — the near miss that
+    // is invisible at one shape and costs occupancy at every shape. The
+    // extent needs the sum of TWO results' widths and `runtime::Dims` carries
+    // one `width`. The driver states the grid instead.
+    kernel!(nemotron_mamba_split_conv_dt "ssm::nemotron_mamba_split_bf16#conv_dt",
+        file = Some("ssm/nemotron_h.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            projected: Buf,
+            conv_in: BufMut,
+            dt: BufMut,
+            projection_dim: I32,
+            intermediate: I32,
+            conv_dim: I32,
+            num_heads: I32,
+            total: I32,
+        ]),
+    // ── the two arms of `nemotron_mamba_ssm_batched_bf16` ────────────────
+    //
+    // `nemotron_h.cu:122-141` (prefill) and `:164-179` (decode). The
+    // launcher's parameter list is identical for both; only the rectangle
+    // differs, and neither rectangle is a rule:
+    //
+    // ```text
+    //   prefill  grid(R, num_heads, ceil(head_dim / (512/32)))  block 512
+    //   decode   grid(R, num_heads)                             block 256
+    //   both     smem = 2 * state_size * sizeof(float)
+    // ```
+    //
+    // The prefill's third axis is `head_dim` divided by the block's WARP
+    // COUNT — one warp per `head_dim` row, `512/32 = 16` of them — so the
+    // 512 appears twice and must move together. `RecurrentScan` states
+    // `grid(rows, kv_heads)` on `block(128)` and `smem = 2 * head_dim * 4`:
+    // the decode arm's grid but not its block, and a shared allocation over
+    // the wrong extent (`head_dim`, not `state_size`). Both `Unstated`, both
+    // fired from `driver-cuda/src/fire/nemotron_h.rs`.
+    //
+    // **`dt_precomputed` and `dA_precomputed` are `| null` on purpose.** The
+    // kernels test both against `nullptr` and recompute from `dt_in`, `A`
+    // and `dt_bias` when absent (`nemotron_h.cuh:257-263`, `:378-384`).
+    // Nemotron-H fires `ssm::nemotron_prepare_mamba_dt_da` to fill them and
+    // Zamba does not; an absent pair is a fact about a model, not drift.
+    //
+    // Unsourced for the reason the whole `#`-suffixed set is: no trace can
+    // spell these symbols. `model-compiler` writes
+    // `ssm::nemotron_mamba_ssm_batched_bf16`, which is the walk.
+    kernel!(nemotron_mamba_ssm_prefill_reg
+        "ssm::nemotron_mamba_ssm_batched_bf16#prefill_reg",
+        file = Some("ssm/nemotron_h.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            conv_out: Buf,
+            dt_in: Buf,
+            a: F32s,
+            d: F32s,
+            dt_bias: F32s,
+            dt_precomputed: F32s | null,
+            da_precomputed: F32s | null,
+            state_base: BufMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            y: BufMut,
+            num_heads: I32,
+            head_dim: I32,
+            state_size: I32,
+            n_groups: I32,
+            conv_dim: I32,
+            intermediate: I32,
+            time_step_min: F32,
+        ]),
+    kernel!(nemotron_mamba_ssm_warp
+        "ssm::nemotron_mamba_ssm_batched_bf16#warp",
+        file = Some("ssm/nemotron_h.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            conv_out: Buf,
+            dt_in: Buf,
+            a: F32s,
+            d: F32s,
+            dt_bias: F32s,
+            dt_precomputed: F32s | null,
+            da_precomputed: F32s | null,
+            state_base: BufMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            y: BufMut,
+            num_heads: I32,
+            head_dim: I32,
+            state_size: I32,
+            n_groups: I32,
+            conv_dim: I32,
+            intermediate: I32,
+            time_step_min: F32,
+        ]),
+    // ── the two pointer builders ─────────────────────────────────────────
+    //
+    // `LaunchRule::Unstated` on both, and it is a REFUSAL rather than an
+    // omission. Each launcher opens `ceil(extent / 256)` blocks of 256, which
+    // is `LaunchRule::Elementwise` arithmetic — but `Elementwise` reads the
+    // extent off a value's element count, and neither extent is one:
+    //
+    //   * `build_nemotron_moe_ptrs_decode_batched` opens over
+    //     `routes = N * top_k`, a PRODUCT of two operands. `ssm/nemotron_h.cuh`
+    //     records it as *"extent is `rows * top_k`"*, and no unary `Term`
+    //     multiplies.
+    //   * `build_nemotron_moe_ptrs_aligned` opens over `max_blocks`, a HOST
+    //     SCALAR — the padded block count the counting sort produced, which
+    //     is not the extent of anything the fire allocated. The `.cuh` says
+    //     *"extent is a host scalar"* in the same list.
+    //
+    // A rule that read either off an output would be reading the POINTER
+    // ARRAY's length, which is `routes` only because the driver sized it
+    // that way. `driver-cuda/src/fire/nemotron_h.rs` states both rectangles
+    // and cites the `<<<>>>`.
+    //
+    // `total`/`max_blocks` cross as operands as well as sizing the grid: each
+    // kernel guards `route >= total` / `b >= max_blocks` with the same number
+    // the launcher divided. One computation, two uses, as the C++ had it.
+    // Both take `_dev`, for `families::moe`'s reason and by its convention:
+    // `table::ssm` states these two symbols without the suffix and
+    // `execution::WALKED` claims them there, so the DEVICE rows must be
+    // different strings or `a_walk_is_only_a_walk` fails. See the block above
+    // `moe::moe_decode_gemv_by_token_bf16` for the full argument.
+    kernel!(build_nemotron_moe_ptrs_decode_batched_dev
+        "ssm::build_nemotron_moe_ptrs_decode_batched_dev_bf16",
+        file = Some("ssm/nemotron_h.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            topk_idx: I32s,
+            topk_w: F32s,
+            up_weight_ptrs: BufArray,
+            down_weight_ptrs: BufArray,
+            norm_x: Buf,
+            expert_up: BufMut,
+            expert_act: BufMut,
+            expert_out: BufMut,
+            a_up_ptrs: BufArrayOut,
+            b_up_ptrs: BufArrayOut,
+            c_up_ptrs: BufArrayOutMut,
+            a_down_ptrs: BufArrayOut,
+            b_down_ptrs: BufArrayOut,
+            c_down_ptrs: BufArrayOutMut,
+            weights_out: F32sMut,
+            total: I32,
+            top_k: I32,
+            hidden: I32,
+            intermediate: I32,
+        ]),
+    kernel!(build_nemotron_moe_ptrs_aligned_dev "ssm::build_nemotron_moe_ptrs_aligned_dev_bf16",
+        file = Some("ssm/nemotron_h.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            expert_ids: I32s,
+            up_weight_ptrs: BufArray,
+            down_weight_ptrs: BufArray,
+            aligned_in: Buf,
+            aligned_up: BufMut,
+            aligned_act: BufMut,
+            aligned_out: BufMut,
+            a_up_ptrs: BufArrayOut,
+            b_up_ptrs: BufArrayOut,
+            c_up_ptrs: BufArrayOutMut,
+            a_down_ptrs: BufArrayOut,
+            b_down_ptrs: BufArrayOut,
+            c_down_ptrs: BufArrayOutMut,
+            max_blocks: I32,
+            block_size: I32,
+            hidden: I32,
+            intermediate: I32,
+        ]),
 ];
 
-/// The one template in `csrc/src/ssm/causal_conv1d.cuh` a row still states.
+/// The two templates in `csrc/src/ssm/causal_conv1d.cuh` a row states.
 ///
 /// The header holds four, and this unit was down to three of them before
 /// §28.4 took two more. What went is instructive, because the argument that
 /// removed them is the argument this header had already made about a THIRD
 /// kernel and then failed to apply to its own rows.
 ///
+/// **THAT THIRD KERNEL IS THE SECOND ROW NOW.**
 /// `causal_conv1d_prefill_noact_bf16` never had a row, on the grounds that a
 /// row for it would be *"a contract naming a caller that does not exist and a
 /// symbol sitting in `migration_status`' denominator forever"* — the conformer
 /// loop fires `ssm::device::causal_conv1d_prefill<T, false>` directly, so the
 /// host launcher is referenced by no C++ and named by no row, an EMPTY
-/// consumer set. §28.9 then measured `ssm::causal_conv1d_prefill_bf16` and
+/// consumer set.
+///
+/// Every clause of that is still true and the conclusion inverted, because
+/// the conformer loop is Rust now
+/// (`driver-cuda/src/tower/gemma4_audio.rs`) and a Rust caller cannot fire a
+/// template it has no row for — `unit::unit_of` resolves a SYMBOL. The empty
+/// consumer set was the whole objection; the set has one member. What the
+/// row does NOT do is resurrect the host launcher: the C++
+/// `causal_conv1d_prefill_noact_bf16` function is still referenced by nothing
+/// and the row names the device template, which is the distinction the
+/// original refusal was drawing and is worth keeping visible.
+///
+/// §28.9 then measured `ssm::causal_conv1d_prefill_bf16` and
 /// `ssm::causal_conv1d_update_bf16` and found the same thing one step out:
 /// their `dsl.rs` wrappers had zero call sites, no golden named either, and
 /// the `_batched` twins carry every fire (6 goldens for the update). The
@@ -854,11 +1204,44 @@ static CAUSAL_CONV1D_ROWS: &[DeviceKernel] = &[
         template_path: "ssm::device::causal_conv1d_update_batched",
         elem: "device::bf16",
     },
+    // TWO NOW, and the second is the one the paragraph above said would never
+    // be asked for. It was right about the C++: `causal_conv1d_prefill_noact_
+    // bf16` had no caller and a row for it would have named none. What
+    // changed is that the caller exists and is Rust —
+    // `driver-cuda/src/tower/gemma4_audio.rs`'s conformer loop, which fires
+    // `<T, false>` at `dim3(C) x dim3(64)` and cannot fire anything at all
+    // without a row to resolve.
+    //
+    // The row states the INSTANTIATION, not the launcher: `elem` carries two
+    // template arguments because the kernel takes two, and `false` is the
+    // fused-silu flag the audio tower does not want. `abi.rs` already splits
+    // `elem` on the comma for exactly this shape.
+    DeviceKernel {
+        sig: &CAUSAL_CONV1D_SIGS[1],
+        template_path: "ssm::device::causal_conv1d_prefill",
+        elem: "device::bf16, false",
+    },
+    // FOUR NOW, and the last two are the two the paragraph above said a row
+    // for either "states half a contract". That is still true of a row for
+    // the LAUNCHER — and neither of these is one. `#channel_tile` and
+    // `#per_channel` name the two `__global__`s the launcher chose between,
+    // and the choice itself moved to `driver-cuda/src/fire/causal_conv1d.rs`
+    // where it is one `if` with both grids beside it.
+    DeviceKernel {
+        sig: &CAUSAL_CONV1D_SIGS[2],
+        template_path: "ssm::device::causal_conv1d_prefill_batched_channel_tile",
+        elem: "device::bf16",
+    },
+    DeviceKernel {
+        sig: &CAUSAL_CONV1D_SIGS[3],
+        template_path: "ssm::device::causal_conv1d_prefill_batched",
+        elem: "device::bf16",
+    },
 ];
 
 /// The contracts, in [`CAUSAL_CONV1D_ROWS`]'s order.
 #[rustfmt::skip]
-static CAUSAL_CONV1D_SIGS: [KernelSig; 1] = [
+static CAUSAL_CONV1D_SIGS: [KernelSig; 4] = [
     // The batched twin: R requests advancing R conv windows in one launch,
     // each window found through `slot_ids[r]` in a paged arena.
     //
@@ -928,16 +1311,145 @@ static CAUSAL_CONV1D_SIGS: [KernelSig; 1] = [
             c: I32 <- Source::Gdn("conv_dim"),
             k: I32 <- Source::Gdn("conv_k"),
         ]),
+    // The single-request prefill, `<T, false>` — gemma-4's audio conformer
+    // and nothing else.
+    //
+    // `LaunchRule::Unstated` and UNSOURCED, and both are the same fact said
+    // twice: no model text names this symbol. It is fired by one Rust walk
+    // that knows its own conv dimension, so there is no statement for a
+    // `Source` to read and no `Dims` for a rule to turn into a grid. A
+    // `Source` invented for it would be a cell pointing at nothing —
+    // `families/rope.rs`'s "a half-bound row is a row whose unbound cells
+    // look like an oversight rather than a fact" — so the whole row is left
+    // unsourced and this sentence is the fact.
+    //
+    // The launcher, quoted from `gemma4_audio.cu:265`:
+    //
+    // ```text
+    // constexpr int BLOCK=64; const int C=Hd, K=w.conv_kernel;
+    // if(N>0&&C>0&&K>0) sd::causal_conv1d_prefill<bfd,false><<<dim3(C),dim3(BLOCK),0,S>>>(
+    //     D(glu),D(L.depthwise_conv),nullptr,D(conv),nullptr,N,C,K);
+    // ```
+    //
+    // `dim3(C)` is one block per channel and the kernel opens `if (c >= C)
+    // return`, so the grid is a channel count and not a tile count — which is
+    // `PerChannel`'s shape, and `PerChannel` fixes a block width this
+    // launcher does not use. The degenerate guard is the caller's and stays
+    // the caller's: the Rust refuses `N`, `C` or `K` at zero rather than
+    // launching an empty grid, because `runtime::launch::eval` refuses
+    // `rows == 0` globally and this fire does not go through it.
+    kernel!(conv_prefill_noact "ssm::causal_conv1d_prefill_noact_bf16",
+        file = Some("ssm/causal_conv1d.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            x: Buf,
+            weight: Buf,
+            bias: Buf | null,
+            y: BufMut,
+            state_out: BufMut | null,
+            n: I32,
+            c: I32,
+            k: I32,
+        ]),
+    // ── the two arms of `causal_conv1d_prefill_batched_bf16` ─────────────
+    //
+    // One launcher, two `__global__`s, and the host chose between them on
+    // `R >= 8`. `kernels-cuda/csrc/src/ssm/causal_conv1d.cu:52-90` was that
+    // launcher; `driver-cuda/src/fire/causal_conv1d.rs` is it now, and
+    // `execution::WALKED` states the switch.
+    //
+    // **The two kernels are NOT the same function at two speeds**, which is
+    // the distinction §30 drew for GDN's SMEM step and which does not hold
+    // here. They index differently — `_channel_tile` opens `c =
+    // blockIdx.x * blockDim.x + threadIdx.x` (`causal_conv1d.cuh:310`) and
+    // the per-channel form opens `c = blockIdx.x` (`:225`) — so each is
+    // correct only under its own grid, and a switch between them is a switch
+    // between two `<<<>>>` and not between two implementations of one. There
+    // was nothing to measure and nothing to delete.
+    //
+    // What the `R >= 8` threshold buys is stated where it was measured, in
+    // the fire: below eight requests a block per channel keeps more blocks
+    // resident than a 128-wide tile does, and above it the tile amortises
+    // its width. That is an occupancy argument about the GRID, and both
+    // kernels compute the same convolution.
+    //
+    // # Neither row is sourced, and that is the same fact as the `#`
+    //
+    // `model-compiler` writes `ssm::causal_conv1d_prefill_batched_bf16` —
+    // the launcher, which is the walk. These two symbols are unspellable by
+    // any trace, exactly as `ssm::nemotron_mamba_split_bf16#split` is, and
+    // `abi.rs` skips a row with an unbound operand so no dispatch arm is
+    // generated for either. The one caller supplies its own operands.
+    //
+    // `write_state_mask` and `commit_len` are `| null` because the launcher
+    // passes null for both on the uniform, non-speculative path — a fact
+    // about a pass, not drift.
+    kernel!(conv_prefill_batched_channel_tile
+        "ssm::causal_conv1d_prefill_batched_bf16#channel_tile",
+        file = Some("ssm/causal_conv1d.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            x: Buf,
+            weight: Buf,
+            bias: Buf | null,
+            y: BufMut,
+            state_out_base: BufMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            c: I32,
+            k: I32,
+            write_state: Bool,
+            write_state_mask: U8s | null,
+            commit_len: I32s | null,
+        ]),
+    kernel!(conv_prefill_batched_per_channel
+        "ssm::causal_conv1d_prefill_batched_bf16#per_channel",
+        file = Some("ssm/causal_conv1d.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            x: Buf,
+            weight: Buf,
+            bias: Buf | null,
+            y: BufMut,
+            state_out_base: BufMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            c: I32,
+            k: I32,
+            write_state: Bool,
+            write_state_mask: U8s | null,
+            commit_len: I32s | null,
+        ]),
 ];
 
-/// The two templates in `csrc/src/ssm/kda.cuh` a row can state.
+/// The FOUR templates in `csrc/src/ssm/kda.cuh` a row states.
 ///
-/// The header's other two, `kda_recurrent_step_batched` and
-/// `kda_prefill_batched`, are plain `__global__`s with no template parameter
+/// # This said "two", and the reason it gave for the other two was wrong
+///
+/// The paragraph here read: *"`kda_recurrent_step_batched` and
+/// `kda_prefill_batched` are plain `__global__`s with no template parameter
 /// at all — NVRTC answers `type name is not allowed` at the name-map pragma
 /// for `path<bf16>` over a non-template, so a row for either fails at compile
-/// rather than at fire. They are Kimi Delta Attention's actual recurrence and
-/// they are the two this unit compiles and cannot reach.
+/// rather than at fire."*
+///
+/// Every clause of that is a statement about spelling `path<bf16>` for a
+/// non-template, and it is true. What it missed is that a row need not spell
+/// one: [`DeviceKernel::PLAIN`] emits the path ALONE, with no angle brackets,
+/// and `tests/layers.rs`'s `every_row_spells_a_qualified_instantiation`
+/// asserts exactly that shape for a plain row. `ssm::nemotron_mamba_split_
+/// bf16#split` has been a `PLAIN` row of a plain `__global__` since the arity
+/// finding, in this same file. The two kernels below were reachable the whole
+/// time and the refusal was reading its own `elem` string as a law.
+///
+/// They are Kimi Delta Attention's actual recurrence and this unit both
+/// compiles and reaches them now. What is still true is the OTHER half — see
+/// `table/ssm.rs:184` and `:204`: the two STATED rows are unsourced, because
+/// `state_base`, `slot_ids` and `slot_stride_elems` have no honest `Source`
+/// and `new-horizon.md` §52.3 names the missing one (`Source::Scratch`). So
+/// nothing dispatches to them and the rows below are fired by one Rust
+/// program, `driver-cuda/src/fire/kda.rs`, which supplies its own operands.
 static KDA_ROWS: &[DeviceKernel] = &[
     DeviceKernel {
         sig: &KDA_SIGS[0],
@@ -949,11 +1461,21 @@ static KDA_ROWS: &[DeviceKernel] = &[
         template_path: "ssm::device::kda_o_norm_gated",
         elem: "device::bf16",
     },
+    DeviceKernel {
+        sig: &KDA_SIGS[2],
+        template_path: "ssm::device::kda_recurrent_step_batched",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &KDA_SIGS[3],
+        template_path: "ssm::device::kda_prefill_batched",
+        elem: DeviceKernel::PLAIN,
+    },
 ];
 
 /// The contracts, in [`KDA_ROWS`]'s order.
 #[rustfmt::skip]
-static KDA_SIGS: [KernelSig; 2] = [
+static KDA_SIGS: [KernelSig; 4] = [
     // The per-head gate and beta: `softplus(a_log · f) · -1` and a sigmoid,
     // one thread per (token, head, channel).
     //
@@ -1046,6 +1568,78 @@ static KDA_SIGS: [KernelSig; 2] = [
             d: I32 <- Source::Param(1),
             eps: F32 <- Source::Ctx("eps"),
         ]),
+    // ── the two recurrences ──────────────────────────────────────────────
+    //
+    // `#step` and `#prefill`, for the reason every `#` in this file exists:
+    // `execution::WALKED` states `ssm::kda_recurrent_step_batched` and
+    // `ssm::kda_prefill_batched` — the launchers — and
+    // `execution::tests::a_walk_is_only_a_walk` asserts a walked symbol is
+    // not also unit-hosted. The suffix is what keeps the stated name and the
+    // fired name two strings. Unlike `#channel_tile`/`#per_channel` above it
+    // does NOT distinguish two kernels behind one launcher: each of these
+    // launchers fires exactly one `__global__`, chosen by nothing.
+    //
+    // # These rows are hosted AND their launchers are stated, and the two
+    // # operand lists differ
+    //
+    // `table/ssm.rs:184` and `:204` state the LAUNCHERS' C++ signatures,
+    // which carry `R` and a `stream`; a `__global__` carries neither — `R`
+    // is `grid.x` and the stream is an argument of `runtime::fire`. Those
+    // table rows are UNSOURCED and stay so: §52.3 records that `state_base`,
+    // `slot_ids` and `slot_stride_elems` have no `Source` that names a KDA
+    // arena, and `Source::Gdn`/`Source::GdnSlab` resolve only `conv_state`
+    // and `recurrent_state` off a `GdnCtx` that Kimi does not populate.
+    // `abi.rs` skips a row with an unbound operand whole, so no dispatch arm
+    // is generated for either symbol — before this edit and after it, for
+    // exactly the same reason.
+    //
+    // What changed is only that the C++ launchers are gone:
+    // `driver-cuda/src/fire/kda.rs` is the program, `execution::RUST_SERVED`
+    // drops the two shim entries, and `csrc/src/ssm/kda.cu` goes with them.
+    //
+    // # `LaunchRule::Unstated`, and the block width is why
+    //
+    // `grid(R, H)` is `RecurrentScan`'s shape — but `RecurrentScan` also
+    // fixes `block(128)` and `smem = 2 * head_dim * 4`, and neither is this
+    // pair's. The step is 256 threads flat and the prefill is
+    // `min(32, D) * 32`, both on `3 * D * sizeof(float)`. The prefill's
+    // width is a MEASUREMENT and it is quoted where it was taken, on the
+    // fire: one warp per state `v` row, 2.2x at T=2048 (26.2 ms -> 12.0 ms
+    // per layer, at K3's widths). A rule that rounded it to 128 would be
+    // slower by that factor at every shape Kimi ships, silently.
+    kernel!(kda_recurrent_step_batched "ssm::kda_recurrent_step_batched#step",
+        file = Some("ssm/kda.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm: F32s,
+            k_norm: F32s,
+            v: F32s,
+            gate: F32s,
+            beta: F32s,
+            state_base: F32sMut,
+            slot_ids: I32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            h: I32,
+            d: I32,
+        ]),
+    kernel!(kda_prefill_batched "ssm::kda_prefill_batched#prefill",
+        file = Some("ssm/kda.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm: F32s,
+            k_norm: F32s,
+            v: F32s,
+            gate: F32s,
+            beta: F32s,
+            state_base: F32sMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            h: I32,
+            d: I32,
+        ]),
 ];
 
 /// [`GATED_DELTA_NET`]'s instantiations — five of the header's fourteen.
@@ -1105,6 +1699,66 @@ static GATED_DELTA_NET_ROWS: &[DeviceKernel] = &[
         template_path: "ssm::device::chunk_gated_delta_prefill_batched_warp_tiled_gqa",
         elem: "ssm::device::state_bf16, false",
     },
+    // ── THIRTEEN NOW, and the eight below are what `gated_delta_net.cu`
+    // ── chose between. The header's "the other nine are refused on their
+    // ── own facts" is superseded for five of the nine.
+    //
+    // Every refusal it recorded was about a RULE: `recurrent_step_batched_
+    // gqa_smem` "opens `grid(ceil(V_d/BV), R, V_h)` on `K_d*BV*sizeof(bf16)
+    // + 2*K_d*sizeof(float)`, which is not `RecurrentScan` in either shape
+    // or size"; `..._fla` "is a three-axis grid"; the chunked prefills "want
+    // a second head width (`K_d * V_d`) or a chunk axis that `Dims` does not
+    // carry". All true, and none of it is a reason a ROW cannot exist —
+    // `LaunchRule::Unstated` says exactly "no rule states this", and the
+    // driver states the rectangle beside the `<<<>>>` it came from
+    // (`driver-cuda/src/fire/gated_delta_net.rs`). What a row could not do
+    // before was be REACHED; it is reached by a `Walk` now.
+    //
+    // The `_fused` pair is still absent, and for a different reason
+    // entirely: `qwen_gdn_fused_step_enabled()` was `constexpr bool { return
+    // false; }` at `gated_delta_net.cu:68`, so the arm selecting it was
+    // never compiled in either archive. A row for a kernel no launcher ever
+    // launched is a contract with an empty consumer set.
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_SIGS[5],
+        template_path: "ssm::device::recurrent_step_batched_gqa_smem",
+        elem: "ssm::device::gqa_smem_bv",
+    },
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_SIGS[6],
+        template_path: "ssm::device::recurrent_step_batched_gqa",
+        elem: "ssm::device::state_bf16, false",
+    },
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_SIGS[7],
+        template_path: "ssm::device::chunk_gated_delta_prefill_batched_fla",
+        elem: "ssm::device::f32, 128, 128",
+    },
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_SIGS[8],
+        template_path: "ssm::device::chunk_gated_delta_prefill_batched_fla",
+        elem: "ssm::device::state_bf16, 128, 128",
+    },
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_SIGS[9],
+        template_path: "ssm::device::chunk_gated_delta_prefill_batched",
+        elem: "ssm::device::f32, false",
+    },
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_SIGS[10],
+        template_path: "ssm::device::chunk_gated_delta_prefill_batched",
+        elem: "ssm::device::state_bf16, false",
+    },
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_SIGS[11],
+        template_path: "ssm::device::chunk_gated_delta_prefill_batched_cached",
+        elem: "ssm::device::f32, false",
+    },
+    DeviceKernel {
+        sig: &GATED_DELTA_NET_SIGS[12],
+        template_path: "ssm::device::chunk_gated_delta_prefill_batched_cached",
+        elem: "ssm::device::state_bf16, false",
+    },
 ];
 
 /// The contracts, in [`GATED_DELTA_NET_ROWS`]' order.
@@ -1154,7 +1808,7 @@ static GATED_DELTA_NET_ROWS: &[DeviceKernel] = &[
 /// number, which is why the rule asks for the quotient it can name rather
 /// than the field it would have to trust.
 #[rustfmt::skip]
-static GATED_DELTA_NET_SIGS: [KernelSig; 5] = [
+static GATED_DELTA_NET_SIGS: [KernelSig; 13] = [
     // THE BATCHED STEP, and the row that `Ty::I64` unblocked.
     //
     // `slot_stride_elems` is a `long long` on purpose: it is an element count
@@ -1392,5 +2046,322 @@ static GATED_DELTA_NET_SIGS: [KernelSig; 5] = [
             v_d: I32 <- Source::Gdn("v_d"),
             write_state: Bool <- Source::Gdn("write_state"),
             write_state_mask: U8s <- Source::Lit(Lit::Null),
+        ]),
+
+    // ════ THE ARMS, `[5]` THROUGH `[12]` ════════════════════════════════
+    //
+    // Eight rows, four launchers, and not one of them is spellable by a
+    // trace. Every symbol here carries a `#arm` suffix because
+    // `execution::WALKED` states the launcher and
+    // `execution::tests::a_walk_is_only_a_walk` asserts a walked symbol is
+    // not also unit-hosted. Every one is `LaunchRule::Unstated` and wholly
+    // UNSOURCED, which are the same fact twice: the driver states the
+    // rectangle and supplies the operands, and a `Source` on any cell here
+    // would be a claim that a dispatcher could pick this arm on its own.
+    // `abi.rs` skips a row with an unbound operand whole, so none is
+    // generated.
+    //
+    // # What the host `if`s were, and which of them survived
+    //
+    // `gated_delta_net.cu` had four file-scope toggles and one shape test.
+    // Three of the toggles were `constexpr bool { return false; }`:
+    //
+    // ```text
+    //   qwen_gdn_gqa_ilp2_enabled()    :59   false   selected an `_ilp2` kernel
+    //   qwen_gdn_k_last_state_enabled():61   false   selected the `KLast` argument
+    //   qwen_gdn_fused_step_enabled()  :68   false   selected `_fused`, and only at K_d <= 256
+    // ```
+    //
+    // **A `constexpr false` arm is dead in one direction, so it is a
+    // DELETION and not a port.** `KLast` in particular reaches every one of
+    // the eight rows below as the literal `false` in `elem` — the same
+    // reading the five rows above already made, and this file's header
+    // states the coupling: if that `constexpr` ever returns `true`, the fix
+    // is thirteen `elem` strings. The `_fused` and `_ilp2` kernels get no
+    // row at all, because no launcher in either archive ever launched them.
+    //
+    // The fourth toggle went the other way — `qwen_gdn_fla_prefill_enabled()`
+    // is `constexpr bool { return true; }` (`:110`) — so the FLA arm is the
+    // live one and the legacy arm is still reachable, through its own shape
+    // test failing. Both are rowed.
+    //
+    // The shape test is `V_d == 128 && K_d == 128` on the step and
+    // `K_d <= 128 && V_d % 128 == 0` on the prefills. Those are facts about
+    // the fire and they survive into `fire/gated_delta_net.rs` unchanged.
+    // **The thing that used to select the step's arm was an environment
+    // variable and it is already gone**: §30 measured
+    // `recurrent_step_batched_gqa_smem<128>` against
+    // `recurrent_step_batched_gqa<__nv_bfloat16, false>` at eight shapes and
+    // 535,822,336 bytes and found them BYTE-IDENTICAL on both results, with
+    // controls proving the comparison could see a difference. The knob could
+    // only ever pick the slower arm (1.48x at R=511 on an L40S) and was
+    // deleted rather than moved. Both kernels stay, because the surviving
+    // predicate is a shape and not a preference.
+
+    // `gated_delta_net.cu:247-257` — the SMEM step:
+    //
+    // ```text
+    // constexpr int BV = 128;
+    // dim3 grid_smem((V_d + BV - 1) / BV, R, V_h);
+    // dim3 block_smem(BV);
+    // const int shmem_bytes_smem =
+    //     K_d * BV * sizeof(__nv_bfloat16) + 2 * K_d * sizeof(float);
+    // device::recurrent_step_batched_gqa_smem<BV><<<
+    //     grid_smem, block_smem, shmem_bytes_smem, stream>>>(...);
+    // ```
+    //
+    // `elem` is `ssm::device::gqa_smem_bv` and not `128`, and the header
+    // that declares it says why in full: this is the tree's only
+    // single-NON-TYPE-parameter template, `instantiation()` prefixes the
+    // first argument unconditionally, and `<::pie_cuda_driver::kernels::128>`
+    // is not a token sequence. The constant is `128` and lives at
+    // `gated_delta_net.cuh`'s `ssm::device` scope so that this row, the
+    // `ceil(V_d / BV)` grid and the `K_d * BV * 2` shared allocation are one
+    // number in three places.
+    //
+    // **The state pointer is `BufMut` and the `__global__` types it
+    // `__nv_bfloat16*` outright** — this kernel is not templated on the
+    // state type at all, which is the other half of why its symbol names
+    // only the bf16 launcher.
+    //
+    // Measured, and the measurement is the reason the kernel exists: 2406 us
+    // -> 1579 us at R=511 saturated decode (34% faster), +32% end-to-end on
+    // Qwen/Qwen3.5-4B (6924 -> 9166 tok/s).
+    kernel!(gdn_step_gqa_smem
+        "ssm::recurrent_gated_delta_step_batched_gqa_state_bf16#smem",
+        file = Some("ssm/gated_delta_net.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm_kh: F32s,
+            k_norm_kh: F32s,
+            v: F32s,
+            g_log: F32s,
+            beta: F32s,
+            state_base: BufMut,
+            slot_ids: I32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            k_h: I32,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+        ]),
+    // `gated_delta_net.cu:284-291` — the arm the shape test falls through
+    // to, and the one §30 proved identical to the arm above wherever both
+    // are legal.
+    //
+    // `RecurrentScan` states `grid(rows, kv_heads)`, `block(128)`,
+    // `smem = 2 * head_dim * sizeof(float)`, which IS this launch — and the
+    // row is `Unstated` anyway, because it is fired by hand from the same
+    // walk that fires the smem arm and `hand::fire` takes a `Launch` rather
+    // than a rule. Stating a rule no caller consults would be a second
+    // spelling of the geometry with nothing keeping the two in step.
+    kernel!(gdn_step_gqa_state_bf16_hbm
+        "ssm::recurrent_gated_delta_step_batched_gqa_state_bf16#hbm",
+        file = Some("ssm/gated_delta_net.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm_kh: F32s,
+            k_norm_kh: F32s,
+            v: F32s,
+            g_log: F32s,
+            beta: F32s,
+            state_base: BufMut,
+            slot_ids: I32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            k_h: I32,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+        ]),
+    // `gated_delta_net.cu:326-336` and `:373-383` — the FLA chunked
+    // prefill, once per state dtype:
+    //
+    // ```text
+    // constexpr int BK_MAX_FLA = 128;
+    // constexpr int BV_FLA     = 128;
+    // const int NV = V_d / BV_FLA;
+    // dim3 grid_fla(NV, R, V_h);
+    // dim3 block_fla(BV_FLA);
+    // const int shmem_bytes_fla = 2 * BK_MAX_FLA * sizeof(float);
+    // device::chunk_gated_delta_prefill_batched_fla<T, BV_FLA, BK_MAX_FLA>
+    //     <<<grid_fla, block_fla, shmem_bytes_fla, stream>>>(...);
+    // ```
+    //
+    // 9x over the legacy per-token-HBM kernel below, bit-identical at
+    // production shapes: 47.5 ms -> 5.3 ms per layer.
+    //
+    // `elem` carries THREE arguments and only the first is prefixed, which
+    // is what makes this shape spellable where the smem step's was not:
+    // `chunk_gated_delta_prefill_batched_fla<::pie_cuda_driver::kernels::ssm
+    // ::device::f32, 128, 128>`. The two 128s are `BV` and `BK_MAX` in that
+    // order, and the second bounds a `__shared__ float[2 * BK_MAX]` the
+    // launcher sizes — so the `elem` string and the `smem` the driver states
+    // must move together, which is why both are quoted here.
+    //
+    // **This kernel is GQA-aware and the legacy one is not**, which is the
+    // one asymmetry between the two arms that is not about speed: it takes
+    // `K_h` and folds `h_k = h / (V_h / K_h)`, where
+    // `chunk_gated_delta_prefill_batched` has no `K_h` parameter at all and
+    // requires the already-expanded layout. A fire that fell back from this
+    // arm to that one with `K_h != V_h` would read q and k at the wrong
+    // head. The driver's refusal states it.
+    kernel!(gdn_prefill_batched_fla
+        "ssm::chunk_gated_delta_prefill_batched#fla",
+        file = Some("ssm/gated_delta_net.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm: F32s,
+            k_norm: F32s,
+            v: F32s,
+            g_log: F32s,
+            beta: F32s,
+            state_base: F32sMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            k_h: I32,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+            write_state: Bool,
+            commit_len: I32s | null,
+            write_state_mask: U8s | null,
+        ]),
+    kernel!(gdn_prefill_batched_fla_state_bf16
+        "ssm::chunk_gated_delta_prefill_batched_state_bf16#fla",
+        file = Some("ssm/gated_delta_net.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm: F32s,
+            k_norm: F32s,
+            v: F32s,
+            g_log: F32s,
+            beta: F32s,
+            state_base: BufMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            k_h: I32,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+            write_state: Bool,
+            commit_len: I32s | null,
+            write_state_mask: U8s | null,
+        ]),
+    // `gated_delta_net.cu:344-354` and `:391-401` — the legacy per-token
+    // prefill, `grid(R, V_h)` on `block(128)` with
+    // `smem = 2 * K_d * sizeof(float)`.
+    //
+    // **Five operands FEWER than the FLA arm, and that is the whole
+    // difference in the contract**: no `K_h` (it demands `K_h == V_h`), no
+    // `write_state`, no `commit_len`, no `write_state_mask`. It always
+    // writes the state and it has no speculative-commit prefix. A caller
+    // that reached this arm with a mask set would silently lose the mask,
+    // which is the second half of the refusal the driver states.
+    kernel!(gdn_prefill_batched_per_token
+        "ssm::chunk_gated_delta_prefill_batched#per_token",
+        file = Some("ssm/gated_delta_net.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm: F32s,
+            k_norm: F32s,
+            v: F32s,
+            g_log: F32s,
+            beta: F32s,
+            state_base: F32sMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+        ]),
+    kernel!(gdn_prefill_batched_per_token_state_bf16
+        "ssm::chunk_gated_delta_prefill_batched_state_bf16#per_token",
+        file = Some("ssm/gated_delta_net.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm: F32s,
+            k_norm: F32s,
+            v: F32s,
+            g_log: F32s,
+            beta: F32s,
+            state_base: BufMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+        ]),
+    // `gated_delta_net.cu:409-445` and `:447-483` — the state-in-shared
+    // prefill, `grid(R, V_h)` on `block(128)` with
+    // `smem = K_d * V_d * sizeof(float)`.
+    //
+    // # THE ONE ROW IN THIS FAMILY WHOSE LAUNCH NEEDS A DRIVER CALL FIRST
+    //
+    // `K_d * V_d * 4` at Qwen3.5's 128x128 is **65,536 bytes**, and CUDA's
+    // default dynamic shared-memory cap is 48 KiB. The launcher called
+    // `gdn_raise_shmem_cap` (`:90-102`) before every fire — a
+    // `cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemory
+    // Size, bytes)` behind a `std::map<std::pair<device, func>, high_water>`
+    // under a `std::mutex`. **The cap is PER DEVICE**, and the C++ comment
+    // says what a process-global flag costs: under tensor parallelism rank 0
+    // raises it on device 0, sets the flag, and rank 1 skips the call, then
+    // launches asking for more shared memory than device 1 allows.
+    //
+    // That map is `KernelModule::raise_dynamic_smem` now
+    // (`kernels-cuda-new/src/runtime/module.rs`), keyed on
+    // `(CUdevice, CUfunction)` exactly as the C++ keyed on
+    // `(int, const void*)`, and `KernelModule::fire` calls it for any launch
+    // over 48 KiB — so a row that needs it cannot forget to ask.
+    kernel!(gdn_prefill_batched_cached
+        "ssm::chunk_gated_delta_prefill_batched_cached#state_in_smem",
+        file = Some("ssm/gated_delta_net.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm: F32s,
+            k_norm: F32s,
+            v: F32s,
+            g_log: F32s,
+            beta: F32s,
+            state_base: F32sMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+            write_state: Bool,
+            write_state_mask: U8s | null,
+        ]),
+    kernel!(gdn_prefill_batched_cached_state_bf16
+        "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16#state_in_smem",
+        file = Some("ssm/gated_delta_net.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_norm: F32s,
+            k_norm: F32s,
+            v: F32s,
+            g_log: F32s,
+            beta: F32s,
+            state_base: BufMut,
+            slot_ids: I32s,
+            qo_indptr: U32s,
+            slot_stride_elems: I64,
+            out: F32sMut,
+            v_h: I32,
+            k_d: I32,
+            v_d: I32,
+            write_state: Bool,
+            write_state_mask: U8s | null,
         ]),
 ];

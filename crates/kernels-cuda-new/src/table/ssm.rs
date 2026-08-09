@@ -15,11 +15,29 @@ pub static KERNELS: &[KernelSig] = &[
     // The other mamba scan had a row here — `ssm::flashinfer_mamba_ssu_bf16`
     // — and it is deleted. `cuda::flashinfer_mamba_ssu` had no caller in any
     // model text, and `flashinfer_mamba_ssu_enabled()` needs sm90, so no
-    // deployment in reach fires it. The vendored source, the launcher
-    // (`csrc/src/ssm/flashinfer_mamba.{cu,hpp}`) and
-    // `examples/vendor_probe.rs` all stay — the probe measured the text
-    // vendoring and compiling under NVRTC (396,128 B cubin, 9 of 9 symbols),
-    // which is the finding that makes re-stating this row cheap.
+    // deployment in reach fires it.
+    //
+    // AND THE LAUNCHER IS GONE TOO. This comment used to say
+    // `csrc/src/ssm/flashinfer_mamba.{cu,hpp}` stayed, which was true of the
+    // change that deleted the row and stopped being true one section later:
+    // `new-horizon.md` §43's sweep deleted both files under a grant that
+    // covered them, an upstream merge handed them back, and the FlashInfer
+    // audit re-landed the deletion.
+    //
+    // There was nothing in the file to keep. It held zero `__global__` and
+    // zero `<<<>>>` — every kernel it reached was a template inside
+    // `flashinfer::mamba::invokeSelectiveStateUpdate` — so no device text
+    // needed lifting into `csrc/src`, and its host half was four `#define`d
+    // shape constants and a refusal, serving a caller that did not exist.
+    // `mamba/selective_state_update.cuh` is CPM-only besides; this crate
+    // vendors no `flashinfer/mamba/` at all, so the file was holding the
+    // FETCH open, never the vendored closure.
+    //
+    // The vendored source and `examples/vendor_probe.rs` stay, and the probe
+    // is why the deletion costs nothing: it measured the text compiling under
+    // NVRTC (396,128 B cubin, 9 of 9 symbols), and its `roots` name the
+    // upstream header rather than the launcher, so the path back never went
+    // through the `.cu`.
     // The third linear-attention shape here, and not a variant of the other
     // two: mamba carries a `[head_dim, state_size]` slab per head and
     // advances it with a scalar `dA` from a per-token `dt` -- a selective

@@ -25,16 +25,32 @@
 //! C++ for attention is **the kernels themselves** — and those are the thing
 //! NVRTC is for. Named, so the next person does not re-derive it:
 //!
-//! * **The FA2/FA3/MLA `__global__` templates** still go through nvcc.
-//!   §13.6 prices that separately and correctly: it is a FlashInfer patch set
-//!   plus ~39 bit-exact device intrinsics, not arithmetic we own.
+//! * **The FA2 `__global__` templates go through NVRTC now.** §13.6 priced
+//!   that as *"a FlashInfer patch set plus ~39 bit-exact device intrinsics"*
+//!   and **the price is obsolete** — it was quoted before anyone re-measured,
+//!   and both halves of it had already been paid: `csrc/vendor/flashinfer/`
+//!   IS the patch set (24 `.cuh`, marked, upstream otherwise unmodified) and
+//!   `csrc/shim/` supplies the impersonating headers the intrinsics wanted.
+//!   Measured against `libnvrtc.so.13` on an L40S at `compute_89`:
+//!   `math.cuh`, `vec_dtypes.cuh`, `page.cuh` and `attention/decode.cuh` all
+//!   compile clean, and both paged kernels return a lowered name and exactly
+//!   one `.entry` — 187,279 B of PTX for decode, 146,396 B for prefill.
+//!   `--device-as-default-execution-space` is load-bearing and is the whole
+//!   of the delta. See [`crate::families::fa2`] for the lattice and
+//!   [`crate::fa2`] for the launcher arithmetic that chose its points.
+//!
+//!   **Nothing about bit-exactness has been established.** No output has been
+//!   compared against the nvcc-built kernels; what is established is that the
+//!   text compiles and that the constants are the ones the host launcher
+//!   computes. FA3 and MLA are unprobed and still go through nvcc.
 //! * **The occupancy query.** [`decode::estimate`] takes `max_grid_size`
 //!   because upstream gets it from
 //!   `cudaOccupancyMaxActiveBlocksPerMultiprocessor` **on the decode kernel**
-//!   — a per-cubin fact, not a per-device one. When the decode kernel is
-//!   JIT-compiled, that becomes `cuOccupancyMaxActiveBlocksPerMultiprocessor`
-//!   on the resulting `CUfunction`, in layer 3. Until then the caller passes
-//!   the number it already has.
+//!   — a per-cubin fact, not a per-device one. With the decode kernel
+//!   JIT-compiled that is
+//!   [`crate::runtime::module::KernelModule::max_active_blocks_per_sm`], over
+//!   `cuOccupancyMaxActiveBlocksPerMultiprocessor`, in layer 3. The caller
+//!   still passes the number, and now has somewhere to get it.
 //! * **The upload.** This module returns the bytes; it does not move them.
 //!   The `cudaMemcpyAsync(int_buffer, page_locked, used, H2D, stream)` at the
 //!   end of every upstream planner is layer 3's, and belongs beside the launch

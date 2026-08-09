@@ -75,28 +75,14 @@ impl MetalDriver {
     /// No Metal 4 device, or a device whose queue could not be created. Both
     /// are boot conditions, not runtime ones.
     pub fn create(config_bytes: &[u8]) -> Result<Self> {
-        // `[model] config` and `[model] id`, read HERE because a boot
-        // TOML is the engine's format. A driver that parsed it would be the
-        // second thing entitled to an opinion about the file's shape, and the
-        // two would drift.
-        //
-        // The id is an OVERRIDE, not a selector: a checkpoint is matched to a
-        // `model::catalog` row by its tensors, and this exists for the one
-        // case tensors cannot settle — two shape-identical rows where the
-        // operator knows which download this is.
-        let boot = std::str::from_utf8(config_bytes)
-            .ok()
-            .and_then(|text| text.parse::<toml::Table>().ok());
-        let boot_config = boot.as_ref().and_then(|v| {
-            v.get("model")?
-                .get("config")?
-                .as_str()
-                .map(std::path::PathBuf::from)
-        });
-        let boot_model_id = boot
-            .as_ref()
-            .and_then(|v| Some(v.get("model")?.get("id")?.as_str()?.to_string()));
-        let shell = driver_metal::serve::Shell::open(boot_config, boot_model_id)
+        // ONE READER of the boot document, in `crate::driver::boot`. This
+        // site used to rebuild the `from_utf8` -> `toml::Table` ->
+        // `get("model")` chain itself, and so did the Vulkan and WebGPU seams
+        // beside it -- three readers of one format, inside the crate whose
+        // format it is, each quoting the same sentence about why a driver
+        // must not be the second one.
+        let boot = crate::driver::BootConfig::parse(config_bytes);
+        let shell = driver_metal::serve::Shell::open(boot.config, boot.model_id)
             .map_err(|e| anyhow!("metal shell: {e}"))?;
         let facts = shell.device_facts().clone();
         let _ = facts;
@@ -105,19 +91,6 @@ impl MetalDriver {
             broker: CompletionBroker::new(),
         })
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
 
 impl Driver for MetalDriver {
@@ -170,10 +143,7 @@ impl Driver for MetalDriver {
     /// # Errors
     ///
     /// A shape or dtype the registry will not serve, or a duplicate id.
-    fn register_channel(
-        &mut self,
-        desc: &ChannelRegistrationPlan,
-    ) -> Result<RegisteredChannel> {
+    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
         let binding = self.shell.register_channel(desc)?;
         Ok(RegisteredChannel {
             driver_id: desc.driver_id,

@@ -165,7 +165,7 @@ const MERGE_SMEM: u32 = 4 * MERGE_BDY * HEAD_DIM * 2 + MERGE_THREADS * 4;
 ///
 /// `page_size` is a `uint_fastdiv`, which holds a `cuda::fast_mod_div<uint32_t>`
 /// — and that class is NOT the same object on the two sides. NVRTC resolves
-/// `<cuda/cmath>` to `csrc/src/cuda/cmath`, this crate's 16-byte shim
+/// `<cuda/cmath>` to `csrc/shim/cuda/cmath`, this crate's 16-byte shim
 /// `{uint32_t divisor; unsigned long long magic;}` with alignment 8; `nvcc`
 /// resolves it to FlashInfer's bundled CCCL, a 16-byte
 /// `{uint32_t divisor; uint32_t multiplier; unsigned add; int shift;}` with
@@ -297,7 +297,7 @@ const _: () = {
     assert!(offset_of!(DecodeParams, padded_batch_size) == 136);
     assert!(offset_of!(DecodeParams, request_indices) == 176);
     assert!(offset_of!(DecodeParams, partition_kv) == 216);
-    // The shim's own signature: 24, not CCCL's 20. If `csrc/src/cuda/cmath`
+    // The shim's own signature: 24, not CCCL's 20. If `csrc/shim/cuda/cmath`
     // ever grows a field or loses its 8-byte magic, this is where it shows.
     assert!(offset_of!(DecodeParams, paged_kv.num_heads) == 16 + 24);
 };
@@ -306,7 +306,7 @@ const _: () = {
 /// intermediate.
 ///
 /// `2^64 - 1 = q*d + r`, so `2^64 = q*d + (r+1)` and the carry into the
-/// quotient happens exactly when `r + 1 == d`. This is `csrc/src/cuda/cmath`'s
+/// quotient happens exactly when `r + 1 == d`. This is `csrc/shim/cuda/cmath`'s
 /// constructor transcribed into Rust — it has to be transcribed, because that
 /// constructor is `__host__ __device__` C++ that the JIT never runs on the
 /// host. Wrong by one and `__umul64hi` returns the wrong page for some but not
@@ -1749,7 +1749,7 @@ fn the_unit_names_what_it_compiles() {
 
 /// The shim's magic constant, checked against the division it stands for.
 ///
-/// `csrc/src/cuda/cmath` proves `floor(n * M / 2^64) == floor(n / d)` for every
+/// `csrc/shim/cuda/cmath` proves `floor(n * M / 2^64) == floor(n / d)` for every
 /// 32-bit `n`; this checks the M this file computes is the M that proof is
 /// about, over the page sizes anything here will ever use plus the awkward
 /// ones. A magic that is off by one divides correctly for small dividends and

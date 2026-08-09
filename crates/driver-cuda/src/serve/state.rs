@@ -15,9 +15,17 @@ use driver_api::local::PIE_STATUS_DRIVER_ERROR;
 /// `cast::<Shell>().as_mut()` on every one of thirteen entry points. The
 /// entry points are methods now, so the receiver IS this.
 pub struct Shell {
-    /// The capabilities JSON `create` hands back; owned here so the
-    /// pointer in [`PieDriverCaps`] lives as long as the driver.
+    /// The capabilities JSON.
+    ///
+    /// It was owned here so the `{ptr, len}` in a `PieDriverCaps`
+    /// out-parameter would outlive the `create` call. Nothing hands out a
+    /// pointer to it now.
     pub(crate) caps: Vec<u8>,
+    /// What this device is, parsed once at create.
+    ///
+    /// The engine used to parse [`Self::caps`] itself, from a `{ptr, len}` it
+    /// was handed back. One parse, on the side that authored the JSON.
+    pub(crate) facts: driver_api::DeviceFacts,
     /// `[model] config` from the boot TOML, for HF snapshots whose
     /// config does not ride inside the checkpoint.
     ///
@@ -273,8 +281,7 @@ pub struct Shell {
 
 /// Driver-lifetime fire scratch.
 pub(crate) struct FireScratch {
-    pub ws:
-        crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
+    pub ws: crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
     /// The PREFILL plan's own workspace, and it has to be its own.
     ///
     /// A FlashInfer plan writes its schedule into the workspace it was
@@ -726,8 +733,7 @@ impl ChannelState {
 /// same two facts from a buffer's LENGTH: a layer's page stride and,
 /// from that, its head dim. Both are things the layout states.
 pub(crate) struct KvState {
-    pub cache:
-        crate::pools::kv_cache_live::KvCache<crate::pools::kv_cache_live::AllResident>,
+    pub cache: crate::pools::kv_cache_live::KvCache<crate::pools::kv_cache_live::AllResident>,
     /// Backing store for `cache`; dropping this frees the pages.
     pub _held: Vec<crate::device::DeviceBuffer>,
     pub num_pages: u32,
@@ -1020,7 +1026,7 @@ impl GdnState {
         {
             use cudarc::runtime::sys::{cudaError, cudaMemcpyAsync, cudaMemcpyKind};
             let keep = self.num_slots;
-            let mut copy = |dst: *mut u8, src: *const u8, bytes: u64| -> Result<(), i32> {
+            let copy = |dst: *mut u8, src: *const u8, bytes: u64| -> Result<(), i32> {
                 if bytes == 0 {
                     return Ok(());
                 }
@@ -1239,7 +1245,6 @@ pub(crate) fn instance_ring_shapes(
 pub(crate) fn channel_dtype(byte: u8) -> driver::tensor_ir::DType {
     driver::tensor_ir::DType::from_wire(byte).unwrap_or(driver::tensor_ir::DType::F32)
 }
-
 
 /// A borrowed ABI slice as a Rust slice; empty for null.
 pub(crate) fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {

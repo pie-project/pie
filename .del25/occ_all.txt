@@ -1,0 +1,219 @@
+=================== attn::write_kv_to_pages_bf16 ===================
+  crates/kernels-cuda-new/src/families/attn.rs:2587:    // The symbol is the KERNEL'S and not `attn::write_kv_to_pages_bf16`'s,
+  crates/kernels-cuda-new/src/families/attn.rs:2589:    // `write_kv_to_pages_bf16` at `:85`/`:95` and `write_kv_to_pages_bf16_devwin`
+  crates/kernels-cuda-new/src/runtime/launch.rs:1016:/// `attn/kv_paged.cu`, `write_kv_to_pages_bf16`:
+  crates/kernels-cuda-new/src/table/attn.rs:517:    kernel!(write_kv_to_pages_bf16 "attn::write_kv_to_pages_bf16",
+  crates/kernels-cuda-new/tests/launch_rules.rs:161:/// `attn/kv_paged.cu`, `write_kv_to_pages_bf16`:
+  crates/kernels-cuda/csrc/src/attn/kv_paged.cu:64:void write_kv_to_pages_bf16(
+  crates/kernels-cuda/csrc/src/attn/kv_paged.cu:134:        write_kv_to_pages_bf16(
+  crates/kernels-cuda/csrc/src/attn/kv_paged.hpp:19:void write_kv_to_pages_bf16(
+  crates/model-compiler/src/dsl.rs:5115:    /// `kernels::attn::write_kv_to_pages_bf16`: the bf16-typed page write.
+  crates/model-compiler/src/dsl.rs:5116:    pub fn write_kv_to_pages_bf16(k: &Val, v: &Val, l: u32) {
+  crates/model-compiler/src/dsl.rs:5120:            "attn::write_kv_to_pages_bf16",
+=================== attn::write_kv_to_pages_bf16_devwin ===================
+  crates/kernels-cuda-new/src/families/attn.rs:2589:    // `write_kv_to_pages_bf16` at `:85`/`:95` and `write_kv_to_pages_bf16_devwin`
+  crates/kernels-cuda-new/src/table/attn.rs:290:    kernel!(write_kv_to_pages_devwin "attn::write_kv_to_pages_bf16_devwin",
+  crates/kernels-cuda/csrc/src/attn/kv_paged.cu:303:void write_kv_to_pages_bf16_devwin(
+  crates/kernels-cuda/csrc/src/attn/kv_paged.cu:319:            "write_kv_to_pages_bf16_devwin requires native bf16 KV cache "
+  crates/kernels-cuda/csrc/src/attn/kv_paged.cu:327:            "write_kv_to_pages_bf16_devwin: envelope maintenance not yet "
+  crates/kernels-cuda/csrc/src/attn/kv_paged.hpp:62:void write_kv_to_pages_bf16_devwin(
+  crates/model-compiler/src/dsl.rs:3392:    /// `kernels::attn::write_kv_to_pages_bf16_devwin`: the page write, over
+  crates/model-compiler/src/dsl.rs:3398:            "attn::write_kv_to_pages_bf16_devwin",
+=================== attn::dispatch_attention_flashinfer_decode_bf16 ===================
+  crates/kernels-cuda-new/src/table/attn.rs:434:    kernel!(flashinfer_decode_bf16 "attn::dispatch_attention_flashinfer_decode_bf16",
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer.cu:473:void dispatch_attention_flashinfer_decode_bf16(
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer.cu:489:            "dispatch_attention_flashinfer_decode_bf16: cache is empty; "
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer.cu:881:    dispatch_attention_flashinfer_decode_bf16(
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer.hpp:161:void dispatch_attention_flashinfer_decode_bf16(
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer_hopper_stub.cpp:58:// `kernels::attn::dispatch_attention_flashinfer_decode_bf16`, which is built on every
+  crates/kernels-cuda/csrc/src/attn/attention_merge_states.cu:11:// gemma4.cpp) calls `kernels::attn::dispatch_attention_flashinfer_decode_bf16` -- which is
+  crates/model-compiler/src/dsl.rs:4677:    /// `kernels::attn::dispatch_attention_flashinfer_decode_bf16`: the bf16-typed
+  crates/model-compiler/src/dsl.rs:4683:            "attn::dispatch_attention_flashinfer_decode_bf16",
+=================== attn::dispatch_attention_flashinfer_prefill_sm90_bf16 ===================
+  crates/kernels-cuda-new/src/table/attn.rs:412:    kernel!(flashinfer_prefill_sm90 "attn::dispatch_attention_flashinfer_prefill_sm90_bf16",
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer.cu:1000:        dispatch_attention_flashinfer_prefill_sm90_bf16(
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer_hopper.cu:278:void dispatch_attention_flashinfer_prefill_sm90_bf16(
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer_hopper.hpp:58:void dispatch_attention_flashinfer_prefill_sm90_bf16(
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer_hopper_stub.cpp:37:void dispatch_attention_flashinfer_prefill_sm90_bf16(
+  crates/model-compiler/src/dsl.rs:4336:    /// `kernels::attn::dispatch_attention_flashinfer_prefill_sm90_bf16`: the FA3
+  crates/model-compiler/src/dsl.rs:4342:            "attn::dispatch_attention_flashinfer_prefill_sm90_bf16",
+=================== attn::attention_flashinfer_prefill_custom ===================
+  crates/kernels-cuda-new/src/table/attn.rs:666:    kernel!(flashinfer_custom_planless "attn::attention_flashinfer_prefill_custom",
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer.cu:1601:void attention_flashinfer_prefill_custom(
+  crates/kernels-cuda/csrc/src/attn/attention_flashinfer.hpp:454:void attention_flashinfer_prefill_custom(
+  crates/model-compiler/src/dsl.rs:6258:    /// `kernels::attn::attention_flashinfer_prefill_custom`: the custom-mask
+  crates/model-compiler/src/dsl.rs:6274:            "attn::attention_flashinfer_prefill_custom",
+  crates/model-compiler/src/dsl.rs:8181:    pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv, window_left: i32) -> Option<Val> {
+  crates/model/src/shared/llama_like/forward/mod.rs:1348:                                    cuda::attention_flashinfer_prefill_custom(
+  crates/model/src/shared/llama_like/forward/mod.rs:1360:                            cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left);
+  crates/model/src/shared/llama_like/forward/mod.rs:1369:                                    cuda::attention_flashinfer_prefill_custom(
+=================== attn::attention_naive_paged_bf16 ===================
+  crates/kernels-cuda-new/src/table/attn.rs:525:    kernel!(attention_naive_paged_bf16 "attn::attention_naive_paged_bf16", whole = true,
+  crates/kernels-cuda/csrc/src/attn/attention_naive_paged.cu:82:void attention_naive_paged_bf16(
+  crates/kernels-cuda/csrc/src/attn/attention_naive_paged.cu:101:    check_head_dim_supported(head_dim, "attention_naive_paged_bf16");
+  crates/kernels-cuda/csrc/src/attn/attention_naive_paged.cu:293:    attention_naive_paged_bf16(
+  crates/kernels-cuda/csrc/src/attn/attention_naive_paged.hpp:36:void attention_naive_paged_bf16(
+  crates/model-compiler/src/dsl.rs:5131:    /// `kernels::attn::attention_naive_paged_bf16`: the bf16-typed naive paged
+  crates/model-compiler/src/dsl.rs:5133:    pub fn attention_naive_paged_bf16(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
+  crates/model-compiler/src/dsl.rs:5137:            "attn::attention_naive_paged_bf16",
+=================== attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin ===================
+  crates/kernels-cuda-new/src/table/attn.rs:280:    kernel!(qkv_decode_fused_devwin "attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin",
+  crates/kernels-cuda/csrc/src/attn/qkv_fused.cu:187:void qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+  crates/kernels-cuda/csrc/src/attn/qkv_fused.hpp:64:void qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+  crates/model-compiler/src/dsl.rs:3374:    /// `kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin`: the
+  crates/model-compiler/src/dsl.rs:3380:            "attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin",
+=================== mlp::chunked_swiglu_strided_bf16 ===================
+  crates/kernels-cuda-new/src/families/mlp.rs:319:    kernel!(chunked_swiglu_strided "mlp::chunked_swiglu_strided_bf16",
+  crates/kernels-cuda-new/src/table/mlp.rs:54:    kernel!(chunked_swiglu_strided "mlp::chunked_swiglu_strided_bf16",
+  crates/kernels-cuda/csrc/src/mlp/swiglu.cu:165:void chunked_swiglu_strided_bf16(
+  crates/kernels-cuda/csrc/src/mlp/swiglu.hpp:154:void chunked_swiglu_strided_bf16(
+  crates/model-compiler/src/dsl.rs:4028:    /// `kernels::mlp::chunked_swiglu_strided_bf16`: chunked swiglu over
+  crates/model-compiler/src/dsl.rs:4034:            "mlp::chunked_swiglu_strided_bf16",
+=================== mlp::gpt_oss_glu_strided_bf16 ===================
+  crates/kernels-cuda-new/csrc/src/moe/moe_dispatch.cuh:67:// either way. `mlp::gpt_oss_glu_strided_bf16` made the same move for the
+  crates/kernels-cuda-new/src/families/mlp.rs:268:    kernel!(gpt_oss_glu_strided "mlp::gpt_oss_glu_strided_bf16",
+  crates/kernels-cuda-new/src/families/moe.rs:188://! the guard is `h >= hidden` either way. `mlp::gpt_oss_glu_strided_bf16`
+  crates/kernels-cuda-new/src/table/mlp.rs:63:    kernel!(gpt_oss_glu_strided "mlp::gpt_oss_glu_strided_bf16",
+  crates/kernels-cuda/csrc/src/mlp/swiglu.cu:67:void gpt_oss_glu_strided_bf16(
+  crates/kernels-cuda/csrc/src/mlp/swiglu.hpp:45:void gpt_oss_glu_strided_bf16(
+  crates/model-compiler/src/dsl.rs:4524:    /// `kernels::mlp::gpt_oss_glu_strided_bf16`: gpt-oss's clamped GLU,
+  crates/model-compiler/src/dsl.rs:4530:            "mlp::gpt_oss_glu_strided_bf16",
+=================== mlp::sigmoid_scalar_gate_add_bf16 ===================
+  crates/kernels-cuda-new/src/families/mlp.rs:18://! became names. Four are `mlp::sigmoid_scalar_gate_add_bf16`'s, whose row is
+  crates/kernels-cuda-new/src/families/mlp.rs:45://! `mlp::sigmoid_scalar_gate_add_bf16` WAS the fourth and fifth at once: it
+  crates/kernels-cuda-new/src/families/mlp.rs:55://! not remove an ambiguity; it left `mlp::sigmoid_scalar_gate_add_bf16` in
+  crates/kernels-cuda-new/src/families/mlp.rs:368:    // The strided gate. `mlp::sigmoid_scalar_gate_add_bf16` is the same
+  crates/kernels-cuda-new/src/families/mlp.rs:419:    // `sigmoid_scalar_gate_add_bf16(...)` called
+  crates/kernels-cuda-new/src/families/mlp.rs:425:    // writes `mlp::sigmoid_scalar_gate_add_bf16` into a trace and
+  crates/kernels-cuda-new/src/families/mlp.rs:439:    kernel!(sigmoid_scalar_gate_add "mlp::sigmoid_scalar_gate_add_bf16",
+  crates/kernels-cuda-new/src/table/mlp.rs:183:    kernel!(sigmoid_scalar_gate_add "mlp::sigmoid_scalar_gate_add_bf16",
+  crates/kernels-cuda/csrc/src/mlp/swiglu.cu:218:void sigmoid_scalar_gate_add_bf16(
+  crates/kernels-cuda/csrc/src/mlp/swiglu.hpp:190:void sigmoid_scalar_gate_add_bf16(
+  crates/model-compiler/src/dsl.rs:3709:    /// `kernels::mlp::sigmoid_scalar_gate_add_bf16`: add `x` onto `out`,
+  crates/model-compiler/src/dsl.rs:3715:            "mlp::sigmoid_scalar_gate_add_bf16",
+  crates/model-compiler/src/dsl.rs:7161:    /// `kernels::mlp::sigmoid_scalar_gate_add_bf16`; this fused form runs when
+  crates/model-compiler/src/trace.rs:508:    /// launch (`kernels::mlp::sigmoid_scalar_gate_add_bf16`); the `[Tokens, 1]`
+  crates/model/src/qwen_3_5/forward/mod.rs:65:/// | SigmoidGateAdd                 | kernels::mlp::sigmoid_scalar_gate_add_bf16         |
+=================== mlp::sigmoid_scalar_gate_strided_add_bf16 ===================
+  crates/kernels-cuda-new/src/families/mlp.rs:46://! is `mlp::sigmoid_scalar_gate_strided_add_bf16` with `stride = 1`, the same
+  crates/kernels-cuda-new/src/families/mlp.rs:388:    kernel!(sigmoid_scalar_gate_strided_add "mlp::sigmoid_scalar_gate_strided_add_bf16",
+  crates/kernels-cuda-new/src/families/mlp.rs:420:    // `sigmoid_scalar_gate_strided_add_bf16(..., /*stride=*/1, stream)` — so
+  crates/kernels-cuda-new/src/table/mlp.rs:192:    kernel!(sigmoid_scalar_gate_strided_add "mlp::sigmoid_scalar_gate_strided_add_bf16",
+  crates/kernels-cuda/csrc/src/mlp/swiglu.cu:222:    sigmoid_scalar_gate_strided_add_bf16(
+  crates/kernels-cuda/csrc/src/mlp/swiglu.cu:226:void sigmoid_scalar_gate_strided_add_bf16(
+  crates/kernels-cuda/csrc/src/mlp/swiglu.hpp:197:void sigmoid_scalar_gate_strided_add_bf16(
+  crates/model-compiler/src/dsl.rs:4046:    /// `kernels::mlp::sigmoid_scalar_gate_strided_add_bf16`: the shared
+  crates/model-compiler/src/dsl.rs:4052:            "mlp::sigmoid_scalar_gate_strided_add_bf16",
+=================== moe::token_batched_weighted_sum_aligned_bf16 ===================
+  crates/kernels-cuda-new/src/families/moe.rs:800:    kernel!(token_batched_weighted_sum_aligned "moe::token_batched_weighted_sum_aligned_bf16",
+  crates/kernels-cuda-new/src/table/moe.rs:196:    kernel!(token_batched_weighted_sum_aligned "moe::token_batched_weighted_sum_aligned_bf16",
+  crates/kernels-cuda/csrc/src/moe/moe_dispatch.cu:146:void token_batched_weighted_sum_aligned_bf16(
+  crates/kernels-cuda/csrc/src/moe/moe_dispatch.hpp:89:void token_batched_weighted_sum_aligned_bf16(
+  crates/model-compiler/src/dsl.rs:5452:    /// `kernels::moe::token_batched_weighted_sum_aligned_bf16`: combine the
+  crates/model-compiler/src/dsl.rs:5458:            "moe::token_batched_weighted_sum_aligned_bf16",
+=================== ssm::causal_conv1d_update_bf16 ===================
+  crates/kernels-cuda-new/src/families/ssm.rs:875:    kernel!(causal_conv1d_update_jit "ssm::causal_conv1d_update_bf16",
+  crates/kernels-cuda-new/src/table/ssm.rs:238:    kernel!(causal_conv1d_update "ssm::causal_conv1d_update_bf16", whole = true,
+  crates/kernels-cuda/csrc/src/ssm/causal_conv1d.cu:57:void causal_conv1d_update_bf16(
+  crates/kernels-cuda/csrc/src/ssm/causal_conv1d.hpp:12://   * `causal_conv1d_update_bf16`: single-token (T=1) update
+  crates/kernels-cuda/csrc/src/ssm/causal_conv1d.hpp:76:void causal_conv1d_update_bf16(
+  crates/model-compiler/src/dsl.rs:5325:    /// `kernels::ssm::causal_conv1d_update_bf16`: the decode-step conv,
+  crates/model-compiler/src/dsl.rs:5334:            "ssm::causal_conv1d_update_bf16",
+=================== ssm::causal_conv1d_prefill_bf16 ===================
+  crates/kernels-cuda-new/src/families/ssm.rs:843:    // `causal_conv1d_prefill_bf16` calls and `<false>` is the other symbol.
+  crates/kernels-cuda-new/src/families/ssm.rs:999:    kernel!(causal_conv1d_prefill_single "ssm::causal_conv1d_prefill_bf16",
+  crates/kernels-cuda-new/src/runtime/launch.rs:1309:/// a flag: `causal_conv1d_prefill_bf16` fires `<SILU=true>` and
+  crates/kernels-cuda-new/src/table/ssm.rs:105:    kernel!(causal_conv1d_prefill_single "ssm::causal_conv1d_prefill_bf16",
+  crates/kernels-cuda-new/tests/launch_rules.rs:204:/// `ssm/causal_conv1d.cu`, `causal_conv1d_prefill_bf16` through
+  crates/kernels-cuda/csrc/src/ssm/causal_conv1d.cu:41:void causal_conv1d_prefill_bf16(
+  crates/kernels-cuda/csrc/src/ssm/causal_conv1d.hpp:6://   * `causal_conv1d_prefill_bf16`: full-prefill of N tokens
+  crates/kernels-cuda/csrc/src/ssm/causal_conv1d.hpp:34:void causal_conv1d_prefill_bf16(
+  crates/model-compiler/src/dsl.rs:3944:    /// `kernels::ssm::causal_conv1d_prefill_bf16`: the prefill conv,
+  crates/model-compiler/src/dsl.rs:3950:            "ssm::causal_conv1d_prefill_bf16",
+  scripts/kernel-vocabulary-audit.py:159:     "`causal_conv1d_prefill_bf16` IS declared -- Qwen3.5 traces that one."),
+=================== ssm::recurrent_gated_delta_step ===================
+  crates/kernels-cuda-new/csrc/src/ssm/gated_delta_net.cuh:28://     `recurrent_gated_delta_step` and its three siblings, unchanged.
+  crates/kernels-cuda-new/src/execution.rs:210:///   over `recurrent_gated_delta_step(q + t*V_h*K_d, k + t*V_h*K_d,
+  crates/kernels-cuda-new/src/families/ssm.rs:1257:    kernel!(gdn_step_single "ssm::recurrent_gated_delta_step",
+  crates/kernels-cuda-new/src/table/ssm.rs:43:    kernel!(gdn_step_single "ssm::recurrent_gated_delta_step",
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.cu:213:void recurrent_gated_delta_step(
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.cu:486:// loop over `recurrent_gated_delta_step`. Mathematically
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.cu:513:        recurrent_gated_delta_step(
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.hpp:39:void recurrent_gated_delta_step(
+  crates/model-compiler/src/dsl.rs:3859:    /// `kernels::ssm::recurrent_gated_delta_step`: one decode step,
+  crates/model-compiler/src/dsl.rs:3865:            "ssm::recurrent_gated_delta_step",
+=================== ssm::recurrent_gated_delta_step_state_bf16 ===================
+  crates/kernels-cuda-new/src/families/ssm.rs:1276:    kernel!(gdn_step_single_state_bf16 "ssm::recurrent_gated_delta_step_state_bf16",
+  crates/kernels-cuda-new/src/table/ssm.rs:58:    kernel!(gdn_step_single_state_bf16 "ssm::recurrent_gated_delta_step_state_bf16",
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.cu:234:void recurrent_gated_delta_step_state_bf16(
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.cu:540:        recurrent_gated_delta_step_state_bf16(
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.hpp:49:void recurrent_gated_delta_step_state_bf16(
+  crates/model-compiler/src/dsl.rs:3888:            "ssm::recurrent_gated_delta_step_state_bf16",
+=================== ssm::chunk_gated_delta_prefill ===================
+  crates/kernels-cuda-new/examples/migration_status.rs:522:    /// `chunk_gated_delta_prefill` is a host `for` issuing T of them;
+  crates/kernels-cuda-new/examples/migration_status.rs:703:    ("ssm::chunk_gated_delta_prefill", Class::Structural(Wall::TwoLaunches), "a host `for` issuing T sequential single-step launches; `ssm/gated_delta_net.cu:484-499`"),
+  crates/kernels-cuda-new/src/execution.rs:209:///   three.** `ssm::chunk_gated_delta_prefill` is `for (t = 0; t < T; ++t)`
+  crates/kernels-cuda-new/src/execution.rs:303:/// | `ssm::chunk_gated_delta_prefill` | `for t in 0..T`, five pointers advancing | no |
+  crates/kernels-cuda-new/src/table/ssm.rs:73:    kernel!(gdn_prefill_single "ssm::chunk_gated_delta_prefill",
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.cu:499:void chunk_gated_delta_prefill(
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.hpp:142:void chunk_gated_delta_prefill(
+  crates/model-compiler/src/dsl.rs:3903:    /// `kernels::ssm::chunk_gated_delta_prefill`: the chunked prefill,
+  crates/model-compiler/src/dsl.rs:3909:            "ssm::chunk_gated_delta_prefill",
+=================== ssm::chunk_gated_delta_prefill_state_bf16 ===================
+  crates/kernels-cuda-new/examples/migration_status.rs:704:    ("ssm::chunk_gated_delta_prefill_state_bf16", Class::Structural(Wall::TwoLaunches), "the same host loop, bf16-state twin; `:525-551`"),
+  crates/kernels-cuda-new/src/execution.rs:304:/// | `ssm::chunk_gated_delta_prefill_state_bf16` | the same loop, bf16 state | no |
+  crates/kernels-cuda-new/src/table/ssm.rs:89:    kernel!(gdn_prefill_single_state_bf16 "ssm::chunk_gated_delta_prefill_state_bf16",
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.cu:525:void chunk_gated_delta_prefill_state_bf16(
+  crates/kernels-cuda/csrc/src/ssm/gated_delta_net.hpp:153:void chunk_gated_delta_prefill_state_bf16(
+  crates/model-compiler/src/dsl.rs:3929:            "ssm::chunk_gated_delta_prefill_state_bf16",
+=================== quant::mxfp4_moe_gate_up_decode_grouped_bf16 ===================
+  crates/kernels-cuda-new/examples/migration_status.rs:698:    ("quant::mxfp4_moe_gate_up_decode_grouped_bf16", Class::Structural(Wall::HostChoice), "`getenv(\"PIE_MXFP4_MOE_KTOK\")` selects one of five instantiations at an IDENTICAL grid and block -- so the shape is a `Specialisation`, which already ships, and only the selector is missing"),
+  crates/kernels-cuda-new/src/table/moe.rs:109:    kernel!(mxfp4_moe_gate_up_decode_grouped "quant::mxfp4_moe_gate_up_decode_grouped_bf16",
+  crates/kernels-cuda/csrc/src/quant/dequant_fp4.cu:81:void mxfp4_moe_gate_up_decode_grouped_bf16(
+  crates/kernels-cuda/csrc/src/quant/dequant_fp4.hpp:52:void mxfp4_moe_gate_up_decode_grouped_bf16(
+  crates/model-compiler/src/dsl.rs:4628:    /// `kernels::quant::mxfp4_moe_gate_up_decode_grouped_bf16`: the gate and
+  crates/model-compiler/src/dsl.rs:4639:            "quant::mxfp4_moe_gate_up_decode_grouped_bf16",
+=================== rope::rope_yarn_bf16 ===================
+  crates/kernels-cuda-new/src/table/rope.rs:99:    kernel!(rope_yarn "rope::rope_yarn_bf16",
+  crates/kernels-cuda/csrc/src/rope/rope.cu:226:void rope_yarn_bf16(
+  crates/kernels-cuda/csrc/src/rope/rope.hpp:162:void rope_yarn_bf16(
+  crates/model-compiler/src/dsl.rs:4209:    /// `kernels::rope::rope_yarn_bf16`: YaRN-scaled rope.
+  crates/model-compiler/src/dsl.rs:4218:            "rope::rope_yarn_bf16",
+=================== gemm::act_x_wt_bf16_cublas ===================
+  crates/kernels-cuda-new/examples/migration_status.rs:650:    ("gemm::act_x_wt_bf16_cublas",     Class::Structural(Wall::HostChoice), "MEASURED: same shape at `gemm.cpp:2353-2358`, and the name is the trap -- the row called \"cuBLAS, named as such\" tries OUR gemv first at M=1 and only then `gemm_bf16_cublas_impl`"),
+  crates/kernels-cuda-new/src/table/gemm.rs:207:    kernel!(gemm_cublas "gemm::act_x_wt_bf16_cublas",
+  crates/kernels-cuda/csrc/src/gemm/gemm.cpp:2339:void act_x_wt_bf16_cublas(
+  crates/kernels-cuda/csrc/src/gemm/gemm.hpp:396:void act_x_wt_bf16_cublas(
+  crates/model-compiler/src/dsl.rs:3618:    /// `kernels::gemm::act_x_wt_bf16_cublas`: the plain cuBLAS GEMM, named.
+  crates/model-compiler/src/dsl.rs:3623:            "gemm::act_x_wt_bf16_cublas",
+=================== norm::residual_add_scale_rmsnorm_bf16 ===================
+  crates/kernels-cuda-new/src/families/norm.rs:923:    kernel!(residual_add_scale_rmsnorm "norm::residual_add_scale_rmsnorm_bf16",
+  crates/kernels-cuda-new/src/table/norm.rs:61:    kernel!(residual_add_scale_rmsnorm "norm::residual_add_scale_rmsnorm_bf16",
+  crates/kernels-cuda/csrc/src/norm/rmsnorm.cu:138:void residual_add_scale_rmsnorm_bf16(
+  crates/kernels-cuda/csrc/src/norm/rmsnorm.hpp:68:void residual_add_scale_rmsnorm_bf16(
+  crates/model-compiler/src/dsl.rs:4317:    /// `kernels::norm::residual_add_scale_rmsnorm_bf16`: residual add, a
+  crates/model-compiler/src/dsl.rs:4327:            "norm::residual_add_scale_rmsnorm_bf16",
+=================== norm::add_bias_bf16_strided ===================
+  crates/kernels-cuda-new/src/families/norm.rs:438:    kernel!(add_bias_strided "norm::add_bias_bf16_strided",
+  crates/kernels-cuda-new/src/table/norm.rs:79:    kernel!(add_bias_strided "norm::add_bias_bf16_strided",
+  crates/kernels-cuda/csrc/src/norm/add_bias.cu:25:void add_bias_bf16_strided(
+  crates/kernels-cuda/csrc/src/norm/add_bias.hpp:22:void add_bias_bf16_strided(
+  crates/model-compiler/src/dsl.rs:4367:    /// `kernels::norm::add_bias_bf16_strided`: add a bias row into a strided
+  crates/model-compiler/src/dsl.rs:4373:            "norm::add_bias_bf16_strided",
+=================== layout::embed_bf16_vocab_shard ===================
+  crates/kernels-cuda-new/src/families/layout.rs:537:    kernel!(embed_vocab_shard "layout::embed_bf16_vocab_shard",
+  crates/kernels-cuda-new/src/table/layout.rs:113:    kernel!(embed_vocab_shard "layout::embed_bf16_vocab_shard",
+  crates/kernels-cuda/csrc/src/layout/embed.cu:9:// `embed_bf16_vocab_shard` is also a row, and the launcher stays anyway: this
+  crates/kernels-cuda/csrc/src/layout/embed.cu:56:void embed_bf16_vocab_shard(
+  crates/kernels-cuda/csrc/src/layout/embed.hpp:24:void embed_bf16_vocab_shard(
+  crates/model-compiler/src/dsl.rs:5717:    /// `kernels::layout::embed_bf16_vocab_shard`: gather from a vocab-SHARDED
+  crates/model-compiler/src/dsl.rs:5729:            "layout::embed_bf16_vocab_shard",
+=================== layout::split_gate_up_bf16 ===================
+  crates/kernels-cuda-new/src/families/layout.rs:489:    // `split_gate_up_bf16`: `dim3 grid((inter + 255) / 256, n_tokens)` at 256
+  crates/kernels-cuda-new/src/families/layout.rs:506:    kernel!(split_gate_up "layout::split_gate_up_bf16",
+  crates/kernels-cuda-new/src/table/layout.rs:56:    kernel!(split_gate_up "layout::split_gate_up_bf16",
+  crates/kernels-cuda/csrc/src/layout/split_gate_up.cu:18:void split_gate_up_bf16(
+  crates/kernels-cuda/csrc/src/layout/split_gate_up.hpp:3:// `split_gate_up_bf16`, split out of `attn/split_packed.hpp`.
+  crates/kernels-cuda/csrc/src/layout/split_gate_up.hpp:19:void split_gate_up_bf16(
+  crates/model-compiler/src/dsl.rs:4246:    /// `kernels::layout::split_gate_up_bf16`: split a packed `[N, 2·I]` bank.
+  crates/model-compiler/src/dsl.rs:4254:            "layout::split_gate_up_bf16",

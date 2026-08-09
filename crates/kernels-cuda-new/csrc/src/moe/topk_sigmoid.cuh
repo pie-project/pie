@@ -1,9 +1,11 @@
 //===-- topk_sigmoid.cuh - the sigmoid router's top-k ---------------------===//
 //
 // One `__global__` template and the two constants its shared arrays are
-// sized by. No host function, no `<<<>>>`, no entry point: `topk_sigmoid.cu`
-// includes this file and keeps only the launcher, so the kernel has exactly
-// ONE definition in the tree and both compilers read the same bytes.
+// sized by. No host function, no `<<<>>>`, no entry point -- and since §43,
+// no `topk_sigmoid.cu` either: that file held only the launcher, the row
+// `moe::topk_sigmoid_bf16` is in `device::JIT_DISPATCHED` so the shim never
+// emitted an entry for it, and nothing else called it. The kernel has
+// exactly ONE definition in the tree and now only one compiler reads it.
 //
 // # Why the split, and what a copy would have cost
 //

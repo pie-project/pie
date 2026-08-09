@@ -390,16 +390,6 @@ pub async fn run_inferlet(
 /// and ignored because `Device::open` takes the first Vulkan device the
 /// loader reports -- a selector here would be a setting nothing acts on.
 pub fn vulkan_standalone_toml(artifact: &str, kernels: &str) -> String {
-    vulkan_standalone_toml_with_pages(artifact, kernels, 256)
-}
-
-/// The same, with the pool sized by the caller.
-///
-/// A test that wants the pool to RUN OUT needs this: 256 pages is four
-/// thousand tokens, which no gate here comes close to, so the driver's
-/// `Exhausted` answer and the engine's re-post are never taken at the default.
-#[must_use]
-pub fn vulkan_standalone_toml_with_pages(artifact: &str, kernels: &str, kv_pages: u32) -> String {
     format!(
         "         [server]\n\
          port = 0\n\
@@ -412,7 +402,7 @@ pub fn vulkan_standalone_toml_with_pages(artifact: &str, kernels: &str, kv_pages
          type = \"vulkan\"\n\
          device = [\"vulkan:0\"]\n\
          kernels = \"{kernels}\"\n\
-         kv_pages = {kv_pages}\n"
+         kv_pages = 256\n"
     )
 }
 
@@ -426,12 +416,6 @@ pub fn vulkan_standalone_toml_with_pages(artifact: &str, kernels: &str, kv_pages
 /// A colon-separated list is accepted and the first entry used: a deployment
 /// serves one model, and the engine's own tests take the list.
 pub async fn boot_vulkan() -> Result<pie::StandaloneHandle> {
-    boot_vulkan_with_pages(256).await
-}
-
-/// The same, with the pool sized by the caller. See
-/// [`vulkan_standalone_toml_with_pages`].
-pub async fn boot_vulkan_with_pages(kv_pages: u32) -> Result<pie::StandaloneHandle> {
     let artifact = std::env::var("PIE_VULKAN_ARTIFACT")
         .ok()
         .filter(|v| !v.is_empty())
@@ -441,8 +425,7 @@ pub async fn boot_vulkan_with_pages(kv_pages: u32) -> Result<pie::StandaloneHand
         .ok()
         .filter(|v| !v.is_empty())
         .context("PIE_KERNELS_VULKAN_SPV_DIR names the compiled modules")?;
-    let (controller, gateway, worker) = derive_standalone(&vulkan_standalone_toml_with_pages(
-        &artifact, &kernels, kv_pages,
-    ))?;
+    let (controller, gateway, worker) =
+        derive_standalone(&vulkan_standalone_toml(&artifact, &kernels))?;
     run_standalone(controller, gateway, worker).await
 }

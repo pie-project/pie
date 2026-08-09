@@ -522,10 +522,44 @@ fn the_five_rows_are_stated_and_hosted() {
 /// **The launcher text is the one these rows were written from.**
 ///
 /// Read through [`include_str!`], so the pin is against the source in the tree
-/// rather than against a copy that could drift on its own. The path crosses
-/// crates on purpose: the device headers moved to `kernels-cuda-new/csrc`,
-/// and the host launchers stayed in `kernels-cuda/csrc`, which is where a
-/// `<<<>>>` lives.
+/// rather than against a copy that could drift on its own.
+///
+/// **`norm/rmsnorm.cu` IS DELETED** — `58b31cf1b`, and
+/// `kernels-cuda/csrc/CMakeLists.txt` records where it went: *"Three of its
+/// five launchers are `device::JIT_DISPATCHED` (`rmsnorm_bf16`,
+/// `rmsnorm_strided_bf16`, `rmsnorm_gated_fp32_in_bf16`) and two are
+/// `execution::RUST_SERVED` ... `driver-cuda/src/fire/rmsnorm.rs` is the host
+/// program."* So `CU` names that Rust now. The path still crosses crates, for
+/// a new reason: the device headers are in `kernels-cuda-new/csrc` and the
+/// host launchers are in `driver-cuda/src/fire`, which is where a `<<<>>>`
+/// lives once it stops being C++.
+///
+/// # What this repoint costs, and what it cannot pay
+///
+/// The three literals each launcher is checked for — `constexpr int BLOCK =
+/// 256;`, `dim3 grid(num_rows);` and the template it launches — are all
+/// quoted in `fire/rmsnorm.rs` verbatim, at `:149`, `:312` and `:150`. **The
+/// ANCHORS are not.** This test finds `void rmsnorm_strided_bf16(` and slices
+/// to the launcher's closing brace so that the three literals are proved to
+/// be in ONE BODY and not merely somewhere in one file; a Rust port has no
+/// C++ signature to find, so `CU.find(launcher)` fails and this test panics
+/// naming the launcher it could not find. That panic is left standing rather
+/// than repaired by widening the search to the whole file, because widening
+/// it is a decision about what `Rule::RowsPerHead` is still witnessed by, and
+/// it belongs to whoever re-anchors this — not to the change that moved the
+/// file. The same holds for the `rmsnorm_bf16` forward below: the identity
+/// survives in `fire/rmsnorm.rs:169-176` as prose (*"the identity
+/// `rmsnorm_bf16(...) == rmsnorm_strided_bf16(..., hidden, hidden, ...)` is
+/// the whole content of the symbol"*) and NOT as the C++ this asserts.
+///
+/// **And `rmsnorm_gated_fp32_in_bf16` has no body to re-anchor to at all.**
+/// `fire/rmsnorm.rs:456-465` says so: *"`rmsnorm.cu:199` launched
+/// `device::rmsnorm_gated_f32_in<device::bf16, 256>` at `<<<num_rows,
+/// 256>>>`. The symbol is already named in `device::JIT_DISPATCHED` ... it
+/// was dead C++ waiting for its file to go. It went with the file. A port
+/// would have been a second, unreachable copy of a routed row."* The geometry
+/// survives in that sentence; the launcher does not. Of the five witnesses
+/// this rule started with, ONE is still a launcher anywhere in this tree.
 ///
 /// Two launchers, one grid. If either stops being `dim3 grid(num_rows)`
 /// over `constexpr int BLOCK = 256`, the rows below state a rule that is no
@@ -543,7 +577,7 @@ fn the_five_rows_are_stated_and_hosted() {
 /// `families::norm` and `examples/unit_probe_norm.rs`.
 #[test]
 fn the_launcher_text_is_the_one_these_rows_were_written_from() {
-    const CU: &str = include_str!("../../kernels-cuda/csrc/src/norm/rmsnorm.cu");
+    const CU: &str = include_str!("../../driver-cuda/src/fire/rmsnorm.rs");
 
     // `(launcher, the device template it launches)`.
     const LAUNCHERS: [(&str, &str); 2] = [
@@ -553,7 +587,9 @@ fn the_launcher_text_is_the_one_these_rows_were_written_from() {
     ];
 
     for (launcher, template) in LAUNCHERS {
-        let start = CU.find(launcher).unwrap_or_else(|| panic!("{launcher} is in rmsnorm.cu"));
+        let start = CU
+            .find(launcher)
+            .unwrap_or_else(|| panic!("{launcher} is in driver-cuda/src/fire/rmsnorm.rs"));
         let body = &CU[start..];
         let end = body.find("\n}\n").expect("the launcher has an end") + 3;
         let body = &body[..end];
@@ -575,7 +611,9 @@ fn the_launcher_text_is_the_one_these_rows_were_written_from() {
 
     // The forward the first row cites, so that `rmsnorm_bf16` naming
     // `rmsnorm_strided_bf16`'s grid is witnessed and not asserted.
-    let start = CU.find("void rmsnorm_bf16(").expect("`rmsnorm_bf16` is in rmsnorm.cu");
+    let start = CU
+        .find("void rmsnorm_bf16(")
+        .expect("`rmsnorm_bf16` is in driver-cuda/src/fire/rmsnorm.rs");
     let body = &CU[start..];
     let end = body.find("\n}\n").expect("the launcher has an end") + 3;
     let forward: String = body[..end].split_whitespace().collect::<Vec<_>>().join(" ");

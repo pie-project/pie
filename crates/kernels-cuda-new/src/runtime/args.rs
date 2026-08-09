@@ -66,6 +66,40 @@ use crate::device::Fact;
 /// Named kinds rather than a raw `u64` because the whole hazard of a `void**`
 /// launch is that every argument is eight bytes and any eight bytes will be
 /// accepted. The kind is what [`Args::bind`] checks the row against.
+///
+/// # The gap: a kernel parameter that is a struct — CLOSED
+///
+/// There is no aggregate in [`Ty`] and there never will be: its variants are
+/// the buffer kinds, the typed slice kinds, `I32`, `U32` and `U8Array`, and a
+/// single variant meaning "some struct" would tag every struct alike.
+/// **A kernel parameter passed by value as a struct is bound by
+/// [`ArgValue::Bytes`]**, added for `.wiki/kernel-x/northstar.md` §3.2. It was
+/// the single thing standing between three of the four remaining FlashInfer
+/// host programs and their Rust form, because every upstream entry point they
+/// call takes exactly one such parameter:
+///
+/// ```text
+/// BatchMLAPagedAttention<MASK,512,64>(params, num_blks_x, num_blks_y, stream)
+/// BatchPrefillWithPagedKVCacheDispatched<…, HopperParams>(params, pdl, stream)
+/// allreduce_fusion_kernel_launcher<Pattern, T, NRanks, acc>(params, pdl)
+/// ```
+///
+/// `MergeStates` is the sole exception, which is why `table/attn.rs` records
+/// it as the cheapest place to start.
+///
+/// The fix was smaller than it looked, and the mechanism was already described
+/// in [`ArgValue::cell`] below: `KernelModule::fire` passes `kernelParams`
+/// with a **null `extra`** — not `CU_LAUNCH_PARAM_BUFFER_POINTER` — so the
+/// driver copies `sizeof(param)` bytes from each parameter's *own address*.
+/// That is why a `bool` is safely one byte, and it is the same mechanism a
+/// struct parameter uses unchanged. **The launch path always supported an
+/// aggregate; `cell() -> u64` was the only thing foreclosing it**, since a
+/// 200-byte struct does not fit in a return value. What was needed was a
+/// variant borrowing a caller-owned byte buffer, plus layout agreement between
+/// Rust and the header — which is the typecheck translation unit's existing
+/// job, and is why [`Args::bind`] does not consult [`Ty`] for this one kind.
+///
+/// See `new-horizon.md` §50.7 and `kernel-x/northstar.md` §3.2.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ArgValue {
     /// A device address — every pointer-shaped [`Ty`].
@@ -127,6 +161,39 @@ pub enum ArgValue {
     /// emits, and a third `ArgValue` would not add a check — `Args::bind`
     /// compares a kind to a `Ty` and both enums are the same kind.
     U8(u8),
+    /// A BY-VALUE AGGREGATE — a struct the kernel takes whole, over the eight
+    /// bytes a [`cell`](ArgValue::cell) can hold.
+    ///
+    /// §3.2 of `.wiki/kernel-x/northstar.md` asks for this variant by name,
+    /// and this module's header already described the whole of the mechanism:
+    /// `KernelModule::fire` passes `kernelParams` with a **null `extra`**, so
+    /// the driver copies `sizeof(param)` bytes from each parameter's own
+    /// address. A 200-byte struct crosses exactly the way a `bool` does; the
+    /// only thing that ever foreclosed it was `cell() -> u64`.
+    ///
+    /// # The bytes are BORROWED, and [`Args::bind`] copies them
+    ///
+    /// A raw pointer and a length rather than a `&'a [u8]`, because
+    /// [`ArgValue`] has no lifetime parameter and giving it one would thread a
+    /// lifetime through every row-world call site in the tree for a variant
+    /// none of them can produce. The borrow is short and local — a host `fn`
+    /// with the aggregate on its own stack, calling into [`Args::bind`] on the
+    /// next line — and `bind` copies into storage it owns, so nothing survives
+    /// the call that could dangle at launch time.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address `len` initialised bytes for the duration of the
+    /// [`Args::bind`] call that consumes it, laid out as the `__global__`'s
+    /// parameter expects. **The layout agreement is not checked here and
+    /// cannot be**: it is the typecheck translation unit's, which compares the
+    /// declaration's whole parameter list against the real `__global__`'s.
+    Bytes {
+        /// The aggregate's first byte.
+        ptr: *const u8,
+        /// How many bytes the kernel's parameter is.
+        len: usize,
+    },
 }
 
 impl ArgValue {
@@ -141,6 +208,7 @@ impl ArgValue {
             ArgValue::I64(_) => "an i64",
             ArgValue::Bool(_) => "a bool",
             ArgValue::U8(_) => "a u8 enumerator",
+            ArgValue::Bytes { .. } => "a by-value aggregate",
         }
     }
 
@@ -179,6 +247,15 @@ impl ArgValue {
             ArgValue::I64(v) => v as u64,
             ArgValue::Bool(v) => u64::from(v),
             ArgValue::U8(v) => u64::from(v),
+            // UNREACHABLE BY CONSTRUCTION, and a panic rather than a zero.
+            // `Args::bind` takes the aggregate out of the value stream before
+            // this is called, because the whole point of the variant is that
+            // it does not fit here. A zero would be eight bytes of silence at
+            // the head of a 200-byte parameter, which is the shape of bug
+            // this file exists to make impossible.
+            ArgValue::Bytes { .. } => {
+                panic!("an aggregate has no cell; Args::bind copies it instead")
+            }
         }
     }
 
@@ -230,6 +307,12 @@ impl ArgValue {
             // nobody means — faults instead of answering. The same argument
             // `Fact`'s header makes against `Int` for a flag, one level over.
             ArgValue::F32(_) | ArgValue::Usize(_) | ArgValue::U8(_) => Fact::Opaque,
+            // OPAQUE for a third reason, and the strongest of the three: the
+            // bytes are not this value's, they are a borrow, and a predicate
+            // that could read them would be reading host memory whose contents
+            // a specialisation has no claim on. An aggregate is a NAME for a
+            // parameter block, exactly as an enumerator is a name.
+            ArgValue::Bytes { .. } => Fact::Opaque,
         }
     }
 }
@@ -354,6 +437,15 @@ pub struct Args {
     /// lives at the old address.
     #[allow(clippy::vec_box)]
     storage: Vec<Box<u64>>,
+    /// By-value aggregates, copied out of the caller's borrow.
+    ///
+    /// A second vector rather than a wider `storage`, because every scalar
+    /// and every pointer IS eight bytes and paying a heap allocation of
+    /// unknown size for each of them to accommodate the rare struct would be
+    /// the tail wagging the dog. `slots` interleaves the two in operand
+    /// order; the boxes in either vector never move, which is the property
+    /// the whole type is built around.
+    blobs: Vec<Box<[u8]>>,
     slots: Vec<*mut c_void>,
 }
 
@@ -372,8 +464,36 @@ impl Args {
                 got: values.len(),
             });
         }
-        let mut out = Self { storage: Vec::with_capacity(values.len()), slots: Vec::new() };
+        let mut out = Self {
+            storage: Vec::with_capacity(values.len()),
+            blobs: Vec::new(),
+            slots: Vec::new(),
+        };
         for (operand, value) in sig.operands.iter().zip(values) {
+            // A BY-VALUE AGGREGATE IS TAKEN OUT OF THE TAG CHECK, and that is
+            // a decision worth its paragraph.
+            //
+            // `kernels::Ty` is a closed enum and it cannot name a struct —
+            // adding one variant meaning "some aggregate" would make every
+            // aggregate the same tag, so the check would pass on a `MLAParams`
+            // bound where a `HopperParams` is declared and catch nothing.
+            // Widening the enum per struct is the forty-variant `LaunchRule`
+            // mistake in a second enum, which is the failure §3.2 makes `Abi`
+            // an OPEN SET of impls to avoid.
+            //
+            // So the check moves to where it is real: the typecheck
+            // translation unit compares the declaration's whole parameter list
+            // against the `__global__`'s, which fails on a swapped aggregate,
+            // a reordered pair and a dropped `const` alike. Nothing is lost —
+            // no `Ty` could ever have caught this — and the tag stops
+            // pretending.
+            //
+            // Only `x::Abi` produces this variant. No `Source` builds one, so
+            // no row-world binding can reach this line at all.
+            if let ArgValue::Bytes { ptr, len } = *value {
+                out.push_bytes(ptr, len);
+                continue;
+            }
             let ok = match operand.ty {
                 t if is_pointer(t) => matches!(value, ArgValue::Ptr(_)),
                 Ty::I32 => matches!(value, ArgValue::I32(_)),
@@ -383,6 +503,7 @@ impl Args {
                 Ty::I64 => matches!(value, ArgValue::I64(_)),
                 Ty::Bool => matches!(value, ArgValue::Bool(_)),
                 Ty::KvScheme | Ty::KvDType => matches!(value, ArgValue::U8(_)),
+                Ty::Fp8Kind => matches!(value, ArgValue::U32(_)),
                 ty => {
                     return Err(ArgError::Unsupported {
                         symbol: sig.symbol,
@@ -408,6 +529,23 @@ impl Args {
         let mut boxed = Box::new(cell);
         let at: *mut u64 = &raw mut *boxed;
         self.storage.push(boxed);
+        self.slots.push(at.cast());
+    }
+
+    /// Copy an aggregate into storage this value owns and record its address.
+    ///
+    /// The copy is the point. `cuLaunchKernel` reads `sizeof(param)` bytes
+    /// from the address in `slots` DURING the call, and the caller's borrow
+    /// ends when [`Args::bind`] returns — so an [`Args`] that recorded the
+    /// caller's address would hand the driver a stack frame that is usually
+    /// still right, which is what makes that class of bug survive a test run.
+    fn push_bytes(&mut self, ptr: *const u8, len: usize) {
+        // SAFETY: `ArgValue::Bytes`' own contract is that `ptr` addresses
+        // `len` initialised bytes for the duration of this call.
+        let mut boxed: Box<[u8]> =
+            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec().into_boxed_slice();
+        let at: *mut u8 = boxed.as_mut_ptr();
+        self.blobs.push(boxed);
         self.slots.push(at.cast());
     }
 

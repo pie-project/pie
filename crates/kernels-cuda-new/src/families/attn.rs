@@ -59,10 +59,13 @@
 //! * **`attn/attention_flashinfer`'s `attn_score_fold_heads` is the newest
 //!   member, and the last kernel in the tree whose blocker was that its text
 //!   had not moved.** The text has moved — `attn/attention_flashinfer.cuh`,
-//!   a PARTIAL split of a file that keeps its FlashInfer dispatch and its
-//!   three private score-normalisation kernels — so the row is now refused
+//!   a PARTIAL split of a file that keeps its FlashInfer dispatch; its three
+//!   private score-normalisation kernels went too, to
+//!   `attn/attention_score_post.cuh`, and are [`ATTN_SCORE_POST`]'s rows as
+//!   of §53.8 — so the row is now refused
 //!   for GEOMETRY like the rest of this list. The launcher is
-//!   `attention_flashinfer.cu:828-829`, `dim3(requests, 64)` at 256 threads
+//!   `driver-cuda/csrc/attn/attention_flashinfer.cu:618-619`,
+//!   `dim3(requests, 64)` at 256 threads
 //!   with nothing shared, and the `64` is a LITERAL: a grid-stride fanout,
 //!   not a dimension of anything. **[`LaunchRule::PerRequest`] is one number
 //!   away** — `dim3(requests)` at 256 with nothing shared, the same `grid.x`,
@@ -192,13 +195,19 @@
 //! no type in them to abstract over, so there is nothing to put between the
 //! brackets and no list makes one.
 //!
-//! # The heavy half has seven, and the list reaches exactly one of them
+//! # The heavy half has nine, and the list reaches exactly one of them
 //!
-//! [`UNITS_HEAVY`]'s three headers hold every multi-argument template in the
+//! [`UNITS_HEAVY`]'s three template-bearing headers hold every
+//! multi-argument template in the
 //! family, and auditing them against the finding produced one row change and
 //! six refusals with a shared cause worth naming once. **Five of those six
 //! refusals have since been overturned** — not by the argument-list finding
 //! but by [`crate::device::Specialisation`], which arrived after it.
+//!
+//! ([`ATTN_SCORE_POST`] takes no part in this: its
+//! three rows are `DeviceKernel::PLAIN`, non-templates whose block width is a
+//! `constexpr int` inside the body. A unit with no template argument cannot
+//! have an argument-list finding.)
 //!
 //! **`attn/kimi_mla.cuh`'s `split_kv_a_norm<class T, int BLOCK_DIM = 256>` is
 //! the one it reaches**, and its row now states `elem: "device::bf16, 256"`
@@ -282,6 +291,107 @@
 //! numeric format cost the line below rather than a translation unit's worth
 //! of `cicc` — which is the measurement `norm/elementwise.cuh` made first and
 //! the reason this design was worth the migration.
+//!
+//! # The sm90 prefill: no row, no unit, and the specification it needs
+//!
+//! `kernels-cuda/csrc/src/attn/attention_flashinfer_hopper.cu` has neither a
+//! row nor a unit, so this header is the only place its specification can
+//! hang. It holds zero `__global__`, zero `__device__` and zero `<<<>>>`:
+//! every kernel is a template inside
+//! `flashinfer::BatchPrefillWithPagedKVCacheDispatched`, so there is no device
+//! text to migrate and the whole file is host program. Four of its six
+//! FlashInfer includes are CPM-only; the other two (`attention/cascade.cuh`,
+//! `attention/scheduler.cuh`, plus `layout.cuh`) have vendored twins that
+//! **no `-I` in this repository reaches**. `new-horizon.md` §50.5 is the long
+//! form.
+//!
+//!  1. FIRES nothing from `hopper_prefill_supported`; whatever
+//!     `flashinfer::PrefillSM90Plan` fires from the plan entry; and one
+//!     `BatchPrefillWithPagedKVCacheDispatched<HeadDim, HeadDim, Mask, Window,
+//!     SameSchedule, Variant, HopperParams>` from the dispatch. The template
+//!     cross-product over head dim × mask × window × schedule IS the
+//!     instantiation set — each member is one row, and [`SPECIALISATIONS`]
+//!     above is the mechanism that picks among them, the same one already
+//!     choosing between five `kv_paged` appenders on a flag.
+//!  2. INTERMEDIATE: the most demanding plan protocol in the tree.
+//!     `PrefillSM90Plan` writes a `PrefillPlanSM90Info` across the float
+//!     buffer, the int buffer AT AN OFFSET, and a PAGE-LOCKED HOST MIRROR at
+//!     the same offset; the dispatch reads it back and throws on an empty
+//!     plan. Two device regions plus a pinned host companion, with an
+//!     `int_base_bytes >= workspace.int_bytes` end-of-buffer refusal, held
+//!     across two calls.
+//!  3. HOST DECIDES the shape gate `hopper_prefill_supported(head_dim, …)`, a
+//!     head-layout refusal, the empty-plan refusal, and the mask/window/
+//!     softcap template arms. All refusals, never fallbacks — a `throw` here
+//!     means the caller knowingly picks another path.
+//!  4. MISSING: the by-value aggregate (`HopperParams` is
+//!     `BatchPrefillPagedParams<…>` and crosses by value — see the note on
+//!     `ArgValue` in `runtime/args.rs`); a SECOND plan `Source`, because
+//!     `Source::AttnPlan` names the FA2 plan and `PrefillPlanSM90Info` is a
+//!     different struct with different fields; and there is no vocabulary at
+//!     all for a host-pinned companion to a device region.
+//!
+//! `PrefillSM90Plan` is itself upstream HOST code, so NVRTC does not carry it.
+//! Whether the Rust reimplements its index arithmetic or keeps calling into it
+//! is the first decision this file forces and the one that sets the cost.
+//!
+//! **But none of that is the first blocker, and points 1-4 are not reachable
+//! yet.** Before a unit can exist, NVRTC has to be able to SEE the device
+//! text, and it cannot. NVRTC reads the vendored tree through
+//! [`crate::unit::Headers::LibraryAndVendor`]; the CPM checkout
+//! (`${flashinfer_SOURCE_DIR}`) is a *C++ compiler* include path and is not on
+//! any NVRTC path. `kernels-cuda-new/csrc/vendor/flashinfer/` has **no
+//! `attention/hopper/` directory at all**, and no `cutlass_utils.cuh`. Four of
+//! this file's six includes are therefore unreachable, so there is no unit to
+//! write, no row to name it, and no Rust in `driver-cuda/src/` that could fire
+//! one. **The vendored tree must gain `attention/hopper/` first**, and that
+//! tree is `vendor-role`'s.
+//!
+//! That is what the vendored-versus-CPM split actually MEANS, and it is worth
+//! stating because the table on its own reads as an accident: **the vendored
+//! set is precisely the set that has been prepared for NVRTC, and the CPM-only
+//! set is precisely the set that has not.** `attention/cascade.cuh`,
+//! `attention/mla.cuh`, `attention/scheduler.cuh`, `layout.cuh` and
+//! `fastdiv.cuh` are vendored, which is why `merge_attention_states` and
+//! `attention_mla` are carryable today; `attention/hopper/*`, `cutlass_utils`
+//! and every `comm/*` are not, which is why this file and
+//! `comm/custom_all_reduce.cu` are not. The dependency order for all four is
+//! header, then unit, then row, then the by-value aggregate, then the Rust —
+//! and this file is blocked at the first step, not the fourth.
+//!
+//! ## Its stub, and what a stub's Rust form is
+//!
+//! `attention_flashinfer_hopper_stub.cpp` is what actually compiles on this
+//! box, and under the no-`.cpp` principle it is not a special case. §48.3:
+//! *a stub goes when the thing it stands in for goes, and a stub with nothing
+//! to stub is not a smaller problem, it is a deleted file.* So the correct
+//! move for it is never "relocate it" — it is to go when this file goes.
+//!
+//! Its Rust form is not a file at all. An architecture stub exists because a
+//! real implementation cannot compile for the target; in Rust that is `#[cfg]`
+//! or a runtime capability check, and the driver already does both. Concretely
+//! the stub IS the refusal arm: on `sm_89` the sm90 prefill is unsupported, so
+//! what replaces it is a device fact read once at load and an eligibility
+//! check that refuses — the same refusal `hopper_prefill_supported` already
+//! spells, moved to the host language. Nothing needs a second artifact,
+//! because a JIT unit that is never selected costs nothing to not compile,
+//! which is the whole difference from an AOT archive that must contain a
+//! symbol for every target it might run on. **The stub is an artefact of
+//! ahead-of-time linking and it does not survive the move to NVRTC.**
+//!
+//! Stated once more so a future reader does not have to reconstruct it: this
+//! box is an L40S, `sm_89`. The stub is what compiles; the real file has never
+//! run here. §44.7 — every `sm_90` conclusion in this tree is argued from the
+//! call graph and *"none of them is argued from a run"*. That the file has
+//! been moved and moved back changes nothing about that standing.
+//!
+//! **None of this has been run.** This box is an L40S, `sm_89`, so
+//! `attention_flashinfer_hopper_stub.cpp` is what compiles and the real file
+//! is untested here. §44.7 recorded that every `sm_90` conclusion in this tree
+//! is argued from the call graph and *"none of them is argued from a run"*.
+//! The four points above are read off the source and inherit exactly that
+//! standing — a specification to build against, not a claim that the Hopper
+//! path works.
 
 use kernels::KernelSig;
 use kernels::Lit;
@@ -655,6 +765,18 @@ static ATTN_RES_SIGS: [KernelSig; 1] = [
 
 /// The index network's LayerNorm-plus-RoPE and its top-k mask, at bf16.
 pub static DSA_INDEXER_ROWS: &[DeviceKernel] = &[
+    // THE QUERY ROTATION HAS A ROW NOW. `dsa_indexer.cu`'s header said the
+    // other two were "waiting on a launch rule"; this one waits no longer,
+    // because it does not need one. Its block width is
+    // `round_up(n_heads, 32)` with a one-warp floor -- a statement PARAMETER
+    // and not a rectangle, so no `Dims` carries it and no rule can state it.
+    // `LaunchRule::Unstated` says that, and
+    // `driver-cuda/src/fire/dsa_indexer.rs::q_rope_block` is the arithmetic.
+    DeviceKernel {
+        sig: &DSA_INDEXER_SIGS[2],
+        template_path: "attn::device::index_q_rope",
+        elem: "device::bf16",
+    },
     DeviceKernel {
         sig: &DSA_INDEXER_SIGS[0],
         template_path: "attn::device::index_knorm_rope",
@@ -672,7 +794,7 @@ pub static DSA_INDEXER_ROWS: &[DeviceKernel] = &[
 ];
 
 #[rustfmt::skip]
-static DSA_INDEXER_SIGS: [KernelSig; 2] = [
+static DSA_INDEXER_SIGS: [KernelSig; 3] = [
     // UNSOURCED, exactly as the twin is. A source is a claim about where a
     // value comes from at fire time, and a guessed one binds the wrong buffer
     // with nothing to report it — so the sources arrive when the statement
@@ -681,7 +803,13 @@ static DSA_INDEXER_SIGS: [KernelSig; 2] = [
     // `tokens` is gone: `Rms` opens one block per row and that IS `tokens`.
     // `head_dim` stays, because the kernel strides over it and no rule the
     // grid states recovers a row's width for a kernel whose row is one head.
-    kernel!(dsa_index_knorm_rope "attn::dsa_index_knorm_rope_bf16",
+    // §60.6's SYMBOL SPLIT: this row was `attn::dsa_index_knorm_rope_bf16`,
+    // the same string `table::attn` carries, which made the table symbol
+    // unit-hosted and so unwalkable (§52.11). The launcher in
+    // `dsa_indexer.cu` could not be taken over while the two names were one.
+    // `_bf16` is dropped as well as `_dev` added: this is
+    // `template <typename T>` and the ROW picks `T`.
+    kernel!(dsa_index_knorm_rope "attn::dsa_index_knorm_rope_dev",
         file = Some("attn/dsa_indexer.cuh"),
         launch = LaunchRule::PerRow,
         // `PerRow`, not `Rms`. The launcher is `<<<tokens, kBlock=256, 0>>>` in
@@ -731,7 +859,11 @@ static DSA_INDEXER_SIGS: [KernelSig; 2] = [
     // reach the ahead-of-time row from `Source::Param`, and a JIT row that
     // guessed which statement parameter carried which would bind three
     // integers in an order nothing reports.
-    kernel!(dsa_index_topk_mask "attn::dsa_index_topk_mask",
+    // §60.6's symbol split, for the twin's reason. This one cost more to
+    // leave joined than the twin did: the `table::attn` row is FULLY sourced,
+    // so it was a live shim entry reaching a live launcher, and the only way
+    // to free the `.cu` was to make the row takeable.
+    kernel!(dsa_index_topk_mask "attn::dsa_index_topk_mask_dev",
         file = Some("attn/dsa_indexer.cuh"),
         launch = LaunchRule::RowScores,
         whole = true,
@@ -744,6 +876,33 @@ static DSA_INDEXER_SIGS: [KernelSig; 2] = [
             n_heads: I32,
             head_dim: I32,
             topk: I32,
+        ]),
+    // `dsa_indexer.cu:36` -- `device::index_q_rope<bf16><<<tokens, block, 0,
+    // stream>>>(idx_q, positions, n_heads, head_dim, rope_dim, theta)`, with
+    // `:34-35` above it:
+    //
+    // ```text
+    // :34   int block = ((n_heads + 31) / 32) * 32;
+    // :35   if (block < 32) block = 32;
+    // ```
+    //
+    // ONE THREAD PER HEAD, rounded up to a whole warp. That is why the row is
+    // `LaunchRule::Unstated` and not `PerRow`: `PerRow` fixes 256 and this
+    // block is 32 for a 24-head indexer, so a rule stating it would launch
+    // eight times the threads the kernel bounds itself against -- harmless
+    // for correctness and wrong as a contract, which is the same objection
+    // the twin above raises against `Rms`.
+    //
+    // Unsourced, for the twins' reason: `n_heads`, `head_dim` and `rope_dim`
+    // reach the ahead-of-time row from statement parameters, and a JIT row
+    // that guessed which parameter carried which would bind three integers
+    // in an order nothing reports.
+    kernel!(dsa_index_q_rope "attn::dsa_index_q_rope_dev",
+        file = Some("attn/dsa_indexer.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            idx_q: BufMut, positions: I32s, n_heads: I32, head_dim: I32,
+            rope_dim: I32, theta: F32,
         ]),
 ];
 
@@ -775,7 +934,19 @@ static ATTENTION_NAIVE_SIGS: [KernelSig; 3] = [
     // `total_tokens` is gone — `Rms` opens one block per row. `num_requests`
     // is NOT: it bounds `find_request_u32`'s scan, and a request count is not
     // a row count.
-    kernel!(mtp_shift_hidden "attn::mtp_shift_hidden_bf16",
+    // §60.6's SYMBOL SPLIT. This row was `attn::mtp_shift_hidden_bf16`, the
+    // same string the `table::attn` row carries, and that made the table
+    // symbol unit-hosted -- which §52.11 forbids for a `Walk` (*a walk may
+    // drive a JIT'd kernel; it may not be one*), enforced by
+    // `execution::tests::a_walk_is_only_a_walk` through `unit_of`. The
+    // launcher in `attention_naive.cu` could not be taken over while the two
+    // names were one. The TABLE symbol does not move: it is what a trace
+    // records. The `_bf16` suffix is dropped here as well as `_dev` added,
+    // for `MLA_PAGED_SIGS`' reason about `attn::write_mla` -- this is
+    // `template <typename T>` and the ROW picks `T`, so a format suffix on
+    // the row's own name advertises a choice at a level that does not make
+    // it. The launcher is `driver-cuda/src/fire/attention_naive.rs`.
+    kernel!(mtp_shift_hidden "attn::mtp_shift_hidden_dev",
         file = Some("attn/attention_naive.cuh"),
         launch = LaunchRule::PerRow,
         // `PerRow`, not `Rms`. The launcher is `<<<total_tokens, BLOCK=256, 0>>>` in
@@ -865,7 +1036,8 @@ static ATTENTION_NAIVE_SIGS: [KernelSig; 3] = [
     // records a `StateRef` and NO result, so the statement names no rectangle
     // of its own — which is the second half of why `PerRow` is wrong here and
     // right for `compact_page_csr`, whose result IS `Shape(vec![Dim::Requests])`.
-    kernel!(mtp_update_pending_hidden "attn::mtp_update_pending_hidden_bf16",
+    // §60.6's symbol split, for the twin's reason above.
+    kernel!(mtp_update_pending_hidden "attn::mtp_update_pending_hidden_dev",
         file = Some("attn/attention_naive.cuh"),
         launch = LaunchRule::PerRequest,
         whole = true,
@@ -956,11 +1128,28 @@ const PACKED_HEADS_OUT: Source =
     Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim"));
 
 /// `attn/split_packed.cuh`'s one instantiation.
-static SPLIT_PACKED_ROWS: &[DeviceKernel] = &[DeviceKernel {
-    sig: &SPLIT_PACKED_SIGS[0],
-    template_path: "attn::device::split_qkv",
-    elem: "device::bf16",
-}];
+static SPLIT_PACKED_ROWS: &[DeviceKernel] = &[
+    DeviceKernel {
+        sig: &SPLIT_PACKED_SIGS[0],
+        template_path: "attn::device::split_qkv",
+        elem: "device::bf16",
+    },
+    // THE TWIN HAS A ROW NOW. The paragraph below says "`split_qkv_devwin`
+    // has no row, and its geometry is not why", and both of its objections
+    // are objections to a `LaunchRule` and to the JIT BINDER -- `grid.y` from
+    // `Dims::rows` instead of the fire's lane count, and `In`/`Out` resolved
+    // through the statement's window on top of pointers that are BASE
+    // pointers by contract. Neither is an objection to a DEVICE row.
+    // `driver-cuda/src/fire/split_packed.rs` states `grid.y = n_max` because
+    // it is handed `n_max`, and `fire::hand::fire` binds the pointers it is
+    // given without re-windowing them. `LaunchRule::Unstated` is the row
+    // saying that: the geometry is the driver's and no rule claims it.
+    DeviceKernel {
+        sig: &SPLIT_PACKED_SIGS[1],
+        template_path: "attn::device::split_qkv_devwin",
+        elem: "device::bf16",
+    },
+];
 
 /// The contract, and the twin that does not get one.
 ///
@@ -995,7 +1184,7 @@ static SPLIT_PACKED_ROWS: &[DeviceKernel] = &[DeviceKernel {
 /// Neither is something a `LaunchRule` can carry, so the row is absent rather
 /// than approximate and the launcher in `split_packed.cu` stays.
 #[rustfmt::skip]
-static SPLIT_PACKED_SIGS: [KernelSig; 1] = [
+static SPLIT_PACKED_SIGS: [KernelSig; 2] = [
     // `n_tokens` is the rule's `grid.y` and the stream was never an operand:
     // eight arguments become six. The two widths come off what is WRITTEN and
     // not off the packed operand — a `[N, q + 2 * kv]` row cannot say where
@@ -1010,6 +1199,25 @@ static SPLIT_PACKED_SIGS: [KernelSig; 1] = [
             v_out: BufMut <- Source::Out(2),
             q_dim: I32 <- Source::OutWidth(0),
             kv_dim: I32 <- Source::OutWidth(1),
+        ]),
+    // `split_packed.cu:46` -- `device::split_qkv_devwin<bf16><<<grid, BLOCK,
+    // 0, stream>>>(packed, q_out, k_out, v_out, win_d, q_dim, kv_dim)`, with
+    // `:45`'s `dim3 grid(xblocks, n_max)` above it. SEVEN operands: `n_max`
+    // is the grid's second axis and never reaches the kernel, and the stream
+    // was never an operand.
+    //
+    // `LaunchRule::Unstated` for the reason the doc comment above gives at
+    // length: the rule would compute the same rectangle from the wrong
+    // numbers. Unsourced for the second half of the same reason -- `In`/`Out`
+    // resolve THROUGH the statement's window and these four are base pointers
+    // by contract, so a `Source` here would state the double-window the
+    // `.cuh` refuses. The driver states the geometry and passes the bases.
+    kernel!(split_qkv_devwin "attn::split_qkv_devwin",
+        file = Some("attn/split_packed.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            packed: Buf, q_out: BufMut, k_out: BufMut, v_out: BufMut,
+            win_d: U32s, q_dim: I32, kv_dim: I32,
         ]),
 ];
 
@@ -1469,6 +1677,298 @@ pub const ATTN_SCORE_FOLD: Unit = Unit {
     options: &[],
 };
 
+/// The one `__global__` `attn/attention_xqa.cuh` holds — and the LAST one the
+/// `kernels-cuda` archive held.
+///
+/// Not a template, for the same reason [`ATTN_SCORE_FOLD_ROWS`] is not: every
+/// buffer is a page-table integer width fixed by the KV cache's own layout,
+/// there is no element type to vary, and a `template <int BLOCK>` would name a
+/// parameter the body never mentions.
+pub static ATTN_XQA_ROWS: &[DeviceKernel] = &[DeviceKernel {
+    sig: &ATTN_XQA_SIGS[0],
+    template_path: "attn::device::build_xqa_metadata",
+    elem: DeviceKernel::PLAIN,
+}];
+
+#[rustfmt::skip]
+static ATTN_XQA_SIGS: [KernelSig; 1] = [
+    // `LaunchRule::Unstated`, and it is the SECOND refusal in this family with
+    // the same mechanism behind it as `attn_score_fold_heads`' — which is what
+    // makes it evidence rather than a coincidence.
+    //
+    // The launcher was `attention_xqa.cu:313`:
+    //
+    //     build_xqa_metadata_kernel<<<num_requests, 128, 0, stream>>>(
+    //
+    // `dim3(num_requests)` at 128 threads, nothing shared. The grid axis IS
+    // statable — [`LaunchRule::PerRequest`] opens exactly `[requests, 1, 1]` —
+    // and the BLOCK is not: `per_request` is 256 wide (`runtime::launch`'s
+    // `BLOCK`) and this launcher is 128.
+    //
+    // A rule cannot be chosen by measuring bytes here either. The page loop is
+    // `for (p = threadIdx.x; p < max_pages_per_seq; p += blockDim.x)` and the
+    // sequence length is written under `if (threadIdx.x == 0)`, so the block
+    // width is a pure STRIDE: 256 computes the same page table and the same
+    // sequence lengths as 128, in half the iterations, with twice the threads.
+    // `PerRequest` would pass any parity test ever written for this kernel and
+    // would silently double the launch's occupancy cost on the one kernel in
+    // the tree that runs once per fire rather than once per layer.
+    //
+    // So the honest reading is that this row's geometry is one axis short of
+    // `PerRequest` and the missing axis is a literal — the same shape
+    // `attn_score_fold_heads` refused, off the other side of the rectangle.
+    // A parameterised `PerRequest(block)` would be vocabulary growth for two
+    // literals in one family, which `new-horizon.md` §10.5 forbids at exactly
+    // this size. `driver-cuda`'s `fire/xqa.rs` builds the `Launch` by hand and
+    // carries the 128 as a named constant with this line cited beside it.
+    //
+    // `whole` because the prepare is fire-wide by construction: it writes one
+    // dense page-table row per REQUEST of the whole fire, which is what
+    // `Prepare::FireWide` means on the row that reads it back
+    // (`table::attn`'s `attn::attention_xqa_decode_bf16_prepared`).
+    //
+    // UNSOURCED, whole, on purpose. Six of the eight operands have honest
+    // `Source`s waiting for them — `KvPageIndices`, `KvPageIndptr`,
+    // `Attn("kv_last_page_lens_d")`, `Rows`, `KvPageSize` — but `page_table`
+    // and `seq_lens` are sub-buffers the DRIVER carves out of
+    // `AttentionWorkspaceView::float_buffer` at offsets no `Source` spells,
+    // and `max_pages_per_seq` is the bucketed stride, not the operand the
+    // caller passed. Half a row sourced is worse than none (`families/rope.rs`
+    // is the worked example), and this row is fired by hand regardless, so
+    // there is nothing a partial binding would buy.
+    kernel!(build_xqa_metadata "attn::build_xqa_metadata",
+        file = Some("attn/attention_xqa.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            kv_page_indices: U32s,
+            kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            page_table: I32sMut,
+            seq_lens: U32sMut,
+            num_requests: I32,
+            max_pages_per_seq: I32,
+            page_size: I32,
+        ]),
+];
+
+/// XQA's fire-wide prepare, as a JIT unit.
+///
+/// The last `__global__` to leave `kernels-cuda`, and the only one whose `.cu`
+/// half could be deleted outright rather than kept beside it: the launcher had
+/// no shim entry (`attn::prepare_attention_xqa_decode_bf16` is in no
+/// [`crate::table`]) and no C++ caller, so its entire consumer set was the
+/// obligation `Prepare::FireWide` states on a DIFFERENT row. That obligation
+/// is discharged in Rust now — `driver-cuda`'s `fire/xqa.rs` — and the C++ is
+/// gone.
+///
+/// **This unit does not make the XQA decode a JIT path.**
+/// `attn::attention_xqa_decode_bf16_prepared` is still ahead-of-time and still
+/// the shim's one XQA entry: its body ends in FlashInfer's
+/// `launchMHAFlashInfer_xqa_gqa*` entry points, which are upstream HOST
+/// functions that do their own launching, and `new-horizon.md` §50.1's
+/// measurement applies to them unchanged — there is no device text of ours to
+/// carry. What moved is the half that was ours.
+pub const ATTN_XQA: Unit = Unit {
+    name: "attn/attention_xqa",
+    root: include_str!("../../csrc/src/attn/attention_xqa.cuh"),
+    rows: ATTN_XQA_ROWS,
+    options: &[],
+};
+
+/// The three `__global__`s of `attn/attention_score_post.cuh`.
+///
+/// # The refusal that named its own expiry, and the thing that asked
+///
+/// The header carries a section titled *"No unit, and that is deliberate
+/// rather than pending"*, and its argument was sound at the time:
+///
+/// > a table row is a thing a model text can STATE — these are internal
+/// > steps of a dispatch that has its own row already.
+///
+/// The premise is what changed, not the reasoning. "A dispatch that has its
+/// own row already" meant `attn::attention_flashinfer_{decode,prefill}_capture_bf16`,
+/// and both of those are [`crate::execution::Control::Switch`] walks whose
+/// bodies are **host C++ that is going to be Rust**. A Rust body cannot fire
+/// a kernel it has no row for: [`crate::unit::unit_of`] resolves a SYMBOL, so
+/// the composing driver needs one row per launch it makes, whether or not a
+/// model text ever spells it. That is the same inversion
+/// `families::ssm`'s `causal_conv1d_prefill_noact_bf16` records — an EMPTY
+/// consumer set was the whole objection, and the consumer is the port.
+///
+/// So these rows are not for `model-compiler`. They exist so that
+/// `driver-cuda`'s Rust — which is where all host code lives — can fire the
+/// three post-kernels by name. **There is already a function in the right
+/// place to do it**: `driver-cuda/src/fire/attn_score.rs::publish` runs on
+/// the fire's stream immediately after the capture dispatch and already
+/// fires `attn_score_fold_heads` this way. Its module doc carries the move
+/// and its one cost (a golden-hash regeneration in
+/// `tests/attn_score_parity.rs`); `new-horizon.md` §53.10 is the same
+/// finding at length.
+///
+/// # Why all three are [`LaunchRule::Unstated`]
+///
+/// Every grid is quoted verbatim in the row comment beside it, and not one of
+/// them is an extent of an operand:
+///
+/// * `dim3(num_requests, num_q_heads)` — statable in principle, but there is
+///   no `PerRequestPerHead` rule and adding one for a single launcher is what
+///   §10.5 forbids.
+/// * `dim3(num_requests, num_q_heads, window)` — THREE extents, the third a
+///   host policy constant that arrives as a dispatch argument and appears
+///   in no [`crate::runtime::Dims`] field.
+/// * `dim3(num_requests, 32)` — the second literal grid axis this file pair
+///   holds, and the sibling row above already measured why a
+///   `PerRequestFanout(N)` covering both `64u` and `32u` would be vocabulary
+///   growth for two constants that share a file.
+///
+/// The driver builds all three `Launch`es by hand, the way
+/// `driver-cuda/src/fire/attn_score.rs` already builds the fold's.
+///
+/// # No `in_place`, and that is not an omission
+///
+/// Two of the three read and write `scores` through one pointer, so the
+/// field looks like it wants `&[(0, 0)]`. It does not. `in_place` is read by
+/// `lower::Buffers` to give a LOWERED op's output its operand's offset, and
+/// nothing lowers these: they have no `table` symbol, no model text spells
+/// them, and the aliasing is a fact the composing Rust already knows because
+/// it allocated the buffer and passes the same pointer twice. The sibling
+/// `attn_score_fold_heads` states none either. A pair here would be an index
+/// into an output list that does not exist.
+///
+/// # `abi::emit_device_typecheck` refuses all three, by design
+///
+/// Every row here is [`DeviceKernel::PLAIN`], and that emitter spells each
+/// buffer operand as a pointer to the head of `elem` — which for a PLAIN row
+/// is the sentinel `"(no template arguments)"`, refused by name at the
+/// `contains('(')` guard. `families::sample` records the same outcome for its
+/// consumer row and `attn_score_fold_heads` above is a third. The offline
+/// arity/constness check is simply not available for a non-template, and
+/// saying so is the honest result rather than a gap: NVRTC still names the
+/// instantiation at run time through `nvrtcAddNameExpression`, and a drifted
+/// operand list surfaces there.
+pub static ATTN_SCORE_POST_ROWS: &[DeviceKernel] = &[
+    DeviceKernel {
+        sig: &ATTN_SCORE_POST_SIGS[0],
+        template_path: "attn::device::attn_score_normalize",
+        // Not a template. `kThreads` is a `constexpr int` inside the body and
+        // the block width is fixed at 256 by the shared array it sizes, so
+        // there is no argument to give and no arm that could differ.
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &ATTN_SCORE_POST_SIGS[1],
+        template_path: "attn::device::attn_prefill_score_normalize",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &ATTN_SCORE_POST_SIGS[2],
+        template_path: "attn::device::attn_prefill_score_fold",
+        elem: DeviceKernel::PLAIN,
+    },
+];
+
+#[rustfmt::skip]
+static ATTN_SCORE_POST_SIGS: [KernelSig; 3] = [
+    // `driver-cuda/csrc/attn/attention_flashinfer.cu`, at the foot of
+    // `dispatch_attention_flashinfer_decode_capture_bf16`:
+    //
+    //     const dim3 grid(static_cast<unsigned>(cache.num_requests),
+    //                     static_cast<unsigned>(cache.num_q_heads));
+    //     device::attn_score_normalize<<<grid, 256, 0, stream>>>(
+    //         score_out, score_indptr_d, kv_page_indptr_d, kv_last_page_lens_d,
+    //         cache.page_size);
+    //
+    // In place: `scores` is read and written by the same block, which is why
+    // it is `BufMut` and why no second buffer appears in the operand list.
+    // `kv_len` is derived from the page CSR inside the body rather than
+    // passed — the header argues that at length and the row must not
+    // "helpfully" add a length operand the kernel would ignore.
+    kernel!(attn_score_normalize "attn::attn_score_normalize",
+        file = Some("attn/attention_score_post.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            scores: BufMut,
+            score_indptr: I32s,
+            kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            page_size: I32,
+        ]),
+
+    // Same file, in `dispatch_attention_flashinfer_prefill_capture_bf16`:
+    //
+    //     const dim3 norm_grid(static_cast<unsigned>(cache.num_requests),
+    //                          static_cast<unsigned>(cache.num_q_heads),
+    //                          static_cast<unsigned>(window));
+    //     device::attn_prefill_score_normalize<<<norm_grid, 256, 0, stream>>>(
+    //         score_out, score_indptr_d, qo_indptr_d, kv_page_indptr_d,
+    //         kv_last_page_lens_d, cache.page_size, window);
+    //
+    // `window` is BOTH the third grid extent and the last operand, and that
+    // is the honest reading of the launcher rather than a redundancy to
+    // clean up: `blockIdx.z` selects the window row and the operand bounds
+    // `rows = min(window, qo_len)` inside the body.
+    kernel!(attn_prefill_score_normalize "attn::attn_prefill_score_normalize",
+        file = Some("attn/attention_score_post.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            scores: BufMut,
+            score_indptr: I32s,
+            qo_indptr: U32s,
+            kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            page_size: I32,
+            window: I32,
+        ]),
+
+    // Same file, immediately after the normalize above:
+    //
+    //     const dim3 fold_grid(static_cast<unsigned>(cache.num_requests), 32u);
+    //     device::attn_prefill_score_fold<<<fold_grid, 256, 0, stream>>>(
+    //         score_out, folded_out, score_indptr_d, qo_indptr_d,
+    //         kv_page_indptr_d, kv_last_page_lens_d, cache.page_size,
+    //         cache.num_q_heads, window);
+    //
+    // `32u` is an occupancy constant exactly as the `64u` one unit up is, and
+    // the body strides over `gridDim.y`, so — the sibling's measurement,
+    // which applies here word for word — any value produces the same floats
+    // and no parity test could ever choose the rule. The driver carries the
+    // 32 and the 256 as named constants citing this line.
+    //
+    // NOT in place: unlike its two siblings this one reads `scores` and
+    // writes a separate `folded`, the same split `attn_score_fold_heads`
+    // makes.
+    kernel!(attn_prefill_score_fold "attn::attn_prefill_score_fold",
+        file = Some("attn/attention_score_post.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            scores: Buf,
+            folded: BufMut,
+            score_indptr: I32s,
+            qo_indptr: U32s,
+            kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            page_size: I32,
+            num_q_heads: I32,
+            window: I32,
+        ]),
+];
+
+/// The capture post-kernels, as a JIT unit.
+///
+/// Three `__global__`s, no host code, one `#include "pie_device.cuh"` — the
+/// cheapest unit in the family to compile and the one with the longest
+/// argument behind it. See [`ATTN_SCORE_POST_ROWS`].
+pub const ATTN_SCORE_POST: Unit = Unit {
+    name: "attn/attention_score_post",
+    root: include_str!("../../csrc/src/attn/attention_score_post.cuh"),
+    rows: ATTN_SCORE_POST_ROWS,
+    options: &[],
+};
+
 /// The units the heavy half of `attn` compiles.
 pub const UNITS_HEAVY: &[Unit] = &[
     KV_PAGED,
@@ -1478,6 +1978,8 @@ pub const UNITS_HEAVY: &[Unit] = &[
     QKV_FUSED,
     ATTENTION_NAIVE_PAGED,
     ATTN_SCORE_FOLD,
+    ATTN_SCORE_POST,
+    ATTN_XQA,
 ];
 
 /// The reference paged attention — `attention_naive_paged.cuh`'s two rows.
@@ -1867,6 +2369,23 @@ static QKV_FUSED_ROWS: &[DeviceKernel] = &[
     DeviceKernel { sig: &QKV_FUSED_SIGS[4], template_path: "attn::device::qkv_decode_qk_norm_rope_write_kv_warp", elem: "device::i32(128), false" },
     DeviceKernel { sig: &QKV_FUSED_SIGS[5], template_path: "attn::device::qkv_decode_qk_norm_rope_write_kv_warp", elem: "device::i32(128), true"  },
     DeviceKernel { sig: &QKV_FUSED_SIGS[6], template_path: "attn::device::qkv_decode_qk_norm_rope_write_kv_warp", elem: "device::i32(128), false" },
+    // ── THE TWO EXPANSIONS THIS UNIT WAS MISSING ────────────────────────
+    //
+    // `QKV_FUSED`'s doc says the warp form is stated at ONE expansion, and
+    // `qkv_fused.cu`'s header names the consequence: *"`head_dim == 64` and
+    // `head_dim == 256` reach a `<<<>>>` below that no row names"*. The
+    // launcher is a three-armed host `if` on `head_dim` and it cannot be
+    // ported while two of its three arms have no instantiation to fire.
+    //
+    // These four are those arms. The `#rope`/`#norope` pair per width is the
+    // `USE_ROPE_TABLE` template argument, chosen from
+    // `rope_table != nullptr`, which is a host null test and not a `Term`.
+    // There is no base row for either width: the base at `d128` exists for a
+    // `Specialisation` that names it, and nothing names these.
+    DeviceKernel { sig: &QKV_FUSED_SIGS[7],  template_path: "attn::device::qkv_decode_qk_norm_rope_write_kv_warp", elem: "device::i32(64), true"   },
+    DeviceKernel { sig: &QKV_FUSED_SIGS[8],  template_path: "attn::device::qkv_decode_qk_norm_rope_write_kv_warp", elem: "device::i32(64), false"  },
+    DeviceKernel { sig: &QKV_FUSED_SIGS[9],  template_path: "attn::device::qkv_decode_qk_norm_rope_write_kv_warp", elem: "device::i32(256), true"  },
+    DeviceKernel { sig: &QKV_FUSED_SIGS[10], template_path: "attn::device::qkv_decode_qk_norm_rope_write_kv_warp", elem: "device::i32(256), false" },
 ];
 
 /// The seven contracts, in [`QKV_FUSED_ROWS`]' order.
@@ -1891,7 +2410,7 @@ static QKV_FUSED_ROWS: &[DeviceKernel] = &[
 /// that compiles and never runs. An arm that can never be taken is worse than
 /// no arm — it reads as a covered case.
 #[rustfmt::skip]
-static QKV_FUSED_SIGS: [KernelSig; 7] = [
+static QKV_FUSED_SIGS: [KernelSig; 11] = [
     // `qkv_fused.cu:245-248` --
     //
     //     constexpr int BLOCK = 256;
@@ -2056,6 +2575,76 @@ static QKV_FUSED_SIGS: [KernelSig; 7] = [
             page_size: I32, hnd_layout: Bool, theta: F32, eps: F32,
         ]),
     kernel!(qkv_decode_warp_norope "attn::qkv_decode_qk_norm_rope_write_kv_warp_d128#norope",
+        file = Some("attn/qkv_fused.cuh"),
+        launch = LaunchRule::WarpPackedHeads,
+        operands = operands![
+            packed: Buf, q_out: BufMut, k_pages: BufMut, v_pages: BufMut,
+            q_weight: Buf, k_weight: Buf, positions: I32s,
+            rope_table: F32s | null,
+            kv_page_indices: U32s, kv_page_indptr: U32s, kv_last_page_lens: U32s,
+            w_page: U32s | null, w_off: U32s | null, row_valid: U8s | null,
+            win: U32s | null,
+            num_requests: I32, num_q_heads: I32, num_kv_heads: I32,
+            page_size: I32, hnd_layout: Bool, theta: F32, eps: F32,
+        ]),
+    // ── THE OTHER TWO HEAD WIDTHS ───────────────────────────────────────
+    //
+    // Same contract as `_d128` above, four times over: the width is a
+    // TEMPLATE argument, so `head_dim` is not an operand and each row names
+    // exactly one instantiation. `qkv_fused.cu:92-104` is the host `if` chain
+    // that picks between them --
+    //
+    // ```text
+    // :92    if (head_dim == 64)  { LAUNCH_QKV_DECODE_POST_WARP(64);  return; }
+    // :96    if (head_dim == 128) { LAUNCH_QKV_DECODE_POST_WARP(128); return; }
+    // :100   if (head_dim == 256) { LAUNCH_QKV_DECODE_POST_WARP(256); return; }
+    // ```
+    //
+    // -- and it falls THROUGH to the block form for every other width, which
+    // is why the chain cannot be a `Specialisation`: the fallthrough changes
+    // the `LaunchRule` from `WarpPackedHeads` to `RowsPackedHeadsNarrow`, and
+    // `Specialisation::agrees` forbids an arm that changes the rule.
+    // `driver-cuda/src/fire/qkv_fused.rs` is the chain now.
+    kernel!(qkv_decode_warp_d64_rope "attn::qkv_decode_qk_norm_rope_write_kv_warp_d64#rope",
+        file = Some("attn/qkv_fused.cuh"),
+        launch = LaunchRule::WarpPackedHeads,
+        operands = operands![
+            packed: Buf, q_out: BufMut, k_pages: BufMut, v_pages: BufMut,
+            q_weight: Buf, k_weight: Buf, positions: I32s,
+            rope_table: F32s | null,
+            kv_page_indices: U32s, kv_page_indptr: U32s, kv_last_page_lens: U32s,
+            w_page: U32s | null, w_off: U32s | null, row_valid: U8s | null,
+            win: U32s | null,
+            num_requests: I32, num_q_heads: I32, num_kv_heads: I32,
+            page_size: I32, hnd_layout: Bool, theta: F32, eps: F32,
+        ]),
+    kernel!(qkv_decode_warp_d64_norope "attn::qkv_decode_qk_norm_rope_write_kv_warp_d64#norope",
+        file = Some("attn/qkv_fused.cuh"),
+        launch = LaunchRule::WarpPackedHeads,
+        operands = operands![
+            packed: Buf, q_out: BufMut, k_pages: BufMut, v_pages: BufMut,
+            q_weight: Buf, k_weight: Buf, positions: I32s,
+            rope_table: F32s | null,
+            kv_page_indices: U32s, kv_page_indptr: U32s, kv_last_page_lens: U32s,
+            w_page: U32s | null, w_off: U32s | null, row_valid: U8s | null,
+            win: U32s | null,
+            num_requests: I32, num_q_heads: I32, num_kv_heads: I32,
+            page_size: I32, hnd_layout: Bool, theta: F32, eps: F32,
+        ]),
+    kernel!(qkv_decode_warp_d256_rope "attn::qkv_decode_qk_norm_rope_write_kv_warp_d256#rope",
+        file = Some("attn/qkv_fused.cuh"),
+        launch = LaunchRule::WarpPackedHeads,
+        operands = operands![
+            packed: Buf, q_out: BufMut, k_pages: BufMut, v_pages: BufMut,
+            q_weight: Buf, k_weight: Buf, positions: I32s,
+            rope_table: F32s | null,
+            kv_page_indices: U32s, kv_page_indptr: U32s, kv_last_page_lens: U32s,
+            w_page: U32s | null, w_off: U32s | null, row_valid: U8s | null,
+            win: U32s | null,
+            num_requests: I32, num_q_heads: I32, num_kv_heads: I32,
+            page_size: I32, hnd_layout: Bool, theta: F32, eps: F32,
+        ]),
+    kernel!(qkv_decode_warp_d256_norope "attn::qkv_decode_qk_norm_rope_write_kv_warp_d256#norope",
         file = Some("attn/qkv_fused.cuh"),
         launch = LaunchRule::WarpPackedHeads,
         operands = operands![
@@ -2359,10 +2948,17 @@ static DSV4_COMPRESS_ROWS: &[DeviceKernel] = &[
         template_path: "attn::device::compressed_attn_paged",
         elem: DeviceKernel::PLAIN,
     },
+    // THE COMBINE HAS A ROW NOW, and `LaunchRule::Unstated` is the whole
+    // point of it -- see the sig below, which carries the measurement.
+    DeviceKernel {
+        sig: &DSV4_COMPRESS_SIGS[9],
+        template_path: "attn::device::combine_attn_outputs",
+        elem: "device::bf16",
+    },
 ];
 
 #[rustfmt::skip]
-static DSV4_COMPRESS_SIGS: [KernelSig; 9] = [
+static DSV4_COMPRESS_SIGS: [KernelSig; 10] = [
     // `n` is the INPUT token count and the grid covers `n / ratio * dim`, so
     // the extent the rule recovers and the extent the kernel is told differ
     // by the compression ratio. Both survive: the rule sizes the launch off
@@ -2466,7 +3062,12 @@ static DSV4_COMPRESS_SIGS: [KernelSig; 9] = [
     // either: `record_many` passes an empty parameter list, so `ratio` has no
     // `Source::Param` to name and inventing one would put a guess in the table
     // where an absence belongs. The stream is gone, as it is from every row.
-    kernel!(dsv4_boundary_meta_decode "attn::dsv4_boundary_meta_decode",
+    // §60.6's SYMBOL SPLIT: this row carried the `table::attn` symbol, which
+    // made that symbol unit-hosted and so unwalkable (§52.11), and the
+    // launcher in `dsv4_compress.cu` could not be taken over while the two
+    // names were one. The TABLE symbol does not move -- it is what a trace
+    // records. Launcher: `driver-cuda/src/fire/dsv4_compress.rs`.
+    kernel!(dsv4_boundary_meta_decode "attn::dsv4_boundary_meta_decode_dev",
         file = Some("attn/dsv4_compress.cuh"),
         launch = LaunchRule::Elementwise,
         operands = operands![
@@ -2476,7 +3077,12 @@ static DSV4_COMPRESS_SIGS: [KernelSig; 9] = [
     // The prefill form, same geometry and same launcher shape; it differs
     // only in resolving the request index by a binary search over `qo_indptr`
     // instead of shortcutting it to the token index.
-    kernel!(dsv4_boundary_meta_paged "attn::dsv4_boundary_meta_paged",
+    // §60.6's SYMBOL SPLIT: this row carried the `table::attn` symbol, which
+    // made that symbol unit-hosted and so unwalkable (§52.11), and the
+    // launcher in `dsv4_compress.cu` could not be taken over while the two
+    // names were one. The TABLE symbol does not move -- it is what a trace
+    // records. Launcher: `driver-cuda/src/fire/dsv4_compress.rs`.
+    kernel!(dsv4_boundary_meta_paged "attn::dsv4_boundary_meta_paged_dev",
         file = Some("attn/dsv4_compress.cuh"),
         launch = LaunchRule::Elementwise,
         operands = operands![
@@ -2533,7 +3139,12 @@ static DSV4_COMPRESS_SIGS: [KernelSig; 9] = [
     // none. It is `whole = true` and `lacks = &[Cap::Scores]` there; neither
     // is a geometry fact and neither survives into a row that states its
     // rectangle.
-    kernel!(attention_compressed_paged "attn::attention_compressed_paged_bf16",
+    // §60.6's SYMBOL SPLIT: this row carried the `table::attn` symbol, which
+    // made that symbol unit-hosted and so unwalkable (§52.11), and the
+    // launcher in `dsv4_compress.cu` could not be taken over while the two
+    // names were one. The TABLE symbol does not move -- it is what a trace
+    // records. Launcher: `driver-cuda/src/fire/dsv4_compress.rs`.
+    kernel!(attention_compressed_paged "attn::compressed_attn_paged_dev",
         file = Some("attn/dsv4_compress.cuh"),
         launch = LaunchRule::PagedScoresDecode,
         operands = operands![
@@ -2542,6 +3153,43 @@ static DSV4_COMPRESS_SIGS: [KernelSig; 9] = [
             req_of_token: I32s,
             num_q_heads: I32, head_dim: I32, ratio: I32, page_size: I32,
             scale: F32,
+        ]),
+    // THE COMBINE, AND `Unstated` IS A FINDING RATHER THAN AN ABSENCE.
+    //
+    // `dsv4_compress.cu:65` and `:87-88`:
+    //
+    // ```text
+    // :65   dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(num_heads));
+    // :87   const int block = (head_dim < 32) ? 32 : ((head_dim > 256) ? 256 : head_dim);
+    // :88   device::combine_attn_outputs<device::bf16><<<grid, block, 0, stream>>>(
+    // ```
+    //
+    // The GRID is `LaunchRule::PerHeadElementwise` to the digit -- token on
+    // `grid.x`, head on `grid.y`. The BLOCK is not: the launcher clamps
+    // `head_dim` into `[32, 256]` and the rule clamps into `[32, 128]`, so on
+    // a head wider than 128 the rule answers with half these threads. The
+    // kernel strides `d += blockDim.x` and reduces nothing, so the narrower
+    // block computes the same bytes in two passes -- a slower kernel, never a
+    // wrong answer.
+    //
+    // That invisibility is why the rule is NOT claimed here. The launcher's
+    // own comment put it best and it survives in
+    // `driver-cuda/src/fire/dsv4_compress.rs`' doc comment in full: a row
+    // stating `PerHeadElementwise` would agree with the `<<<>>>` at
+    // deepseek_v4's 128-wide heads and stop agreeing at the first config that
+    // widens one, with nothing failing and nothing reporting. Reconciling it
+    // is a decision about `SINK_BLOCK_MAX` in `runtime/launch.rs`, and
+    // `Unstated` is how a row declines to prejudge it.
+    //
+    // Unsourced, as every row in this unit is: the twin in `table::attn`
+    // carries no `Source` either.
+    kernel!(combine_attn_outputs "attn::combine_attn_outputs_dev",
+        file = Some("attn/dsv4_compress.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            o1: Buf, lse1: F32s, o2: Buf, lse2: F32s,
+            o_out: BufMut, lse_out: F32sMut,
+            num_heads: I32, head_dim: I32,
         ]),
 ];
 
@@ -2617,10 +3265,20 @@ static KV_PAGED_ROWS: &[DeviceKernel] = &[
     // that reads it has to see it.
     DeviceKernel { sig: &KV_PAGED_SIGS[18], template_path: "attn::device::build_window_page_view",   elem: DeviceKernel::PLAIN         },
     DeviceKernel { sig: &KV_PAGED_SIGS[19], template_path: "attn::device::build_full_split_view",    elem: DeviceKernel::PLAIN         },
+    // ── the quantised appenders and the per-tensor dequant ────────────────
+    //
+    // Three plain `__global__`s and one `template <bool UseFp8>`. The two
+    // `write_kv_per_token_head` rows are TWO SYMBOLS off one template and not
+    // a `Specialisation`; the sigs below argue it where the geometry is.
+    DeviceKernel { sig: &KV_PAGED_SIGS[20], template_path: "attn::device::write_kv_fp8_per_tensor",  elem: DeviceKernel::PLAIN         },
+    DeviceKernel { sig: &KV_PAGED_SIGS[21], template_path: "attn::device::write_kv_per_token_head",  elem: "device::false_type::value" },
+    DeviceKernel { sig: &KV_PAGED_SIGS[22], template_path: "attn::device::write_kv_per_token_head",  elem: "device::true_type::value"  },
+    DeviceKernel { sig: &KV_PAGED_SIGS[23], template_path: "attn::device::write_kv_fp4_block",       elem: DeviceKernel::PLAIN         },
+    DeviceKernel { sig: &KV_PAGED_SIGS[24], template_path: "attn::device::dequant_fp8_pages_active", elem: DeviceKernel::PLAIN         },
 ];
 
 #[rustfmt::skip]
-static KV_PAGED_SIGS: [KernelSig; 20] = [
+static KV_PAGED_SIGS: [KernelSig; 25] = [
     // `n` is `I64` because the kernel's parameter is `long long`, and it is a
     // `long long` because it indexes a page arena that is multiple gigabytes
     // at production page counts — `Ty::I64` says exactly that and the row
@@ -2629,10 +3287,14 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
     // The fp8 pages are `U8s` and not a format of their own: on the device
     // they are `__nv_fp8_storage_t`, which IS one byte, and the format is the
     // kernel's to interpret. `attn::device::dequant_fp8_pages_active` — the
-    // per-TENSOR form — has no row for the other half of that sentence: it
-    // takes the interpretation as an `__nv_fp8_interpretation_t` argument and
-    // the `Ty` vocabulary has no enum. Defaulting it to `__NV_E4M3` would
-    // decode an E5M2 page to a numerically plausible wrong answer.
+    // per-TENSOR form — is `KV_PAGED_SIGS[24]` at the end of this array, and
+    // for most of this migration it was NOT: it takes the interpretation as
+    // an `__nv_fp8_interpretation_t` argument and the `Ty` vocabulary had no
+    // enum, so the row could not be spelled and defaulting the value to
+    // `__NV_E4M3` would have decoded an E5M2 page to a numerically plausible
+    // wrong answer. `kernels::Ty::Fp8Kind` closed that; the row is stated
+    // now, and this paragraph is kept because the reasoning is why the value
+    // is an operand rather than a template default.
     kernel!(dequant_fp8_per_token_head "attn::dequant_fp8_per_token_head_pages_active_bf16",
         file = Some("attn/kv_paged.cuh"),
         launch = LaunchRule::Elementwise,
@@ -2748,6 +3410,31 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
     // `if (layer.hnd_layout)` over `<true>` at `:372` and `<false>` at `:380`,
     // both `<<<B, 256, 0, stream>>>`.
     //
+    // ── THE SYMBOL SPLIT, §60.6, AND WHY THESE THREE ROWS ARE `_dev` ─────
+    //
+    // These rows read `attn::write_kv_explicit_bf16` until this change, and
+    // the paragraph below — kept verbatim, because it is still true about
+    // the KERNEL — celebrated the join with `table::attn`'s row of the same
+    // name. **That join is what had to go**, and the reason is §52.11's law
+    // rather than a preference: `execution::tests::a_walk_is_only_a_walk`
+    // requires every `WALKED` symbol to satisfy `unit_of(sym).is_none()` —
+    // *a walk may drive a JIT'd kernel; it may not be one* — and
+    // `kv_paged.cu:304`'s launcher IS a walk: a throw, an empty-extent
+    // decline, an instantiation choice, and a CONDITIONAL second launch into
+    // the envelope tier. §58 says the same thing from the other side: a
+    // symbol is `Specialisation`-selected **or** `Walk`-driven, never both,
+    // and a host program that needs a walk AND an instantiation choice
+    // spends two symbols on it.
+    //
+    // So the walk keeps the trace's spelling — `table::attn` and
+    // `model-compiler/src/dsl.rs:7393` still say `attn::write_kv_explicit_bf16`,
+    // and no model text moved — and the DEVICE rows take the `_dev` suffix.
+    // That is the direction §60.6 fixes: the ahead-of-time row's name is the
+    // one a trace records, so it is the one that may not move.
+    // `driver-cuda/src/fire/kv_paged.rs::write_kv_explicit_bf16` fires
+    // `#hnd`/`#nhd` below directly, which is why [`WRITE_KV_EXPLICIT`]'s
+    // arms resolve for a reader and no longer for a dispatcher.
+    //
     // **The one symbol here that is also an ahead-of-time row's.**
     // `attn::write_kv_explicit_bf16` in [`crate::table::attn`] is the host
     // function at `kv_paged.cu:355`, and that function holds this `__global__`
@@ -2756,7 +3443,7 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
     // so the two state the same rectangle from the same number rather than
     // agreeing by coincidence. Sharing the string is what `examples/migration_status`
     // means by a join, and this row earns it.
-    kernel!(write_kv_explicit "attn::write_kv_explicit_bf16",
+    kernel!(write_kv_explicit "attn::write_kv_explicit_bf16_dev",
         file = Some("attn/kv_paged.cuh"),
         launch = LaunchRule::PerRow,
         operands = operands![
@@ -2765,7 +3452,7 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
             b: I32, page_size: I32, h_kv: I32, d: I32,
             hnd_layout: Bool,
         ]),
-    kernel!(write_kv_explicit_hnd "attn::write_kv_explicit_bf16#hnd",
+    kernel!(write_kv_explicit_hnd "attn::write_kv_explicit_bf16_dev#hnd",
         file = Some("attn/kv_paged.cuh"),
         launch = LaunchRule::PerRow,
         operands = operands![
@@ -2773,7 +3460,7 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
             w_page: U32s, w_off: U32s, row_valid: U8s | null,
             b: I32, page_size: I32, h_kv: I32, d: I32,
         ]),
-    kernel!(write_kv_explicit_nhd "attn::write_kv_explicit_bf16#nhd",
+    kernel!(write_kv_explicit_nhd "attn::write_kv_explicit_bf16_dev#nhd",
         file = Some("attn/kv_paged.cuh"),
         launch = LaunchRule::PerRow,
         operands = operands![
@@ -2802,6 +3489,33 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
     // which the sibling `write_kv_explicit` rows above already take.
     //
     // WHAT THE AUDIT'S LINE DID NOT SAY, AND IS THE LOAD-BEARING PART: the
+    // **AND THEN THE SYMBOL MOVED AGAIN, FOR §60.6's REASON.** These three
+    // rows now read `attn::write_kv_explicit_bf16_devwin_dev`, which reads
+    // like the defect above being reintroduced and is its opposite. The
+    // paragraph above is about a device row whose spelling no model text
+    // could state; this is about a device row that shares its spelling with
+    // an ahead-of-time row the DRIVER now executes. `execution::tests::
+    // a_walk_is_only_a_walk` asserts a `WALKED` symbol has no unit -- §52.11,
+    // *a walk may drive a JIT'd kernel; it may not be one* -- so as long as
+    // this unit hosted the string `attn::write_kv_explicit_bf16_devwin`, the
+    // table row of that name could not be walked and `kv_paged.cu`'s C++
+    // launcher could not be deleted. The sibling `write_kv_explicit` rows
+    // twenty lines up took the same `_dev` suffix for the same reason and
+    // their comment says so.
+    //
+    // The trace's spelling has NOT moved: `table::attn`'s row and
+    // `dsl.rs:3468` are both still `attn::write_kv_explicit_bf16_devwin`, and
+    // the join `examples/migration_status` performs is between THOSE. What
+    // this rename separates is the two ends of the join, which had been one
+    // string by accident of both being right.
+    //
+    // [`WRITE_KV_EXPLICIT_DEVWIN`]'s `base` moved with them, and the driver
+    // fires `_dev#hnd` / `_dev#nhd` directly
+    // (`driver-cuda/src/fire/kv_paged.rs`), so the `Specialisation` states
+    // the selection for a reader and no longer performs it -- exactly the
+    // arrangement [`WRITE_KV_EXPLICIT`] is already in.
+    //
+    // WHAT THE AUDIT'S LINE DID NOT SAY, AND IS THE LOAD-BEARING PART: the
     // grid. `PerRow` is `Dims::rows`; the launcher opens `n_max`, and `n_max`
     // is NOT this launch's region. It is the fire's FULL lane count —
     // `DispatchCtx::rows_total`, *"the fire's FULL row count, which a
@@ -2824,7 +3538,7 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
     // here because a reader who checked only the unpeeled shape would have
     // found the grids byte-identical and learned nothing: that is hazard 1,
     // and `whole` is the thing that actually holds it.
-    kernel!(write_kv_explicit_devwin "attn::write_kv_explicit_bf16_devwin",
+    kernel!(write_kv_explicit_devwin "attn::write_kv_explicit_bf16_devwin_dev",
         file = Some("attn/kv_paged.cuh"),
         launch = LaunchRule::PerRow,
         operands = operands![
@@ -2833,7 +3547,7 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
             n_max: I32, page_size: I32, h_kv: I32, d: I32,
             hnd_layout: Bool,
         ]),
-    kernel!(write_kv_explicit_devwin_hnd "attn::write_kv_explicit_bf16_devwin#hnd",
+    kernel!(write_kv_explicit_devwin_hnd "attn::write_kv_explicit_bf16_devwin_dev#hnd",
         file = Some("attn/kv_paged.cuh"),
         launch = LaunchRule::PerRow,
         operands = operands![
@@ -2841,7 +3555,7 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
             w_page: U32s, w_off: U32s, row_valid: U8s | null, win: U32s,
             n_max: I32, page_size: I32, h_kv: I32, d: I32,
         ]),
-    kernel!(write_kv_explicit_devwin_nhd "attn::write_kv_explicit_bf16_devwin#nhd",
+    kernel!(write_kv_explicit_devwin_nhd "attn::write_kv_explicit_bf16_devwin_dev#nhd",
         file = Some("attn/kv_paged.cuh"),
         launch = LaunchRule::PerRow,
         operands = operands![
@@ -2944,6 +3658,190 @@ static KV_PAGED_SIGS: [KernelSig; 20] = [
             src_indptr: U32s, src_last_page_len: U32s, splits: I32, page_size: I32,
             dst_indptr: U32sMut, dst_indices: U32sMut, dst_last: U32sMut,
             src_indices: U32s,
+        ]),
+
+    // ═══ THE QUANTISED APPENDERS AND THE PER-TENSOR DEQUANT ═══════════════
+    //
+    // Five rows added when `kernels::Ty::Fp8Kind` closed the gap this file's
+    // header and `kv_paged.cuh:63-78` both name. Before it, two of these
+    // kernels could not be spelled at all — they take an
+    // `__nv_fp8_interpretation_t` and the vocabulary had no enum — and the
+    // other three were held back with them because they are the same host
+    // switch's other arms and a row set covering three arms of four is a
+    // dispatch that silently writes a page in the wrong format.
+    //
+    // The switch is `kv_paged.cu:156-215`, on `layer.scheme`:
+    //
+    // ```text
+    // :158   case KvCacheScheme::Fp8PerTensor:
+    // :162       device::write_kv_fp8_per_tensor<<<total_tokens, BLOCK, 0, stream>>>
+    // :170   case KvCacheScheme::Int8PerTokenHead:
+    // :174       device::write_kv_per_token_head<false><<<grid, BLOCK, shmem, stream>>>
+    // :183   case KvCacheScheme::Fp8PerTokenHead:
+    // :187       device::write_kv_per_token_head<true><<<grid, BLOCK, shmem, stream>>>
+    // :196   case KvCacheScheme::Fp4Block:
+    // :203       device::write_kv_fp4_block<<<grid, 32, 0, stream>>>
+    // :212   case KvCacheScheme::Native:
+    // :213       break;                       // handled above, before the switch
+    // ```
+    //
+    // `BLOCK` is `constexpr int BLOCK = 256` at `:155`.
+    //
+    // # Why `write_kv_per_token_head` is TWO symbols and not a specialisation
+    //
+    // Its template parameter is `bool UseFp8`, and the five appenders above
+    // are `template <bool HND_LAYOUT>` under [`crate::device::Specialisation`]
+    // — so the shape looks identical and is not. A `Specialisation` resolves
+    // a flag that the CONTRACT row carries as an operand: `hnd_layout: Bool`
+    // is in the base signature, the model states it, and `choose` reads it
+    // back off the fire. `UseFp8` is nowhere in this kernel's parameter list.
+    // It is read off `layer.scheme`, which is a property of the CACHE and not
+    // of the call, and a base row inventing an operand to carry it would put
+    // a cell in `cuLaunchKernel`'s array that the instantiation does not
+    // read — exactly what `Specialisation::flags_are_covered` exists to
+    // forbid in the other direction.
+    //
+    // The precedent is three rows up in this same array:
+    // `dequant_fp8_per_token_head_pages_active_bf16` and
+    // `dequant_int8_per_token_head_pages_active_bf16` are two symbols for two
+    // storage formats off two templates, chosen by the same `layer.scheme`
+    // switch at `kv_paged.cu:404`/`:416`. These two are that pair's write
+    // halves and are named the same way.
+    //
+    // `attn/kv_paged.cu:162`:
+    //
+    // ```text
+    // :162   device::write_kv_fp8_per_tensor<<<total_tokens, BLOCK, 0, stream>>>(
+    // ```
+    //
+    // One block per token at 256 threads — `LaunchRule::PerRow` to the digit,
+    // the same rule the bf16 `write_kv` rows carry, because it is the same
+    // grid over the same tokens with a different destination format.
+    //
+    // The pages are `U8sMut` for the reason the dequant rows give above:
+    // `__nv_fp8_storage_t` IS `unsigned char`, so the width is a byte and the
+    // FORMAT is the `fp8_kind` operand's to say. That operand is why this row
+    // exists: `kv_paged.cu:159-161` computes it on the host as
+    // `layer.storage_dtype == DType::FP8_E5M2 ? __NV_E5M2 : __NV_E4M3`, and
+    // that ternary is host logic, so it becomes Rust and arrives here as an
+    // argument rather than as a template default. `kv_paged.cuh:66-68`
+    // records what the default would have cost: *"`__NV_E5M2` pages would
+    // silently decode as `__NV_E4M3`"*.
+    kernel!(write_kv_fp8_per_tensor "attn::write_kv_fp8_per_tensor",
+        file = Some("attn/kv_paged.cuh"),
+        launch = LaunchRule::PerRow,
+        operands = operands![
+            k_curr: Buf, v_curr: Buf, k_pages: U8sMut, v_pages: U8sMut,
+            qo_indptr: U32s, kv_page_indices: U32s, kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            R: I32, page_size: I32, h_kv: I32, d: I32, fp8_kind: Fp8Kind,
+        ]),
+    // `attn/kv_paged.cu:172-174` and `:185-187` — the two arms differ only in
+    // the template argument and the scheme that selects them:
+    //
+    // ```text
+    // :172   const dim3 grid(total_tokens, num_kv_heads);
+    // :173   const std::size_t shmem = 2 * (BLOCK / 32) * sizeof(float);
+    // :174   device::write_kv_per_token_head<false><<<grid, BLOCK, shmem, stream>>>(
+    // ```
+    //
+    // **`LaunchRule::Unstated`, and the reason is the grid and the shared
+    // memory both.** Two meaningful axes — tokens on `x`, KV heads on `y`,
+    // and the kernel reads `blockIdx.y` at `kv_paged.cuh:427` — which no rule
+    // here states; `RowsPerHead` is the nearest and is a FLATTENED product,
+    // `rows · (width / head_dim)` blocks on one axis, so a kernel reading
+    // `blockIdx.y` under it would find zero. On top of that the launch
+    // carries dynamic shared memory, and no `LaunchRule` states smem at all.
+    //
+    // So the driver owns the `Launch`, which is `fire/attn_score.rs`' shape
+    // and `fire/moe.rs`' precedent for this family of row. §10.5 forbids
+    // growing the rule vocabulary for one kernel and this is two.
+    //
+    // `shmem` is `2 * (256 / 32) * sizeof(float)` = **64 bytes** — two floats
+    // per warp, which `kv_paged.cuh:428` spends on the K and V absmax
+    // reductions. It is a function of the BLOCK and not of `head_dim`, so it
+    // is the same 64 bytes at every geometry; the driver states it as a
+    // constant with that derivation beside it.
+    kernel!(write_kv_int8_per_token_head "attn::write_kv_int8_per_token_head",
+        file = Some("attn/kv_paged.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            k_curr: Buf, v_curr: Buf, k_pages: BufMut, v_pages: BufMut,
+            k_scales: F32sMut, v_scales: F32sMut,
+            qo_indptr: U32s, kv_page_indices: U32s, kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            R: I32, page_size: I32, h_kv: I32, d: I32,
+        ]),
+    kernel!(write_kv_fp8_per_token_head "attn::write_kv_fp8_per_token_head",
+        file = Some("attn/kv_paged.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            k_curr: Buf, v_curr: Buf, k_pages: BufMut, v_pages: BufMut,
+            k_scales: F32sMut, v_scales: F32sMut,
+            qo_indptr: U32s, kv_page_indices: U32s, kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            R: I32, page_size: I32, h_kv: I32, d: I32,
+        ]),
+    // `attn/kv_paged.cu:199-203`:
+    //
+    // ```text
+    // :199   const int block_size = layer.block_size > 0 ? layer.block_size : 16;
+    // :201   const int blocks = (head_dim + block_size - 1) / block_size;
+    // :202   const dim3 grid(total_tokens, num_kv_heads, blocks);
+    // :203   device::write_kv_fp4_block<<<grid, 32, 0, stream>>>(
+    // ```
+    //
+    // **Three meaningful axes at 32 threads**, and the kernel reads all three
+    // (`kv_paged.cuh:563-565` is `blockIdx.x`, `.y`, `.z`). `Unstated` for
+    // the reason above, one axis further out: `SingleWarp` fixes 32 threads
+    // and `dim3(1, heads, rows)`, which is two axes and a fixed `x`.
+    //
+    // **The `block_size` default is a MEASUREMENT and it is carried.** The
+    // host reads `layer.block_size` and substitutes 16 when it is not
+    // positive — 16 because an fp4 block scale covers 16 values, which is the
+    // arena's own layout and not a tuning knob. It appears twice in the C++,
+    // here and at `kv_paged.cu:429-431` in the dequant, and the two must
+    // agree or a page is written in blocks of one width and read in blocks
+    // of another. The Rust states it once, in the view, so they cannot drift.
+    kernel!(write_kv_fp4_block "attn::write_kv_fp4_block",
+        file = Some("attn/kv_paged.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            k_curr: Buf, v_curr: Buf, k_pages: U8sMut, v_pages: U8sMut,
+            k_scales: F32sMut, v_scales: F32sMut,
+            qo_indptr: U32s, kv_page_indices: U32s, kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            R: I32, page_size: I32, h_kv: I32, d: I32, block_size: I32,
+        ]),
+    // `attn/kv_paged.cu:397`:
+    //
+    // ```text
+    // :394   const auto fp8_kind = layer.storage_dtype == DType::FP8_E5M2
+    // :395       ? __NV_E5M2 : __NV_E4M3;
+    // :397   device::dequant_fp8_pages_active<<<blocks, BLOCK, 0, stream>>>(
+    // ```
+    //
+    // where `blocks` is `(logical_n + 255) / 256` at `:388` — the same
+    // `LaunchRule::Elementwise` its three siblings above carry, over the same
+    // `logical_n`.
+    //
+    // **This is the row the array's own comment said could not exist.** The
+    // note above `dequant_fp8_per_token_head` reads *"`dequant_fp8_pages_active`
+    // — the per-TENSOR form — has no row for the other half of that sentence:
+    // it takes the interpretation as an `__nv_fp8_interpretation_t` argument
+    // and the `Ty` vocabulary has no enum."* The vocabulary now has one, so
+    // the row is here and that sentence is answered rather than deleted.
+    //
+    // `page_elems` and not `page_size, h_kv, d`: the per-tensor form takes
+    // the product pre-multiplied (`layer.page_size * num_kv_heads * head_dim`
+    // at `kv_paged.cu:385`) because a per-tensor scale needs no per-head
+    // addressing, which is exactly the difference from its three siblings.
+    kernel!(dequant_fp8_per_tensor "attn::dequant_fp8_pages_active_bf16",
+        file = Some("attn/kv_paged.cuh"),
+        launch = LaunchRule::Elementwise,
+        operands = operands![
+            k_pages: U8s, v_pages: U8s, k_out: BufMut, v_out: BufMut,
+            page_indices: U32s, n: I64, page_elems: I32, fp8_kind: Fp8Kind,
         ]),
 ];
 
@@ -3173,7 +4071,7 @@ pub static WRITE_KV_AT_POSITIONS: Specialisation = Specialisation {
 
 /// `kv_paged.cu:371`, as data. The flag is operand 11 of twelve.
 pub static WRITE_KV_EXPLICIT: Specialisation = Specialisation {
-    base: "attn::write_kv_explicit_bf16",
+    base: "attn::write_kv_explicit_bf16_dev",
     arms: &[
         Arm {
             name: "hnd",
@@ -3195,7 +4093,7 @@ pub static WRITE_KV_EXPLICIT: Specialisation = Specialisation {
 
 /// `kv_paged.cu:283`, as data. The flag is operand 12 of thirteen.
 pub static WRITE_KV_EXPLICIT_DEVWIN: Specialisation = Specialisation {
-    base: "attn::write_kv_explicit_bf16_devwin",
+    base: "attn::write_kv_explicit_bf16_devwin_dev",
     arms: &[
         Arm {
             name: "hnd",
@@ -3320,3 +4218,452 @@ mod tests {
         assert_eq!(checked, 14, "seven specialised kernels, two arms each");
     }
 }
+
+// ===========================================================================
+// The XQA lattice
+// ===========================================================================
+
+/// One member of the XQA lattice: a `-D` set, and what it is for.
+///
+/// `attn/attention_xqa.cu` and its five siblings in `kernels-cuda` are each a
+/// `#define` block, one `#include`, and a host launcher. The launcher is Rust
+/// now (`driver-cuda/src/fire/xqa.rs`), the include is
+/// `csrc/src/attn/attention_xqa_mha.cuh`, and the `#define` block is this —
+/// [`crate::unit::Unit::options`], which `unit.rs:95` describes as *"NVRTC
+/// options this unit needs and the others must not have"* and which is the
+/// right hook for exactly this: sixteen object-like macros that configure one
+/// upstream template body six ways.
+///
+/// # `options` is the right hook, and two nearby things are not
+///
+/// `unit.rs:95-125` warns that `options` is the WRONG hook for two cases, and
+/// XQA hits both of them separately, so it is worth being explicit about
+/// which field each belongs in:
+///
+/// * **A toolchain floor** is [`crate::unit::Demands::floor`], not an option.
+///   The lattice has no floor to state at all: the five non-Hopper members
+///   compile under NVRTC 13.0, measured. The Hopper member is not blocked on
+///   a NVRTC version either — see [`XQA_LATTICE`]'s last entry.
+/// * **A header set** is [`crate::unit::Demands::headers`], not an option.
+///   Every member needs [`crate::unit::Headers::LibraryAndVendor`], and that
+///   is the one entry the currently-empty `DEMANDS` table would gain. Buying
+///   the same thing with `-I` in `options` is precisely what `source.rs`'s
+///   module header refuses: *"No include path on disk."*
+///
+/// What is left over after those two are moved out is a pure `-D` set, which
+/// is what `options` was built to carry. XQA does not need the hook `unit.rs`
+/// warns against.
+pub struct XqaVariant {
+    /// The `Unit::name` this member gets.
+    pub unit: &'static str,
+    /// The `-D` set, verbatim, as `Unit::options` would carry it.
+    ///
+    /// [`XQA_COMMON_OPTIONS`] is not repeated here; the full option array is
+    /// the concatenation of that and this.
+    pub options: &'static [&'static str],
+    /// The `extern "C"` device entry point this member exports, after the
+    /// rename in [`Self::options`].
+    ///
+    /// One name per member, and they must differ:
+    /// [`crate::unit::unit_of`] resolves a symbol across the whole table, so
+    /// six units exporting `kernel_mha` are six rows that cannot be told
+    /// apart.
+    pub entry: &'static str,
+    /// The archive file this member's `#define` block came from, with the
+    /// line the varying defines are on.
+    pub from: &'static str,
+    /// Why this member exists — the measurement its `.cu` carried.
+    ///
+    /// These are per-model justifications, not decoration. A lattice member
+    /// with no reason to exist is a compile nobody asked for; a lattice
+    /// member whose reason was dropped in the port is a regression that
+    /// compiles.
+    pub because: &'static str,
+}
+
+/// The twelve `-D`s every member of the lattice shares, plus the one that is
+/// ours.
+///
+/// Cited to `attn/attention_xqa_gqa2.cu:17-30`, and byte-identical in the
+/// other five (`attention_xqa.cu:58-71`,
+/// `attention_xqa_gqa2_p16.cu:17-30`, `attention_xqa_gqa4.cu:17-30`,
+/// `attention_xqa_gqa8.cu:17-30`, `attention_xqa_gqa8_sm90.cu:19-32`).
+///
+/// # `GENERATE_CUBIN` is the only one that is not the archive's
+///
+/// It is upstream's define, not ours — `xqa/mha.cu:2820` guards `launchMHA`
+/// behind `#ifndef GENERATE_CUBIN` and `xqa/mha_stdheaders.cuh` swaps the
+/// host standard library under the same name. The archive never set it
+/// because the archive wanted the host launcher. A JIT does not, so this is
+/// the one line the port adds rather than moves.
+///
+/// # `DTYPE` is spelled in the prelude's types, and that is not an accident
+///
+/// `device::bf16`, verbatim from `attention_xqa_gqa2.cu:22` — not
+/// `__nv_bfloat16`. `csrc/shim/cuda_bf16.h:248` aliases `__nv_bfloat16` TO
+/// `device::bf16`, so under the production header set the two spellings are
+/// one type and the archive's is the one that does not depend on the shim
+/// being reached first.
+///
+/// (The probes behind this section substituted `-DDTYPE=__nv_bfloat16`,
+/// because they swapped the toolkit's dtype headers in to isolate the shim
+/// gap enumerated below. That substitution is a property of the probe, not of
+/// the unit.)
+pub const XQA_COMMON_OPTIONS: &[&str] = &[
+    "-DGENERATE_CUBIN=1",
+    "-DNDEBUG=1",
+    "-DBEAM_WIDTH=1",
+    "-DUSE_INPUT_KV=0",
+    "-DUSE_CUSTOM_BARRIER=1",
+    "-DINPUT_FP16=0",
+    "-DDTYPE=device::bf16",
+    "-DCACHE_ELEM_ENUM=0",
+    "-DHEAD_ELEMS=128",
+    "-DSLIDING_WINDOW=0",
+    "-DLOW_PREC_OUTPUT=0",
+    "-DSPEC_DEC=0",
+    "-DMLA_WRAPPER=0",
+];
+
+/// The root all six members compile, carried so a moved file is a compile
+/// error here rather than a missing include at run time.
+pub const XQA_ROOT: &str = include_str!("../../csrc/src/attn/attention_xqa_mha.cuh");
+
+/// `sizeof(SharedMem)` (`xqa/mha.cu:409`), measured out of the PTX.
+///
+/// NVRTC 13.0, `compute_89`, [`XQA_ROOT`] verbatim: **79,488 bytes, the same
+/// for every member measured** — HEAD_GRP_SIZE 2, 4, 5 and 8 at
+/// TOKENS_PER_PAGE 32, and HEAD_GRP_SIZE 2 at TOKENS_PER_PAGE 16 all emit
+/// `.global .align 4 .u32 pie_xqa_smem_size = 79488;`. Neither the head group
+/// nor the page size moves it.
+///
+/// It is over the 48 KiB `runtime::module::DEFAULT_DYNAMIC_SMEM` default, so
+/// the opt-in path is mandatory, and under sm_89's 99 KiB per-block opt-in
+/// maximum, so the opt-in succeeds. `driver-cuda/src/fire/xqa.rs` puts it in
+/// `Launch::smem`, which is what makes `KernelModule::fire` raise the cap.
+pub const XQA_SMEM_BYTES: u32 = 79_488;
+
+/// The six units, as option sets.
+///
+/// # Why this is a table and not six `Unit`s
+///
+/// Not because the include does not resolve — it does. `csrc/vendor/xqa/`
+/// holds the fifteen-file closure now, and `carried.rs` walks the directory,
+/// so it is carried as `xqa/mha.cuh` and answers the one directive that names
+/// it, in [`XQA_ROOT`].
+///
+/// Two things stop the enrolment, and both are about the ROW rather than the
+/// source:
+///
+/// * **`tests/units.rs:436` fails a unit that declares no rows** — *"a unit
+///   with no rows would compile to a cubin nothing can fire"*. So `rows:
+///   &[]` is not a way to enrol these early.
+/// * **A row needs a `KernelSig`, and `kernel_mha`'s cannot be written yet.**
+///   It takes `KVCacheList<usePagedKVCache> const cacheList` **by value**
+///   (`xqa/mha.cu:2757`), and with `ENABLE_4BIT_KV_CACHE` off
+///   (`xqa/mhaUtils.cuh:242-253`) that aggregate is four pointers plus a
+///   `uint32_t`: **40 bytes, 8-aligned**. `runtime::args::ArgValue` has
+///   `Ptr/I32/U32/F32/Usize/I64/Bool/U8` and no byte-buffer variant, which is
+///   the gap `new-horizon.md` §3.2 names — *"a borrowed byte buffer, so
+///   by-value aggregates over 8 bytes … can cross the JIT path"*. A
+///   `KernelSig` written today would be inventing a spelling for a parameter
+///   the runtime cannot pass.
+///
+/// A third thing is mechanical but is a claim about the whole table:
+/// `unit.rs:929` asserts every unit in [`UNITS`] has `Demands::DEFAULT` and
+/// that `DEMANDS` is empty, *"the table and the units above are two
+/// spellings of one fact"*. Six `Headers::LibraryAndVendor` rows edit that
+/// test — which its own message invites (*"update it with the reason"*) —
+/// and the reason is this section.
+///
+/// So the honest artifact is the option sets, which are measured and exact.
+/// Enrolling them afterwards is a `UNITS_HEAVY` entry per member with
+/// `root: XQA_ROOT`, `options:` the concatenation of
+/// [`XQA_COMMON_OPTIONS`] and [`XqaVariant::options`], and one `DEMANDS` row
+/// each stating [`crate::unit::Headers::LibraryAndVendor`].
+///
+/// # The gate that does NOT cover this
+///
+/// `tests/layers.rs::every_include_reachable_from_a_unit_resolves` walks
+/// `source::quoted_includes`, which reads `#include "..."` and nothing else.
+/// [`XQA_ROOT`]'s includes are all ANGLE-bracketed — `<cuda_bf16.h>`,
+/// `<xqa/mha.cu>` — so they pass that test whether or not the set carries
+/// them, and would fail at first fire on a GPU box with a diagnostic naming
+/// the include rather than the omission. `carried.rs`'s header calls this out
+/// as the failure mode the generated set exists to prevent. **The directory
+/// is the guarantee; the test is not.**
+///
+/// # Vendored, not CPM — and the reasoning, because it is easy to get wrong
+///
+/// `xqa/` **is vendored, at `csrc/vendor/xqa/`.** The CPM checkout cannot be
+/// published to the JIT, for reasons that are all one reason:
+///
+/// * `runtime::nvrtc::options` (`nvrtc.rs:861`) passes
+///   `--gpu-architecture=sm_XY -std=c++17 --fmad=false --prec-div=true
+///   --prec-sqrt=true` and the unit's own `Unit::options`. **There is no
+///   `-I` on that list and there is no mechanism for one.** Includes resolve
+///   against `includeNames[]`, an in-memory set carried in the binary. There
+///   is nothing for `${flashinfer_SOURCE_DIR}` to be spelled into.
+/// * `${flashinfer_SOURCE_DIR}` is a **C++ compiler** include path.
+///   `kernels-cuda/csrc/CMakeLists.txt` names it and never names
+///   `csrc/vendor`; the two sets are populated by different mechanisms and
+///   the archive's is not one a Rust binary can read at run time.
+/// * The same header set is the **cache key**. `source.rs`'s
+///   `the_digest_moves_when_any_header_does` exists because a compile keyed on
+///   text that the key cannot see serves a stale cubin. A CPM checkout is a
+///   host fact — a path, a git tag, a `_deps` directory that may or may not
+///   have been populated — and none of it is in the digest.
+///
+/// (A probe rooted at `-I csrc/{src,shim,vendor}` resolves the same literal
+/// names the carried set resolves, which is why probe results transfer. It is
+/// a faithful simulation of the mechanism and not the mechanism, and `-I`
+/// must never appear in a `Unit::options`.)
+///
+/// **The `<pie/…>` spelling split did not bite XQA**, which is the part worth
+/// stating because it is the part that would have cost a rewrite. Every one
+/// of the closure's internal includes is sibling-relative and quoted:
+/// `"barriers.cuh"`, `"mha.h"`, `"utils.cuh"`, `"mhaUtils.cuh"`,
+/// `"defines.h"` and ten more, all resolving within one directory —
+/// `carried.rs`'s `collect` even builds the beside-the-includer aliases for
+/// them. **Not one upstream byte was respelled**, so `PIE_INCLUDES`
+/// (`tests/vendor_manifest.rs:276`) stays empty, which is the state that
+/// makes the first `<pie/…>` fail loudly instead of passing silently.
+///
+/// # One name did change, and it is ours
+///
+/// Upstream's `mha.cu` is carried as **`csrc/vendor/xqa/mha.cuh`**, because
+/// `kernels-cuda-new` holds no translation units: 120 `.cuh` and no `.cu`,
+/// which is the device/host line this crate exists to draw. A `.cu` is
+/// something nvcc compiles ahead of time; a `.cuh` is device text carried
+/// into NVRTC.
+///
+/// The rename is free precisely because it is not an impersonation.
+/// `carried.rs`'s *"the name is the path, because the name is what
+/// resolves"* exists so a header we do not own can be answered under the
+/// spelling ITS includer writes (§13.4) — and the only thing that ever wrote
+/// `<xqa/mha.cu>` is `attn/attention_xqa_gqa2.cu:35` and its five siblings,
+/// which this port replaces. Checked before renaming: **no file under
+/// `csrc/vendor/xqa/` includes a `.cu` by name**, across all fifteen. So one
+/// directive moved, in [`XQA_ROOT`], which is ours. Re-measured after it:
+/// rc = 0, same entries, same 79,488.
+///
+/// If `mha_sm90` is vendored later the same applies — and the same check
+/// applies first. `attn/attention_xqa_gqa8_sm90.cu:37` names
+/// `<xqa/tensorMap.cpp>`, so if an upstream header there reaches a `.cu` or
+/// `.cpp` by name, the spelling is upstream's and the decision is a
+/// different one.
+///
+/// **Citation convention, because the rename makes it matter.** Every
+/// `xqa/mha.cu:N` in this crate and in `driver-cuda/src/fire/xqa.rs` is a line
+/// in UPSTREAM's file, which is the anchor that does not move. The carried
+/// copy is offset by two insertions and its own `// PIE:` header states both
+/// offsets and converts the three citations that are load-bearing.
+///
+/// # What was vendored, and what was left behind
+///
+/// Fifteen files, 272 KB: the transitive closure of upstream `xqa/mha.cu`'s
+/// quoted includes and nothing else. `NVRTC` copies every byte of `VENDOR`
+/// into every unit that asks for it, so the closure was computed rather than
+/// the directory copied — upstream's `xqa/` is 25 files and 800 KB, and
+/// `gmma_impl.cuh` alone is 323 KB of Hopper GMMA that `mha.cu` never
+/// reaches.
+///
+/// Deliberately NOT vendored: `mha_sm90.cu`, `tensorMap.{h,cpp}` and their
+/// closure. The Hopper member does not compile (see its entry below), so
+/// carrying it would be 400 KB of text every vendored unit pays for and
+/// nothing can use.
+///
+/// `csrc/vendor/xqa/` is outside `tests/vendor_manifest.rs`'s reach: that
+/// test walks `csrc/vendor/flashinfer` specifically, so `MODIFICATIONS`
+/// continues to describe the tree it describes. The one patch below is
+/// therefore recorded HERE and in the file, and is not in that table.
+///
+/// One vendor patch was needed, and it is the difference between 2 errors and
+/// 0: `xqa/mha.cu:2955-3050` — `configureKernel`, `hostSmemSize` and
+/// `launchMHAFlashInfer` — is wrapped in `#ifndef GENERATE_CUBIN` under a
+/// `// PIE:` marker. Upstream already guards `launchMHA` that way at
+/// `:2820`; the tail is FlashInfer's own downstream addition and they never
+/// guarded it. A preprocessor-depth walk confirms the trailing `#endif` at
+/// EOF closes `#if !(IS_MLA)` from `:20`, so the tail really was unguarded
+/// rather than merely appearing so.
+///
+/// # The shim gap, enumerated
+///
+/// With `csrc/shim`'s dtype headers rather than the toolkit's, and everything
+/// else identical, the compile is **7 errors and not 0**. None of them is an
+/// NVRTC limitation, which is the whole reason to write them down: they read
+/// like one.
+///
+/// ```text
+/// xqa/mhaUtils.cuh:368   no conversion float2 -> __nv_fp8x2_storage_t
+/// xqa/utils.cuh:209      no __half2 constructor matches
+/// xqa/mha.cu:1211        no operator* for the operands
+/// xqa/mha.cu:1429  (x2)  no constructor converts int -> device::bf16
+/// xqa/mha.cu:1442        no instance of __hadd2_rn matches
+/// ```
+///
+/// What is actually missing, as opposed to what the error says:
+///
+/// 1. `__nv_fp8x2_e4m3(float2)` — a **constructor**. The error names
+///    `__nv_fp8x2_storage_t` only because brace-init fell through to the
+///    aggregate member. `csrc/shim/cuda_fp8.h:460-473` refuses this one in
+///    writing: *"No constructor is spelled anywhere, so none is written here
+///    — a `float2` constructor would be a second, untested spelling of
+///    `__nv_cvt_float2_to_fp8x2`."*
+/// 2. `__half2::__half2(__nv_fp8x2_e4m3)` — a constructor **from fp8**, not
+///    (as it is easy to read from the line number alone) from two `__half`.
+///    `utils.cuh:209` is
+///    `half2(reinterpret_cast<__nv_fp8x2_e4m3 const&>(src[i]))`.
+/// 3. `operator*(__nv_bfloat162, __nv_bfloat162)`.
+///    `csrc/shim/cuda_bf16.h` defines **one** arithmetic intrinsic in total —
+///    `__hmul2`, at `:460` — and no operators at all.
+/// 4-5. `__nv_bfloat162{0, 0}` at `mha.cu:1429`, which needs `device::bf16`
+///    constructible from an integer literal.
+/// 6. `__hadd2_rn` for `__nv_bfloat162`. The shim has no `__hadd2` and no
+///    `_rn` form of anything; `cuda_fp16.h` has `__hadd2` but no `_rn`.
+///
+/// And a second layer underneath, found by probing with those six patched
+/// over: `float2(__nv_fp8x2_e4m3)` (`utils.cuh:186`),
+/// `__nv_fp8x2_e4m3{__half2}` (`:217`), `__nv_fp8x2_e4m3{__nv_bfloat162}`
+/// (`:229`), and the scalar `Dst{src}` forms beside them.
+///
+/// ## Why this was NOT fixed here, which is the actionable half
+///
+/// Because it is not a list of omissions. It is three design decisions
+/// meeting a consumer they were not measured against:
+///
+/// * **The bf16 arithmetic set is a written refusal.**
+///   `csrc/shim/cuda_bf16.h:489-496` has a section titled *"what is
+///   deliberately not here"* naming `__hmul`, `__hadd`, `__hsub`, `__hfma`,
+///   `__hmax`, `__hmin`, `__habs` *"and their packed forms"*, the comparison
+///   set, and the operator set — each justified by a use count of zero across
+///   two trees. **XQA is a third tree, and it was not in the count.** The
+///   absence is still a measurement; the measurement's denominator changed.
+///   Adding to it is right, and it is a deliberate revision of a recorded
+///   decision, not a fill-in.
+/// * **Half the gap is not in `csrc/shim` at all.**
+///   `csrc/shim/cuda_bf16.h:248,262` alias `__nv_bfloat16` and
+///   `__nv_bfloat162` to `device::bf16` and `device::bf16x2`, so items 3-6
+///   land on `csrc/src/pie_device.cuh` — where `bf16`'s constructors are
+///   `explicit` **on purpose** (`:68-108`: *"an implicit constructor from
+///   `float` would make `bf16 x = 1.0f;` compile — silently narrowing"*) and
+///   `bf16x2` (`:371`) is a plain aggregate. Item 4-5's `{0, 0}` is asking
+///   for the exact implicit conversion that comment refuses.
+/// * **The fp8 constructors cannot be checked here.** Bit-exactness against
+///   `__nv_cvt_float2_to_fp8x2` is the property that matters and it needs a
+///   device to compare on.
+///
+/// So the enumeration is the deliverable and the patch is not. The one item
+/// that WAS obviously right has been added: `csrc/shim/cassert`, which
+/// declares nothing — `xqa/barriers.cuh:19` and `xqa/utils.h:5` include
+/// `<cassert>` unguarded, NVRTC's preamble already supplies `assert`, and the
+/// missing FILE was a *catastrophic* error that ended the compile and hid
+/// every other question behind it.
+///
+/// `.wiki/driver/new-horizon.md` §13.6 priced FA2's move as *"a FlashInfer
+/// patch set plus ~39 bit-exact device intrinsics"*, and §62 records the
+/// patch set as paid. This gap is very likely what the second half of that
+/// quote was pointing at, and it is shared: anything reaching bf16 packed
+/// arithmetic or fp8x2 conversion hits it, not just XQA.
+pub static XQA_LATTICE: [XqaVariant; 6] = [
+    XqaVariant {
+        unit: "attn/attention_xqa_mha_gqa2_p32",
+        options: &[
+            "-DHEAD_GRP_SIZE=2",
+            "-DTOKENS_PER_PAGE=32",
+            "-DUSE_SM90_MHA=0",
+            "-Dkernel_mha=kernel_mha_xqa_gqa2_bf16_p32_h128",
+        ],
+        entry: "kernel_mha_xqa_gqa2_bf16_p32_h128",
+        from: "attn/attention_xqa_gqa2.cu:24-33",
+        because: "head_group_size=2, used by small Qwen GQA models such as \
+                  Qwen3-0.6B and Qwen3-1.7B",
+    },
+    XqaVariant {
+        unit: "attn/attention_xqa_mha_gqa2_p16",
+        options: &[
+            "-DHEAD_GRP_SIZE=2",
+            "-DTOKENS_PER_PAGE=16",
+            "-DUSE_SM90_MHA=0",
+            "-Dkernel_mha=kernel_mha_xqa_gqa2_bf16_p16_h128",
+        ],
+        entry: "kernel_mha_xqa_gqa2_bf16_p16_h128",
+        from: "attn/attention_xqa_gqa2_p16.cu:24-33",
+        because: "the same head group at a 16-token page. Dead code TODAY and \
+                  kept anyway: `xqa_decode_page_bucket` never returns 16 \
+                  because `xqa_gqa2_page16_enabled()` returns false, so the \
+                  only way to reach this member is to flip that — which is \
+                  what it is for. Deleting it would make flipping the flag a \
+                  port rather than a flag.",
+    },
+    XqaVariant {
+        unit: "attn/attention_xqa_mha_gqa4_p32",
+        options: &[
+            "-DHEAD_GRP_SIZE=4",
+            "-DTOKENS_PER_PAGE=32",
+            "-DUSE_SM90_MHA=0",
+            "-Dkernel_mha=kernel_mha_xqa_gqa4_bf16_p32_h128",
+        ],
+        entry: "kernel_mha_xqa_gqa4_bf16_p32_h128",
+        from: "attn/attention_xqa_gqa4.cu:24-33",
+        because: "head_group_size=4, used by medium Qwen GQA models such as \
+                  Qwen3-4B and Qwen3-8B",
+    },
+    XqaVariant {
+        unit: "attn/attention_xqa_mha_gqa5_p32",
+        options: &[
+            "-DHEAD_GRP_SIZE=5",
+            "-DTOKENS_PER_PAGE=32",
+            "-DUSE_SM90_MHA=0",
+            "-Dkernel_mha=kernel_mha_xqa_gqa5_bf16_p32_h128",
+        ],
+        entry: "kernel_mha_xqa_gqa5_bf16_p32_h128",
+        from: "attn/attention_xqa.cu:65-74",
+        because: "head_group_size=5, the ratio Llama-3.1-8B-shaped models use \
+                  (32 query heads over 8 KV heads is 4; 40 over 8 is 5). It \
+                  lives in the family's dispatch head rather than a sibling \
+                  file because that file is also where the host program was.",
+    },
+    XqaVariant {
+        unit: "attn/attention_xqa_mha_gqa8_p32",
+        options: &[
+            "-DHEAD_GRP_SIZE=8",
+            "-DTOKENS_PER_PAGE=32",
+            "-DUSE_SM90_MHA=0",
+            "-Dkernel_mha=kernel_mha_xqa_gqa8_bf16_p32_h128",
+        ],
+        entry: "kernel_mha_xqa_gqa8_bf16_p32_h128",
+        from: "attn/attention_xqa_gqa8.cu:24-33",
+        because: "head_group_size=8, used by common large GQA models such as \
+                  Qwen3-32B and Llama-70B-style shapes. Its launcher \
+                  FORWARDS to the sm90 member when `current_device_major() \
+                  >= 9`, which is why the two exist as a pair rather than as \
+                  alternatives.",
+    },
+    XqaVariant {
+        unit: "attn/attention_xqa_mha_gqa8_p32_sm90",
+        options: &[
+            "-DHEAD_GRP_SIZE=8",
+            "-DTOKENS_PER_PAGE=32",
+            "-DUSE_SM90_MHA=1",
+            "-Dkernel_mha=kernel_mha_xqa_gqa8_sm90_bf16_p32_h128",
+        ],
+        entry: "kernel_mha_xqa_gqa8_sm90_bf16_p32_h128",
+        from: "attn/attention_xqa_gqa8_sm90.cu:26-35",
+        because: "Hopper GMMA/TMA, kept in a separate translation unit \
+                  because FlashInfer's `xqa/mha.cu` and `xqa/mha_sm90.cu` \
+                  intentionally define the same static kernel symbols. It \
+                  also passes `enable_pdl = true` unconditionally where the \
+                  other five pass `current_device_major() >= 9` — which is \
+                  the same predicate, already known true here. NOT READY: \
+                  measured at compute_90a it stops on `std::pair` in DEVICE \
+                  code (`xqa/mha_sm90.cu:1980`, 12 diagnostics cascading \
+                  from that one line), the header set has no `<utility>`, \
+                  `csrc/shim/cuda.h` has no `CUtensorMap` or \
+                  `CUtensorMapDataType_enum` for `xqa/tensorMap.h` to \
+                  declare against, and the archive unit compiles \
+                  `<xqa/tensorMap.cpp>` first — HOST code building tensor \
+                  maps through `cuTensorMapEncodeTiled`, which is a second \
+                  and larger host-to-Rust port than `launchMHA` was.",
+    },
+];

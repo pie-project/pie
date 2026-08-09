@@ -112,10 +112,23 @@ pub static KERNELS: &[KernelSig] = &[
     // bound it; `cuda::mxfp4_moe_gemm_w4a16` had no caller in any model
     // text; and `driver-cuda/src/weights/plan.rs:147` answers
     // `native_mxfp4_moe = false` on purpose, so nothing plans the
-    // lowering the launcher serves. The vendored tree and
-    // `marlin_moe_wrapper.{cpp,hpp}` stay: `PIE_CUDA_BUILD_MARLIN_MOE`
+    // lowering the launcher serves.
+    //
+    // THE SENTENCE THAT USED TO FINISH THIS NOTE IS WHY THE TREE OUTLIVED
+    // THE ROW BY A ROUND, and it is worth keeping as an example of a true
+    // statement that answers the wrong question. It read: *"The vendored
+    // tree and `marlin_moe_wrapper.{cpp,hpp}` stay: `PIE_CUDA_BUILD_MARLIN_MOE`
     // defaults ON and `kernels_manifest.hpp:139` reads
-    // `PIE_CUDA_HAS_MARLIN_MOE` to answer the device capability.
+    // `PIE_CUDA_HAS_MARLIN_MOE` to answer the device capability."* Every
+    // clause of that was correct. What it did not ask is whether the chain
+    // TERMINATED in anything: the line it cited was
+    // `#if defined(PIE_CUDA_HAS_MARLIN_MOE) && defined(PIE_CUDA_HAS_MARLIN)`,
+    // and `PIE_CUDA_BUILD_MARLIN` defaulted OFF while `..._MOE` defaulted ON —
+    // so a default build compiled 156 KB of CUDA and answered *no* from the
+    // conjunct next to the flag it had just been given. Both trees, both
+    // options, the whole capability and its two `getenv` sites are gone;
+    // `kernels_manifest.hpp` carries the chain and the one open question
+    // (sm_100) in prose. `new-horizon.md` §47.
     kernel!(topk_sqrtsoftplus "moe::topk_sqrtsoftplus_bf16",
         operands = operands![
             logits: Buf <- Source::In(0),

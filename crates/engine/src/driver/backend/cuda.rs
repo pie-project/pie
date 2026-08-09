@@ -143,10 +143,22 @@ impl CudaDriverHandle {
     }
 }
 
-// NO `unsafe impl Send`/`Sync`. The pair that was here existed because the
-// handle carried a `*mut PieDriver` — a raw pointer, which is neither — and
-// the compiler had to be told what the C boundary made unprovable. The field
-// is a `Shell` now, so both are derived.
+// STILL `unsafe impl`, and the reason changed rather than went away.
+//
+// The pair used to cover a `*mut PieDriver` — an erased handle the C boundary
+// made unprovable. That pointer is gone, and this did not become derivable: a
+// `Shell` holds the device's own raw handles inline (a `cublasContext`, CUDA
+// events, the arena's `c_void` bases), none of which is `Send` to the
+// compiler, and no amount of taking C out of the CALL changes what a CUDA
+// context is.
+//
+// What makes it sound is unchanged, and it is the driver's rule rather than
+// this seam's: every verb takes `&mut self`, so exactly one thread touches a
+// shell at a time. `create_group` moves each rank's handle to its own init
+// thread and joins before any verb runs, which is the one place the move
+// actually happens.
+unsafe impl Send for CudaDriverHandle {}
+unsafe impl Sync for CudaDriverHandle {}
 
 impl Drop for CudaDriverHandle {
     fn drop(&mut self) {
@@ -258,7 +270,6 @@ impl CudaDriver {
             )
             .collect()
     }
-
 }
 
 impl Driver for CudaDriver {
@@ -268,6 +279,15 @@ impl Driver for CudaDriver {
 
     fn device_domain(&self) -> ::driver_api::DeviceDomain {
         ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE
+    }
+
+    /// The one driver that takes host-generated kernels.
+    ///
+    /// The other three generate their own or need none, and take the trait's
+    /// default. `Remote` takes it too, and deliberately: the far side does
+    /// its own generation, even when the device behind it is a CUDA card.
+    fn codegen_backend(&self) -> Option<&'static str> {
+        Some("cuda")
     }
 
     /// The LEADER's facts.
@@ -329,10 +349,7 @@ impl Driver for CudaDriver {
         self.leader.register_program(plan)
     }
 
-    fn register_channel(
-        &mut self,
-        plan: &ChannelRegistrationPlan,
-    ) -> Result<RegisteredChannel> {
+    fn register_channel(&mut self, plan: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
         self.leader.register_channel(plan)
     }
 
@@ -396,17 +413,4 @@ pub(crate) fn sync_status(status: i32, op: &str) -> Result<()> {
     } else {
         Err(anyhow!("{op} failed with status {status}"))
     }
-}
-
-fn parse_json<T: serde::de::DeserializeOwned>(caps: PieDriverCaps, label: &str) -> Result<T> {
-    if caps.json_bytes.is_null() {
-        return Err(anyhow!("driver returned null {label} payload"));
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(caps.json_bytes, caps.json_len) };
-    serde_json::from_slice(bytes).map_err(|e| anyhow!("driver {label} payload parse: {e}"))
-}
-
-#[allow(dead_code)]
-pub unsafe fn _touch_create_symbol() {
-    let _ = pie_cuda_create;
 }

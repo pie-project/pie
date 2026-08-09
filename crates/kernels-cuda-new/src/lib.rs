@@ -152,6 +152,14 @@ pub mod emit;
 /// kernels. Layer 2, and DATA: a name, not a call. See its header for why
 /// [`KernelSig`] does not change.
 pub mod execution;
+/// FA2's launch arithmetic: `decode.cuh` and `prefill.cuh`'s host prologues.
+///
+/// [`plan`]'s sibling and its opposite half. [`plan`] decides which CTA does
+/// which work; [`fa2`] decides what shape a CTA is, and therefore which
+/// template instantiation has to exist for it. Both are the parts of
+/// FlashInfer that nvcc used to run at build time, once per head_dim, in the
+/// four `attention_flashinfer_hd<N>.cu` translation units.
+pub mod fa2;
 /// The kernel families, each owning the units it compiles.
 ///
 /// One module per family, because a single list of units would be a file
@@ -162,6 +170,16 @@ pub mod plan;
 pub mod source;
 pub mod table;
 pub mod unit;
+/// **kernel-x** — the floor a kernel stands on when it is written as a
+/// program rather than as a row.
+///
+/// `.wiki/kernel-x/northstar.md` §5 steps 1-3. A family that has crossed
+/// lives here whole: its device declarations, its host programs, its
+/// contracts and its binds, in one file beside no table at all. [`table`]
+/// and [`families`] keep the families that have not crossed yet, and the two
+/// worlds meet in exactly two lines — `table::TABLES` takes `x::rope::SIGS`
+/// and `families::ALL` takes `x::rope::UNITS`.
+pub mod x;
 
 #[cfg(feature = "_cuda")]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "cuda-12", feature = "cuda-13"))))]

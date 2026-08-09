@@ -379,13 +379,14 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
 #[must_use]
 pub fn with_host_codegen<'a>(
     plan: &'a ::driver_api::ProgramRegistration,
-    driver_kind: &str,
+    driver_backend: Option<&str>,
 ) -> std::borrow::Cow<'a, ::driver_api::ProgramRegistration> {
-    // A REMOTE driver generates on the far side, so its kind is not a
-    // codegen backend even when the device behind it is a CUDA card. That is
-    // the same answer the `match` this replaced gave (`Self::Remote(_) =>
-    // None`), stated once instead of per verb.
-    let Some(backend) = Backend::parse(driver_kind).map(|_| driver_kind) else {
+    // THE DRIVER'S ANSWER, not one derived from its name. Deriving it from
+    // `Driver::kind()` reads almost right and is wrong for Metal: `"metal"`
+    // parses as a codegen backend, so a Metal driver would be handed
+    // host-generated Metal kernels while its shell still runs its own
+    // emitter — and nothing would say so. See `Driver::codegen_backend`.
+    let Some(backend) = driver_backend.filter(|name| Backend::parse(name).is_some()) else {
         return std::borrow::Cow::Borrowed(plan);
     };
     let registered = lookup(plan.program_hash);
@@ -402,7 +403,7 @@ pub fn with_host_codegen<'a>(
     // contract -- which regions bind, and how the kernel's intrinsic side
     // tables are laid out -- so it only means anything to a driver running
     // those kernels.
-    let region_analysis = if plan.region_analysis.is_empty() && driver_kind == "cuda" {
+    let region_analysis = if plan.region_analysis.is_empty() && backend == "cuda" {
         registered
             .as_ref()
             .map(|program| program.region_analysis())

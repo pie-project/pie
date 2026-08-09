@@ -19,7 +19,7 @@
 //! own code rather than from a generated arm — and a consumer is not a
 //! property of a row.
 //!
-//! # What `driver_internal` actually holds, which is the finding
+//! # What `driver_internal` actually held, which is the finding
 //!
 //! Three rows, not thirty-two. `vision::qwen3vl_scatter`,
 //! `vision::gemma4_vision_encode` and `vision::gemma4_audio_encode`, every one
@@ -31,19 +31,79 @@
 //! against a `vision::device::<kernel>` template, leaf name unchanged from the
 //! `k_*` the towers wrote, so that the split is auditable as the move it is.
 //!
-//! Those three whole-tower rows are UNCHANGED by this migration and stay on
-//! the ahead-of-time path. A `whole = true` row is a C++ function with a
-//! mutex-guarded interpolation cache, a `std::map`, a cuBLAS handle and a
-//! flashinfer plan behind it; none of that is device text and none of it can
-//! be carried into an NVRTC header set. What moved is the device text those
-//! three functions launch.
+//! **NO ROWS NOW, and the citations below outlived all three.**
+//! `vision::gemma4_vision_encode`, `vision::gemma4_audio_encode` and
+//! `vision::qwen3vl_scatter` are all gone from `driver_internal`: their host
+//! walks are Rust, in `driver-cuda/src/tower/gemma4_vision.rs`,
+//! `.../gemma4_audio.rs` and `.../qwen3_vl.rs`, firing the rows below one at a
+//! time through [`crate::runtime::fire`]. That is what this module was FOR —
+//! the rows existed so that a walk could stop being a monolith — and all
+//! three took them up on it. `driver-cuda/csrc/vision/` no longer exists.
 //!
-//! What has since ALSO moved is the three functions themselves, though not
-//! into a row. They were compiled by `kernels-cuda` and are now compiled by
-//! `driver-cuda`, from `crates/driver-cuda/csrc/vision/`; the rows did not
-//! change and neither did the shim entries. The reason is the sentence above
-//! read the other way round: every `.cuh` those three functions include is
-//! in THIS crate's `csrc/src` — the five in `vision/` that the table below
+//! The consequence for the reader: **every `gemma4_vision.cu:NNN`,
+//! `gemma4_audio.cu:NNN` and `qwen3_vl_tower.cu:NNN` citation in this file
+//! names a file that no longer exists.** They are left verbatim rather than
+//! repointed, because a citation's job is to say where a number came from,
+//! and these numbers came from those lines. `git log --follow
+//! crates/driver-cuda/csrc/vision/qwen3_vl_tower.cu` reaches them; the Rust
+//! that replaced each one quotes the same `<<<>>>` at its own call site, which
+//! is where a live reader should look.
+//!
+//! **Four rows were ADDED by that move**, at the end of `GEMMA4_AUDIO`:
+//! `k_conv2d_s2`, `k_chlast`, `k_chfirst` and `k_local_attn`, which
+//! `examples/unit_probe_vision.rs` held as unrowed because no `LaunchRule`
+//! states their grids. That is still true and is now written on the rows as
+//! `LaunchRule::Unstated` rather than as an absence: the owner's principle
+//! puts a tower's composition in Rust, so the grid is computed by the caller
+//! and handed to `KernelModule::fire` — which is how `fire/attn_score.rs` has
+//! fired `attn::attn_score_fold_heads` all along. A row with every operand
+//! sourced and one honestly empty cell is not the half-bound row
+//! `families/rope.rs` warns about.
+//!
+//! **`vision::qwen3vl_scatter` IS GONE TOO, and the paragraph that stood here
+//! is worth quoting because every clause of it was true and its conclusion
+//! was not.** It read:
+//!
+//! > `vision::qwen3vl_scatter` is UNCHANGED by this migration and stays on the
+//! > ahead-of-time path. A `whole = true` row is a C++ function with a
+//! > mutex-guarded interpolation cache, a `std::map`, a cuBLAS handle and a
+//! > flashinfer plan behind it; none of that is device text and none of it can
+//! > be carried into an NVRTC header set. What moved is the device text that
+//! > function launches — and what keeps it C++ is `vis_helpers.cpp:131`'s call
+//! > into `dispatch_attention_flashinfer_prefill_bf16`, not anything about the
+//! > walk.
+//!
+//! The cache was mutex-guarded, the `std::map` was there, the cuBLAS handle
+//! and the flashinfer plan were both real, and no part of any of it could
+//! have been carried into an NVRTC header set. What the paragraph answered is
+//! *"can this C++ go into NVRTC?"*, and the answer to that is still no,
+//! because it is a host program and NVRTC compiles device text. The question
+//! the nvcc ban asks is a different one — *"must this host program be C++?"*
+//! — and its answer is no: **it becomes Rust.** The interpolation cache is a
+//! `Mutex<Res>` holding a `BTreeMap<(i32, i32, i32), Grid>`, the cuBLAS handle
+//! crosses one FFI call per GEMM, and the flashinfer plan is built by
+//! `tower::qwen3_vl::attn`. `qwen3_vl_tower.cu` held **zero `__global__` and
+//! sixteen `<<<>>>`** — it was a host program wearing a `.cu` extension
+//! because `<<<>>>` needs nvcc to parse, and the sixteen launches named nine
+//! kernels that are rows in this file.
+//!
+//! The same paragraph named the one blocker that WAS real —
+//! `vis_helpers.cpp:131`'s call into
+//! `dispatch_attention_flashinfer_prefill_bf16` — and it is still real and
+//! still not this family's. It is now `tower::qwen3_vl::attn`'s single FFI
+//! edge, through the generated
+//! `ffi::pie_k_attn_dispatch_attention_flashinfer_prefill_bf16` binding, and
+//! north star §5 step 8 retires it. A Rust walk that calls one C++ launcher
+//! across the C ABI is a Rust walk; `fire/attn_score.rs` has had that shape
+//! all along.
+//!
+//! What ALSO moved, before all three walks became Rust, is the three
+//! functions themselves. They were compiled by `kernels-cuda`, then by
+//! `driver-cuda` from `crates/driver-cuda/csrc/vision/`, and now by nothing:
+//! that directory is deleted and `driver-cuda/build.rs` runs no nvcc for the
+//! towers. The reason the intermediate step was possible is the sentence
+//! above read the other way round: every `.cuh` those three functions include
+//! is in THIS crate's `csrc/src` — the five in `vision/` that the table below
 //! rows, plus `norm/rmsnorm.cuh`, `norm/elementwise.cuh`, `mlp/swiglu.cuh`
 //! and `ssm/causal_conv1d.cuh` — so the archive was never holding a tower's
 //! device code. It was holding a host walk over device code that had already
@@ -73,11 +133,15 @@
 //! headers are inside this family. Converting them is what unlocks seven of
 //! the twenty-eight rows.
 //!
-//! The genuine C++-calling-C++ calls in these three files are
+//! The genuine C++-calling-C++ calls these three files made were
 //! `gemm::act_x_wt_bf16`, `norm::rmsnorm_bf16`, `norm::rmsnorm_no_scale_bf16`,
 //! `norm::residual_add_bf16`, `mlp::geglu_tanh_bf16`,
 //! `ssm::causal_conv1d_prefill_noact_bf16`, and `qwen3vl_vis_gemm_bf16` /
-//! `qwen3vl_vis_attn` in the adapter `.cpp`. None of them is touched here.
+//! `qwen3vl_vis_attn` in the adapter `.cpp`. None of them is touched here, and
+//! all three callers are Rust now: the two `qwen3vl_vis_*` helpers were
+//! `vis_helpers.cpp` and went with it, the cuBLAS GEMM crossing as
+//! `ffi::pie_k_gemm_act_x_wt_bf16` and the attention as
+//! `tower::qwen3_vl::attn`.
 //!
 //! # Twenty-eight rows of thirty-nine kernels, and why the other eleven are
 //! not
@@ -119,29 +183,49 @@
 //! width is ONE HEAD's 64, `k_rel_pos_enc`'s rows are POSITIONS, and
 //! `k_glu`'s width is its output's where its input is twice that.
 //!
-//! The eleven that remain refused fall into three kinds, and every one is
+//! The eleven that remained refused fell into three kinds, and every one is
 //! recorded on the kernel in its `.cuh` with the `<<<>>>` it was checked
-//! against:
+//! against.
 //!
-//! * **Three independent extents — three kernels.** `k_conv2d_s2`, `k_chlast`
-//!   and `k_chfirst` launch `dim3((F+15)/16, (T+15)/16, C)` at
-//!   `gemma4_audio.cu:186-197` — `Tile16`'s grid with a convolution's channel
-//!   count on `grid.z`. The axis is no longer the blocker; the VALUE is.
+//! **FIVE OF THE ELEVEN ARE ROWS NOW, and the paragraphs below are why they
+//! are `LaunchRule::Unstated` rather than why they are absent.** Every word
+//! of the arithmetic stands — `Dims` still carries two extents, `k_local_attn`
+//! still counts tiles — but "no rule states this grid" and "this cannot be a
+//! row" are different claims and only the first was ever measured. The second
+//! rested on there being no caller that could state a grid itself, and there
+//! is one: `driver-cuda/src/tower/gemma4_audio.rs`, which computes each grid
+//! below and fires through `KernelModule::fire`. §10.5 forbids growing the
+//! vocabulary for one kernel; it does not forbid a row that declines to use
+//! it.
+//!
+//! **The remaining six are DEAD** — nothing launches them, so there is no
+//! `<<<>>>` to check a rule against and no caller to state a grid either.
+//! That is the one refusal this reading does not touch.
+//!
+//! * **Three independent extents — three kernels, NOW ROWED `Unstated`.**
+//!   `k_conv2d_s2`, `k_chlast` and `k_chfirst` launch
+//!   `dim3((F+15)/16, (T+15)/16, C)` at `gemma4_audio.cu:186-197` —
+//!   `Tile16`'s grid with a convolution's channel count on `grid.z`. The axis
+//!   is no longer the blocker; the VALUE is.
 //!   [`crate::runtime::launch::Dims`] carries two extents plus head counts,
 //!   these rectangles are `[C, T, F]`, and the tiled pair are transposes of
 //!   each other — so a rule taking `rows` and `width` off a statement would
 //!   have to be told which of three axes each one is. Spelling `C` as a head
 //!   count is the failure `Dims::kv_heads` is filled from an attention head
 //!   count to guarantee.
-//! * **A block width a rule fixes — one kernel.** `k_split_rope_qkv` launches
-//!   `<<<dim3(NH,N), HEAD/2>>>` (`qwen3_vl_tower.cu:249`) where
-//!   [`kernels::LaunchRule::PerHead`]'s grid matches to the digit and its
-//!   `PAD_BLOCK = 128` does not. `PerRowNarrow` is the precedent for what a
-//!   fix looks like — a rule per block width, one function each — and the
-//!   reason this one has not been asked for is that widening the launch
-//!   QUADRUPLES it at qwen3-vl's 32-wide half-head, where `PerRowNarrow`'s
-//!   sibling would only have halved a fold.
-//! * **A tile count on `grid.x` — one kernel.** `k_local_attn` launches
+//! * **A block width a rule fixes — one kernel, NOW ROWED `Unstated`.**
+//!   `k_split_rope_qkv` launches `<<<dim3(NH,N), HEAD/2>>>`
+//!   (`qwen3_vl_tower.cu:249`) where [`kernels::LaunchRule::PerHead`]'s grid
+//!   matches to the digit and its `PAD_BLOCK = 128` does not. `PerRowNarrow`
+//!   is the precedent for what a RULE fix looks like — a rule per block
+//!   width, one function each — and the reason one has not been asked for is
+//!   that widening the launch QUADRUPLES it at qwen3-vl's 32-wide half-head,
+//!   where `PerRowNarrow`'s sibling would only have halved a fold. The row
+//!   states no rule and the tower's Rust states `[NH, N, 1] x [HEAD/2, 1, 1]`,
+//!   which keeps that decision with the tower's owner where it belongs. It
+//!   was the last kernel `qwen3_vl_tower.cu` fires without a row.
+//! * **A tile count on `grid.x` — one kernel, NOW ROWED `Unstated`.**
+//!   `k_local_attn` launches
 //!   `dim3((N+127)/128, NH)` at 128 (`gemma4_audio.cu:243`). Every ported
 //!   rule's leading axis is a count of THINGS; this one counts tiles, and the
 //!   128 is an occupancy decision about a 1 KiB per-thread local array rather
@@ -229,7 +313,8 @@ pub const GEMMA4_AUDIO: Unit = Unit {
     options: &[],
 };
 
-/// The Qwen3-VL vision encoder's eleven.
+/// The Qwen3-VL vision encoder: six rows of the header's eleven
+/// `__global__`s, the other five being dead. See [`QWEN3_VL_ROWS`].
 pub const QWEN3_VL_TOWER: Unit = Unit {
     name: "vision/qwen3_vl_tower",
     root: include_str!("../../csrc/src/vision/qwen3_vl_tower.cuh"),
@@ -775,11 +860,46 @@ static GEMMA4_AUDIO_ROWS: &[DeviceKernel] = &[
         template_path: "vision::device::k_rel_pos_enc",
         elem: "device::bf16",
     },
+    // THE FOUR THE PROBE HELD, promoted. `examples/unit_probe_vision.rs`
+    // instantiated these under `GEMMA4_AUDIO_UNROWED` because no rule could
+    // state their grids, and a row with no launch was read as a row with no
+    // home. That reading is over: the owner's principle puts every host
+    // composition in Rust, and `driver-cuda/src/tower/gemma4_audio.rs` builds
+    // each grid below by hand and fires through `KernelModule::fire`, the way
+    // `fire/attn_score.rs` has fired `attn_score_fold_heads` all along.
+    //
+    // `LaunchRule::Unstated` is what the row says about that, and it says it
+    // HONESTLY: `families/attn.rs:1446` and `families/rope.rs:1155` are the
+    // precedents. An `Unstated` row is not a half-bound row -- every operand
+    // is sourced, the contract is complete, and the one cell left empty is
+    // the one this crate genuinely cannot fill. The alternative was inventing
+    // a three-extent rule for four kernels, which §10.5 forbids in its own
+    // words.
+    DeviceKernel {
+        sig: &GEMMA4_AUDIO_SIGS[8],
+        template_path: "vision::device::k_conv2d_s2",
+        elem: "device::bf16",
+    },
+    DeviceKernel {
+        sig: &GEMMA4_AUDIO_SIGS[9],
+        template_path: "vision::device::k_chlast",
+        elem: "device::bf16",
+    },
+    DeviceKernel {
+        sig: &GEMMA4_AUDIO_SIGS[10],
+        template_path: "vision::device::k_chfirst",
+        elem: "device::bf16",
+    },
+    DeviceKernel {
+        sig: &GEMMA4_AUDIO_SIGS[11],
+        template_path: "vision::device::k_local_attn",
+        elem: "device::bf16",
+    },
 ];
 
 /// The contracts, in [`GEMMA4_AUDIO_ROWS`]' order.
 #[rustfmt::skip]
-static GEMMA4_AUDIO_SIGS: [KernelSig; 8] = [
+static GEMMA4_AUDIO_SIGS: [KernelSig; 12] = [
     // `Elementwise` -- fired twice with two different rectangles,
     // `k_silu<<<((long)N*IM+255)/256, 256, 0, S>>>` in the feed-forward and
     // `k_silu<<<((long)N*Hd+255)/256, 256, 0, S>>>` after the conv module.
@@ -967,17 +1087,139 @@ static GEMMA4_AUDIO_SIGS: [KernelSig; 8] = [
             p: I32,
             hidden: I32,
         ]),
+    // ── The four whose grid the vocabulary does not state ─────────────────
+    //
+    // `LaunchRule::Unstated`, and the fire is `driver-cuda`'s own
+    // `tower::fire_stated`, which takes the grid, the block and the shared
+    // bytes as arguments and hands them to `KernelModule::fire`. Each call
+    // site quotes the `dim3` it came from, which is what a `because` is for a
+    // row that has no rule to carry one.
+    //
+    // Why not a rule. Three of the four launch
+    // `dim3 g((Fo+15)/16, (To+15)/16, OC)` -- `Tile16`'s rectangle with a
+    // CHANNEL COUNT on `grid.z`. `Dims` has no third spatial extent and
+    // adding one would be a field twelve kernels never read, on a struct
+    // every rule matches over; §10.5's "do not grow the vocabulary for one
+    // kernel" is about exactly this, and it is four here only because they
+    // share one launcher shape. The fourth, `k_local_attn`, puts a TILE COUNT
+    // on `grid.x` where every ported rule puts a count of things, and its 128
+    // is fixed by a 1 KiB `float acc[256]` per thread rather than by a width.
+    //
+    // What the rows DO carry is the whole contract: every operand is sourced,
+    // in the kernel's order, so `Args::bind` still refuses a drifted argument
+    // list. `families/rope.rs`'s warning is about a row whose unbound cells
+    // look like an oversight; these look like what they are.
+    //
+    // `dim3 g((F1+15)/16,(T1+15)/16,C0); k_conv2d_s2<bfd><<<g,B2,0,S>>>` at
+    // `gemma4_audio.cu:183` and `:189`, twice: SSCP layer 0 and layer 1.
+    kernel!(k_conv2d_s2 "vision::k_conv2d_s2_bf16",
+        file = Some("vision/gemma4_audio.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            input: Buf,
+            w: Buf,
+            out: BufMut,
+            ic: I32,
+            t_in: I32,
+            f_in: I32,
+            oc: I32,
+            t_out: I32,
+            f_out: I32,
+        ]),
+    // `dim3 g((F1+15)/16,(T1+15)/16,C0); k_chlast<bfd><<<g,B2,0,S>>>` at
+    // `:185` and `:191` -- channel-first to channel-last, the transpose
+    // `k_chfirst` undoes. Same grid, so a rule taking `rows` and `width` off
+    // a statement would have to be told which of three axes each one is.
+    kernel!(k_chlast "vision::k_chlast_bf16",
+        file = Some("vision/gemma4_audio.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            input: Buf,
+            out: BufMut,
+            oc: I32,
+            t_out: I32,
+            f_out: I32,
+        ]),
+    // `dim3 g((F1+15)/16,(T1+15)/16,C0); k_chfirst<bfd><<<g,B2,0,S>>>` at
+    // `:187` and `:193`.
+    kernel!(k_chfirst "vision::k_chfirst_bf16",
+        file = Some("vision/gemma4_audio.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            input: Buf,
+            out: BufMut,
+            oc: I32,
+            t_out: I32,
+            f_out: I32,
+        ]),
+    // `dim3 g((N+127)/128,NH); k_local_attn<bfd><<<g,128,0,S>>>` at `:246`,
+    // once per conformer layer. The chunked-local self-attention the tower's
+    // header derives from HF's blocked 5-D mask; `gemma4_audio.cuh` holds the
+    // derivation next to the body.
+    kernel!(k_local_attn "vision::k_local_attn_bf16",
+        file = Some("vision/gemma4_audio.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q: Buf,
+            k: Buf,
+            v: Buf,
+            relk: Buf,
+            out: BufMut,
+            n: I32,
+            h: I32,
+            hd: I32,
+            p: I32,
+            cap: F32,
+        ]),
 ];
 
-/// [`QWEN3_VL_TOWER`]'s instantiations — five of its eleven.
+/// [`QWEN3_VL_TOWER`]'s instantiations — six of its eleven.
 ///
-/// Five of the six refusals are DEAD kernels, which is the largest single
-/// finding of this migration: `k_split_rope_qkv` fused `k_split_qkv_bias` and
-/// `k_rope_qk` into one pass and both survivors were left behind, those two
-/// have un-fused ancestors that were left behind before them, and
-/// `k_add_inplace` is `k_add` under another name. The sixth is
-/// `k_split_rope_qkv` itself — the closest call in the family, and the one
-/// refusal here that is still about geometry. See `qwen3_vl_tower.cuh`.
+/// **All five remaining refusals are DEAD kernels**, which is the largest
+/// single finding of this migration: `k_split_rope_qkv` fused
+/// `k_split_qkv_bias` and `k_rope_qk` into one pass and both survivors were
+/// left behind, those two have un-fused ancestors that were left behind
+/// before them, and `k_add_inplace` is `k_add` under another name. Nothing
+/// fires any of them and no row should exist for a kernel with no launch.
+///
+/// # The sixth row, and the premise that changed
+///
+/// `k_split_rope_qkv` was the sixth refusal and the only one that was ever
+/// about geometry rather than deadness. `qwen3_vl_tower.cuh` set it out: the
+/// launch is `<<<dim3(NH, N), HEAD/2, 0, S>>>`, whose GRID is exactly
+/// `Rule::PerHead`'s `[heads, rows, 1]` but whose BLOCK is `HEAD/2` — 32 for
+/// qwen3-vl's `head_dim = 64` — against `per_head`'s fixed `PAD_BLOCK = 128`.
+/// Rule 3 requires the evaluated launch and the `<<<>>>` to AGREE, so no rule
+/// in the vocabulary states it, and §10.5 forbids adding one for a single
+/// kernel.
+///
+/// Every word of that is still true. What changed is what it IMPLIES. The
+/// refusal was written when a row's only consumer was the AOT dispatcher,
+/// which can fire nothing it cannot evaluate a rule for — so "no rule" meant
+/// "no row". It is now the driver's Rust that composes a tower, and a driver
+/// states its own geometry: `LaunchRule::Unstated` with the `<<<>>>` quoted
+/// on the row is a complete and honest row, the same standing
+/// `attn::attn_score_fold_heads` has had since its own launcher became
+/// `fire::attn_score`'s. `families::attn`'s `ATTN_SCORE_POST` is three more.
+///
+/// So the row below is `Unstated`, and the block width stays `HEAD/2`
+/// because widening it to 128 would be a performance decision taken on the
+/// tower owner's behalf — 96 idle lanes over a 32-wide half, correct and
+/// four times the launch. A migration does not get to make that call
+/// silently, and now it does not have to: the Rust launches what the C++
+/// launched.
+///
+/// # What this unblocks
+///
+/// It was the last unrowed kernel `qwen3_vl_tower.cu` fires. The other eight
+/// distinct `__global__`s behind its sixteen `<<<>>>` — `k_bias`,
+/// `k_gelu_erf`, `k_gelu_tanh`, `k_layernorm`, `k_merge_gather`, `k_add_pe`,
+/// `k_gelu_bias`, `k_f32_to_bf16` — are rows already, here and in
+/// [`VISION_COMMON_ROWS`]. **The tower's device text is complete under
+/// NVRTC**, and what remains between it and a Rust walk is host work, not
+/// device text: see `new-horizon.md` §54.3, which sets out the tower's walk,
+/// its intermediate buffers, its three host decisions and the one thing that
+/// turned out not to be missing from the vocabulary after all.
 static QWEN3_VL_ROWS: &[DeviceKernel] = &[
     DeviceKernel {
         sig: &QWEN3_VL_SIGS[0],
@@ -1004,11 +1246,16 @@ static QWEN3_VL_ROWS: &[DeviceKernel] = &[
         template_path: "vision::device::k_merge_gather",
         elem: "device::bf16",
     },
+    DeviceKernel {
+        sig: &QWEN3_VL_SIGS[5],
+        template_path: "vision::device::k_split_rope_qkv",
+        elem: "device::bf16",
+    },
 ];
 
 /// The contracts, in [`QWEN3_VL_ROWS`]' order.
 #[rustfmt::skip]
-static QWEN3_VL_SIGS: [KernelSig; 5] = [
+static QWEN3_VL_SIGS: [KernelSig; 6] = [
     // `Elementwise` -- `k_bias<<<((long)M*O+255)/256, 256, 0, S>>>` at all
     // three call sites (`gemm_bias`'s epilogue, o_proj's, fc2's), and
     // `elementwise` evaluates `rows * width` to the same `ceil(M*O/256)`
@@ -1104,5 +1351,43 @@ static QWEN3_VL_SIGS: [KernelSig; 5] = [
             n_token: I32,
             u: I32,
             c: I32,
+        ]),
+
+    // `driver-cuda/csrc/vision/qwen3_vl_tower.cu:249`:
+    //
+    //     vd::k_split_rope_qkv<bfd><<<dim3(NH,N),HEAD/2,0,S>>>(
+    //         D(qkv),D(L.qkv.b),D(q),D(k),D(v),rope_pos,N,NH,HEAD,THETA);
+    //
+    // `LaunchRule::Unstated` and the reason is on `QWEN3_VL_ROWS` at length:
+    // the grid is `PerHead`'s and the block is not, so no rule states it and
+    // the driver's walk states it instead -- `grid = [NH, N, 1]`,
+    // `block = [HEAD/2, 1, 1]`, `smem = 0`, transcribed from the line above.
+    // `HEAD/2` and not `PAD_BLOCK`: the loop is
+    // `for (j = threadIdx.x; j < half; j += blockDim.x)`, so 128 threads
+    // would be correct and four times the launch, and choosing that is the
+    // tower owner's call and not a migration's.
+    //
+    // `b` may be null -- the kernel tests `b ? ... : nullptr` three times and
+    // adds nothing when it is -- which is a fact the row must carry, because
+    // a null a launcher MEANS is not something a C++ signature can state.
+    //
+    // The bias is read at THREE offsets off one pointer (`b`, `b + H`,
+    // `b + 2H` for the q, k and v sections of the fused row), so it is one
+    // operand and not three: the kernel does the sectioning, and a row that
+    // split it would describe a kernel that does not exist.
+    kernel!(k_split_rope_qkv "vision::k_split_rope_qkv_bf16",
+        file = Some("vision/qwen3_vl_tower.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            qkv: Buf,
+            b: Buf | null,
+            q: BufMut,
+            k: BufMut,
+            v: BufMut,
+            pos: F32s,
+            n: I32,
+            nh: I32,
+            head: I32,
+            theta: F32,
         ]),
 ];

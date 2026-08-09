@@ -227,71 +227,21 @@ impl Driver for VulkanDriver {
                 .hold(&name, &bytes)
                 .map_err(|e| anyhow!("driver-vulkan: `{name}` would not stage: {e:?}"))?;
         }
-        let shape = shell.shape();
-        self.shell = Some(shell);
-        Ok(::driver_api::DriverCapabilities {
-            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
-            total_pages: shape.pages,
-            kv_page_size: shape.page_size,
-            // No swap pool and no recurrent-state cache: this driver has
-            // neither, and `copy_state` refuses by name for the same reason.
-            swap_pool_size: 0,
-            // Device to device, and only that. `Pool::copy_plan` moves whole
-            // pages inside the one KV buffer -- which is what a prefix-cache
-            // hit is -- and refuses any plan whose ends are not both
-            // `PIE_MEMORY_DOMAIN_VULKAN_DEVICE`.
-            //
-            // Advertising it is new, and it only became true once the
-            // scheduler stopped stamping `PIE_MEMORY_DOMAIN_CUDA_DEVICE` on
-            // every plan regardless of backend. Host directions stay off:
-            // there is no swap pool here, so `swap_pool_size` is 0 and a
-            // device-to-host copy has nowhere to land.
-            kv_copy_domain_mask: ::driver_api::KV_COPY_DEVICE_TO_DEVICE,
-            rs_cache_required: false,
-            rs_cache_slots: 0,
-            rs_cache_slot_bytes: 0,
-            // Not elastic. `resize_pool` here restages the whole KV buffer --
-            // `Pool::resize` -- so nothing can be given back page-wise, and
-            // both numbers are zero together, which is the condition
-            // `bootstrap` reads before it starts a trim task at all.
-            elastic_page_bytes: 0,
-            elastic_budget_pages: 0,
-            has_mtp_logits: false,
-            has_mtp_drafts: false,
-            has_value_head: false,
-            // Sinks this backend cannot honour. Every one of them would bind
-            // and then run as a silent no-op, which is worse than a refusal
-            // at the door.
-            has_kv_envelopes: false,
-            has_attn_score: false,
-            has_attn_page_mask: false,
-            has_lora: false,
-            model_site_summary: ::driver_api::ModelSiteSummary::default(),
-            device_geometry_port_mask: ::driver_api::PIE_DECODE_ENVELOPE_PORTS,
-            // The ceilings a batch is formed under, and they are the arena's:
-            // `Shell::open` sizes one fire's scratch, and a fire wider than
-            // this has nothing to run in.
-            max_forward_tokens: 4096,
-            max_forward_requests: 256,
-            max_page_refs: shape.pages,
+        let facts = ::driver_api::ModelFacts {
             // The row's answers, not a config's: the checkpoint was
-            // identified once and these come from that identification.
+            // identified once, above, and these come from that
+            // identification. They are the ONLY half of the capabilities this
+            // side still authors -- the driver states the rest about itself.
             arch_name: deployment.advertised.arch.to_string(),
             model_id: row.id().to_string(),
             vocab_size: deployment.shape.vocab,
             max_model_len: deployment.advertised.max_model_len,
-            activation_dtype: "bf16".to_string(),
             hidden_size: deployment.shape.hidden,
-            // False about the BACKEND rather than about the row: there is no
-            // encode entry point here at all, so a model with a vision tower
-            // is served as its text half. `Shell::encode` refuses by name.
-            supports_media_encode: false,
             snapshot_dir: path.display().to_string(),
-            kv_handle: None,
-            // The modules are read from disk already built; nothing upstream
-            // generates a kernel for this driver.
-            codegen_backend: String::new(),
-        })
+        };
+        let capabilities = shell.capabilities(&facts);
+        self.shell = Some(shell);
+        Ok(capabilities)
     }
 
     /// Register a PTIR program: its launch package and its emitted kernels.
@@ -572,22 +522,24 @@ struct Boot {
 ///
 /// No module directory, from either the file or the environment.
 fn boot_of(config_bytes: &[u8]) -> Result<Boot> {
-    // The boot TOML is the ENGINE's format, read here for the same reason
-    // the Metal seam reads it here: a driver that parsed it would be the
-    // second thing entitled to an opinion about the file's shape.
-    let boot = std::str::from_utf8(config_bytes)
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok());
+    // ONE READER of the document, in `crate::driver::boot`. What stays here
+    // is what is VULKAN's: the environment fallback (the variable names this
+    // backend in its own spelling) and the refusal when neither answers.
+    // `BootConfig` states what the operator wrote; what a missing key means
+    // is a question about this device.
+    let boot = crate::driver::BootConfig::parse(config_bytes);
     // The directory `kernels-vulkan`'s build script wrote, which reaches
     // this crate only if it is asked for. It is NOT a dependency of this
     // one: the engine linking a shader compiler to run a driver would be
     // the build-time equivalent of loading a checkpoint format, and a
     // driver consumes modules rather than producing them.
     let module_dir = boot
-        .as_ref()
-        .and_then(|v| Some(v.get("model")?.get("kernels")?.as_str()?.to_string()))
-        .or_else(|| std::env::var("PIE_KERNELS_VULKAN_SPV_DIR").ok())
-        .map(std::path::PathBuf::from)
+        .kernels
+        .or_else(|| {
+            std::env::var("PIE_KERNELS_VULKAN_SPV_DIR")
+                .ok()
+                .map(std::path::PathBuf::from)
+        })
         .ok_or_else(|| {
             anyhow!(
                 "driver-vulkan: no SPIR-V module directory. Set `[model] kernels` in the \
@@ -595,14 +547,9 @@ fn boot_of(config_bytes: &[u8]) -> Result<Boot> {
                  `kernels-vulkan` built."
             )
         })?;
-    let kv_pages = boot
-        .as_ref()
-        .and_then(|v| v.get("model")?.get("kv_pages")?.as_integer())
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(DEFAULT_KV_PAGES);
     Ok(Boot {
         module_dir,
-        kv_pages,
+        kv_pages: boot.kv_pages.unwrap_or(DEFAULT_KV_PAGES),
     })
 }
 

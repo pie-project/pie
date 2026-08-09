@@ -1304,8 +1304,8 @@ impl DriverLane {
                     // the driver layer, which had to reach into
                     // `crate::pipeline` to do it -- against its own header.
                     Some(driver) => {
-                        let kind = driver.kind();
-                        let plan = crate::pipeline::program::with_host_codegen(&plan, kind);
+                        let backend = driver.codegen_backend();
+                        let plan = crate::pipeline::program::with_host_codegen(&plan, backend);
                         driver.register_program(&plan)
                     }
                     None => Err(anyhow!("driver has no backend installed")),
@@ -1497,8 +1497,8 @@ impl DriverLane {
                 }
                 let program_registered = program.is_some();
                 if let Some(plan) = &program {
-                    let kind = driver.kind();
-                    let plan = &crate::pipeline::program::with_host_codegen(plan, kind);
+                    let backend = driver.codegen_backend();
+                    let plan = &crate::pipeline::program::with_host_codegen(plan, backend);
                     match driver.register_program(plan) {
                         Ok(program_id) => bind.program_id = program_id,
                         Err(error) => {

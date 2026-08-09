@@ -78,14 +78,23 @@
 //! and a pinned device ABI behind it, not something a refactor gets to decide
 //! on the way past.
 //!
-//! It was decided, and the answer was neither: the shims in `csrc/src` are
+//! It was decided, and the answer was neither: the shims in `csrc/shim` are
 //! written against the instructions rather than copied out of the toolkit,
 //! and they wear NVIDIA's filenames only where the includer is upstream
 //! source we do not own (`new-horizon.md` §13.4). They are entries in
 //! [`DEVICE_HEADERS`] like any other file in the tree, because the mechanism
 //! never cared which headers it carried — which is the argument for having
 //! built the set before the decision rather than after it.
-//! # Names are relative to `csrc/src`
+//!
+//! They sat at the root of `csrc/src` until `csrc/` was re-cut by role, with
+//! the six that arrived by vendoring — `cstdint`, `type_traits`, `bit`,
+//! `cuda.h`, `cuda_runtime.h`, `boost/math/ccmath/fabs.hpp` — under
+//! `csrc/vendor` doing the identical job from the other directory. The
+//! fourteen are one thing and now sit in one place, [`SHIM`] — eight of
+//! ours and six of theirs. Not one name changed, because for these files the
+//! name IS the contract.
+//!
+//! # Names are relative to the tree the file sits in
 //!
 //! One spelling, two resolvers — and the second resolver is not the first
 //! one's synonym. `#include "pie_device.cuh"` is what NVRTC matches against
@@ -96,15 +105,54 @@
 //! so a row, a `#include` and an entry here cannot drift into three spellings
 //! of one file.
 //!
+//! `csrc/shim` is a second `-iquote` beside it and must be, and the traffic
+//! crosses in BOTH directions. Outward: two files in `csrc/src` reach the
+//! shims by QUOTED include — `pie_fp8.cuh` says `#include "cuda_fp16.h"` and
+//! `#include "cuda_fp8.h"`, `pie_half2.cuh` says the first. Inward:
+//! `shim/cuda_fp16.h` and `shim/cuda_bf16.h` both open with
+//! `#include "pie_device.cuh"`, which is back in `csrc/src`. Three directives
+//! out, two in; every one of them used to resolve beside the includer.
+//!
+//! Costs nothing to get right and is silent to get wrong — in the outward
+//! direction. With the shim moved and no `-iquote` naming its new home, a
+//! quoted `"cuda_fp16.h"` falls through to the real toolkit header and
+//! `__half` stops being `device::f16` — the exact 17,744-vs-15,088-byte
+//! divergence measured below, and no diagnostic. The inward direction is the
+//! kind one: there is no `pie_device.cuh` anywhere else, so a missing
+//! `csrc/src` fails to resolve and says so. Three call sites pass both, and
+//! they are the three places nvcc sees this tree at all:
+//! `kernels-cuda/csrc/CMakeLists.txt`'s `target_compile_options` for
+//! `pie_kernels_cuda`, `driver-cuda/build.rs`'s `cc::Build` target
+//! (`pie_attn_flashinfer`), and `tests/device_typecheck_types.rs`'s
+//! `compile`. It was four until `driver-cuda/csrc/vision/` was deleted and
+//! `pie_vision_towers` with it: the three multimodal towers are Rust now, so
+//! nvcc never sees this tree on their account.
+//!
+//! One shim-to-shim edge stays where it was: `shim/cuda_bf16.h` says
+//! `#include "cuda_fp16.h"` and both are now in `shim/`, so it resolves
+//! beside the includer with no flag at all. That is the whole reason `shim/`
+//! was the first role to move — the group is nearly closed under its own
+//! includes, and NVRTC, which has no `-iquote` and matches the literal name,
+//! cannot tell the move happened.
+//!
 //! ## `-iquote`, and NOT `-I`, and the difference is silent
 //!
 //! An earlier version of this section said `-I`. It is wrong, and not as a
 //! spelling: `-I` is the ANGLE-BRACKET search path, and the section above
-//! just finished explaining that this tree holds five shims wearing NVIDIA's
-//! filenames — `cuda_fp16.h`, `cuda_bf16.h`, `cuda_fp8.h`, `cuda_fp4.h`,
-//! `cooperative_groups.h`. Putting that directory on the angled path puts the
-//! impersonation ahead of the real toolkit header UNDER NVCC, where the real
-//! one exists and `__half` is not `device::f16`.
+//! just finished explaining that this tree holds fourteen shims wearing
+//! NVIDIA's and the standard library's filenames — `cuda_fp16.h`,
+//! `cuda_bf16.h`, `cuda_fp8.h`, `cuda_fp4.h`, `cooperative_groups.h`,
+//! `cstdint`, `type_traits`, `bit`, `cuda.h`, `cuda_runtime.h`,
+//! `boost/math/ccmath/fabs.hpp`, `cuda/{cmath,pipeline,std/limits}`. Putting
+//! that directory on the angled path puts the impersonation ahead of the real
+//! toolkit header UNDER NVCC,
+//! where the real one exists and `__half` is not `device::f16`.
+//!
+//! Since the role cut this is narrower than it was, and deliberately: the
+//! shims are no longer AT the root of a directory anybody has a reason to
+//! `-I`. `-I …/csrc/src` reaches every kernel header and not one shim.
+//! Reaching them wrongly now takes an `-I …/csrc/shim`, which is a line
+//! somebody has to write on purpose.
 //!
 //! Measured here rather than reasoned about. One TU including
 //! `pie_device.cuh` and `quant/dequant_wna16.cuh` — whose
@@ -169,26 +217,27 @@ pub struct Header {
 /// not open source file"* on a machine with a GPU, at the first fire of
 /// whatever unit needed it.
 ///
-/// [`LIBRARY`] is `csrc/src`: every kernel header this crate compiles, the
-/// prelude they are written over, and the shims that replace NVIDIA's device
-/// headers and close the CCCL door. [`VENDOR`] is `csrc/vendor`: the patched
-/// FlashInfer closure, which is 1.7 MB and goes only to the units that ask
-/// for it.
+/// [`LIBRARY`] is `csrc/src`: every kernel header this crate compiles and the
+/// prelude they are written over. [`SHIM`] is `csrc/shim`: the headers that
+/// wear NVIDIA's and the standard library's filenames, because the source
+/// that reaches for those names is source we do not own. [`VENDOR`] is
+/// `csrc/vendor`: the patched FlashInfer closure, which is 1.7 MB and goes
+/// only to the units that ask for it.
 mod carried {
     include!(concat!(env!("OUT_DIR"), "/carried.rs"));
 }
 
-pub use carried::{LIBRARY, VENDOR};
+pub use carried::{LIBRARY, SHIM, VENDOR};
 
 /// What every compile in this crate resolves an `#include` against, unless the
 /// unit says otherwise.
 ///
-/// [`LIBRARY`], and nothing else. Not [`VENDOR`]: NVRTC copies every byte of
-/// every header it is handed, and a `norm` kernel has no business paying for
-/// an attention library. A unit that needs it says so — with
-/// [`crate::unit::Headers::LibraryAndVendor`], which is the field that used to
-/// be missing and the reason `tests/flashinfer_decode.rs` had to reach past
-/// `nvrtc::compile` to compile a vendored unit at all.
+/// [`SHIM`] and [`LIBRARY`], and nothing else. Not [`VENDOR`]: NVRTC copies
+/// every byte of every header it is handed, and a `norm` kernel has no
+/// business paying for an attention library. A unit that needs it says so —
+/// with [`crate::unit::Headers::LibraryAndVendor`], which is the field that
+/// used to be missing and the reason `tests/flashinfer_decode.rs` had to
+/// reach past `nvrtc::compile` to compile a vendored unit at all.
 ///
 /// This was a concatenation of two walks — `SHIMS` for `csrc/src` and
 /// `LIBRARY` for the sibling tree's `*.cuh` — until the `.cuh` files moved
@@ -199,7 +248,20 @@ pub use carried::{LIBRARY, VENDOR};
 /// `.cu`: a kernel header that includes a sibling is the normal case, not the
 /// exception, and a hand-list is a set that is correct until someone forgets.
 /// The generator walks the directory, so the set is the directory.
-pub const DEVICE_HEADERS: &[Header] = LIBRARY;
+///
+/// It is two walks again, and the second is `SHIM` — but the seam is now
+/// where the ROLE changes rather than where the authorship does. Eight
+/// impersonating headers used to sit under `csrc/src` and six more under
+/// `csrc/vendor`, doing one job from two directories, and the only thing the
+/// split recorded was which of the two reasons a name had to be answered:
+/// ours asked for it, or upstream's did. The SET is unchanged, file for file
+/// and byte for byte; what changed is that a directory now answers *what is
+/// this text for* instead of *who wrote it*.
+const SHIMMED: [Header; SHIM.len() + LIBRARY.len()] =
+    join::<{ SHIM.len() + LIBRARY.len() }>(SHIM, LIBRARY);
+
+/// See [`SHIMMED`].
+pub const DEVICE_HEADERS: &[Header] = &SHIMMED;
 
 /// [`DEVICE_HEADERS`] plus [`VENDOR`] — what a unit compiling vendored source
 /// resolves against.
@@ -209,7 +271,8 @@ pub const DEVICE_HEADERS: &[Header] = LIBRARY;
 /// one — `Unit::cache_key`, `as_nvrtc_arrays`, the tests — and neither
 /// `concat` nor iterator chaining is const. [`crate::table`] builds `KERNELS`
 /// the same way for the same reason.
-pub const ALL_HEADERS: &[Header] = &join::<{ LIBRARY.len() + VENDOR.len() }>(LIBRARY, VENDOR);
+pub const ALL_HEADERS: &[Header] =
+    &join::<{ SHIM.len() + LIBRARY.len() + VENDOR.len() }>(&SHIMMED, VENDOR);
 
 /// `[T] ++ [U] -> [T; N]` at compile time.
 ///
@@ -477,7 +540,7 @@ mod tests {
     fn a_units_header_choice_decides_what_resolves() {
         let vendored = VENDOR
             .iter()
-            .find(|v| !LIBRARY.iter().any(|l| l.name == v.name))
+            .find(|v| !Headers::Library.set().iter().any(|l| l.name == v.name))
             .expect("the vendored closure carries a header the library does not");
         let root = format!("#include \"{}\"\n", vendored.name);
 
@@ -540,9 +603,19 @@ mod tests {
     /// So the rule checked is every include of DEVICE text. A missing `.cuh`
     /// is still a failure here, which is the case that costs a compile on a
     /// machine with a GPU.
+    ///
+    /// # Why [`DEVICE_HEADERS`] and not [`LIBRARY`]
+    ///
+    /// The role cut split one tree into two, and the includes cross the seam
+    /// in both directions: `csrc/src/pie_fp8.cuh` reaches
+    /// `shim/cuda_fp16.h`, and `shim/cuda_fp16.h` reaches back for
+    /// `csrc/src/pie_device.cuh`. Walking [`LIBRARY`] alone would check the
+    /// first direction and stop checking the second on the day the second
+    /// became possible — a test that got quieter because the tree got more
+    /// structure. Both groups are authored here, so both are held to it.
     #[test]
     fn every_device_include_resolves() {
-        for header in LIBRARY {
+        for header in DEVICE_HEADERS {
             for included in quoted_includes(header.text) {
                 if included.ends_with(".hpp") || included.ends_with(".def") {
                     continue;

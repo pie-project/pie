@@ -1,0 +1,5 @@
+hash_route_lookup
+hash_route_lookup_kernel
+sqrtsoftplus
+topk_sqrtsoftplus_bf16
+topk_sqrtsoftplus_kernel

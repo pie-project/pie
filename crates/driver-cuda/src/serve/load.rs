@@ -11,7 +11,6 @@ use crate::fire::scratch::Scratch;
 use driver_api::CompletionBroker;
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED, PIE_STATUS_INVALID_ARGUMENT,
-    PIE_STATUS_UNSUPPORTED,
 };
 
 /// Stand the shell up.
@@ -146,8 +145,16 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
         );
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
+    let facts: driver_api::DeviceFacts = match serde_json::from_str(CAPS_JSON) {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("[driver-cuda] create: device facts JSON: {error}");
+            return Err(PIE_STATUS_DRIVER_ERROR);
+        }
+    };
     Ok(Shell {
         caps: CAPS_JSON.as_bytes().to_vec(),
+        facts,
         boot_config,
         boot_model_id,
         runahead,
@@ -1044,9 +1051,9 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // encode arms refuse a deployment with no `gemma_vision` /
         // `gemma_audio`, so answering true without one would advertise a
         // call that is guaranteed to fail. Qwen3-VL is deliberately NOT
-        // here — its tower row (`vision::qwen3vl_scatter`) writes into
-        // the fire's hidden rows rather than handing host rows back, so
-        // it is an in-fire path and not an encode one.
+        // here — its tower (`tower::qwen3_vl::scatter`) writes into the
+        // fire's hidden rows rather than handing host rows back, so it is
+        // an in-fire path and not an encode one.
         supports_media_encode: deployment.advertised.media_encode,
         kv_handle: None,
         // This driver compiles its own PTIR through NVRTC; nothing upstream

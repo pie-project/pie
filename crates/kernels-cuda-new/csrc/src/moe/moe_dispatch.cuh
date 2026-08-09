@@ -1,12 +1,20 @@
 //===-- moe_dispatch.cuh - the sparse-MoE dispatch kernels ----------------===//
 //
-// Twenty-two `__global__`s' worth of device text, as templates. No launcher:
-// `moe_dispatch.cu` includes this file and keeps every `<<<>>>`, so each
-// kernel has exactly ONE definition that nvcc and NVRTC both read. This is
+// Twenty-two `__global__`s' worth of device text, as templates. No launcher,
+// and now no second compiler either: `moe_dispatch.cu` used to include this
+// file and keep every `<<<>>>`, so each kernel had exactly ONE definition
+// that nvcc and NVRTC both read. That `.cu` is DELETED and all eight of its
+// launchers are `driver-cuda/src/fire/moe_dispatch.rs`, so NVRTC is the only
+// reader left and the two halves can no longer disagree. This is
 // the largest file in the family and the one the split matters most for —
 // twenty-two kernels copied instead of moved is twenty-two chances for the
 // archive and the JIT to disagree, each of them right for whichever half its
 // test exercises.
+//
+// Eight of the twenty-two are fired by name from that Rust, and every one of
+// those names carries a `_dev` suffix in `families::moe` — see the mapping
+// block there. `execution`'s `a_walk_is_only_a_walk` is why: the ABI symbol a
+// model trace records is walked, and a walked symbol may not be unit-hosted.
 //
 // # What this file is for
 //
@@ -624,13 +632,13 @@ __global__ void moe_decode_wmma_by_route(
 /// for Qwen3.6's gate/up shape (routes=8, N=1024, K=2048).
 ///
 /// `kUnroll` hoists several loads above the math that consumes them, as
-/// gemv.cu's row-per-warp kernel does. MEASURED AND NOT WORTH IT HERE, which
+/// gemv.cuh's row-per-warp kernel does. MEASURED AND NOT WORTH IT HERE, which
 /// is why the entry points below fix it at 1 (identical code to before it was
 /// templated).
 ///
 /// The reasoning that motivated it was sound and still wrong: with no unroll
-/// each lane keeps one load in flight, the condition gemv.cu records as having
-/// cost it ~963 GB/s. But this kernel does not have that problem -- it already
+/// each lane keeps one load in flight, the condition gemv.cuh records as
+/// having cost it ~963 GB/s. But this kernel does not have that problem -- it already
 /// runs near roofline. Swept at gemma-4-26B-A4B's real shapes (from its config
 /// and cross-checked against its decode trace, 60 calls/step at 11.50 us):
 ///

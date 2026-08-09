@@ -192,21 +192,47 @@ fn the_selection_agrees_with_rmsnorm_vec8_ok() {
 /// machine with no GPU rather than in a model that answers fluently and
 /// slightly wrong.
 ///
-/// It reads the `.cu` through [`include_str!`], so the pin is against the
-/// source in the tree rather than against a copy that could drift on its own.
+/// It reads the host program through [`include_str!`], so the pin is against
+/// the source in the tree rather than against a copy that could drift on its
+/// own.
 ///
-/// **The path crosses crates on purpose.** The dependency inversion moved the
-/// device headers to `kernels-cuda-new/csrc/src/norm/rmsnorm.cuh` — the JIT
-/// compiles those — and left the host launchers in `kernels-cuda/csrc`, which
-/// is where `rmsnorm_vec8_ok` lives, because a host `if` is exactly the thing
-/// the JIT does not need. If this `include_str!` ever fails to resolve, the
-/// launcher has moved too, and the right response is to follow it rather than
-/// to drop the pin: without it the transliteration below is unwitnessed.
+/// **`norm/rmsnorm.cu` IS DELETED** (`58b31cf1b`), and this `include_str!`
+/// follows it, which is what the sentence that used to stand here required:
+/// *"If this `include_str!` ever fails to resolve, the launcher has moved
+/// too, and the right response is to follow it rather than to drop the pin:
+/// without it the transliteration below is unwitnessed."* The dependency
+/// inversion had already moved the device headers to
+/// `kernels-cuda-new/csrc/src/norm/rmsnorm.cuh`; `kernels-cuda/csrc/CMakeLists.txt`
+/// records where the host half went — *"`driver-cuda/src/fire/rmsnorm.rs` is
+/// the host program"* — because a host `if` is exactly the thing the JIT does
+/// not need, and it had to change languages rather than tables.
+///
+/// # THE PREDICATE THIS PINS NO LONGER EXISTS AS C++, AND THAT IS A FINDING
+///
+/// `fire/rmsnorm.rs` did not carry `rmsnorm_vec8_ok` across as text. It
+/// TRANSLITERATED it, into `fn vec8_ok` at `:65-79`, and cites the original
+/// in prose at `:54` (`` `rmsnorm.cu:26` — `rmsnorm_vec8_ok` ``). The six
+/// clauses are all there and all in the C++'s own order — the module says so
+/// deliberately, *"The order is the C++'s own so the two read as one list"* —
+/// but they are spelled `aligned16(x)` where the C++ spelled a `reinterpret_cast`
+/// lambda, so `PINNED` below is not a substring of anything in this tree and
+/// `CU.find` fails.
+///
+/// **So this test panics, and the panic is the finding.** What it proved was
+/// that a hand transliteration in `families::norm::RMSNORM_STRIDED_VEC8` and
+/// a hand transliteration in this file's `rmsnorm_vec8_ok` oracle were both
+/// checked against ONE ORIGINAL. There are now three transliterations and no
+/// original. That is a real loss of a witness, it is not repaired by pointing
+/// `PINNED` at the Rust — which would be checking two transliterations
+/// against each other — and re-deriving what should replace it is a decision
+/// about the oracle, not about the include path.
 #[test]
 fn the_cpp_predicate_is_the_one_this_file_was_written_from() {
-    const CU: &str = include_str!("../../kernels-cuda/csrc/src/norm/rmsnorm.cu");
+    const CU: &str = include_str!("../../driver-cuda/src/fire/rmsnorm.rs");
 
-    let start = CU.find("inline bool rmsnorm_vec8_ok").expect("`rmsnorm_vec8_ok` is in rmsnorm.cu");
+    let start = CU
+        .find("inline bool rmsnorm_vec8_ok")
+        .expect("`rmsnorm_vec8_ok` is in driver-cuda/src/fire/rmsnorm.rs");
     let body = &CU[start..];
     let end = body.find("\n}\n").expect("the predicate has an end") + 3;
     let normalised: String = body[..end].split_whitespace().collect::<Vec<_>>().join(" ");

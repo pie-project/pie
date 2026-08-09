@@ -34,8 +34,18 @@
 //  3. `Ty::I64` binds, through its own `ArgValue` kept distinct from `Usize`
 //     because a signed stride and an unsigned size are not the same claim.
 //
-// Five of the fourteen are rows now — `families::ssm::GATED_DELTA_NET`. The
-// other nine are refused on their own facts and not on the vocabulary's:
+// THIRTEEN of the fourteen are rows now — `families::ssm::GATED_DELTA_NET`.
+// Five were rows when the paragraph below was written and eight arrived with
+// §57, which is the section that also deleted the launchers: the refusals
+// the paragraph records were all refusals of a LAUNCH RULE, and
+// `LaunchRule::Unstated` plus a driver-owned `kernels::Launch` in
+// `driver-cuda/src/fire/gated_delta_net.rs` is exactly the answer to "no
+// rule states this". Read the next paragraph as the history of what each
+// row had to route AROUND, not as a list of what is still missing. The one
+// kernel with no row is the `_fused` pair's, and that is not a vocabulary
+// refusal either: `qwen_gdn_fused_step_enabled()` was `constexpr false`, so
+// no launcher in either archive ever launched it.
+//
 // `recurrent_step_batched_gqa_smem` is reached on a SHAPE the fire states
 // (`V_d == 128 && K_d == 128`), which `Term` cannot spell until §26.10(b)'s
 // `Term::IntIs` lands and which selects an arm that has no row and no
@@ -140,6 +150,32 @@ using ::pie_cuda_driver::kernels::device::usize;
 /// keeps compiling: an alias declares no new type.
 using f32 = float;
 using state_bf16 = __nv_bfloat16;
+
+/// `recurrent_step_batched_gqa_smem`'s ONE `BV`, spellable for the same
+/// reason the two aliases above are.
+///
+/// That kernel is `template <int BV>` — a single NON-TYPE parameter — and
+/// `elem` is the whole argument list with `::pie_cuda_driver::kernels::`
+/// glued to its FIRST token. A row spelling `elem: "128"` emits
+/// `recurrent_step_batched_gqa_smem<::pie_cuda_driver::kernels::128>`, which
+/// is not a C++ token sequence at all; the prefix reaches the first argument
+/// and there is no second one to hide behind. `chunk_gated_delta_prefill_
+/// batched_fla<StateT, BV, BK_MAX>` escapes this only because its first
+/// argument is a type — `"ssm::device::f32, 128, 128"` prefixes `f32` and
+/// leaves the two integers alone.
+///
+/// `DeviceKernel::PLAIN` is not the way out either: it emits no angle
+/// brackets, and `kernels-cuda-new/tests/layers.rs`'s
+/// `every_row_spells_a_qualified_instantiation` asserts a plain row's
+/// instantiation carries neither `<` nor `>`.
+///
+/// So the number gets a name. `gated_delta_net.cu:243` held it as
+/// `constexpr int BV = 128;` beside the launch; this is that same constant,
+/// moved to where a row can reach it, and the launcher's grid
+/// (`ceil(V_d / BV)` on `grid.x`) is stated against it in
+/// `driver-cuda/src/fire/gated_delta_net.rs`. Change one and both rows and
+/// that grid are stale together, which is why they cite this line.
+constexpr int gqa_smem_bv = 128;
 
 template <typename StateT>
 __device__ __forceinline__ float state_load(const StateT* p) {

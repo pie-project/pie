@@ -1,0 +1,60 @@
+warning: variant `Text` is never constructed
+   --> crates/kernels-cuda-new/examples/migration_status.rs:602:5
+    |
+590 | enum Class {
+    |      ----- variant in this enum
+...
+602 |     Text,
+    |     ^^^^
+    |
+    = note: `Class` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+
+Migration status -- ahead-of-time rows with a JIT twin
+
+family          rows  migrated                                  library
+--------------------------------------------------------------------------
+attn              38        23     61%   ############........  +11 library
+comm               2         0      0%   ....................  
+dist               3         0      0%   ....................  
+gemm              13         0      0%   ....................  
+layout            10        10    100%   ####################  
+marlin_moe         1         0      0%   ....................  
+mlp               16        16    100%   ####################  
+moe               21        14     67%   #############.......  
+norm              28        26     93%   ##################..  
+pie_lora_qkv_correction       1         0      0%   ....................  
+quant             16        15     94%   ##################..  
+qwen35_verify_stash_load       1         0      0%   ....................  
+qwen35_verify_stash_store       1         0      0%   ....................  
+rope              12         6     50%   ##########..........  
+sample             1         0      0%   ....................  
+ssm               34        19     56%   ###########.........  
+--------------------------------------------------------------------------
+TOTAL            198       129     65%   #############.......  +11 library
+
+`library` rows state a `Prepare` -- they dispatch into FlashInfer rather
+than launching a kernel this tree holds, so they are not candidates and are
+out of the denominator below. Read in this report's vocabulary they are
+SERVICES too, and they are counted apart only because they were out of the
+denominator before the word existed. See `new-horizon.md` §14 for their track.
+
+==========================================================================
+129 of 198 stated symbols       65%
+129 of 174 KERNELS              74%   14 services and 10 ops are not kernels
+129 of 162 reachable KERNELS    80%   12 kernels behind a structural wall
+  2 of  10 OPS composed         20%   1 of them fires here; the rest are stated, not run
+131 of 184 symbols OURS TO RUN  71%   kernels + ops, which is every row no library serves
+==========================================================================
+
+Every stated symbol is a KERNEL (174), an OP (10) or a SERVICE (14).
+`Execution` in `src/execution.rs` is that distinction as data; `kind_of_wall`
+is the mapping, and `assert_total` derives the service set twice -- from the
+walls here and from `execution::SERVED` -- and asserts the two agree.
+
+  A SERVICE is never work: cuBLAS, CUTLASS, NCCL, the P2P all-reduce plane, or
+  the driver itself. It cannot migrate because it was never a kernel of ours.
+  An OP is a host program over kernels of ours, most of which migrate already;
+  what a row cannot say is the composition -- and `Step` now says some of it.
+  So the third line is the migration's real denominator, and the second is the

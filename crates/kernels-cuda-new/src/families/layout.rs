@@ -13,8 +13,11 @@
 //! ONLY row of its unit, and `tests/units.rs` fails a unit with an empty row
 //! set, so `layout/split_gate_up` and `layout/embed` are no longer units.
 //! Their device text is still carried — [`crate::source::DEVICE_HEADERS`]
-//! walks `csrc/src` for `*.cuh` — and the ahead-of-time `.cu`s still include
-//! and compile it, which is where `layout::embed_bf16` actually fires:
+//! walks `csrc/src` for `*.cuh`. `layout/split_gate_up.cu` no longer compiles
+//! it: Â§43 deleted that file, since a rowless launcher has no shim entry and
+//! nothing else called it, so `layout/split_gate_up.cuh` is now device text
+//! with no host caller at all. `layout/embed.cu` DOES still compile its half,
+//! which is where `layout::embed_bf16` actually fires:
 //! `driver-cuda/tests/bridge_smoke.rs` names it at five call sites and
 //! `real_hybrid.rs:577` at a sixth. **What was lost is the NVRTC compile
 //! check on `layout/embed.cuh`**,
@@ -114,6 +117,19 @@
 //! are `dim3(32, 8)`. `Slab`, `PerRowNarrow`, `RowsPerHead`, `AxialRope` and
 //! `RoutedQmv` have no launcher of their shape here at all.
 //!
+//! # READ [`ENVELOPE`] BEFORE THE FOUR REFUSALS BELOW
+//!
+//! Every finding in them is still true and none of them still refuses a row.
+//! They refused a **`LaunchRule`**, and five envelope kernels have rows
+//! without one: [`kernels::LaunchRule::Unstated`] states no geometry, and
+//! `driver-cuda/src/fire/envelope.rs` builds the `kernels::Launch` itself.
+//! `layout/envelope.cu` is DELETED. The paragraphs stay because they are the
+//! argument FOR that shape — a rule that could state a
+//! `(token, kv_head)` grid off a host-computed page bound is a rule §10.5
+//! would refuse for one launcher's sake — and because *"one symbol, two
+//! launches"* is the sentence that says a host program, not a table row, is
+//! the thing that was missing.
+//!
 //! * **The arithmetic would have to change.** `envelope::merge_written_fused`
 //!   and `envelope::merge_written` are `dim3(num_tokens, num_kv_heads)`,
 //!   which `Rule::GatedRms` spells exactly — and they narrow with
@@ -193,10 +209,12 @@
 //! * **No fire, no `Source`.** `geometry`'s two kernels are
 //!   `<<<ceil(n / 256), 256>>>`, which is
 //!   [`kernels::LaunchRule::RowsFlat`] to the digit —
-//!   `runtime::launch::rows_flat` cites `layout/geometry.cu:29-31` and
-//!   `:45-47` by name among the launchers it reproduces, and says of these
+//!   `runtime::launch::rows_flat` cited `layout/geometry.cu:29-31` and
+//!   `:45-47` by name among the launchers it reproduces, and said of these
 //!   two that they *"stay rowless for a reason that is not geometry"* —
-//!   and they still get no row. They are composed by the DRIVER while it
+//!   and they still get no row. Â§43 has since deleted that file, on
+//!   exactly the reading below: rowless means no shim entry, and nothing
+//!   else called them. `layout/geometry.cuh` still holds both kernels. They are composed by the DRIVER while it
 //!   builds a plan, not stated by any model text, so a row for either would
 //!   be a contract naming a caller that does not exist, and the symbol would
 //!   sit in `migration_status`' denominator forever. Both are also plain
@@ -256,8 +274,60 @@ pub const SLOT_OPS: Unit = Unit {
     options: &[],
 };
 
+/// The quest envelope tier — five of the header's seven kernels.
+///
+/// # THE REFUSAL LIST ABOVE IS RETIRED FOR THIS UNIT, AND NOT REPAIRED
+///
+/// Every sentence in the module header refusing an envelope row is still
+/// TRUE: `merge_written_fused`, `reset_started_pages` and `merge_written` are
+/// `dim3(num_tokens, num_kv_heads)` at `min(head_dim, 256)`, `update_appended`
+/// is `dim3(max_touched, num_kv_heads)` at the same block, and no
+/// [`LaunchRule`] states either rectangle — `GatedRms` puts `dims.rows` on
+/// `grid.x`, and a host-computed touched-page bound is not a fire's row count.
+/// `launch_envelope_merge_written_bf16` is still one symbol firing two
+/// launches.
+///
+/// What changed is the CONCLUSION, not the finding. Those sentences refused a
+/// **rule**, and a row does not need one: [`LaunchRule::Unstated`] is a row
+/// that states no geometry, and the driver builds the [`kernels::Launch`]
+/// itself. That is `fire/attn_score.rs`' shape, `families::sample`'s
+/// precedent, and §10.5 honoured rather than bent — the vocabulary of rules
+/// does not grow for these five, because they ask it for nothing.
+///
+/// The "one symbol, two launches" refusal dissolves the same way and is the
+/// reason this unit exists at all: `driver-cuda/src/fire/envelope.rs` is the
+/// host program that picks, and it is Rust rather than a row. A row for
+/// either half would state half a contract; a WALK over both states the
+/// whole one.
+///
+/// # `Tu = 0`, and why `elem` spells a value here
+///
+/// Four of the five carry `template <int Tu = 0>` — a parameter that
+/// parameterises nothing, added because a plain `__global__` in a header
+/// caps that header at one includer (`envelope.cuh:100-119` measured the
+/// link error, twice per kernel). `emit` renders every template argument, so
+/// a defaulted one rendered as ABSENT is a different instantiation and the
+/// row must spell it. `device::i32(0)` is the spelling that resolves under
+/// NVRTC: a bare `0` fails the name-map pragma with *expected an identifier*,
+/// because a literal cannot take a namespace, and the module header records
+/// `device::i32(128)` resolving for `dot<BLOCK>` under the same rule.
+///
+/// **The cost is the offline typecheck, and it is stated rather than
+/// discovered.** `abi::emit_device_typecheck` refuses a row whose `elem` head
+/// is a value — it spells every buffer operand as a pointer to that head —
+/// so the four `Tu` rows are not checkable from `elem` alone. Only
+/// [`ENVELOPE_SIGS`]`[4]`, whose `elem` is `device::bf16`, is. That is the
+/// same trade `attn::write_kv_per_token_head`'s two `device::*_type::value`
+/// rows already make.
+pub const ENVELOPE: Unit = Unit {
+    name: "layout/envelope",
+    root: include_str!("../../csrc/src/layout/envelope.cuh"),
+    rows: ENVELOPE_ROWS,
+    options: &[],
+};
+
 /// The units `layout` compiles.
-pub static UNITS: &[Unit] = &[DEINTERLEAVE, GATHER_ROWS, SLOT_OPS];
+pub static UNITS: &[Unit] = &[DEINTERLEAVE, EMBED, ENVELOPE, GATHER_ROWS, SLOT_OPS];
 
 /// [`SLOT_OPS`]'s one instantiation, which is not one: `copy_if_valid_slot`
 /// is a plain `__global__` over `u8`, so it is [`DeviceKernel::PLAIN`].
@@ -291,13 +361,24 @@ static SLOT_OPS_ROWS: &[DeviceKernel] = &[DeviceKernel {
 /// is the launcher's property and a fire can make no statement about it true
 /// or false.
 ///
-/// **Unsourced, and the twin is too.** `table/layout.rs:35` states
+/// **Unsourced, and the twin is GONE.** `table/layout.rs` used to state
 /// `layout::copy_if_valid_slot` with no `Source` on any operand: `src` and
 /// `dst` are driver-owned slot arenas, `request` is an index into a batch the
 /// driver holds, and `bytes` is a slot stride the model text never names.
 /// `crate::abi` skips a row with any [`kernels::Source::Unbound`] operand
-/// whole, so this row generates no dispatch and claims none — it states what
-/// the kernel is and how it launches, which is what the migration counts.
+/// whole, so that row generated no dispatch and claimed none.
+///
+/// §54 finished the sentence: a row that cannot say where its arguments come
+/// from, in a family with no C++ caller, was being held live by ONE thing —
+/// a `dsl::cuda::copy_if_valid_slot` wrapper that no model called. The table
+/// row and the wrapper are deleted together. **This row is not**, and the
+/// reason is worth stating because it is the general one: a table row is a
+/// claim about who CALLS a symbol, and a family row is a claim about what
+/// the kernel IS. Nothing stopped calling this kernel — it is the tree's
+/// only witness for [`LaunchRule::Single`], fired three times by
+/// `tests/launch_rules.rs` through [`crate::runtime::fire`], which resolves
+/// through [`crate::unit::unit_of`] and has never looked at `table::layout`.
+/// Deleting it would delete the only evidence a `LaunchRule` variant has.
 #[rustfmt::skip]
 static SLOT_OPS_SIGS: [KernelSig; 1] = [
     kernel!(copy_if_valid_slot "layout::copy_if_valid_slot", whole = true,
@@ -368,6 +449,17 @@ static DEINTERLEAVE_SIGS: [KernelSig; 6] = [
     // deinterleave and not a slice. Weight-shaped: `i` is a WEIGHT's row
     // count, which is why the twin sourced neither extent, and `RouteRows`
     // recovers it from the fire's rectangle regardless.
+    //
+    // THE TWIN IS GONE. §54 deleted `table::layout`'s rows for this, for
+    // `deinterleave_vec_bf16` and for `concat_bf16_rows`, together with the
+    // three `dsl::cuda` wrappers that were their only reason to exist --
+    // nothing in `crates/model/src` called either the symbol or the wrapper,
+    // no `lower.rs::semantic()` mapping named them, no C++ called them, and
+    // `driver-cuda/src` has no hand-written `ffi::pie_k_*` arm for them.
+    // These three device rows stay because the KERNELS are real and their
+    // device text is in `layout/deinterleave.cuh`; what went is the claim
+    // that something asks for them. If a model wants one back, it comes back
+    // as a table row and a wrapper TOGETHER, with a caller.
     kernel!(deinterleave_rows "layout::deinterleave_rows_bf16",
         file = Some("layout/deinterleave.cuh"),
         launch = LaunchRule::RouteRows,
@@ -394,7 +486,9 @@ static DEINTERLEAVE_SIGS: [KernelSig; 6] = [
             i: I32,
         ]),
     // `[N, left] ++ [N, right] -> [N, left+right]`, one block per row.
-    // Sourced by nothing, exactly as its twin sources nothing.
+    // Sourced by nothing, and its twin is deleted -- see the note on
+    // `deinterleave_rows` above. `layout::split_bf16_rows`, the inverse, is
+    // alive on both sides; being half of a pair is not a consumer.
     kernel!(concat_rows "layout::concat_bf16_rows",
         file = Some("layout/deinterleave.cuh"),
         launch = LaunchRule::RouteRows,
@@ -546,5 +640,246 @@ static GATHER_ROWS_SIGS: [KernelSig; 2] = [
             ),
             dim: I32 <- Source::Ctx("ple_dim"),
             total: Usize <- Source::OutElements(0),
+        ]),
+];
+
+/// [`ENVELOPE`]'s instantiations, in [`ENVELOPE_SIGS`]' order.
+///
+/// The template paths are the `__global__`s' own, in `layout::device` —
+/// `envelope.cuh:374` for the fused one, `:492` for the reset, `:535` for the
+/// merge, `:337` for the seed, `:238` for the append.
+static ENVELOPE_ROWS: &[DeviceKernel] = &[
+    DeviceKernel {
+        sig: &ENVELOPE_SIGS[0],
+        template_path: "layout::device::merge_written_fused",
+        elem: "device::i32(0)",
+    },
+    DeviceKernel {
+        sig: &ENVELOPE_SIGS[1],
+        template_path: "layout::device::reset_started_pages",
+        elem: "device::i32(0)",
+    },
+    DeviceKernel {
+        sig: &ENVELOPE_SIGS[2],
+        template_path: "layout::device::merge_written",
+        elem: "device::i32(0)",
+    },
+    DeviceKernel {
+        sig: &ENVELOPE_SIGS[3],
+        template_path: "layout::device::seed_empty",
+        elem: "device::i32(0)",
+    },
+    DeviceKernel {
+        sig: &ENVELOPE_SIGS[4],
+        template_path: "layout::device::update_appended",
+        elem: "device::bf16",
+    },
+];
+
+/// The contracts, each the `__global__`'s parameter list and nothing else.
+///
+/// No stream — `cuLaunchKernel` takes it outside the `void**` — and no extent
+/// removed, because [`LaunchRule::Unstated`] recovers nothing: a row that
+/// states no geometry cannot have folded an extent into one. Every operand
+/// here is a parameter the kernel reads.
+///
+/// **The `<<<>>>` each row is fired at is the launcher's, cited on the row.**
+/// `driver-cuda/src/fire/envelope.rs` states them; nothing here does.
+#[rustfmt::skip]
+static ENVELOPE_SIGS: [KernelSig; 5] = [
+    // `envelope.cu:41`, `<<<grid, threads, 0, stream>>>` with
+    // `grid = dim3(num_tokens, num_kv_heads)` and
+    // `threads = head_dim < 256 ? head_dim : 256`, taken when
+    // `num_tokens <= kEnvelopeFuseMaxTokens` (128, `envelope.cuh:374`).
+    //
+    // The fused kernel is the WHOLE maintenance step for a short append: it
+    // resets a page it is the first writer of and merges into one it is not,
+    // deciding per token from `w_off`. Two kernels' work, and the reason the
+    // fork below exists at all is that the decision is only sound while the
+    // launch is small enough that no two blocks race on the same page.
+    kernel!(envelope_merge_written_fused "layout::envelope_merge_written_fused_bf16",
+        file = Some("layout/envelope.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            k_curr: Buf, w_page: U32s, w_off: U32s, row_valid: U8s | null,
+            env_min: BufMut, env_max: BufMut,
+            num_tokens: I32, num_kv_heads: I32, head_dim: I32,
+        ]),
+    // `envelope.cu:49`, same grid and block, the FIRST of the two launches
+    // taken when `num_tokens > 128`. It only resets, and it must complete
+    // before the merge below reads what it wrote -- which is why these are
+    // two launches on one stream and not one kernel.
+    kernel!(envelope_reset_started_pages "layout::envelope_reset_started_pages_bf16",
+        file = Some("layout/envelope.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            w_page: U32s, w_off: U32s, row_valid: U8s | null,
+            env_min: BufMut, env_max: BufMut,
+            num_tokens: I32, num_kv_heads: I32, head_dim: I32,
+        ]),
+    // `envelope.cu:54`, same grid and block, the SECOND of the two. No
+    // `w_off`: the reset already used it, and this kernel merges every
+    // written row unconditionally.
+    kernel!(envelope_merge_written "layout::envelope_merge_written_bf16",
+        file = Some("layout/envelope.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            k_curr: Buf, w_page: U32s, row_valid: U8s | null,
+            env_min: BufMut, env_max: BufMut,
+            num_tokens: I32, num_kv_heads: I32, head_dim: I32,
+        ]),
+    // `envelope.cu:76`, `<<<blocks, 256, 0, stream>>>` with
+    // `blocks = (n + 255) / 256` over `n = num_pages * num_kv_heads * head_dim`.
+    //
+    // This is the one geometry here a rule COULD state -- it is a flat
+    // elementwise grid -- and it is `Unstated` anyway, because `n` is a
+    // product of three cache extents and no fire's row count. `Elementwise`
+    // would take `dims.rows`, and a page pool's size is not a rectangle's
+    // height. The driver multiplies; the row does not pretend it was told.
+    kernel!(envelope_seed_empty "layout::envelope_seed_empty_bf16",
+        file = Some("layout/envelope.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            env_min: BufMut, env_max: BufMut, n: Usize,
+        ]),
+    // `envelope.cu:137`, `<<<grid, threads, 0, stream>>>` with
+    // `grid = dim3(max_touched, num_kv_heads)` and the same block rule.
+    //
+    // `max_touched` is the caller's BOUND on how many pages an append could
+    // have touched, not a count of anything: `kv_paged.cu:216` computes
+    // `(total_tokens + page_size - 1) / page_size + num_requests`, the
+    // ceiling plus one straddle per request. Blocks past a request's real
+    // page span early out. THAT number is why no rule states this grid --
+    // it is host arithmetic over two fire extents and a cache extent, and a
+    // `LaunchRule` that took it would be stating a bound it cannot compute.
+    kernel!(envelope_update_appended "layout::envelope_update_appended_bf16",
+        file = Some("layout/envelope.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            k_pages: Buf, qo_indptr: U32s, kv_page_indices: U32s,
+            kv_page_indptr: U32s, kv_last_page_lens: U32s,
+            env_min: BufMut, env_max: BufMut,
+            num_requests: I32, page_size: I32, num_kv_heads: I32, head_dim: I32,
+        ]),
+];
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// `layout/embed` IS A UNIT AGAIN, AND THE REASON IS THE OPPOSITE OF THE ONE
+// THAT TOOK IT AWAY
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `layout/embed.cuh`, compiled by NVRTC — the flat embedding gather.
+///
+/// This module's header says `layout/embed` is *no longer a unit* and gives
+/// the reason: the two DSL wrappers that named it were deleted, so the
+/// vocab-sharded row was reached through `layout::embed_bf16` instead and
+/// nothing needed the header at run time. **`layout/embed.cu` still compiled
+/// its half**, and the header says that too — *"which is where
+/// `layout::embed_bf16` actually fires"*. That `.cu` is now deleted, so the
+/// header has to be compilable by NVRTC or the flat gather is not compilable
+/// at all.
+///
+/// # `VEC` was the argument for keeping the launcher, and it is the argument
+/// for this unit
+///
+/// `embed.cuh:18-25` states it: *"`embed` is NOT a row and is not templated.
+/// Its `VEC` parameter is chosen on the HOST from a run-time test the device
+/// cannot make — `hidden % 8 == 0` and both `weight` and `y` 16-byte aligned
+/// — and the element count it launches over is `num_tokens * (vec ? hidden/8
+/// : hidden)`, an extent that depends on the answer. No `Source` in
+/// `kernels/src/lib.rs` produces 'is this pointer 16-byte aligned', and §10.5
+/// refuses an invented one."*
+///
+/// All of that is still true and none of it argues for C++. It argues that
+/// the CHOICE is host code — which `driver-cuda/src/fire/embed.rs` now is —
+/// and that the two instantiations are device text, which is what a unit
+/// holds. The `VEC` test is `fire::hand::aligned16`, the same predicate the
+/// C++ spelled as `(uintptr_t)p % 16 == 0`.
+///
+/// # The measurement travels
+///
+/// `embed.cuh:27-31`: *"The vectorised form is not an optimisation to drop:
+/// at decode the token-per-block form issued 24 dependent 2-byte loads from 8
+/// blocks and ran at 8 GB/s — the row it reads is a random offset into the
+/// largest tensor in the model, so the access is a cold TLB miss whose
+/// latency only a wide grid hides."* That paragraph is repeated on
+/// `fire::embed::embed_bf16`, because a port that consumes a measurement has
+/// lost the reason the branch exists.
+///
+/// # Two rows for one `__global__`
+///
+/// `embed<bool VEC>` is one template with two instantiations, and a
+/// `DeviceKernel` names one instantiation. The symbols are suffixed
+/// `#vec`/`#scalar` — the same device-side disambiguation
+/// `attn::write_kv_explicit_bf16_dev#hnd` uses — and `elem` spells the
+/// non-type argument as `device::true_type::value` and
+/// `device::false_type::value`, which is `KV_PAGED_ROWS`' established
+/// spelling for a `bool` template parameter and the one that resolves under
+/// NVRTC's name-map pragma.
+///
+/// **The cost is the offline typecheck, stated rather than discovered.**
+/// `abi::emit_device_typecheck` refuses a row whose `elem` head is a value,
+/// so neither of these two is checkable from `elem` alone — the same trade
+/// the four `Tu` rows in [`ENVELOPE`] and the `write_kv_*` pairs make.
+///
+/// `embed_vocab_shard` is NOT in this unit's rows: it is a `table::layout`
+/// row routed through `device::JIT_DISPATCHED` already, and it reaches the
+/// same header through the unit whose file names it.
+pub const EMBED: Unit = Unit {
+    name: "layout/embed",
+    root: include_str!("../../csrc/src/layout/embed.cuh"),
+    rows: EMBED_ROWS,
+    options: &[],
+};
+
+/// The two instantiations of `embed<bool VEC>`.
+static EMBED_ROWS: &[DeviceKernel] = &[
+    DeviceKernel {
+        sig: &EMBED_SIGS[0],
+        template_path: "layout::device::embed",
+        elem: "device::true_type::value",
+    },
+    DeviceKernel {
+        sig: &EMBED_SIGS[1],
+        template_path: "layout::device::embed",
+        elem: "device::false_type::value",
+    },
+];
+
+/// The contract, which is the `__global__`'s seven parameters.
+///
+/// `embed.cuh:60-64`:
+///
+/// ```text
+/// :60   __global__ void embed(
+/// :61       const i32* __restrict__ token_ids,
+/// :62       const bf16* __restrict__ weight,
+/// :63       bf16* __restrict__ y,
+/// :64       int hidden, int vocab, int num_tokens, int per_row)
+/// ```
+///
+/// `per_row` is `vec ? hidden / 8 : hidden` and is therefore NOT derivable
+/// from anything a [`crate::runtime::Dims`] carries — it is the host's answer
+/// to the alignment test, handed to the kernel so the flat index can be split
+/// back into `(token, lane)`. That is why both rows are
+/// [`LaunchRule::Unstated`]: the grid is
+/// `ceil(num_tokens * per_row / 256)` and `per_row` is a host quantity.
+static EMBED_SIGS: [KernelSig; 2] = [
+    // `embed.cu:41` -- `device::embed<true><<<grid, block, 0, stream>>>`.
+    kernel!(embed_vec "layout::embed#vec",
+        file = Some("layout/embed.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            token_ids: I32s, weight: Buf, y: BufMut,
+            hidden: I32, vocab: I32, num_tokens: I32, per_row: I32,
+        ]),
+    // `embed.cu:47` -- `device::embed<false><<<grid, block, 0, stream>>>`.
+    kernel!(embed_scalar "layout::embed#scalar",
+        file = Some("layout/embed.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            token_ids: I32s, weight: Buf, y: BufMut,
+            hidden: I32, vocab: I32, num_tokens: I32, per_row: I32,
         ]),
 ];

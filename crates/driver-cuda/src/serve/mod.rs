@@ -44,7 +44,7 @@
 use driver_api::completion::CompletionTarget;
 use driver_api::local::{
     ChannelBinding, InstanceBinding, PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED,
-    PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK,
+    PIE_STATUS_INVALID_ARGUMENT,
 };
 
 pub(crate) mod encode;
@@ -79,8 +79,7 @@ pub const DECODE_GQA_GROUPS: &[u32] = &[1, 2, 3, 4, 8];
 
 use crate::fire::launch::launch_impl;
 use load::{adopt_and_compile, load_impl};
-use state::{ChannelState, InstanceEntry, ProgramEntry, Shell as ShellState, channel_dtype};
-
+use state::{ChannelState, InstanceEntry, ProgramEntry, channel_dtype};
 
 /// Run a driver entry point, turning a panic into a status rather than into
 /// the caller's problem.
@@ -125,6 +124,16 @@ pub(crate) fn guard<T>(what: &str, on_panic: T, body: impl FnOnce() -> T) -> T {
 }
 
 impl Shell {
+    /// What this device is, as it answered at create.
+    ///
+    /// Parsed once, here, from the JSON this crate authors. The engine used
+    /// to parse it itself out of a `{ptr, len}` handed back through a
+    /// `PieDriverCaps` out-parameter, which is two readers of one document.
+    #[must_use]
+    pub fn device_facts(&self) -> &driver_api::DeviceFacts {
+        &self.facts
+    }
+
     /// Open the driver.
     ///
     /// Takes the boot bytes and the broker it will finish work through. It
@@ -243,55 +252,59 @@ impl Shell {
         &mut self,
         program: &driver_api::ProgramRegistration,
     ) -> Result<u64, i32> {
-        guard("register_program", Err(PIE_STATUS_DRIVER_ERROR), move || {
-            let state = self;
-            // No validate call: `validate_program_desc` stated an
-            // `abi_version` and two reserved words and nothing else, and a
-            // `ProgramRegistration` has none of the three.
-            let desc = program;
-            if let Some(id) = state
-                .programs
-                .iter()
-                .find(|(_, p)| p.program_hash == desc.program_hash)
-                .map(|(&id, _)| id)
-            {
-                return Ok(id);
-            }
+        guard(
+            "register_program",
+            Err(PIE_STATUS_DRIVER_ERROR),
+            move || {
+                let state = self;
+                // No validate call: `validate_program_desc` stated an
+                // `abi_version` and two reserved words and nothing else, and a
+                // `ProgramRegistration` has none of the three.
+                let desc = program;
+                if let Some(id) = state
+                    .programs
+                    .iter()
+                    .find(|(_, p)| p.program_hash == desc.program_hash)
+                    .map(|(&id, _)| id)
+                {
+                    return Ok(id);
+                }
 
-            // NO ADOPTION. The package and the kernel table arrive owned, so
-            // the copy that used to turn `PieLaunchPackage` back into
-            // `LaunchPackage` -- 1,557 lines of field-for-field mapping whose
-            // whole job was to undo `engine`'s `launch_abi.rs` -- has nothing
-            // left to do. `driver::adopt_launch_package` below is a different
-            // thing and stays: it lowers the package into an ExecPlan.
-            let package = desc.launch.clone();
-            let kernels = desc.emitted_kernels.as_slice();
+                // NO ADOPTION. The package and the kernel table arrive owned, so
+                // the copy that used to turn `PieLaunchPackage` back into
+                // `LaunchPackage` -- 1,557 lines of field-for-field mapping whose
+                // whole job was to undo `engine`'s `launch_abi.rs` -- has nothing
+                // left to do. `driver::adopt_launch_package` below is a different
+                // thing and stays: it lowers the package into an ExecPlan.
+                let package = desc.launch.clone();
+                let kernels = desc.emitted_kernels.as_slice();
 
-            let id = state.next_id;
-            state.next_id += 1;
+                let id = state.next_id;
+                state.next_id += 1;
 
-            // A package with NO STAGES is not a malformed program; it is the
-            // absence of one. The engine registers such a descriptor for a
-            // forward-only deployment — the model runs, the logits come back
-            // through the instance's reader channel, and no user program sits
-            // around the fire. `adopt_launch_package` refuses an empty stage list
-            // because an ExecPlan with nothing to execute is not a plan, and it is
-            // right to; the judgement that this is not an ERROR belongs here,
-            // where the difference between "the host sent a broken program" and
-            // "the host sent no program" is visible.
-            if !package.stages.is_empty() {
-                adopt_and_compile(state, id, desc, package, kernels)?;
-            }
+                // A package with NO STAGES is not a malformed program; it is the
+                // absence of one. The engine registers such a descriptor for a
+                // forward-only deployment — the model runs, the logits come back
+                // through the instance's reader channel, and no user program sits
+                // around the fire. `adopt_launch_package` refuses an empty stage list
+                // because an ExecPlan with nothing to execute is not a plan, and it is
+                // right to; the judgement that this is not an ERROR belongs here,
+                // where the difference between "the host sent a broken program" and
+                // "the host sent no program" is visible.
+                if !package.stages.is_empty() {
+                    adopt_and_compile(state, id, desc, package, kernels)?;
+                }
 
-            state.programs.insert(
-                id,
-                ProgramEntry {
-                    program_hash: desc.program_hash,
-                    emitter_version: desc.emitter_version,
-                },
-            );
-            Ok(id)
-        })
+                state.programs.insert(
+                    id,
+                    ProgramEntry {
+                        program_hash: desc.program_hash,
+                        emitter_version: desc.emitter_version,
+                    },
+                );
+                Ok(id)
+            },
+        )
     }
 
     /// Register a channel endpoint: the C++ registry's binding contract —
@@ -308,93 +321,97 @@ impl Shell {
         &mut self,
         plan: &driver_api::ChannelRegistrationPlan,
     ) -> Result<ChannelBinding, i32> {
-        guard("register_channel", Err(PIE_STATUS_DRIVER_ERROR), move || {
-            use crate::fire::attention_workspace::{LiveStagingOps, StagingOps};
+        guard(
+            "register_channel",
+            Err(PIE_STATUS_DRIVER_ERROR),
+            move || {
+                use crate::fire::attention_workspace::{LiveStagingOps, StagingOps};
 
-            const MAX_RING: u64 = 64;
-            let state = self;
-            // No `abi_version` and no `validate_channel_desc`: the plan is an
-            // owned `ChannelRegistrationPlan`, so the forty `ptr/len mismatch`
-            // rules that validator carried are rules about a representation
-            // that is gone. What is left is what a `Vec` still cannot state.
-            let desc = plan;
-            if state.channels.contains_key(&desc.channel_id)
-                || desc.dtype > driver_api::local::PIE_CHANNEL_DTYPE_ACT
-            {
-                return Err(PIE_STATUS_INVALID_ARGUMENT);
-            }
-            let mut numel: u64 = 1;
-            for &d in &desc.shape {
-                let Some(next) = numel.checked_mul(u64::from(d)) else {
+                const MAX_RING: u64 = 64;
+                let state = self;
+                // No `abi_version` and no `validate_channel_desc`: the plan is an
+                // owned `ChannelRegistrationPlan`, so the forty `ptr/len mismatch`
+                // rules that validator carried are rules about a representation
+                // that is gone. What is left is what a `Vec` still cannot state.
+                let desc = plan;
+                if state.channels.contains_key(&desc.channel_id)
+                    || desc.dtype > driver_api::local::PIE_CHANNEL_DTYPE_ACT
+                {
+                    return Err(PIE_STATUS_INVALID_ARGUMENT);
+                }
+                let mut numel: u64 = 1;
+                for &d in &desc.shape {
+                    let Some(next) = numel.checked_mul(u64::from(d)) else {
+                        return Err(PIE_STATUS_INVALID_ARGUMENT);
+                    };
+                    numel = next;
+                }
+                let wire_bytes: u64 = if desc.dtype == driver_api::local::PIE_CHANNEL_DTYPE_BOOL {
+                    numel.div_ceil(8)
+                } else {
+                    match numel.checked_mul(4) {
+                        Some(b) => b,
+                        None => return Err(PIE_STATUS_INVALID_ARGUMENT),
+                    }
+                };
+                let ring = u64::from(desc.capacity) + 1;
+                if wire_bytes == 0 || ring > MAX_RING {
+                    return Err(PIE_STATUS_INVALID_ARGUMENT);
+                }
+                let Some(mirror_bytes) = wire_bytes.checked_mul(ring) else {
                     return Err(PIE_STATUS_INVALID_ARGUMENT);
                 };
-                numel = next;
-            }
-            let wire_bytes: u64 = if desc.dtype == driver_api::local::PIE_CHANNEL_DTYPE_BOOL {
-                numel.div_ceil(8)
-            } else {
-                match numel.checked_mul(4) {
-                    Some(b) => b,
-                    None => return Err(PIE_STATUS_INVALID_ARGUMENT),
-                }
-            };
-            let ring = u64::from(desc.capacity) + 1;
-            if wire_bytes == 0 || ring > MAX_RING {
-                return Err(PIE_STATUS_INVALID_ARGUMENT);
-            }
-            let Some(mirror_bytes) = wire_bytes.checked_mul(ring) else {
-                return Err(PIE_STATUS_INVALID_ARGUMENT);
-            };
-            let Ok(mirror_bytes) = usize::try_from(mirror_bytes) else {
-                return Err(PIE_STATUS_INVALID_ARGUMENT);
-            };
+                let Ok(mirror_bytes) = usize::try_from(mirror_bytes) else {
+                    return Err(PIE_STATUS_INVALID_ARGUMENT);
+                };
 
-            let mut ops = LiveStagingOps;
-            let Some(mirror) = ops.malloc_host(mirror_bytes) else {
-                return Err(PIE_STATUS_EXHAUSTED);
-            };
-            let word_bytes = 4 * std::mem::size_of::<u64>();
-            let Some(words) = ops.malloc_host(word_bytes) else {
-                ops.free_host(mirror);
-                return Err(PIE_STATUS_EXHAUSTED);
-            };
-            unsafe {
-                std::ptr::write_bytes(mirror.cast::<u8>(), 0, mirror_bytes);
-                std::ptr::write_bytes(words.cast::<u8>(), 0, word_bytes);
-            }
-            state.channels.insert(
-                desc.channel_id,
-                ChannelState {
-                    mirror,
-                    words,
-                    mirror_bytes,
-                    cell_bytes: usize::try_from(wire_bytes).unwrap_or(usize::MAX),
-                    ring: u32::try_from(ring).expect("ring fits u32"),
-                    host_role: desc.host_role,
-                    numel: usize::try_from(numel).unwrap_or(usize::MAX),
-                    dtype: channel_dtype(desc.dtype),
-                    // RECORDED AT REGISTRATION, refused at bind. Registering
-                    // an extern channel is harmless — the endpoint binding
-                    // below is the same either way, and the host mirror is
-                    // real. What cannot be served is ATTACHING two programs
-                    // to it, which is what `bind_instance` turns away.
-                    extern_dir: desc.extern_dir,
-                },
-            );
-            Ok(ChannelBinding {
-                channel_id: desc.channel_id,
-                mirror_base: mirror as u64,
-                word_base: words as u64,
-                mirror_bytes: mirror_bytes as u64,
-                word_bytes: word_bytes as u64,
-                cell_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
-                capacity: desc.capacity,
-                head_word_index: 0,
-                tail_word_index: 1,
-                poison_word_index: 2,
-                closed_word_index: 3,
-            })
-        })
+                let mut ops = LiveStagingOps;
+                let Some(mirror) = ops.malloc_host(mirror_bytes) else {
+                    return Err(PIE_STATUS_EXHAUSTED);
+                };
+                let word_bytes = 4 * std::mem::size_of::<u64>();
+                let Some(words) = ops.malloc_host(word_bytes) else {
+                    ops.free_host(mirror);
+                    return Err(PIE_STATUS_EXHAUSTED);
+                };
+                unsafe {
+                    std::ptr::write_bytes(mirror.cast::<u8>(), 0, mirror_bytes);
+                    std::ptr::write_bytes(words.cast::<u8>(), 0, word_bytes);
+                }
+                state.channels.insert(
+                    desc.channel_id,
+                    ChannelState {
+                        mirror,
+                        words,
+                        mirror_bytes,
+                        cell_bytes: usize::try_from(wire_bytes).unwrap_or(usize::MAX),
+                        ring: u32::try_from(ring).expect("ring fits u32"),
+                        host_role: desc.host_role,
+                        numel: usize::try_from(numel).unwrap_or(usize::MAX),
+                        dtype: channel_dtype(desc.dtype),
+                        // RECORDED AT REGISTRATION, refused at bind. Registering
+                        // an extern channel is harmless — the endpoint binding
+                        // below is the same either way, and the host mirror is
+                        // real. What cannot be served is ATTACHING two programs
+                        // to it, which is what `bind_instance` turns away.
+                        extern_dir: desc.extern_dir,
+                    },
+                );
+                Ok(ChannelBinding {
+                    channel_id: desc.channel_id,
+                    mirror_base: mirror as u64,
+                    word_base: words as u64,
+                    mirror_bytes: mirror_bytes as u64,
+                    word_bytes: word_bytes as u64,
+                    cell_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
+                    capacity: desc.capacity,
+                    head_word_index: 0,
+                    tail_word_index: 1,
+                    poison_word_index: 2,
+                    closed_word_index: 3,
+                })
+            },
+        )
     }
 
     /// Bind an instance to a registered program: the id lifecycle, honoring
@@ -489,41 +506,41 @@ impl Shell {
     ) -> Result<(), i32> {
         guard("launch", Err(PIE_STATUS_DRIVER_ERROR), move || {
             let state = self;
-        // THE FRAME IS VALIDATED, and the comment that used to sit here said
-        // it was not. That comment claimed `validate_frame_desc` was too
-        // strict to adopt ("this shell serves frames today that state
-        // neither"); the code under it had adopted it anyway, and
-        // `entry_validation::no_validator_is_deferred` records what doing so
-        // caught — fixtures whose `roster_rows` counted TOKENS, steps with no
-        // terminal cell, two steps sharing one. The claim had inverted and
-        // the note had not been rewritten.
-        //
-        // `FrameSubmission::validate` carries every rule that validator did:
-        // roster bounds, the distinctness of members and of cells (within a
-        // step and across them), one cell per member, the CSRs, the
-        // recurrent-state parallelism and flag bits, the ticket cover.
-        //
-        // What it does NOT carry is the forty-odd `ptr/len mismatch` checks,
-        // and those are not weakened rules -- a `Vec` cannot be a null
-        // pointer with a nonzero length, so they are rules about a
-        // representation that is gone.
-        if let Err(why) = frame.validate() {
-            eprintln!("[driver-cuda] launch: {why}");
-            return Err(PIE_STATUS_INVALID_ARGUMENT);
-        }
-        // THE CALL RETURNS WITH THE WORK STILL ON THE STREAM.
-        //
-        // Publishing the terminal cells and notifying used to happen here,
-        // after `launch_impl` had synchronized — which made the driver
-        // serialize the engine's `frame_dispatch_depth`, because the call
-        // that would enqueue fire n+1 could not start until fire n had
-        // retired on the GPU.
-        //
-        // Both debts moved into a stream-ordered host callback
-        // (`retire_fire`), so an `Ok` here means ENQUEUED rather than DONE.
-        // An error still returns synchronously: a fire that could not be
-        // built owes nothing and the runtime must hear so on this thread.
-        launch_impl(state, frame, completion)
+            // THE FRAME IS VALIDATED, and the comment that used to sit here said
+            // it was not. That comment claimed `validate_frame_desc` was too
+            // strict to adopt ("this shell serves frames today that state
+            // neither"); the code under it had adopted it anyway, and
+            // `entry_validation::no_validator_is_deferred` records what doing so
+            // caught — fixtures whose `roster_rows` counted TOKENS, steps with no
+            // terminal cell, two steps sharing one. The claim had inverted and
+            // the note had not been rewritten.
+            //
+            // `FrameSubmission::validate` carries every rule that validator did:
+            // roster bounds, the distinctness of members and of cells (within a
+            // step and across them), one cell per member, the CSRs, the
+            // recurrent-state parallelism and flag bits, the ticket cover.
+            //
+            // What it does NOT carry is the forty-odd `ptr/len mismatch` checks,
+            // and those are not weakened rules -- a `Vec` cannot be a null
+            // pointer with a nonzero length, so they are rules about a
+            // representation that is gone.
+            if let Err(why) = frame.validate() {
+                eprintln!("[driver-cuda] launch: {why}");
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
+            }
+            // THE CALL RETURNS WITH THE WORK STILL ON THE STREAM.
+            //
+            // Publishing the terminal cells and notifying used to happen here,
+            // after `launch_impl` had synchronized — which made the driver
+            // serialize the engine's `frame_dispatch_depth`, because the call
+            // that would enqueue fire n+1 could not start until fire n had
+            // retired on the GPU.
+            //
+            // Both debts moved into a stream-ordered host callback
+            // (`retire_fire`), so an `Ok` here means ENQUEUED rather than DONE.
+            // An error still returns synchronously: a fire that could not be
+            // built owes nothing and the runtime must hear so on this thread.
+            launch_impl(state, frame, completion)
         })
     }
 

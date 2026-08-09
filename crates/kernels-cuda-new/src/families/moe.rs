@@ -9,6 +9,26 @@
 //! outside the `void**`, so it was never an operand — and minus whatever
 //! extent the launch rule recovers.
 //!
+//! # `csrc/src/moe/` HAS NO LAUNCHERS LEFT, and four rows are `_dev` for it
+//!
+//! `moe/moe_dispatch.cu` and `moe/dsv4_routing.cu` are both DELETED with
+//! their headers, and `csrc/src/moe/` holds `flashinfer_moe.cu` alone, which
+//! contains no `<<<` at all — it instantiates CUTLASS templates, which is
+//! device text. Everything below that reads as *"the launcher does X"* is
+//! now history about a file, and it is kept in the present tense of the
+//! `<<<>>>` it transcribes, because a transcription that starts hedging
+//! stops being checkable.
+//!
+//! Four rows in this module changed NAME for it, on §60.6's precedent:
+//! `scatter_add_weighted`, `moe_bucket_exact`, `add_moe_route_bias` and
+//! `hash_route_lookup` carry `_dev` symbols, because their ABI symbols are
+//! `Execution::Walk` and `a_walk_is_only_a_walk` refuses a walked symbol that
+//! a unit hosts. All four KEEP their `LaunchRule` — `PerRow`, `RouterSort`,
+//! `Rms`, `RowsFlat` — and the mapping is written out once at the head of the
+//! `_dev` block near [`MOE_DISPATCH_SIGS`]' tail. The Rust that fires them is
+//! `driver-cuda/src/fire/moe_dispatch.rs` and
+//! `driver-cuda/src/fire/dsv4_routing.rs`.
+//!
 //! # Five files, thirty-nine entry points, thirteen rows
 //!
 //! The family's five `.cu` files held 31 `__global__`s and fired 39 launches.
@@ -203,8 +223,34 @@
 //! only way the shim's coverage of this family is a measurement rather than a
 //! reading.
 //!
-//! `moe/moe_grouped_gemm` therefore gets NO unit: a unit is a list of
+//! `moe/moe_grouped_gemm` therefore got NO unit: a unit is a list of
 //! instantiations, and that file has none a rule can state.
+//!
+//! **That refusal is lifted, and only its premise was wrong.** A unit is a
+//! list of instantiations; it is not a list of instantiations a *rule* can
+//! state. [`MOE_GROUPED_GEMM`] below carries the one instantiation the file
+//! has — `device::moe_grouped_gemm<device::bf16>` — on
+//! [`kernels::LaunchRule::Unstated`], and `driver-cuda/src/fire/moe.rs`
+//! builds the `dim3(N / kNTile, max_blocks)` grid by hand, exactly as
+//! `fire/attn_score.rs` does for a fold whose `grid.y` no rule states and
+//! `fire/lm_head_argmax.rs` for two whose grids come off an occupancy query.
+//! The sentence above is still true of a rule and was never true of a unit,
+//! and `examples/unit_probe_moe.rs` instantiating it by hand remains the
+//! measurement of the shim's coverage — the unit does not replace the probe,
+//! it just means the driver no longer needs the C++ launcher to reach it.
+//!
+//! Its device row is `moe::moe_grouped_gemm_wmma_bf16` and NOT the stated
+//! symbol `moe::moe_grouped_gemm_bf16`, which is a requirement and not a
+//! taste: [`crate::execution`]'s `a_walk_is_only_a_walk` and `tests/layers.rs`
+//! both assert that a walked symbol has no unit, because a `Walk` is a host
+//! program and `fire` takes a `Dims` that has no meaning for one. A walk may
+//! DRIVE JIT'd kernels; it may not BE one. `sample::lm_head_gemv_argmax_int8`
+//! is the precedent — it walks, and the two rows it fires are
+//! `sample::lm_head_gemv_argmax_int8_bf16` and
+//! `sample::select_lm_head_argmax_pairs`. The `wmma` in the name is the other
+//! half of the disambiguation: `moe/moe_grouped_gemm_tile` below is the same
+//! arithmetic and is faster, so a bare `_tile` suffix here would have named
+//! the wrong kernel.
 //!
 //! # And `moe/moe_grouped_gemm_tile` gets none either, for a different reason
 //!
@@ -400,8 +446,99 @@ pub const MOE_DISPATCH: Unit = Unit {
     options: &[],
 };
 
+/// The short-K grouped GEMM, as a JIT unit.
+///
+/// One template, one instantiation, and a launch no rule states — the same
+/// shape as [`crate::families::attn::ATTN_SCORE_FOLD`], and taken over for
+/// the same reason. `moe/moe_grouped_gemm.cu` held the `<<<>>>` and the
+/// support predicate and nothing else; both are `driver-cuda`'s
+/// `fire/moe.rs` now, and the `.cu` is deleted.
+pub const MOE_GROUPED_GEMM: Unit = Unit {
+    name: "moe/moe_grouped_gemm",
+    root: include_str!("../../csrc/src/moe/moe_grouped_gemm.cuh"),
+    rows: MOE_GROUPED_GEMM_ROWS,
+    options: &[],
+};
+
 /// The units `moe` compiles.
-pub static UNITS: &[Unit] = &[TOPK_SIGMOID, DSV4_ROUTING, TOPK_SOFTMAX, MOE_DISPATCH];
+pub static UNITS: &[Unit] = &[
+    TOPK_SIGMOID,
+    DSV4_ROUTING,
+    TOPK_SOFTMAX,
+    MOE_DISPATCH,
+    MOE_GROUPED_GEMM,
+    EXPERT_OFFSETS,
+];
+
+/// [`MOE_GROUPED_GEMM`]'s instantiation — the header's only template.
+static MOE_GROUPED_GEMM_ROWS: &[DeviceKernel] = &[DeviceKernel {
+    sig: &MOE_GROUPED_GEMM_SIGS[0],
+    template_path: "moe::device::moe_grouped_gemm",
+    // `static_assert(is_same<T, bf16>::value)` at `moe_grouped_gemm.cuh:124`
+    // — `pie_mma.cuh` implements bf16 fragments only, and its own comment
+    // forbids extending it without a parity run. One arm is not a shortage.
+    elem: "device::bf16",
+}];
+
+/// The contract, in [`MOE_GROUPED_GEMM_ROWS`]'s order.
+#[rustfmt::skip]
+static MOE_GROUPED_GEMM_SIGS: [KernelSig; 1] = [
+    // `LaunchRule::Unstated`, and the deleted launcher argued it in its own
+    // words rather than leaving it to be inferred:
+    //
+    // ```text
+    // // `max_blocks` is a host-side bound on the padded batch, not an extent of
+    // // any operand -- which is why no launch rule states this grid.
+    // const dim3 grid(N / device::kNTile, max_blocks);
+    // device::moe_grouped_gemm<device::bf16><<<grid, device::kGemmWarps * 32, 0, stream>>>(
+    // ```
+    //
+    // — `moe/moe_grouped_gemm.cu:38-41`. `max_blocks` comes off the param
+    // channel (`Source::Param(1)` on the table row), so `grid.y` is a
+    // *statement's* number and not any operand's row count or width; and
+    // `grid.x` divides an output width by 64, which is a tile constant of
+    // this kernel and of nothing else. Two axes, neither in `Dims`.
+    //
+    // A `GroupedBlocks` rule for it would be §10.5's forbidden shape
+    // exactly: one member, one literal, no second launcher to share it.
+    //
+    // # The support predicate is host code and stays host code
+    //
+    // `moe_grouped_gemm_bf16_supported(M, N, K)` was `M == kFrag && N > 0 &&
+    // K > 0 && K <= 512 && N % kNTile == 0 && K % kFrag == 0`
+    // (`moe_grouped_gemm.cu:18-24`), and it decides whether this kernel or
+    // cuBLAS runs. It is a REFUSAL, never a fallback: `driver-cuda`'s
+    // `fire::moe::moe_grouped_gemm_bf16` answers `Grouped::Declined` and the
+    // caller keeps the cuBLAS path it already had. The measurement behind the
+    // bound, from the launcher's comment, verbatim — Qwen3.6-35B-A3B tp2
+    // decode against cuBLAS:
+    //
+    // ```text
+    //   down     K=256   7.94 -> 5.91 ms   taken
+    //   gate_up  K=2048  11.08 -> 11.98    left on cuBLAS
+    // ```
+    //
+    // Above `kShortK = 512` cuBLAS's tuned mainloop beats the early exit; the
+    // kernel is correct at any K and 512 is where firing it stops paying.
+    //
+    // The operands are the `__global__`'s six (`moe_grouped_gemm.cuh:116`),
+    // NOT the launcher's nine: `max_blocks` and `M` never reached the kernel
+    // — the first was `grid.y`, the second only a predicate input.
+    //
+    // The symbol is `..._wmma_bf16` and not the stated `..._bf16` because a
+    // walked symbol may not also be unit-hosted; the module header argues it.
+    kernel!(moe_grouped_gemm_wmma "moe::moe_grouped_gemm_wmma_bf16",
+        file = Some("moe/moe_grouped_gemm.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            a: Buf,
+            weight_base: Buf,
+            c: BufMut,
+            expert_ids: I32s,
+            n: I32,
+            k: I32,
+        ]),
+];
 
 /// [`TOPK_SIGMOID`]'s instantiation.
 static TOPK_SIGMOID_ROWS: &[DeviceKernel] = &[DeviceKernel {
@@ -524,7 +661,25 @@ static DSV4_ROUTING_SIGS: [KernelSig; 2] = [
     // to report it, which is the standard `causal_conv1d_update_batched`
     // sets in `crate::families::ssm`. The geometry, the device text and the
     // offline typecheck all land; the sources land when a statement does.
-    kernel!(hash_route_lookup "moe::hash_route_lookup",
+    //
+    // ── THE SYMBOL IS `_dev` AND THE HOST SIDE IS RUST ───────────────────
+    //
+    // `moe/dsv4_routing.cu` is DELETED and its one launcher is
+    // `driver-cuda/src/fire/dsv4_routing.rs`, so this row is the DEVICE half
+    // of a split symbol on §60.6's precedent: `moe::hash_route_lookup` is
+    // what `table::moe` states, what a model trace names and what
+    // `execution::WALKED` classifies; `moe::hash_route_lookup_dev` is what
+    // NVRTC compiles and what the Rust fires by name. `a_walk_is_only_a_walk`
+    // asserts a walked symbol has no unit, which is the law that forced the
+    // second name.
+    //
+    // `RowsFlat` STAYS on the row even though the Rust states the same
+    // rectangle from the `<<<>>>` it came from. The rule was ported FROM this
+    // launcher — `ceil(tokens / 256)` blocks of 256, digit for digit — and
+    // deleting the statement because a second one exists would throw away the
+    // transcription that makes the two checkable against each other. This is
+    // the only row `RowsFlat` has.
+    kernel!(hash_route_lookup "moe::hash_route_lookup_dev",
         file = Some("moe/dsv4_routing.cuh"),
         launch = LaunchRule::RowsFlat,
         operands = operands![
@@ -637,6 +792,49 @@ static TOPK_SOFTMAX_SIGS: [KernelSig; 3] = [
     // parameter list, and `cuLaunchKernel` reads `sizeof(param)` per cell off
     // an array whose length nothing else checks. `router_topk_softmax` is the
     // same body with `FusedGemv` true and is what reads them.
+    // # THE WARP LADDER, AND WHAT THIS ROW IS NOT
+    //
+    // This row fires the BLOCK form and only the block form. Until
+    // `new-horizon.md` §52 the launcher `moe/topk_softmax.cu` chose between
+    // six instantiations at fire time, and the choice is not in this crate:
+    //
+    // ```text
+    // if (use_warp && K <= 8 && num_experts <= kSoftmaxMaxExperts) {
+    //     if      (num_experts <=  32) topk_softmax_warp_x1 <<<N, 32>>>
+    //     else if (num_experts <=  64) topk_softmax_warp_x2 <<<N, 32>>>
+    //     else if (num_experts <= 128) topk_softmax_warp_x4 <<<N, 32>>>
+    //     else if (num_experts <= 256) topk_softmax_warp_x8 <<<N, 32>>>
+    //     else                         topk_softmax_warp_x16<<<N, 32>>>
+    //     return;
+    // }
+    // topk_softmax<T><<<N, kSoftmaxBlock>>>(...)
+    // ```
+    //
+    // The measurement that motivated the ladder, in the launcher's words:
+    // *"The warp form keeps the experts in registers, so it applies while
+    // they fit (<= 512, which is `kSoftmaxMaxExperts`) and while the K
+    // winners fit the small result array (<= 8). **Qwen3.6-35B-A3B routes
+    // through more than 128 and was falling back to the block form at
+    // 7.56 us/call, 4.9% of its step.**"* And the reason it could never be a
+    // rule: *"one rung is one instantiation, and a JIT row can state one of
+    // them but not the choice between them."*
+    //
+    // Two host facts went with the launcher and neither is stated anywhere
+    // yet. **`num_experts > kSoftmaxMaxExperts` THREW**
+    // (`std::runtime_error("topk_softmax_bf16: num_experts exceeds
+    // MAX_EXPERTS")`) rather than returning quietly — the kernel's result
+    // array is sized by that constant and a wider router would overrun it.
+    // And `PIE_TOPK_WARP=0` forced the block form for A/B measurement; the
+    // env read is deleted with the file, which is §30's rule applied again
+    // (a `getenv` may not pick a kernel), but the A/B it enabled is how the
+    // 7.56 us was obtained.
+    //
+    // Re-landing the ladder is five `DeviceKernel` rows over the five `_xN`
+    // templates and one `Walk` with `Control::Switch { on: "num_experts" }`
+    // in `driver-cuda`. It is NOT done here: this row is in
+    // `device::JIT_DISPATCHED`, so a walk would have to take it back out,
+    // and the two states cannot both be true in one edit. §52 carries the
+    // specification.
     kernel!(topk_softmax "moe::topk_softmax_bf16",
         file = Some("moe/topk_softmax.cuh"),
         launch = LaunchRule::RouterLane,
@@ -692,6 +890,13 @@ static TOPK_SOFTMAX_SIGS: [KernelSig; 3] = [
 /// are carried as device text; this module's header lists what blocks each of
 /// them, and the `.cuh`'s own header repeats the list beside the kernels it
 /// is about.
+///
+/// **Fourteen now.** Six rows were appended when `moe/moe_dispatch.cu`'s host
+/// program moved to `driver-cuda/src/fire/moe_dispatch.rs`: the two decode
+/// GEMVs, the expert-scale transpose, the aligned pointer builder and BOTH
+/// arms of the aligned-output reorder. Every one of the six is
+/// `LaunchRule::Unstated` and says why where it sits. Eleven templates of the
+/// file are still carried as device text with no row.
 static MOE_DISPATCH_ROWS: &[DeviceKernel] = &[
     DeviceKernel {
         sig: &MOE_DISPATCH_SIGS[0],
@@ -733,11 +938,49 @@ static MOE_DISPATCH_ROWS: &[DeviceKernel] = &[
         template_path: "moe::device::scatter_add_weighted",
         elem: "device::bf16",
     },
+    // ── the six that `moe/moe_dispatch.cu`'s host program now fires ───────
+    //
+    // Every one of them is `LaunchRule::Unstated`, and the file header said
+    // so before any of them had a row: *"those are the reasons this file is
+    // not empty, and each of them is a row in `families/moe.rs` that states
+    // `LaunchRule::Unstated`."* The rows are here now because
+    // `driver-cuda/src/fire/moe_dispatch.rs` is the host program, and a Rust
+    // launcher resolves its kernel through `unit_of` + `unit.row`.
+    DeviceKernel {
+        sig: &MOE_DISPATCH_SIGS[8],
+        template_path: "moe::device::moe_decode_gemv_by_token",
+        elem: "device::bf16",
+    },
+    DeviceKernel {
+        sig: &MOE_DISPATCH_SIGS[9],
+        template_path: "moe::device::moe_decode_gemv_by_route",
+        elem: "device::bf16",
+    },
+    DeviceKernel {
+        sig: &MOE_DISPATCH_SIGS[10],
+        template_path: "moe::device::transpose_expert_scales",
+        elem: "device::u8",
+    },
+    DeviceKernel {
+        sig: &MOE_DISPATCH_SIGS[11],
+        template_path: "moe::device::build_moe_ptrs_aligned",
+        elem: "device::bf16",
+    },
+    DeviceKernel {
+        sig: &MOE_DISPATCH_SIGS[12],
+        template_path: "moe::device::reorder_moe_aligned_output",
+        elem: "device::bf16",
+    },
+    DeviceKernel {
+        sig: &MOE_DISPATCH_SIGS[13],
+        template_path: "moe::device::reorder_moe_aligned_output_vec",
+        elem: "device::bf16",
+    },
 ];
 
 /// The contracts, in [`MOE_DISPATCH_ROWS`]' order.
 #[rustfmt::skip]
-static MOE_DISPATCH_SIGS: [KernelSig; 8] = [
+static MOE_DISPATCH_SIGS: [KernelSig; 14] = [
     // `out += weight * src` over a flat buffer -- the shared expert's
     // contribution folded onto the routed one. `Elementwise` is the launcher
     // exactly: `ceil(n / 256)` blocks of 256, `n` rounded UP so the last
@@ -840,7 +1083,21 @@ static MOE_DISPATCH_SIGS: [KernelSig; 8] = [
     // unsourced, as the twin left them -- `cols` is the BIAS's width and
     // `out_stride` the staging's pitch, and a fire that splits a fused bias
     // holds neither as an extent of a value.
-    kernel!(add_moe_route_bias "moe::add_moe_route_bias_bf16",
+    //
+    // **`cols` and `out_stride` STAY UNSOURCED and the Rust supplies both.**
+    // Two of six unbound is precisely the half-bound row `families/rope.rs`
+    // warns about — *"a row whose unbound cells look like an oversight rather
+    // than a fact"* — and here it is a fact: a fire that splits a fused bias
+    // holds neither the bias's width nor the staging's pitch as an extent of
+    // a value it named. `driver-cuda/src/fire/moe_dispatch.rs` passes all six
+    // to `hand::fire`, which is what a host launcher is FOR, and the row is
+    // left exactly as the ahead-of-time twin left it.
+    //
+    // The symbol is `_dev`: the host side is `moe::add_moe_route_bias_bf16`,
+    // walked, and `moe/moe_dispatch.cu` is deleted. `Rms` stays for the same
+    // reason `RowsFlat` does above — it states `<<<num_routes, 256>>>`
+    // exactly and it has other rows.
+    kernel!(add_moe_route_bias "moe::add_moe_route_bias_dev_bf16",
         file = Some("moe/moe_dispatch.cuh"),
         launch = LaunchRule::Rms,
         whole = true,
@@ -925,7 +1182,21 @@ static MOE_DISPATCH_SIGS: [KernelSig; 8] = [
     // of a value it named, and inventing an edge to `topk_idx` that the
     // route count happens to equal would be a claim about the trace rather
     // than a reading of it.
-    kernel!(moe_bucket_exact "moe::moe_bucket_exact",
+    //
+    // **THE SMEM IS THE REASON THIS SYMBOL SPLIT.** `RouterSort` computes
+    // `(3E + 34) · 4` and the launcher asked for `(3E + 1) · 4` — the rule
+    // over-allocates 132 bytes, which the paragraph above blesses and which
+    // is still true. What it cannot do is state the launcher's OWN number,
+    // and a dynamic shared allocation sized from an operand is exactly what
+    // `execution::Control::Supplies` names. `moe/moe_dispatch.cu` is deleted;
+    // `driver-cuda/src/fire/moe_dispatch.rs::moe_bucket_exact` states
+    // `(3 * num_experts + 1) * 4` beside the `<<<1, 1024, smem>>>` it came
+    // from, and the host symbol `moe::moe_bucket_exact` is walked.
+    //
+    // `RouterSort` stays on the row because `moe_align` above still fires
+    // through it and because the over-allocation reading is worth keeping
+    // where both sorts can be read together.
+    kernel!(moe_bucket_exact "moe::moe_bucket_exact_dev",
         file = Some("moe/moe_dispatch.cuh"),
         launch = LaunchRule::RouterSort,
         whole = true,
@@ -974,7 +1245,18 @@ static MOE_DISPATCH_SIGS: [KernelSig; 8] = [
     //
     // `hidden` stays: it is the pitch the kernel addresses `src` and `out`
     // with, not an extent the grid recovers.
-    kernel!(scatter_add_weighted "moe::scatter_add_weighted_bf16",
+    //
+    // The symbol is `_dev` because the host side is walked and
+    // `moe/moe_dispatch.cu` is deleted. **`num_routed` is not one of the five
+    // operands below** — the kernel reads `blockIdx.x` and has no bound to
+    // test it against — so the grid extent is a value the host supplies and
+    // nothing in the argument list carries. `PerRow` states the same
+    // rectangle from `Dims::rows`, and the precondition in bold above is
+    // exactly why a rule alone was never enough: nothing checks that a fire's
+    // rows counted routes rather than tokens, and
+    // `driver-cuda/src/fire/moe_dispatch.rs` takes `num_routed` as a named
+    // parameter so the caller has to say which it meant.
+    kernel!(scatter_add_weighted "moe::scatter_add_weighted_dev_bf16",
         file = Some("moe/moe_dispatch.cuh"),
         launch = LaunchRule::PerRow,
         whole = true,
@@ -984,5 +1266,358 @@ static MOE_DISPATCH_SIGS: [KernelSig; 8] = [
             dst_idx: I32s,
             row_weights: F32s,
             hidden: I32,
+        ]),
+    // ── SIX ROWS AND SIX REFUSALS TO INVENT A RULE ───────────────────────
+    //
+    // These are `moe/moe_dispatch.cu`'s last six kernels, and the launchers
+    // that fired them are `driver-cuda/src/fire/moe_dispatch.rs`. Each row is
+    // `LaunchRule::Unstated`, and the reason is per row rather than a blanket
+    // one:
+    //
+    //   * both decode GEMVs launch `block(32, kGemvWarps)` -- a 2-D BLOCK,
+    //     which no `LaunchRule` states, over a grid whose x axis is the
+    //     OUTPUT width divided by the warp count. `Qmv` is the closest and it
+    //     is one warp per output row at a fixed 256-wide block, which is a
+    //     different rectangle.
+    //   * `transpose_expert_scales` launches a 3-D GRID `(ceil(kg/32),
+    //     ceil(n/8), num_experts)` with a 2-D block `(32, 8)`. Two axes past
+    //     anything in the vocabulary.
+    //   * `build_moe_ptrs_aligned` opens over `max_blocks`, which is a HOST
+    //     SCALAR -- the padded block count the counting sort produced -- and
+    //     not an extent of any value the fire named. `Elementwise` reads
+    //     output elements and the output here is six pointer arrays.
+    //   * both `reorder_moe_aligned_output` forms launch
+    //     `grid(aligned_rows, ceil(width / 256))` where `width` is `hidden`
+    //     or `hidden / 8` DEPENDING ON A POINTER ALIGNMENT TEST. A rule
+    //     cannot see an address; `families::moe`'s header has carried that
+    //     finding since the split.
+    //
+    // The operand lists are the KERNELS', read from `moe_dispatch.cuh`, and
+    // they are shorter than the ahead-of-time twins in `table::moe` by the
+    // stream and by every extent the C++ launcher computed and did not pass.
+    // `moe_gate_up_decode_gemv_bf16`'s twin declares `num_tokens`, `top_k`,
+    // `H` and `I_moe`; the kernel takes `top_k`, `K`, `N` and a `long long`
+    // stride, and three of those four are host arithmetic over the twin's
+    // four. Deriving one list from the other by dropping the stream would
+    // have been wrong in three places, which is why the kernel is read first.
+    // Deriving one list from the other by dropping the stream would
+    // have been wrong in three places, which is why the kernel is read first.
+    //
+    // # NONE OF THESE SIX SYMBOLS IS THE SYMBOL `table::moe` STATES
+    //
+    // Read that before matching a row here to a row there, because five of
+    // the six are one word away from their twin and the word is load-bearing.
+    // [`crate::execution`]'s `a_walk_is_only_a_walk` and `tests/layers.rs`
+    // both assert that a WALKED symbol has no unit: a `Walk` is a host
+    // program and `fire` takes a `Dims` that has no meaning for one. All five
+    // launchers below are walks -- each guards, each computes extents the
+    // fire never named, and one forks on a pointer alignment -- so each needs
+    // two names, exactly as `moe::moe_grouped_gemm_wmma_bf16` sits beside
+    // `moe::moe_grouped_gemm_bf16` and `sample::lm_head_gemv_argmax_int8_bf16`
+    // beside `sample::lm_head_gemv_argmax_int8`.
+    //
+    // ```text
+    //   table::moe (walked, host)         families::moe (device, here)
+    //   moe_gate_up_decode_gemv_bf16   -> moe_decode_gemv_by_token_bf16
+    //   moe_down_decode_gemv_bf16      -> moe_decode_gemv_by_route_bf16
+    //   transpose_expert_scales_u8     -> transpose_expert_scales_dev_u8
+    //   build_moe_ptrs_aligned_bf16    -> build_moe_ptrs_aligned_dev_bf16
+    //   reorder_moe_aligned_output_bf16-> reorder_moe_aligned_output_scalar_bf16
+    //                                   + reorder_moe_aligned_output_vec_bf16
+    //   scatter_add_weighted_bf16      -> scatter_add_weighted_dev_bf16
+    //   moe_bucket_exact               -> moe_bucket_exact_dev
+    //   add_moe_route_bias_bf16        -> add_moe_route_bias_dev_bf16
+    //   hash_route_lookup              -> hash_route_lookup_dev
+    // ```
+    //
+    // **The last four landed after the first five and they are the ones the
+    // door was said to be closed on.** §60.2 and §60.3 called them blocked
+    // because each was unit-hosted under the symbol `table::moe` states, and
+    // read the split as buying *"a `Walk` that walks nowhere"*. That reading
+    // measured the wrong thing: what each host program supplies is not a
+    // control SHAPE but an OPERAND no `Source` names — `moe_bucket_exact`'s
+    // `(3E + 1) · 4` smem, `add_moe_route_bias`'s `cols` and `out_stride`,
+    // `hash_route_lookup`'s `tid2eid` and `vocab_size`, and
+    // `scatter_add_weighted`'s `num_routed`, which is not an operand of the
+    // `__global__` at all. That is `Control::Supplies` in its own words, and
+    // it is the reason all four rows were unsourced rather than unfinished.
+    // Their four `<<<>>>` are `driver-cuda/src/fire/{moe_dispatch,dsv4_routing}.rs`
+    // and `moe/moe_dispatch.cu` and `moe/dsv4_routing.cu` are DELETED.
+    //
+    // Note the last four keep a real `LaunchRule` where the first five are
+    // `Unstated`, and the difference is a finding rather than an oversight:
+    // `PerRow`, `Rms`, `RouterSort` and `RowsFlat` were ported FROM these four
+    // launchers and state their rectangles digit for digit, so the row and the
+    // Rust say the same thing twice and either can be read against the other.
+    //
+    // The first two are not renames at all -- they are the `__global__`s'
+    // OWN names, and the launchers were the things misnamed: two host entry
+    // points, one per MoE projection, over a single kernel template that
+    // indexes `by_token`. Where the kernel's name and the launcher's already
+    // agreed the row takes `_dev`, which claims only what it is: the device
+    // side of a symbol whose host side is walked. `_scalar` earns a better
+    // word than `_dev` because it has a sibling to be distinguished from.
+    kernel!(moe_decode_gemv_by_token "moe::moe_decode_gemv_by_token_bf16",
+        file = Some("moe/moe_dispatch.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            topk_idx: I32s,
+            act: Buf,
+            weight_base: Buf,
+            out: BufMut,
+            top_k: I32,
+            k: I32,
+            n: I32,
+            expert_stride: I64,
+        ]),
+    kernel!(moe_decode_gemv_by_route "moe::moe_decode_gemv_by_route_bf16",
+        file = Some("moe/moe_dispatch.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            topk_idx: I32s,
+            act: Buf,
+            weight_base: Buf,
+            out: BufMut,
+            top_k: I32,
+            k: I32,
+            n: I32,
+            expert_stride: I64,
+        ]),
+    // `u8` and not bf16: an MXFP4 group scale is one E8M0 byte and this
+    // kernel only moves it. The row's `elem` says `device::u8` for the same
+    // reason `quant::mxfp4_scales_to_marlin_e8m0`'s does.
+    kernel!(transpose_expert_scales_dev "moe::transpose_expert_scales_dev_u8",
+        file = Some("moe/moe_dispatch.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            src: U8s,
+            dst: U8sMut,
+            n: I32,
+            k_groups: I32,
+        ]),
+    kernel!(build_moe_ptrs_aligned_dev "moe::build_moe_ptrs_aligned_dev_bf16",
+        file = Some("moe/moe_dispatch.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            expert_ids: I32s,
+            gate_up_base: Buf,
+            down_base: Buf,
+            aligned_in: Buf,
+            aligned_gate_up: BufMut,
+            aligned_act: BufMut,
+            aligned_out: BufMut,
+            a_gu_ptrs: BufArrayOut,
+            b_gu_ptrs: BufArrayOut,
+            c_gu_ptrs: BufArrayOutMut,
+            a_dn_ptrs: BufArrayOut,
+            b_dn_ptrs: BufArrayOut,
+            c_dn_ptrs: BufArrayOutMut,
+            max_blocks: I32,
+            block_size: I32,
+            h: I32,
+            i_moe: I32,
+            routed_blocks: I32,
+            shared_gate_up_base: Buf,
+            shared_down_base: Buf,
+        ]),
+    // TWO SYMBOLS FOR ONE STATEMENT, and they are not interchangeable.
+    // `_scalar_bf16` is the arm that runs when nothing is aligned;
+    // `_vec_bf16` reads a `uint4` per thread and FAULTS on a
+    // pointer that is not 16-byte aligned. §30's question -- *do the arms
+    // differ?* -- has a measured answer here and it is yes: the two kernels
+    // index different widths (`hidden` against `hidden / 8`) and the vector
+    // one has a `static_assert(sizeof(T) == 2)` and a `reinterpret_cast` the
+    // scalar one does not. There is no shape at which running the wrong one
+    // is merely slower; one of the two is a fault.
+    kernel!(reorder_moe_aligned_output_scalar "moe::reorder_moe_aligned_output_scalar_bf16",
+        file = Some("moe/moe_dispatch.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            aligned_out: Buf,
+            sorted_route_ids: I32s,
+            route_out: BufMut,
+            num_routes: I32,
+            aligned_rows: I32,
+            hidden: I32,
+            shared_row_begin: I32,
+            num_tokens: I32,
+            shared_out: BufMut,
+        ]),
+    kernel!(reorder_moe_aligned_output_vec "moe::reorder_moe_aligned_output_vec_bf16",
+        file = Some("moe/moe_dispatch.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            aligned_out: Buf,
+            sorted_route_ids: I32s,
+            route_out: BufMut,
+            num_routes: I32,
+            aligned_rows: I32,
+            hidden_vec: I32,
+            shared_row_begin: I32,
+            num_tokens: I32,
+            shared_out: BufMut,
+        ]),
+];
+
+// ---------------------------------------------------------------------------
+// `moe/expert_offsets.cuh` — the CUTLASS fused MoE's routing front-end.
+//
+// Four `__global__`s lifted out of FlashInfer's CPM-fetched
+// `cutlass_fused_moe_kernels.cuh`, which is the last ahead-of-time CUDA
+// compile in `kernels-cuda`'s CMake project. They are the tractable end of
+// that file: no CUTLASS types in their signatures, no `Params`, no
+// `CUtensorMap` — three phases of a segmented integer count that produce the
+// `expert_first_token_offset` array everything downstream is indexed by.
+//
+// Measured through NVRTC on this L40S (13.0, `compute_89`, the recipe in
+// `csrc/shim/README.md`): **rc=0, 28,503 B of PTX, exactly 4 `.entry`**, all
+// four lowered names returned by `nvrtcGetLoweredName`. One unit, four rows.
+//
+// None of these is in `table::moe`, and that is the point rather than an
+// omission: they are internal steps of `moe::flashinfer_cutlass_moe_bf16`,
+// which `device::RUST_SERVED` already carries. A device row with no table
+// twin has no shim entry to lose — the same arrangement
+// `moe::moe_grouped_gemm_wmma_bf16` is in, and for the same reason.
+// ---------------------------------------------------------------------------
+
+/// The routing front-end: three phases, four kernels, one compile.
+pub const EXPERT_OFFSETS: Unit = Unit {
+    name: "moe/expert_offsets",
+    root: include_str!("../../csrc/src/moe/expert_offsets.cuh"),
+    rows: EXPERT_OFFSETS_ROWS,
+    options: &[],
+};
+
+/// [`EXPERT_OFFSETS`]' four instantiations.
+///
+/// Every one is [`DeviceKernel::PLAIN`], and that is the visible half of the
+/// decision the header argues at length: upstream templated three of these on
+/// their block width because `cub::BlockScan` needs a compile-time width, and
+/// laddered six instantiations of each behind a host `if` chain over function
+/// pointers. Replacing cub with `block_exclusive_sum_i32` — 4.2 MB of carried
+/// CCCL against twenty-six lines of `__shfl_up_sync`, and an exact-integer
+/// argument for why the rewrite needs no tolerance — makes the width a
+/// run-time value. **Fourteen rows became four**, and the width moved from
+/// the symbol to the `Launch`, which is where a launch geometry belongs.
+static EXPERT_OFFSETS_ROWS: &[DeviceKernel] = &[
+    DeviceKernel {
+        sig: &EXPERT_OFFSETS_SIGS[0],
+        template_path: "moe::device::block_expert_prefix_sum",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &EXPERT_OFFSETS_SIGS[1],
+        template_path: "moe::device::global_expert_prefix_sum",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &EXPERT_OFFSETS_SIGS[2],
+        template_path: "moe::device::global_expert_prefix_sum_large",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &EXPERT_OFFSETS_SIGS[3],
+        template_path: "moe::device::merge_expert_prefix_sum",
+        elem: DeviceKernel::PLAIN,
+    },
+];
+
+/// The contracts, in [`EXPERT_OFFSETS_ROWS`]' order.
+///
+/// # Every one is `LaunchRule::Unstated`, and the grids say why
+///
+/// Two of them open `dim3(num_experts_per_node, num_blocks_per_seq)` — a
+/// two-dimensional grid whose axes are an expert count and a *derived* tile
+/// count, neither of which is an extent of any operand. One opens a single
+/// block. One opens a single block at a fixed 1024. No ported rule describes
+/// any of those, and inventing one would be §10.5's forbidden shape: one
+/// member, one literal, no second launcher to share it.
+///
+/// # `expert_first_token_offset` is `BufMut` and the kernel takes `int64_t*`
+///
+/// A stated loss, not an oversight. [`kernels::Ty`] has `I64s` for a
+/// read-only `int64_t*` — added, its own doc says, because *"only the
+/// DECLARED width makes the mismatch a compile error instead of a stride
+/// bug"* — and has **no `I64sMut`**. Adding one is not a one-line change:
+/// `Ty` is matched exhaustively in fourteen places across five crates,
+/// including `kernels-vulkan`, `kernels-wgpu`, `driver-vulkan` and
+/// `driver-wgpu`, none of which has anything to do with a CUDA MoE. So these
+/// rows spell the widest thing that exists and this paragraph records what it
+/// costs: a caller that handed these kernels an `i32` array would be caught
+/// by neither the row nor the compile.
+#[rustfmt::skip]
+static EXPERT_OFFSETS_SIGS: [KernelSig; 4] = [
+    // Phase one. `dim3(num_experts_per_node, num_blocks_per_seq)` blocks of
+    // `num_tokens_per_block` threads, upstream `:646-679`.
+    //
+    // `blocked_row_to_unpermuted_row` is `[num_experts_per_node, num_tokens]`
+    // and is written SPARSELY — only the first `count` slots of each block's
+    // slice are live — so its extent is not a row count and the operand
+    // carries no rule.
+    kernel!(expert_offsets_block "moe::expert_offsets_block_dev",
+        file = Some("moe/expert_offsets.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            token_selected_experts: I32s,
+            blocked_expert_counts: I32sMut,
+            blocked_row_to_unpermuted_row: I32sMut,
+            num_tokens: I64,
+            num_experts_per_token: I64,
+            start_expert_id: I32,
+        ]),
+    // Phase two, one element per thread. A single block, upstream `:764-800`,
+    // used when `num_experts_per_node * num_blocks_per_seq <= 1024`.
+    kernel!(expert_offsets_scan "moe::expert_offsets_scan_dev",
+        file = Some("moe/expert_offsets.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            blocked_expert_counts: I32s,
+            blocked_expert_counts_cumsum: I32sMut,
+            expert_first_token_offset: BufMut,
+            num_experts_per_node: I64,
+            num_blocks_per_seq: I64,
+        ]),
+    // Phase two, strided. A single block of 1024, upstream `:801-807`, used
+    // above 1024 elements. `num_elem_per_thread` is `ceil(n / 1024)` and is
+    // the only operand of the four that exists because of a launch decision
+    // rather than a shape.
+    kernel!(expert_offsets_scan_large "moe::expert_offsets_scan_large_dev",
+        file = Some("moe/expert_offsets.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            blocked_expert_counts: I32s,
+            blocked_expert_counts_cumsum: I32sMut,
+            expert_first_token_offset: BufMut,
+            num_experts_per_node: I64,
+            num_blocks_per_seq: I64,
+            num_elem_per_thread: I64,
+        ]),
+    // Phase three, the scatter. Phase one's grid at phase one's width,
+    // upstream `:843-868`. `num_tokens` is `i32` here and `i64` in phase one,
+    // which is upstream's inconsistency carried across rather than tidied:
+    // it is a STRIDE into `blocked_row_to_unpermuted_row` in this kernel and
+    // a bound in that one, and quietly widening it would be a body change
+    // wearing a type change's clothes.
+    kernel!(expert_offsets_merge "moe::expert_offsets_merge_dev",
+        file = Some("moe/expert_offsets.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            blocked_expert_counts: I32s,
+            blocked_expert_counts_cumsum: I32s,
+            blocked_row_to_unpermuted_row: I32s,
+            permuted_token_selected_experts: I32sMut,
+            permuted_row_to_unpermuted_row: I32sMut,
+            unpermuted_row_to_permuted_row: I32sMut,
+            num_tokens: I32,
         ]),
 ];

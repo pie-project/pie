@@ -56,8 +56,10 @@
 //!   *"The gap is a `Dims` that carries a stream count and a rule that tiles
 //!   by one, and both are the vocabulary's."* Both landed:
 //!   [`kernels_cuda_new::Dims::altup_streams`] is the field and
-//!   [`LaunchRule::AltUpStreams`] is the rule, cited at `norm/altup.cu:18-19`
-//!   and `:32-33`. The field is a DISTINCT QUANTITY and not a sentinel in
+//!   [`LaunchRule::AltUpStreams`] is the rule, transcribed from
+//!   `norm/altup.cu:18-19` and `:32-33` before Â§43 deleted that file as
+//!   unreached, and re-pinned since to `norm/altup.cuh:83-85`, where the
+//!   kernel reads the three axes back. The field is a DISTINCT QUANTITY and not a sentinel in
 //!   `kv_heads`, for the reason §22 gives for `stated_head_dim`: seven rules
 //!   read `kv_heads` and would have started answering a stream count.
 //! * `hc_post` and `hc_expand` **were** the entry above, and are now
@@ -289,7 +291,9 @@ pub const RMSNORM: Unit = Unit {
 ///
 /// **The rowless state was a vocabulary gap and it is closed.**
 /// [`LaunchRule::AltUpStreams`] states `dim3(T, K, ceil(H / 128))` at 128
-/// threads against `norm/altup.cu:18-19` and `:32-33`, and
+/// threads against the deleted `norm/altup.cu:18-19` and `:32-33` -- the
+/// launchers went in Â§43, the axis order is witnessed by
+/// `norm/altup.cuh:83-85` now -- and
 /// [`kernels_cuda_new::Dims::altup_streams`] is the field `K` lives in — its
 /// own doc says why it could not be `kv_heads` (an attention head count, and
 /// [`LaunchRule::WarpTiledScan`] already reads it) or `n_experts` (the
@@ -346,8 +350,10 @@ static ALTUP_ROWS: &[DeviceKernel] = &[
 /// them `Buf` would follow the element type the day a second format lands.
 #[rustfmt::skip]
 static ALTUP_SIGS: [KernelSig; 2] = [
-    // `norm/altup.cu:18-19` --
+    // The deleted `norm/altup.cu:18-19` --
     // `device::altup_predict<device::bf16><<<dim3(T, K, ceil(H/128)), 128, 0, stream>>>`.
+    // `norm/altup.cuh:83-85` reads t/k/h off x/y/z, which is what still
+    // witnesses the order.
     kernel!(altup_predict "norm::altup_predict_bf16",
         file = Some("norm/altup.cuh"),
         launch = LaunchRule::AltUpStreams,
@@ -359,8 +365,9 @@ static ALTUP_SIGS: [KernelSig; 2] = [
             t: I32 <- Source::Rows,
             h: I32 <- Source::Div(&Source::Width(&Source::In(0)), &Source::CtxNonZero("altup_streams")),
         ]),
-    // `norm/altup.cu:32-33` --
+    // The deleted `norm/altup.cu:32-33` --
     // `device::altup_correct<device::bf16><<<dim3(T, K, ceil(H/128)), 128, 0, stream>>>`.
+    // `norm/altup.cuh:113-115` is the surviving witness.
     //
     // `k` comes off the COEFFICIENT width and `h` off the ACTIVATED width
     // here, not off the context and a quotient -- the ahead-of-time row makes
@@ -519,10 +526,34 @@ static DSV4_HC_ROWS: &[DeviceKernel] = &[
 /// for why `Elementwise` is not merely a coarser answer there.
 #[rustfmt::skip]
 static DSV4_HC_SIGS: [KernelSig; 7] = [
+    // ── FOUR OF THESE ROWS WERE RENAMED, AND THE RENAME IS THE POINT ────
+    //
+    // A device row states a `__global__`; the ahead-of-time twin in
+    // `table/norm.rs` states a LAUNCHER. While `norm/dsv4_hc.cu` existed
+    // those were two spellings of one program. It does not exist: the host
+    // program is `driver-cuda/src/fire/dsv4_hc.rs` and all four launcher
+    // symbols are `execution::WALKED` + `execution::RUST_SERVED`, and
+    // `execution::tests::a_walk_is_only_a_walk` and
+    // `tests/layers.rs::the_lookup_agrees_with_the_tables_it_reads` both
+    // refuse a symbol that is walked AND unit-hosted.
+    //
+    //   stated (table/norm.rs)          fired (here)
+    //   norm::hc_pre_postprocess_bf16   norm::hc_pre_postprocess_rows_bf16
+    //   norm::hc_head_postprocess_bf16  norm::hc_head_postprocess_rows_bf16
+    //   norm::hc_rmsnorm_to_f32         norm::hc_rmsnorm_to_f32_rows
+    //   norm::hc_post_bf16              norm::hc_post_elems_bf16
+    //
+    // The suffix names the `LaunchRule`, because that is the one thing that
+    // separates the last row from the other three: `hc_post` is
+    // `ElementwiseIn` over `n * hidden_size` and the rest are `PerRow` over
+    // `n`. `norm::hc_expand_bf16` is NOT renamed -- it is in
+    // `device::JIT_DISPATCHED`, where one symbol is right because one
+    // program runs.
+    //
     // The mix split, the Sinkhorn, and the collapse of `hc_mult` residual
     // streams into the layer's input -- one block per token because `pre`,
     // `post` and `comb` live in shared memory across all of it.
-    kernel!(hc_pre "norm::hc_pre_postprocess_bf16",
+    kernel!(hc_pre "norm::hc_pre_postprocess_rows_bf16",
         file = Some("norm/dsv4_hc.cuh"),
         launch = LaunchRule::PerRow,
         // `PerRow`, not `Rms`. The launcher is `<<<N, BLOCK, 0, stream>>>`
@@ -551,7 +582,7 @@ static DSV4_HC_SIGS: [KernelSig; 7] = [
     // The head variant: a gated sum with no Sinkhorn. `hc_eps` sits LAST
     // because the twin's C++ signature put the stream before it, and dropping
     // the stream is the only change a row may make to that order.
-    kernel!(hc_head "norm::hc_head_postprocess_bf16",
+    kernel!(hc_head "norm::hc_head_postprocess_rows_bf16",
         file = Some("norm/dsv4_hc.cuh"),
         launch = LaunchRule::PerRow,
         // `PerRow`, not `Rms`. The launcher is `<<<N, BLOCK, 0, stream>>>`
@@ -577,7 +608,7 @@ static DSV4_HC_SIGS: [KernelSig; 7] = [
     // in fp32. The reduction is a fixed-order tree on STATIC shared memory,
     // so the 32 bytes `Rms` hands the launch are never read -- the rule sizes
     // `device::block_sum`'s scratch, and this kernel does not use it.
-    kernel!(hc_rmsnorm_to_f32 "norm::hc_rmsnorm_to_f32",
+    kernel!(hc_rmsnorm_to_f32 "norm::hc_rmsnorm_to_f32_rows",
         file = Some("norm/dsv4_hc.cuh"),
         launch = LaunchRule::PerRow,
         // `PerRow`, not `Rms`. The launcher is `<<<N, BLOCK, 0, stream>>>`
@@ -681,7 +712,7 @@ static DSV4_HC_SIGS: [KernelSig; 7] = [
     // and a fire is a `void**` and a grid, with no host in front of it. The
     // guard is now `dsv4_hc.cuh`'s first statement. It changes nothing the
     // archive does, because the archive never launched the case it catches.
-    kernel!(hc_post "norm::hc_post_bf16",
+    kernel!(hc_post "norm::hc_post_elems_bf16",
         file = Some("norm/dsv4_hc.cuh"),
         launch = LaunchRule::ElementwiseIn,
         operands = operands![
@@ -829,6 +860,71 @@ static RMSNORM_ROWS: &[DeviceKernel] = &[
         template_path: "norm::device::rmsnorm_vec8",
         elem: "device::i32(256), false, true",
     },
+    //===------------------------------------------------------------===//
+    //
+    // THE FIVE `rmsnorm.cu` LEFT BEHIND WHEN ITS HOST PROGRAM BECAME RUST
+    //
+    //===------------------------------------------------------------===//
+    //
+    // Every row above is a launcher's DECISION restated at the width its
+    // `LaunchRule` launches. These five are the opposite trade and it is
+    // worth naming, because it is the trade that only exists once the host
+    // program is on this side of the language boundary: they are the widths
+    // the LAUNCHER fired, and they are reachable only from a caller that
+    // builds a `Launch` itself. `driver-cuda/src/fire/rmsnorm.rs` is that
+    // caller, and it cites the `.cu` line beside every one of them.
+    //
+    // So `launch` is `LaunchRule::Unstated` on all five, deliberately.
+    // `Unstated` is not "a rule nobody got to"; it is the row saying that
+    // its geometry is not derivable from a `Dims`, which is true here for
+    // the reason `rmsnorm.cu:2` gave for the whole file: *it reads pointer
+    // ALIGNMENT, and no `LaunchRule` can see an address*. `families/rope.rs`
+    // spells the same answer for `qk_rmsnorm_rope_bf16_rounded`.
+    //
+    // # Why 512 and not the 256 the two rows above chose
+    //
+    // `RMSNORM_SIGS[3]` and `[9]` are instantiated at 256 because they are
+    // fired by `LaunchRule::Rms`, which launches 256 threads, and `BLOCK`
+    // sizes the `__shared__ float[BLOCK]` that `block_reduce_sum_exact`
+    // folds through — an instantiation at 512 launched at 256 folds 256
+    // floats no thread wrote. That reasoning is a constraint on a ROW WITH A
+    // RULE. A hand-built launch has no such constraint: it states 512 and
+    // 512 threads arrive, so the port can have the width its launcher had
+    // and does. The two readings do not conflict; they answer different
+    // questions, and both rows exist so neither has to compromise.
+    DeviceKernel {
+        sig: &RMSNORM_SIGS[10],
+        template_path: "norm::device::rmsnorm_vec8",
+        elem: "device::i32(512), false, false",
+    },
+    DeviceKernel {
+        sig: &RMSNORM_SIGS[11],
+        template_path: "norm::device::rmsnorm_vec8",
+        elem: "device::i32(512), false, true",
+    },
+    // `rmsnorm_rasr_vec8` is `template <int BLOCK>` and hard-codes `bf16` in
+    // its own parameters, exactly as `rmsnorm_vec8` does — so `elem` is a
+    // VALUE here too, and `device::i32(...)` for `RMSNORM_SIGS[3]`'s reason:
+    // `DeviceKernel::instantiation` glues `::pie_cuda_driver::kernels::`
+    // onto the first token and a bare literal cannot carry it.
+    DeviceKernel {
+        sig: &RMSNORM_SIGS[12],
+        template_path: "norm::device::rmsnorm_rasr_vec8",
+        elem: "device::i32(512)",
+    },
+    DeviceKernel {
+        sig: &RMSNORM_SIGS[13],
+        template_path: "norm::device::rmsnorm_rasr_vec8",
+        elem: "device::i32(256)",
+    },
+    // The scalar fallback of the same launcher, and the one row of the five
+    // whose first template argument IS a type — `template <class T, int
+    // BLOCK>` — so `elem` reads like every row at the top of this table.
+    DeviceKernel {
+        sig: &RMSNORM_SIGS[14],
+        template_path: "norm::device::rmsnorm_residual_add_scale_rmsnorm",
+        elem: "device::bf16, 512",
+    },
 ];
 
 /// The contracts, in [`RMSNORM_ROWS`]' order.
@@ -861,7 +957,7 @@ static RMSNORM_ROWS: &[DeviceKernel] = &[
 /// a row for a kernel nothing states is a claim about a caller that does not
 /// exist.
 #[rustfmt::skip]
-static RMSNORM_SIGS: [KernelSig; 10] = [
+static RMSNORM_SIGS: [KernelSig; 15] = [
     // The strided norm, and the only one of the four plain RMSNorm symbols
     // with a SINGLE reading: `num_rows <- Source::Rows` and nothing
     // conditional, because `OpKind::RmsnormPerHead` does not lower here.
@@ -1311,6 +1407,139 @@ static RMSNORM_SIGS: [KernelSig; 10] = [
             hidden: I32,
             x_row_stride: I32,
             y_row_stride: I32,
+            eps: F32,
+        ]),
+    //===------------------------------------------------------------===//
+    //
+    // THE FIVE THE RUST LAUNCHER FIRES, at the widths `rmsnorm.cu` fired
+    //
+    //===------------------------------------------------------------===//
+    //
+    // `norm/rmsnorm.cu` is gone and `driver-cuda/src/fire/rmsnorm.rs` is its
+    // host program. These five rows are what that program launches; see
+    // [`RMSNORM_ROWS`]' comment above them for why the widths differ from
+    // the two `#vec8` rows and why `launch` is `Unstated` on all five.
+    //
+    // # No `Source` on any operand, and here that is not a limitation
+    //
+    // `model-compiler` cannot write any of these names — `#vec8_512` is
+    // unspellable by a trace, exactly as `#vec8` is — so nothing binds them
+    // from a fire's rectangle and nothing should. The caller supplies the
+    // operands because the caller is a port of the launcher that supplied
+    // them, and `abi::emit_dispatch` skipping an unbound row is the correct
+    // answer rather than an omission.
+    //
+    // The three SYMBOLS behind the five rows keep their ahead-of-time rows
+    // in `table/norm.rs` unchanged, and two of those are what a statement
+    // actually names: `norm::rmsnorm_strided_bf16` is routed (its
+    // ahead-of-time row is fully sourced and it is in
+    // `device::JIT_DISPATCHED`) and `norm::rmsnorm_residual_add_scale_rmsnorm_bf16`
+    // is in `execution::RUST_SERVED`, so its generated arm calls
+    // `bind::service` with the same operand list it used to hand to
+    // `pie_k_norm_rmsnorm_residual_add_scale_rmsnorm_bf16`.
+
+    // `rmsnorm.cu:88-94` — the vectorised arm of `rmsnorm_strided_bf16`, at
+    // the launcher's `VBLOCK = 512`. `y_fp16` is `| null` for the sibling
+    // row's reason: `EMIT_FP16=false` reads it only inside a dead
+    // `if constexpr`, and the launcher passes `nullptr`.
+    kernel!(rmsnorm_strided_vec8_512 "norm::rmsnorm_strided_bf16#vec8_512",
+        file = Some("norm/rmsnorm.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            x: Buf,
+            weight: Buf,
+            y: BufMut,
+            y_fp16: BufMut | null,
+            hidden: I32,
+            x_row_stride: I32,
+            y_row_stride: I32,
+            eps: F32,
+        ]),
+    // `rmsnorm.cu:69-77` — the fused arm of `rmsnorm_bf16_with_fp16`, at the
+    // launcher's `VBLOCK = 512`. `y_fp16` is NOT `| null`: this arm writes
+    // through it on every row, so a null is a null store and not a spare
+    // cell — the sibling row states the same contract at 256.
+    //
+    // THE KNOWN DEFECT IS THIS ROW'S TOO, and it is not fixed by adding a
+    // width. `rmsnorm.cuh:318` writes the fp16 copy without a row offset, so
+    // `EMIT_FP16=true` is wrong above one row;
+    // `tests/launch_rules.rs::the_emit_fp16_kernel_is_wrong_above_one_row`
+    // pins the signature so it cannot be renamed away. A port that corrected
+    // it would make the symbol compute something the archive did not.
+    kernel!(rmsnorm_with_fp16_vec8_512 "norm::rmsnorm_bf16_with_fp16#vec8_512",
+        file = Some("norm/rmsnorm.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            x: Buf,
+            weight: Buf,
+            y: BufMut,
+            y_fp16: BufMut,
+            hidden: I32,
+            x_row_stride: I32,
+            y_row_stride: I32,
+            eps: F32,
+        ]),
+    // `rmsnorm.cu:160-177` — the two vectorised arms of
+    // `rmsnorm_residual_add_scale_rmsnorm_bf16`, and the widths are a
+    // MEASUREMENT rather than a convention. Swept under graph replay, in us:
+    //
+    //   hidden   scalar256  scalar512   vec256  vec512  vec1024
+    //     2048        4.38       3.68     2.72    2.93     3.31
+    //     2816        6.17       4.83     3.46    3.12     3.51
+    //     5376        8.48       6.55     4.44    4.07     4.02
+    //
+    // vec512 above hidden 2560 and vec256 below: best at 2816, within 1.5%
+    // of best at 5376, and 2048 prefers the narrower block. Both are
+    // bit-identical to the scalar form at all three sizes -- only the two
+    // sum reductions reassociate, and at these lengths that rounds to the
+    // same bf16. The scalar form measured 10.79 us/call in gemma-4-26B's
+    // decode, 8% of the step.
+    //
+    // Two rows and not one `Specialisation`, because the choice between them
+    // is `hidden_size >= 2560` -- a COMPARISON, and every `Term` in the
+    // specialisation vocabulary is unary. `new-horizon.md` §44.6 is the
+    // general form of that sentence.
+    kernel!(rasr_vec8_512 "norm::rmsnorm_residual_add_scale_rmsnorm_bf16#vec8_512",
+        file = Some("norm/rmsnorm.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            x: Buf,
+            weight: Buf,
+            hidden: BufMut,
+            scale: F32,
+            next_weight: Buf,
+            norm_out: BufMut,
+            hidden_size: I32,
+            eps: F32,
+        ]),
+    kernel!(rasr_vec8_256 "norm::rmsnorm_residual_add_scale_rmsnorm_bf16#vec8_256",
+        file = Some("norm/rmsnorm.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            x: Buf,
+            weight: Buf,
+            hidden: BufMut,
+            scale: F32,
+            next_weight: Buf,
+            norm_out: BufMut,
+            hidden_size: I32,
+            eps: F32,
+        ]),
+    // `rmsnorm.cu:179-189` — the arm taken when the five addresses do not
+    // all land on 16 bytes. 512 at every width, because the unaligned path
+    // is the one the sweep above could not improve: `scalar512` beats
+    // `scalar256` at all three sizes.
+    kernel!(rasr_scalar_512 "norm::rmsnorm_residual_add_scale_rmsnorm_bf16#scalar_512",
+        file = Some("norm/rmsnorm.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            x: Buf,
+            weight: Buf,
+            hidden: BufMut,
+            scale: F32,
+            next_weight: Buf,
+            norm_out: BufMut,
+            hidden_size: I32,
             eps: F32,
         ]),
 ];

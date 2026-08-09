@@ -5,9 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    PIE_MEMORY_DOMAIN_HOST_PINNED, KvMoveCell, DeviceDomain, PoolRange, StateCopyRange,
-};
+use crate::{DeviceDomain, KvMoveCell, PIE_MEMORY_DOMAIN_HOST_PINNED, PoolRange, StateCopyRange};
 
 pub const CHANNEL_TICKET_NONE: u64 = u64::MAX;
 

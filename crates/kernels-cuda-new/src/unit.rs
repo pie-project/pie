@@ -223,10 +223,35 @@ impl fmt::Display for Toolchain {
 /// headers uses. `source`'s header explains what `-I` instead of `-iquote`
 /// silently does to `<cuda_fp16.h>`, with the two objects measured. Nothing
 /// here can state that, and a second set does not make it statable.
+///
+/// # Where this is going, and what it is not yet
+///
+/// Two arms is a DICHOTOMY, and it exists for exactly one reason: FlashInfer
+/// arrived wholesale as somebody else's tree, so the only question a unit was
+/// ever asked was *do you want the vendored library or not*. That is a
+/// question about provenance.
+///
+/// `csrc/` is being re-cut so that a directory answers *what is this text
+/// for* instead — [`crate::source::SHIM`] is the first cut and landed with
+/// this comment. When `csrc/device/` and `csrc/attn/` follow, the useful
+/// question becomes *which roles does this unit need*: an `attn` unit takes
+/// `device` + `attn`, a `norm` unit takes `device` + `norm`, and neither
+/// carries the other's bytes. Two arms becomes a per-unit SUBSET, and the
+/// 1.7 MB that a `norm` kernel pays for today because it is in one bag
+/// stops being one bag.
+///
+/// It is not that yet, and this comment is not pretending otherwise. Both
+/// arms below gained [`crate::source::SHIM`] and neither lost anything: the
+/// sets are the same files with the same names, regrouped. A subset needs the
+/// device stdlib separated from the attention algorithms inside
+/// `csrc/vendor/flashinfer/`, and separating them rewrites upstream's
+/// `#include` lines, which is why `tests/vendor_manifest.rs` grew a
+/// transform and a counted negative control before anything moved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Headers {
-    /// [`DEVICE_HEADERS`]: `csrc/src`, the prelude and the shims. What every
-    /// unit authored here compiles against.
+    /// [`DEVICE_HEADERS`]: `csrc/shim` and `csrc/src` — the impersonating
+    /// headers, the prelude, and every kernel header authored here. What
+    /// every unit authored here compiles against.
     Library,
     /// [`ALL_HEADERS`]: the above plus `csrc/vendor`, the patched FlashInfer
     /// closure — 1.7 MB, and NVRTC copies every byte of it, which is why it
@@ -283,11 +308,39 @@ impl Demands {
 
 /// The units that demand something other than [`Demands::DEFAULT`].
 ///
-/// **Empty, and that emptiness is a measurement rather than a placeholder.**
-/// Every unit declared today compiles under the NVRTC this crate loads and
-/// resolves against the library set; the one file that would be in this table
-/// — `moe/moe_grouped_gemm_tile` — is deliberately not a unit yet, and adding
-/// it here without adding the unit would be a demand about nothing.
+/// **One entry, and it covers 56 units** — see the prefix rule below.
+///
+/// It was empty until the FA2 lattice landed, and that emptiness was a
+/// measurement rather than a placeholder: every unit declared before it
+/// compiles under the NVRTC this crate loads and resolves against the library
+/// set. `crate::families::fa2` is the first that does not. Its 56 units
+/// `#include <flashinfer/attention/decode.cuh>` and
+/// `<flashinfer/attention/prefill.cuh>`, which reach the whole 1.7 MB patched
+/// vendor closure, so they demand [`Headers::LibraryAndVendor`] and every
+/// other unit still demands nothing.
+///
+/// The one file that would ALSO be here — `moe/moe_grouped_gemm_tile` — is
+/// deliberately not a unit yet, and adding it here without adding the unit
+/// would be a demand about nothing. The long note below is about that unit and
+/// is unchanged.
+///
+/// # A key ending in `*` is a PREFIX, and why that is not vocabulary growth
+///
+/// `crate::families::fa2`'s unit names are macro-generated from four axes:
+/// `attn/fa2_decode_hd128_g4`, `attn/fa2_prefill_hd512_q32_kv1`, 56 of them.
+/// Listing every one here would be a table that has to be edited whenever the
+/// lattice's arithmetic selects a different point — which is a table that
+/// silently stops covering a unit, i.e. the exact failure the `const`
+/// assertion below exists to prevent, reintroduced one level up.
+///
+/// So one entry states the family: `"attn/fa2_*"`. The `*` is a suffix on the
+/// KEY and nothing else — there is no glob, no character class and no second
+/// wildcard position — because the only thing being expressed is *"a family's
+/// units demand what the family demands"*, and a family is a name prefix in
+/// this crate by construction ([`crate::families`]'s header says so).
+///
+/// The `const` assertion is kept honest across the change: a prefix entry must
+/// match **at least one** unit, so a renamed family is still a compile error.
 ///
 /// # Why a table beside [`UNITS`] and not two fields on [`Unit`]
 ///
@@ -298,6 +351,10 @@ impl Demands {
 /// declarations across thirteen files that this change does not own. A seam
 /// that cannot be landed is worth less than a seam one indirection away from
 /// where it belongs.
+///
+/// (The FA2 lattice is the counter-example that makes the point sharper rather
+/// than weaker: its 56 units are ONE macro, so a fifth field would cost it one
+/// line. It is the other 45 that keep the table here.)
 ///
 /// So the statement is here, next to the concatenation that builds [`UNITS`],
 /// and nothing outside this file reads it: every caller goes through
@@ -353,7 +410,38 @@ impl Demands {
 /// library form, so this is a subprocess and a packaging decision rather than
 /// another `dlopen`. `.wiki/driver/new-horizon.md` §23.18 has the bisect that
 /// found `CUDA_ROOT` and the eight-step transcript.
-const DEMANDS: &[(&str, Demands)] = &[];
+const DEMANDS: &[(&str, Demands)] = &[(
+    "attn/fa2_*",
+    Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+)];
+
+/// Whether a [`DEMANDS`] key applies to a unit name.
+///
+/// Exact, unless the key ends in `*`, in which case the rest of it is a
+/// prefix. See [`DEMANDS`] for why the one wildcard exists and why it is a
+/// suffix on the key rather than a pattern language.
+const fn demand_covers(key: &str, unit: &str) -> bool {
+    let key_bytes = key.as_bytes();
+    if key_bytes.is_empty() {
+        return false;
+    }
+    if key_bytes[key_bytes.len() - 1] != b'*' {
+        return str_eq(key, unit);
+    }
+    let prefix = key_bytes.len() - 1;
+    let unit_bytes = unit.as_bytes();
+    if unit_bytes.len() < prefix {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix {
+        if key_bytes[i] != unit_bytes[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 /// Every demand names a unit that exists.
 ///
@@ -367,7 +455,7 @@ const fn every_demand_names_a_unit() -> bool {
         let mut found = false;
         let mut u = 0;
         while u < units.len() {
-            if str_eq(DEMANDS[d].0, units[u].name) {
+            if demand_covers(DEMANDS[d].0, units[u].name) {
                 found = true;
             }
             u += 1;
@@ -410,13 +498,13 @@ impl Unit {
     /// What this unit demands of the compiler and of the header set.
     ///
     /// [`Demands::DEFAULT`] for a unit that states nothing, which is every
-    /// unit today. A linear scan of [`DEMANDS`], which is empty and will be
-    /// short: this runs once per compile, not once per fire.
+    /// unit except `crate::families::fa2`'s 56. A linear scan of [`DEMANDS`],
+    /// which is one entry long: this runs once per compile, not once per fire.
     #[must_use]
     pub fn demands(&self) -> Demands {
         DEMANDS
             .iter()
-            .find(|(name, _)| *name == self.name)
+            .find(|(key, _)| demand_covers(key, self.name))
             .map_or(Demands::DEFAULT, |(_, demands)| *demands)
     }
 

@@ -390,6 +390,24 @@ pub mod ffi {
 /// produced and the extents are the geometry it allocated them against;
 /// a null plane is a cache with no envelopes, which the launcher reads
 /// as nothing to do.
+///
+/// # This was the tree's `ffi::pie_k_layout_launch_envelope_seed_empty_bf16`
+///
+/// It called `layout/envelope.cu`'s `launch_envelope_seed_empty_bf16` through
+/// a shim entry `abi::emit_c_shim` generated from
+/// `table::driver_internal`'s `envelope_seed` row. **Both are gone**: the
+/// `.cu` is deleted, the row is deleted, and the launch is
+/// [`crate::fire::envelope::seed_empty`] — a driver-owned
+/// `kernels::Launch` over a `LaunchRule::Unstated` JIT row. The signature
+/// here does not change, so no caller of this function does.
+///
+/// The [`crate::fire::envelope::Envelope`] answer is dropped rather than
+/// returned, and that is this function's own decision rather than an
+/// oversight: the C++ launcher returned `void` and its guard was silent, the
+/// callers in `pools/kv_cache_live.rs` pass extents the cache allocated
+/// against and cannot be empty, and a `Result` here would be a new refusal
+/// channel for a condition no caller can act on. `#[must_use]` on the enum is
+/// what makes dropping it a decision spelled out loud.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn seed_envelopes_empty(
     env_min: *mut u16,
@@ -399,16 +417,16 @@ pub fn seed_envelopes_empty(
     head_dim: i32,
     stream: crate::device::StreamRef<'_>,
 ) {
-    unsafe {
-        ffi::pie_k_layout_launch_envelope_seed_empty_bf16(
+    let _ = unsafe {
+        crate::fire::envelope::seed_empty(
             env_min,
             env_max,
             num_pages,
             num_kv_heads,
             head_dim,
             stream.as_raw().cast(),
-        );
-    }
+        )
+    };
 }
 
 #[cfg(test)]

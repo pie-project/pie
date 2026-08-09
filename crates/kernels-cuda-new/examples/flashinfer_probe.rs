@@ -33,7 +33,8 @@
 //! * **Six carried headers of our own** — `cstdint`, `type_traits`, `cuda.h`,
 //!   `cuda_runtime.h`, `bit`, `boost/math/ccmath/fabs.hpp`. Each exists because
 //!   guarding its include was measured and REFUSED: the names in it reach
-//!   device code. They are in `csrc/vendor/` beside the tree they serve and
+//!   device code. They are in `csrc/shim/` beside the other headers that
+//!   answer for a compiler this one is not, and
 //!   each says in its own banner what it replaces and why.
 //! * **The device and CCCL headers**, which are somebody else's shims and are
 //!   reported in two configurations below.
@@ -71,7 +72,7 @@
 //! the source is acceptable and everything after is about the shims. Mixing the
 //! two questions would produce one result that answers neither.
 //!
-//! **The shims** run second, with `csrc/src/`'s hand-written replacements for
+//! **The shims** run second, with `csrc/shim/`'s hand-written replacements for
 //! whatever exists at the moment this runs — the set is discovered rather than
 //! assumed, because those files are being written by other hands and a probe
 //! that hard-coded them would report on a snapshot. What has no shim yet falls
@@ -146,38 +147,53 @@ mod probe {
     /// list went on carrying the file it used to be.
     ///
     /// The split here is by prefix because the directory is: `flashinfer/…` is
-    /// somebody else's tree — the closure this probe reports on — and everything
-    /// else under `csrc/vendor` is ours.
+    /// somebody else's tree — the closure this probe reports on. Since the
+    /// role cut there is nothing else under `csrc/vendor`, so this is now the
+    /// whole of it plus the second spellings its own relative directives
+    /// register.
     fn closure() -> impl Iterator<Item = &'static Header> {
         source::VENDOR.iter().filter(|h| h.name.starts_with("flashinfer/"))
     }
 
-    /// Everything under `csrc/vendor` that is not FlashInfer's.
+    /// The impersonating headers the closure resolves its non-FlashInfer
+    /// names against.
     ///
     /// The headers PIE carries so that a guard did not have to lie.
     ///
     /// `cstdint`, `type_traits`, `cuda.h`, `cuda_runtime.h`, `bit`,
-    /// `boost/math/ccmath/fabs.hpp` — everything under `csrc/vendor` that is not
-    /// FlashInfer. Every one of them was a guard first, and every one of those
-    /// guards was measured and refused. `#ifndef __CUDACC_RTC__` around
-    /// `#include <cstdint>` compiles and then deletes `uint32_t` from 2,512
-    /// device declarations; around `<cuda_runtime.h>` it deletes `ushort`, which
-    /// `math.cuh`'s `ex2.approx.f16` wrapper is written in; around `<cuda.h>` it
-    /// silently unsets `CUDA_VERSION` and the fp4 vector types disappear with no
-    /// diagnostic at all. A host header whose names reach device code is CARRIED,
-    /// under the exact spelling the directive uses. That rule is the difference
-    /// between 33 guards and roughly seventy.
-    /// By text, not by name: since the generator registers a file under every
-    /// spelling that reaches it, `mask.cuh` and `../cp_async.cuh` are `flashinfer/`
-    /// files wearing a name that does not say so, and counting by prefix alone
-    /// would file thirty-two of them here.
+    /// `boost/math/ccmath/fabs.hpp`. Every one of them was a guard first, and
+    /// every one of those guards was measured and refused.
+    /// `#ifndef __CUDACC_RTC__` around `#include <cstdint>` compiles and then
+    /// deletes `uint32_t` from 2,512 device declarations; around
+    /// `<cuda_runtime.h>` it deletes `ushort`, which `math.cuh`'s
+    /// `ex2.approx.f16` wrapper is written in; around `<cuda.h>` it silently
+    /// unsets `CUDA_VERSION` and the fp4 vector types disappear with no
+    /// diagnostic at all. A host header whose names reach device code is
+    /// CARRIED, under the exact spelling the directive uses. That rule is the
+    /// difference between 33 guards and roughly seventy.
+    ///
+    /// They used to sit at the root of `csrc/vendor`, and this function used
+    /// to find them by *not* being FlashInfer's — a definition by exclusion,
+    /// which is what a provenance-shaped tree forces. Since `csrc/` was cut by
+    /// ROLE they are in `csrc/shim/` beside the eight PIE wrote for its own
+    /// text, and the same set is now named positively: [`source::SHIM`] IS the
+    /// impersonation layer, so this is a filter for the ones this closure
+    /// actually reaches rather than a subtraction.
+    ///
+    /// `csrc/vendor` therefore now partitions cleanly into the closure and its
+    /// second spellings, with nothing of ours left in it.
     fn carried() -> impl Iterator<Item = &'static Header> {
-        source::VENDOR.iter().filter(|h| {
-            !h.name.starts_with("flashinfer/") && !closure().any(|c| c.text == h.text)
-        })
+        // The six that arrived because FlashInfer asked, as opposed to the
+        // eight in `SHIMMABLE` that PIE's own text asks for. Both sets are in
+        // `csrc/shim/` now; the split here is about who needs them, which is
+        // what this probe reports on.
+        const VENDOR_SHIMS: &[&str] =
+            &["bit", "boost/math/ccmath/fabs.hpp", "cstdint", "cuda.h", "cuda_runtime.h",
+              "type_traits"];
+        source::SHIM.iter().filter(|h| VENDOR_SHIMS.contains(&h.name))
     }
 
-    /// One of `csrc/src`'s shims, by the name an `#include` spells.
+    /// One of `csrc/shim`'s headers, by the name an `#include` spells.
     ///
     /// Looked up in [`source::DEVICE_HEADERS`] rather than `include_str!`-ed, for the same
     /// reason the closure is: those files are other hands' work, and a probe that
@@ -189,7 +205,7 @@ mod probe {
     /// The names the closure reaches outside itself and outside the standard
     /// library, in the order a report should mention them.
     ///
-    /// These eight are what `csrc/src/` is expected to answer with hand-written
+    /// These eight are what `csrc/shim/` is expected to answer with hand-written
     /// shims. The probe looks for each one there at run time and falls back to the
     /// crutch, so the report is a statement about the moment it ran.
     const SHIMMABLE: &[&str] = &[
@@ -256,7 +272,7 @@ mod probe {
         /// `nvrtcCreateProgram` return `NVRTC_ERROR_INVALID_INPUT` before a single
         /// line is compiled, which cost an hour the first time it happened.
         entries: Vec<Entry>,
-        /// Shim names taken from `csrc/src/`.
+        /// Shim names taken from `csrc/shim/`.
         shimmed: Vec<String>,
         /// Names answered by a file read out of `$CUDA_HOME` or the CCCL in the
         /// build tree.
@@ -265,7 +281,7 @@ mod probe {
         /// missing shim, not a broken source.
         missing: Vec<String>,
         /// Entries taken from the library's own [`source::DEVICE_HEADERS`] — the
-        /// prelude `csrc/src`'s shims are written against, and the one part of the
+        /// prelude `csrc/shim`'s headers are written against, and the one part of the
         /// set that the shipped crate already carries verbatim.
         ///
         /// [`source::DEVICE_HEADERS`]: kernels_cuda_new::source::DEVICE_HEADERS
@@ -297,12 +313,16 @@ mod probe {
         // numbers would be hiding the mechanism that makes the tree compile.
         let files: HashSet<&str> = source::VENDOR.iter().map(|h| h.text).collect();
         println!(
-            "VENDOR:         {} entries, {} files -- {} closure, {} PIE, {} second spellings",
+            "VENDOR:         {} entries, {} files -- {} closure, {} second spellings",
             source::VENDOR.len(),
             files.len(),
             closure().count(),
-            carried().count(),
             source::VENDOR.len() - files.len()
+        );
+        println!(
+            "SHIM:           {} headers, {} of them here because FlashInfer asks",
+            source::SHIM.len(),
+            carried().count()
         );
         println!("$CUDA_HOME:     {}", cuda.display());
         println!(
@@ -472,7 +492,7 @@ mod probe {
         // generator refuses to emit one spelling for two files, which covers a
         // collision WITHIN a tree; this is the other half -- three trees walked
         // separately and joined by a const fn, where nothing upstream can see
-        // that `csrc/src/cuda_fp16.h` and a `csrc/vendor/cuda_fp16.h` would be
+        // that `csrc/shim/cuda_fp16.h` and a `csrc/vendor/cuda_fp16.h` would be
         // two entries with one name.
         let mut names = HashSet::new();
         let doubled: Vec<&str> =
@@ -618,7 +638,7 @@ mod probe {
     /// toolkit off the build machine at run time.
     ///
     /// [`source::VENDOR`] and not [`source::ALL_HEADERS`], deliberately: the
-    /// crutch must not see `csrc/src`, or it would be measuring the shims it
+    /// crutch must not see `csrc/shim`, or it would be measuring the shims it
     /// exists to be independent of. The single exception is
     /// `cooperative_groups.h`, which is the shim in BOTH columns — NVIDIA's is a
     /// door onto a forty-file `cooperative_groups/details/` tree, and carrying it
@@ -629,7 +649,7 @@ mod probe {
     fn crutch_config(cuda: &Path) -> Config {
         let mut entries: Vec<Entry> =
             source::VENDOR.iter().map(|h| entry(h.name, Cow::Borrowed(h.text))).collect();
-        let cg = shim(COOPERATIVE_GROUPS).expect("`csrc/src` carries the CG shim");
+        let cg = shim(COOPERATIVE_GROUPS).expect("`csrc/shim` carries the CG shim");
         entries.push(entry(cg.name, Cow::Borrowed(cg.text)));
 
         let mut crutched = Vec::new();
@@ -675,7 +695,7 @@ mod probe {
     /// until `build.rs` learned to walk `csrc/`; the list is gone and the set is
     /// now the same object the crate ships.
     ///
-    /// The crutch still fills anything `csrc/src` has no shim for, and the report
+    /// The crutch still fills anything `csrc/shim` has no shim for, and the report
     /// names it. CCCL is deliberately excluded from that fallback even when a
     /// `cuda/*` name goes unanswered: mixing was measured, and with our 4 KB
     /// `cuda/std/limits` in the set CCCL's `__bit/popcount.h` finds an incomplete
@@ -708,7 +728,7 @@ mod probe {
 
         // What the crate carries that FlashInfer never asks for by name: the
         // prelude every unit gets, and the shims' own supporting files.
-        // `csrc/src/cuda_bf16.h` opens with `#include "pie_device.cuh"` -- the
+        // `csrc/shim/cuda_bf16.h` opens with `#include "pie_device.cuh"` -- the
         // shims are written against the crate's header set rather than against
         // nothing -- so a set that carried only the doors stops on a shim's first
         // line. Measured, and it is why this configuration is `ALL_HEADERS` and
