@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/nemotron_h/nemotron_h_model.hpp"
 
 #include <cstdlib>
@@ -52,7 +53,7 @@ void NemotronHModel::prepare(AttentionWorkspace& attn_ws,
 void NemotronHModel::body(Workspace& ws,
                           KvCache& kv,
                           AttentionWorkspace& attn_ws,
-                          ops::CublasHandle& cublas,
+                          kernels::gemm::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
     nemotron_h_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_,

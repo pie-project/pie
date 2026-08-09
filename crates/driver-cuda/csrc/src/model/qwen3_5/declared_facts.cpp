@@ -3,7 +3,7 @@
 #include "model/qwen3_5/declared_forward.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
 #include "model/qwen3_5/qwen3_5_moe_forward.hpp"
-#include "ops/flashinfer_moe.hpp"
+#include "moe/flashinfer_moe.hpp"
 #include "store/recurrent_state_cache.hpp"
 
 #include <algorithm>
@@ -510,7 +510,7 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
     }
 
     // The norm fold: the dense qwen3_5 forward launches
-    // launch_rmsnorm_gemma_bf16 unconditionally; the MoE forward folds
+    // kernels::norm::rmsnorm_gemma_bf16 unconditionally; the MoE forward folds
     // Gemma for everything but plain qwen3_moe
     // (qwen3_5_moe_forward.cpp::uses_gemma_rmsnorm).
     PieForwardNormVariant variant = PieForwardNormVariant::Gemma;
@@ -685,11 +685,11 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         // gives the same answer without waiting for the merge, and a
         // throw means the same thing zero does: no fused leg.
         cuda.moe_cutlass_max_rows = 0;
-        if (ops::flashinfer_cutlass_moe_enabled()) {
+        if (kernels::moe::flashinfer_cutlass_moe_enabled()) {
             std::size_t bytes = 0;
             try {
-                bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
-                    ops::MoeActivation::Swiglu, 512, cfg.hidden_size,
+                bytes = kernels::moe::flashinfer_cutlass_moe_workspace_bytes(
+                    kernels::moe::MoeActivation::Swiglu, 512, cfg.hidden_size,
                     cfg.moe_intermediate_size, cfg.num_experts,
                     cfg.num_experts_per_tok, /*tp_size=*/1, /*tp_rank=*/0);
             } catch (const std::exception&) {
@@ -730,6 +730,55 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         cuda.moe_shared_gate_dot = shared_gate_dot ? 1 : 0;
     }
 
+    // The WEIGHT REPRESENTATION, read once off the binding — 1b, and
+    // the same derivation llama_like's `build` does. Every projection
+    // this family ever carried a descriptor for is one of these; a
+    // deployment that stores two different ways is refused rather than
+    // half-stated, because the declaration carries ONE answer.
+    //
+    // `fa_o_proj` first because a full-attention layer always binds it
+    // separately: `q/k/v` disappear behind the fused `qgkv` bank and the
+    // MLP's `down` differs between the dense and MoE readings.
+    {
+        const std::optional<QuantMeta>* repr_meta = nullptr;
+        const auto consider = [&](const std::optional<QuantMeta>& m) {
+            if (m.has_value() && repr_meta == nullptr) repr_meta = &m;
+        };
+        for (const auto& layer : w.layers) {
+            consider(layer.fa_o_proj_quant);
+            consider(layer.fa_q_proj_quant);
+            consider(layer.fa_k_proj_quant);
+            consider(layer.fa_v_proj_quant);
+            if constexpr (kMoe) {
+                consider(layer.shared_down_proj_quant);
+            } else {
+                consider(layer.down_proj_quant);
+            }
+        }
+        if (repr_meta != nullptr) {
+            switch ((*repr_meta)->kind) {
+            case QuantMeta::Kind::PerTensor:
+                cuda.proj_repr = static_cast<std::uint32_t>(
+                    pie_forward::PieForwardWeightRepr::ScaledPerTensor);
+                break;
+            case QuantMeta::Kind::PerChannel:
+                cuda.proj_repr = static_cast<std::uint32_t>(
+                    pie_forward::PieForwardWeightRepr::ScaledPerChannel);
+                break;
+            case QuantMeta::Kind::PerGroup:
+                cuda.proj_repr = static_cast<std::uint32_t>(
+                    pie_forward::PieForwardWeightRepr::ScaledPerGroup);
+                break;
+            }
+            cuda.proj_zero_point =
+                (*repr_meta)->zero_point != nullptr ? 1 : 0;
+            cuda.proj_group =
+                static_cast<std::uint32_t>((*repr_meta)->group_size);
+            cuda.proj_axis =
+                static_cast<std::uint32_t>((*repr_meta)->channel_axis);
+        }
+    }
+
     // The digest naming what these traces were taken from — one format,
     // two printers (this and `emit_qwen35::facts_digest`); the live
     // static-form gate is what holds them together, llama's mechanism.
@@ -758,7 +807,8 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         "/wtm" + std::to_string(cuda.warp_tiled_max) +
         "/cm" + std::to_string(cuda.cached_max) +
         "/vs" + std::to_string(cuda.verify_stash) +
-        "/pd" + std::to_string(cuda.prefill_decode);
+        "/pd" + std::to_string(cuda.prefill_decode) +
+        "/pr" + std::to_string(cuda.proj_repr);
 
     out.decode = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);

@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The attention block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Gemma2AttnFacts {
     pub heads: u32,
     pub kv_heads: u32,
@@ -36,7 +36,7 @@ impl Gemma2AttnFacts {
 }
 
 /// The whole family.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Gemma2Facts {
     pub layers: u32,
     pub vocab: u32,

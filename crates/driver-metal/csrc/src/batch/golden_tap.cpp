@@ -51,7 +51,7 @@ bool tap_for(const Dispatch& d, const DecodeGeometry& g, Tap& out) {
         case Kernel::RopeK:         out = {"rope_k",     0, kv_dim};    return true;
         case Kernel::Sdpa:
         case Kernel::SdpaPaged:     out = {"sdpa",       3, q_dim};     return true;
-        case Kernel::AttnGate:      out = {"attn_gated", 0, q_dim};     return true;
+        case Kernel::AttnGate:      out = {"gated", 0, q_dim};     return true;
         case Kernel::QmvO:          out = {"o_proj",     4, g.hidden};  return true;
         case Kernel::Residual:      out = {"attn_resid", 2, g.hidden};  return true;
 

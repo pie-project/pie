@@ -375,14 +375,14 @@ pub enum OpKind {
     /// Qwen-2 family's attention biases (`{q,k,v}_proj.bias`), applied to
     /// the raw projections after the lora correction and before
     /// norms/rope — the hand-written `maybe_add_bias` position
-    /// (llama_like.cpp). The kernel is 1:1 (`launch_add_bias_bf16`), so
+    /// (llama_like.cpp). The kernel is 1:1 (`kernels::norm::add_bias_bf16`), so
     /// the semantic and lowered traces state the same op.
     AddBias { weight: String },
     /// Per-head RMSNorm of packed `[rows, heads * head_dim]` Q or K.
     /// `variant` selects the weight fold exactly as on [`OpKind::Rmsnorm`]:
     /// qwen3/olmo-style checkpoints multiply `w` directly (`Plain`), while
     /// qwen3.5's full-attention q/k norms fold `(1 + w)` (`Gemma` —
-    /// `full_attn_layer_body` launches `launch_rmsnorm_gemma_bf16` over
+    /// `full_attn_layer_body` launches `kernels::norm::rmsnorm_gemma_bf16` over
     /// `N * heads` rows of `head_dim`). Serde-defaulted to `Plain` and
     /// skipped there, so every pre-variant golden stays byte-identical.
     RmsnormPerHead {
@@ -397,7 +397,7 @@ pub enum OpKind {
     ///
     /// `partial` is the partial-rotary width: `Some(rotary_dim)` rotates
     /// only the first `rotary_dim` channels of each head and passes the
-    /// rest through (qwen3.5 full attention, `launch_rope_partial_bf16`);
+    /// rest through (qwen3.5 full attention, `kernels::rope::rope_partial_bf16`);
     /// `None` is the full rotation every earlier family traces. The trace
     /// states the resolved CHANNEL COUNT, not HF's `partial_rotary_factor`,
     /// for the same reason `SplitQkv` states widths rather than head
@@ -426,7 +426,7 @@ pub enum OpKind {
     /// the residual stream by its own launch, because the norm between the
     /// projection GEMM and the add is what makes the pre-norm `beta=1`
     /// fold impossible. A separate op because it is a separate launch in
-    /// the hand-written pass (`launch_residual_add_bf16`).
+    /// the hand-written pass (`kernels::norm::residual_add_bf16`).
     ResidualAdd,
     /// The WINDOW of a value along its leading dim — `x[index]`.
     ///
@@ -452,12 +452,12 @@ pub enum OpKind {
     /// [`DynAxis::PerToken`] — the `dyn` value everything expert-indexed
     /// consumes) and the routing weights (`[Tokens, k]` f32). One op
     /// because it is one launch in the hand-written MoE pass
-    /// (`launch_topk_softmax_bf16`: top-k + softmax + renormalize).
+    /// (`kernels::moe::topk_softmax_bf16`: top-k + softmax + renormalize).
     TopK { k: u32 },
     /// Per-token combine of the k routed expert outputs:
     /// `out[t] = sum_j w[t, j] * x[t, j, :]`, collapsing `[Tokens, k, d]`
     /// to `[Tokens, d]`. The hand-written MoE pass's
-    /// `launch_token_batched_weighted_sum_bf16` (the prefill path's
+    /// `kernels::moe::token_batched_weighted_sum_bf16` (the prefill path's
     /// per-expert `scatter_add_weighted` loop is a lowering of the same
     /// combine, chosen with the grouped GEMM it follows).
     WeightedSum { k: u32 },
@@ -465,14 +465,14 @@ pub enum OpKind {
     /// per-token gate broadcast over the hidden dim. Operands `[x, gate,
     /// base]` — fresh value first, the stream it lands on last, the
     /// [`TraceBuilder::residual_add`] convention. One op because it is one
-    /// launch (`launch_sigmoid_scalar_gate_add_bf16`); the `[Tokens, 1]`
+    /// launch (`kernels::mlp::sigmoid_scalar_gate_add_bf16`); the `[Tokens, 1]`
     /// gate logit comes from an ordinary `Matmul` the trace states
     /// separately, exactly as the hand-written pass launches it.
     SigmoidGateAdd,
     /// Split a packed `[rows, w0 + w1]` value at `w0` into two (two
     /// results). The GDN in-projection splits when the deployment binds the
     /// fused banks: `in_proj_qkvz` → (mixed qkv, z gate) and `in_proj_ba` →
-    /// (b, a) — `launch_split_bf16_rows` and `launch_split_qwen_gdn_ba_bf16`
+    /// (b, a) — `kernels::layout::split_bf16_rows` and `kernels::layout::split_qwen_gdn_ba_bf16`
     /// respectively, one op each because each is one launch. Distinct from
     /// [`OpKind::SplitQkv`], which is the three-way attention split.
     SplitGdn { width0: u32, width1: u32 },
@@ -491,7 +491,7 @@ pub enum OpKind {
         layer: u32,
         kernel: u32,
     },
-    /// The post-conv GDN prep (`launch_qwen_gdn_post_conv_prep_bf16`): one
+    /// The post-conv GDN prep (`kernels::ssm::qwen_gdn_post_conv_prep_bf16`): one
     /// launch that unpacks the conv output's `[q_raw | k_raw | v_raw]`,
     /// L2-normalizes q/k into compact per-head fp32, converts v to fp32,
     /// and folds `a`/`b` with the `a_log`/`dt_bias` parameters into the
@@ -511,7 +511,7 @@ pub enum OpKind {
     /// lowerings the backend picks per fire. `layer` marks the implicit
     /// per-request state slab ([`OpKind::state_ref`]).
     GatedDelta { layer: u32 },
-    /// Gated RMSNorm (`launch_rmsnorm_gated_fp32_in_bf16`): per (row,
+    /// Gated RMSNorm (`kernels::norm::rmsnorm_gated_fp32_in_bf16`): per (row,
     /// head), `out = w * rmsnorm(x) * silu(gate)`, normalizing the trailing
     /// head dim of the rank-3 f32 core output and flattening to the gate's
     /// `[Tokens, Vh * Vd]` bf16 shape (the fp32→bf16 conversion is fused
@@ -523,7 +523,7 @@ pub enum OpKind {
     RmsnormGated { weight: String },
     /// The interleaved per-head `[query | gate]` split of qwen3.5 full
     /// attention's 2×-wide gated q projection
-    /// (`launch_split_q_gate_bf16`): the packed `[rows, heads * 2 *
+    /// (`kernels::layout::split_q_gate_bf16`): the packed `[rows, heads * 2 *
     /// head_dim]` input carries, PER HEAD, `head_dim` query channels then
     /// `head_dim` gate channels — `q[n, h*d + i] = packed[n, h*2d + i]`,
     /// `gate[n, h*d + i] = packed[n, h*2d + d + i]` — so this is NOT a row
@@ -532,7 +532,7 @@ pub enum OpKind {
     /// gate, each `[rows, heads * head_dim]`.
     SplitQGate { heads: u32, head_dim: u32 },
     /// `out = x * sigmoid(gate)`, elementwise — qwen3.5 full attention's
-    /// output gate (`launch_sigmoid_gate_inplace_bf16`: `attn_out *=
+    /// output gate (`kernels::mlp::sigmoid_gate_inplace_bf16`: `attn_out *=
     /// sigmoid(gate)` before o_proj). Operands `[x, gate]`, same shape.
     /// A multiply with NO residual and no landing: distinct from
     /// [`OpKind::SigmoidGateAdd`], whose scalar per-token gate broadcasts
@@ -562,6 +562,21 @@ pub enum OpKind {
         weights: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<StateRef>,
+        /// Scalar arguments the stated kernel takes that no operand
+        /// shape gives — a rotary width, a padded head dim.
+        ///
+        /// A `Launch`'s two wire params are already spoken for (the
+        /// state mark), and a scalar that has nowhere to ride is a
+        /// scalar the DRIVER re-derives from its config. That is the
+        /// thing this arc removes, so the channel exists rather than
+        /// the derivation.
+        ///
+        /// Not a general escape hatch: a number belongs here only when
+        /// it is a property of THIS STATEMENT that no shape spells.
+        /// `eps`, `rope_theta` and a vocabulary size are properties of
+        /// the deployment, and they stay the arm's parameters.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        params: Vec<u32>,
     },
     /// The one branch a lowered trace may carry: a CHAIN of arms over
     /// per-fire RUNTIME INPUTS ([`GuardPred`], closed vocabulary) — the
@@ -1236,7 +1251,7 @@ impl TraceBuilder {
     }
 
     /// The partial-rotary form: only the first `rotary_dim` channels of
-    /// each head rotate (`launch_rope_partial_bf16`; qwen3.5's
+    /// each head rotate (`kernels::rope::rope_partial_bf16`; qwen3.5's
     /// `partial_rotary_factor` resolved to a channel count — see
     /// [`OpKind::Rope`]).
     pub fn rope_partial(
@@ -1292,11 +1307,31 @@ impl TraceBuilder {
         inputs: Vec<ValueId>,
         out_shapes: Vec<(Shape, DType)>,
     ) -> Vec<ValueId> {
+        self.launch_with_params(kernel, weights, state, Vec::new(), inputs, out_shapes)
+    }
+
+    /// [`Self::launch`], plus the scalar arguments the symbol takes
+    /// that no operand shape gives — see [`OpKind::Launch::params`].
+    ///
+    /// A separate entry point rather than a sixth argument on `launch`,
+    /// because the overwhelming majority of statements have no such
+    /// scalar and a `Vec::new()` at every one of them would say
+    /// nothing.
+    pub fn launch_with_params(
+        &mut self,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        params: Vec<u32>,
+        inputs: Vec<ValueId>,
+        out_shapes: Vec<(Shape, DType)>,
+    ) -> Vec<ValueId> {
         self.push(
             OpKind::Launch {
                 kernel: kernel.to_string(),
                 weights,
                 state,
+                params,
             },
             inputs,
             out_shapes,
@@ -1316,7 +1351,7 @@ impl TraceBuilder {
     /// Router top-k: `(indices, weights)`, both `[Tokens, k]`. The indices
     /// are the trace's first `dyn` value ([`DynAxis::PerToken`]); the
     /// weights are already softmaxed and renormalized, because the launch
-    /// this op mirrors (`launch_topk_softmax_bf16`) does all three.
+    /// this op mirrors (`kernels::moe::topk_softmax_bf16`) does all three.
     pub fn topk(&mut self, logits: ValueId, k: u32) -> (ValueId, ValueId) {
         let rows = self.values[logits as usize].shape.0[0];
         let out = self.push(

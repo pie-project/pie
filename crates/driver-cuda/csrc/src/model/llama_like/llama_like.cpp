@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/llama_like/llama_like.hpp"
 
 #include <algorithm>
@@ -15,25 +16,26 @@
 #include "comm/custom_all_reduce.hpp"
 #include "batch/forward_graph.hpp"  // prefill_graph_enabled()
 #include "cuda_check.hpp"
-#include "kernels/add_bias.hpp"
-#include "kernels/argmax.hpp"
-#include "kernels/dtype_cast.hpp"
-#include "kernels/embed.hpp"
-#include "kernels/gather_rows.hpp"
-#include "kernels/head_dim_pad.hpp"
-#include "kernels/kv_paged.hpp"
-#include "kernels/residual_add.hpp"
-#include "kernels/rmsnorm.hpp"
-#include "kernels/rope.hpp"
-#include "kernels/split_packed.hpp"
-#include "kernels/swiglu.hpp"
+#include "norm/add_bias.hpp"
+#include "sample/argmax.hpp"
+#include "quant/dtype_cast.hpp"
+#include "layout/embed.hpp"
+#include "layout/gather_rows.hpp"
+#include "attn/head_dim_pad.hpp"
+#include "attn/kv_paged.hpp"
+#include "norm/residual_add.hpp"
+#include "norm/rmsnorm.hpp"
+#include "rope/rope.hpp"
+#include "attn/qkv_fused.hpp"
+#include "attn/split_packed.hpp"
+#include "mlp/swiglu.hpp"
 #include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"
 #include "model/attn_page_mask.hpp"
 #include "model/attn_score.hpp"
 #include "model/lora.hpp"
 #include "model/stage_hooks.hpp"
-#include "ops/attention_flashinfer.hpp"
-#include "ops/gemm.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -133,7 +135,7 @@ inline void maybe_add_bias(
     int N, int dim, cudaStream_t stream)
 {
     if (bias_tensor == nullptr) return;
-    kernels::launch_add_bias_bf16(out, bias_tensor->data(), N, dim, stream);
+    kernels::norm::add_bias_bf16(out, bias_tensor->data(), N, dim, stream);
 }
 
 // Row `row` of a row-major bf16 buffer of width `width`. Used to hand a
@@ -198,7 +200,7 @@ struct LoraFireState {
         bool grouped = false;
     };
     // One same-shape group: lanes whose (rank, d_in, d_out, num_layers)
-    // agree, lowered through ops::gemm_grouped_act_x_wt_bf16 (shared N/K
+    // agree, lowered through kernels::gemm::grouped_act_x_wt_bf16 (shared N/K
     // per call, per-lane M = token span). Only groups of size >= 2 are
     // kept; a group of 1 has nothing to share and stays a per-lane pair.
     struct Group {
@@ -322,7 +324,7 @@ struct LoraFireState {
                 Lane out{&lane, nullptr, nullptr};
                 out.a_bf16 = arena.alloc(l_elems * 2);
                 lanes.push_back(out);
-                kernels::launch_cast_fp32_to_bf16(
+                kernels::quant::cast_fp32_to_bf16(
                     lane.a, out.a_bf16, l_elems, stream);
                 continue;
             }
@@ -355,9 +357,9 @@ struct LoraFireState {
             out.a_bf16 = arena.alloc(a_elems * 2);
             out.b_bf16 = arena.alloc(b_elems * 2);
             lanes.push_back(out);
-            kernels::launch_cast_fp32_to_bf16(
+            kernels::quant::cast_fp32_to_bf16(
                 lane.a, out.a_bf16, a_elems, stream);
-            kernels::launch_cast_fp32_to_bf16(
+            kernels::quant::cast_fp32_to_bf16(
                 lane.b, out.b_bf16, b_elems, stream);
         }
 
@@ -622,7 +624,7 @@ struct LoraFireState {
     //   * solo lanes — one [t, R] GEMM into scratch, then one beta=1 GEMM
     //     per named site into that lane's token rows, stream-ordered;
     //   * same-shape groups — both GEMMs go through
-    //     ops::gemm_grouped_act_x_wt_bf16 (shared N/K, per-lane M;
+    //     kernels::gemm::grouped_act_x_wt_bf16 (shared N/K, per-lane M;
     //     pointer arrays staged into the device-resident `ptr_slab` —
     //     see its member note), one launch per correction GEMM per group.
     // Ranks may still differ ACROSS groups (different rank = different
@@ -660,16 +662,16 @@ struct LoraFireState {
             // xA^T -> scratch [t, R]. Solo lanes reuse the same scratch
             // base: the stream orders each lane's pair before the next
             // lane's overwrite (and before any group's grouped write).
-            ops::gemm_act_x_wt_bf16(
+            kernels::gemm::act_x_wt_bf16(
                 handle, x, a_l, xa_scratch, t, R, H);
             if ((v.sites_bits & kLoraSiteQ) != 0) {
-                ops::gemm_act_x_wt_bf16(
+                kernels::gemm::act_x_wt_bf16(
                     handle, xa_scratch, b_l,
                     bf16_row(q_out, static_cast<int>(v.token_start), Hq),
                     t, static_cast<int>(v.d_out), R, /*beta=*/1.f);
             }
             if ((v.sites_bits & kLoraSiteV) != 0) {
-                ops::gemm_act_x_wt_bf16(
+                kernels::gemm::act_x_wt_bf16(
                     handle, xa_scratch, b_l,
                     bf16_row(v_out, static_cast<int>(v.token_start), Hk),
                     t, static_cast<int>(v.d_out), R, /*beta=*/1.f);
@@ -687,7 +689,7 @@ struct LoraFireState {
             const void* const* x_ptrs = slot;
             const void* const* a_ptrs = x_ptrs + n;
             const auto* xa_ptrs = x_ptrs + 2 * n;
-            ops::gemm_grouped_act_x_wt_bf16(
+            kernels::gemm::grouped_act_x_wt_bf16(
                 handle, x_ptrs, a_ptrs,
                 const_cast<void* const*>(xa_ptrs),
                 g.m.data(), static_cast<int>(n), g.rank, g.d_in);
@@ -699,14 +701,14 @@ struct LoraFireState {
             // so the span list is the same prefix-free filter of `m`.
             if (g.nq > 0) {
                 const auto* base = x_ptrs + 3 * n;
-                ops::gemm_grouped_act_x_wt_bf16(
+                kernels::gemm::grouped_act_x_wt_bf16(
                     handle, base, base + g.nq,
                     const_cast<void* const*>(base + 2 * g.nq),
                     g.mq.data(), g.nq, g.d_out, g.rank, /*beta=*/1.f);
             }
             if (g.nv > 0) {
                 const auto* base = x_ptrs + 3 * n + 3 * g.nq;
-                ops::gemm_grouped_act_x_wt_bf16(
+                kernels::gemm::grouped_act_x_wt_bf16(
                     handle, base, base + g.nv,
                     const_cast<void* const*>(base + 2 * g.nv),
                     g.mv.data(), g.nv, g.d_out, g.rank, /*beta=*/1.f);
@@ -723,13 +725,13 @@ struct LoraFireState {
                 static_cast<const std::uint16_t*>(lane.a_bf16) +
                 static_cast<std::size_t>(layer) * v.d_out;
             if ((v.sites_bits & kLoraSiteQ) != 0) {
-                kernels::launch_scale_rows_bf16(
+                kernels::quant::scale_rows_bf16(
                     bf16_row(q_out,
                              static_cast<int>(v.token_start), Hq),
                     l_l, t, static_cast<int>(v.d_out), stream);
             }
             if ((v.sites_bits & kLoraSiteV) != 0) {
-                kernels::launch_scale_rows_bf16(
+                kernels::quant::scale_rows_bf16(
                     bf16_row(v_out,
                              static_cast<int>(v.token_start), Hk),
                     l_l, t, static_cast<int>(v.d_out), stream);
@@ -753,7 +755,7 @@ void apply_rope(
     cudaStream_t stream)
 {
     if (fwd_cfg.rope_kind == RopeKind::YaRN) {
-        kernels::launch_rope_yarn_bf16(
+        kernels::rope::rope_yarn_bf16(
             q, k, positions,
             N, num_q_heads, num_kv_heads, head_dim,
             cfg.rope_theta,
@@ -763,7 +765,7 @@ void apply_rope(
             fwd_cfg.yarn_original_max_position,
             stream);
     } else if (fwd_cfg.rope_kind == RopeKind::YaRNOriginal) {
-        kernels::launch_rope_yarn_original_bf16(
+        kernels::rope::rope_yarn_original_bf16(
             q, k, positions,
             N, num_q_heads, num_kv_heads, head_dim,
             cfg.rope_theta,
@@ -774,7 +776,7 @@ void apply_rope(
             fwd_cfg.yarn_original_max_position,
             stream);
     } else {
-        kernels::launch_rope_bf16(
+        kernels::rope::rope_bf16(
             q, k, positions,
             N, num_q_heads, num_kv_heads, head_dim,
             cfg.rope_theta, stream);
@@ -782,7 +784,7 @@ void apply_rope(
 }
 
 // Bug#2 A/B: the fused decode QKV+qk-norm+rope+KV-write kernel
-// (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
+// (`kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
 // suspect (the standalone BatchDecode attention is proven per-request-correct,
 // so the corruption is upstream in KV/Q production). PIE_CUDA_DECODE_FUSED_POST=0
 // falls back to the non-fused split-qkv + separate rope + `write_kv_to_pages`
@@ -941,7 +943,7 @@ void prepare_llama_like_decode_plan(
             }
         }
         if (!state.mask_decode_plan) {
-            state.mask_decode_plan = ops::make_prefill_plan();
+            state.mask_decode_plan = kernels::attn::make_prefill_plan();
         }
         if (std::getenv("PIE_KVPP_TRACE") != nullptr) {
             std::fprintf(stderr,
@@ -956,7 +958,7 @@ void prepare_llama_like_decode_plan(
             std::fprintf(stderr, "]\n");
         }
         const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
-        ops::plan_attention_flashinfer_prefill_bf16(
+        kernels::attn::plan_attention_flashinfer_prefill_bf16(
             *state.mask_decode_plan,
             qo_suffix.data(),
             kvpp_suffix.data(),
@@ -973,7 +975,7 @@ void prepare_llama_like_decode_plan(
             // ALSO the concurrency precondition: the suffix custom
             // dispatch now overlaps the prefix decode on the side
             // stream, so their scratch must be disjoint.
-            spatial_suffix_ws(),
+            spatial_suffix_ws().view(),
             /*stream=*/nullptr,
             fwd_cfg.decode_plan_cuda_graph,
             /*window_left=*/-1,
@@ -1038,9 +1040,9 @@ void prepare_llama_like_decode_plan(
             // the prefix's truth (requests [0, split_req), tokens
             // [0, planned rows)). No score capture: hooks are UNPLANNED.
             if (!state.prefill_plan) {
-                state.prefill_plan = ops::make_prefill_plan();
+                state.prefill_plan = kernels::attn::make_prefill_plan();
             }
-            ops::plan_attention_flashinfer_prefill_bf16(
+            kernels::attn::plan_attention_flashinfer_prefill_bf16(
                 *state.prefill_plan,
                 qo_indptr_h,
                 kv_page_indptr_h,
@@ -1051,7 +1053,7 @@ void prepare_llama_like_decode_plan(
                 num_kv_heads_local,
                 cfg.head_dim_kernel,
                 cache.page_size(),
-                attn_ws,
+                attn_ws.view(),
                 /*stream=*/nullptr,
                 fwd_cfg.decode_plan_cuda_graph,
                 fwd_cfg.sliding_window,
@@ -1100,12 +1102,12 @@ void prepare_llama_like_decode_plan(
                     }
                     if (!state.mixed_mid_decode_plan) {
                         state.mixed_mid_decode_plan =
-                            ops::make_decode_plan();
+                            kernels::attn::make_decode_plan();
                     }
-                    ops::plan_attention_flashinfer_decode(
+                    kernels::attn::plan_attention_flashinfer_decode(
                         *state.mixed_mid_decode_plan, kvpp_mid.data(),
                         mid, num_q_heads_local, num_kv_heads_local,
-                        cfg.head_dim_kernel, cache.page_size(), attn_ws,
+                        cfg.head_dim_kernel, cache.page_size(), attn_ws.view(),
                         /*stream=*/nullptr,
                         fwd_cfg.decode_plan_cuda_graph,
                         decode_full_attention_variant_enabled() &&
@@ -1116,7 +1118,7 @@ void prepare_llama_like_decode_plan(
                     // Re-plan the prefix CAUSAL to the prefill lanes
                     // only (requests [0, P), tokens qo[P]) — the middle
                     // now belongs to the decode kernel.
-                    ops::plan_attention_flashinfer_prefill_bf16(
+                    kernels::attn::plan_attention_flashinfer_prefill_bf16(
                         *state.prefill_plan,
                         qo_indptr_h,
                         kv_page_indptr_h,
@@ -1127,7 +1129,7 @@ void prepare_llama_like_decode_plan(
                         num_kv_heads_local,
                         cfg.head_dim_kernel,
                         cache.page_size(),
-                        attn_ws,
+                        attn_ws.view(),
                         /*stream=*/nullptr,
                         fwd_cfg.decode_plan_cuda_graph,
                         fwd_cfg.sliding_window,
@@ -1164,9 +1166,9 @@ void prepare_llama_like_decode_plan(
                 }
             }
             if (!state.mask_decode_plan) {
-                state.mask_decode_plan = ops::make_prefill_plan();
+                state.mask_decode_plan = kernels::attn::make_prefill_plan();
             }
-            ops::plan_attention_flashinfer_prefill_bf16(
+            kernels::attn::plan_attention_flashinfer_prefill_bf16(
                 *state.mask_decode_plan,
                 qo_suffix.data(),
                 kvpp_suffix.data(),
@@ -1179,7 +1181,7 @@ void prepare_llama_like_decode_plan(
                 num_kv_heads_local,
                 cfg.head_dim_kernel,
                 cache.page_size(),
-                spatial_suffix_ws(),
+                spatial_suffix_ws().view(),
                 /*stream=*/nullptr,
                 fwd_cfg.decode_plan_cuda_graph,
                 /*window_left=*/-1,
@@ -1201,12 +1203,12 @@ void prepare_llama_like_decode_plan(
         auto& mask_plan = is_pure_decode ? state.mask_decode_plan
                                          : state.prefill_plan;
         if (!mask_plan) {
-            mask_plan = ops::make_prefill_plan();
+            mask_plan = kernels::attn::make_prefill_plan();
         }
         const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         const int num_q_heads_local  = cfg.num_attention_heads / T;
         const int num_kv_heads_local = cfg.num_key_value_heads / T;
-        ops::plan_attention_flashinfer_prefill_bf16(
+        kernels::attn::plan_attention_flashinfer_prefill_bf16(
             *mask_plan,
             qo_indptr_h,
             kv_page_indptr_h,
@@ -1217,7 +1219,7 @@ void prepare_llama_like_decode_plan(
             num_kv_heads_local,
             cfg.head_dim_kernel,
             cache.page_size(),
-            attn_ws,
+            attn_ws.view(),
             /*stream=*/nullptr,
             fwd_cfg.decode_plan_cuda_graph,
             /*window_left=*/-1,
@@ -1242,7 +1244,7 @@ void prepare_llama_like_decode_plan(
         }
         state.use_xqa_decode = true;
         state.xqa_max_pages_per_seq =
-            ops::xqa_decode_page_bucket(max_pages);
+            kernels::attn::xqa_decode_page_bucket(max_pages);
         // ④ envelope banding: this deployment's band walk is PLAN-FREE
         // (the XQA arm reads the fire's staged device CSRs and takes the
         // row count as a parameter), so stamping k/rows is ALL the
@@ -1273,7 +1275,7 @@ void prepare_llama_like_decode_plan(
         // sliding-window layouts keep the older per-layer planner path.
         if (fwd_cfg.per_layer_window_left.empty()) {
             if (!state.prefill_plan) {
-                state.prefill_plan = ops::make_prefill_plan();
+                state.prefill_plan = kernels::attn::make_prefill_plan();
             }
             const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
             const int num_q_heads_local  = cfg.num_attention_heads / T;
@@ -1286,7 +1288,7 @@ void prepare_llama_like_decode_plan(
             // softmax discards.
             const std::uint32_t score_window =
                 (fwd_cfg.sliding_window < 0) ? attn_score_window : 0u;
-            ops::plan_attention_flashinfer_prefill_bf16(
+            kernels::attn::plan_attention_flashinfer_prefill_bf16(
                 *state.prefill_plan,
                 qo_indptr_h,
                 kv_page_indptr_h,
@@ -1297,7 +1299,7 @@ void prepare_llama_like_decode_plan(
                 num_kv_heads_local,
                 cfg.head_dim_kernel,
                 cache.page_size(),
-                attn_ws,
+                attn_ws.view(),
                 /*stream=*/nullptr,
                 // `graph_mode_plan` marks the plan CUDA-graph capturable
                 // (`PrefillPlanCache::graph_capturable`), which is what
@@ -1393,7 +1395,7 @@ void prepare_llama_like_decode_plan(
          avg_kv_pages >= min_prefill_decode_pages);
     if (state.use_prefill_decode_plan) {
         if (!state.prefill_decode_plan) {
-            state.prefill_decode_plan = ops::make_prefill_plan();
+            state.prefill_decode_plan = kernels::attn::make_prefill_plan();
         }
         const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         const int num_q_heads_local  = cfg.num_attention_heads / T;
@@ -1412,12 +1414,12 @@ void prepare_llama_like_decode_plan(
              avg_kv_pages >= min_full_attention_pages) &&
             fwd_cfg.sliding_window < 0 &&
             fwd_cfg.per_layer_window_left.empty();
-        ops::plan_attention_flashinfer_prefill_bf16(
+        kernels::attn::plan_attention_flashinfer_prefill_bf16(
             *state.prefill_decode_plan, qo_indptr_h.data(), kv_page_indptr_h,
             kv_last_page_lens_h,
             /*total_tokens=*/num_requests, num_requests,
             num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
-            cache.page_size(), attn_ws, /*stream=*/nullptr,
+            cache.page_size(), attn_ws.view(), /*stream=*/nullptr,
             fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
             full_attention_variant, cache.hnd_layout(),
             /*causal_mask=*/false);
@@ -1434,9 +1436,9 @@ void prepare_llama_like_decode_plan(
                 if (rows == 0) continue;
                 if (!state.depth_band_prefill_plans[j]) {
                     state.depth_band_prefill_plans[j] =
-                        ops::make_prefill_plan();
+                        kernels::attn::make_prefill_plan();
                 }
-                ops::plan_attention_flashinfer_prefill_bf16(
+                kernels::attn::plan_attention_flashinfer_prefill_bf16(
                     *state.depth_band_prefill_plans[j],
                     qo_indptr_h.data(), kv_page_indptr_h,
                     kv_last_page_lens_h,
@@ -1444,7 +1446,7 @@ void prepare_llama_like_decode_plan(
                     static_cast<int>(rows),
                     num_q_heads_local, num_kv_heads_local,
                     cfg.head_dim_kernel, cache.page_size(),
-                    depth_band_ws(static_cast<int>(j)),
+                    depth_band_ws(static_cast<int>(j)).view(),
                     /*stream=*/nullptr,
                     fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
                     full_attention_variant, cache.hnd_layout(),
@@ -1460,15 +1462,15 @@ void prepare_llama_like_decode_plan(
         return;
     }
     if (!state.decode_plan) {
-        state.decode_plan = ops::make_decode_plan();
+        state.decode_plan = kernels::attn::make_decode_plan();
     }
     const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
     const int num_q_heads_local  = cfg.num_attention_heads / T;
     const int num_kv_heads_local = cfg.num_key_value_heads / T;
-    ops::plan_attention_flashinfer_decode(
+    kernels::attn::plan_attention_flashinfer_decode(
         *state.decode_plan, kv_page_indptr_h, num_requests,
         num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
-        cache.page_size(), attn_ws, /*stream=*/nullptr,
+        cache.page_size(), attn_ws.view(), /*stream=*/nullptr,
         fwd_cfg.decode_plan_cuda_graph,
         decode_full_attention_variant_enabled() &&
             fwd_cfg.sliding_window < 0 && fwd_cfg.per_layer_window_left.empty(),
@@ -1484,13 +1486,13 @@ void prepare_llama_like_decode_plan(
         full_depth_rows < static_cast<std::uint32_t>(num_requests) &&
         is_pure_decode && !have_custom_mask) {
         if (!state.depth_prefix_decode_plan) {
-            state.depth_prefix_decode_plan = ops::make_decode_plan();
+            state.depth_prefix_decode_plan = kernels::attn::make_decode_plan();
         }
-        ops::plan_attention_flashinfer_decode(
+        kernels::attn::plan_attention_flashinfer_decode(
             *state.depth_prefix_decode_plan, kv_page_indptr_h,
             static_cast<int>(full_depth_rows),
             num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
-            cache.page_size(), spatial_suffix_attn_ws(),
+            cache.page_size(), spatial_suffix_attn_ws().view(),
             /*stream=*/nullptr,
             fwd_cfg.decode_plan_cuda_graph,
             decode_full_attention_variant_enabled() &&
@@ -1519,13 +1521,13 @@ void prepare_llama_like_decode_plan(
             // against the fire's own staged workspace instead.
             if (state.use_xqa_decode) continue;
             if (!state.depth_band_plans[j]) {
-                state.depth_band_plans[j] = ops::make_decode_plan();
+                state.depth_band_plans[j] = kernels::attn::make_decode_plan();
             }
-            ops::plan_attention_flashinfer_decode(
+            kernels::attn::plan_attention_flashinfer_decode(
                 *state.depth_band_plans[j], kv_page_indptr_h,
                 static_cast<int>(rows),
                 num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
-                cache.page_size(), depth_band_ws(static_cast<int>(j)),
+                cache.page_size(), depth_band_ws(static_cast<int>(j)).view(),
                 /*stream=*/nullptr,
                 fwd_cfg.decode_plan_cuda_graph,
                 decode_full_attention_variant_enabled() &&
@@ -1559,27 +1561,27 @@ std::uint32_t llama_like_decode_graph_layout(
         std::uint64_t h = mix(
             0x5350414Cull ^
             static_cast<std::uint64_t>(state.spatial_mask_split));
-        h = mix(h ^ ops::prefill_plan_graph_layout(
+        h = mix(h ^ kernels::attn::prefill_plan_graph_layout(
                         *state.mask_decode_plan));
         if (state.spatial_mask_split > 0 && state.decode_plan) {
-            h = mix(h ^ ops::decode_plan_graph_layout(*state.decode_plan));
+            h = mix(h ^ kernels::attn::decode_plan_graph_layout(*state.decode_plan));
         }
         return static_cast<std::uint32_t>(h & 0x00ffffffu);
     }
     if (state.use_xqa_decode) {
-        return ops::xqa_decode_graph_layout(state.xqa_max_pages_per_seq);
+        return kernels::attn::xqa_decode_graph_layout(state.xqa_max_pages_per_seq);
     }
     if (state.use_prefill_decode_plan && state.prefill_decode_plan) {
-        return ops::prefill_plan_graph_layout(*state.prefill_decode_plan);
+        return kernels::attn::prefill_plan_graph_layout(*state.prefill_decode_plan);
     }
     if (state.use_prefill_plan && state.prefill_plan) {
-        return ops::prefill_plan_graph_layout(*state.prefill_plan);
+        return kernels::attn::prefill_plan_graph_layout(*state.prefill_plan);
     }
     if (state.use_mask_decode_plan && state.mask_decode_plan) {
-        return ops::prefill_plan_graph_layout(*state.mask_decode_plan);
+        return kernels::attn::prefill_plan_graph_layout(*state.mask_decode_plan);
     }
     if (!state.decode_plan) return 0;
-    return ops::decode_plan_graph_layout(*state.decode_plan);
+    return kernels::attn::decode_plan_graph_layout(*state.decode_plan);
 }
 
 std::uint32_t llama_like_supergraph_graph_layout(
@@ -1595,13 +1597,13 @@ std::uint32_t llama_like_supergraph_graph_layout(
     // shifts the key and recaptures, exactly the existing per-layout
     // discipline.
     const std::uint32_t decode_side = state.use_xqa_decode
-        ? ops::xqa_decode_graph_layout(state.xqa_max_pages_per_seq)
+        ? kernels::attn::xqa_decode_graph_layout(state.xqa_max_pages_per_seq)
         : (state.decode_plan
-               ? ops::decode_plan_graph_layout(*state.decode_plan)
+               ? kernels::attn::decode_plan_graph_layout(*state.decode_plan)
                : 0u);
     const std::uint32_t mask_side =
         state.mask_decode_plan
-            ? ops::prefill_plan_graph_layout(*state.mask_decode_plan)
+            ? kernels::attn::prefill_plan_graph_layout(*state.mask_decode_plan)
             : 0u;
     // splitmix-style mix so the pair cannot alias a plain layout.
     std::uint32_t h = decode_side + 0x9e3779b9u;
@@ -1616,7 +1618,7 @@ bool llama_like_prefill_graph_capturable(const LlamaLikePlanState& state)
     // through the pure-decode rules, so only the true prefill plan is
     // reported here.
     if (state.use_prefill_plan && state.prefill_plan) {
-        return ops::prefill_plan_graph_capturable(*state.prefill_plan);
+        return kernels::attn::prefill_plan_graph_capturable(*state.prefill_plan);
     }
     return false;
 }
@@ -1629,7 +1631,7 @@ void llama_like_forward_paged(
     Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -1744,7 +1746,7 @@ void llama_like_forward_paged(
         : -1.f;  // -1 = let the dispatch pick `1/sqrt(dk)`
 
     // 1. Embed.
-    kernels::launch_embed_bf16(
+    kernels::layout::embed_bf16(
         token_ids, w.embed->data(), ws.y.data(),
         N, H, cfg.vocab_size, stream);
 
@@ -1771,7 +1773,7 @@ void llama_like_forward_paged(
     // hole in a non-last page). Route it through the custom-mask prefill path
     // (the `else if (custom_mask_d)` branch below). Disabling `use_decode_path`
     // ALSO disables the fused decode qkv-postproc (below), so the per-beam KV
-    // write goes through `launch_write_kv_to_pages`, whose page-run derivation
+    // write goes through `kernels::attn::write_kv_to_pages`, whose page-run derivation
     // (abs_kv_pos = klen-1) lands each beam's new token on (last live page,
     // last_page_len-1) = the correct freeze/heir write target.
     const bool has_custom_mask = (custom_mask_d != nullptr);
@@ -1788,11 +1790,11 @@ void llama_like_forward_paged(
     // cudaStream capture region) — the body just reads from
     // `plan_state.decode_plan`. Keeps the body purely device-side so
     // the executor can capture it into a CUDA graph.
-    const ops::DecodePlanCache* decode_plan =
+    const kernels::attn::DecodePlanCache* decode_plan =
         plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
-    const ops::PrefillPlanCache* prefill_decode_plan =
+    const kernels::attn::PrefillPlanCache* prefill_decode_plan =
         plan_state.prefill_decode_plan ? plan_state.prefill_decode_plan.get() : nullptr;
-    const ops::PrefillPlanCache* prefill_plan =
+    const kernels::attn::PrefillPlanCache* prefill_plan =
         plan_state.prefill_plan ? plan_state.prefill_plan.get() : nullptr;
     // SnapKV's observation window only exists on the true prefill branch: the
     // prepare hook plans the score-capturing dispatch there and nowhere else,
@@ -1804,14 +1806,14 @@ void llama_like_forward_paged(
         !use_decode_path && !has_custom_mask;
 
     if (use_xqa_decode_path) {
-        ops::prepare_attention_xqa_decode_bf16(
+        kernels::attn::prepare_attention_xqa_decode_bf16(
             kv_page_indices,
             kv_page_indptr,
             kv_last_page_lens,
             R,
             cache.page_size(),
             plan_state.xqa_max_pages_per_seq,
-            attn_ws,
+            attn_ws.view(),
             stream);
     }
 
@@ -1843,9 +1845,9 @@ void llama_like_forward_paged(
     // text is unchanged. Depth fires are pure decode, so N == R and
     // the full-depth prefix is rows [0, split) of every base array.
     const auto run_layer = [&](const int L, const int N, const int R,
-                               const ops::DecodePlanCache* decode_plan,
+                               const kernels::attn::DecodePlanCache* decode_plan,
                                AttentionWorkspace& attn_ws,
-                               const ops::PrefillPlanCache*
+                               const kernels::attn::PrefillPlanCache*
                                    prefill_plan_override = nullptr) {
         // Tier 2: hook stages fire only while the hook rows are live —
         // a truncated hook region's rows freeze past its k in the banded
@@ -1866,7 +1868,7 @@ void llama_like_forward_paged(
         const void* qkv_in = ws.y.data();
         if (!post_norm) {
             if (!have_next_attn_norm) {
-                kernels::launch_rmsnorm_bf16(
+                kernels::norm::rmsnorm_bf16(
                     ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
                     N, H, eps, stream);
             }
@@ -1930,12 +1932,12 @@ void llama_like_forward_paged(
                          R, fast_rows, fused_decode_qkv_post ? 1 : 0);
         }
         if (use_fused_qkv) {
-            ops::gemm_act_x_w(cublas.handle(),
-                qkv_in, ops::WeightView(*layer.qkv_proj_fused),
+            kernels::gemm::act_x_w(cublas.handle(),
+                qkv_in, WeightView(*layer.qkv_proj_fused),
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
             if (fused_decode_qkv_post) {
                 if (!rope_table_ready && !ws.rope_table.empty()) {
-                    kernels::launch_rope_standard_table(
+                    kernels::rope::rope_standard_table(
                         positions,
                         static_cast<float*>(ws.rope_table.data()),
                         N, d, cfg.rope_theta, stream);
@@ -1947,7 +1949,7 @@ void llama_like_forward_paged(
                     // Device-window capture: both regions launch at the
                     // full-N grid and read the split from the device word,
                     // so the exec replays across row splits.
-                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+                    kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                         ws.qkv_fused.data(),
                         ws.q.data(),
                         cache.k(L), cache.v(L),
@@ -1962,12 +1964,12 @@ void llama_like_forward_paged(
                         N, num_q_heads_local, num_kv_heads_local, d,
                         cache.page_size(), cache.hnd_layout(),
                         cfg.rope_theta, eps, stream);
-                    kernels::launch_split_qkv_bf16_devwin(
+                    kernels::attn::split_qkv_bf16_devwin(
                         ws.qkv_fused.data(),
                         ws.q.data(), ws.k.data(), ws.v.data(),
                         peel_window_d, N, Hq, Hk, stream);
                 } else {
-                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16(
                         ws.qkv_fused.data(),
                         ws.q.data(),
                         cache.k(L), cache.v(L),
@@ -1985,7 +1987,7 @@ void llama_like_forward_paged(
                         // The hook-visible tail: split into ws.q/k/v at their
                         // ABSOLUTE row offsets, so the full-N hook below still
                         // observes one contiguous query buffer.
-                        kernels::launch_split_qkv_bf16(
+                        kernels::attn::split_qkv_bf16(
                             bf16_row(ws.qkv_fused.data(), fast_rows,
                                      Hq + 2 * Hk),
                             bf16_row(ws.q.data(), fast_rows, Hq),
@@ -1995,19 +1997,19 @@ void llama_like_forward_paged(
                     }
                 }
             } else {
-                kernels::launch_split_qkv_bf16(
+                kernels::attn::split_qkv_bf16(
                     ws.qkv_fused.data(),
                     ws.q.data(), ws.k.data(), ws.v.data(),
                     N, Hq, Hk, stream);
             }
         } else {
-            ops::gemm_act_x_w(cublas.handle(),
+            kernels::gemm::act_x_w(cublas.handle(),
                 qkv_in, make_weight_view(layer.q_proj, layer.q_proj_quant),
                 ws.q.data(), N, Hq, H);
-            ops::gemm_act_x_w(cublas.handle(),
+            kernels::gemm::act_x_w(cublas.handle(),
                 qkv_in, make_weight_view(layer.k_proj, layer.k_proj_quant),
                 ws.k.data(), N, Hk, H);
-            ops::gemm_act_x_w(cublas.handle(),
+            kernels::gemm::act_x_w(cublas.handle(),
                 qkv_in, make_weight_view(layer.v_proj, layer.v_proj_quant),
                 ws.v.data(), N, Hk, H);
         }
@@ -2058,10 +2060,10 @@ void llama_like_forward_paged(
             const bool global_norm = (w->shape().size() == 1 &&
                                       w->shape()[0] == per_rank_H);
             if (global_norm) {
-                kernels::launch_rmsnorm_bf16(
+                kernels::norm::rmsnorm_bf16(
                     x, w->data(), x, N, per_rank_H, eps, stream);
             } else {
-                kernels::launch_rmsnorm_bf16(
+                kernels::norm::rmsnorm_bf16(
                     x, w->data(), x,
                     N * num_heads_local, d, eps, stream);
             }
@@ -2081,7 +2083,7 @@ void llama_like_forward_paged(
             // per-head-norm + standard-rope transform the predicate
             // guaranteed, over its own rows only.
             if (peel_window_d != nullptr) {
-                kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                kernels::rope::qk_rmsnorm_rope_bf16_devwin(
                     ws.q.data(), ws.k.data(),
                     layer.q_norm->data(), layer.k_norm->data(),
                     positions,
@@ -2089,7 +2091,7 @@ void llama_like_forward_paged(
                     num_q_heads_local, num_kv_heads_local, d,
                     cfg.rope_theta, eps, stream);
             } else if (unfused_tail_rows > 0) {
-                kernels::launch_qk_rmsnorm_rope_bf16(
+                kernels::rope::qk_rmsnorm_rope_bf16(
                     bf16_row(ws.q.data(), fast_rows, Hq),
                     bf16_row(ws.k.data(), fast_rows, Hk),
                     layer.q_norm->data(), layer.k_norm->data(),
@@ -2100,7 +2102,7 @@ void llama_like_forward_paged(
             }
         } else if (use_mrope) {
             // Qwen3-VL: fused per-head q/k RMSNorm + interleaved 3-axis M-RoPE.
-            kernels::launch_qk_rmsnorm_mrope_bf16(
+            kernels::rope::qk_rmsnorm_mrope_bf16(
                 ws.q.data(), ws.k.data(),
                 layer.q_norm->data(), layer.k_norm->data(),
                 vision->mrope_positions,
@@ -2109,7 +2111,7 @@ void llama_like_forward_paged(
                 fwd_cfg.mrope_section_t, fwd_cfg.mrope_section_h,
                 fwd_cfg.mrope_section_w, stream);
         } else if (fuse_qk_norm_rope) {
-            kernels::launch_qk_rmsnorm_rope_bf16(
+            kernels::rope::qk_rmsnorm_rope_bf16(
                 ws.q.data(), ws.k.data(),
                 layer.q_norm->data(), layer.k_norm->data(),
                 positions, N, num_q_heads_local, num_kv_heads_local, d,
@@ -2159,13 +2161,13 @@ void llama_like_forward_paged(
         const void* attn_v   = ws.v.data();
         void* attn_out_buf   = ws.attn_out.data();
         if (!fused_decode_qkv_post && head_dim_padded) {
-            kernels::launch_pad_head_dim_bf16(
+            kernels::attn::pad_head_dim_bf16(
                 ws.q.data(), ws.q_padded.data(),
                 N, num_q_heads_local, d, dk, stream);
-            kernels::launch_pad_head_dim_bf16(
+            kernels::attn::pad_head_dim_bf16(
                 ws.k.data(), ws.k_padded.data(),
                 N, num_kv_heads_local, d, dk, stream);
-            kernels::launch_pad_head_dim_bf16(
+            kernels::attn::pad_head_dim_bf16(
                 ws.v.data(), ws.v_padded.data(),
                 N, num_kv_heads_local, d, dk, stream);
             attn_q = ws.q_padded.data();
@@ -2176,17 +2178,17 @@ void llama_like_forward_paged(
         auto kv_view = cache.layer_view(L);
         if (fused_decode_qkv_post) {
             // Rows [0, fast_rows) were already written by
-            // launch_qkv_decode_qk_norm_rope_write_kv_bf16; only the
+            // kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16; only the
             // hook-visible tail still needs its K/V appended.
             if (peel_window_d != nullptr) {
                 if (has_write_desc) {
-                    kernels::launch_write_kv_explicit_bf16_devwin(
+                    kernels::attn::write_kv_explicit_bf16_devwin(
                         kv_view,
                         ws.k.data(), ws.v.data(),
                         w_page_d, w_off_d,
                         peel_window_d, N, stream, row_valid_d);
                 } else {
-                    kernels::launch_write_kv_to_pages_bf16_devwin(
+                    kernels::attn::write_kv_to_pages_bf16_devwin(
                         kv_view,
                         ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2195,7 +2197,7 @@ void llama_like_forward_paged(
                 }
             } else if (unfused_tail_rows > 0) {
                 if (has_write_desc) {
-                    kernels::launch_write_kv_explicit_bf16(
+                    kernels::attn::write_kv_explicit_bf16(
                         kv_view,
                         bf16_row(ws.k.data(), fast_rows, Hk),
                         bf16_row(ws.v.data(), fast_rows, Hk),
@@ -2204,7 +2206,7 @@ void llama_like_forward_paged(
                         row_valid_d != nullptr ? row_valid_d + fast_rows
                                                : nullptr);
                 } else {
-                    kernels::launch_write_kv_to_pages(
+                    kernels::attn::write_kv_to_pages(
                         kv_view,
                         ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2224,12 +2226,12 @@ void llama_like_forward_paged(
             // variable-length prompt PREFILL has one lane (R==1) but N>1 tokens,
             // so N (not R) cells must be written from `attn_k`/`attn_v` [N,·] and
             // the N-entry WSlot/WOff descriptor.
-            kernels::launch_write_kv_explicit_bf16(
+            kernels::attn::write_kv_explicit_bf16(
                 kv_view,
                 const_cast<void*>(attn_k), const_cast<void*>(attn_v),
                 w_page_d, w_off_d, N, stream, row_valid_d);
         } else {
-            kernels::launch_write_kv_to_pages(
+            kernels::attn::write_kv_to_pages(
                 kv_view,
                 const_cast<void*>(attn_k), const_cast<void*>(attn_v),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
@@ -2283,7 +2285,7 @@ void llama_like_forward_paged(
             // counts, so handing it a shorter list silently attends over the
             // wrong tiles. The static non-split plan does not, which is why
             // substitution is legal there and nowhere else.
-            if (!ops::decode_plan_is_page_count_independent(*decode_plan)) {
+            if (!kernels::attn::decode_plan_is_page_count_independent(*decode_plan)) {
                 throw std::runtime_error(
                     "attn_page_mask requires a page-count-independent decode "
                     "plan; this fire planned split-KV");
@@ -2319,28 +2321,28 @@ void llama_like_forward_paged(
             stream);
 
         if (use_xqa_decode_path) {
-            ops::launch_attention_xqa_decode_bf16_prepared(
+            kernels::attn::attention_xqa_decode_bf16_prepared(
                 attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
                 R, num_q_heads_local, num_kv_heads_local, dk,
                 cache.page_size(), plan_state.xqa_max_pages_per_seq,
-                attn_ws, stream, sm_scale_override);
+                attn_ws.view(), stream, sm_scale_override);
         } else if (use_prefill_decode_path) {
             const int num_pages_in_batch = kv_page_indptr_h[R];
-            kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+            kernels::attn::dequant_kv_cache_layer_to_bf16_active(
                 kv_view, kv_page_indices, num_pages_in_batch, stream);
-            ops::dispatch_attention_flashinfer_prefill_bf16(
+            kernels::attn::dispatch_attention_flashinfer_prefill_bf16(
                 *(prefill_plan_override != nullptr ? prefill_plan_override
                                                    : prefill_decode_plan),
                 attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
+                attn_ws.view(), stream, /*logits_soft_cap=*/0.f, sm_scale_override);
         } else if (use_decode_path) {
             if (score_capture.active()) {
-                ops::dispatch_attention_flashinfer_decode_capture(
+                kernels::attn::dispatch_attention_flashinfer_decode_capture(
                     *decode_plan,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr, attn_last_page_lens,
-                    attn_ws, stream,
+                    attn_ws.view(), stream,
                     score_capture.raw(), score_capture.indptr_d(),
                     layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
@@ -2351,15 +2353,15 @@ void llama_like_forward_paged(
                 score_capture.publish(
                     attn_page_indptr, attn_last_page_lens, cache.page_size());
             } else {
-                ops::dispatch_attention_flashinfer_decode(
+                kernels::attn::dispatch_attention_flashinfer_decode(
                     *decode_plan,
                     attn_q, kv_view, attn_out_buf,
                     attn_page_indices, attn_page_indptr, attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    attn_ws.view(), stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             }
         } else if (custom_mask_d) {
-            const ops::PrefillPlanCache* mask_plan = is_pure_decode
+            const kernels::attn::PrefillPlanCache* mask_plan = is_pure_decode
                 ? (plan_state.use_mask_decode_plan
                        ? plan_state.mask_decode_plan.get()
                        : nullptr)
@@ -2410,15 +2412,15 @@ void llama_like_forward_paged(
                         // the prefix — pure decode, so tokens == rows ==
                         // split and every CSR's `[0, split]` head is the
                         // prefix's truth.
-                        kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+                        kernels::attn::dequant_kv_cache_layer_to_bf16_active(
                             kv_view, kv_page_indices,
                             kv_page_indptr_h[split], stream);
-                        ops::launch_attention_flashinfer_prefill(
+                        kernels::attn::attention_flashinfer_prefill(
                             attn_q, kv_view, attn_out_buf,
                             qo_indptr, kv_page_indices, kv_page_indptr,
                             kv_last_page_lens,
                             qo_indptr_h, kv_page_indptr_h,
-                            split, split, num_q_heads_local, attn_ws,
+                            split, split, num_q_heads_local, attn_ws.view(),
                             stream, layer_window_left,
                             /*logits_soft_cap=*/0.f, sm_scale_override);
                     } else if (decode_plan == nullptr) {
@@ -2436,12 +2438,12 @@ void llama_like_forward_paged(
                         // decode arm — request ordinals start at row 0,
                         // identical indexing.
                         if (score_capture.active()) {
-                            ops::dispatch_attention_flashinfer_decode_capture(
+                            kernels::attn::dispatch_attention_flashinfer_decode_capture(
                                 *decode_plan,
                                 attn_q, kv_view, attn_out_buf,
                                 attn_page_indices, attn_page_indptr,
                                 attn_last_page_lens,
-                                attn_ws, stream,
+                                attn_ws.view(), stream,
                                 score_capture.raw(),
                                 score_capture.indptr_d(),
                                 layer_window_left,
@@ -2450,12 +2452,12 @@ void llama_like_forward_paged(
                                 attn_page_indptr, attn_last_page_lens,
                                 cache.page_size());
                         } else {
-                            ops::dispatch_attention_flashinfer_decode(
+                            kernels::attn::dispatch_attention_flashinfer_decode(
                                 *decode_plan,
                                 attn_q, kv_view, attn_out_buf,
                                 attn_page_indices, attn_page_indptr,
                                 attn_last_page_lens,
-                                attn_ws, stream, layer_window_left,
+                                attn_ws.view(), stream, layer_window_left,
                                 /*logits_soft_cap=*/0.f, sm_scale_override);
                         }
                     }
@@ -2470,7 +2472,7 @@ void llama_like_forward_paged(
                 // plan/qo[0]-relative (offset pointers + the identity qo), the
                 // KV side reads the device CSR ABSOLUTELY (base indices +
                 // +split indptr — the composed device truth, no host rebase).
-                ops::dispatch_attention_flashinfer_prefill_custom(
+                kernels::attn::dispatch_attention_flashinfer_prefill_custom(
                     *mask_plan,
                     bf16_row(attn_q, split, Hq), kv_view,
                     bf16_row(attn_out_buf, split, Hq),
@@ -2479,7 +2481,7 @@ void llama_like_forward_paged(
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    spatial_suffix_ws(), suffix_stream2);
+                    spatial_suffix_ws().view(), suffix_stream2);
                 if (side_on2) {
                     CUDA_CHECK(cudaEventRecord(ss2->join, ss2->stream));
                     CUDA_CHECK(cudaStreamWaitEvent(stream, ss2->join, 0));
@@ -2510,7 +2512,7 @@ void llama_like_forward_paged(
                     throw std::runtime_error(
                         "spatial mask (mixed): suffix qo identity missing");
                 }
-                const ops::PrefillPlanCache* suffix_plan =
+                const kernels::attn::PrefillPlanCache* suffix_plan =
                     plan_state.use_mask_decode_plan
                         ? plan_state.mask_decode_plan.get()
                         : nullptr;
@@ -2548,7 +2550,7 @@ void llama_like_forward_paged(
                     CUDA_CHECK(cudaStreamWaitEvent(
                         ss->stream, ss->fork, 0));
                 }
-                ops::dispatch_attention_flashinfer_prefill_custom(
+                kernels::attn::dispatch_attention_flashinfer_prefill_custom(
                     *suffix_plan,
                     bf16_row(attn_q, split_rows, Hq), kv_view,
                     bf16_row(attn_out_buf, split_rows, Hq),
@@ -2557,21 +2559,21 @@ void llama_like_forward_paged(
                     kv_page_indptr + split_req,
                     kv_last_page_lens + split_req,
                     custom_mask_d, custom_mask_indptr_d + split_req,
-                    spatial_suffix_ws(), custom_stream);
+                    spatial_suffix_ws().view(), custom_stream);
                 // The prefix causal dispatch on the main stream — the
                 // bf16 view needs the prefix pages staged (no-op on
                 // native-bf16 caches; the custom dispatch takes the
                 // layer view whole and needs none).
-                kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+                kernels::attn::dequant_kv_cache_layer_to_bf16_active(
                     kv_view, kv_page_indices,
                     kv_page_indptr_h[split_req], stream);
-                ops::dispatch_attention_flashinfer_prefill_bf16(
+                kernels::attn::dispatch_attention_flashinfer_prefill_bf16(
                     *mask_plan,
                     attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
                     attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
-                    attn_ws, stream, /*logits_soft_cap=*/0.f,
+                    attn_ws.view(), stream, /*logits_soft_cap=*/0.f,
                     sm_scale_override);
                 // NO-DEMOTION: the plain-decode middle takes the DECODE
                 // kernel (its own plan over requests [P, split_req),
@@ -2597,14 +2599,14 @@ void llama_like_forward_paged(
                         CUDA_CHECK(cudaStreamWaitEvent(
                             ss->stream2, ss->fork2, 0));
                     }
-                    ops::dispatch_attention_flashinfer_decode(
+                    kernels::attn::dispatch_attention_flashinfer_decode(
                         *plan_state.mixed_mid_decode_plan,
                         bf16_row(attn_q, mid_row, Hq), kv_view,
                         bf16_row(attn_out_buf, mid_row, Hq),
                         kv_page_indices,
                         kv_page_indptr + P,
                         kv_last_page_lens + P,
-                        attn_ws, mid_stream, layer_window_left,
+                        attn_ws.view(), mid_stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, sm_scale_override);
                     if (side_on && ss != nullptr) {
                         CUDA_CHECK(cudaEventRecord(
@@ -2630,24 +2632,24 @@ void llama_like_forward_paged(
                         ms, side_on ? 1 : 0);
                 }
             } else {
-                ops::dispatch_attention_flashinfer_prefill_custom(
+                kernels::attn::dispatch_attention_flashinfer_prefill_custom(
                     *mask_plan,
                     attn_q, kv_view, attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                    attn_ws, stream);
+                    attn_ws.view(), stream);
             }
         } else if (plan_state.use_prefill_plan && prefill_plan != nullptr) {
             const int num_pages_in_batch = kv_page_indptr_h[R];
-            kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+            kernels::attn::dequant_kv_cache_layer_to_bf16_active(
                 kv_view, kv_page_indices, num_pages_in_batch, stream);
             if (prefill_score_capture.active()) {
-                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                kernels::attn::dispatch_attention_flashinfer_prefill_capture_bf16(
                     *prefill_plan,
                     attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
                     attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens, attn_ws, stream,
+                    kv_last_page_lens, attn_ws.view(), stream,
                     prefill_score_capture.raw(),
                     prefill_score_capture.folded(),
                     prefill_score_capture.indptr_d(),
@@ -2655,20 +2657,20 @@ void llama_like_forward_paged(
                     /*logits_soft_cap=*/0.f, sm_scale_override);
                 prefill_score_capture.publish();
             } else {
-                ops::dispatch_attention_flashinfer_prefill_bf16(
+                kernels::attn::dispatch_attention_flashinfer_prefill_bf16(
                     *prefill_plan,
                     attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
                     attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
-                    attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
+                    attn_ws.view(), stream, /*logits_soft_cap=*/0.f, sm_scale_override);
             }
         } else {
-            ops::launch_attention_flashinfer_prefill(
+            kernels::attn::attention_flashinfer_prefill(
                 attn_q, kv_view, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, attn_ws, stream, layer_window_left,
+                N, R, num_q_heads_local, attn_ws.view(), stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
         invoke_stage_hook(
@@ -2688,7 +2690,7 @@ void llama_like_forward_paged(
         // it feeds the o_proj GEMM (which expects `[N, num_q*head_dim]`,
         // not `[N, num_q*head_dim_kernel]`).
         if (head_dim_padded) {
-            kernels::launch_strip_head_dim_bf16(
+            kernels::attn::strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
                 N, num_q_heads_local, d, dk, stream);
         }
@@ -2701,11 +2703,11 @@ void llama_like_forward_paged(
             // (ws.norm_x is free here — it held the QKV input before),
             // all-reduce the partials, then add to the residual.
             if (T == 1) {
-                ops::gemm_act_x_w(cublas.handle(),
+                kernels::gemm::act_x_w(cublas.handle(),
                     ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
                     ws.y.data(), N, H, Hq, /*beta=*/1.f);
             } else {
-                ops::gemm_act_x_w(cublas.handle(),
+                kernels::gemm::act_x_w(cublas.handle(),
                     ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
                     ws.norm_x.data(), N, H, Hq, /*beta=*/0.f);
                 auto* fused_ar = tp->custom_all_reduce();
@@ -2717,7 +2719,7 @@ void llama_like_forward_paged(
                 } else {
                     tp->all_reduce_bf16_out(ws.norm_x.data(), ws.norm_y.data(),
                         static_cast<std::size_t>(N) * H, ncclSum, stream);
-                    kernels::launch_residual_add_rmsnorm_bf16(
+                    kernels::norm::residual_add_rmsnorm_bf16(
                         ws.y.data(), ws.norm_y.data(), layer.mlp_norm->data(),
                         ws.norm_y.data(), N, H, eps, stream);
                 }
@@ -2726,17 +2728,17 @@ void llama_like_forward_paged(
         } else {
             // Post-norm: o_proj writes to norm_x (a scratch we own here),
             // norm_attn(norm_x) → norm_y, then y += norm_y.
-            ops::gemm_act_x_w(cublas.handle(),
+            kernels::gemm::act_x_w(cublas.handle(),
                 ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
                 ws.norm_x.data(), N, H, Hq, /*beta=*/0.f);
             if (T > 1) {
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
             }
-            kernels::launch_rmsnorm_bf16(
+            kernels::norm::rmsnorm_bf16(
                 ws.norm_x.data(), layer.attn_norm->data(), ws.norm_y.data(),
                 N, H, eps, stream);
-            kernels::launch_residual_add_bf16(
+            kernels::norm::residual_add_bf16(
                 ws.y.data(), ws.norm_y.data(), N * H, stream);
         }
 
@@ -2744,7 +2746,7 @@ void llama_like_forward_paged(
         const void* mlp_in = ws.y.data();
         if (!post_norm) {
             if (!have_mlp_norm) {
-                kernels::launch_rmsnorm_bf16(
+                kernels::norm::rmsnorm_bf16(
                     ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
                     N, H, eps, stream);
             }
@@ -2755,19 +2757,19 @@ void llama_like_forward_paged(
         const bool use_fused_gu = (layer.gate_up_proj_fused != nullptr) &&
                                   !ws.gate_up_fused.empty();
         if (use_fused_gu) {
-            ops::gemm_act_x_w(cublas.handle(),
-                mlp_in, ops::WeightView(*layer.gate_up_proj_fused),
+            kernels::gemm::act_x_w(cublas.handle(),
+                mlp_in, WeightView(*layer.gate_up_proj_fused),
                 ws.gate_up_fused.data(), N, 2 * I, H);
-            kernels::launch_chunked_swiglu_bf16(
+            kernels::mlp::chunked_swiglu_bf16(
                 ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
         } else {
-            ops::gemm_act_x_w(cublas.handle(),
+            kernels::gemm::act_x_w(cublas.handle(),
                 mlp_in, make_weight_view(layer.gate_proj, layer.gate_proj_quant),
                 ws.gate.data(), N, I, H);
-            ops::gemm_act_x_w(cublas.handle(),
+            kernels::gemm::act_x_w(cublas.handle(),
                 mlp_in, make_weight_view(layer.up_proj, layer.up_proj_quant),
                 ws.up.data(),   N, I, H);
-            kernels::launch_swiglu_bf16(
+            kernels::mlp::swiglu_bf16(
                 ws.gate.data(), ws.up.data(), ws.gate.data(),
                 N * I, stream);
         }
@@ -2778,11 +2780,11 @@ void llama_like_forward_paged(
             // mlp pre-norm input on the post-norm path; on pre-norm it
             // hasn't been touched since QKV).
             if (T == 1) {
-                ops::gemm_act_x_w(cublas.handle(),
+                kernels::gemm::act_x_w(cublas.handle(),
                     ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
                     ws.y.data(), N, H, I, /*beta=*/1.f);
             } else {
-                ops::gemm_act_x_w(cublas.handle(),
+                kernels::gemm::act_x_w(cublas.handle(),
                     ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
                     ws.norm_x.data(), N, H, I, /*beta=*/0.f);
                 auto* fused_ar = tp->custom_all_reduce();
@@ -2805,23 +2807,23 @@ void llama_like_forward_paged(
                 } else {
                     tp->all_reduce_bf16_out(ws.norm_x.data(), ws.norm_y.data(),
                         static_cast<std::size_t>(N) * H, ncclSum, stream);
-                    kernels::launch_residual_add_bf16(
+                    kernels::norm::residual_add_bf16(
                         ws.y.data(), ws.norm_y.data(), N * H, stream);
                 }
             }
         } else {
             // Post-norm MLP: down_proj → norm_x scratch, norm_mlp, += y.
-            ops::gemm_act_x_w(cublas.handle(),
+            kernels::gemm::act_x_w(cublas.handle(),
                 ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
                 ws.norm_x.data(), N, H, I, /*beta=*/0.f);
             if (T > 1) {
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
             }
-            kernels::launch_rmsnorm_bf16(
+            kernels::norm::rmsnorm_bf16(
                 ws.norm_x.data(), layer.mlp_norm->data(), ws.norm_y.data(),
                 N, H, eps, stream);
-            kernels::launch_residual_add_bf16(
+            kernels::norm::residual_add_bf16(
                 ws.y.data(), ws.norm_y.data(), N * H, stream);
         }
 
@@ -2834,7 +2836,7 @@ void llama_like_forward_paged(
             const auto* ds = static_cast<const std::uint16_t*>(
                                  vision->deepstack_scratch) +
                              static_cast<std::size_t>(L) * N * H;
-            kernels::launch_residual_add_bf16(
+            kernels::norm::residual_add_bf16(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
@@ -2898,10 +2900,10 @@ void llama_like_forward_paged(
                 j == 0 ? cfg.num_hidden_layers
                        : static_cast<int>(plan_state.depth_band_k
                              [static_cast<std::size_t>(j - 1)]);
-            const ops::DecodePlanCache* band_plan =
+            const kernels::attn::DecodePlanCache* band_plan =
                 plan_state.depth_band_plans[static_cast<std::size_t>(j)]
                     .get();
-            const ops::PrefillPlanCache* band_prefill =
+            const kernels::attn::PrefillPlanCache* band_prefill =
                 plan_state
                     .depth_band_prefill_plans[static_cast<std::size_t>(j)]
                     .get();
@@ -3011,7 +3013,7 @@ void llama_like_forward_paged(
         // design, north-star-dsl.md). Guards are loud: the engine
         // plans this shape only for plain pure-decode fires.
         const int split = static_cast<int>(full_depth_rows);
-        const ops::DecodePlanCache* prefix_plan =
+        const kernels::attn::DecodePlanCache* prefix_plan =
             plan_state.depth_prefix_decode_plan
                 ? plan_state.depth_prefix_decode_plan.get()
                 : nullptr;
@@ -3055,19 +3057,19 @@ void llama_like_forward_paged(
         int lm_head_rows = N;
         if (compact_logits) {
             if (have_final_norm) {
-                kernels::launch_gather_bf16_rows(
+                kernels::layout::gather_bf16_rows(
                     static_cast<const std::uint16_t*>(final_norm_buf),
                     logit_row_indices_d,
                     static_cast<std::uint16_t*>(ws.norm_x.data()),
                     num_logit_rows, H, stream);
                 lm_head_input = ws.norm_x.data();
             } else {
-                kernels::launch_gather_bf16_rows(
+                kernels::layout::gather_bf16_rows(
                     static_cast<const std::uint16_t*>(ws.y.data()),
                     logit_row_indices_d,
                     static_cast<std::uint16_t*>(ws.norm_x.data()),
                     num_logit_rows, H, stream);
-                kernels::launch_rmsnorm_bf16(
+                kernels::norm::rmsnorm_bf16(
                     ws.norm_x.data(), w.final_norm->data(), ws.norm_y.data(),
                     num_logit_rows, H, eps, stream);
                 lm_head_input = ws.norm_y.data();
@@ -3083,7 +3085,7 @@ void llama_like_forward_paged(
             // the full pre-norm hidden (the fused-AR updates it in place via
             // `residual_inout`), so `rmsnorm(ws.y)` reproduces the correct
             // final-normed activation.
-            kernels::launch_rmsnorm_bf16(
+            kernels::norm::rmsnorm_bf16(
                 ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
                 N, H, eps, stream);
             lm_head_input = ws.norm_y.data();
@@ -3106,7 +3108,7 @@ void llama_like_forward_paged(
         const int chunk = fwd_cfg.logits_argmax_chunk_tokens;
         if (chunk > 0) {
             const auto rows = static_cast<std::size_t>(lm_head_rows);
-            const std::size_t accum = rows * kernels::kArgmaxAccumSlots;
+            const std::size_t accum = rows * kernels::sample::kArgmaxAccumSlots;
             if (ws.sampled_tokens.numel() < rows ||
                 ws.argmax_acc_val.numel() < accum ||
                 ws.argmax_acc_idx.numel() < accum) {
@@ -3114,13 +3116,13 @@ void llama_like_forward_paged(
                     "fused lm_head argmax: workspace holds fewer rows than "
                     "this fire samples");
             }
-            if (ops::lm_head_argmax_slab_bytes(lm_head_rows, V, chunk) >
+            if (kernels::gemm::lm_head_argmax_slab_bytes(lm_head_rows, V, chunk) >
                 ws.logits.nbytes()) {
                 throw std::runtime_error(
                     "fused lm_head argmax: vocabulary slab does not fit the "
                     "logits arena");
             }
-            if (!ops::lm_head_argmax_chunked(
+            if (!kernels::gemm::lm_head_argmax_chunked(
                     cublas.handle(), lm_head_input, *w.lm_head,
                     static_cast<std::int32_t*>(ws.sampled_tokens.data()),
                     ws.logits.data(),
@@ -3132,7 +3134,7 @@ void llama_like_forward_paged(
                     "yet the model advertised the capability");
             }
         } else {
-            ops::gemm_act_x_w(cublas.handle(),
+            kernels::gemm::act_x_w(cublas.handle(),
                 lm_head_input, *w.lm_head, ws.logits.data(),
                 lm_head_rows, V, H);
         }

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "attention_workspace.hpp"
 #include "model/csm/csm.hpp"
 #include "model/imodel.hpp"
 
@@ -23,7 +24,7 @@ public:
 
     void prepare(AttentionWorkspace&, const ForwardFn::PrepareInputs&) override {}
     void body(Workspace&, KvCache&, AttentionWorkspace&,
-              ops::CublasHandle&, const ForwardFn::ForwardInputs&) override;
+              kernels::gemm::CublasHandle&, const ForwardFn::ForwardInputs&) override;
 
     ModelCapabilities capabilities() const override { return {}; }
 

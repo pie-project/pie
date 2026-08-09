@@ -18,7 +18,7 @@
 //     drives `LlamaLikeForwardCfg::per_layer_window_left`; the
 //     mixtral forward already consumes that table per layer.
 //   * Q/K/V/O biases. Loaded from the checkpoint and added via
-//     `launch_add_bias_bf16` after each projection.
+//     `kernels::norm::add_bias_bf16` after each projection.
 //   * MXFP4 expert weights. Stored as packed E2M1 nibbles plus per-32
 //     E8M0 block scales in the checkpoint. Blackwell-class native targets
 //     repack them into the backend's packed FE2M1/E8M0 GEMM layout. Legacy

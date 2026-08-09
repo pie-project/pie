@@ -15,6 +15,7 @@
 use model::families::llama_like::forward::emit::emit_llama_like_cuda_inc;
 use model::qwen_3_5::forward::emit::emit_qwen35_cuda_inc;
 use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use model_compiler::dsl::WeightRepr;
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
 
 fn write_inc_at(family: &str, name: &str, contents: &str) {
@@ -71,7 +72,16 @@ fn main() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: false,
+                head_dim_kernel: 0,
                 gate_up_fused: true,
+                // Dense: these fixtures are the BF16 deployments
+                // emission was taken against.
+                proj_repr: WeightRepr::Bf16,
+                // Single GPU.
+                tp_size: 1,
+                // Every emission target attends the whole context.
+                window_left: Vec::new(),
+                all_reduce_p2p_max_rows: 0,
             },
             "olmo2_1b",
         ),
@@ -95,7 +105,16 @@ fn main() {
                 rope_table: true,
                 force_prefill_path: true,
                 head_dim_padded: false,
+                head_dim_kernel: 0,
                 gate_up_fused: true,
+                // Dense: these fixtures are the BF16 deployments
+                // emission was taken against.
+                proj_repr: WeightRepr::Bf16,
+                // Single GPU.
+                tp_size: 1,
+                // Every emission target attends the whole context.
+                window_left: Vec::new(),
+                all_reduce_p2p_max_rows: 0,
             },
             "qwen2_5_1_5b",
         ),
@@ -119,7 +138,16 @@ fn main() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: false,
+                head_dim_kernel: 0,
                 gate_up_fused: true,
+                // Dense: these fixtures are the BF16 deployments
+                // emission was taken against.
+                proj_repr: WeightRepr::Bf16,
+                // Single GPU.
+                tp_size: 1,
+                // Every emission target attends the whole context.
+                window_left: Vec::new(),
+                all_reduce_p2p_max_rows: 0,
             },
             "mistral_7b_v03",
         ),
@@ -143,7 +171,16 @@ fn main() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: true,
+                head_dim_kernel: 128,
                 gate_up_fused: true,
+                // Dense: these fixtures are the BF16 deployments
+                // emission was taken against.
+                proj_repr: WeightRepr::Bf16,
+                // Single GPU.
+                tp_size: 1,
+                // Every emission target attends the whole context.
+                window_left: Vec::new(),
+                all_reduce_p2p_max_rows: 0,
             },
             "phi3_mini",
         ),
@@ -159,6 +196,8 @@ fn main() {
         &emit_qwen35_cuda_inc(
             &Qwen35HybridFacts::qwen3_5_0_8b(),
             &Qwen35CudaFacts {
+                // Attends the whole context.
+                window_left: Vec::new(),
                 // LIVE-anchored (digest-corrected on first boot — the
                 // mechanism's fourth catch: the synthetic fixture said
                 // wt1/cm4096, the live env defaults say wt0/cm0):
@@ -183,6 +222,8 @@ fn main() {
                 // 0.8B binds the packed bank; the emitted body states the
                 // chunked activation rather than reading a workspace.
                 gate_up_fused: true,
+                // 0.8B is a BF16 checkpoint.
+                proj_repr: WeightRepr::Bf16,
             },
             "qwen3_5_0_8b",
         ),

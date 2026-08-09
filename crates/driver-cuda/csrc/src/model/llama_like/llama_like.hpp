@@ -20,13 +20,14 @@
 #include <string>
 #include <vector>
 
+#include "attention_workspace.hpp"
 #include "distributed.hpp"
 #include "model/loaded_model.hpp"
 #include "model/llama_like/qwen3.hpp"           // Qwen3Weights
 #include "model/workspace.hpp"       // Workspace
 #include "pie/driver/region_plans.hpp"  // kMaxDepthBands
-#include "ops/attention_flashinfer.hpp"
-#include "ops/attention_xqa.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "attn/attention_xqa.hpp"
 #include "store/kv_cache.hpp"
 
 namespace pie_cuda_driver::model {
@@ -142,32 +143,32 @@ struct LlamaLikeVisionInputs {
 class LoraFireStateHandle;
 
 struct LlamaLikePlanState {
-    ops::DecodePlanCachePtr decode_plan;
-    ops::PrefillPlanCachePtr prefill_plan;
-    ops::PrefillPlanCachePtr prefill_decode_plan;
+    kernels::attn::DecodePlanCachePtr decode_plan;
+    kernels::attn::PrefillPlanCachePtr prefill_plan;
+    kernels::attn::PrefillPlanCachePtr prefill_decode_plan;
     // Custom-mask PURE-DECODE fires get their OWN plan slot (the
     // supergraph axiom, S3: an arm may not share a mutable plan slot
     // with a foreign fire class). Before this, masked decodes re-planned
     // `prefill_plan` and every request's PREFILL re-planned it back —
     // the layout oscillation cost the union key one orphan capture per
     // request, and today's masked-variant graphs the same churn.
-    ops::PrefillPlanCachePtr mask_decode_plan;
+    kernels::attn::PrefillPlanCachePtr mask_decode_plan;
     // STRUCTURAL S-2: the depth union's PREFIX decode plan (requests
     // [0, split) at layers [k, L)); planned against the SECONDARY
     // workspace (two same-family plans must not share scheduling
     // buffers — the mixed-fire lesson; a depth fire is never also a
     // spatial-mask fire, so the workspace is free).
-    ops::DecodePlanCachePtr depth_prefix_decode_plan;
+    kernels::attn::DecodePlanCachePtr depth_prefix_decode_plan;
     // V2 rung ④ Act 1 (banded depth): one PREFIX decode plan per
     // distinct-k band (deepest-first), each against its OWN dedicated
     // workspace (the two-plans-one-workspace lesson, per band).
     // count == 0 = unbanded fire.
-    std::array<ops::DecodePlanCachePtr,
+    std::array<kernels::attn::DecodePlanCachePtr,
                pie::driver::fire::kMaxDepthBands> depth_band_plans;
     // Prefill-family band plans (force_prefill / prefill-decode
     // deployments — their per-band prefix dispatch is the planned
     // causal prefill, not the decode kernel).
-    std::array<ops::PrefillPlanCachePtr, 3> depth_band_prefill_plans;
+    std::array<kernels::attn::PrefillPlanCachePtr, 3> depth_band_prefill_plans;
     std::array<std::uint32_t, 3> depth_band_k{};
     std::array<std::uint32_t, 3> depth_band_rows{};
     std::uint32_t depth_band_count = 0;
@@ -175,7 +176,7 @@ struct LlamaLikePlanState {
     // (requests [P, split_req) of a mixed fire, kvpp-rebased). The
     // seriation puts prefill lanes first, so P = the first 1-token
     // request; -1 = no middle (all-prefill prefix or shape declined).
-    ops::DecodePlanCachePtr mixed_mid_decode_plan;
+    kernels::attn::DecodePlanCachePtr mixed_mid_decode_plan;
     int mixed_mid_start = -1;
     // NS-2: when >= 0, this fire's attention splits at this REQUEST
     // index — the prefix plans cover requests [0, split),
@@ -296,7 +297,7 @@ void llama_like_forward_paged(
     Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -432,7 +433,7 @@ void apply_rope_config(LlamaLikeForwardCfg& fwd_cfg, const HfConfig& hf);
 // or plain. Exported because MIXTRAL SHARES THIS CFG: it is handed the
 // same `LlamaLikeForwardCfg`, so the scaling its checkpoint asks for is
 // already resolved there, and a family that spells its own
-// `launch_rope_bf16` silently drops it. gpt-oss did exactly that.
+// `kernels::rope::rope_bf16` silently drops it. gpt-oss did exactly that.
 void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,
     const HfConfig& cfg,

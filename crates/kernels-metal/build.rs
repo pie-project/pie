@@ -21,13 +21,24 @@ fn main() {
 
     let kernels = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels");
 
-    // Both keys name the same directory and are read for different reasons:
-    // `include` is the conventional one a C++ include path is built from (the
-    // shell compiles against `affine_format.hpp` and the `*_params.h` a
-    // shader and its host caller must agree on), and `kernels_dir` is what
-    // becomes `PIE_METAL_KERNELS_DIR_DEFAULT` — a path baked into the binary
-    // for the runtime shader compiler to read `.metal` out of.
-    println!("cargo:include={}", kernels.display());
+    // Two keys, two DIRECTORIES, and they are different roles.
+    //
+    // `include` is the C++ include path: `include/pie/kernels/` holds the host
+    // library — the launch shapes, the name grammar, the `Grid` PODs — plus
+    // `kernels/<family>/` for the `*_params.h` a shader and its host caller
+    // must agree on, which is why both are published.
+    //
+    // `kernels_dir` is what becomes `PIE_METAL_KERNELS_DIR_DEFAULT`, a path
+    // baked into the binary for the RUNTIME shader compiler to read `.metal`
+    // out of. It is the shader tree and nothing else.
+    //
+    // They used to be one directory, and the note here said so. That put a
+    // host-only C++ header inside the runtime shader search path and left the
+    // two roles indistinguishable; `.wiki/kernel-metal-refactor.md` §4 is why
+    // they are separate now.
+    let include = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include");
+    println!("cargo:rerun-if-changed=include");
+    println!("cargo:include={};{}", include.display(), kernels.display());
     println!("cargo:kernels_dir={}", kernels.display());
 
     if std::env::var_os("CARGO_FEATURE_NATIVE").is_none() {
@@ -52,7 +63,7 @@ fn stage_rng_preamble(kernels: &Path) {
         .join("tensor-compiler/include/ptir_rng.generated.metal");
     println!("cargo:rerun-if-changed={}", src.display());
 
-    let dst = kernels.join("ptir_rng.generated.metal");
+    let dst = kernels.join("ptir").join("ptir_rng.generated.metal");
     let text = std::fs::read(&src).unwrap_or_else(|e| {
         panic!(
             "cannot read the generated RNG preamble at {}: {e}. It is emitted \

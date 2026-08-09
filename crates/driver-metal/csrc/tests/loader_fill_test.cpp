@@ -285,7 +285,7 @@ void the_encoder_reproduces_mlx_quantize_exactly() {
     if (!dir.empty() && dir.back() != '/') dir += '/';
     std::string error;
     const auto pso =
-        ctx.compile_precise_pso_from_file(dir + "transcode.metal", "affine_encode_u4_f32", &error);
+        ctx.compile_precise_pso_from_file(dir + "quant/transcode.metal", "affine_encode_u4_f32", &error);
     if (!expect(pso.valid(), "affine_encode_u4_f32 compiles: " + error)) return;
 
     const std::uint32_t groups = std::uint32_t(kRows * kCols / 64);

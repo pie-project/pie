@@ -19,6 +19,22 @@ build = "build.rs"
 name = "model"
 path = "src/lib.rs"
 
+# Both binaries are aspect tools, so both name the aspect they need. Without
+# `required-features` cargo auto-discovers them and builds them under every
+# feature set, which is how `emit-cuda` came to fail
+# `cargo check -p model --no-default-features` — it names `qwen_3_5::forward`,
+# a module that only exists behind `forward`.
+[[bin]]
+name = "emit-cuda"
+path = "src/bin/emit-cuda.rs"
+required-features = ["forward"]
+
+# The Rust half of the descriptor round-trip check; see the module doc.
+[[bin]]
+name = "descriptor"
+path = "src/bin/descriptor.rs"
+required-features = ["config"]
+
 [features]
 # One feature per aspect, because the aspects pull different worlds: `chat`
 # needs the tokenizer and the image decoders, `contract` needs the loader's
@@ -32,11 +48,17 @@ path = "src/lib.rs"
 # feature gates modules directly.
 default = ["chat"]
 chat = ["dep:tokenizer", "dep:anyhow", "dep:serde_json", "dep:image"]
-# `model-config` comes with the contract aspect because `ModelFacts` is
-# read out of a `pie.model/1` descriptor, and that crate owns the descriptor's
-# schema. It is a serde-only leaf — no loader, no runtime — so this does not
-# widen a driver link.
-contract = ["dep:model-loader", "dep:model-config", "dep:serde_json"]
+# The `pie.model/1` descriptor: HuggingFace `config.json` normalization on the
+# way in, `ModelFacts` projection on the way out. Its own aspect and its own
+# feature because it is the ONE that carries no graph: serde and nothing else,
+# no loader, no tracer, no kernels table. That is what `model-config` was a
+# separate crate for, and a feature holds it just as well now that the only
+# two consumers are `contract` below and `worker` — which already links this
+# crate for `forward`.
+config = ["dep:serde", "dep:serde_json", "dep:anyhow"]
+# `config` comes with the contract aspect because `ModelFacts` is read out of
+# a `pie.model/1` descriptor, and that module owns the descriptor's schema.
+contract = ["dep:model-loader", "dep:serde_json", "config"]
 # The forward aspect: a model's forward pass, written in `model-compiler`'s
 # tracing eDSL, and the `#[repr(C)]` boundary a driver traces it across. NOT
 # default -- `pie model convert` reads a chat template and a load contract and
@@ -45,10 +67,9 @@ forward = ["dep:model-compiler", "dep:serde"]
 
 [dependencies]
 # The facts a declaration traces against are serialized for the goldens, the
-# same way the traced form is.
+# same way the traced form is; the descriptor's schema derives on it too.
 serde = { version = "1.0", features = ["derive"], optional = true }
 tokenizer = { path = "../tokenizer", optional = true }
-model-config = { path = "../model-config", optional = true }
 # `default-features = false` drops the loader's testkit half — the authoring
 # side needs the algebra, never the host executor.
 model-loader = { path = "../model-loader", default-features = false, optional = true }

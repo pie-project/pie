@@ -6,7 +6,7 @@
 // designated-child tail, within-page fork, plus a multi-row causal prefill —
 // as (Q, paged K/V, BRLE mask), decodes the BRLE through the REAL src/brle.cpp
 // into FlashInfer's packed `qo×kv` bitmap, runs the production masked path
-// (`launch_attention_flashinfer_prefill_custom_bf16`, MaskMode::kCustom), and
+// (`kernels::attn::attention_flashinfer_prefill_custom_bf16`, MaskMode::kCustom), and
 // diffs the device output against `masked_attention_reference.hpp`. A masked
 // position is exactly prefix truncation (W6/W11): NO attention-kernel change.
 //
@@ -23,8 +23,9 @@
 
 #include <cuda_runtime.h>
 
+#include "attention_workspace.hpp"
 #include "batch/brle.hpp"
-#include "ops/attention_flashinfer.hpp"
+#include "attn/attention_flashinfer.hpp"
 
 #include "masked_attention_reference.hpp"
 
@@ -175,11 +176,11 @@ bool run_case(const Case& c, float tol) {
     // dispatch twice. This is the serving path: persistent mask pointers and a
     // cached prefill plan, with no host planner work in the graph body.
     auto ws = AttentionWorkspace::allocate(128ull*1024*1024, 16ull*1024*1024);
-    auto plan = pie_cuda_driver::ops::make_prefill_plan();
-    pie_cuda_driver::ops::plan_attention_flashinfer_prefill_bf16(
+    auto plan = pie_cuda_driver::kernels::attn::make_prefill_plan();
+    pie_cuda_driver::kernels::attn::plan_attention_flashinfer_prefill_bf16(
         *plan, qo_indptr_h.data(), kv_page_indptr_h.data(),
         kv_last_page_lens_h.data(), tokens, /*num_requests=*/1,
-        HQ, HKV, D, PAGE, ws, /*stream=*/nullptr,
+        HQ, HKV, D, PAGE, ws.view(), /*stream=*/nullptr,
         /*enable_cuda_graph=*/true, /*window_left=*/-1,
         /*full_attention_variant=*/false, /*hnd_layout=*/false,
         /*causal_mask=*/false, /*custom_mask=*/true);
@@ -191,9 +192,9 @@ bool run_case(const Case& c, float tol) {
     RT(cudaStreamCreateWithFlags(&graph_stream, cudaStreamNonBlocking));
     RT(cudaStreamBeginCapture(
         graph_stream, cudaStreamCaptureModeThreadLocal));
-    pie_cuda_driver::ops::dispatch_attention_flashinfer_prefill_custom_bf16(
+    pie_cuda_driver::kernels::attn::dispatch_attention_flashinfer_prefill_custom_bf16(
         *plan, d_q, d_k, d_v, d_o, d_qo, d_kpi, d_kpp, d_klpl,
-        d_mask, d_mip, ws, graph_stream);
+        d_mask, d_mip, ws.view(), graph_stream);
     RT(cudaStreamEndCapture(graph_stream, &graph));
     RT(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
     RT(cudaGraphLaunch(graph_exec, graph_stream));
@@ -282,12 +283,12 @@ void beam_microbench() {
     cudaEvent_t e0, e1; RT(cudaEventCreate(&e0)); RT(cudaEventCreate(&e1));
     constexpr int WARM = 10, ITER = 50;
 
-    auto masked = [&]{ pie_cuda_driver::ops::launch_attention_flashinfer_prefill_custom_bf16(
+    auto masked = [&]{ pie_cuda_driver::kernels::attn::attention_flashinfer_prefill_custom_bf16(
         d_q,d_k,d_v,d_o,d_qo,d_kpi,d_kpp,d_klpl,d_mask,d_mip,qo_h.data(),kvpp_h.data(),
-        B,B,QH,KVH,HD,PG,ws,nullptr); };
-    auto dense = [&]{ pie_cuda_driver::ops::launch_attention_flashinfer_prefill_bf16(
+        B,B,QH,KVH,HD,PG,ws.view(),nullptr); };
+    auto dense = [&]{ pie_cuda_driver::kernels::attn::attention_flashinfer_prefill_bf16(
         d_q,d_k,d_v,d_o,d_qo,d_kpi,d_kpp,d_klpl,qo_h.data(),kvpp_h.data(),
-        B,B,QH,KVH,HD,PG,ws,nullptr); };
+        B,B,QH,KVH,HD,PG,ws.view(),nullptr); };
 
     for (int i=0;i<WARM;++i){ masked(); dense(); } RT(cudaDeviceSynchronize());
     RT(cudaEventRecord(e0)); for(int i=0;i<ITER;++i) masked(); RT(cudaEventRecord(e1));

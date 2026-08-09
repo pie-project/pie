@@ -1,6 +1,6 @@
 #pragma once
 
-#include "affine_format.hpp"
+#include "quant/affine_format.hpp"
 
 /// Decode geometry for the llama-shaped families.
 ///

@@ -1,10 +1,12 @@
 #pragma once
 
-// Sizing policy for the attention plan/dispatch scratch. The scratch buffer
-// type itself (`AttentionWorkspace`) is defined in ops/attention_workspace.hpp
-// (every attention kernel wrapper takes one by reference); this header pulls
-// it in and adds the batch-level sizing functions below, which need the
-// model's HfConfig and are therefore not ops-owned themselves.
+// Sizing policy for the attention plan/dispatch scratch. The buffer type
+// itself (`AttentionWorkspace`) is defined in `../attention_workspace.hpp`;
+// this header pulls it in and adds the batch-level sizing functions below,
+// which need the model's HfConfig and so are not the type's own business.
+//
+// Kernels do not see that type -- they take the `AttentionWorkspaceView` it
+// hands out.
 //
 // Allocated once at boot (see Context::create); reused across all forward
 // passes.
@@ -13,7 +15,7 @@
 
 #include <cuda_runtime.h>
 
-#include "ops/attention_workspace.hpp"
+#include "attention_workspace.hpp"
 
 namespace pie_cuda_driver {
 

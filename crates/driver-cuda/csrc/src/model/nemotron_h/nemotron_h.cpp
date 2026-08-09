@@ -12,7 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/nemotron_h.hpp"
+#include "ssm/nemotron_h.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -96,7 +96,7 @@ NemotronHWeights bind_nemotron_h(const LoadedModel& engine) {
             Lw.mamba_D_f32 = DeviceBuffer<float>::alloc(local_heads);
             Lw.mamba_dt_bias_f32 =
                 DeviceBuffer<float>::alloc(local_heads);
-            kernels::launch_nemotron_prepare_mamba_params(
+            kernels::ssm::nemotron_prepare_mamba_params(
                 Lw.mamba_A_log->data(),
                 Lw.mamba_D->data(),
                 Lw.mamba_dt_bias->data(),

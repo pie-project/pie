@@ -60,7 +60,7 @@ PersistentInputs PersistentInputs::allocate(
     p.structured_mask_klen =
         DeviceBuffer<std::uint32_t>::alloc(max_requests);
     p.structured_masks =
-        DeviceBuffer<kernels::StructuredMaskParams>::alloc(max_requests);
+        DeviceBuffer<kernels::attn::StructuredMaskParams>::alloc(max_requests);
     p.w_page             = DeviceBuffer<std::uint32_t>::alloc(max_workspace_tokens);
     p.w_off              = DeviceBuffer<std::uint32_t>::alloc(max_workspace_tokens);
     p.row_valid          = DeviceBuffer<std::uint8_t>::alloc(max_workspace_tokens);
@@ -131,7 +131,7 @@ std::size_t persistent_input_bytes(int N,
         static_cast<std::size_t>(max_custom_mask_bytes));
     bytes += static_cast<std::size_t>(R + 1) * 4;
     bytes += static_cast<std::size_t>(R) *
-        (sizeof(std::uint32_t) + sizeof(kernels::StructuredMaskParams));
+        (sizeof(std::uint32_t) + sizeof(kernels::attn::StructuredMaskParams));
     bytes += static_cast<std::size_t>(N) * (4 + 4 + 1);
     return bytes;
 }

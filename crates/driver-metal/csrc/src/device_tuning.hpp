@@ -138,34 +138,6 @@ struct DeviceTuning {
     /// field to live in.
     int qmm_min_batch_emulated = 12;
 
-    /// The same crossover for a checkpoint whose FFN is ROUTED.
-    ///
-    /// A separate number because the measurement says so, not for symmetry. In
-    /// a mixture the dense projections this constant governs are the attention
-    /// four and the head; the FFN -- the largest weights in the layer, and on a
-    /// decode the whole of the bandwidth -- is routed and takes
-    /// `moe_tile_rows`' own decision instead. So the GEMM here pays its padding
-    /// without the matrices that repay it.
-    ///
-    /// M2 Max (Apple8, 38 cores), GEMM against GEMV at the batches where the
-    /// dense value would have switched, tok/s:
-    ///
-    ///     batch          6             7             8
-    ///     Qwen3-30B    63.6/63.5    67.8/75.2    90.4/98.3
-    ///     gemma-4-26B  60.1/64.3    71.7/76.6    84.8/96.3
-    ///     gpt-oss-20B  96.0/101.3  102.1/104.9  107.4/107.8
-    ///
-    /// The GEMV wins or ties at every one of them: taking the dense value here
-    /// would cost Qwen3-30B 8% and gemma-4-26B 12% at the batch it helps a
-    /// dense model most. So a routed checkpoint keeps the M1 number.
-    ///
-    /// This agrees with what the two routed families already recorded from
-    /// their own side on the M1 Max -- `gemma4_qmm_rows` measured a lowered
-    /// crossover at -17%, `gptoss_qmm_rows` at -1%. Those were read then as
-    /// "the inherited number holds"; they were the routed half of this split,
-    /// taken before there was a dense half to compare against.
-    int qmm_min_batch_moe = 12;
-
     /// The threadgroup count at which the unsplit GEMM's BN=32 tile overtakes
     /// BN=16.
     ///

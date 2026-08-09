@@ -6,15 +6,15 @@
 
 #include <cstdint>
 
-#include "ops/attention_workspace.hpp"
+#include "attention_workspace.hpp"
 #include "device_buffer.hpp"
 #include "distributed.hpp"
 #include "store/kv_cache.hpp"
 #include "model/llama_like/qwen3.hpp"
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/workspace.hpp"  // for Workspace (reused)
-#include "ops/attention_flashinfer.hpp"  // DecodePlanCachePtr
-#include "ops/gemm.hpp"
+#include "attn/attention_flashinfer.hpp"  // DecodePlanCachePtr
+#include "gemm/gemm.hpp"
 #include "store/recurrent_state_cache.hpp"
 
 namespace pie_cuda_driver::model {
@@ -127,8 +127,8 @@ struct Qwen3_5ForwardCfg {
 // hoisting it here we let the executor refresh it once per fire,
 // outside any cudaStream capture region.
 struct Qwen3_5PlanState {
-    ops::DecodePlanCachePtr decode_plan;
-    ops::PrefillPlanCachePtr prefill_plan;
+    kernels::attn::DecodePlanCachePtr decode_plan;
+    kernels::attn::PrefillPlanCachePtr prefill_plan;
     bool use_prefill_plan = false;
 };
 
@@ -186,7 +186,7 @@ void qwen3_5_forward_paged(
     KvCache& cache,
     RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -241,7 +241,7 @@ void qwen3_5_mtp_process_cache(
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
     RecurrentStateCache& state_cache,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -265,7 +265,7 @@ void qwen3_5_mtp_forward(
     Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* position_ids,
     const std::int32_t* base_hidden_row_indices,

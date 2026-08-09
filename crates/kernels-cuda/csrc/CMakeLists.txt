@@ -1,4 +1,5 @@
-# The CUDA kernel archive: `src/kernels/`, `src/ops/`, and the vendored
+# The CUDA kernel archive: one directory per kernel family under `src/`,
+# and the vendored
 # third-party kernels they wrap.
 #
 # This used to be part of `crates/driver-cuda/csrc`, and the split follows a
@@ -17,7 +18,22 @@
 #                        are expressed in. The shell reads it too, and reads
 #                        it from HERE, because a kernel signature cannot be
 #                        stated in a type the caller owns.
-#   runahead.hpp         the runahead slot count attention_workspace sizes by.
+#
+# What went BACK to the driver: `runahead.hpp`, and then the class it was
+# there to size. `runahead.hpp` holds the scheduler's run-ahead depth, which
+# is shell policy, and it was here only because `attention_workspace.hpp`
+# sized a `std::array` by it. That array became a `std::vector` and
+# `allocate()` took the depth as an argument, which sent the constant home.
+#
+# `AttentionWorkspace` itself followed. The measurement that decided it: of
+# everything the class offers, `attn/` reads exactly five values and calls
+# nothing else, while `allocate` / `begin_plan_update` / `end_plan_update`
+# are the driver's alone. So the five stayed as a POD --
+# `src/attention_workspace_view.hpp`, which is what every launcher now takes
+# -- and the allocation, the move semantics, the pinned staging rotation and
+# the events fencing it went to `driver-cuda/csrc/src/attention_workspace.*`.
+# Same shape as `runahead`: what crosses is a value, not an object, and the
+# dependency is one-way.
 #   third_party/         FlashInfer's generated MoE launchers, marlin,
 #                        marlin_moe. Kernels, vendored.
 #
@@ -38,6 +54,12 @@
 
 
 cmake_minimum_required(VERSION 3.23)
+
+# The PTIR contract headers (`rng_contract.generated.h`). `kernels-cuda`'s
+# build.rs passes this; the fallback keeps a bare `cmake csrc/` working.
+if(NOT PIE_PTIR_INCLUDE_DIR)
+  set(PIE_PTIR_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tensor-compiler/include")
+endif()
 
 include(cmake/DetectCudaArchitecture.cmake)
 detect_cuda_architectures()
@@ -65,11 +87,17 @@ endif()
 project(PIE_KERNELS_CUDA CUDA CXX)
 
 
-# There is no "where the rest of the repo is" block here, and its absence is
-# the boundary being real: not one file under `src/` includes a header from
-# `driver`, `tensor-compiler`, `driver-abi` or `model-loader-capi`. A kernel
-# takes pointers and extents. Everything it needs is in this directory or
-# fetched into it.
+# The boundary, stated precisely: not one file under `src/` includes a header
+# from `driver`, `driver-abi` or `model-loader-capi`. A kernel takes pointers
+# and extents.
+#
+# One exception, and it is a CONTRACT rather than machinery:
+# `src/ptir/tier0.cuh` includes `tensor-compiler`'s generated
+# `rng_contract.generated.h`. Tier-0 interprets a PTIR trace kernel by kernel
+# and tier-1 re-emits the same math through NVRTC; the two are diffed against
+# a host golden, so their RNG has to agree bit for bit. That agreement is what
+# the generated header IS. Reading it here is the same shape as `kernels.def`
+# being read by both C++ and CMake -- one source, two consumers, no copy.
 
 # Optional compiler cache; speeds clean rebuilds / branch switches.
 # Host C/C++ accepts either sccache or ccache.
@@ -272,7 +300,7 @@ endif()
 # pass has no __CUDA_ARCH__ at all and therefore keeps everything, which is what
 # the launcher needs in order to compile.
 #
-# This takes nothing away from sm_80/86/89. `src/ops/flashinfer_mamba.cu` only
+# This takes nothing away from sm_80/86/89. `src/ssm/flashinfer_mamba.cu` only
 # enters FlashInfer's SSU at all when the device's major version is >= 9, and
 # FlashInfer's own selector independently sends sm_major < 9 to kSimple, so
 # these kernels were unreachable on those architectures before this patch.
@@ -423,11 +451,11 @@ pie_cuda_has_arch(PIE_HAS_SM120 120)
 # arch gets the stub.
 if(PIE_HAS_SM90)
   set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE
-    src/ops/attention_flashinfer_hopper.cu
-    src/ops/attention_xqa_gqa8_sm90.cu)
+    src/attn/attention_flashinfer_hopper.cu
+    src/attn/attention_xqa_gqa8_sm90.cu)
   message(STATUS "Enabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
 else()
-  set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/ops/attention_flashinfer_hopper_stub.cpp)
+  set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/attn/attention_flashinfer_hopper_stub.cpp)
   message(STATUS "Disabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
@@ -456,22 +484,22 @@ endif()
 # both lived in one archive; the grouping was about build cost, not about
 # ownership, so it did not survive the split.
 set(PIE_CUDA_GRAPH_KERNEL_SOURCES
-  src/kernels/altup.cu
-  src/kernels/altup_aux.cu
-  src/kernels/attn_sink.cu
-  src/kernels/dsa_indexer.cu
-  src/kernels/dsv4_compress.cu
-  src/kernels/dsv4_hc.cu
-  src/kernels/dsv4_routing.cu
-  src/kernels/gaussian_topk.cu
-  src/kernels/kimi_mla.cu
-  src/kernels/mla_paged.cu
-  src/kernels/nemotron_h.cu
-  src/kernels/page_compact.cu
-  src/kernels/scalar_mul.cu
-  src/kernels/softcap.cu
-  src/ops/attention_mla.cu
-  src/ops/flashinfer_mamba.cu)
+  src/norm/altup.cu
+  src/norm/altup_aux.cu
+  src/attn/attn_sink.cu
+  src/attn/dsa_indexer.cu
+  src/attn/dsv4_compress.cu
+  src/norm/dsv4_hc.cu
+  src/moe/dsv4_routing.cu
+  src/mlp/gaussian_topk.cu
+  src/attn/kimi_mla.cu
+  src/attn/mla_paged.cu
+  src/ssm/nemotron_h.cu
+  src/attn/page_compact.cu
+  src/norm/scalar_mul.cu
+  src/attn/softcap.cu
+  src/attn/attention_mla.cu
+  src/ssm/flashinfer_mamba.cu)
 
 # ---- pie_kernels_cuda ------------------------------------------------------
 # The kernel archive. `driver-cuda` links it; nothing else does. Every
@@ -482,7 +510,7 @@ set(PIE_CUDA_GRAPH_KERNEL_SOURCES
 # next to the primary TU and verified here instead.
 set(PIE_ATTENTION_HEAD_DIM_SOURCES)
 foreach(_pie_hd IN LISTS PIE_ATTN_HEAD_DIMS)
-  set(_pie_hd_src "src/ops/attention_flashinfer_hd${_pie_hd}.cu")
+  set(_pie_hd_src "src/attn/attention_flashinfer_hd${_pie_hd}.cu")
   if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_pie_hd_src}")
     message(FATAL_ERROR
       "kernels.def declares PIE_ATTN_HEAD_DIM(${_pie_hd}) but ${_pie_hd_src} "
@@ -496,7 +524,7 @@ endforeach()
 # CONFIGURE_DEPENDS so that dropping in a new stub re-runs the check instead of
 # passing until someone happens to reconfigure.
 file(GLOB _pie_hd_stubs CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/ops/attention_flashinfer_hd*.cu")
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/attn/attention_flashinfer_hd*.cu")
 foreach(_pie_hd_src IN LISTS _pie_hd_stubs)
   if(NOT _pie_hd_src IN_LIST PIE_ATTENTION_HEAD_DIM_SOURCES)
     message(FATAL_ERROR
@@ -505,60 +533,88 @@ foreach(_pie_hd_src IN LISTS _pie_hd_stubs)
   endif()
 endforeach()
 
+
+# The custom P2P all-reduce, arch-gated. It wraps FlashInfer's vllm-style
+# kernel and FUSES a residual add and an RMSNorm into the reduction -- the
+# unfused halves of which are `norm/`'s -- so it is a compute kernel that
+# happens to be collective, not comm machinery. What it needs from the
+# collective is one bootstrap all-gather, taken as a callback
+# (`HostAllgather`) rather than an `NcclComm&`.
+#
+# Blackwell (sm100/120) has no kernel yet; the stub keeps the entry points.
+if(PIE_HAS_SM100 OR PIE_HAS_SM120)
+  set(PIE_KERNELS_CUSTOM_ALL_REDUCE_SOURCE src/comm/custom_all_reduce_stub.cpp)
+  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+else()
+  set(PIE_KERNELS_CUSTOM_ALL_REDUCE_SOURCE src/comm/custom_all_reduce.cu)
+endif()
+
 add_library(pie_kernels_cuda STATIC
+  src/layout/split_gate_up.cu
+  src/moe/topk_sigmoid.cu
+  # vision/ -- the multimodal towers, bridged at TOWER granularity (one
+  # launcher per tower; the walk and its host prep stay C++ — see the
+  # provenance headers and the retirement wiki's VL judgment).
+  src/vision/qwen3_vl_tower.cu
+  src/vision/qwen3_vl_tower_c.cpp
+  src/vision/vis_helpers.cpp
+  src/vision/gemma4_vision.cu
+  src/vision/gemma4_audio.cu
+  src/vision/gemma4_towers_c.cpp
+  ${PIE_KERNELS_CUSTOM_ALL_REDUCE_SOURCE}
   src/tensor.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers
-  src/ops/attention_flashinfer.cu
+  src/attn/attention_flashinfer.cu
   ${PIE_ATTENTION_HEAD_DIM_SOURCES}
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
   # Unconditional, and not part of PIE_CUDA_FLASHINFER_HOPPER_SOURCE above:
   # the decode KV-split path reaches the state merge on every architecture,
   # so it cannot ride the sm90 prefill's stub/real switch.
-  src/ops/attention_merge_states.cu
-  src/ops/attention_naive.cu
-  src/ops/attention_naive_paged.cu
-  src/ops/attention_workspace.cpp
-  src/ops/attention_xqa.cu
-  src/ops/attention_xqa_gqa2.cu
-  src/ops/attention_xqa_gqa2_p16.cu
-  src/ops/attention_xqa_gqa4.cu
-  src/ops/attention_xqa_gqa8.cu
-  src/ops/gemm.cpp
+  src/attn/attention_merge_states.cu
+  src/attn/attention_naive.cu
+  src/attn/attention_naive_paged.cu
+  src/attn/attention_xqa.cu
+  src/attn/attention_xqa_gqa2.cu
+  src/attn/attention_xqa_gqa2_p16.cu
+  src/attn/attention_xqa_gqa4.cu
+  src/attn/attention_xqa_gqa8.cu
+  src/gemm/gemm.cpp
   # kernels/ -- fused kernels
-  src/kernels/add_bias.cu
-  src/kernels/argmax.cu
-  src/kernels/graph_pad.cu
-  src/kernels/causal_conv1d.cu
-  src/kernels/deinterleave.cu
-  src/kernels/dequant_fp4.cu
-  src/kernels/dequant_fp8.cu
-  src/kernels/dequant_wna16.cu
-  src/kernels/dtype_cast.cu
-  src/kernels/embed.cu
-  src/kernels/envelope.cu
-  src/kernels/gated_delta_net.cu
-  src/kernels/kda.cu
-  src/kernels/attn_res.cu
-  src/kernels/gather_rows.cu
-  src/kernels/gemv.cu
-  src/kernels/gather_tokens.cu
-  src/kernels/geometry.cu
-  src/kernels/head_dim_pad.cu
-  src/kernels/kv_paged.cu
-  src/kernels/moe_dispatch.cu
-  src/kernels/moe_grouped_gemm.cu
-  src/kernels/mxfp4_marlin.cu
-  src/kernels/pack_dense_mask.cu
-  src/kernels/quant_bf16_to_fp8.cu
-  src/kernels/quant_bf16_to_mxfp4.cu
-  src/kernels/residual_add.cu
-  src/kernels/rmsnorm.cu
-  src/kernels/rope.cu
-  src/kernels/slot_ops.cu
-  src/kernels/split_packed.cu
-  src/kernels/swiglu.cu
-  src/kernels/topk_softmax.cu
-  src/kernels/transcode.cu
+  src/norm/add_bias.cu
+  src/sample/argmax.cu
+  src/layout/graph_pad.cu
+  src/ssm/causal_conv1d.cu
+  src/layout/deinterleave.cu
+  src/quant/dequant_fp4.cu
+  src/quant/dequant_fp8.cu
+  src/quant/dequant_wna16.cu
+  src/quant/dtype_cast.cu
+  src/layout/embed.cu
+  src/layout/envelope.cu
+  src/ssm/gated_delta_net.cu
+  src/ssm/kda.cu
+  src/attn/attn_res.cu
+  src/layout/gather_rows.cu
+  src/gemm/gemv.cu
+  src/layout/gather_tokens.cu
+  src/layout/geometry.cu
+  src/attn/head_dim_pad.cu
+  src/attn/kv_paged.cu
+  src/moe/moe_dispatch.cu
+  src/moe/moe_grouped_gemm.cu
+  src/quant/mxfp4_marlin.cu
+  src/attn/pack_dense_mask.cu
+  src/quant/quant_bf16_to_fp8.cu
+  src/quant/quant_bf16_to_mxfp4.cu
+  src/norm/residual_add.cu
+  src/norm/rmsnorm.cu
+  src/rope/rope.cu
+  src/attn/qkv_fused.cu
+  src/layout/slot_ops.cu
+  src/attn/split_packed.cu
+  src/mlp/swiglu.cu
+  src/moe/topk_softmax.cu
+  src/quant/transcode.cu
   # ...and the graph-heavy ones a model implementation launches by name.
   ${PIE_CUDA_GRAPH_KERNEL_SOURCES}
 )
@@ -581,6 +637,8 @@ target_compile_options(pie_kernels_cuda PRIVATE
 target_include_directories(pie_kernels_cuda
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # The PTIR contract headers -- see the boundary note at the top.
+    ${PIE_PTIR_INCLUDE_DIR}
     # Ahead of anything the toolkit ships: FlashInfer needs its own vendored
     # CCCL, and a toolkit that bundles an older one would shadow it.
     ${PIE_CCCL_INCLUDE_DIRS}
@@ -690,7 +748,7 @@ endif()
 # library because its dependency slice (nv_internal/) is large and should
 # stay a clear opt-in boundary for Nemotron experimentation.
 add_library(pie_flashinfer_cutlass_moe OBJECT
-  src/ops/flashinfer_moe.cu
+  src/moe/flashinfer_moe.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/envUtils.cpp
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/logger.cpp
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/stringUtils.cpp

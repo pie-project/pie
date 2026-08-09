@@ -1,5 +1,5 @@
 #include "model/qwen3_5/qwen3_5_moe.hpp"
-#include "kernels/swiglu.hpp"
+#include "mlp/swiglu.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/gated_delta_net.hpp"  // launch_bf16_to_fp32
+#include "ssm/gated_delta_net.hpp"  // kernels::ssm::bf16_to_fp32
 
 namespace pie_cuda_driver::model {
 

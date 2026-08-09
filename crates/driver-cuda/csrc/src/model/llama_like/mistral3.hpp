@@ -7,7 +7,7 @@
 //
 // Strategy: dequantize-on-load. Each FP8 projection ships with a
 // scalar `weight_scale_inv`; we materialize a fresh bf16 tensor via
-// `launch_dequant_fp8_e4m3_to_bf16` (a per-tensor-scaled cast), then
+// `kernels::quant::dequant_fp8_e4m3_to_bf16` (a per-tensor-scaled cast), then
 // register it in the engine under the canonical "self_attn.q_proj.weight"
 // name `bind_llama_like` expects. Cost: 2× the FP8 footprint while we
 // hold both copies, then we drop the FP8 source.

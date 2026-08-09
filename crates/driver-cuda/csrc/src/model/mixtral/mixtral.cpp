@@ -1,4 +1,5 @@
 #include <cstring>
+#include "attention_workspace.hpp"
 #include "model/mixtral/mixtral.hpp"
 #include "model/stage_hooks.hpp"
 
@@ -14,28 +15,28 @@
 
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
-#include "kernels/add_bias.hpp"
-#include "kernels/attn_sink.hpp"
-#include "kernels/dequant_fp4.hpp"
-#include "kernels/dequant_wna16.hpp"
-#include "kernels/deinterleave.hpp"
-#include "kernels/embed.hpp"
-#include "kernels/gather_rows.hpp"
-#include "kernels/gemv.hpp"
-#include "kernels/residual_add.hpp"
-#include "kernels/kv_paged.hpp"
-#include "kernels/moe_dispatch.hpp"
+#include "norm/add_bias.hpp"
+#include "attn/attn_sink.hpp"
+#include "quant/dequant_fp4.hpp"
+#include "quant/dequant_wna16.hpp"
+#include "layout/deinterleave.hpp"
+#include "layout/embed.hpp"
+#include "layout/gather_rows.hpp"
+#include "gemm/gemv.hpp"
+#include "norm/residual_add.hpp"
+#include "attn/kv_paged.hpp"
+#include "moe/moe_dispatch.hpp"
 #ifdef PIE_CUDA_HAS_MARLIN_MOE
   #include "marlin_moe_wrapper.hpp"
 #endif
-#include "kernels/rmsnorm.hpp"
-#include "kernels/rope.hpp"
+#include "norm/rmsnorm.hpp"
+#include "rope/rope.hpp"
 #include <cstdio>
-#include "kernels/swiglu.hpp"
-#include "kernels/topk_softmax.hpp"
-#include "ops/gemm.hpp"
-#include "ops/attention_flashinfer.hpp"
-#include "ops/attention_flashinfer_hopper.hpp"
+#include "mlp/swiglu.hpp"
+#include "moe/topk_softmax.hpp"
+#include "gemm/gemm.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "attn/attention_flashinfer_hopper.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -351,7 +352,7 @@ void mixtral_forward_paged(
     Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -420,16 +421,16 @@ void mixtral_forward_paged(
         lse_ptr = d_lse.data();
     }
 
-    kernels::launch_embed_bf16(
+    kernels::layout::embed_bf16(
         token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
 
-    ops::DecodePlanCachePtr decode_plan;
+    kernels::attn::DecodePlanCachePtr decode_plan;
     if (use_decode_path) {
-        decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode(
+        decode_plan = kernels::attn::make_decode_plan();
+        kernels::attn::plan_attention_flashinfer_decode(
             *decode_plan, kv_page_indptr_h, R,
             num_q_heads_local, num_kv_heads_local, d,
-            cache.page_size(), attn_ws, stream,
+            cache.page_size(), attn_ws.view(), stream,
             /*enable_cuda_graph=*/true,
             /*full_attention_variant=*/false,
             cache.hnd_layout());
@@ -476,7 +477,7 @@ void mixtral_forward_paged(
             static_cast<std::size_t>(R) * keep_max);
         win_indptr = DeviceBuffer<std::uint32_t>::alloc(
             static_cast<std::size_t>(R) + 1);
-        kernels::launch_build_window_page_view(
+        kernels::attn::build_window_page_view(
             kv_page_indices, kv_page_indptr, keep_max,
             win_indptr.data(), win_indices.data(), R, stream);
     }
@@ -506,7 +507,7 @@ void mixtral_forward_paged(
         const int n = (v != nullptr) ? std::atoi(v) : 16;
         return (n >= 1 && n <= 128) ? n : 16;
     }();
-    ops::DecodePlanCachePtr split_plan;
+    kernels::attn::DecodePlanCachePtr split_plan;
     DeviceBuffer<std::uint32_t> split_indptr, split_indices, split_last;
     DeviceBuffer<std::uint16_t> split_partial;
     DeviceBuffer<float> split_lse, split_lse_merged;
@@ -517,7 +518,7 @@ void mixtral_forward_paged(
                             : fwd_cfg.sliding_window;
         if (w_l < 0) { has_full_layer = true; break; }
     }
-    // The split's partials are folded by `merge_attention_states_bf16`. That
+    // The split's partials are folded by `kernels::attn::merge_attention_states_bf16`. That
     // used to live in the sm90 TU and be a THROWING STUB elsewhere, so this
     // site asked `merge_attention_states_supported()` before taking the
     // split -- a guard added here after a gpt-oss decode on an L40S threw
@@ -556,13 +557,13 @@ void mixtral_forward_paged(
             static_cast<std::size_t>(splits) +
             std::min<std::size_t>(max_req_pages,
                                   static_cast<std::size_t>(cache.num_pages())));
-        kernels::launch_build_full_split_view(
+        kernels::attn::build_full_split_view(
             kv_page_indptr, kv_last_page_lens, splits, page_size,
             split_indptr.data(), split_indices.data(), split_last.data(),
             kv_page_indices, stream);
-        split_plan = ops::make_decode_plan();
+        split_plan = kernels::attn::make_decode_plan();
         // Past the primary plan's descriptor, which is sized for R.
-        ops::set_decode_plan_int_base(*split_plan, 1u << 20);
+        kernels::attn::set_decode_plan_int_base(*split_plan, 1u << 20);
         // The descriptor is page-count independent, so the counts handed to
         // the planner only have to be a well-formed indptr over `splits`
         // requests; the real ranges reach the LAUNCH, from the device.
@@ -570,10 +571,10 @@ void mixtral_forward_paged(
         for (int i = 0; i <= splits; ++i) {
             plan_indptr_h[i] = static_cast<std::uint32_t>(i);
         }
-        ops::plan_attention_flashinfer_decode(
+        kernels::attn::plan_attention_flashinfer_decode(
             *split_plan, plan_indptr_h.data(), splits,
             num_q_heads_local, num_kv_heads_local, d, page_size,
-            attn_ws, stream, /*enable_cuda_graph=*/true,
+            attn_ws.view(), stream, /*enable_cuda_graph=*/true,
             /*full_attention_variant=*/true, cache.hnd_layout());
         const std::size_t rows =
             static_cast<std::size_t>(splits) * num_q_heads_local;
@@ -772,7 +773,7 @@ void mixtral_forward_paged(
 
         // ── Attention block (identical to llama_like pre-norm path) ──
         if (prof.enabled) prof.open(&prof.attn, stream);
-        kernels::launch_rmsnorm_bf16(
+        kernels::norm::rmsnorm_bf16(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
         // Bias folded into the projection: at decode these route to the
@@ -786,7 +787,7 @@ void mixtral_forward_paged(
         // own to work with and cuBLAS is the better answer.
         const bool fused_qkv_gemv =
             N == 1 &&
-            kernels::launch_gemv3_bf16(
+            kernels::gemm::gemv3_bf16(
                 layer.q_proj->data(), layer.k_proj->data(),
                 layer.v_proj->data(),
                 layer.q_bias ? layer.q_bias->data() : nullptr,
@@ -795,15 +796,15 @@ void mixtral_forward_paged(
                 ws.q.data(), ws.k.data(), ws.v.data(),
                 ws.norm_x.data(), Hq, Hk, Hk, H, stream);
         if (!fused_qkv_gemv) {
-        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bias_bf16(cublas.handle(),
             ws.norm_x.data(), layer.q_proj->data(),
             layer.q_bias ? layer.q_bias->data() : nullptr,
             ws.q.data(), N, Hq, H, stream);
-        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bias_bf16(cublas.handle(),
             ws.norm_x.data(), layer.k_proj->data(),
             layer.k_bias ? layer.k_bias->data() : nullptr,
             ws.k.data(), N, Hk, H, stream);
-        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bias_bf16(cublas.handle(),
             ws.norm_x.data(), layer.v_proj->data(),
             layer.v_bias ? layer.v_bias->data() : nullptr,
             ws.v.data(), N, Hk, H, stream);
@@ -836,7 +837,7 @@ void mixtral_forward_paged(
         // graph capture introduces at concurrency. It costs nothing today,
         // since concurrency is broken for an unrelated reason.
         // PLAIN ROPE ONLY, and this term is not optional.
-        // `launch_rope_write_kv_bf16` takes `rope_theta` and nothing else, so
+        // `kernels::rope::rope_write_kv_bf16` takes `rope_theta` and nothing else, so
         // a model whose config asks for YaRN cannot go through it. gpt-oss is
         // exactly such a model -- YaRNOriginal, factor 32 over an original
         // 4096 -- and it is the ONE model carrying this fusion. Without the
@@ -847,7 +848,7 @@ void mixtral_forward_paged(
             N == 1 && kv_view.is_native_bf16() && !kv_view.has_envelopes() &&
             fwd_cfg.rope_kind == RopeKind::Standard;
         if (fused_rope_kv) {
-            kernels::launch_rope_write_kv_bf16(
+            kernels::rope::rope_write_kv_bf16(
                 ws.q.data(), ws.k.data(), ws.v.data(), positions,
                 kv_view.k_pages, kv_view.v_pages,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
@@ -878,7 +879,7 @@ void mixtral_forward_paged(
             static_cast<std::uint32_t>(L), stream);
 
         if (!fused_rope_kv) {
-            kernels::launch_write_kv_to_pages(
+            kernels::attn::write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 N, R, stream, row_valid_d);
@@ -892,15 +893,15 @@ void mixtral_forward_paged(
         const bool use_full_split =
             use_decode_path && !split_indices.empty() && layer_window < 0;
         if (use_full_split) {
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            kernels::attn::dispatch_attention_flashinfer_decode_bf16(
                 *split_plan, ws.q.data(),
                 kv_view.k_pages, kv_view.v_pages,
                 split_partial.data(), split_indices.data(),
                 split_indptr.data(), split_last.data(),
-                attn_ws, stream, /*window_left=*/-1,
+                attn_ws.view(), stream, /*window_left=*/-1,
                 /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
                 split_lse.data(), /*broadcast_q=*/true);
-            ops::merge_attention_states_bf16(
+            kernels::attn::merge_attention_states_bf16(
                 split_partial.data(), split_lse.data(),
                 ws.attn_out.data(), split_lse_merged.data(),
                 kMixtralFullSplits, 1, num_q_heads_local, d, stream);
@@ -913,33 +914,33 @@ void mixtral_forward_paged(
             // planner run competes for offset 0 of the shared int workspace.
             const bool trimmed =
                 !win_indices.empty() && layer_window == trim_window;
-            ops::dispatch_attention_flashinfer_decode(
+            kernels::attn::dispatch_attention_flashinfer_decode(
                 *decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 trimmed ? win_indices.data() : kv_page_indices,
                 trimmed ? win_indptr.data() : kv_page_indptr,
                 kv_last_page_lens,
-                attn_ws, stream,
+                attn_ws.view(), stream,
                 /*window_left=*/layer_window,
                 /*logits_soft_cap=*/0.f,
                 /*sm_scale=*/-1.f,
                 layer_lse);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom(
+            kernels::attn::attention_flashinfer_prefill_custom(
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws.view(), stream,
                 /*window_left=*/-1,
                 /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
                 layer_lse);
         } else {
-            ops::launch_attention_flashinfer_prefill(
+            kernels::attn::attention_flashinfer_prefill(
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws.view(), stream,
                 /*window_left=*/layer_window,
                 /*logits_soft_cap=*/0.f,
                 /*sm_scale=*/-1.f,
@@ -951,7 +952,7 @@ void mixtral_forward_paged(
         if (layer.attn_sinks != nullptr) {
             // On a split layer each slice's lse is a partial; the total the
             // sink extension needs is the one MergeStates just folded.
-            kernels::launch_attention_sink_rescale_bf16(
+            kernels::attn::attention_sink_rescale_bf16(
                 ws.attn_out.data(),
                 use_full_split ? split_lse_merged.data() : layer_lse,
                 layer.attn_sinks->data(),
@@ -974,18 +975,18 @@ void mixtral_forward_paged(
             // beta = 1 accumulates into the residual and the bias rides the
             // same epilogue, so what used to be a GEMM plus an `add_bias` plus
             // a `residual_add` is one kernel.
-            ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            kernels::gemm::act_x_wt_bias_bf16(cublas.handle(),
                 ws.attn_out.data(), layer.o_proj->data(),
                 layer.o_bias ? layer.o_bias->data() : nullptr,
                 ws.y.data(), N, H, Hq, stream, /*beta=*/1.f);
         } else {
-            ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            kernels::gemm::act_x_wt_bias_bf16(cublas.handle(),
                 ws.attn_out.data(), layer.o_proj->data(),
                 (layer.o_bias && tp_is_leader) ? layer.o_bias->data() : nullptr,
                 ws.norm_x.data(), N, H, Hq, stream);
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
-            kernels::launch_residual_add_bf16(
+            kernels::norm::residual_add_bf16(
                 ws.y.data(), ws.norm_x.data(), N * H, stream);
         }
 
@@ -995,7 +996,7 @@ void mixtral_forward_paged(
         // The MoE input is wanted in fp16 by the decode GEMV, and this norm is
         // where it is produced; emitting both here retires the cast kernel
         // that used to read it straight back.
-        kernels::launch_rmsnorm_bf16_with_fp16(
+        kernels::norm::rmsnorm_bf16_with_fp16(
             ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
             d_mxfp4_act_fp16.data(),
             N, H, eps, stream);
@@ -1005,11 +1006,11 @@ void mixtral_forward_paged(
         // — its allocation is `[max_tokens, intermediate]` which is
         // always ≥ [N, num_experts] for any production config (E ≤ 64,
         // I ≥ 4096).
-        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bias_bf16(cublas.handle(),
             ws.norm_y.data(), layer.router->data(),
             layer.router_bias ? layer.router_bias->data() : nullptr,
             ws.gate.data(), N, num_experts, H, stream);
-        kernels::launch_topk_softmax_bf16(
+        kernels::moe::topk_softmax_bf16(
             ws.gate.data(), d_topk_idx.data(), d_topk_w.data(),
             N, num_experts, top_k, stream);
 
@@ -1169,14 +1170,14 @@ void mixtral_forward_paged(
             const int routes = N * top_k;
             const auto& e0 = layer.experts[0];
             // DELIBERATELY NOT TRANSPOSED. This block used to run
-            // `launch_transpose_expert_scales_u8` over these three
+            // `kernels::moe::transpose_expert_scales_u8` over these three
             // tensors, on the stated belief that they were "the
             // checkpoint's `[E, n, k/32]` scales". They are not: the
             // loader already repacked them. `model/gpt_oss`'s contract
             // publishes all three through `RepackLayout::MarlinMxfp4Scale`
             // (contract.rs `native_gate_up` and `native_down`), which
             // `transcode_engine.hpp` executes as
-            // `launch_mxfp4_scales_to_marlin_e8m0` -- already K-major AND
+            // `kernels::quant::mxfp4_scales_to_marlin_e8m0` -- already K-major AND
             // already carrying Marlin's 64-wide plus four-lane
             // permutation. Transposing that again destroyed it.
             //
@@ -1201,7 +1202,7 @@ void mixtral_forward_paged(
             // for `resolve()` to close at teardown. Every other stage boundary
             // in this branch pairs the two for the same reason.
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_align, stream); }
-            kernels::launch_moe_align_decode(
+            kernels::moe::moe_align_decode(
                 d_topk_idx.data(), d_marlin_sorted.data(),
                 d_marlin_expert_ids.data(), /*route_to_aligned_row=*/nullptr,
                 routes, num_experts, marlin_block, marlin_max_blocks,
@@ -1237,20 +1238,20 @@ void mixtral_forward_paged(
             // GPT-OSS publishes its expert biases at the UNPADDED width, which
             // is not the stride Marlin's own bias epilogue assumes.
             if (e0.b_gate != nullptr) {
-                kernels::launch_add_moe_route_bias_bf16(
+                kernels::moe::add_moe_route_bias_bf16(
                     d_marlin_gate.data(), e0.b_gate->data(),
                     d_topk_idx.data(), routes, I, Ip_marlin, stream);
-                kernels::launch_add_moe_route_bias_bf16(
+                kernels::moe::add_moe_route_bias_bf16(
                     d_marlin_up.data(), e0.b_up->data(),
                     d_topk_idx.data(), routes, I, Ip_marlin, stream);
             }
             if (cfg.swiglu_limit > 0.f) {
-                kernels::launch_gpt_oss_glu_strided_bf16(
+                kernels::mlp::gpt_oss_glu_strided_bf16(
                     d_marlin_gate.data(), d_marlin_up.data(),
                     d_marlin_act.data(), routes, I, Ip_marlin, Ip_marlin,
                     stream, cfg.swiglu_limit);
             } else {
-                kernels::launch_gpt_oss_glu_strided_bf16(
+                kernels::mlp::gpt_oss_glu_strided_bf16(
                     d_marlin_gate.data(), d_marlin_up.data(),
                     d_marlin_act.data(), routes, I, Ip_marlin, Ip_marlin,
                     stream, /*limit=*/0.f);
@@ -1261,11 +1262,11 @@ void mixtral_forward_paged(
                      routes, /*top_k=*/1, H, Ip_marlin, false);
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_reduce, stream); }
             if (e0.b_down != nullptr && tp_is_leader) {
-                kernels::launch_add_moe_route_bias_bf16(
+                kernels::moe::add_moe_route_bias_bf16(
                     d_mxfp4_route_out.data(), e0.b_down->data(),
                     d_topk_idx.data(), routes, H, H, stream);
             }
-            kernels::launch_token_batched_weighted_sum_bf16(
+            kernels::moe::token_batched_weighted_sum_bf16(
                 d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
                 static_cast<const float*>(d_topk_w.data()), N, top_k, H,
                 stream);
@@ -1274,7 +1275,7 @@ void mixtral_forward_paged(
                 tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
             }
-            kernels::launch_residual_add_bf16(
+            kernels::norm::residual_add_bf16(
                 ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
             continue;
         }
@@ -1285,7 +1286,7 @@ void mixtral_forward_paged(
             const int routes = N * top_k;
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_align, stream); }
             // No cast here: the mlp_norm above already emitted this exact
-            // buffer. `launch_rmsnorm_bf16_with_fp16` writes ws.norm_y and its
+            // buffer. `kernels::norm::rmsnorm_bf16_with_fp16` writes ws.norm_y and its
             // fp16 image in one pass, `d_mxfp4_act_fp16` is only allocated
             // when use_mxfp4_decode_gemv (the condition guarding this branch),
             // and nothing between the two writes ws.norm_y. Re-casting it cost
@@ -1305,11 +1306,11 @@ void mixtral_forward_paged(
             // re-streams its expert's slab, so weight traffic scales with
             // tokens and the decode throughput is flat in batch size.
             if (mxfp4_moe_grouped_choice(routes, num_experts)) {
-                kernels::launch_moe_bucket_exact(
+                kernels::moe::moe_bucket_exact(
                     d_topk_idx.data(), d_moe_sorted_routes.data(),
                     d_moe_route_to_row.data(), d_moe_expert_counts.data(),
                     routes, num_experts, stream);
-                kernels::launch_mxfp4_moe_gate_up_decode_grouped_bf16(
+                kernels::quant::mxfp4_moe_gate_up_decode_grouped_bf16(
                     d_mxfp4_act_fp16.data(),
                     d_moe_sorted_routes.data(), d_moe_expert_counts.data(),
                     layer.expert_gate_up_packed_ptrs.data(),
@@ -1319,7 +1320,7 @@ void mixtral_forward_paged(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
                     num_experts, top_k, H, I, stream);
             } else {
-                kernels::launch_mxfp4_moe_gate_up_decode_bf16(
+                kernels::quant::mxfp4_moe_gate_up_decode_bf16(
                     d_mxfp4_act_fp16.data(), d_topk_idx.data(),
                     layer.expert_gate_up_packed_ptrs.data(),
                     layer.expert_gate_up_scale_ptrs.data(),
@@ -1339,7 +1340,7 @@ void mixtral_forward_paged(
             // swiglu branch, which no model with this activation takes.
             bool act_fp16_ready = false;
             if (cfg.swiglu_limit > 0.f) {
-                kernels::launch_gpt_oss_glu_bf16(
+                kernels::mlp::gpt_oss_glu_bf16(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
                     d_mxfp4_route_gate.data(),
                     static_cast<int>(static_cast<std::size_t>(routes) * I),
@@ -1347,13 +1348,13 @@ void mixtral_forward_paged(
                     d_mxfp4_route_act_fp16.data());
                 act_fp16_ready = true;
             } else {
-                kernels::launch_swiglu_bf16(
+                kernels::mlp::swiglu_bf16(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
                     d_mxfp4_route_gate.data(),
                     static_cast<std::size_t>(routes) * I, stream);
             }
             if (!act_fp16_ready) {
-                kernels::launch_bf16_to_fp16(
+                kernels::quant::bf16_to_fp16(
                     d_mxfp4_route_gate.data(), d_mxfp4_route_act_fp16.data(),
                     static_cast<std::size_t>(routes) * I, stream);
             }
@@ -1362,7 +1363,7 @@ void mixtral_forward_paged(
             // the all-reduce below would otherwise sum it T times.
             if (prof.enabled) prof.close(stream);   // moe_act (glu + cast)
             mx_stage(prof, &prof.moe_down, stream, [&]{
-            kernels::launch_mxfp4_moe_down_decode_bf16(
+            kernels::quant::mxfp4_moe_down_decode_bf16(
                 d_mxfp4_route_act_fp16.data(), d_topk_idx.data(),
                 layer.expert_down_packed_ptrs.data(),
                 layer.expert_down_scale_ptrs.data(),
@@ -1377,18 +1378,18 @@ void mixtral_forward_paged(
                 // hidden state to do what an epilogue could. Under TP the
                 // all-reduce has to see the combine's output alone, so that
                 // path keeps the two apart.
-                kernels::launch_token_batched_weighted_sum_add_bf16(
+                kernels::moe::token_batched_weighted_sum_add_bf16(
                     ws.y.data(), d_mxfp4_route_out.data(),
                     static_cast<const float*>(d_topk_w.data()),
                     N, top_k, H, stream);
             } else {
-                kernels::launch_token_batched_weighted_sum_bf16(
+                kernels::moe::token_batched_weighted_sum_bf16(
                     d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
                     static_cast<const float*>(d_topk_w.data()),
                     N, top_k, H, stream);
                 tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
-                kernels::launch_residual_add_bf16(
+                kernels::norm::residual_add_bf16(
                     ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
             }
             if (prof.enabled) prof.close(stream);   // moe_reduce
@@ -1458,7 +1459,7 @@ void mixtral_forward_paged(
                 Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
 
             // Gather norm_y rows routed to this expert.
-            kernels::launch_gather_bf16_rows(
+            kernels::layout::gather_bf16_rows(
                 static_cast<const std::uint16_t*>(ws.norm_y.data()),
                 d_expert_idx.data(),
                 d_expert_in.data(),
@@ -1503,42 +1504,42 @@ void mixtral_forward_paged(
                     throw std::runtime_error(
                         "mixtral/gpt_oss: incomplete native MXFP4 expert backend");
                 }
-                ops::gemm_act_x_w(cublas.handle(),
+                kernels::gemm::act_x_w(cublas.handle(),
                     d_expert_in.data(),
-                    ops::WeightView::mxfp4_marlin(
+                    WeightView::mxfp4_marlin(
                         *expert.w_gate_mxfp4, *expert.w_gate_mxfp4_scale),
                     d_expert_gate.data(), Ne, Ip, H);
-                ops::gemm_act_x_w(cublas.handle(),
+                kernels::gemm::act_x_w(cublas.handle(),
                     d_expert_in.data(),
-                    ops::WeightView::mxfp4_marlin(
+                    WeightView::mxfp4_marlin(
                         *expert.w_up_mxfp4, *expert.w_up_mxfp4_scale),
                     d_expert_up.data(), Ne, Ip, H);
-                if (expert.b_gate) kernels::launch_add_bias_bf16_strided(
+                if (expert.b_gate) kernels::norm::add_bias_bf16_strided(
                     d_expert_gate.data(), expert.b_gate->data(), Ne, I, Ip,
                     stream);
-                if (expert.b_up) kernels::launch_add_bias_bf16_strided(
+                if (expert.b_up) kernels::norm::add_bias_bf16_strided(
                     d_expert_up.data(), expert.b_up->data(), Ne, I, Ip,
                     stream);
                 if (cfg.swiglu_limit > 0.f) {
-                    kernels::launch_gpt_oss_glu_bf16(
+                    kernels::mlp::gpt_oss_glu_bf16(
                         d_expert_gate.data(), d_expert_up.data(),
                         d_expert_gate.data(),
                         static_cast<int>(static_cast<std::size_t>(Ne) * Ip), stream,
                         /*limit=*/cfg.swiglu_limit);
                 } else {
-                    kernels::launch_swiglu_bf16(
+                    kernels::mlp::swiglu_bf16(
                         d_expert_gate.data(), d_expert_up.data(),
                         d_expert_gate.data(),
                         static_cast<std::size_t>(Ne) * Ip, stream);
                 }
-                ops::gemm_act_x_w(cublas.handle(),
+                kernels::gemm::act_x_w(cublas.handle(),
                     d_expert_gate.data(),
-                    ops::WeightView::mxfp4_marlin(
+                    WeightView::mxfp4_marlin(
                         *expert.w_down_mxfp4, *expert.w_down_mxfp4_scale),
                     d_expert_out.data(), Ne, H, Ip);
-                if (expert.b_down && tp_is_leader) kernels::launch_add_bias_bf16(
+                if (expert.b_down && tp_is_leader) kernels::norm::add_bias_bf16(
                     d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
-                kernels::launch_scatter_add_weighted_bf16(
+                kernels::moe::scatter_add_weighted_bf16(
                     moe_target, d_expert_out.data(),
                     d_expert_idx.data(), d_expert_w.data(),
                     Ne, H, stream);
@@ -1554,20 +1555,20 @@ void mixtral_forward_paged(
                     throw std::runtime_error(
                         "mixtral/gpt_oss: incomplete MXFP4 expert backend");
                 }
-                kernels::launch_dequant_mxfp4_to_bf16(
+                kernels::quant::dequant_mxfp4_to_bf16(
                     static_cast<const std::uint8_t*>(expert.w_gate_up->data()),
                     static_cast<const std::uint8_t*>(
                         expert.w_gate_up_scale->data()),
                     w.mxfp4_gate_up_bf16_scratch.data(),
                     2 * I, H, stream);
-                kernels::launch_dequant_mxfp4_to_bf16(
+                kernels::quant::dequant_mxfp4_to_bf16(
                     static_cast<const std::uint8_t*>(
                         expert.w_down_packed->data()),
                     static_cast<const std::uint8_t*>(
                         expert.w_down_scale->data()),
                     w.mxfp4_down_bf16_scratch.data(),
                     H, I, stream);
-                kernels::launch_deinterleave_rows_bf16(
+                kernels::layout::deinterleave_rows_bf16(
                     w.mxfp4_gate_up_bf16_scratch.data(),
                     w.mxfp4_gate_bf16_scratch.data(),
                     w.mxfp4_up_bf16_scratch.data(),
@@ -1580,40 +1581,40 @@ void mixtral_forward_paged(
                 up_w = expert.w_up->data();
                 down_w = expert.w_down->data();
             }
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
+            kernels::gemm::act_x_wt_bf16(cublas.handle(),
                 d_expert_in.data(), gate_w,
                 d_expert_gate.data(), Ne, I, H);
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
+            kernels::gemm::act_x_wt_bf16(cublas.handle(),
                 d_expert_in.data(), up_w,
                 d_expert_up.data(), Ne, I, H);
-            if (expert.b_gate) kernels::launch_add_bias_bf16(
+            if (expert.b_gate) kernels::norm::add_bias_bf16(
                 d_expert_gate.data(), expert.b_gate->data(), Ne, I, stream);
-            if (expert.b_up) kernels::launch_add_bias_bf16(
+            if (expert.b_up) kernels::norm::add_bias_bf16(
                 d_expert_up.data(), expert.b_up->data(), Ne, I, stream);
             if (cfg.swiglu_limit > 0.f) {
-                kernels::launch_gpt_oss_glu_bf16(
+                kernels::mlp::gpt_oss_glu_bf16(
                     d_expert_gate.data(), d_expert_up.data(),
                     d_expert_gate.data(),
                     static_cast<int>(static_cast<std::size_t>(Ne) * I), stream,
                     /*limit=*/cfg.swiglu_limit);
             } else {
-                kernels::launch_swiglu_bf16(
+                kernels::mlp::swiglu_bf16(
                     d_expert_gate.data(), d_expert_up.data(),
                     d_expert_gate.data(),
                     static_cast<std::size_t>(Ne) * I, stream);
             }
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
+            kernels::gemm::act_x_wt_bf16(cublas.handle(),
                 d_expert_gate.data(), down_w,
                 d_expert_out.data(), Ne, H, I);
             // b_down is replicated across ranks; only the leader applies
             // it so the all-reduce sums it once. Plain Mixtral has no
             // b_down so this branch is dead until GPT-OSS.
-            if (expert.b_down && tp_is_leader) kernels::launch_add_bias_bf16(
+            if (expert.b_down && tp_is_leader) kernels::norm::add_bias_bf16(
                 d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
 
             // Scatter into ws.y (TP=1) or moe_target scratch (TP>1) with
             // routing weight, residual-add style.
-            kernels::launch_scatter_add_weighted_bf16(
+            kernels::moe::scatter_add_weighted_bf16(
                 moe_target, d_expert_out.data(),
                 d_expert_idx.data(), d_expert_w.data(),
                 Ne, H, stream);
@@ -1622,7 +1623,7 @@ void mixtral_forward_paged(
         if (T > 1) {
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
-            kernels::launch_residual_add_bf16(
+            kernels::norm::residual_add_bf16(
                 ws.y.data(), ws.norm_x.data(), N * H, stream);
         }
     }
@@ -1640,24 +1641,24 @@ void mixtral_forward_paged(
         num_logit_rows < N;
     const int lm_head_rows = compact_logits ? num_logit_rows : N;
     if (compact_logits) {
-        kernels::launch_gather_bf16_rows(
+        kernels::layout::gather_bf16_rows(
             static_cast<const std::uint16_t*>(ws.y.data()),
             logit_row_indices_d,
             static_cast<std::uint16_t*>(ws.norm_x.data()),
             num_logit_rows, H, stream);
-        kernels::launch_rmsnorm_bf16(
+        kernels::norm::rmsnorm_bf16(
             ws.norm_x.data(), w.final_norm->data(), ws.norm_y.data(),
             num_logit_rows, H, eps, stream);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.norm_y.data(), w.lm_head->data(), ws.logits.data(),
             lm_head_rows, V, H);
         if (prof.enabled) prof.close(stream);
         return;
     }
-    kernels::launch_rmsnorm_bf16(
+    kernels::norm::rmsnorm_bf16(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
+    kernels::gemm::act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
         N, V, H);
     if (prof.enabled) prof.close(stream);

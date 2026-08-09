@@ -8,7 +8,7 @@
 #include <utility>
 
 #include "cuda_check.hpp"
-#include "kernels/envelope.hpp"
+#include "layout/envelope.hpp"
 #include "../model/config.hpp"
 #include "elastic.hpp"
 
@@ -361,7 +361,7 @@ void KvCache::allocate_envelopes_() {
             DType::BF16, {num_pages_, kvh, hd}));
         k_env_max_layers_.push_back(DeviceTensor::allocate(
             DType::BF16, {num_pages_, kvh, hd}));
-        kernels::launch_envelope_seed_empty_bf16(
+        kernels::layout::launch_envelope_seed_empty_bf16(
             static_cast<std::uint16_t*>(k_env_min_layers_[i].data()),
             static_cast<std::uint16_t*>(k_env_max_layers_[i].data()),
             num_pages_, kvh, hd, nullptr);

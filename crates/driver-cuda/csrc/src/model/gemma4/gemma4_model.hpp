@@ -2,6 +2,7 @@
 
 #include <optional>
 
+#include "attention_workspace.hpp"
 #include "model/gemma4/declared_forward.hpp"
 #include "model/declared/value_arena.hpp"
 #include "model/gemma4/gemma4.hpp"
@@ -51,7 +52,7 @@ public:
     void body(Workspace& ws,
               KvCache& kv,
               AttentionWorkspace& attn_ws,
-              ops::CublasHandle& cublas,
+              kernels::gemm::CublasHandle& cublas,
               const ForwardFn::ForwardInputs& in) override;
 
     ModelCapabilities capabilities() const override { return caps_; }

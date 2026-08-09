@@ -17,7 +17,7 @@
 
 namespace pie_cuda_driver {
 
-class CustomAllReduce;  // see comm/custom_all_reduce.hpp
+namespace kernels::comm { class CustomAllReduce; }  // see kernels-cuda comm/custom_all_reduce.hpp
 
 #define NCCL_CHECK(expr)                                                       \
     do {                                                                       \
@@ -133,15 +133,15 @@ public:
     // Optional fast-path: when set, `all_reduce_bf16(... ncclSum ...)`
     // routes small messages through the NVLink P2P custom kernel
     // (flashinfer's vllm_custom_all_reduce). Caller still owns the
-    // CustomAllReduce instance — NcclComm just borrows the pointer.
-    void set_custom_all_reduce(CustomAllReduce* car) noexcept { custom_ar_ = car; }
-    CustomAllReduce* custom_all_reduce() const noexcept { return custom_ar_; }
+    // kernels::comm::CustomAllReduce instance — NcclComm just borrows the pointer.
+    void set_custom_all_reduce(kernels::comm::CustomAllReduce* car) noexcept { custom_ar_ = car; }
+    kernels::comm::CustomAllReduce* custom_all_reduce() const noexcept { return custom_ar_; }
 
 private:
     ncclComm_t comm_ = nullptr;
     int world_size_ = 1;
     int rank_ = 0;
-    CustomAllReduce* custom_ar_ = nullptr;
+    kernels::comm::CustomAllReduce* custom_ar_ = nullptr;
 };
 
 }  // namespace pie_cuda_driver

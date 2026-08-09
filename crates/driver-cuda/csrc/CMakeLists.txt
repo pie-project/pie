@@ -189,13 +189,35 @@ function(pie_add_cuda_target NAME)
   cmake_parse_arguments(ARG "NO_CTEST" "TEST_NAME;WORKING_DIRECTORY"
     "SOURCES;INCLUDE_DIRS;LIBS;TEST_ARGS" ${ARGN})
   add_executable(${NAME} ${ARG_SOURCES})
+  # `${PIE_KERNELS_CUDA_INCLUDE_DIRS}` is not optional here. These harnesses
+  # include kernel headers -- `attn/page_compact.hpp`, `layout/envelope.hpp`,
+  # `ssm/causal_conv1d.hpp` -- and several compile a kernels-cuda .cu directly
+  # as one of their SOURCES. That worked while `kernels/` and `ops/` lived
+  # under this crate's src/; the split moved them and no one noticed, because
+  # nothing built these targets. The first run of `pie_driver_cuda_checks`
+  # produced 2 executables out of 59, all the rest on a missing header.
   target_include_directories(${NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src ${ARG_INCLUDE_DIRS})
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_KERNELS_CUDA_INCLUDE_DIRS}
+    ${ARG_INCLUDE_DIRS})
   target_compile_options(${NAME} PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)
+  # The kernel archive, for the same reason its headers are on the include path
+  # above: harnesses call into it. That used to be a headers-only relationship
+  # -- the towers were self-contained naive code -- and stopped being one when
+  # csm_backbone_forward started calling gemm/norm/mlp/sample prims. cuBLAS
+  # comes along because `gemm::act_x_wt_bf16` is a cuBLAS dispatch.
+  target_link_libraries(${NAME} PRIVATE
+    ${PIE_KERNELS_CUDA_LIB} CUDA::cublas CUDA::cublasLt)
   if(ARG_LIBS)
     target_link_libraries(${NAME} PRIVATE ${ARG_LIBS})
   endif()
+  # Record every target so `pie_driver_cuda_checks` below can depend on all of
+  # them. Without this there is no way to ask for "build the harnesses": they
+  # are configured but nothing references them, so `cargo build -p driver-cuda`
+  # -- which asks CMake for `pie_driver_cuda_lib` and nothing else -- compiled
+  # the library and left 67 targets untouched. Eleven kernel-family renames
+  # landed green over that blind spot.
+  set_property(GLOBAL APPEND PROPERTY PIE_DRIVER_CUDA_CHECK_TARGETS ${NAME})
   if(NOT ARG_NO_CTEST)
     if(NOT ARG_TEST_NAME)
       string(REGEX REPLACE "^test_" "" ARG_TEST_NAME ${NAME})
@@ -214,13 +236,7 @@ pie_cuda_has_arch(PIE_HAS_SM90 90)
 pie_cuda_has_arch(PIE_HAS_SM100 100)
 pie_cuda_has_arch(PIE_HAS_SM120 120)
 
-# Blackwell (sm100/120) has no custom-all-reduce kernel yet; stub it out.
-if(PIE_HAS_SM100 OR PIE_HAS_SM120)
-  set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/comm/custom_all_reduce_stub.cpp)
-  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
-else()
-  set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/comm/custom_all_reduce.cu)
-endif()
+# The custom all-reduce moved to the kernels crate; its arch gate went with it.
 
 
 # The graph-heavy model implementations. The registry (src/model/registry.cpp)
@@ -304,12 +320,17 @@ set(PIE_CUDA_MODEL_SOURCES
 
 add_library(pie_driver_cuda_lib STATIC
   src/abi.cpp
+  # The attention plan/dispatch scratch. Owned here rather than in
+  # kernels-cuda because everything past the five values a kernel reads --
+  # allocation, the pinned plan-staging rotation and the events fencing it --
+  # is sized by this crate's run-ahead depth. Kernels take the view instead
+  # (`kernels-cuda/csrc/src/attention_workspace_view.hpp`).
+  src/attention_workspace.cpp
   src/context.cpp
   src/distributed.cpp
   # comm/ -- the TP collective's device half, which is not a compute kernel:
   # it sits on the NCCL/CUDA-IPC comm `distributed.cpp` owns, and that is why
   # it did not go to the kernels crate with the rest of src/kernels.
-  ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   # batch/ -- one submitted batch -> device work
   src/batch/brle.cpp
   src/batch/frame.cpp
@@ -475,10 +496,10 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
 
 # Mixed prefill/decode batch: a continuing T=1 request must reuse its conv window.
 pie_add_cuda_target(test_causal_conv1d
-  SOURCES tests/test_causal_conv1d.cu ${PIE_KERNELS_CUDA_SRC}/kernels/causal_conv1d.cu
+  SOURCES tests/test_causal_conv1d.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_gather_tokens
-  SOURCES tests/test_gather_tokens.cu ${PIE_KERNELS_CUDA_SRC}/kernels/gather_tokens.cu
+  SOURCES tests/test_gather_tokens.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_pack_dense_mask
   SOURCES tests/pack_dense_mask_test.cu
@@ -489,13 +510,13 @@ pie_add_cuda_target(test_kimi_k3_kernels
   SOURCES tests/kimi_k3_kernels_test.cu
   LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_envelope_dot
-  SOURCES tests/test_envelope_dot.cu ${PIE_KERNELS_CUDA_SRC}/kernels/envelope.cu
+  SOURCES tests/test_envelope_dot.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_kv_len_geometry
-  SOURCES tests/test_kv_len_geometry.cu ${PIE_KERNELS_CUDA_SRC}/kernels/geometry.cu
+  SOURCES tests/test_kv_len_geometry.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_page_compact
-  SOURCES tests/test_page_compact.cu ${PIE_KERNELS_CUDA_SRC}/kernels/page_compact.cu
+  SOURCES tests/test_page_compact.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_brle SOURCES tests/test_brle.cpp src/batch/brle.cpp)
 # Host oracle: fork geometry -> BRLE decode -> masking == prefix truncation.
@@ -566,7 +587,7 @@ pie_add_cuda_target(test_swap_pool
   SOURCES tests/test_swap_pool.cpp
   LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_mxfp4_marlin
-  SOURCES tests/test_mxfp4_marlin.cu ${PIE_KERNELS_CUDA_SRC}/kernels/mxfp4_marlin.cu
+  SOURCES tests/test_mxfp4_marlin.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_transcode_fused
   SOURCES tests/test_transcode_fused.cu
@@ -606,8 +627,12 @@ pie_add_cuda_target(gemma4_vision_full_parity
   SOURCES tests/gemma4_vision_full_parity.cu
   LIBS CUDA::cudart
   NO_CTEST)
+# The forward under test is the driver's now, not a copy inside the harness,
+# so its translation unit is a source here.
 pie_add_cuda_target(gemma4_vision_full_parity_bf16
-  SOURCES tests/gemma4_vision_full_parity_bf16.cu
+  SOURCES
+    tests/gemma4_vision_full_parity_bf16.cu
+    src/model/gemma4/gemma4_vision_forward.cu
   LIBS CUDA::cudart
   NO_CTEST)
 pie_add_cuda_target(gemma4_vision_patch_parity
@@ -639,7 +664,9 @@ pie_add_cuda_target(test_grouped_copy
 # purpose: whether a slab thrashes is decided here, and that must be checkable
 # without a device.
 pie_add_cuda_target(test_group_slot_index
-  SOURCES tests/group_slot_index_test.cpp)
+  SOURCES tests/group_slot_index_test.cpp
+  # The header under test is the loader's, not this crate's.
+  INCLUDE_DIRS ${PIE_LOADER_INCLUDE_DIR})
 # When a pack on disk may be trusted. Header-only, device-free and backend-free
 # on purpose: the pack is a property of the load plan, both drivers can use one,
 # and every check here stands between a mapping and the wrong weights.
@@ -678,7 +705,7 @@ pie_add_cuda_target(test_strided_copy
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_chunked_argmax
-  SOURCES tests/test_chunked_argmax.cu ${PIE_KERNELS_CUDA_SRC}/kernels/argmax.cu
+  SOURCES tests/test_chunked_argmax.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_nucleus_region
@@ -805,3 +832,110 @@ else()
     "test_model_registry: skipped (no libpie_loader_capi.a; build one with "
     "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()
+
+# ---- The bench tree, which was in no build at all ---------------------------
+#
+# Seven .cu under bench/ and three under tests/ were sources of no target: they
+# compiled only when someone typed nvcc by hand, so nothing noticed when an API
+# moved under them. `gemv_bench` had been calling `gemv_splitk_tuned` without
+# the `unroll` argument it gained in 674d4dbc2, AND sweeping a warps=32 that is
+# not instantiated -- printing the empty interval as a bandwidth number.
+#
+# NO_CTEST throughout: these are manual harnesses that want a GPU and a shape
+# argument, not pass/fail tests. Being BUILT is the point.
+pie_add_cuda_target(bench_gemv SOURCES bench/gemv_bench.cu LIBS CUDA::cudart NO_CTEST)
+pie_add_cuda_target(bench_mla SOURCES bench/mla_bench.cu LIBS CUDA::cudart NO_CTEST)
+pie_add_cuda_target(bench_smallop SOURCES bench/smallop_bench.cu LIBS CUDA::cudart NO_CTEST)
+pie_add_cuda_target(bench_mxfp4_roof SOURCES bench/mxfp4_roof_bench.cu LIBS CUDA::cudart NO_CTEST)
+pie_add_cuda_target(test_peel_window SOURCES tests/test_peel_window.cu LIBS CUDA::cudart NO_CTEST)
+pie_add_cuda_target(test_supergraph
+  SOURCES tests/test_supergraph.cu src/batch/supergraph.cu
+  LIBS CUDA::cudart NO_CTEST)
+pie_add_cuda_target(test_generated_lane_grid_padding
+  SOURCES tests/test_generated_lane_grid_padding.cu
+  INCLUDE_DIRS ${PIE_DRIVER_INCLUDE_DIR} ${PIE_PTIR_INCLUDE_DIR}
+               ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
+  LIBS CUDA::cudart NO_CTEST)
+
+# These two were held back by a note saying all three remaining benches
+# "include cutlass/ or marlin_moe_wrapper.hpp ... neither is on any path this
+# crate is given", and that the fix was a change to the kernels crate's
+# cargo:: metadata. Reading the metadata it actually publishes said otherwise
+# on both counts. `moe_bench.cu` includes neither vendor tree -- only
+# `quant/dequant_fp4.hpp` and `moe/moe_dispatch.hpp`, which are the kernels
+# crate's own headers. And cutlass is ALREADY here: kernels-cuda publishes
+# `cutlass/include` and `cutlass/tools/util/include` as the third and fourth
+# entries of its `flashinfer=` value, which this crate's build.rs forwards
+# whole into PIE_KERNELS_CUDA_INCLUDE_DIRS. Nothing had to be published; the
+# note had simply never been re-read against what was.
+pie_add_cuda_target(bench_moe SOURCES bench/moe_bench.cu LIBS CUDA::cudart NO_CTEST)
+pie_add_cuda_target(bench_mxfp4_cutlass
+  SOURCES bench/mxfp4_cutlass_bench.cu LIBS CUDA::cudart NO_CTEST)
+
+# `marlin_moe_verify.cu` needed one thing the other two did not: the header
+# tree behind `marlin_moe_wrapper.hpp`. kernels-cuda had been publishing it as
+# `marlin_moe=` all along -- what was missing is that this crate's build.rs
+# read only CCCL / FLASHINFER / INCLUDE out of that handoff, so the path
+# stopped there. It forwards both keys now.
+#
+# It needs BOTH marlin trees, which the file's name does not say and I did not
+# believe until the link failed: line 238 calls
+# `::marlin::pie_gptq_marlin_repack_w4_no_perm`, which is `third_party/marlin`
+# -- the DENSE path, `PIE_CUDA_BUILD_MARLIN`, which defaults OFF because it is
+# not pruned to one quant config the way marlin_moe is and costs several
+# multi-minute translation units. The verify builds the reference layout with
+# the dense repack and checks the MoE kernel against it, so the two are not
+# separable.
+#
+# Gated rather than assumed, and on both: a harness compiled against a header
+# whose `.cu` was never built fails at LINK with an undefined symbol, which is
+# a worse way to learn a toggle is off than not being offered the target.
+# Turn it on with `PIE_CUDA_BUILD_MARLIN=1 PIE_DRIVER_CUDA_CHECKS=1 cargo build
+# -p driver-cuda`.
+if(PIE_HAS_MARLIN AND PIE_HAS_MARLIN_MOE)
+  pie_add_cuda_target(bench_marlin_moe_verify
+    SOURCES bench/marlin_moe_verify.cu
+    INCLUDE_DIRS ${PIE_MARLIN_INCLUDE_DIR} ${PIE_MARLIN_MOE_INCLUDE_DIR}
+    LIBS CUDA::cudart NO_CTEST)
+else()
+  message(STATUS
+    "bench_marlin_moe_verify: skipped -- needs both PIE_CUDA_BUILD_MARLIN "
+    "(now ${PIE_HAS_MARLIN}) and PIE_CUDA_BUILD_MARLIN_MOE "
+    "(now ${PIE_HAS_MARLIN_MOE})")
+endif()
+
+# ---- One target that builds every harness (KEEP LAST) ----------------------------------
+#
+# `cargo build -p driver-cuda` asks CMake for `pie_driver_cuda_lib` and stops.
+# The 67 test and bench executables configured above were therefore never
+# compiled by any command anyone runs. Eleven kernel-family renames landed
+# green across them, and left behind: a `namespace ops` alias naming a
+# namespace that no longer exists, call sites qualified with a `kernels` that
+# is not in scope, tier-0 constants that moved to `kernels::ptir`, and -- the
+# one worth the whole exercise -- a `DType` collision that resolved to the
+# WRONG enum and was caught only because the two spell their members
+# differently.
+#
+# Depend on the library too, so this single target is the whole build.
+# Must stay at the END of this file: `get_property` reads the registry as it
+# stands right here, so any target added below would silently not be built --
+# which is precisely what happened when the bench targets were appended.
+get_property(_pie_check_targets GLOBAL PROPERTY PIE_DRIVER_CUDA_CHECK_TARGETS)
+add_custom_target(pie_driver_cuda_checks)
+add_dependencies(pie_driver_cuda_checks pie_driver_cuda_lib ${_pie_check_targets})
+list(LENGTH _pie_check_targets _pie_check_count)
+message(STATUS "pie_driver_cuda_checks: ${_pie_check_count} harness targets")
+
+# Nothing under tests/ or bench/ is unwired any more. This used to list ten
+# .cu files that were sources of no target at all and compiled only when
+# someone typed nvcc by hand -- which is how `gemv_bench` came to sweep a
+# `warps=32` that is not instantiated, print the empty interval as a bandwidth
+# number, and go on doing it after `gemv_splitk_tuned` gained an `unroll`
+# parameter it never passed. Seven were wired when the aggregate target above
+# was added; the last three were held back by a vendor-gate note that turned
+# out to be wrong about all three (see above).
+#
+# The invariant to keep, then, is not a list: it is that a .cu under tests/ or
+# bench/ with no target is a file nothing can check. `pie_driver_cuda_checks`
+# is what makes a wired one worth wiring.
+

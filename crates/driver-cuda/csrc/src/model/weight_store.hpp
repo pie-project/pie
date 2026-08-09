@@ -8,7 +8,7 @@
 #include <utility>
 
 #include "loader/tensor_spec.hpp"
-#include "ops/quant_meta.hpp"
+#include "quant_meta.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
@@ -17,11 +17,12 @@ class WeightStoreBuilder;
 
 // Per-weight metadata for quantized tensors. Lives beside the materialized
 // tensor store; absent entries mean "use the raw bf16/fp16/fp32 path".
-// Owned by ops/ (it is GEMM operand-scaling metadata, see ops/quant_meta.hpp);
-// re-exported here under its historical `pie_cuda_driver::QuantMeta` name.
+// `QuantMeta` is GEMM operand-scaling metadata and lives in
+// kernels-cuda's `quant_meta.hpp`. This used to re-export it "under its
+// historical `pie_cuda_driver::QuantMeta` name" -- that name is now the only
+// one it has, so the re-export is gone and the history with it.
 // The pointers reference DeviceTensors registered separately under their own
 // names in the same WeightStore. QuantMeta does not own those tensors.
-using ops::QuantMeta;
 
 struct TensorRecord {
     TensorDecl spec;

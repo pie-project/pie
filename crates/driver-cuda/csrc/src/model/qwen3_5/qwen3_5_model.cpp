@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/qwen3_5/qwen3_5_model.hpp"
 
 #include <cstdio>
@@ -67,7 +68,7 @@ void Qwen35Model::prepare(AttentionWorkspace& attn_ws,
 void Qwen35Model::body(Workspace& ws,
                        KvCache& kv,
                        AttentionWorkspace& attn_ws,
-                       ops::CublasHandle& cublas,
+                       kernels::gemm::CublasHandle& cublas,
                        const ForwardFn::ForwardInputs& in) {
     // The declared executor covers the hand-written TP=1 base pass —
     // decode AND prefill fires (arc 3; mixed prefill+decode fires are the
@@ -224,7 +225,7 @@ void Qwen35Model::wire_system_drafter(
         };
     drafter.draft_step =
         [this, prefix_global_cache](
-            Workspace& ws, KvCache& cache, ops::CublasHandle& cublas,
+            Workspace& ws, KvCache& cache, kernels::gemm::CublasHandle& cublas,
             const std::int32_t* tok, const std::int32_t* pos,
             const std::int32_t* base_hidden_row_indices,
             const std::int32_t* request_ids,

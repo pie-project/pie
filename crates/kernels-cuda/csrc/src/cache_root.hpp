@@ -13,9 +13,9 @@
 // It was four lines in the shell's `config.hpp`, which is the natural home for
 // something read out of a config file. But `config.hpp` also pulls
 // `batch/planner_calibration.hpp` and `store/kv_cache_format.hpp`, and
-// `ops/tuning_cache.hpp` -- a kernel-side autotuning memo -- needs the cache
+// `tuning_cache.hpp` -- a kernel-side autotuning memo -- needs the cache
 // root and nothing else. Including the shell's config header to get a string
-// was the single edge in either direction between `kernels`/`ops` and the rest
+// was the single edge in either direction between the kernels and the rest
 // of the driver.
 //
 // So the four lines moved rather than the tangle staying. This is not a kernel

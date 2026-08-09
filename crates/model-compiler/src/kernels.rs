@@ -122,12 +122,63 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
     problems
 }
 
-/// The operand a stated kernel accumulates into, if it is in-place.
+/// Which outputs a stated kernel writes over which inputs.
 ///
 /// Reads the BACKEND's table, which is why it takes the plan: the family
 /// name says which backend, exactly as `check_plan` reads it.
-pub fn in_place_operand(plan: &ForwardPlan, kernel: &str) -> Option<u32> {
+pub fn in_place_pairs(plan: &ForwardPlan, kernel: &str) -> &'static [(u32, u32)] {
     Backend::of_family(&plan.family)
         .and_then(|b| sig_in(b, kernel))
-        .and_then(|s| s.in_place)
+        .map_or(&[][..], |s| s.in_place)
+}
+
+/// Which outputs a SEMANTIC op writes over which inputs.
+///
+/// The companion to [`in_place_pairs`], for the kinds that name no
+/// kernel. A stated kernel carries this fact in the `kernel!` table
+/// because the symbol is the thing being described; a semantic kind is
+/// described by the kind itself, so the fact lives here.
+///
+/// It takes no backend, and that is a claim rather than a convenience:
+/// these are properties of what the kind MEANS, so a backend that
+/// disagreed would not be another implementation of the kind.
+pub fn semantic_in_place(kind: &OpKind) -> &'static [(u32, u32)] {
+    match kind {
+        // Rope ROTATES; it does not produce. Every driver's arm takes
+        // one q pointer and one k pointer and no separate destination
+        // -- CUDA's four families and Metal's alike -- because there is
+        // no other way to write the kernel.
+        //
+        // The trace still names the rotated q and k as new values,
+        // which is right: SSA is how a reader tells the pre-rope q from
+        // the post-rope one. What was missing is that those names are
+        // two names for one buffer, and while every q was pinned to the
+        // same workspace field, nothing needed the distinction. A host
+        // that assigns addresses does: it gave the normed k an address
+        // of its own, and rope then rotated the OTHER address and left
+        // the real k unread.
+        OpKind::Rope { .. } => &[(0, 0), (1, 1)],
+        // `beta_one` IS the accumulate: cuBLAS computes `C = A·Bᵀ + C`,
+        // so C is read as well as written and the residual it folds must
+        // BE C. `try_fold_residual` pushes that residual as input 1 and
+        // gives the op a fresh output id, which is right for dataflow —
+        // a reader after the fold wants the summed stream, not the
+        // pre-fold one — and says nothing about memory. This does.
+        //
+        // Only when it folded: a plain matmul writes its output and
+        // reads nothing of it.
+        OpKind::Matmul {
+            beta_one: true, ..
+        } => &[(0, 1)],
+        // `attn_out *= sigmoid(gate)`. The full-attention output gate,
+        // and the kernel qwen3.5 states for it is spelled
+        // `sigmoid_gate_inplace_bf16` -- the gate is read-only, the
+        // gated value is rewritten where it lies.
+        OpKind::SigmoidGateMul => &[(0, 0)],
+        // `x[r, :] += bias`. One buffer in both drivers that state it --
+        // gpt-oss's `o_bias`, llama_like's three attention biases -- and
+        // the kernel has no destination parameter to give it another.
+        OpKind::AddBias { .. } => &[(0, 0)],
+        _ => &[],
+    }
 }

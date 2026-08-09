@@ -36,16 +36,19 @@ fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// The generation modules: directory modules under `src/`, minus the two that
-/// are not generations — `families/` (cross-generation sharing) and `ffi/`
-/// (the C boundary, one door for all of them).
+/// The generation modules: directory modules under `src/`, minus the four
+/// that are not generations — `families/` (cross-generation sharing), `ffi/`
+/// (the C boundary, one door for all of them), `config/` (the `pie.model/1`
+/// descriptor, an aspect every generation is parameterized by rather than one
+/// generation's property) and `bin/` (cargo's layout, not this crate's).
 fn generations() -> Vec<String> {
+    let not_a_generation = ["families", "ffi", "config", "bin"];
     let mut names: Vec<String> = std::fs::read_dir(src())
         .expect("src/ exists")
         .filter_map(Result::ok)
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "families" && n != "ffi")
+        .filter(|n| !not_a_generation.contains(&n.as_str()))
         .collect();
     assert!(
         names.len() >= 15,

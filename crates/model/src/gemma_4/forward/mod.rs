@@ -6,8 +6,8 @@ use self::facts::{
     Gemma4CudaFacts, Gemma4Facts,
 };
 use model_compiler::dsl::{
-    self, matmul,
-    rmsnorm, MatW, NormW,
+    WeightRepr,
+    self, matmul, MatW, NormW,
 };
 use model_compiler::trace::{
     FireClass, ForwardPlan, NormVariant, RopeKind,
@@ -47,10 +47,11 @@ impl Gemma4LayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         // PLAIN, despite the family name: `gemma4.cpp` fires
-        // `launch_rmsnorm_bf16` at all fourteen of its norm sites and
-        // `launch_rmsnorm_gemma_bf16` at none. The `(1 + w)` fold is
+        // `kernels::norm::rmsnorm_bf16` at all fourteen of its norm sites and
+        // `kernels::norm::rmsnorm_gemma_bf16` at none. The `(1 + w)` fold is
         // done to the tensors at LOAD for this family, so a declaration
         // that stated Gemma would be stating a second fold.
         let norm = |name: &str| NormW {
@@ -97,7 +98,7 @@ impl Gemma4LayerW {
 ///
 /// **The input norm is missing from every layer but the first.** That is
 /// not an omission: layer `l`'s PLE epilogue fires
-/// `launch_rmsnorm_residual_add_scale_rmsnorm_bf16`, whose FOURTH
+/// `kernels::norm::rmsnorm_residual_add_scale_rmsnorm_bf16`, whose FOURTH
 /// statement is layer `l+1`'s `attn_norm`. The fusion crosses the layer
 /// boundary, so the declaration does too — `gemma4.cpp:1999` produces
 /// it and `:1529` is the guard that skips re-computing it.
@@ -139,7 +140,11 @@ pub fn gemma4_cuda(
 
         // ── Prologue ────────────────────────────────────────────────
         // The token embedding, scaled by sqrt(hidden).
-        let mut y = dsl::cuda::scalar_mul(&dsl::embed_with(t, "embed", hidden), "sqrt_hidden");
+        let mut y = dsl::cuda::scalar_mul(
+            &dsl::embed_with(t, "embed", hidden),
+            "sqrt_hidden",
+            Some((hidden as f32).sqrt()),
+        );
 
         // PLE: a SECOND embedding table, projected to the whole stack's
         // per-layer width, normed, scaled and relaid so each layer reads
@@ -149,6 +154,7 @@ pub fn gemma4_cuda(
         let table = dsl::cuda::scalar_mul(
             &dsl::embed_with(t, "embed_per_layer", ple_total),
             "sqrt_ple_dim",
+            Some((facts.ple_dim as f32).sqrt()),
         );
         // The projection consumes the MAIN embedding, not the table:
         // `per_layer_proj = inputs_embeds @ ple_model_proj.T`. The table
@@ -161,10 +167,12 @@ pub fn gemma4_cuda(
                 name: "ple_model_proj".into(),
                 width: ple_total,
                 layer: None,
+                repr: WeightRepr::Bf16,
             },
         );
-        let scaled = dsl::cuda::scalar_mul(&ple, "rsqrt_hidden");
-        let normed_ple = rmsnorm(
+        let scaled =
+            dsl::cuda::scalar_mul(&ple, "rsqrt_hidden", Some(1.0 / (hidden as f32).sqrt()));
+        let normed_ple = dsl::cuda::rmsnorm(
             &scaled,
             &NormW {
                 name: "ple_model_norm".into(),
@@ -179,15 +187,20 @@ pub fn gemma4_cuda(
         // its scale consumes and found two producers where the trace had
         // one.
         let ple = dsl::cuda::residual_add(&normed_ple, &table, ple_total);
-        let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_2");
+        let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_2", Some(1.0 / 2f32.sqrt()));
         let ple_table = dsl::cuda::transpose_nld_to_lnd(&ple, facts.layers, facts.ple_dim);
 
         // ── Layers ──────────────────────────────────────────────────
         // Layer 0 norms the stream itself; every other layer received
         // its input norm from the layer before (see the doc above).
-        let mut normed = rmsnorm(&y, &Gemma4LayerW::new(0, facts).attn_norm);
+        let mut normed = dsl::cuda::rmsnorm(&y, &Gemma4LayerW::new(0, facts).attn_norm);
 
         for l in 0..facts.layers {
+            // THIS LAYER's sliding window, `-1` for none — a
+            // load-time fact the dispatch statements carry, where four
+            // executors used to re-derive it per launch.
+            let window_left =
+                model_compiler::facts::window_left_at(&cuda.window_left, l);
             let w = Gemma4LayerW::new(l, facts);
             let full = facts.is_full_attn(l);
             let d = facts.head_dim_of(l);
@@ -217,8 +230,8 @@ pub fn gemma4_cuda(
                 // have used — NOT by falling back to a generic rope.
                 let q = matmul(&normed, &w.q_proj);
                 if full {
-                    let q = rmsnorm(&q, &w.q_norm);
-                    dsl::cuda::rope_partial_q_only(&q)
+                    let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
+                    dsl::cuda::rope_partial_q_only(&q, facts.global_rotary_dim)
                 } else {
                     dsl::cuda::qk_rmsnorm_rope_rounded_q_only(&q, &w.q_norm)
                 }
@@ -244,8 +257,8 @@ pub fn gemma4_cuda(
                     // Partial rope has no fused pair, so the norms are
                     // their own statements — `can_fuse_qk_norm_rope`
                     // reads `!partial`.
-                    let q = rmsnorm(&q, &w.q_norm);
-                    let k = rmsnorm(&k, &w.k_norm);
+                    let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
+                    let k = dsl::cuda::rmsnorm(&k, &w.k_norm);
                     dsl::rope_partial(&q, &k, RopeKind::Standard, facts.global_rotary_dim)
                 } else {
                     dsl::cuda::qk_rmsnorm_rope_rounded(&q, &k, &w.q_norm, &w.k_norm)
@@ -267,12 +280,12 @@ pub fn gemma4_cuda(
             // lands.
             dsl::seam(attn_in.trace(), &dsl::seam::ATTN_Q, &[&attn_in], Some(l));
             let a = match class {
-                FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&attn_in, &kv),
+                FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&attn_in, &kv, window_left),
                 FireClass::Prefill if d == 512 => {
-                    dsl::cuda::attention_naive_paged(&attn_in, &kv)
+                    dsl::cuda::attention_naive_paged(&attn_in, &kv, window_left)
                 }
                 FireClass::Prefill => {
-                    dsl::cuda::attention_flashinfer_prefill_planless(&attn_in, &kv)
+                    dsl::cuda::attention_flashinfer_prefill_planless(&attn_in, &kv, window_left)
                 }
                 other => unreachable!("gemma4 refuses {other:?} at trace start"),
             }
@@ -288,6 +301,7 @@ pub fn gemma4_cuda(
             // for the MLP — four statements, one launch.
             let (landed, mlp_in) = dsl::cuda::norm_residual_scale_norm(
                 &attn_out,
+                &y,
                 &w.post_attn_norm,
                 &w.pre_ffw_norm,
                 hidden,
@@ -309,19 +323,32 @@ pub fn gemma4_cuda(
                 dsl::cuda::geglu_tanh_pair(&gate, &up, inter)
             };
             let mlp_out = matmul(&act, &w.down);
-            y = dsl::cuda::norm_residual_add(&mlp_out, &w.post_ffw_norm, hidden);
+            y = dsl::cuda::norm_residual_add(&mlp_out, &y, &w.post_ffw_norm, hidden);
 
             // ── The PLE epilogue ────────────────────────────────────
             // Gate this layer's slice of the per-layer table into the
             // stream, then land it — and, for every layer but the last,
             // produce the NEXT layer's input norm in the same launch.
             let gate = matmul(&y, &w.ple_gate);
-            let gated = dsl::cuda::geglu_tanh_pair(&gate, &ple_table, facts.ple_dim);
+            // THIS LAYER's slice of the relay, as a `select` rather than
+            // as an offset the executor computes. The relay is `[L,
+            // Tokens, ple_dim]` -- the layer axis leads, which is the
+            // whole reason the transpose above exists -- so a select at
+            // `l` IS the slice, and `Buffers::assign` places it at
+            // `offset(relay) + l * N * ple_dim` without being told.
+            //
+            // The arm used to add that offset itself, and to tell this
+            // site from the MLP's by comparing the result's WIDTH
+            // against `ple_dim`. Both go: the two sites now differ only
+            // in which values they name.
+            let slice = dsl::select(&ple_table, l);
+            let gated = dsl::cuda::geglu_tanh_pair(&gate, &slice, facts.ple_dim);
             let ple_out = matmul(&gated, &w.ple_proj);
             if l + 1 < facts.layers {
                 let next = Gemma4LayerW::new(l + 1, facts);
                 let (landed, next_norm) = dsl::cuda::norm_residual_scale_norm(
                     &ple_out,
+                    &y,
                     &w.ple_norm,
                     &next.attn_norm,
                     hidden,
@@ -332,12 +359,12 @@ pub fn gemma4_cuda(
                 // The last layer has no next input norm to fuse, so it
                 // lands unfused and the epilogue norms for itself —
                 // `gemma4.cpp`'s :2010 arm.
-                y = dsl::cuda::norm_residual_add(&ple_out, &w.ple_norm, hidden);
+                y = dsl::cuda::norm_residual_add(&ple_out, &y, &w.ple_norm, hidden);
             }
         }
 
         // ── Epilogue ────────────────────────────────────────────────
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".into(),

@@ -515,7 +515,7 @@ private:
         finalized_buffer_names_[instr.buffer_id] = runtime_name;
     }
 
-    // Normalize a block/group FP8 weight scale to FP32 (the gemm_act_x_w FP8
+    // Normalize a block/group FP8 weight scale to FP32 (the kernels::gemm::act_x_w FP8
     // path requires FP32). Handles both shipped formats: E8M0 bytes (DeepSeek-V4,
     // expanded to 2^(b-127)) and BF16 block scales (Qwen3-FP8 / dense block-FP8,
     // where BF16 is the high 16 bits of the F32). FP32 passes through unchanged.

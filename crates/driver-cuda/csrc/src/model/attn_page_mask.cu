@@ -4,7 +4,7 @@
 #include <new>
 #include <stdexcept>
 
-#include "kernels/page_compact.hpp"
+#include "attn/page_compact.hpp"
 #include "model/attn_observation.hpp"
 #include "model/hook_sideband_arena.hpp"
 #include "model/stage_hooks.hpp"
@@ -172,7 +172,7 @@ void FirePageMask::compact(
         throw std::runtime_error(
             "attn_page_mask compaction and fire disagree on request count");
     }
-    kernels::launch_compact_page_csr(
+    kernels::attn::compact_page_csr(
         page_indices_d, page_indptr_d, last_page_lens_d, sink_.keep, counts_,
         sink_.stride, static_cast<int>(sink_.num_requests), out_indices_,
         out_indptr_, out_last_lens_, stream);

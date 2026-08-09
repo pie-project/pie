@@ -23,7 +23,8 @@
 pub mod facts;
 
 use self::facts::{KimiCudaFacts, KimiFacts};
-use model_compiler::dsl::{self, matmul, rmsnorm, MatW, NormW};
+use model_compiler::dsl::{
+    WeightRepr,self, matmul, MatW, NormW};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct KimiLayerW {
@@ -51,6 +52,7 @@ impl KimiLayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         let n = |name: &str| NormW {
             name: w(name),
@@ -95,11 +97,11 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
 
         for l in 0..facts.layers {
             let w = KimiLayerW::new(l, facts);
-            let x = rmsnorm(&y, &w.attn_norm);
+            let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
             // The two latents, fused or not. The FUSED arm norms the
             // query half in place with a pitch, which is a different
-            // kernel and not a buffer detail — `launch_rmsnorm_strided_bf16`
+            // kernel and not a buffer detail — `kernels::norm::rmsnorm_strided_bf16`
             // reads a row stride the plain one has no parameter for.
             let (q_a_n, kv_a) = if cuda.q_kv_a_fused {
                 let qkv_a = matmul(&x, &w.q_kv_a);
@@ -111,7 +113,7 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
                 (q_a_n, qkv_a)
             } else {
                 let q_a = matmul(&x, &w.q_a_proj);
-                (rmsnorm(&q_a, &w.q_a_norm), matmul(&x, &w.kv_a_proj))
+                (dsl::cuda::rmsnorm(&q_a, &w.q_a_norm), matmul(&x, &w.kv_a_proj))
             };
             let q_b = matmul(&q_a_n, &w.q_b_proj);
 
@@ -133,7 +135,7 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
             dsl::seam(attn_v.trace(), &dsl::seam::ATTN_OUT, &[&attn_v], Some(l));
             y += matmul(&attn_v, &w.o_proj);
 
-            let m = rmsnorm(&y, &w.mlp_norm);
+            let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             if !facts.is_moe_layer(l) {
                 let gate = matmul(&m, &w.dense_gate);
                 let _up = matmul(&m, &w.dense_up);
@@ -153,12 +155,18 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
                 &m_fp16,
                 &experts,
                 facts.moe.moe_intermediate,
+                &format!("layer.{l}.experts"),
             );
             let _ = up;
             let act = dsl::cuda::swiglu(&gate, facts.moe.moe_intermediate, false);
             let act_fp16 = dsl::cuda::bf16_to_fp16(&act);
             let route_out =
-                dsl::cuda::wna16_down_decode(&act_fp16, &experts, facts.hidden);
+                dsl::cuda::wna16_down_decode(
+                    &act_fp16,
+                    &experts,
+                    facts.hidden,
+                    &format!("layer.{l}.experts"),
+                );
             let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
 
             let moe_out = if facts.moe.shared_intermediate > 0 {
@@ -173,7 +181,7 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".to_string(),

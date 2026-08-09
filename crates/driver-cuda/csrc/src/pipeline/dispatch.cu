@@ -4,7 +4,7 @@
 
 #include "pipeline/dispatch.hpp"
 
-#include "kernels/pack_dense_mask.hpp"
+#include "attn/pack_dense_mask.hpp"
 
 #include <algorithm>
 #include <array>
@@ -632,7 +632,7 @@ enum FixedDecodeKillReason : std::uint32_t {
 };
 
 // Copy each lane's dense mask cell into the contiguous [lanes, stride]
-// tensor `launch_pack_dense_mask` reads. One block per lane, threads across
+// tensor `kernels::attn::pack_dense_mask` reads. One block per lane, threads across
 // the row — the cells are separate ring allocations, so a gather is what
 // makes them a tensor. A lane with no mask, or a dead one, leaves its row
 // zeroed (the caller pre-zeroes), which reads as "attends nothing" and is
@@ -8787,7 +8787,7 @@ bool Dispatch::enqueue_fixed_decode(
         // Gather the lanes' mask cells into one tensor, then pack it with
         // the SAME kernel the host path uses. Only the middle of the chain
         // was ever missing: the cells were already device-resident and
-        // `launch_pack_dense_mask` already took device pointers, so the mask
+        // `kernels::attn::pack_dense_mask` already took device pointers, so the mask
         // was making a D2H/H2D round trip to travel between two device
         // buffers.
         const std::size_t gather_bytes =
@@ -8811,7 +8811,7 @@ bool Dispatch::enqueue_fixed_decode(
             buffers.custom_mask_indptr,
             static_cast<std::uint32_t>(programs));
         CUDA_CHECK(cudaGetLastError());
-        kernels::launch_pack_dense_mask(
+        kernels::attn::pack_dense_mask(
             buffers.dense_mask,
             buffers.mask_klen,
             buffers.qo_indptr,

@@ -281,7 +281,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::GoRouterTopK:
             shared_kernels::router_topk_dispatch(g.n_experts, d.grid, d.tg, n); break;
         case Kernel::LlMoeSort:
-            shared_kernels::moe_route_sort_dispatch(g.n_experts, d.grid, d.tg); break;
+            shared_kernels::route_sort_dispatch(g.n_experts, d.grid, d.tg); break;
         case Kernel::LlMoeGather:
             // The stack this fills is the one the sort writes, so it has to
             // ask the same question the sort did. Launched over the padded
@@ -289,7 +289,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             // sort never grouped -- which at 512 tokens is 12800 rows of copy
             // for 4096 of content, and is exactly the cost
             // `qwen35_routed_decode_batched` was turned off to stop paying.
-            shared_kernels::moe_route_rows_dispatch(
+            shared_kernels::route_rows_dispatch(
                 g.hidden, moe_sorted_rows(g, n, qwen35_routed_decode_batched()),
                 d.grid, d.tg);
             break;
@@ -303,7 +303,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             // pool did. At N=1 the two shapes are the same grid, which is why
             // this survived every single-sequence gate and broke a fleet of two
             // at its first step.
-            shared_kernels::moe_route_rows_dispatch(g.hidden, n, d.grid, d.tg); break;
+            shared_kernels::route_rows_dispatch(g.hidden, n, d.grid, d.tg); break;
 
         default:
             throw std::runtime_error("missing multi-batch launch geometry");
@@ -351,10 +351,10 @@ bool routed_group_shape(const Dispatch& d, const DecodeGeometry& g, int rows,
             return true;
         case Kernel::LlMoeSort:
             // One threadgroup whatever the batch is; only its params change.
-            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            shared_kernels::route_sort_dispatch(g.n_experts, grid, tg);
             return true;
         case Kernel::LlMoeGather:
-            shared_kernels::moe_route_rows_dispatch(g.hidden, sorted, grid, tg);
+            shared_kernels::route_rows_dispatch(g.hidden, sorted, grid, tg);
             return true;
         case Kernel::LlExpertSiluMul:
             elementwise_mb_dispatch(g.moe_intermediate, sorted, grid, tg);
@@ -370,7 +370,7 @@ bool routed_group_shape(const Dispatch& d, const DecodeGeometry& g, int rows,
             if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
                 bn > 0 && shared_kernels::moe_should_batch(pairs, g.n_experts)) {
                 const int bm = shared_kernels::moe_tile_rows(pairs, g.n_experts);
-                const Pso& gemm = mb.qmm_routed[shared_kernels::moe_bm_slot(bm)]
+                const Pso& gemm = mb.qmm_routed[shared_kernels::bm_slot(bm)]
                                               [bn == 64 ? 2 : (bn == 32 ? 1 : 0)];
                 if (gemm.valid()) {
                     qmm_t_dispatch(N, sorted, bn, bm, grid, tg);
@@ -417,7 +417,7 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::LlExpertDown: {
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
-                const int bm = shared_kernels::moe_bm_slot(d.qmm_bm);
+                const int bm = shared_kernels::bm_slot(d.qmm_bm);
                 if (mb.qmm_routed[bm][slot].valid()) return mb.qmm_routed[bm][slot];
             }
             return base[d.kind];

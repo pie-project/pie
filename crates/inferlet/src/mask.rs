@@ -18,8 +18,9 @@ pub fn mask_words(vocab: usize) -> usize {
 }
 
 /// An all-allowed packed mask for `vocab` tokens (every bit `1`). The identity
-/// for [`and_into`]; tail bits past `vocab` in the last word are don't-care
-/// (consumers index only `[0, vocab)`).
+/// under the word-wise AND that composes two constraints; tail bits past
+/// `vocab` in the last word are don't-care (consumers index only
+/// `[0, vocab)`).
 #[inline]
 pub fn all_allowed(vocab: usize) -> Vec<u32> {
     vec![u32::MAX; mask_words(vocab)]
@@ -147,32 +148,21 @@ mod tests {
     }
 
     #[test]
-    fn and_into_is_set_intersection() {
-        // {0,1,2} AND {0,2} = {0,2}.
-        let mut acc = [0b111u32];
-        and_into(&mut acc, &[0b101u32]);
-        assert_eq!(acc, [0b101u32]);
-        // {1,2} AND {0,1} = {1}.
-        let mut acc2 = [0b110u32];
-        and_into(&mut acc2, &[0b011u32]);
-        assert_eq!(acc2, [0b010u32]);
-    }
-
-    #[test]
     fn composed_mask_forces_out_via_intersection() {
         // Compose all-allowed with a ban on the natural argmax -> forced out.
+        //
+        // The AND is spelled here rather than called: `and_into` was dropped
+        // from this module when nothing outside it composed masks, and a
+        // one-line loop in the one test that needs the semantics is cheaper
+        // than a public helper with no caller. What is under test is
+        // `all_allowed` being the identity for it and the argmax honouring
+        // the result — not the loop.
         let logits = [1.0f32, 5.0, 3.0];
         let mut mask = all_allowed(logits.len());
-        and_into(&mut mask, &[0b101u32]); // intersect: disallow index 1
+        for (a, b) in mask.iter_mut().zip([0b101u32]) {
+            *a &= b; // intersect: disallow index 1
+        }
         assert_eq!(apply_mask_argmax(&logits, &mask), 2);
-    }
-
-    #[test]
-    fn bf16_hi_round_trips_high_bits() {
-        // 1.0f32 = 0x3F800000; its bf16 high half is 0x3F80.
-        assert_eq!(bf16_hi_to_f32(0x3F80), 1.0);
-        // bf16 -inf = 0xFF80 -> f32 -inf.
-        assert_eq!(bf16_hi_to_f32(0xFF80), f32::NEG_INFINITY);
     }
 
     #[test]

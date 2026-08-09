@@ -27,8 +27,8 @@
 
 #include <cuda_runtime.h>
 
-#include "ops/attention_workspace.hpp"
-#include "kernels/argmax.hpp"
+#include "attention_workspace.hpp"
+#include "sample/argmax.hpp"
 #include "comm/custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
@@ -41,7 +41,7 @@
 #include "model/attn_observation.hpp"
 #include "model/llama_like/qwen3.hpp"
 #include "model/workspace.hpp"
-#include "ops/gemm.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver {
 
@@ -81,7 +81,7 @@ void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
 void ForwardFn::invoke_body(model::Workspace& ws,
                             KvCache& kv,
                             AttentionWorkspace& aws,
-                            ops::CublasHandle& cublas,
+                            kernels::gemm::CublasHandle& cublas,
                             const ForwardInputs& in) {
     if (model) {
         if (in.stage_hooks == nullptr) {
@@ -122,7 +122,7 @@ std::uint64_t ForwardFn::invoke_lora_stage(model::Workspace& ws,
 bool ForwardFn::invoke_supergraph_body(model::Workspace& ws,
                                        KvCache& kv,
                                        AttentionWorkspace& aws,
-                                       ops::CublasHandle& cublas,
+                                       kernels::gemm::CublasHandle& cublas,
                                        const ForwardInputs& in,
                                        batch::SupergraphBuilder& sg) {
     return model != nullptr &&
@@ -295,7 +295,7 @@ class CudaStreamOwner {
 
     class CublasStreamScope {
       public:
-        explicit CublasStreamScope(ops::CublasHandle& handle)
+        explicit CublasStreamScope(kernels::gemm::CublasHandle& handle)
             : handle_(handle), previous_(handle.stream()) {}
         void bind(cudaStream_t stream) {
             handle_.set_stream(stream);
@@ -315,7 +315,7 @@ class CudaStreamOwner {
         }
 
       private:
-        ops::CublasHandle& handle_;
+        kernels::gemm::CublasHandle& handle_;
         cudaStream_t previous_ = nullptr;
         bool active_ = true;
 };
@@ -395,10 +395,10 @@ int logits_argmax_chunk_tokens() {
         // a config error, and failing at startup beats capturing a graph with
         // tens of thousands of slab nodes and appearing to hang.
         if (parsed > std::numeric_limits<int>::max() ||
-            parsed < static_cast<long>(kernels::kArgmaxAccumSlots)) {
+            parsed < static_cast<long>(kernels::sample::kArgmaxAccumSlots)) {
             throw std::runtime_error(
                 "PIE_LOGITS_CHUNK_TOKENS must be at least " +
-                std::to_string(kernels::kArgmaxAccumSlots) +
+                std::to_string(kernels::sample::kArgmaxAccumSlots) +
                 " (the per-row accumulator width) and fit in an int; a slab "
                 "narrower than that carries more running state than it "
                 "summarises");
@@ -554,7 +554,7 @@ cudaGraphExec_t capture_forward_graph_exec(
     if (engine.tp_comm != nullptr &&
         engine.tp_comm->custom_all_reduce() != nullptr) {
         engine.tp_comm->custom_all_reduce()
-            ->register_graph_buffers(*engine.tp_comm);
+            ->register_graph_buffers();
     }
     cublas_stream.restore();
 

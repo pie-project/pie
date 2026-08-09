@@ -4,7 +4,7 @@
 //!   * [`DriverCapabilities`] — typed driver capability payloads.
 //!   * [`write_cuda_startup_toml`] / [`write_metal_startup_toml`] — emit the
 //!     per-launch TOML each native driver reads at creation.
-//!   * [`create_driver_backend`] — build a runtime-owned [`DriverBackend`]
+//!   * [`create_driver_backend`] — build a runtime-owned [`::engine::driver::DriverBackend`]
 //!     plus its caps before `::engine::bootstrap`.
 
 #[cfg(feature = "driver-cuda")]

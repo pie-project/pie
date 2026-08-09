@@ -104,9 +104,11 @@
   "ops": [
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.0.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.0.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -135,7 +137,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -150,7 +152,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::flashinfer_cutlass_moe_bf16",
+          "kernel": "moe::flashinfer_cutlass_moe_bf16",
           "weights": [
             "layer.0.expert.{e}.gate_up",
             "layer.0.expert.{e}.down"
@@ -170,7 +172,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
@@ -200,7 +202,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -229,7 +231,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_sigmoid_dot_scalar_gate_add_bf16",
+          "kernel": "mlp::sigmoid_dot_scalar_gate_add_bf16",
           "weights": [
             "layer.0.shared_expert_gate"
           ]

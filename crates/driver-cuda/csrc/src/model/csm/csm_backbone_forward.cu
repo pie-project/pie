@@ -19,37 +19,19 @@
 
 #include "model/csm/csm_backbone_forward.hpp"
 
+#include "gemm/gemm.hpp"
+#include "mlp/swiglu.hpp"
+#include "norm/rmsnorm.hpp"
+#include "sample/argmax.hpp"
+#include "model/csm/csm_naive_kernels.cuh"
+
 namespace pie_cuda_driver::model {
 namespace {
 
-using bf = __nv_bfloat16;
 #define CK(x) do{cudaError_t e=(x);if(e)throw std::runtime_error(std::string("csm_bb: ")+cudaGetErrorString(e));}while(0)
-__device__ __forceinline__ float F(bf x){return __bfloat162float(x);}
-__device__ __forceinline__ bf   Bf(float x){return __float2bfloat16(x);}
 
 // y[n,o] = sum_k x[n,k]*W[o,k]   (W is [O,K] row-major, PyTorch Linear layout).
-__global__ void k_matmul(const bf* x,const bf* W,bf* y,int N,int K,int O){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,o=blockIdx.x*blockDim.x+threadIdx.x;
-    if(n>=N||o>=O)return;
-    const bf* xr=x+(long)n*K;const bf* wr=W+(long)o*K;
-    float a=0;for(int k=0;k<K;k++)a+=F(xr[k])*F(wr[k]);
-    y[(long)n*O+o]=Bf(a);
-}
 // Per-row RMSNorm over D (fp32 accumulate, matches LlamaRMSNorm).
-__global__ void k_rms(const bf* x,const bf* w,bf* o,int R,int D,float eps){
-    int r=blockIdx.x;if(r>=R)return;const bf* xr=x+(long)r*D;bf* orow=o+(long)r*D;
-    float loc=0;for(int d=threadIdx.x;d<D;d+=blockDim.x){float v=F(xr[d]);loc+=v*v;}
-    for(int s=warpSize/2;s>0;s>>=1)loc+=__shfl_down_sync(0xffffffff,loc,s);
-    __shared__ float warp[32],ss;if((threadIdx.x&31)==0)warp[threadIdx.x>>5]=loc;__syncthreads();
-    if(threadIdx.x==0){float t=0;int nw=(blockDim.x+31)/32;for(int i=0;i<nw;i++)t+=warp[i];ss=rsqrtf(t/D+eps);}__syncthreads();
-    float inv=ss;for(int d=threadIdx.x;d<D;d+=blockDim.x)orow[d]=Bf(F(xr[d])*inv*(w?F(w[d]):1.f));
-}
-__global__ void k_swiglu(const bf* gate,const bf* up,bf* o,long t){
-    long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i>=t)return;
-    float g=F(gate[i]);o[i]=Bf((g/(1.f+__expf(-g)))*F(up[i]));
-}
-__global__ void k_add(bf* a,const bf* b,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t)a[i]=Bf(F(a[i])+F(b[i]));}
-
 // llama3 YaRN inv-freq (mirrors rope.cu::yarn_freq / the depth decoder).
 __device__ __forceinline__ float yarn_freq(float base_freq,float factor,
         float low_freq_factor,float high_freq_factor,float orig_max_pos){
@@ -64,7 +46,7 @@ __device__ __forceinline__ float yarn_freq(float base_freq,float factor,
 }
 // Apply RoPE in place to a [R, H, hd] block where row r has absolute position
 // pos0+r (rotate-half convention, matches modeling_csm / llama).
-__global__ void k_rope(bf* x,int R,int H,int hd,int pos0,
+__global__ void k_rope_yarn_1d(bf* x,int R,int H,int hd,int pos0,
         float theta,float factor,float lo,float hi,float orig){
     int r=blockIdx.z; int h=blockIdx.y*blockDim.y+threadIdx.y, d=blockIdx.x*blockDim.x+threadIdx.x;
     int half=hd/2;if(r>=R||h>=H||d>=half)return;
@@ -82,7 +64,7 @@ __global__ void k_rope(bf* x,int R,int H,int hd,int pos0,
 // [q0 .. q0+R-1]; the KV cache holds `L` keys at absolute positions [0..L-1]
 // (so q0 = L - R). Row r attends keys 0..(q0+r). GQA: head h -> kv head h/(H/KV).
 // out [R, H*hd].
-__global__ void k_attn(const bf* q,const bf* kcache,const bf* vcache,
+__global__ void k_attn_causal_cached(const bf* q,const bf* kcache,const bf* vcache,
         bf* out,int R,int H,int KV,int hd,int L,int q0,float scale){
     int r=blockIdx.y; int h=blockIdx.x; if(r>=R||h>=H)return;
     int kvh=h/(H/KV);
@@ -108,14 +90,6 @@ __global__ void k_attn(const bf* q,const bf* kcache,const bf* vcache,
         float acc=0;for(int j=0;j<=lim;j++){const bf* vj=vcache+((long)j*KV+kvh)*hd;acc+=sh[j]*F(vj[d]);}
         out[((long)r*H+h)*hd+d]=Bf(acc*inv);
     }
-}
-__global__ void k_argmax(const bf* logits,int V,int* out){
-    int t=threadIdx.x;float bv=-1e30f;int bi=0;
-    for(int v=t;v<V;v+=blockDim.x){float x=F(logits[v]);if(x>bv){bv=x;bi=v;}}
-    __shared__ float sv[256];__shared__ int si[256];
-    sv[t]=bv;si[t]=bi;__syncthreads();
-    for(int s=blockDim.x/2;s>0;s>>=1){if(t<s){if(sv[t+s]>sv[t]||(sv[t+s]==sv[t]&&si[t+s]<si[t])){sv[t]=sv[t+s];si[t]=si[t+s];}}__syncthreads();}
-    if(t==0)*out=si[0];
 }
 // Sum the 32 codebook embeds of one frame into out [hidden].
 //   embed_audio [num_codebooks*audio_vocab, hidden]; codes[c] (host-resident on
@@ -149,6 +123,7 @@ struct BBScratch {
     bf *resid, *normed, *q, *k, *v, *attn, *attn_o, *gate, *up, *mlp;
     std::vector<bf*> kcache, vcache;   // [maxL, KV, hd] per layer
     cudaStream_t S;
+    cublasHandle_t cublas;   // owned by csm_generate_audio, bound to S
 };
 
 // Run one backbone block over R rows. `resid` holds [R, hidden] in/out. KV cache
@@ -160,25 +135,25 @@ void bb_layer(const CsmBackboneRawWeights& w,const CsmBackboneLayerRaw& L,
     const int q0=Lkv-R;
     const float scale=1.f/sqrtf((float)hd);
     cudaStream_t S=s.S;
-    k_rms<<<R,256,0,S>>>(s.resid,L.in_ln_w,s.normed,R,H,w.norm_eps);
-    k_matmul<<<G2(QD,R),B2,0,S>>>(s.normed,L.q,s.q,R,H,QD);
-    k_matmul<<<G2(KD,R),B2,0,S>>>(s.normed,L.k,s.k,R,H,KD);
-    k_matmul<<<G2(KD,R),B2,0,S>>>(s.normed,L.v,s.v,R,H,KD);
-    { dim3 g((hd/2+15)/16,(NH+15)/16,R); k_rope<<<g,B2,0,S>>>(s.q,R,NH,hd,q0,
+    kernels::norm::rmsnorm_bf16(s.resid,L.in_ln_w,s.normed,R,H,w.norm_eps,S);
+    kernels::gemm::act_x_wt_bf16(s.cublas,s.normed,L.q,s.q,R,QD,H);
+    kernels::gemm::act_x_wt_bf16(s.cublas,s.normed,L.k,s.k,R,KD,H);
+    kernels::gemm::act_x_wt_bf16(s.cublas,s.normed,L.v,s.v,R,KD,H);
+    { dim3 g((hd/2+15)/16,(NH+15)/16,R); k_rope_yarn_1d<<<g,B2,0,S>>>(s.q,R,NH,hd,q0,
         w.rope_theta,w.rope_factor,w.rope_low_freq_factor,w.rope_high_freq_factor,(float)w.rope_original_max_position); }
-    { dim3 g((hd/2+15)/16,(KV+15)/16,R); k_rope<<<g,B2,0,S>>>(s.k,R,KV,hd,q0,
+    { dim3 g((hd/2+15)/16,(KV+15)/16,R); k_rope_yarn_1d<<<g,B2,0,S>>>(s.k,R,KV,hd,q0,
         w.rope_theta,w.rope_factor,w.rope_low_freq_factor,w.rope_high_freq_factor,(float)w.rope_original_max_position); }
     // append the R new k,v rows into the cache at slots q0..q0+R-1
     CK(cudaMemcpyAsync(s.kcache[li]+(long)q0*KD,s.k,(long)R*KD*sizeof(bf),cudaMemcpyDeviceToDevice,S));
     CK(cudaMemcpyAsync(s.vcache[li]+(long)q0*KD,s.v,(long)R*KD*sizeof(bf),cudaMemcpyDeviceToDevice,S));
-    { dim3 g(NH,R); k_attn<<<g,128,(size_t)Lkv*sizeof(float),S>>>(s.q,s.kcache[li],s.vcache[li],s.attn,R,NH,KV,hd,Lkv,q0,scale); }
-    k_matmul<<<G2(H,R),B2,0,S>>>(s.attn,L.o,s.attn_o,R,QD,H);
+    { dim3 g(NH,R); k_attn_causal_cached<<<g,128,(size_t)Lkv*sizeof(float),S>>>(s.q,s.kcache[li],s.vcache[li],s.attn,R,NH,KV,hd,Lkv,q0,scale); }
+    kernels::gemm::act_x_wt_bf16(s.cublas,s.attn,L.o,s.attn_o,R,H,QD);
     k_add<<<(long)(R*H+255)/256,256,0,S>>>(s.resid,s.attn_o,(long)R*H);
-    k_rms<<<R,256,0,S>>>(s.resid,L.post_ln_w,s.normed,R,H,w.norm_eps);
-    k_matmul<<<G2(s.inter,R),B2,0,S>>>(s.normed,L.gate,s.gate,R,H,s.inter);
-    k_matmul<<<G2(s.inter,R),B2,0,S>>>(s.normed,L.up,s.up,R,H,s.inter);
-    k_swiglu<<<(long)(R*s.inter+255)/256,256,0,S>>>(s.gate,s.up,s.gate,(long)R*s.inter);
-    k_matmul<<<G2(H,R),B2,0,S>>>(s.gate,L.down,s.mlp,R,s.inter,H);
+    kernels::norm::rmsnorm_bf16(s.resid,L.post_ln_w,s.normed,R,H,w.norm_eps,S);
+    kernels::gemm::act_x_wt_bf16(s.cublas,s.normed,L.gate,s.gate,R,s.inter,H);
+    kernels::gemm::act_x_wt_bf16(s.cublas,s.normed,L.up,s.up,R,s.inter,H);
+    kernels::mlp::swiglu_bf16(s.gate,s.up,s.gate,R*s.inter,S);
+    kernels::gemm::act_x_wt_bf16(s.cublas,s.gate,L.down,s.mlp,R,H,s.inter);
     k_add<<<(long)(R*H+255)/256,256,0,S>>>(s.resid,s.mlp,(long)R*H);
 }
 
@@ -212,7 +187,13 @@ int csm_generate_audio(const CsmBackboneRawWeights& w,
     const int maxL=n_prompt+max_frames+1;
 
     auto MAL=[&](long n){bf* d;CK(cudaMalloc(&d,n*sizeof(bf)));return d;};
-    BBScratch s; s.hidden=H;s.NH=NH;s.KV=KV;s.hd=hd;s.QD=QD;s.KD=KD;s.inter=w.intermediate;s.maxL=maxL;s.S=S;
+    // One handle for the whole generation, bound to this call's stream.
+    // RAII: cublasCreate is expensive enough to not want per-layer, and
+    // generate_audio is already the coarse entry point (it loops frames
+    // internally). `d1` copies this scratch, so it carries the handle too.
+    kernels::gemm::CublasHandle cublas(S);
+
+    BBScratch s; s.cublas=cublas.handle(); s.hidden=H;s.NH=NH;s.KV=KV;s.hd=hd;s.QD=QD;s.KD=KD;s.inter=w.intermediate;s.maxL=maxL;s.S=S;
     const int R0=n_prompt;            // prefill rows
     s.resid=MAL((long)R0*H); s.normed=MAL((long)R0*H);
     s.q=MAL((long)R0*QD); s.k=MAL((long)R0*KD); s.v=MAL((long)R0*KD);
@@ -238,7 +219,7 @@ int csm_generate_audio(const CsmBackboneRawWeights& w,
     int Lkv=R0;
     for(int l=0;l<w.num_layers;l++) bb_layer(w,w.layers[l],s,l,R0,Lkv);
     // final norm on the LAST row only (the one that predicts frame 0's cb0).
-    k_rms<<<1,256,0,S>>>(s.resid+(long)(R0-1)*H,w.norm_w,last_hidden,1,H,w.norm_eps);
+    kernels::norm::rmsnorm_bf16(s.resid+(long)(R0-1)*H,w.norm_w,last_hidden,1,H,w.norm_eps,S);
 
     // Single-row decode scratch (reuse layer scratch sized for 1 row).
     bf* d_resid=MAL(H); bf* d_normed=MAL(H);
@@ -254,8 +235,8 @@ int csm_generate_audio(const CsmBackboneRawWeights& w,
 
     for(int f=0; f<max_frames; ++f){
         // cb0 = argmax(lm_head(last_hidden))
-        k_matmul<<<G2(AV,1),B2,0,S>>>(last_hidden,w.lm_head,lm_logits,1,H,AV);
-        k_argmax<<<1,256,0,S>>>(lm_logits,AV,d_arg);
+        kernels::gemm::act_x_wt_bf16(s.cublas,last_hidden,w.lm_head,lm_logits,1,AV,H);
+        kernels::sample::argmax_bf16(lm_logits,d_arg,1,AV,S);
         int cb0; CK(cudaMemcpyAsync(&cb0,d_arg,sizeof(int),cudaMemcpyDeviceToHost,S));CK(cudaStreamSynchronize(S));
 
         // depth decoder -> cb1..cb31 (seeded by last_hidden + cb0)
@@ -283,7 +264,7 @@ int csm_generate_audio(const CsmBackboneRawWeights& w,
         int newL=Lkv+1;
         for(int l=0;l<w.num_layers;l++) bb_layer(w,w.layers[l],d1,l,1,newL);
         Lkv=newL;
-        k_rms<<<1,256,0,S>>>(d1.resid,w.norm_w,last_hidden,1,H,w.norm_eps);
+        kernels::norm::rmsnorm_bf16(d1.resid,w.norm_w,last_hidden,1,H,w.norm_eps,S);
     }
     CK(cudaStreamSynchronize(S));
 

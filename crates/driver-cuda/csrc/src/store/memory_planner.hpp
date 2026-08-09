@@ -24,7 +24,7 @@ struct Config;
 struct HfConfig;
 class KvCacheFormat;
 
-namespace ops { struct RuntimeQuantScratchSpec; }
+namespace kernels::gemm { struct RuntimeQuantScratchSpec; }
 
 // Upper bounds on per-fire shapes. Sized by the planner so persistent
 // device buffers can be reserved once and shared across all calls.
@@ -84,7 +84,7 @@ CudaMemoryPlan plan_cuda_memory(
     bool kimi_k3_selected,
     bool prefill_graph_capable,
     const KvCacheFormat& kv_format,
-    const ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
+    const kernels::gemm::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose);
 
 }  // namespace pie_cuda_driver

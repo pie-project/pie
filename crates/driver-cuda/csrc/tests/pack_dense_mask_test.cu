@@ -14,8 +14,8 @@
 #include <cuda_runtime.h>
 
 #include "batch/persistent_inputs.hpp"
-#include "kernels/graph_pad.hpp"
-#include "kernels/pack_dense_mask.hpp"
+#include "layout/graph_pad.hpp"
+#include "attn/pack_dense_mask.hpp"
 
 namespace {
 
@@ -108,7 +108,7 @@ void test_fork_freeze() {
                        cudaMemcpyHostToDevice));
     CUDA_RT(cudaMemset(d_packed, 0, want.size()));
 
-    pie_cuda_driver::kernels::launch_pack_dense_mask(
+    pie_cuda_driver::kernels::attn::pack_dense_mask(
         d_kvm, d_klen, d_qo_indptr, d_indptr, d_packed, B, P_PAGE, nullptr);
     CUDA_RT(cudaDeviceSynchronize());
 
@@ -134,7 +134,7 @@ void test_fork_freeze() {
 }
 
 void test_mixed_structured() {
-    using pie_cuda_driver::kernels::StructuredMaskParams;
+    using pie_cuda_driver::kernels::attn::StructuredMaskParams;
     constexpr int B = 5;
     const std::vector<std::uint32_t> positions = {3, 5, 7, 9, 4, 6};
     const std::vector<std::uint32_t> qo = {0, 1, 3, 4, 5, 6};
@@ -206,7 +206,7 @@ void test_mixed_structured() {
     CUDA_RT(cudaMemcpy(
         d_masks, masks.data(), masks.size() * sizeof(StructuredMaskParams),
         cudaMemcpyHostToDevice));
-    pie_cuda_driver::kernels::launch_pack_structured_mask(
+    pie_cuda_driver::kernels::attn::pack_structured_mask(
         d_positions, d_klen, d_qo, d_indptr, d_masks, d_packed, B, nullptr);
     CUDA_RT(cudaDeviceSynchronize());
     std::vector<std::uint8_t> got(want.size());
@@ -253,7 +253,7 @@ void test_persistent_mask_graph_replay() {
         pi.qo_indptr.copy_from_host(qo);
         pi.custom_mask_indptr.copy_from_host(indptr);
         CUDA_RT(cudaMemset(pi.custom_mask.data(), 0, 2));
-        pie_cuda_driver::kernels::launch_pack_dense_mask(
+        pie_cuda_driver::kernels::attn::pack_dense_mask(
             pi.dense_mask.data(),
             pi.structured_mask_klen.data(),
             pi.qo_indptr.data(),
@@ -340,6 +340,7 @@ void test_mask_aware_graph_padding() {
         /*real_requests=*/1,
         /*real_tokens=*/1,
         /*padding=*/1,
+        /*pad_tokens=*/1,  // decode path: one token per pad lane
         /*pad_page=*/9,
         /*stream=*/nullptr);
     CUDA_RT(cudaDeviceSynchronize());

@@ -29,6 +29,7 @@
 
 use super::facts::{LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm};
 use super::llama_like_cuda;
+use model_compiler::dsl::{ScaleLayout, WeightRepr};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, OpKind, RopeKind};
 
 /// The digest naming what a generated TU was emitted FROM. The driver
@@ -39,7 +40,7 @@ use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, OpKind, RopeKin
 /// the live parity gate is what holds them together.
 pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String {
     format!(
-        "llama_like/h{}/l{}/qh{}/kvh{}/hd{}/i{}/v{}/rope{}/nv{}/np{}/qk{}/fq{}/te{}/qb{}/xqa{}/dfp{}/rt{}/fpp{}/pad{}",
+        "llama_like/h{}/l{}/qh{}/kvh{}/hd{}/i{}/v{}/rope{}/nv{}/np{}/qk{}/fq{}/te{}/qb{}/xqa{}/dfp{}/rt{}/fpp{}/pad{}/pr{}/hdk{}/tp{}/wl{}",
         facts.hidden,
         facts.layers,
         facts.q_heads,
@@ -72,6 +73,36 @@ pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String
         u8::from(cuda.rope_table),
         u8::from(cuda.force_prefill_path),
         u8::from(cuda.head_dim_padded),
+        // The WEIGHT REPRESENTATION, so a generated TU emitted against a
+        // BF16 deployment cannot run on a quantized one -- the body is
+        // different (a scaled projection states a launcher and names
+        // scale tensors), so the digest has to say so.
+        //
+        // The PAYLOAD is not in the digest and does not need to be: the
+        // group size and the axis are arguments the arm reads off the
+        // bound tensors, not shapes the emitted body is written around.
+        match cuda.proj_repr {
+            WeightRepr::Bf16 => 0,
+            WeightRepr::Scaled { layout: ScaleLayout::PerTensor, .. } => 1,
+            WeightRepr::Scaled { layout: ScaleLayout::PerChannel, .. } => 2,
+            WeightRepr::Scaled { layout: ScaleLayout::PerGroup, .. } => 3,
+            WeightRepr::Mxfp4Marlin => 4,
+        },
+        // The WIDTH, not just the fact of padding: the emitted body's
+        // pads and strip carry it as `cfg.head_dim_kernel`, and a
+        // deployment padding to a different one is a different text.
+        cuda.head_dim_kernel,
+        cuda.tp_size,
+        // The SLIDING WINDOW list. It is a constant of the emitted text
+        // now -- `const int layer_window_left = <n>;` per dispatch --
+        // so a body emitted against one window must not serve another.
+        // Joined rather than hashed: the list is short and a digest a
+        // reader can compare by eye has caught three drifts already.
+        cuda.window_left
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>()
+            .join("."),
     )
 }
 
@@ -147,7 +178,7 @@ const PARAMS: &str = "\
     Workspace& ws,\n\
     KvCache& cache,\n\
     AttentionWorkspace& attn_ws,\n\
-    ops::CublasHandle& cublas,\n\
+    kernels::gemm::CublasHandle& cublas,\n\
     const std::int32_t* token_ids,\n\
     const std::int32_t* positions,\n\
     const std::uint32_t* qo_indptr,\n\
@@ -358,15 +389,15 @@ fn emit_class_fn(
     // call and no scan.
     let states_xqa = plan.ops.iter().any(|op| {
         matches!(&op.kind, OpKind::Launch { kernel, .. }
-                 if kernel == "launch_attention_xqa_decode_bf16_prepared")
+                 if kernel == "attn::attention_xqa_decode_bf16_prepared")
     });
     if states_xqa {
         b.line("    // The trace states the XQA attention kernel; its fire-wide");
         b.line("    // prepare is that statement's obligation.");
-        b.line("    ops::prepare_attention_xqa_decode_bf16(");
+        b.line("    kernels::attn::prepare_attention_xqa_decode_bf16(");
         b.line("        kv_page_indices, kv_page_indptr, kv_last_page_lens,");
         b.line("        R, cache.page_size(), plan_state.xqa_max_pages_per_seq,");
-        b.line("        attn_ws, stream);");
+        b.line("        attn_ws.view(), stream);");
         b.line("");
     }
 
@@ -750,6 +781,19 @@ struct Body {
     out: String,
     /// Extra indent levels while inside an emitted Guard region.
     indent: usize,
+    /// WHICH of q, k, v the next `attn::pad_head_dim_bf16` stages.
+    ///
+    /// The one piece of state that crosses statements here, and it
+    /// exists because this form spells buffers where the interpreter
+    /// resolves values: a padded deployment states pad(q), pad(k),
+    /// pad(v) in that order, and under MHA -- phi-3, the only padded
+    /// deployment in the tree -- the three results have the SAME shape,
+    /// so nothing but the order tells them apart.
+    ///
+    /// The precedent is qwen3.5's `repeat_next_is_k`, and the reason is
+    /// the same: an operand order fixed by the declaration, bound by a
+    /// cursor rather than guessed from an extent.
+    pad_stage: usize,
 }
 
 impl Body {
@@ -783,26 +827,14 @@ fn require(layer: u32, member: &str, name: &str) -> String {
     format!("require(w.layers[{layer}].{member}, \"{name}\")->data()")
 }
 
-fn emit_op(
-    b: &mut Body,
-    op: &model_compiler::trace::Op,
-    plan: &ForwardPlan,
-    facts: &LlamaLikeFacts,
-    cuda: &LlamaLikeCudaFacts,
-    is_decode: bool,
-    win: Option<Win>,
-    depth_active: bool,
-) {
-    let _ = plan;
-    match &op.kind {
-        OpKind::Embed { weight } => {
-            assert_eq!(weight, "embed");
-            b.stmt("kernels::launch_embed_bf16(");
-            b.stmt("    token_ids, require(w.embed, \"embed\")->data(), ws.y.data(),");
-            b.stmt("    N, H, V, stream);");
-        }
-        OpKind::Rmsnorm { weight, variant } => {
-            assert_eq!(*variant, NormVariant::Plain, "emitter: Plain only");
+/// The ROW norm's emission, shared by the semantic kind and the stated
+/// symbols.
+///
+/// A CUDA text states `norm::rmsnorm_bf16` or its gemma twin now
+/// (`dsl::cuda::rmsnorm`), so this arrives as a `Launch`; a semantic
+/// text still records the kind. Same buffers, same widths, one body —
+/// which is the point of the migration rather than a side effect of it.
+fn emit_row_norm(b: &mut Body, facts: &LlamaLikeFacts, weight: &str) {
             if weight == "final_norm" {
                 // Deferred into the LmHead epilogue, exactly the
                 // interpreter's arm (gather-then-norm ≡ norm-then-gather).
@@ -828,12 +860,36 @@ fn emit_op(
                 "k_norm" => ("ws.k.data()", "ws.k.data()", "Hk"),
                 other => panic!("emitter: row-norm field {other} out of scope"),
             };
-            b.stmt(&format!("kernels::launch_rmsnorm_bf16("));
+            b.stmt(&format!("kernels::norm::rmsnorm_bf16("));
             b.stmt(&format!(
                 "    {input}, {},",
                 require(layer, field, weight)
             ));
             b.stmt(&format!("    {output}, N, {width}, eps, stream);"));
+}
+
+
+fn emit_op(
+    b: &mut Body,
+    op: &model_compiler::trace::Op,
+    plan: &ForwardPlan,
+    facts: &LlamaLikeFacts,
+    cuda: &LlamaLikeCudaFacts,
+    is_decode: bool,
+    win: Option<Win>,
+    depth_active: bool,
+) {
+    let _ = plan;
+    match &op.kind {
+        OpKind::Embed { weight } => {
+            assert_eq!(weight, "embed");
+            b.stmt("kernels::layout::embed_bf16(");
+            b.stmt("    token_ids, require(w.embed, \"embed\")->data(), ws.y.data(),");
+            b.stmt("    N, H, V, stream);");
+        }
+        OpKind::Rmsnorm { weight, variant } => {
+            assert_eq!(*variant, NormVariant::Plain, "emitter: Plain only");
+            emit_row_norm(b, facts, weight);
         }
         OpKind::AddBias { weight } => {
             // Qwen-2 family qkv biases: the hand-written `maybe_add_bias`
@@ -848,7 +904,7 @@ fn emit_op(
                 "v_bias" => ("ws.v.data()", "Hk"),
                 other => panic!("emitter: bias field {other} out of scope"),
             };
-            b.stmt("kernels::launch_add_bias_bf16(");
+            b.stmt("kernels::norm::add_bias_bf16(");
             b.stmt(&format!("    {buf}, {},", require(layer, field, weight)));
             b.stmt(&format!("    N, {width}, stream);"));
         }
@@ -862,18 +918,18 @@ fn emit_op(
                 .unwrap_or_else(|| panic!("emitter: unknown matmul weight {weight}"));
             match (field, *beta_one) {
                 ("qkv", false) => {
-                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("kernels::gemm::act_x_w(cublas.handle(),");
                     b.stmt("    ws.norm_x.data(),");
                     b.stmt(&format!(
-                        "    ops::WeightView(*require(w.layers[{layer}].qkv_proj_fused, \"{weight}\")),"
+                        "    WeightView(*require(w.layers[{layer}].qkv_proj_fused, \"{weight}\")),"
                     ));
                     b.stmt("    ws.qkv_fused.data(), N, Hq + 2 * Hk, H);");
                 }
                 ("o_proj", true) => {
-                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("kernels::gemm::act_x_w(cublas.handle(),");
                     b.stmt("    ws.attn_out.data(),");
                     b.stmt(&format!(
-                        "    make_weight_view(require(w.layers[{layer}].o_proj, \"{weight}\"), w.layers[{layer}].o_proj_quant),"
+                        "    dense(*require(w.layers[{layer}].o_proj, \"{weight}\"), w.layers[{layer}].o_proj_quant, \"{weight}\"),"
                     ));
                     b.stmt("    ws.y.data(), N, H, Hq, 1.f);");
                 }
@@ -883,44 +939,45 @@ fn emit_op(
                     } else {
                         "ws.norm_y.data()"
                     };
-                    // The binding dispatch, RESOLVED — not transliterated.
-                    // It used to be a per-layer `const bool ... != nullptr
-                    // && !ws.gate_up_fused.empty()` and an `if` around
-                    // both GEMM forms, in a file whose whole point is that
-                    // this deployment's choices are already made. The
-                    // second term was always true (`workspace.cpp`
-                    // allocates that buffer unconditionally), and the
-                    // first is the load-time fact the trace now carries,
-                    // so only the taken branch is emitted. The `require`
-                    // on the unfused side is what refuses a binding that
-                    // disagrees with the fact.
-                    if cuda.gate_up_fused {
-                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
-                        b.stmt(&format!("    {mlp_in},"));
-                        b.stmt(&format!(
-                            "    ops::WeightView(*require(w.layers[{layer}].gate_up_proj_fused, \"{weight}\")),"
-                        ));
-                        b.stmt("    ws.gate_up_fused.data(), N, 2 * I, H);");
+                    // The PACKED bank (2d). The unfused branch this arm
+                    // used to carry is gone with the one-statement
+                    // reading: a deployment without the bank states
+                    // `gate_proj` and `up_proj` below, so reaching this
+                    // name means the join materialised one. `require`
+                    // refuses a binding that says otherwise.
+                    b.stmt("kernels::gemm::act_x_w(cublas.handle(),");
+                    b.stmt(&format!("    {mlp_in},"));
+                    b.stmt(&format!(
+                        "    WeightView(*require(w.layers[{layer}].gate_up_proj_fused, \"{weight}\")),"
+                    ));
+                    b.stmt("    ws.gate_up_fused.data(), N, 2 * I, H);");
+                }
+                // The two halves of an unfused binding, each its own
+                // statement and each landing where the pair activation
+                // reads it.
+                ("gate_proj", false) | ("up_proj", false) => {
+                    let mlp_in = if facts.norm_placement == NormPlacement::Post {
+                        "ws.y.data()"
                     } else {
-                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
-                        b.stmt(&format!("    {mlp_in},"));
-                        b.stmt(&format!(
-                            "    make_weight_view(require(w.layers[{layer}].gate_proj, \"{weight}\"), w.layers[{layer}].gate_proj_quant),"
-                        ));
-                        b.stmt("    ws.gate.data(), N, I, H);");
-                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
-                        b.stmt(&format!("    {mlp_in},"));
-                        b.stmt(&format!(
-                            "    make_weight_view(require(w.layers[{layer}].up_proj, \"{weight}\"), w.layers[{layer}].up_proj_quant),"
-                        ));
-                        b.stmt("    ws.up.data(), N, I, H);");
-                    }
+                        "ws.norm_y.data()"
+                    };
+                    let (member, quant, dst) = if field == "gate_proj" {
+                        ("gate_proj", "gate_proj_quant", "ws.gate.data()")
+                    } else {
+                        ("up_proj", "up_proj_quant", "ws.up.data()")
+                    };
+                    b.stmt("kernels::gemm::act_x_w(cublas.handle(),");
+                    b.stmt(&format!("    {mlp_in},"));
+                    b.stmt(&format!(
+                        "    dense(*require(w.layers[{layer}].{member}, \"{weight}\"), w.layers[{layer}].{quant}, \"{weight}\"),"
+                    ));
+                    b.stmt(&format!("    {dst}, N, I, H);"));
                 }
                 ("down", true) => {
-                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("kernels::gemm::act_x_w(cublas.handle(),");
                     b.stmt("    ws.gate.data(),");
                     b.stmt(&format!(
-                        "    make_weight_view(require(w.layers[{layer}].down_proj, \"{weight}\"), w.layers[{layer}].down_proj_quant),"
+                        "    dense(*require(w.layers[{layer}].down_proj, \"{weight}\"), w.layers[{layer}].down_proj_quant, \"{weight}\"),"
                     ));
                     b.stmt("    ws.y.data(), N, H, I, 1.f);");
                 }
@@ -936,10 +993,10 @@ fn emit_op(
                         "k_proj" => ("ws.k.data()", "Hk", "k_proj", "k_proj_quant"),
                         _ => ("ws.v.data()", "Hk", "v_proj", "v_proj_quant"),
                     };
-                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("kernels::gemm::act_x_w(cublas.handle(),");
                     b.stmt(&format!("    {input},"));
                     b.stmt(&format!(
-                        "    make_weight_view(require(w.layers[{layer}].{member}, \"{weight}\"), w.layers[{layer}].{quant}),"
+                        "    dense(*require(w.layers[{layer}].{member}, \"{weight}\"), w.layers[{layer}].{quant}, \"{weight}\"),"
                     ));
                     b.stmt(&format!("    {out}, N, {width}, H);"));
                 }
@@ -947,18 +1004,18 @@ fn emit_op(
                 // the norm_x scratch at beta=0; Rmsnorm + ResidualAdd land
                 // it — the interpreter's post-norm arms verbatim.
                 ("o_proj", false) => {
-                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("kernels::gemm::act_x_w(cublas.handle(),");
                     b.stmt("    ws.attn_out.data(),");
                     b.stmt(&format!(
-                        "    make_weight_view(require(w.layers[{layer}].o_proj, \"{weight}\"), w.layers[{layer}].o_proj_quant),"
+                        "    dense(*require(w.layers[{layer}].o_proj, \"{weight}\"), w.layers[{layer}].o_proj_quant, \"{weight}\"),"
                     ));
                     b.stmt("    ws.norm_x.data(), N, H, Hq, 0.f);");
                 }
                 ("down", false) => {
-                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("kernels::gemm::act_x_w(cublas.handle(),");
                     b.stmt("    ws.gate.data(),");
                     b.stmt(&format!(
-                        "    make_weight_view(require(w.layers[{layer}].down_proj, \"{weight}\"), w.layers[{layer}].down_proj_quant),"
+                        "    dense(*require(w.layers[{layer}].down_proj, \"{weight}\"), w.layers[{layer}].down_proj_quant, \"{weight}\"),"
                     ));
                     b.stmt("    ws.norm_x.data(), N, H, I, 0.f);");
                 }
@@ -972,7 +1029,7 @@ fn emit_op(
                 Some(Win::Host { start: s, len: n }) => {
                     // A Peel region's split: the window's rows at their
                     // absolute offsets (the interpreter's windowed form).
-                    b.stmt("kernels::launch_split_qkv_bf16(");
+                    b.stmt("kernels::attn::split_qkv_bf16(");
                     b.stmt(&format!(
                         "    bf16_row(ws.qkv_fused.data(), {s}, Hq + 2 * Hk),"
                     ));
@@ -982,7 +1039,7 @@ fn emit_op(
                     b.stmt(&format!("    {n}, Hq, Hk, stream);"));
                 }
                 Some(Win::DevTail) => {
-                    b.stmt("kernels::launch_split_qkv_bf16_devwin(");
+                    b.stmt("kernels::attn::split_qkv_bf16_devwin(");
                     b.stmt("    ws.qkv_fused.data(),");
                     b.stmt("    ws.q.data(), ws.k.data(), ws.v.data(),");
                     b.stmt("    peel_window_d, N, Hq, Hk, stream);");
@@ -994,29 +1051,17 @@ fn emit_op(
                     panic!("emitter: the qkv split in a mask peel region")
                 }
                 None => {
-                    b.stmt("kernels::launch_split_qkv_bf16(");
+                    b.stmt("kernels::attn::split_qkv_bf16(");
                     b.stmt("    ws.qkv_fused.data(),");
                     b.stmt("    ws.q.data(), ws.k.data(), ws.v.data(),");
                     b.stmt("    N, Hq, Hk, stream);");
                 }
             }
         }
-        OpKind::Rope { kind, partial } => {
-            assert!(partial.is_none(), "emitter: partial rope out of scope");
-            assert_eq!(
-                *kind,
-                model_compiler::trace::RopeKind::Standard,
-                "emitter: only standard rope"
-            );
-            b.stmt("kernels::launch_rope_bf16(");
-            b.stmt("    ws.q.data(), ws.k.data(), positions,");
-            b.stmt("    N, num_q_heads, num_kv_heads, d,");
-            b.stmt("    cfg.rope_theta, stream);");
-        }
         OpKind::ResidualAdd => {
             // The post-norm landing: `y += norm_y` — the interpreter's
             // arm verbatim.
-            b.stmt("kernels::launch_residual_add_bf16(");
+            b.stmt("kernels::norm::residual_add_bf16(");
             b.stmt("    ws.y.data(), ws.norm_y.data(),");
             b.stmt("    static_cast<std::size_t>(N) * H, stream);");
         }
@@ -1029,11 +1074,11 @@ fn emit_op(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
             b.stmt("    if (has_write_desc) {");
-            b.stmt("        kernels::launch_write_kv_explicit_bf16(");
+            b.stmt("        kernels::attn::write_kv_explicit_bf16(");
             b.stmt("            kv_view, ws.k.data(), ws.v.data(),");
             b.stmt("            w_page_d, w_off_d, N, stream, row_valid_d);");
             b.stmt("    } else {");
-            b.stmt("        kernels::launch_write_kv_to_pages(");
+            b.stmt("        kernels::attn::write_kv_to_pages(");
             b.stmt("            kv_view, ws.k.data(), ws.v.data(),");
             b.stmt("            qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("            kv_last_page_lens,");
@@ -1065,25 +1110,25 @@ fn emit_op(
             b.stmt("    const void* lm_head_input = nullptr;");
             b.stmt("    int lm_head_rows = N;");
             b.stmt("    if (compact_logits) {");
-            b.stmt("        kernels::launch_gather_bf16_rows(");
+            b.stmt("        kernels::layout::gather_bf16_rows(");
             b.stmt("            static_cast<const std::uint16_t*>(ws.y.data()),");
             b.stmt("            logit_row_indices_d,");
             b.stmt("            static_cast<std::uint16_t*>(ws.norm_x.data()),");
             b.stmt("            num_logit_rows, H, stream);");
-            b.stmt("        kernels::launch_rmsnorm_bf16(");
+            b.stmt("        kernels::norm::rmsnorm_bf16(");
             b.stmt("            ws.norm_x.data(), w.final_norm->data(),");
             b.stmt("            ws.norm_y.data(), num_logit_rows, H, eps, stream);");
             b.stmt("        lm_head_input = ws.norm_y.data();");
             b.stmt("        lm_head_rows = num_logit_rows;");
             b.stmt("    } else {");
-            b.stmt("        kernels::launch_rmsnorm_bf16(");
+            b.stmt("        kernels::norm::rmsnorm_bf16(");
             b.stmt("            ws.y.data(), w.final_norm->data(), ws.norm_y.data(),");
             b.stmt("            N, H, eps, stream);");
             b.stmt("        lm_head_input = ws.norm_y.data();");
             b.stmt("    }");
-            b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
+            b.stmt("    kernels::gemm::act_x_w(cublas.handle(),");
             b.stmt(&format!(
-                "        lm_head_input, ops::WeightView(*require({member}, \"{weight}\")),"
+                "        lm_head_input, WeightView(*require({member}, \"{weight}\")),"
             ));
             b.stmt("        ws.logits.data(), lm_head_rows, V, H);");
             b.stmt("}");
@@ -1092,8 +1137,9 @@ fn emit_op(
             kernel,
             weights,
             state,
+            params,
         } => emit_launch(
-            b, kernel, weights, state.as_ref(), op, facts, cuda,
+            b, kernel, weights, state.as_ref(), params, op, facts, cuda,
             is_decode, win, depth_active,
         ),
         OpKind::HookSite { stage, layer } => {
@@ -1164,7 +1210,7 @@ fn emit_masked_pages_bracket(b: &mut Body, layer: u32, takes_paged_decode: bool)
         b.stmt("            \"attn_page_mask was written but this layer does \"");
         b.stmt("            \"not take the paged decode path\");");
         b.stmt("    }");
-        b.stmt("    if (!ops::decode_plan_is_page_count_independent(");
+        b.stmt("    if (!kernels::attn::decode_plan_is_page_count_independent(");
         b.stmt("            *plan_state.decode_plan)) {");
         b.stmt("        throw std::runtime_error(");
         b.stmt("            \"attn_page_mask requires a page-count-independent \"");
@@ -1195,6 +1241,8 @@ fn emit_launch(
     kernel: &str,
     weights: &[String],
     state: Option<&model_compiler::trace::StateRef>,
+    // The statement's scalar arguments -- see `OpKind::Launch::params`.
+    params: &[u32],
     op: &model_compiler::trace::Op,
     facts: &LlamaLikeFacts,
     cuda: &LlamaLikeCudaFacts,
@@ -1202,12 +1250,20 @@ fn emit_launch(
     win: Option<Win>,
     depth_active: bool,
 ) {
+    // THIS STATEMENT's sliding window, `-1` for none. An attention
+    // dispatch carries it in its params; every other symbol carries
+    // none, and this is only read under one.
+    let window = params.first().map_or(-1, |&w| w as i32);
     // Padded head dim (Phi-3): the attention consumes the zero-padded
     // `dk` staging copies and the softmax keeps the real-dim scale —
     // all resolved AT EMISSION (the interpreter's `head_dim_padded`
     // locals become constants of this deployment's text).
     let padded = cuda.head_dim_padded;
     let q_buf = if padded { "attn_q" } else { "ws.q.data()" };
+    // The attention's DESTINATION. Padded, it is the staging buffer the
+    // stated strip then narrows -- which is the same buffer either way
+    // in this form, because the strip is a statement of its own now
+    // (2c) rather than a tail this emitter appended to every dispatch.
     let out_buf = if padded {
         "attn_out_buf"
     } else {
@@ -1221,13 +1277,10 @@ fn emit_launch(
     // The post-attention strip (padded only): the o_proj GEMM reads the
     // logical-width ws.attn_out; every attention launch's output gets
     // stripped into it — the interpreter's name-keyed strip block.
-    let strip = |b: &mut Body| {
-        if padded {
-            b.stmt("kernels::launch_strip_head_dim_bf16(");
-            b.stmt("    attn_out_buf, ws.attn_out.data(),");
-            b.stmt("    N, num_q_heads, d, dk, stream);");
-        }
-    };
+    // The post-attention strip is a STATEMENT now (2c) -- one launch
+    // after the guard chain, emitted by its own arm below -- so no
+    // dispatch appends one here.
+    let strip = |_b: &mut Body| {};
     match kernel {
         // The MLP activation, no longer a per-layer `if` in the emitted
         // file: the binding decided this at load and the trace states
@@ -1239,26 +1292,26 @@ fn emit_launch(
         // convention, character for character what the `OpKind::Swiglu`
         // emission wrote — the island moves when the down_proj that
         // reads it moves, not before.
-        "launch_chunked_swiglu_bf16" => {
-            b.stmt("kernels::launch_chunked_swiglu_bf16(");
+        "mlp::chunked_swiglu_bf16" => {
+            b.stmt("kernels::mlp::chunked_swiglu_bf16(");
             b.stmt("    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);");
         }
-        "launch_swiglu_bf16" => {
-            b.stmt("kernels::launch_swiglu_bf16(");
+        "mlp::swiglu_bf16" => {
+            b.stmt("kernels::mlp::swiglu_bf16(");
             b.stmt("    ws.gate.data(), ws.up.data(), ws.gate.data(),");
             b.stmt("    N * I, stream);");
         }
-        "launch_rope_standard_table" => {
+        "rope::rope_standard_table" => {
             b.stmt("if (ws.rope_table.empty()) {");
             b.stmt("    throw std::runtime_error(");
             b.stmt("        \"generated forward: no rope table in workspace\");");
             b.stmt("}");
-            b.stmt("kernels::launch_rope_standard_table(");
+            b.stmt("kernels::rope::rope_standard_table(");
             b.stmt("    positions,");
             b.stmt("    static_cast<float*>(ws.rope_table.data()),");
             b.stmt("    N, d, cfg.rope_theta, stream);");
         }
-        "launch_qkv_decode_qk_norm_rope_write_kv_bf16" => {
+        "attn::qkv_decode_qk_norm_rope_write_kv_bf16" => {
             assert!(
                 !padded,
                 "emitter: the fused decode epilogue requires the unpadded \
@@ -1276,7 +1329,7 @@ fn emit_launch(
             if matches!(win, Some(Win::DevPrefix)) {
                 // Device-window capture: the prefix form — the word's
                 // START is this kernel's row count.
-                b.stmt("kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(");
+                b.stmt("kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin(");
                 b.stmt("    ws.qkv_fused.data(),");
                 b.stmt("    ws.q.data(),");
                 b.stmt(&format!("    cache.k({layer}), cache.v({layer}),"));
@@ -1294,7 +1347,7 @@ fn emit_launch(
                 b.stmt("    cfg.rope_theta, eps, stream);");
                 return;
             }
-            b.stmt("kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(");
+            b.stmt("kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16(");
             b.stmt("    ws.qkv_fused.data(),");
             b.stmt("    ws.q.data(),");
             b.stmt(&format!("    cache.k({layer}), cache.v({layer}),"));
@@ -1323,12 +1376,12 @@ fn emit_launch(
             b.stmt("    cache.page_size(), cache.hnd_layout(),");
             b.stmt("    cfg.rope_theta, eps, stream);");
         }
-        "launch_write_kv_explicit_bf16" => {
+        "attn::write_kv_explicit_bf16" => {
             let layer = state.expect("kv write addresses kv state").layer;
             if matches!(win, Some(Win::DevTail)) {
                 b.stmt(&format!("{{"));
                 b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
-                b.stmt("    kernels::launch_write_kv_explicit_bf16_devwin(");
+                b.stmt("    kernels::attn::write_kv_explicit_bf16_devwin(");
                 b.stmt("        kv_view, ws.k.data(), ws.v.data(),");
                 b.stmt("        w_page_d, w_off_d,");
                 b.stmt("        peel_window_d, N, stream, row_valid_d);");
@@ -1340,19 +1393,10 @@ fn emit_launch(
                 None => ("0", "N"),
                 Some(_) => panic!("emitter: KV write in a Peel prefix region"),
             };
-            if padded {
-                // A windowed write never coincides with padding (the Peel
-                // exists only in the fused deployment, whose facts require
-                // the unpadded head dim) — same invariant as the
-                // interpreter's comment, checked at emission.
-                assert!(win.is_none(), "emitter: windowed write under padding");
-                b.stmt("kernels::launch_pad_head_dim_bf16(");
-                b.stmt("    ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);");
-                b.stmt("kernels::launch_pad_head_dim_bf16(");
-                b.stmt("    ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);");
-                b.stmt("kernels::launch_pad_head_dim_bf16(");
-                b.stmt("    ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);");
-            }
+            // The cache is at the KERNEL head dim, so a padded
+            // deployment's write reads the pads' results -- which the
+            // trace names as this statement's operands, and which this
+            // form spells as the staging buffers they land in.
             let (kbuf, vbuf) = if padded {
                 ("attn_k", "attn_v")
             } else {
@@ -1360,7 +1404,7 @@ fn emit_launch(
             };
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
-            b.stmt("    kernels::launch_write_kv_explicit_bf16(");
+            b.stmt("    kernels::attn::write_kv_explicit_bf16(");
             b.stmt("        kv_view,");
             b.stmt(&format!("        bf16_row({kbuf}, {s_}, Hk),"));
             b.stmt(&format!("        bf16_row({vbuf}, {s_}, Hk),"));
@@ -1371,17 +1415,8 @@ fn emit_launch(
             ));
             b.stmt("}");
         }
-        "launch_write_kv_to_pages" => {
+        "attn::write_kv_to_pages" => {
             let layer = state.expect("kv write addresses kv state").layer;
-            if padded {
-                assert!(win.is_none(), "emitter: windowed write under padding");
-                b.stmt("kernels::launch_pad_head_dim_bf16(");
-                b.stmt("    ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);");
-                b.stmt("kernels::launch_pad_head_dim_bf16(");
-                b.stmt("    ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);");
-                b.stmt("kernels::launch_pad_head_dim_bf16(");
-                b.stmt("    ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);");
-            }
             let kv_bufs = if padded {
                 "kv_view, attn_k, attn_v,"
             } else {
@@ -1392,7 +1427,7 @@ fn emit_launch(
                 b.stmt(&format!(
                     "    auto kv_view = cache.layer_view({layer});"
                 ));
-                b.stmt("    kernels::launch_write_kv_to_pages_bf16_devwin(");
+                b.stmt("    kernels::attn::write_kv_to_pages_bf16_devwin(");
                 b.stmt(&format!("        {kv_bufs}"));
                 b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
                 b.stmt("        kv_last_page_lens,");
@@ -1407,7 +1442,7 @@ fn emit_launch(
                 None => "0",
                 Some(_) => panic!("emitter: KV write in a Peel prefix region"),
             };
-            b.stmt("    kernels::launch_write_kv_to_pages(");
+            b.stmt("    kernels::attn::write_kv_to_pages(");
             b.stmt(&format!("        {kv_bufs}"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("        kv_last_page_lens,");
@@ -1416,11 +1451,11 @@ fn emit_launch(
             ));
             b.stmt("}");
         }
-        "launch_qk_rmsnorm_rope_bf16" => {
+        "rope::qk_rmsnorm_rope_bf16" => {
             let (q_norm, k_norm) = (&weights[0], &weights[1]);
             let (ql, _) = split_layer_weight(q_norm).expect("q_norm layer");
             if matches!(win, Some(Win::DevTail)) {
-                b.stmt("kernels::launch_qk_rmsnorm_rope_bf16_devwin(");
+                b.stmt("kernels::rope::qk_rmsnorm_rope_bf16_devwin(");
                 b.stmt("    ws.q.data(), ws.k.data(),");
                 b.stmt(&format!("    {},", require(ql, "q_norm", q_norm)));
                 b.stmt(&format!("    {},", require(ql, "k_norm", k_norm)));
@@ -1437,7 +1472,7 @@ fn emit_launch(
                     panic!("emitter: qk-norm+rope in a Peel prefix region")
                 }
             };
-            b.stmt("kernels::launch_qk_rmsnorm_rope_bf16(");
+            b.stmt("kernels::rope::qk_rmsnorm_rope_bf16(");
             b.stmt(&format!("    bf16_row(ws.q.data(), {s_}, Hq),"));
             b.stmt(&format!("    bf16_row(ws.k.data(), {s_}, Hk),"));
             b.stmt(&format!("    {},", require(ql, "q_norm", q_norm)));
@@ -1446,7 +1481,7 @@ fn emit_launch(
             b.stmt("    num_q_heads, num_kv_heads, d,");
             b.stmt("    cfg.rope_theta, eps, stream);");
         }
-        "launch_attention_xqa_decode_bf16_prepared" => {
+        "attn::attention_xqa_decode_bf16_prepared" => {
             assert!(
                 !padded,
                 "emitter: XQA with a padded head dim has no deployment and \
@@ -1458,15 +1493,15 @@ fn emit_launch(
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
-            b.stmt("    ops::launch_attention_xqa_decode_bf16_prepared(");
+            b.stmt("    kernels::attn::attention_xqa_decode_bf16_prepared(");
             b.stmt("        ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,");
             b.stmt("        ws.attn_out.data(),");
             b.stmt("        R, num_q_heads, num_kv_heads, d,");
             b.stmt("        cache.page_size(), plan_state.xqa_max_pages_per_seq,");
-            b.stmt("        attn_ws, stream, /*sm_scale_override=*/-1.f);");
+            b.stmt("        attn_ws.view(), stream, /*sm_scale_override=*/-1.f);");
             b.stmt("}");
         }
-        "launch_dequant_kv_cache_layer_to_bf16_active" => {
+        "attn::dequant_kv_cache_layer_to_bf16_active" => {
             let layer = state.expect("dequant addresses kv state").layer;
             // In a mask peel's prefix region the staging covers the
             // PLAIN lanes' pages only — `kv_page_indptr_h[split]`.
@@ -1482,13 +1517,13 @@ fn emit_launch(
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
-            b.stmt("    kernels::launch_dequant_kv_cache_layer_to_bf16_active(");
+            b.stmt("    kernels::attn::dequant_kv_cache_layer_to_bf16_active(");
             b.stmt(&format!(
                 "        kv_view, kv_page_indices, {pages}, stream);"
             ));
             b.stmt("}");
         }
-        "dispatch_attention_flashinfer_prefill_bf16" => {
+        "attn::dispatch_attention_flashinfer_prefill_bf16" => {
             let layer = state.expect("attention addresses kv state").layer;
             // The class is static here: this function IS the prefill (or
             // the decode force_prefill fallback) — the plan-cache binding
@@ -1507,18 +1542,8 @@ fn emit_launch(
                     "    auto kv_view = cache.layer_view({layer});"
                 ));
                 b.stmt(&format!(
-                    "    const int layer_window_left ="
+                    "    const int layer_window_left = {window};"
                 ));
-                b.stmt(&format!(
-                    "        (!fwd_cfg.per_layer_window_left.empty() &&"
-                ));
-                b.stmt(&format!(
-                    "         {layer} < static_cast<int>(fwd_cfg.per_layer_window_left.size()))"
-                ));
-                b.stmt(&format!(
-                    "            ? fwd_cfg.per_layer_window_left[{layer}]"
-                ));
-                b.stmt("            : fwd_cfg.sliding_window;");
                 // A mask peel's prefix region: the plan-free launcher
                 // over the plain rows — pure decode, so tokens == rows
                 // == split, and every CSR's `[0, split]` head is the
@@ -1528,13 +1553,13 @@ fn emit_launch(
                 } else {
                     ("N", "R")
                 };
-                b.stmt("    ops::launch_attention_flashinfer_prefill(");
+                b.stmt("    kernels::attn::attention_flashinfer_prefill(");
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
                 b.stmt("        kv_last_page_lens,");
                 b.stmt("        qo_indptr_h, kv_page_indptr_h,");
                 b.stmt(&format!(
-                    "        {n_rows}, {n_reqs}, num_q_heads, attn_ws, stream,"
+                    "        {n_rows}, {n_reqs}, num_q_heads, attn_ws.view(), stream,"
                 ));
                 b.stmt("        layer_window_left,");
                 b.stmt("        /*logits_soft_cap=*/0.f,");
@@ -1552,7 +1577,7 @@ fn emit_launch(
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
-            b.stmt("    ops::dispatch_attention_flashinfer_prefill_bf16(");
+            b.stmt("    kernels::attn::dispatch_attention_flashinfer_prefill_bf16(");
             b.stmt(&format!("        *{plan_cache},"));
             b.stmt(&format!(
                 "        {q_buf}, kv_view.k_bf16_pages, kv_view.v_bf16_pages,"
@@ -1560,7 +1585,7 @@ fn emit_launch(
             b.stmt(&format!("        {out_buf},"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("        kv_last_page_lens,");
-            b.stmt("        attn_ws, stream, /*logits_soft_cap=*/0.f,");
+            b.stmt("        attn_ws.view(), stream, /*logits_soft_cap=*/0.f,");
             b.stmt(&format!("        {scale});"));
             if win == Some(Win::MaskPrefix) {
                 // NO-DEMOTION (3-way, generated leg): when prepare armed
@@ -1572,16 +1597,8 @@ fn emit_launch(
                 b.stmt("        const int mid_P = plan_state.mixed_mid_start;");
                 b.stmt("        const int mid_row =");
                 b.stmt("            static_cast<int>(qo_indptr_h[mid_P]);");
-                b.stmt("        const int mid_wl =");
-                b.stmt("            (!fwd_cfg.per_layer_window_left.empty() &&");
-                b.stmt(&format!(
-                    "             {layer} < static_cast<int>(fwd_cfg.per_layer_window_left.size()))"
-                ));
-                b.stmt(&format!(
-                    "                ? fwd_cfg.per_layer_window_left[{layer}]"
-                ));
-                b.stmt("                : fwd_cfg.sliding_window;");
-                b.stmt("        ops::dispatch_attention_flashinfer_decode(");
+                b.stmt(&format!("        const int mid_wl = {window};"));
+                b.stmt("        kernels::attn::dispatch_attention_flashinfer_decode(");
                 b.stmt("            *plan_state.mixed_mid_decode_plan,");
                 b.stmt(&format!(
                     "            bf16_row({q_buf}, mid_row, Hq), kv_view,"
@@ -1592,7 +1609,7 @@ fn emit_launch(
                 b.stmt("            kv_page_indices,");
                 b.stmt("            kv_page_indptr + mid_P,");
                 b.stmt("            kv_last_page_lens + mid_P,");
-                b.stmt("            attn_ws, stream, mid_wl,");
+                b.stmt("            attn_ws.view(), stream, mid_wl,");
                 b.stmt(&format!(
                     "            /*logits_soft_cap=*/0.f, {scale});"
                 ));
@@ -1601,7 +1618,7 @@ fn emit_launch(
             strip(b);
             b.stmt("}");
         }
-        "dispatch_attention_flashinfer_decode" => {
+        "attn::dispatch_attention_flashinfer_decode" => {
             let layer = state.expect("attention addresses kv state").layer;
             if win == Some(Win::MaskPrefix) {
                 // The UnmaskedPrefix peel's PREFIX region (NS-4/AC-4):
@@ -1621,24 +1638,14 @@ fn emit_launch(
                     "    auto kv_view = cache.layer_view({layer});"
                 ));
                 b.stmt(&format!(
-                    "    const int layer_window_left ="
+                    "    const int layer_window_left = {window};"
                 ));
-                b.stmt(&format!(
-                    "        (!fwd_cfg.per_layer_window_left.empty() &&"
-                ));
-                b.stmt(&format!(
-                    "         {layer} < static_cast<int>(fwd_cfg.per_layer_window_left.size()))"
-                ));
-                b.stmt(&format!(
-                    "            ? fwd_cfg.per_layer_window_left[{layer}]"
-                ));
-                b.stmt("            : fwd_cfg.sliding_window;");
-                b.stmt("    ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode(");
                 b.stmt("        *plan_state.decode_plan,");
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        attn_page_indices, attn_page_indptr,");
                 b.stmt("        attn_last_page_lens,");
-                b.stmt("        attn_ws, stream, layer_window_left,");
+                b.stmt("        attn_ws.view(), stream, layer_window_left,");
                 b.stmt(&format!(
                     "        /*logits_soft_cap=*/0.f, {scale});"
                 ));
@@ -1647,9 +1654,9 @@ fn emit_launch(
                 return;
             }
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
-            // Per-layer window resolution is RUNTIME cfg reads
-            // (per_layer_window_left / sliding_window) — placement-
-            // independent, so post-norm deployments emit it unchanged.
+            // The window is a CONSTANT of this text now: the statement
+            // carries it, so the emitted body spells the number rather
+            // than re-reading `fwd_cfg.per_layer_window_left` per launch.
             if depth_active
                 && op.layer.is_some()
                 && model_compiler::kernels::sig(kernel).is_some_and(|k| k.depth_prefix_plan)
@@ -1658,7 +1665,7 @@ fn emit_launch(
                 // on union tail layers (migration step 5: the fact left
                 // the per-op wire word and joined the kernel table,
                 // where it was always a property of).
-                b.stmt("const ops::DecodePlanCache* depth_dp = band_j >= 0");
+                b.stmt("const kernels::attn::DecodePlanCache* depth_dp = band_j >= 0");
                 b.stmt("    ? plan_state.depth_band_plans[band_j].get()");
                 b.stmt("    : depth_tail");
                 b.stmt("    ? plan_state.depth_prefix_decode_plan.get()");
@@ -1679,37 +1686,27 @@ fn emit_launch(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
             b.stmt(&format!(
-                "    const int layer_window_left ="
-            ));
-            b.stmt(&format!(
-                "        (!fwd_cfg.per_layer_window_left.empty() &&"
-            ));
-            b.stmt(&format!(
-                "         {layer} < static_cast<int>(fwd_cfg.per_layer_window_left.size()))"
-            ));
-            b.stmt(&format!(
-                "            ? fwd_cfg.per_layer_window_left[{layer}]"
-            ));
-            b.stmt("            : fwd_cfg.sliding_window;");
+                    "    const int layer_window_left = {window};"
+                ));
             if depth_active {
-                b.stmt("    ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode(");
                 b.stmt("        *depth_dp,");
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        attn_page_indices, attn_page_indptr,");
                 b.stmt("        attn_last_page_lens,");
-                b.stmt("        band_j >= 0 ? depth_band_attn_ws_public(band_j)");
-                b.stmt("        : depth_tail ? spatial_suffix_attn_ws() : attn_ws,");
+                b.stmt("        (band_j >= 0 ? depth_band_attn_ws_public(band_j)");
+                b.stmt("         : depth_tail ? spatial_suffix_attn_ws() : attn_ws).view(),");
                 b.stmt("        stream, layer_window_left,");
                 b.stmt(&format!(
                     "        /*logits_soft_cap=*/0.f, {scale});"
                 ));
             } else {
-                b.stmt("    ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode(");
                 b.stmt("        *plan_state.decode_plan,");
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        attn_page_indices, attn_page_indptr,");
                 b.stmt("        attn_last_page_lens,");
-                b.stmt("        attn_ws, stream, layer_window_left,");
+                b.stmt("        attn_ws.view(), stream, layer_window_left,");
                 b.stmt(&format!(
                     "        /*logits_soft_cap=*/0.f, {scale});"
                 ));
@@ -1717,7 +1714,7 @@ fn emit_launch(
             strip(b);
             b.stmt("}");
         }
-        "dispatch_attention_flashinfer_prefill_custom" => {
+        "attn::dispatch_attention_flashinfer_prefill_custom" => {
             // The custom-mask arm (A1): the custom dispatch takes the
             // layer view whole (no dequant), and the mask data rides as
             // runtime args of the stated kernel — the interpreter's
@@ -1759,8 +1756,8 @@ fn emit_launch(
                     // the mixed/prefill class into the dedicated
                     // suffix workspace (its prefix causal plan owns
                     // attn_ws).
-                    let ws = "spatial_suffix_attn_ws()";
-                    b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
+                    let ws = "spatial_suffix_attn_ws().view()";
+                    b.stmt("    kernels::attn::dispatch_attention_flashinfer_prefill_custom(");
                     b.stmt(&format!("        *{plan_cache},"));
                     b.stmt(&format!(
                         "        bf16_row({q_buf}, split_rows, Hq), kv_view,"
@@ -1779,12 +1776,12 @@ fn emit_launch(
                 // fires, padded/XQA deployments) and the peel's
                 // UNPLANNED endpoint alike.
                 None => {
-                    b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
+                    b.stmt("    kernels::attn::dispatch_attention_flashinfer_prefill_custom(");
                     b.stmt(&format!("        *{plan_cache},"));
                     b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                     b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
                     b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
-                    b.stmt("        attn_ws, stream);");
+                    b.stmt("        attn_ws.view(), stream);");
                 }
                 Some(_) => panic!(
                     "emitter: the custom dispatch in a foreign peel region"
@@ -1815,7 +1812,7 @@ fn emit_launch(
             b.stmt("    H, Hq, Hk,");
             b.stmt("    ws.q.data(), ws.v.data(), ws.gate.data());");
         }
-        "dispatch_attention_flashinfer_decode_capture" => {
+        "attn::dispatch_attention_flashinfer_decode_capture" => {
             // The interpreter's capture-decode handler, layer constant.
             let layer = state.expect("attention addresses kv state").layer;
             b.stmt("if (!plan_state.decode_plan) {");
@@ -1830,12 +1827,12 @@ fn emit_launch(
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
-            b.stmt("    ops::dispatch_attention_flashinfer_decode_capture(");
+            b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode_capture(");
             b.stmt("        *plan_state.decode_plan,");
             b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
             b.stmt("        attn_page_indices, attn_page_indptr,");
             b.stmt("        attn_last_page_lens,");
-            b.stmt("        attn_ws, stream,");
+            b.stmt("        attn_ws.view(), stream,");
             b.stmt("        score_capture->raw(), score_capture->indptr_d(),");
             b.stmt("        /*window_left=*/-1,");
             b.stmt(&format!(
@@ -1847,7 +1844,7 @@ fn emit_launch(
             strip(b);
             b.stmt("}");
         }
-        "dispatch_attention_flashinfer_prefill_capture_bf16" => {
+        "attn::dispatch_attention_flashinfer_prefill_capture_bf16" => {
             let layer = state.expect("attention addresses kv state").layer;
             let plan_cache = if is_decode {
                 "plan_state.prefill_decode_plan"
@@ -1867,14 +1864,14 @@ fn emit_launch(
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/false);
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
-            b.stmt("    ops::dispatch_attention_flashinfer_prefill_capture_bf16(");
+            b.stmt("    kernels::attn::dispatch_attention_flashinfer_prefill_capture_bf16(");
             b.stmt(&format!("        *{plan_cache},"));
             b.stmt(&format!(
                 "        {q_buf}, kv_view.k_bf16_pages, kv_view.v_bf16_pages,"
             ));
             b.stmt(&format!("        {out_buf},"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
-            b.stmt("        kv_last_page_lens, attn_ws, stream,");
+            b.stmt("        kv_last_page_lens, attn_ws.view(), stream,");
             b.stmt("        prefill_score_capture->raw(),");
             b.stmt("        prefill_score_capture->folded(),");
             b.stmt("        prefill_score_capture->indptr_d(),");
@@ -1886,6 +1883,77 @@ fn emit_launch(
             strip(b);
             b.stmt("}");
         }
+        // The head-dim STAGING (2c). Three pads per layer in the order
+        // the text states them -- q, k, v -- and the cursor is what
+        // binds each to its buffer; see `Body::pad_stage`.
+        "attn::pad_head_dim_bf16" => {
+            let (src, dst, heads) = match b.pad_stage % 3 {
+                0 => ("ws.q.data()", "attn_q", "num_q_heads"),
+                1 => ("ws.k.data()", "attn_k", "num_kv_heads"),
+                _ => ("ws.v.data()", "attn_v", "num_kv_heads"),
+            };
+            b.pad_stage += 1;
+            b.stmt("kernels::attn::pad_head_dim_bf16(");
+            b.stmt(&format!("    {src}, {dst}, N, {heads}, d, dk, stream);"));
+        }
+        // The narrowing, after the guard chain. Its destination is the
+        // logical-width `ws.attn_out` that `o_proj` reads -- the same
+        // place an unpadded fire's attention lands directly, which is
+        // why the projection reads one buffer either way.
+        "attn::strip_head_dim_bf16" => {
+            b.stmt("kernels::attn::strip_head_dim_bf16(");
+            b.stmt("    attn_out_buf, ws.attn_out.data(),");
+            b.stmt("    N, num_q_heads, d, dk, stream);");
+        }
+        // The ROTATION, now that `cuda::rope` names it. Same body the
+        // semantic `OpKind::Rope` arm held, minus its two asserts: the
+        // symbol is the assert.
+        "rope::rope_bf16" => {
+            b.stmt("kernels::rope::rope_bf16(");
+            b.stmt("    ws.q.data(), ws.k.data(), positions,");
+            b.stmt("    N, num_q_heads, num_kv_heads, d,");
+            b.stmt("    cfg.rope_theta, stream);");
+        }
+        // The partial one, whose width the STATEMENT carries.
+        "rope::rope_partial_bf16" => {
+            let rotary = params
+                .first()
+                .expect("a partial rotation states its rotary width");
+            b.stmt("kernels::rope::rope_partial_bf16(");
+            b.stmt("    ws.q.data(), ws.k.data(), positions,");
+            b.stmt("    N, num_q_heads, num_kv_heads, d,");
+            b.stmt(&format!("    {rotary}, cfg.rope_theta, stream);"));
+        }
+        // The ROW norms, now that `cuda::rmsnorm` states which fold it
+        // runs. Same body as the semantic kind's — see `emit_row_norm`.
+        "norm::rmsnorm_bf16" | "norm::rmsnorm_gemma_bf16" => {
+            let weight = weights
+                .first()
+                .expect("a stated row norm names its weight");
+            emit_row_norm(b, facts, weight);
+        }
+        // The WEIGHT REPRESENTATION axis. The interpreter binds these
+        // through `declared::arm_scaled_matmul`, which reads its
+        // operands off the plan; the GENERATED form spells kernel calls
+        // against `w.layers[l].<field>` and would need a per-field map
+        // from the projection to its quant member and its two workspace
+        // buffers — the same table the semantic `Matmul` arms above
+        // spell by hand, written a second time.
+        //
+        // No emission target is quantized (every fixture in
+        // `bin/emit-cuda.rs` is a BF16 checkpoint) and none can become
+        // one silently: `proj_repr` is in the digest, so a quantized
+        // deployment matches no generated TU and takes the interpreter,
+        // which does state these. So this is a gap in RUNG 3 only, and
+        // it is named rather than left to the catch-all below.
+        "gemm::act_x_wt_tensor_scaled"
+        | "gemm::act_x_wt_channel_scaled"
+        | "gemm::act_x_wt_grouped_scaled"
+        | "gemm::act_x_wt_mxfp4_marlin" => panic!(
+            "emitter: {kernel} — the static form has no scaled-projection \
+             spelling yet; this deployment's digest carries its repr, so \
+             it runs on the interpreter"
+        ),
         other => panic!("emitter: stated kernel {other} out of scope"),
     }
 }

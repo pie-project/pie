@@ -16,6 +16,8 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "../../mtl4_context.hpp"
+#include "pie/kernels/norm.h"
+#include "pie/kernels/attn.h"
 #include "../shared_kernels.hpp"
 #include "geometry.hpp"
 
@@ -144,27 +146,15 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir,
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
 
-/// `vnorm_single_row`: one threadgroup per row, the row's width in threads,
-/// four elements each — the same shape `rms_single_row` uses.
-inline void vnorm_dispatch(int rows, int axis, Grid& g, Threadgroup& tg) {
-    constexpr int kNReads = 4;
-    const int threads = (axis + kNReads - 1) / kNReads;
-    g = Grid{std::uint32_t(threads) * std::uint32_t(rows > 0 ? rows : 1), 1, 1};
-    tg = Threadgroup{std::uint32_t(threads), 1, 1};
-}
+using pie::kernels::norm::vnorm_dispatch;
 
-/// Sliding-window decode attention: one threadgroup per query head, as
-/// `sdpa_vector` does, with BN=32/BD=32 inside.
-/// One threadgroup of 1024 threads per (head, query row).
-///
-/// The grid is in THREADS -- `StepEncoder::dispatch` calls `dispatchThreads` --
-/// so the head count multiplies the threadgroup width rather than standing alone.
-/// Writing it the other way launches `n_q_heads` threads TOTAL, which is not an
-/// error the hardware reports: the kernel's simd reductions just read lanes that
-/// were never dispatched.
-inline void sdpa_sliding_dispatch(int n_q_heads, Grid& g, Threadgroup& tg, int rows = 1) {
-    g = Grid{std::uint32_t(n_q_heads) * 1024, std::uint32_t(rows < 1 ? 1 : rows), 1};
-    tg = Threadgroup{1024, 1, 1};
+/// Sliding-window decode attention takes the SAME shape as every other
+/// `sdpa_vector` form -- one threadgroup of 1024 per (head, query row) -- which
+/// is why it is a name for the shared one rather than a body. See
+/// `pie/kernels/attn.h`.
+inline void sdpa_sliding_dispatch(int n_q_heads, Grid& g, Threadgroup& tg,
+                                  int rows = 1) {
+    pie::kernels::attn::sdpa_dispatch(n_q_heads, g, tg, rows);
 }
 
 }  // namespace pie::metal::gemma4

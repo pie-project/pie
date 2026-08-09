@@ -298,6 +298,10 @@ class ForwardPlan {
     /// `Launch` only: the weight names the stated kernel consumes, as NAME
     /// indices (resolve each with [`name`]), in signature order.
     IdSpan aux_names(const PieForwardOp& op) const { return ids(op.aux_names); }
+    /// A stated kernel's SCALAR arguments, in signature order — raw
+    /// values, not name indices (`PieForwardOp::aux_params`). Empty for
+    /// a statement whose symbol takes none, which is most of them.
+    IdSpan aux_params(const PieForwardOp& op) const { return ids(op.aux_params); }
 
     /// A name-table entry as a view into the plan's blob; valid for the
     /// plan's lifetime (the strings are not NUL-terminated — see

@@ -15,9 +15,11 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "kernels/dequant_fp8.hpp"
-#include "kernels/quant_bf16_to_mxfp4.hpp"
-#include "kernels/transcode.hpp"
+#include "quant/dequant_fp8.hpp"
+#include "quant/quant_bf16_to_mxfp4.hpp"
+#include "quant/transcode.hpp"
+
+namespace kernels = pie_cuda_driver::kernels;
 
 namespace {
 
@@ -95,18 +97,18 @@ void run_fp8(int rows, int cols, int gs) {
 
     void* d_bf16 = nullptr;
     CUDA_CHECK(cudaMalloc(&d_bf16, n * 2));
-    K::launch_dequant_fp8_e4m3_to_bf16_per_group(d_fp8, d_bf16, d_scale, rows, cols, gs, 0);
+    kernels::quant::dequant_fp8_e4m3_to_bf16_per_group(d_fp8, d_bf16, d_scale, rows, cols, gs, 0);
     std::uint8_t* d_pr = nullptr; std::uint8_t* d_sr = nullptr;
     CUDA_CHECK(cudaMalloc(&d_pr, n / 2)); CUDA_CHECK(cudaMalloc(&d_sr, n / 32));
-    K::quantize_bf16_to_mxfp4_e2m1_per_block(d_bf16, d_pr, d_sr, rows, cols, 0);
+    K::quant::quantize_bf16_to_mxfp4_e2m1_per_block(d_bf16, d_pr, d_sr, rows, cols, 0);
 
     std::uint8_t* d_pf = nullptr; std::uint8_t* d_sf = nullptr;
     CUDA_CHECK(cudaMalloc(&d_pf, n / 2)); CUDA_CHECK(cudaMalloc(&d_sf, n / 32));
-    K::TranscodeParams p;
+    K::quant::TranscodeParams p;
     p.src = d_fp8; p.src_scale = d_scale; p.src_group_size = gs;
     p.dst_packed = d_pf; p.dst_scale = d_sf; p.rows = rows; p.cols = cols;
-    K::launch_transcode(K::TranscodeSource::Fp8E4m3PerGroup,
-                        K::TranscodeTarget::Mxfp4E2m1E8m0, p, 0);
+    K::quant::launch_transcode(K::quant::TranscodeSource::Fp8E4m3PerGroup,
+                        K::quant::TranscodeTarget::Mxfp4E2m1E8m0, p, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     compare("fp8->mxfp4", rows, cols, d_pr, d_sr, d_pf, d_sf);
@@ -129,14 +131,14 @@ void run_bf16(int rows, int cols) {
 
     std::uint8_t* d_pr = nullptr; std::uint8_t* d_sr = nullptr;
     CUDA_CHECK(cudaMalloc(&d_pr, n / 2)); CUDA_CHECK(cudaMalloc(&d_sr, n / 32));
-    K::quantize_bf16_to_mxfp4_e2m1_per_block(d_bf16, d_pr, d_sr, rows, cols, 0);
+    K::quant::quantize_bf16_to_mxfp4_e2m1_per_block(d_bf16, d_pr, d_sr, rows, cols, 0);
 
     std::uint8_t* d_pf = nullptr; std::uint8_t* d_sf = nullptr;
     CUDA_CHECK(cudaMalloc(&d_pf, n / 2)); CUDA_CHECK(cudaMalloc(&d_sf, n / 32));
-    K::TranscodeParams p;
+    K::quant::TranscodeParams p;
     p.src = d_bf16; p.dst_packed = d_pf; p.dst_scale = d_sf; p.rows = rows; p.cols = cols;
-    K::launch_transcode(K::TranscodeSource::Bf16,
-                        K::TranscodeTarget::Mxfp4E2m1E8m0, p, 0);
+    K::quant::launch_transcode(K::quant::TranscodeSource::Bf16,
+                        K::quant::TranscodeTarget::Mxfp4E2m1E8m0, p, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     compare("bf16->mxfp4", rows, cols, d_pr, d_sr, d_pf, d_sf);
@@ -174,7 +176,7 @@ void run_fp8_blocked(int rows, int cols, int row_block, int col_block) {
     const std::size_t n = static_cast<std::size_t>(rows) * cols;
     void* d_bf16 = nullptr;
     CUDA_CHECK(cudaMalloc(&d_bf16, n * 2));
-    K::launch_dequant_fp8_e4m3_to_bf16_blocked(
+    kernels::quant::dequant_fp8_e4m3_to_bf16_blocked(
         d_fp8, d_bf16, d_scale, rows, cols, row_block, col_block, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
 

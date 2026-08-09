@@ -35,14 +35,14 @@
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
 #include <cuda_runtime.h>
 #include "cuda_check.hpp"
-#include "kernels/dtype_cast.hpp"
-#include "kernels/mxfp4_marlin.hpp"
-#include "kernels/dequant_fp4.hpp"
-#include "kernels/dequant_wna16.hpp"
-#include "kernels/dequant_fp8.hpp"
-#include "kernels/quant_bf16_to_fp8.hpp"
-#include "kernels/quant_bf16_to_mxfp4.hpp"
-#include "kernels/transcode.hpp"
+#include "quant/dtype_cast.hpp"
+#include "quant/mxfp4_marlin.hpp"
+#include "quant/dequant_fp4.hpp"
+#include "quant/dequant_wna16.hpp"
+#include "quant/dequant_fp8.hpp"
+#include "quant/quant_bf16_to_fp8.hpp"
+#include "quant/quant_bf16_to_mxfp4.hpp"
+#include "quant/transcode.hpp"
 #ifdef PIE_CUDA_HAS_MARLIN
 #include "marlin_wrapper.hpp"
 #endif
@@ -133,16 +133,16 @@ private:
                 cudaMemcpyDeviceToDevice,
                 /*stream=*/0));
         } else if (src.dtype() == DType::FP16 && dst_dtype == DType::BF16) {
-            kernels::launch_cast_fp16_to_bf16(
+            kernels::quant::cast_fp16_to_bf16(
                 src.data(), dst, src.numel(), /*stream=*/0);
         } else if (src.dtype() == DType::FP32 && dst_dtype == DType::BF16) {
-            kernels::launch_cast_fp32_to_bf16(
+            kernels::quant::cast_fp32_to_bf16(
                 src.data(), dst, src.numel(), /*stream=*/0);
         } else if (src.dtype() == DType::BF16 && dst_dtype == DType::FP32) {
-            kernels::launch_cast_bf16_to_fp32(
+            kernels::quant::cast_bf16_to_fp32(
                 src.data(), dst, src.numel(), /*stream=*/0);
         } else if (src.dtype() == DType::E8M0 && dst_dtype == DType::FP32) {
-            kernels::launch_cast_e8m0_to_fp32(
+            kernels::quant::cast_e8m0_to_fp32(
                 src.data(), dst, src.numel(), /*stream=*/0);
         } else {
             throw std::runtime_error(
@@ -232,13 +232,13 @@ private:
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
         switch (src.dtype()) {
         case DType::BF16:
-            kernels::launch_scale_bf16(src.data(), dst, src.numel(), factor, /*stream=*/0);
+            kernels::quant::scale_bf16(src.data(), dst, src.numel(), factor, /*stream=*/0);
             return;
         case DType::FP32:
-            kernels::launch_scale_fp32(src.data(), dst, src.numel(), factor, /*stream=*/0);
+            kernels::quant::scale_fp32(src.data(), dst, src.numel(), factor, /*stream=*/0);
             return;
         case DType::FP16:
-            kernels::launch_scale_fp16(src.data(), dst, src.numel(), factor, /*stream=*/0);
+            kernels::quant::scale_fp16(src.data(), dst, src.numel(), factor, /*stream=*/0);
             return;
         default:
             throw std::runtime_error(
@@ -423,7 +423,7 @@ private:
             instr, source, fp8 ? rows * cols : rows * cols / 2);
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
         if (mxfp4) {
-            kernels::launch_dequant_mxfp4_to_bf16(
+            kernels::quant::dequant_mxfp4_to_bf16(
                 static_cast<const std::uint8_t*>(scratch.data()),
                 static_cast<const std::uint8_t*>(factors.data()),
                 dst,
@@ -431,7 +431,7 @@ private:
                 static_cast<int>(cols),
                 /*stream=*/0);
         } else if (fp8) {
-            kernels::launch_dequant_fp8_e4m3_to_bf16_blocked(
+            kernels::quant::dequant_fp8_e4m3_to_bf16_blocked(
                 static_cast<const std::uint8_t*>(scratch.data()),
                 dst,
                 static_cast<const float*>(factors.data()),
@@ -446,7 +446,7 @@ private:
             // source already holds, so the reinterpret is a type change and
             // not a repack -- but it does require the row to be a multiple of
             // eight elements, which a group of 32 already guarantees.
-            kernels::launch_dequant_wna16_int4b8_to_bf16(
+            kernels::quant::dequant_wna16_int4b8_to_bf16(
                 static_cast<const std::int32_t*>(scratch.data()),
                 factors.data(),
                 dst,
@@ -874,7 +874,7 @@ private:
         // The FP8 source tile is enqueued on stream 0 by
         // acquire_encode_source_tile, so this dequant (also stream 0) sees
         // those bytes via implicit stream ordering — no flush needed.
-        kernels::launch_dequant_fp8_e4m3_to_bf16_per_group(
+        kernels::quant::dequant_fp8_e4m3_to_bf16_per_group(
             static_cast<const std::uint8_t*>(fp8_tile.data()),
             fp8_bf16_scratch_ptr_,
             s.scale_dev,
@@ -902,7 +902,7 @@ private:
         std::uint8_t* scale_dst)
     {
         const Fp8TileScale s = fp8_tile_scale(instr, source, full_shape, row_start, rows);
-        kernels::TranscodeParams p;
+        kernels::quant::TranscodeParams p;
         p.src = fp8_tile.data();
         p.src_scale = s.scale_dev;
         p.src_group_size = s.group_size;
@@ -910,9 +910,9 @@ private:
         p.dst_scale = scale_dst;
         p.rows = rows;
         p.cols = s.local_cols;
-        kernels::launch_transcode(
-            kernels::TranscodeSource::Fp8E4m3PerGroup,
-            kernels::TranscodeTarget::Mxfp4E2m1E8m0, p, /*stream=*/0);
+        kernels::quant::launch_transcode(
+            kernels::quant::TranscodeSource::Fp8E4m3PerGroup,
+            kernels::quant::TranscodeTarget::Mxfp4E2m1E8m0, p, /*stream=*/0);
         CUDA_CHECK(cudaGetLastError());
     }
 #endif
@@ -950,7 +950,7 @@ private:
                 throw std::runtime_error(
                     "rust storage executor: FP8 Encode output dtype mismatch");
             }
-            kernels::quantize_bf16_to_fp8_e4m3_per_channel(
+            kernels::quant::quantize_bf16_to_fp8_e4m3_per_channel(
                 bf16.data(),
                 static_cast<std::uint8_t*>(out.data()) +
                     static_cast<std::uint64_t>(row_start) *
@@ -966,7 +966,7 @@ private:
                 throw std::runtime_error(
                     "rust storage executor: INT8 Encode output dtype mismatch");
             }
-            kernels::quantize_bf16_to_int8_per_channel(
+            kernels::quant::quantize_bf16_to_int8_per_channel(
                 bf16.data(),
                 static_cast<std::int8_t*>(out.data()) +
                     static_cast<std::uint64_t>(row_start) *
@@ -1003,7 +1003,7 @@ private:
             std::uint8_t* scale_dst =
                 static_cast<std::uint8_t*>(scale.data()) +
                 static_cast<std::uint64_t>(row_start) * scale_row_bytes;
-            kernels::quantize_bf16_to_mxfp4_e2m1_per_block(
+            kernels::quant::quantize_bf16_to_mxfp4_e2m1_per_block(
                 bf16.data(),
                 packed_dst,
                 scale_dst,
@@ -1325,12 +1325,12 @@ private:
                 src_base + static_cast<std::uint64_t>(b) * source_bytes;
             auto* dst =
                 dst_base + static_cast<std::uint64_t>(b) * target_bytes;
-            kernels::launch_mxfp4_weight_to_gptq_w4(
+            kernels::quant::mxfp4_weight_to_gptq_w4(
                 src, gptq_stage.data(),
                 source_rows, /*source_row_offset=*/0, target_rows,
                 /*valid_rows=*/source_rows, /*source_stride_cols=*/source_cols,
                 /*source_col_offset=*/0, source_cols, target_cols,
-                kernels::Mxfp4RowSelect::Identity, /*stream=*/0);
+                kernels::quant::Mxfp4RowSelect::Identity, /*stream=*/0);
             marlin::launch_gptq_repack_w4_no_perm(
                 gptq_stage.data(), dst, target_cols, target_rows,
                 /*stream=*/0);
@@ -1363,13 +1363,13 @@ private:
         const std::uint64_t target_bytes =
             checked_mul_u64(target_rows, target_groups, "MXFP4 scale target");
         for (int b = 0; b < batch; ++b) {
-            kernels::launch_mxfp4_scales_to_marlin_e8m0(
+            kernels::quant::mxfp4_scales_to_marlin_e8m0(
                 src_base + static_cast<std::uint64_t>(b) * source_bytes,
                 dst_base + static_cast<std::uint64_t>(b) * target_bytes,
                 source_rows, /*source_row_offset=*/0, target_rows,
                 /*valid_rows=*/source_rows, /*source_stride_groups=*/source_groups,
                 /*source_group_offset=*/0, source_groups, target_groups,
-                kernels::Mxfp4RowSelect::Identity, /*stream=*/0);
+                kernels::quant::Mxfp4RowSelect::Identity, /*stream=*/0);
         }
         CUDA_CHECK(cudaGetLastError());
     }

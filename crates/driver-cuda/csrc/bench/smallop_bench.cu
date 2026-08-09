@@ -36,8 +36,8 @@
 //   nvcc -O3 -std=c++20 -arch=sm_100 --expt-relaxed-constexpr \
 //        -I driver/cuda/src -o /tmp/smallop_bench \
 //        driver/cuda/bench/smallop_bench.cu \
-//        driver/cuda/src/kernels/rmsnorm.cu \
-//        driver/cuda/src/kernels/topk_softmax.cu
+//        driver/cuda/src/norm/rmsnorm.cu \
+//        driver/cuda/src/moe/topk_softmax.cu
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -47,10 +47,12 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "kernels/kv_paged.hpp"
-#include "kernels/rmsnorm.hpp"
-#include "kernels/rope.hpp"
-#include "kernels/topk_softmax.hpp"
+#include "attn/kv_paged.hpp"
+#include "norm/rmsnorm.hpp"
+#include "rope/rope.hpp"
+#include "moe/topk_softmax.hpp"
+
+namespace kernels = pie_cuda_driver::kernels;
 
 namespace {
 
@@ -158,7 +160,7 @@ bool verify() {
             // caches its choice in a function-local static, so flipping
             // PIE_TOPK_WARP here would run the block form twice and the
             // comparison would pass without comparing anything.
-            pie_cuda_driver::kernels::launch_topk_softmax_bf16_form(
+            pie_cuda_driver::kernels::moe::topk_softmax_bf16_form(
                 d, di[form], dw[form], rows, E, K, /*use_warp=*/form == 1,
                 nullptr);
             CHECK(cudaDeviceSynchronize());
@@ -261,14 +263,14 @@ bool bench_rope_write_kv() {
         }
         namespace K = pie_cuda_driver::kernels;
         // Reference: the two kernels the engine runs today.
-        K::launch_rope_bf16(q[0], k[0], (const std::int32_t*)dpos, f.N, f.hq,
+        kernels::rope::rope_bf16(q[0], k[0], (const std::int32_t*)dpos, f.N, f.hq,
                             f.hkv, f.d, 10000.f, nullptr);
-        K::launch_write_kv_to_pages_bf16(
+        kernels::attn::write_kv_to_pages_bf16(
             kp[0], vp[0], k[0], v, (const std::uint32_t*)dqo,
             (const std::uint32_t*)dpi, (const std::uint32_t*)dpp,
             (const std::uint32_t*)dll, f.N, f.R, f.page_size, f.hkv, f.d,
             f.hnd, nullptr, nullptr);
-        K::launch_rope_write_kv_bf16(
+        kernels::rope::rope_write_kv_bf16(
             q[1], k[1], v, (const std::int32_t*)dpos, kp[1], vp[1],
             (const std::uint32_t*)dqo, (const std::uint32_t*)dpi,
             (const std::uint32_t*)dpp, (const std::uint32_t*)dll, nullptr,
@@ -295,16 +297,16 @@ bool bench_rope_write_kv() {
 
         if (bad == 0 && f.N == 1 && !f.hnd && f.d == 64) {
             bench("  rope + write_kv (2 kernels)", [&](cudaStream_t st) {
-                K::launch_rope_bf16(q[0], k[0], (const std::int32_t*)dpos, f.N,
+                kernels::rope::rope_bf16(q[0], k[0], (const std::int32_t*)dpos, f.N,
                                     f.hq, f.hkv, f.d, 10000.f, st);
-                K::launch_write_kv_to_pages_bf16(
+                kernels::attn::write_kv_to_pages_bf16(
                     kp[0], vp[0], k[0], v, (const std::uint32_t*)dqo,
                     (const std::uint32_t*)dpi, (const std::uint32_t*)dpp,
                     (const std::uint32_t*)dll, f.N, f.R, f.page_size, f.hkv,
                     f.d, f.hnd, st, nullptr);
             });
             bench("  rope_write_kv (fused)", [&](cudaStream_t st) {
-                K::launch_rope_write_kv_bf16(
+                kernels::rope::rope_write_kv_bf16(
                     q[1], k[1], v, (const std::int32_t*)dpos, kp[1], vp[1],
                     (const std::uint32_t*)dqo, (const std::uint32_t*)dpi,
                     (const std::uint32_t*)dpp, (const std::uint32_t*)dll,
@@ -350,13 +352,13 @@ int main() {
           [](cudaStream_t s) { empty_kernel<<<49, 128, 0, s>>>(); });
 
     bench("rmsnorm_bf16", [&](cudaStream_t s) {
-        pie_cuda_driver::kernels::launch_rmsnorm_bf16(x, w, y, N, H, 1e-6f, s);
+        pie_cuda_driver::kernels::norm::rmsnorm_bf16(x, w, y, N, H, 1e-6f, s);
     });
     // pie runs a separate bf16_to_fp16_kernel once per layer (42 us/step).
     // This variant already folds that copy into the norm; if it costs the
     // same as the plain one, that whole kernel is deletable.
     bench("rmsnorm_bf16_with_fp16 (fused cast)", [&](cudaStream_t s) {
-        pie_cuda_driver::kernels::launch_rmsnorm_bf16_with_fp16(
+        pie_cuda_driver::kernels::norm::rmsnorm_bf16_with_fp16(
             x, w, y, yf, N, H, 1e-6f, s);
     });
     // The warp form must pick the SAME experts as the block form. A routing
@@ -368,29 +370,29 @@ int main() {
         return 1;
     }
     bench("topk_softmax (block, old)", [&](cudaStream_t s) {
-        pie_cuda_driver::kernels::launch_topk_softmax_bf16_form(
+        pie_cuda_driver::kernels::moe::topk_softmax_bf16_form(
             logits, idx, wt, N, E, K, /*use_warp=*/false, s);
     });
     bench("topk_softmax (warp, new)", [&](cudaStream_t s) {
-        pie_cuda_driver::kernels::launch_topk_softmax_bf16_form(
+        pie_cuda_driver::kernels::moe::topk_softmax_bf16_form(
             logits, idx, wt, N, E, K, /*use_warp=*/true, s);
     });
     // Qwen3.6-35B-A3B and gemma-4-26B-A4B route through bigger expert pools,
     // where the block form had more parallelism to lose.
     bench("topk_softmax E=256 K=8 (block)", [&](cudaStream_t s) {
-        pie_cuda_driver::kernels::launch_topk_softmax_bf16_form(
+        pie_cuda_driver::kernels::moe::topk_softmax_bf16_form(
             big_logits, idx, wt, N, 256, 8, /*use_warp=*/false, s);
     });
     bench("topk_softmax E=256 K=8 (warp)", [&](cudaStream_t s) {
-        pie_cuda_driver::kernels::launch_topk_softmax_bf16_form(
+        pie_cuda_driver::kernels::moe::topk_softmax_bf16_form(
             big_logits, idx, wt, N, 256, 8, /*use_warp=*/true, s);
     });
     bench("topk_softmax E=128 K=8 (block)", [&](cudaStream_t s) {
-        pie_cuda_driver::kernels::launch_topk_softmax_bf16_form(
+        pie_cuda_driver::kernels::moe::topk_softmax_bf16_form(
             big_logits, idx, wt, N, 128, 8, /*use_warp=*/false, s);
     });
     bench("topk_softmax E=128 K=8 (warp)", [&](cudaStream_t s) {
-        pie_cuda_driver::kernels::launch_topk_softmax_bf16_form(
+        pie_cuda_driver::kernels::moe::topk_softmax_bf16_form(
             big_logits, idx, wt, N, 128, 8, /*use_warp=*/true, s);
     });
     if (!bench_rope_write_kv()) {

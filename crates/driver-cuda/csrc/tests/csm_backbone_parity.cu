@@ -5,10 +5,27 @@
 // This isolates the backbone forward from the (separately verified) depth
 // decoder + Mimi decoder.
 //
+// The 420 above is a copy. The authority is `reference.txt`, which the dump
+// script recomputes from the same weights in the same run -- so if a future
+// transformers or checkpoint revision moves the argmax, that file disagrees
+// with this comment instead of both being quietly wrong together.
+//
+//   pip install torch transformers safetensors
+//   python scripts/csm_backbone_dump.py --out /tmp/csm_bb_dump
+//
 //   export PATH=/usr/local/cuda/bin:$PATH
+//   # the two decoder TUs are required to link: csm_backbone_forward.cu calls
+//   # run_csm_depth_decoder_frame() and run_mimi_decoder(), which live there.
 //   nvcc -O2 -arch=sm_89 -std=c++17 -I crates/driver-cuda/csrc/src \
-//        crates/driver-cuda/csrc/tests/csm_backbone_parity.cu -o /tmp/cbp
+//        crates/driver-cuda/csrc/tests/csm_backbone_parity.cu \
+//        crates/driver-cuda/csrc/src/model/csm/csm_depth_decoder_forward.cu \
+//        crates/driver-cuda/csrc/src/model/csm/mimi_decoder_forward.cu -o /tmp/cbp
 //   /tmp/cbp /tmp/csm_bb_dump
+//
+// Verified end to end on 2026-08-08 (L40S, sm_89, transformers 5.14.1):
+//   frame0 cb0 argmax = 420 (logit 9.3125)   [HF reference = 420]  PASS
+// The logit differs from HF's 9.375 by bf16 rounding; the argmax is what is
+// being asserted.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -73,7 +90,15 @@ int main(int argc, char** argv) {
     const int QD = NH * hd, KD = KV * hd, AV = w.audio_vocab;
     const int maxL = n_prompt + 4;
     auto MAL = [&](long n){ BF* d; HCK(cudaMalloc(&d, n * sizeof(BF))); return d; };
-    BBScratch s; s.hidden=H; s.NH=NH; s.KV=KV; s.hd=hd; s.QD=QD; s.KD=KD; s.inter=w.intermediate; s.maxL=maxL; s.S=0;
+    // This harness builds the scratch itself rather than calling
+    // csm_generate_audio, so every field the forward reads has to be set HERE
+    // too. `cublas` is one of them now that the projections go through
+    // `gemm::act_x_wt_bf16`: leaving it default gave an uninitialised handle
+    // and `cublasGemmEx` answered CUBLAS_STATUS_NOT_INITIALIZED on the first
+    // GEMM. A scratch that mirrors a setup by hand is a second place to keep
+    // in step; this comment is the reminder.
+    pie_cuda_driver::kernels::gemm::CublasHandle cublas(0);
+    BBScratch s; s.cublas=cublas.handle(); s.hidden=H; s.NH=NH; s.KV=KV; s.hd=hd; s.QD=QD; s.KD=KD; s.inter=w.intermediate; s.maxL=maxL; s.S=0;
     int R0 = n_prompt;
     s.resid=MAL((long)R0*H); s.normed=MAL((long)R0*H);
     s.q=MAL((long)R0*QD); s.k=MAL((long)R0*KD); s.v=MAL((long)R0*KD);

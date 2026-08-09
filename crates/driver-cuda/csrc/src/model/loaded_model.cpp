@@ -14,7 +14,7 @@
 #include "cuda_check.hpp"
 #include "kernels_manifest.hpp"
 #include "distributed.hpp"
-#include "ops/gemm.hpp"
+#include "gemm/gemm.hpp"
 #include "loader/rust_author.hpp"
 #include "loader/load_plan_executor.hpp"
 #include "model/descriptor.hpp"
@@ -164,7 +164,7 @@ LoadedModel LoadedModel::load(
             "pie.model/1 descriptor beside its startup TOML; a hand-written "
             "config must point `[model] descriptor` at one "
             "(`pie model import` writes an artifact that carries it, and "
-            "`cargo run -p pie-model-config --bin descriptor config.json` "
+            "`cargo run -p model --features config --bin descriptor config.json` "
             "compiles one from a snapshot).");
     }
     log_stage("read model descriptor begin");
@@ -572,9 +572,9 @@ std::optional<QuantMeta> LoadedModel::quant_meta(const std::string& name) const 
     return weights_.quant_meta(name);
 }
 
-ops::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engine,
+kernels::gemm::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engine,
                                                        std::size_t max_tokens) {
-    ops::RuntimeQuantScratchSpec spec;
+    kernels::gemm::RuntimeQuantScratchSpec spec;
     spec.max_tokens = max_tokens;
 
     const auto& store = engine.weight_store();

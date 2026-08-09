@@ -80,7 +80,7 @@ inline pie_loader::DeviceTarget metal_device_target() {
 ///
 /// It writes the schema's own field names, which is the only reason it is
 /// tolerable to spell a descriptor here at all: a name that drifts from
-/// `pie-model-config`'s schema stops being read rather than being read wrong,
+/// `model::config`'s schema stops being read rather than being read wrong,
 /// because `ModelFacts::from_descriptor` takes what it recognizes and leaves
 /// the rest at its default.
 inline std::string descriptor_for_testing(std::string_view model_type,

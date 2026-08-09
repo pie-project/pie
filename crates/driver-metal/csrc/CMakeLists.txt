@@ -164,6 +164,15 @@ endif()
 if(NOT PIE_KERNELS_METAL_DIR)
   set(PIE_KERNELS_METAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../kernels-metal/kernels")
 endif()
+# The host library, which is a DIFFERENT tree from the shaders: `include/` is
+# ordinary C++ this shell compiles against (launch shapes, the entrypoint name
+# grammar, the Grid PODs), `kernels/` is text the Metal runtime compiler reads.
+# Conflating them is what put a host-only header inside the runtime shader
+# search path; see .wiki/kernel-metal-refactor.md §4.
+if(NOT PIE_KERNELS_METAL_INCLUDE_DIR)
+  set(PIE_KERNELS_METAL_INCLUDE_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../kernels-metal/include")
+endif()
 
 add_library(pie_driver_metal_lib STATIC
   ${PIE_METAL_EXPLICIT_SOURCES}
@@ -182,6 +191,7 @@ target_include_directories(pie_driver_metal_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/batch
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/qwen3_5
     ${PIE_KERNELS_METAL_DIR}
+    ${PIE_KERNELS_METAL_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src/store
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loader
     # ../common/include carries the shared launch-package view headers
@@ -221,13 +231,13 @@ set_source_files_properties(src/batch/forward.cpp
 # the same default when PIE_METAL_KERNELS_DIR is unset. Installed packaging
 # of the kernels dir is a follow-up.
 #
-# ptir_rng.generated.metal is owned by tensor-compiler and staged here at configure
-# time rather than checked in twice. The host emitter now embeds the M1 runtime
-# template into every emitted MSL source itself, but the RNG preamble still
-# needs to sit beside the checked-in .metal kernels so a build-time
-# `configure_file` (below) keeps them in lockstep -- the driver splices it in
-# at compile time because Metal's runtime shader compiler does no filesystem
-# include lookup.
+# ptir_rng.generated.metal is NOT staged here. It is owned by tensor-compiler,
+# committed once under its `include/`, and copied beside the shaders by
+# `crates/kernels-metal/build.rs` -- which is where it has to sit, because
+# Metal's runtime shader compiler does no filesystem include lookup and the
+# driver's splicer resolves a quoted include against the including file's
+# directory. This file only points at the result; nothing here generates or
+# copies it, and PIE_MSL_RNG_PREAMBLE below is a path into the same directory.
 if(APPLE)
   target_compile_definitions(pie_driver_metal_lib PUBLIC
     PIE_METAL_KERNELS_DIR_DEFAULT="${PIE_KERNELS_METAL_DIR}")
@@ -332,6 +342,7 @@ if(NOT APPLE)
       -I${CMAKE_CURRENT_SOURCE_DIR}/src/batch
       -I${CMAKE_CURRENT_SOURCE_DIR}/src/model/qwen3_5
       -I${PIE_KERNELS_METAL_DIR}
+      -I${PIE_KERNELS_METAL_INCLUDE_DIR}
       -I${CMAKE_CURRENT_SOURCE_DIR}/src/store
       -I${CMAKE_CURRENT_SOURCE_DIR}/src/loader
       -I${PIE_DRIVER_INCLUDE_DIR}
@@ -613,7 +624,7 @@ if(APPLE)
     PIE_MSL_GOLDEN_DIR="${PIE_PTIR_INCLUDE_DIR}/../tests/golden-msl"
     PIE_MSL_RUNTIME_TEMPLATE="${PIE_PTIR_RUNTIME_DIR}/metal/ptir_m1_runtime.metal"
     PIE_MSL_GROUPED_PREAMBLE="${PIE_PTIR_RUNTIME_DIR}/metal/ptir_m1_grouped.metal"
-    PIE_MSL_RNG_PREAMBLE="${PIE_KERNELS_METAL_DIR}/ptir_rng.generated.metal")
+    PIE_MSL_RNG_PREAMBLE="${PIE_KERNELS_METAL_DIR}/ptir/ptir_rng.generated.metal")
   # The tests that load a real checkpoint each take a multi-gigabyte Metal heap
   # -- `gemma4_forward_test` asks for 6 GiB and `gemma4_prefill_numerics_test`
   # for 8 -- so two of them scheduled together can exhaust the device where

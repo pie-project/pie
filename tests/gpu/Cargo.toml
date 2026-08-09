@@ -23,7 +23,6 @@ doctest = false
 # handful of no-GPU diagnostics here run against.
 default = []
 driver-cuda = ["pie/driver-cuda"]
-driver-metal = ["pie/driver-metal"]
 driver-dummy = ["pie/driver-dummy"]
 
 [dev-dependencies]

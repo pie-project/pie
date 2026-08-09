@@ -2,14 +2,14 @@
 
 #include <cstdint>
 
-#include "ops/attention_workspace.hpp"
+#include "attention_workspace.hpp"
 #include "distributed.hpp"
 #include "store/dsa_cache.hpp"
 #include "store/kv_cache.hpp"
 #include "store/mla_cache.hpp"
 #include "model/glm5/glm5.hpp"
 #include "model/kimi/kimi_forward.hpp"
-#include "ops/gemm.hpp"
+#include "gemm/gemm.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::model {
@@ -107,7 +107,7 @@ void glm5_forward_paged(
     MlaCache& mla_cache,
     DsaCache& dsa_cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     void* logits_out,
     const std::int32_t* token_ids,
     const std::int32_t* positions,

@@ -5,10 +5,11 @@
 //! needs nothing per-family except a name-to-tensor map. What it still
 //! needs is an ARM per launcher symbol — the call itself.
 //!
-//! Four executors exist and between them resolve a set of symbols. Seven
-//! families were declared without one. This measures the overlap, which
-//! is the size of the remaining work and the only honest way to state it:
-//! not "seven executors to write" but "N symbols that no arm covers".
+//! ONE registry resolves a set of symbols. Seven families were declared
+//! without any arm for theirs. This measures the overlap, which is the
+//! size of the remaining work and the only honest way to state it: not
+//! "seven executors to write" -- there is one executor -- but "N symbols
+//! the registry does not resolve".
 //!
 //! It is a measurement, not a gate — it prints, and only fails if the
 //! registries stop being readable.
@@ -18,26 +19,56 @@ use model_compiler::trace::{FireClass, ForwardPlan};
 use std::collections::BTreeSet;
 
 fn arms() -> BTreeSet<String> {
-    let root = format!(
-        "{}/../driver-cuda/csrc/src/model",
+    // ONE registry now. There were four -- one per family executor --
+    // and this function read all four; the merge is what made
+    // `AttnFlashinferPrefill` naming two different kernels visible.
+    //
+    // Reading the header rather than the executors is also the more
+    // honest measure: an arm serves a symbol only if the registry
+    // resolves it, and the registry is where that is decided.
+    let path = format!(
+        "{}/../driver-cuda/csrc/src/model/declared/registry.hpp",
         env!("CARGO_MANIFEST_DIR")
     );
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     let mut out = BTreeSet::new();
-    for fam in ["llama_like", "qwen3_5", "gemma4", "mixtral"] {
-        let path = format!("{root}/{fam}/declared_forward.cpp");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
-        for (i, _) in text.match_indices("== \"") {
-            let before = &text[..i];
-            if !(before.ends_with("k ") || before.ends_with("kernel ")) {
-                continue;
-            }
-            if let Some(end) = text[i + 4..].find('"') {
-                out.insert(text[i + 4..i + 4 + end].to_string());
-            }
+    for (i, _) in text.match_indices("k == \"") {
+        if let Some(end) = text[i + 6..].find('"') {
+            out.insert(text[i + 6..i + 6 + end].to_string());
         }
     }
-    assert!(!out.is_empty(), "the registries stopped being literal compares");
+    assert!(
+        !out.is_empty(),
+        "the registry stopped being literal compares"
+    );
+
+    // AND the GENERATED dispatch, which needs no registry entry: it is
+    // keyed by the symbol the statement carries, so the enum a
+    // hand-written switch wanted never enters the path.
+    //
+    // A branch there is a STRONGER claim than a registry entry. An entry
+    // says some executor may have an arm; a branch says the shared
+    // switch fires this symbol for every family that states it, from a
+    // row that named where each argument comes from. Counting only the
+    // registry made a symbol whose row is fully stated read as unserved.
+    let dispatch = format!(
+        "{}/../driver-cuda/csrc/src/model/declared/generated_dispatch.inc",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let emitted = std::fs::read_to_string(&dispatch)
+        .unwrap_or_else(|e| panic!("cannot read {dispatch}: {e}"));
+    let mut generated = 0usize;
+    for (i, _) in emitted.match_indices("if (sym == \"") {
+        if let Some(end) = emitted[i + 12..].find('"') {
+            out.insert(emitted[i + 12..i + 12 + end].to_string());
+            generated += 1;
+        }
+    }
+    assert!(
+        generated > 0,
+        "the generated dispatch stopped emitting symbol compares"
+    );
     out
 }
 
@@ -155,7 +186,7 @@ fn how_many_symbols_the_undriven_families_still_owe() {
 
     let mut owed_all: BTreeSet<String> = BTreeSet::new();
     println!(
-        "symbol-keyed arms across the four existing executors: {}",
+        "symbol-keyed arms — registry entries plus generated branches: {}",
         have.len()
     );
     println!(
@@ -205,4 +236,69 @@ fn how_many_symbols_the_undriven_families_still_owe() {
     for k in &unwritten {
         println!("    {k}");
     }
+}
+
+/// How many arms are LEFT in the four family executors.
+///
+/// The number to steer by, and it is not the count of `case` labels: a
+/// family file holds three switches over the same enum — the walk's
+/// commit-advance filter, the pin table's A/B, and the executor proper —
+/// and only the third is an arm. So a label counts here when the body
+/// under it actually LAUNCHES: it names a `kernels::` entry point or one
+/// of the shared `arm_*` helpers.
+///
+/// A measurement, like everything else in this file. It prints, and only
+/// fails if the executors stop being readable — because the honest
+/// version of "how much is left" is a number nobody can talk up, and one
+/// hand-counted in a commit message is exactly that.
+#[test]
+fn how_many_arms_the_four_executors_still_hold() {
+    let families = ["llama_like", "mixtral", "gemma4", "qwen3_5"];
+    let mut total = 0usize;
+    println!("{:12} {:>6} {:>7}", "", "arms", "labels");
+    for f in families {
+        let path = format!(
+            "{}/../driver-cuda/csrc/src/model/{f}/declared_forward.cpp",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+
+        let mut arms = 0usize;
+        let mut labels = 0usize;
+        let mut pending = 0usize;
+        for line in text.lines() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("case declared::Kernel::") {
+                if rest.contains(':') {
+                    pending += 1;
+                    continue;
+                }
+            }
+            if pending == 0 {
+                continue;
+            }
+            // A LAUNCHING body closes the run of labels above it.
+            if t.contains("kernels::") || t.contains("declared::arm_") {
+                arms += 1;
+                labels += pending;
+                pending = 0;
+            } else if t.starts_with("break;")
+                || t.starts_with("return ")
+                || t.starts_with("place(")
+                || t.starts_with("pin(")
+            {
+                // A filter's label, or a pin table's. Not an arm.
+                pending = 0;
+            }
+        }
+        println!("{f:12} {arms:>6} {labels:>7}");
+        total += arms;
+    }
+    println!("\nlaunching arms left across the four executors: {total}");
+    assert!(
+        total > 0,
+        "no executor holds a launching arm — either D1 is finished or \
+         this measurement stopped reading the executors"
+    );
 }

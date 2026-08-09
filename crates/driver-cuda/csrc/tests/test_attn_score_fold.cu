@@ -35,9 +35,10 @@
 
 #include <cuda_runtime.h>
 
-#include "ops/attention_flashinfer.hpp"
+#include "attn/attention_flashinfer.hpp"
 
-namespace ops = pie_cuda_driver::ops;
+
+namespace kernels = pie_cuda_driver::kernels;
 
 namespace {
 
@@ -147,7 +148,7 @@ void run(int page_size, int num_q_heads, const std::vector<Case>& cases) {
     RT(cudaMemset(folded_d, 0x7f,
                   static_cast<std::size_t>(folded_total) * sizeof(float)));
 
-    ops::launch_attn_score_fold_heads(raw_d, raw_indptr_d, page_indptr_d,
+    kernels::attn::attn_score_fold_heads(raw_d, raw_indptr_d, page_indptr_d,
                                       last_page_lens_d, page_size, requests,
                                       num_q_heads, folded_d, nullptr);
     RT(cudaGetLastError());

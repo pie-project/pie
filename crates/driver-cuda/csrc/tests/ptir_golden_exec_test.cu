@@ -518,7 +518,7 @@ void run_mtp_verify_tail(const std::string& dir) {
     }
     cudaMemcpy(
         d_rows, row_pointers, sizeof(row_pointers), cudaMemcpyHostToDevice);
-    k_materialize_bf16_rows<<<1, kTier0Block>>>(
+    k_materialize_bf16_rows<<<1, pie_cuda_driver::kernels::ptir::kTier0Block>>>(
         d_rows, d_materialized, 7, V);
     Tier0Runner direct_bf16_runner(t);
     direct_bf16_runner.arena().seed_cell(0, drafts, sizeof(drafts));

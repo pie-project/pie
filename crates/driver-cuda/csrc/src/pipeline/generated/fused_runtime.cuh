@@ -20,7 +20,7 @@
 #include <cuda_runtime.h>
 
 #include "batch/fire_timing.hpp"
-#include "kernels/envelope_device.cuh"
+#include "layout/envelope_device.cuh"
 #include "cuda_check.hpp"
 #include "pipeline/region_support.hpp"
 #include "pipeline/generated/module_cache.hpp"
@@ -2818,7 +2818,7 @@ inline GroupedLaunchResult launch_generated_stage(
             case PreparedRegionLaunch::Kind::kNucleus: {
                 k_grouped_nucleus_sample<<<
                     region.nucleus_segments,
-                    kCanonicalReduceWidth,
+                    kernels::ptir::kCanonicalReduceWidth,
                     0,
                     stream>>>(
                     prepared.device_header,
@@ -2891,21 +2891,21 @@ inline GroupedLaunchResult launch_generated_stage(
                 // header->lane_count` before reading `dests[lane]`.
                 if (region.mask_dtype == PTIR_DT_F32) {
                     k_generated_attn_page_mask<float><<<
-                        grid_lanes, kTier0Block, 0, stream>>>(
+                        grid_lanes, kernels::ptir::kTier0Block, 0, stream>>>(
                         prepared.device_header, prepared.device_lanes,
                         region.device_dests,
                         prepared.device_value_pointers, value_count,
                         region.value_a);
                 } else if (region.mask_dtype == PTIR_DT_I32) {
                     k_generated_attn_page_mask<std::int32_t><<<
-                        grid_lanes, kTier0Block, 0, stream>>>(
+                        grid_lanes, kernels::ptir::kTier0Block, 0, stream>>>(
                         prepared.device_header, prepared.device_lanes,
                         region.device_dests,
                         prepared.device_value_pointers, value_count,
                         region.value_a);
                 } else if (region.mask_dtype == PTIR_DT_U32) {
                     k_generated_attn_page_mask<std::uint32_t><<<
-                        grid_lanes, kTier0Block, 0, stream>>>(
+                        grid_lanes, kernels::ptir::kTier0Block, 0, stream>>>(
                         prepared.device_header, prepared.device_lanes,
                         region.device_dests,
                         prepared.device_value_pointers, value_count,
@@ -2917,7 +2917,7 @@ inline GroupedLaunchResult launch_generated_stage(
                     // instantiation, not a reinterpretation of the u32 one.
                     // (Prepare already refused every other dtype.)
                     k_generated_attn_page_mask<std::uint8_t><<<
-                        grid_lanes, kTier0Block, 0, stream>>>(
+                        grid_lanes, kernels::ptir::kTier0Block, 0, stream>>>(
                         prepared.device_header, prepared.device_lanes,
                         region.device_dests,
                         prepared.device_value_pointers, value_count,
@@ -2934,9 +2934,9 @@ inline GroupedLaunchResult launch_generated_stage(
                 // for a dimension the future capture key can carry
                 // exactly. Idle lanes guard-exit before reading
                 // `envelopes[lane]` (live-sized table).
-                k_generated_envelope_dot<kTier0Block><<<
+                k_generated_envelope_dot<kernels::ptir::kTier0Block><<<
                     grid_lanes * region.max_pages,
-                    kTier0Block,
+                    kernels::ptir::kTier0Block,
                     0,
                     stream>>>(
                     prepared.device_header,
@@ -2981,7 +2981,7 @@ inline GroupedLaunchResult launch_generated_stage(
             case PreparedRegionLaunch::Kind::kMatmul: {
                 k_generated_matmul_f32<<<
                     region.matmul_grid,
-                    kTier0Block,
+                    kernels::ptir::kTier0Block,
                     0,
                     stream>>>(
                     prepared.device_header,
@@ -3004,7 +3004,7 @@ inline GroupedLaunchResult launch_generated_stage(
                 // before any lane table).
                 k_grouped_topk<<<
                     grid_lanes * region.topk_rows,
-                    kTier0Block,
+                    kernels::ptir::kTier0Block,
                     0,
                     stream>>>(
                     prepared.device_header,

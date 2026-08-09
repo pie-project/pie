@@ -69,7 +69,7 @@ pub struct Glm5MoeFacts {
     pub moe_intermediate: u32,
     /// `n_shared_experts * moe_intermediate`; zero means no shared expert.
     pub shared_intermediate: u32,
-    /// `kernels::moe_aligned_block(maxR, num_experts)`, resolved once at
+    /// `kernels::moe::moe_aligned_block(maxR, num_experts)`, resolved once at
     /// workspace setup. A deployment fact rather than a per-fire number,
     /// which is why it can shape a `Dim`.
     pub aligned_block: u32,

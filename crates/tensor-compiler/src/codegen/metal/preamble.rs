@@ -15,9 +15,12 @@ use crate::codegen::layout;
 const M1: &str = "M1";
 const M3: &str = "M3";
 
-/// `crates/driver-metal/csrc/src/kernels/ptir_m1_runtime.metal`, embedded so the emitter
-/// is self-contained (the C++ takes it as a `runtime_template` argument the
-/// driver reads from disk at init).
+/// The M1 runtime template, from
+/// `crates/tensor-compiler/runtime/metal/ptir_m1_runtime.metal` (the C++ oracle
+/// this was ported from read the same text out of the driver's tree; the file
+/// moved here when the emitter became the only implementation). Embedded so the
+/// emitter is self-contained — the C++ took it as a `runtime_template` argument
+/// read from disk at init.
 ///
 /// It still carries `#include "ptir_rng.generated.metal"`; expanding that is
 /// the driver's job at library-build time, not the emitter's.

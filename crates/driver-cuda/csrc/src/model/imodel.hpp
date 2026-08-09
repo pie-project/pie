@@ -18,7 +18,7 @@
 #include <memory>
 
 #include "batch/forward.hpp"
-#include "ops/attention_workspace.hpp"
+#include "attention_workspace.hpp"
 #include "store/kv_cache.hpp"
 
 namespace pie_forward {
@@ -35,7 +35,7 @@ class LoadedModel;
 class HfConfig;
 class RecurrentStateCache;
 
-namespace ops {
+namespace kernels::gemm {
 class CublasHandle;
 }
 
@@ -120,7 +120,7 @@ public:
     virtual void body(Workspace& ws,
                       KvCache& kv,
                       AttentionWorkspace& attn_ws,
-                      ops::CublasHandle& cublas,
+                      kernels::gemm::CublasHandle& cublas,
                       const ForwardFn::ForwardInputs& in) = 0;
 
     // Optional: per-arch scratch-buffer byte budget for the persistent
@@ -219,7 +219,7 @@ public:
     virtual bool supergraph_body(Workspace&,
                                  KvCache&,
                                  AttentionWorkspace&,
-                                 ops::CublasHandle&,
+                                 kernels::gemm::CublasHandle&,
                                  const ForwardFn::ForwardInputs&,
                                  batch::SupergraphBuilder&) {
         return false;

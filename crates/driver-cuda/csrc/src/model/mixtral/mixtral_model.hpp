@@ -1,5 +1,9 @@
 #pragma once
 
+#include <algorithm>
+
+#include "attention_workspace.hpp"
+#include "model/declared/value_arena.hpp"
 #include "model/imodel.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/mixtral/declared_forward.hpp"
@@ -12,6 +16,20 @@ namespace pie_cuda_driver::model {
 // No prepare hook, no graph capture, no fused argmax.
 class MixtralModel final : public IModel {
 public:
+    // The activation block this deployment's declaration needs, over
+    // BOTH traced classes — gemma-4's rule, and for its reason: one
+    // block serves whichever fires, and it is allocated once outside any
+    // capture, so it must hold the wider.
+    std::size_t declared_arena_bytes(int max_tokens,
+                                     int max_sampled) const override {
+        if (!declared_.usable) return 0;
+        return std::max(
+            declared::arena_bytes_for_widest(declared_.decode, max_tokens,
+                                             max_sampled),
+            declared::arena_bytes_for_widest(declared_.prefill, max_tokens,
+                                             max_sampled));
+    }
+
     MixtralModel(MixtralWeights weights,
                  const HfConfig& hf_config,
                  const LlamaLikeForwardCfg& fwd_cfg,
@@ -22,7 +40,7 @@ public:
     void body(Workspace& ws,
               KvCache& kv,
               AttentionWorkspace& attn_ws,
-              ops::CublasHandle& cublas,
+              kernels::gemm::CublasHandle& cublas,
               const ForwardFn::ForwardInputs& in) override;
 
     ModelCapabilities capabilities() const override { return caps_; }

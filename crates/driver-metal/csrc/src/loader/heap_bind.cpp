@@ -323,7 +323,7 @@ class TranscodeGpu {
         std::string dir = env != nullptr ? std::string(env) : std::string(kKernelsDir);
         if (dir.empty()) return false;
         if (dir.back() != '/') dir += '/';
-        const std::string path = dir + "transcode.metal";
+        const std::string path = dir + "quant/transcode.metal";
         std::string error;
         dequant_ = ctx_.compile_precise_pso_from_file(path, "mxfp4_dequant_bf16", &error);
         encode_bf16_ = ctx_.compile_precise_pso_from_file(path, "affine_encode_u4_bf16", &error);

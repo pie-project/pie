@@ -46,11 +46,28 @@ fn every_shipped_kernel_compiles_on_this_device() {
     };
     let compiler = Compiler::new(&context).expect("compiler");
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(kernels_dir())
-        .expect("kernels dir is readable")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "metal"))
-        .collect();
+    // Recursive: the kernels grew subject directories, and the flat scan
+    // this replaces was red for "no .metal found" while thirty shaders sat
+    // one level down. `third_party/` is excluded from STANDALONE compiling —
+    // the MLX steel fragments there are not translation units (they expect
+    // their includer's macros); they are compiled through `quant/qmm_t.metal`,
+    // which is in the walk, and their text is still covered by
+    // `real_kernels::every_shipped_shader_splices`.
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("kernels dir is readable") {
+            let path = entry.expect("kernels dir entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "third_party") {
+                    continue;
+                }
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "metal") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    walk(&kernels_dir(), &mut files);
     files.sort();
     assert!(!files.is_empty(), "no .metal found to compile");
 

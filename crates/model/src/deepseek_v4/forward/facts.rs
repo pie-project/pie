@@ -59,7 +59,7 @@ pub struct Dsv4MoeFacts {
     /// `cfg.swiglu_limit`, the clamp the activation applies.
     pub swiglu_limit_milli: u32,
     /// The router is a HASH TABLE lookup rather than a learned gate on
-    /// some deployments (`launch_hash_route_lookup`).
+    /// some deployments (`kernels::moe::hash_route_lookup`).
     pub hash_routed: bool,
 }
 

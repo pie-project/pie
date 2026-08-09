@@ -9,8 +9,8 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/gated_delta_net.hpp"
-#include "kernels/quant_bf16_to_fp8.hpp"
+#include "ssm/gated_delta_net.hpp"
+#include "quant/quant_bf16_to_fp8.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -177,7 +177,7 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
         // `PIE_QWEN35_MTP_INT8_LM_HEAD` is set; absent, the draft step reads
         // the same bf16 head as the main path.
         if (const DeviceTensor* int8_head = maybe(engine, "mtp.lm_head")) {
-            const std::optional<ops::QuantMeta> meta = engine.quant_meta("mtp.lm_head");
+            const std::optional<QuantMeta> meta = engine.quant_meta("mtp.lm_head");
             if (meta.has_value() && meta->scale != nullptr) {
                 mtp.lm_head = int8_head;
                 mtp.lm_head_scale_inv = meta->scale;

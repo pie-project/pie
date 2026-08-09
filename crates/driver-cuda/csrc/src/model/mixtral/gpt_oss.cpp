@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/deinterleave.hpp"
+#include "layout/deinterleave.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -346,7 +346,7 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
 
                     auto gate_bias = DeviceTensor::allocate(DType::BF16, {I});
                     auto up_bias = DeviceTensor::allocate(DType::BF16, {I});
-                    kernels::launch_deinterleave_vec_bf16(
+                    kernels::layout::deinterleave_vec_bf16(
                         static_cast<const std::uint8_t*>(b_gate_up_all.data()) +
                             expert_idx * mxfp4_gate_up_bias_expert_bytes,
                         gate_bias.data(), up_bias.data(), I, /*stream=*/0);
@@ -440,7 +440,7 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
 
                     auto gate_bias = DeviceTensor::allocate(DType::BF16, {I});
                     auto up_bias = DeviceTensor::allocate(DType::BF16, {I});
-                    kernels::launch_deinterleave_vec_bf16(
+                    kernels::layout::deinterleave_vec_bf16(
                         static_cast<const std::uint8_t*>(b_gate_up_all.data()) +
                             expert_idx * mxfp4_gate_up_bias_expert_bytes,
                         gate_bias.data(), up_bias.data(), I, /*stream=*/0);

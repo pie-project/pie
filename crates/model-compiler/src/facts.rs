@@ -42,7 +42,7 @@ pub enum NormPlacement {
 /// the global form shares one scale across heads — so the tri-state is a
 /// fact, and the traced ops differ: per-head traces `RmsnormPerHead`,
 /// global traces a plain row `Rmsnorm` (which is exactly what the kernel
-/// launches: `launch_rmsnorm_bf16` over `[N, heads * head_dim]`).
+/// launches: `kernels::norm::rmsnorm_bf16` over `[N, heads * head_dim]`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QkNorm {
     #[default]
@@ -51,3 +51,43 @@ pub enum QkNorm {
     Global,
 }
 
+
+/// The SLIDING WINDOW layer `l` attends over, `-1` for none.
+///
+/// One reader for a fact every family's backend carries the same way,
+/// because the shape of the list is the same everywhere: empty is "no
+/// window", one element is a config's single `sliding_window` broadcast
+/// to every layer, and a longer list is the per-layer array an
+/// alternating architecture states (gemma-2, gemma-4, OLMo-3).
+///
+/// It lives here rather than on any one facts struct for the reason
+/// `NormPlacement` and `QkNorm` do: more than one family is written in
+/// these words. Eleven executor sites across four families derived this
+/// from `fwd_cfg.per_layer_window_left` -- an array no statement
+/// mentioned -- and the dispatch statements carry it now.
+///
+/// A list SHORTER than the layer count is not an error: the last entry
+/// covers the tail, which is what the drivers' fallback meant.
+pub fn window_left_at(list: &[i32], l: u32) -> i32 {
+    match list.len() {
+        0 => -1,
+        n => list[(l as usize).min(n - 1)],
+    }
+}
+
+/// The ROPE THETA layer `l` rotates at.
+///
+/// The same shape as [`window_left_at`] and for the same reason: most
+/// architectures carry one value in config, and some (gemma-4) alternate
+/// it per layer between their local and global attention. A driver that
+/// read the single one from config was reading the wrong one for half of
+/// gemma-4's layers, which is why this is a fact and not a cfg field.
+///
+/// An EMPTY list is a text that states no rotation, and the accessor
+/// says so by answering zero rather than by guessing a default.
+pub fn rope_theta_at(list: &[f32], l: u32) -> f32 {
+    match list.len() {
+        0 => 0.0,
+        n => list[(l as usize).min(n - 1)],
+    }
+}

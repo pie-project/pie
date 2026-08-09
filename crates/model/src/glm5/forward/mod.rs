@@ -5,7 +5,7 @@
 //! things about the reading are worth stating before the body, because
 //! each is a place a transcription could go wrong quietly:
 //!
-//! * **The MLA prepare is FUSED.** `launch_mla_prepare_bf16` does what
+//! * **The MLA prepare is FUSED.** `kernels::attn::mla_prepare_bf16` does what
 //!   the four launches beside it do (`kimi_split_kv_a_norm`,
 //!   `kimi_split_q_b`, `rope`, `write_mla_to_pages`), and the driver
 //!   takes it whenever `mla_prepare_supported(q_rope)` holds. This text
@@ -27,7 +27,8 @@
 pub mod facts;
 
 use self::facts::Glm5Facts;
-use model_compiler::dsl::{self, matmul, rmsnorm, MatW, NormW};
+use model_compiler::dsl::{
+    WeightRepr,self, matmul, MatW, NormW};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 /// One glm5 layer's weight handles, under the tree-wide
@@ -59,6 +60,7 @@ impl Glm5LayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         let n = |name: &str| NormW {
             name: w(name),
@@ -105,13 +107,13 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
 
         for l in 0..facts.layers {
             let w = Glm5LayerW::new(l, facts);
-            let x = rmsnorm(&y, &w.attn_norm);
+            let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
             // The query's own latent, normed, then expanded. `hidden`
             // appears nowhere between here and `o_proj` — that is what
             // makes this MLA rather than a wide attention.
             let q_a = matmul(&x, &w.q_a_proj);
-            let q_a_n = rmsnorm(&q_a, &w.q_a_norm);
+            let q_a_n = dsl::cuda::rmsnorm(&q_a, &w.q_a_norm);
             let q_b = matmul(&q_a_n, &w.q_b_proj);
             let kv_a = matmul(&x, &w.kv_a_proj);
 
@@ -163,10 +165,10 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             y += matmul(&attn_v, &w.o_proj);
 
             // ── MLP / MoE ────────────────────────────────────────────
-            let m = rmsnorm(&y, &w.mlp_norm);
+            let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             if !facts.is_moe_layer(l) {
                 // The pair form: glm5 binds gate and up separately and
-                // fires `launch_swiglu_bf16` over the two buffers.
+                // fires `kernels::mlp::swiglu_bf16` over the two buffers.
                 let gate = matmul(&m, &w.dense_gate);
                 let _up = matmul(&m, &w.dense_up);
                 let act = dsl::cuda::swiglu(&gate, facts.dense_intermediate, false);
@@ -185,6 +187,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                     name: format!("layer.{l}.expert.{{e}}.gate_up"),
                     width: 2 * facts.moe.moe_intermediate,
                     layer: Some(l),
+                    repr: WeightRepr::Bf16,
                 },
                 &experts,
                 facts.moe.top_k,
@@ -196,6 +199,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                     name: format!("layer.{l}.expert.{{e}}.down"),
                     width: facts.hidden,
                     layer: Some(l),
+                    repr: WeightRepr::Bf16,
                 },
                 &experts,
                 facts.moe.top_k,
@@ -218,7 +222,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".to_string(),

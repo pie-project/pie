@@ -193,6 +193,28 @@ class ValueArena {
         return block_ + at;
     }
 
+    // The epilogue's two intermediates, from the same block.
+    //
+    // They belong to no traced value, because they belong to no traced
+    // STATEMENT: one `LmHead` lowers to a gather, a norm and a GEMM, and
+    // whether the gather runs is a fact about the FIRE's rows. So the
+    // lowering owns them and this hands them over — which is what every
+    // executor's `ws.norm_y` apology was standing in for.
+    void* epilogue_gather(const PieForwardLowered& flat) const {
+        return at_offset(flat.epilogue_gather);
+    }
+    void* epilogue_norm(const PieForwardLowered& flat) const {
+        return at_offset(flat.epilogue_norm);
+    }
+
+    // Whether a value is reached through the PIN table rather than the
+    // host's placement. A bring-up probe: an arm mid-migration whose
+    // operand answers `false` is reading bytes no unconverted arm
+    // writes, which is a silently wrong buffer rather than a fault.
+    bool is_pinned(std::uint32_t value_id) const {
+        return value_id < count_ && pinned_[value_id] != nullptr;
+    }
+
     // Overload kept for the call sites mid-migration, which pass the
     // value descriptor because the arena used to need it for SIZING. It
     // does not any more — the host sized it — so the descriptor is
@@ -202,6 +224,16 @@ class ValueArena {
     }
 
    private:
+    // A lowering-owned offset, bounds-checked like a value's. `kNamed`
+    // means the fire needs none, and a caller that asks anyway gets
+    // nullptr rather than an address into somebody else's bytes.
+    void* at_offset(std::size_t at) const {
+        if (at == kNamed || block_ == nullptr || at >= capacity_) {
+            return nullptr;
+        }
+        return block_ + at;
+    }
+
     std::uint8_t* block_ = nullptr;
     std::size_t capacity_ = 0;
     // What the whole plan's arena wants, for the refusal message: the
@@ -212,6 +244,37 @@ class ValueArena {
     std::size_t count_ = 0;
     std::vector<void*> pinned_;
 };
+
+// How many elements one traced value holds at this fire's extents.
+//
+// An arm needs it wherever a kernel takes an ELEMENT COUNT rather than
+// rows and a width — the casts, the elementwise GLU. Those counts used
+// to be spelled `N * H` and `routes * I` at each site, which is the
+// convention doing arithmetic the value descriptor already carries; and
+// it is the same arithmetic in each, so it lives here once.
+//
+// Dims outside the closed kinds resolve to their stated value, which is
+// what `Const` means and what a padded route count is not — a value on
+// `MoeAlignedRoutes` is not asked for by any arm that uses this.
+inline std::size_t value_elements(const pie_forward::ForwardPlan& plan,
+                                  std::uint32_t id, int n_fire, int r_fire) {
+    const PieForwardValue& val = plan.value(id);
+    std::size_t elements = 1;
+    for (std::uint32_t d = 0; d < val.rank; ++d) {
+        switch (val.dims[d].kind) {
+        case pie_forward::PieForwardDimKind::Tokens:
+            elements *= static_cast<std::size_t>(n_fire);
+            break;
+        case pie_forward::PieForwardDimKind::Requests:
+            elements *= static_cast<std::size_t>(r_fire);
+            break;
+        default:
+            elements *= static_cast<std::size_t>(val.dims[d].value);
+            break;
+        }
+    }
+    return elements;
+}
 
 // The activation block one plan needs for the WIDEST fire a deployment
 // admits — what `ws.declared_values` has to hold.
@@ -309,6 +372,67 @@ inline void trace_arena(const char* family,
     }
     std::fprintf(stderr, "[arena/%s] placed=%zu values, %zu bytes if none reused\n",
                  family, rows.size(), placed_total);
+    // Name one value and every statement that touches it. Both queries
+    // below end here: a bisect narrows to a KEY, and this is what turns
+    // a key back into text.
+    const auto describe = [&](const Row& r, const char* how, std::size_t key) {
+        const PieForwardValue& val = plan.value(r.id);
+        std::fprintf(stderr, "[arena/%s] %s %zu: v%u at %zu %zu bytes [",
+                     family, how, key, r.id, r.at, r.bytes);
+        for (std::uint32_t d = 0; d < val.rank; ++d) {
+            std::fprintf(stderr, "%s%u:%u", d ? ", " : "",
+                         static_cast<unsigned>(val.dims[d].kind),
+                         val.dims[d].value);
+        }
+        std::fprintf(stderr, "] dtype=%u\n", static_cast<unsigned>(val.dtype));
+        for (std::size_t i = 0; i < plan.op_count(); ++i) {
+            const pie_forward::PieForwardOp& op = plan.op(i);
+            for (const std::uint32_t o : plan.outputs(op)) {
+                if (o != r.id) continue;
+                std::fprintf(stderr,
+                             "[arena/%s]    written by op %zu kind=%u '%.*s'\n",
+                             family, i, static_cast<unsigned>(op.kind),
+                             static_cast<int>(plan.weight_name(op).size()),
+                             plan.weight_name(op).data());
+            }
+            for (const std::uint32_t in : plan.inputs(op)) {
+                if (in != r.id) continue;
+                std::fprintf(stderr,
+                             "[arena/%s]    read by    op %zu kind=%u '%.*s'\n",
+                             family, i, static_cast<unsigned>(op.kind),
+                             static_cast<int>(plan.weight_name(op).size()),
+                             plan.weight_name(op).data());
+            }
+        }
+    };
+
+    // `PIE_DECLARED_ARENA_AT=<offset>`: name every value living at one
+    // offset. Kept, but it answers a WEAKER question than it looks: an
+    // offset is reused over a fire, so this lists every chain that ever
+    // sat there, not one chain.
+    if (const char* want_at = std::getenv("PIE_DECLARED_ARENA_AT")) {
+        const std::size_t at = static_cast<std::size_t>(std::atoll(want_at));
+        for (const Row& r : rows) {
+            if (r.at == at) describe(r, "AT", at);
+        }
+    }
+
+    // `PIE_DECLARED_ARENA_OWNER=<value id>`: name every value in one
+    // alias chain. This is the query the owner-keyed bisect leaves you
+    // with, and unlike AT it names exactly the values that share a
+    // buffer BECAUSE they share a buffer -- so what it prints is one
+    // statement's stream, start to end.
+    if (const char* want_owner = std::getenv("PIE_DECLARED_ARENA_OWNER")) {
+        const std::size_t want = static_cast<std::size_t>(std::atoll(want_owner));
+        for (const Row& r : rows) {
+            const std::size_t owner =
+                r.id < flat.value_owners_len
+                    ? static_cast<std::size_t>(flat.value_owners[r.id])
+                    : static_cast<std::size_t>(r.id);
+            if (owner == want) describe(r, "OWNER", want);
+        }
+    }
+
     std::sort(rows.begin(), rows.end(),
               [](const Row& a, const Row& b) { return a.bytes > b.bytes; });
     for (std::size_t i = 0; i < rows.size() && i < 8; ++i) {

@@ -4,6 +4,7 @@
 // MLA cache and a recurrent-state cache: three of every four layers keep a
 // KDA state slab plus three conv windows, the fourth pages KV.
 
+#include "attention_workspace.hpp"
 #include "distributed.hpp"
 #include "model/imodel.hpp"
 #include "model/kimi/kimi_forward.hpp"  // KimiPlanState (shared MLA plan type)
@@ -31,7 +32,7 @@ public:
     void body(Workspace& ws,
               KvCache& kv,
               AttentionWorkspace& attn_ws,
-              ops::CublasHandle& cublas,
+              kernels::gemm::CublasHandle& cublas,
               const ForwardFn::ForwardInputs& in) override;
 
     ModelCapabilities capabilities() const override { return caps_; }

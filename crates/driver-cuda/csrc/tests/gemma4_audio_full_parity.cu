@@ -96,12 +96,23 @@ static AudioFfnRaw ffn(const std::string& b) {
     return f;
 }
 
-static double report(const char* tag, const std::vector<float>& y, const std::string& file) {
+// Both numbers, because the verdict needs both.
+//
+// Cosine alone cannot see a rescale: y = a*r has cosine exactly 1 for every
+// a. That is not hypothetical here -- the first reference this harness was
+// ever run against had been built by calling `embed_audio.embedding_projection`
+// instead of `embed_audio`, skipping the parameterless RMSNorm in front of it.
+// An unnormalized input to a linear is very nearly a pure rescale, so the run
+// printed rel_rms_err=87.9% with cosine=0.99681 and called it a PASS. The
+// magnitude column had the answer; the criterion was not reading it.
+struct Cmp { double cosine, rel_rms; };
+static Cmp report(const char* tag, const std::vector<float>& y, const std::string& file) {
     std::vector<float> rp = as_f32(load_npy(DIR + "/" + file));
     long n = (long)y.size(); double dn = 0, rn = 0, dot = 0, en = 0;
     for (long i = 0; i < n; i++) { double e = (double)y[i] - rp[i]; en += e * e; dn += (double)y[i] * y[i]; rn += (double)rp[i] * rp[i]; dot += (double)y[i] * rp[i]; }
-    std::printf("  vs %-16s rel_rms_err=%.3f%%  cosine=%.5f\n", tag, 100 * std::sqrt(en / rn), dot / std::sqrt(dn * rn));
-    return dot / std::sqrt(dn * rn);
+    Cmp c{dot / std::sqrt(dn * rn), std::sqrt(en / rn)};
+    std::printf("  vs %-16s rel_rms_err=%.3f%%  cosine=%.5f\n", tag, 100 * c.rel_rms, c.cosine);
+    return c;
 }
 
 // ── per-stage checkpoint hook: device bf16 → host f32, cosine vs the dumps ────
@@ -166,9 +177,19 @@ int main(int argc, char** argv) {
     for (long i = 0; i < n; i++) y[i] = __bfloat162float(hb[i]);
 
     std::printf("=== Gemma-4 audio encoder parity ===\n");
-    double cb = report("HF-bf16", y, "projected.npy");
+    Cmp cb = report("HF-bf16", y, "projected.npy");
     report("HF-fp32", y, "projected_f32.npy");
-    bool pass = cb > 0.99;
-    std::printf("%s (cosine=%.5f)\n", pass ? "AUDIO PARITY PASS" : "AUDIO PARITY (needs work)", cb);
+    // 5% on magnitude is loose on purpose: twelve conformer layers of bf16
+    // accumulate, and the measured value is 0.74%. It is not there to police
+    // the last digit -- it is there so a rescale cannot pass, and at 87.9%
+    // the failure it was written for clears it by more than an order of
+    // magnitude.
+    const bool pass = cb.cosine > 0.99 && cb.rel_rms < 0.05;
+    std::printf("%s (cosine=%.5f, rel_rms=%.3f%%)\n",
+                pass ? "AUDIO PARITY PASS"
+                     : (cb.cosine > 0.99 ? "AUDIO PARITY (direction right, MAGNITUDE wrong "
+                                           "-- suspect a missing norm or scale)"
+                                         : "AUDIO PARITY (needs work)"),
+                cb.cosine, 100 * cb.rel_rms);
     return pass ? 0 : 1;
 }

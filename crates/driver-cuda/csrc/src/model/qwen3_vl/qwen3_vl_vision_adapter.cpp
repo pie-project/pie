@@ -11,9 +11,9 @@
 #include <stdexcept>
 #include <vector>
 
-#include "ops/attention_workspace.hpp"
-#include "ops/attention_flashinfer.hpp"
-#include "ops/gemm.hpp"
+#include "attention_workspace.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -24,7 +24,7 @@ namespace pie_cuda_driver::model {
 void qwen3vl_vis_gemm_bf16(cublasHandle_t blas, const void* x, const void* W,
                            void* y, int M, int N, int K, float beta) {
     // beta=1 fuses a residual add (used by the o-/fc2-projection epilogues).
-    ops::gemm_act_x_wt_bf16(blas, x, W, y, M, N, K, beta);
+    kernels::gemm::act_x_wt_bf16(blas, x, W, y, M, N, K, beta);
 }
 
 // ── Vision attention via flashinfer (the same flash kernel the LLM uses) ──────
@@ -42,7 +42,7 @@ void qwen3vl_vis_gemm_bf16(cublasHandle_t blas, const void* x, const void* W,
 namespace {
 struct VisAttnRes {
     AttentionWorkspace ws;
-    ops::PrefillPlanCachePtr plan;
+    kernels::attn::PrefillPlanCachePtr plan;
     bool ready = false;
     // Plan/index signature: (num_seqs, total_tokens, per-seq len[0], NH, HEAD).
     // Vision images in one batch are equal-sized, so this captures the shape.
@@ -66,7 +66,7 @@ void qwen3vl_vis_attn(const void* q, void* k, void* v, void* o,
     int total = 0; for (int i = 0; i < num_seqs; ++i) total += seqlens[i];
     if (!st.ready) {
         st.ws = AttentionWorkspace::allocate();
-        st.plan = ops::make_prefill_plan();
+        st.plan = kernels::attn::make_prefill_plan();
         st.ready = true;
     }
     // Build host indptr/index arrays for the multi-sequence paged layout.
@@ -93,17 +93,17 @@ void qwen3vl_vis_attn(const void* q, void* k, void* v, void* o,
             cudaMemcpy(*d, h.data(), h.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice);
         };
         up(&st.qo_d, qo); up(&st.kvpi_d, kvpi); up(&st.kvidx_d, kvidx); up(&st.klpl_d, klpl);
-        ops::plan_attention_flashinfer_prefill_bf16(
+        kernels::attn::plan_attention_flashinfer_prefill_bf16(
             *st.plan, qo.data(), kvpi.data(), klpl.data(), /*total_tokens=*/total, num_seqs,
-            NH, NH, HEAD, ps, st.ws, S, /*enable_cuda_graph=*/false, /*window_left=*/-1,
+            NH, NH, HEAD, ps, st.ws.view(), S, /*enable_cuda_graph=*/false, /*window_left=*/-1,
             /*full_attention_variant=*/false, /*hnd_layout=*/false, /*causal_mask=*/false);
         st.sig_seqs = num_seqs; st.sig_total = total; st.sig_len0 = len0;
         st.sig_NH = NH; st.sig_HD = HEAD;
     }
     const float sm_scale = 1.0f / std::sqrt((float)HEAD);
-    ops::dispatch_attention_flashinfer_prefill_bf16(
+    kernels::attn::dispatch_attention_flashinfer_prefill_bf16(
         *st.plan, q, k, v, o, st.qo_d, st.kvidx_d, st.kvpi_d, st.klpl_d,
-        st.ws, S, /*logits_soft_cap=*/0.f, sm_scale, /*lse_out=*/nullptr);
+        st.ws.view(), S, /*logits_soft_cap=*/0.f, sm_scale, /*lse_out=*/nullptr);
 }
 
 namespace {

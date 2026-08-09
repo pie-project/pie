@@ -26,6 +26,7 @@
 #include "pipeline/tier0/tier0_runner.hpp"
 
 using namespace pie_cuda_driver::pipeline;
+namespace ptir = pie_cuda_driver::kernels::ptir;
 
 namespace {
 int g_pass = 0, g_fail = 0;
@@ -240,7 +241,7 @@ void test_log_softmax_expansion() {
     PassResult r = runner.run_pass(in);
     std::vector<float> got(B * V); runner.arena().host_take(0, got.data(), got.size() * 4);
     const auto maximum =
-        host_eval::reduce(RedKind::Max, logits, B, V);
+        host_eval::reduce(ptir::RedKind::Max, logits, B, V);
     std::vector<float> centered(logits.size());
     std::vector<float> exponentials(logits.size());
     for (std::uint32_t row = 0; row < B; ++row) {
@@ -252,7 +253,7 @@ void test_log_softmax_expansion() {
         }
     }
     const auto sum =
-        host_eval::reduce(RedKind::Sum, exponentials, B, V);
+        host_eval::reduce(ptir::RedKind::Sum, exponentials, B, V);
     std::vector<float> want(logits.size());
     for (std::uint32_t row = 0; row < B; ++row) {
         for (std::uint32_t column = 0; column < V; ++column) {

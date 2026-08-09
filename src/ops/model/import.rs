@@ -51,7 +51,7 @@ use model_loader::types::{CheckpointFormat, TensorDecl, Visibility};
 // of something a reader elsewhere has to match exactly, and a mismatch does
 // not fail — the read just finds nothing.
 use model_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY, meta_name};
-use model_config::DESCRIPTOR_OBJECT;
+use model::config::DESCRIPTOR_OBJECT;
 
 /// Parses a human-written byte size: `16GiB`, `5GB`, `512MiB`, `1000000`.
 ///
@@ -215,7 +215,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     match &descriptor {
         Some(_) => println!(
             "convert: model config normalized to {}",
-            model_config::VERSION
+            model::config::VERSION
         ),
         None => println!("convert: no config.json beside the weights"),
     }
@@ -693,7 +693,7 @@ pub(crate) fn compile_descriptor(source: &Source) -> Result<Option<Vec<u8>>> {
         .with_context(|| format!("cannot read {}", path.display()))?;
     let root: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|err| anyhow!("cannot parse {}: {err}", path.display()))?;
-    let descriptor = model_config::descriptor(&root, &path.display().to_string())
+    let descriptor = model::config::descriptor(&root, &path.display().to_string())
         .map_err(|err| anyhow!("cannot normalize {}: {err:#}", path.display()))?;
     Ok(Some(serde_json::to_vec(&descriptor)?))
 }

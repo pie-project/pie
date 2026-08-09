@@ -95,7 +95,7 @@ impl ModelFacts {
     /// The one place a descriptor becomes facts. Every field above is a field
     /// of the descriptor — no probing of alternate spellings, no
     /// per-`model_type` rule, no defaulting beyond what the schema already
-    /// resolved: `model-config` did all of that once, at import, and this
+    /// resolved: [`crate::config`] did all of that once, at import, and this
     /// is a projection of the result.
     ///
     /// A field the descriptor does not carry keeps [`Default`], which is what
@@ -107,11 +107,11 @@ impl ModelFacts {
         let doc: serde_json::Value = serde_json::from_slice(json)
             .map_err(|err| Error::Contract(format!("model descriptor is not JSON: {err}")))?;
         let version = doc.get("version").and_then(serde_json::Value::as_str);
-        if version != Some(model_config::VERSION) {
+        if version != Some(crate::config::VERSION) {
             return Err(Error::Contract(format!(
                 "model descriptor declares version {:?}, this build reads {:?}",
                 version.unwrap_or("<absent>"),
-                model_config::VERSION,
+                crate::config::VERSION,
             )));
         }
 

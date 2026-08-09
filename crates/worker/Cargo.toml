@@ -28,7 +28,6 @@ default = []
 # script. The driver crates build their own `csrc/` and emit their own link
 # lines; what this crate needs from them is that they be in the graph.
 driver-cuda = ["engine/driver-cuda"]
-driver-metal = ["engine/driver-metal"]
 driver-dummy = []
 nixl = ["dep:transport", "transport/nixl"]
 
@@ -111,11 +110,12 @@ model-loader-capi = { path = "../model-loader-capi", default-features = false }
 # The artifact's compiled metadata is lifted here and handed to the runtime
 # whole: `model` owns the shape it arrives in, `tokenizer` names the
 # objects that make up a `pie.tokenizer/1`.
-model = { path = "../model", features = ["forward"] }
+#
+# `config` is what used to be the `model-config` crate: it names `pie.model/1`
+# and the object it lives in, so the worker normalizes a snapshot and reads
+# the descriptor under the same name `convert` writes it under.
+model = { path = "../model", features = ["forward", "config"] }
 tokenizer = { path = "../tokenizer" }
-# Names `pie.model/1` and the object it lives in, so the worker reads the
-# descriptor under the same name `convert` writes it under.
-model-config = { path = "../model-config" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example

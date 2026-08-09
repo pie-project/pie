@@ -51,7 +51,7 @@ impl Model {
     ///
     /// The descriptor is always produced: an artifact carries it compiled, and
     /// a snapshot's `config.json` is normalized here by the same
-    /// `model-config` the artifact was written with. That is what lets
+    /// `model::config` the artifact was written with. That is what lets
     /// everything downstream — both drivers and the runtime's model service —
     /// read one document instead of keeping a second path that parses the
     /// files beside a snapshot.
@@ -73,14 +73,14 @@ impl Model {
 
         let descriptor = model_loader::checkpoint::read::read_meta(
             &checkpoint,
-            model_config::DESCRIPTOR_OBJECT,
+            model::config::DESCRIPTOR_OBJECT,
         )?
         .ok_or_else(|| {
             anyhow!(
                 "artifact {} carries no {} descriptor; re-import it with \
                  `pie model import`",
                 path.display(),
-                model_config::DESCRIPTOR_OBJECT,
+                model::config::DESCRIPTOR_OBJECT,
             )
         })?;
 
@@ -132,7 +132,7 @@ fn normalize_snapshot_descriptor(path: &Path) -> Result<Vec<u8>> {
     })?;
     let root: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|err| anyhow!("cannot parse {}: {err}", config.display()))?;
-    let descriptor = model_config::descriptor(&root, &config.display().to_string())
+    let descriptor = model::config::descriptor(&root, &config.display().to_string())
         .map_err(|err| anyhow!("cannot normalize {}: {err:#}", config.display()))?;
     Ok(serde_json::to_vec(&descriptor)?)
 }
@@ -279,7 +279,7 @@ mod tests {
         let mut writer = CheckpointWriter::create(&path, &Default::default()).unwrap();
         // Ascending names: `model/…` sorts before `tokenizer/…`.
         writer
-            .add_meta(model_config::DESCRIPTOR_OBJECT, descriptor)
+            .add_meta(model::config::DESCRIPTOR_OBJECT, descriptor)
             .unwrap();
         for (name, bytes) in canonical.objects() {
             if !whole_tokenizer && name == tokenizer::canonical::MERGE_TABLE {
@@ -376,7 +376,7 @@ mod tests {
         let lifted = Model::Snapshot(snap.clone()).metadata().unwrap();
         assert!(lifted.tokenizer.is_none());
         let doc: serde_json::Value = serde_json::from_slice(&lifted.descriptor).unwrap();
-        assert_eq!(doc["version"], model_config::VERSION);
+        assert_eq!(doc["version"], model::config::VERSION);
         assert_eq!(doc["num_hidden_layers"], 2);
         // The two fields the runtime reads out of it, so a schema change that
         // dropped either shows up here rather than at boot.

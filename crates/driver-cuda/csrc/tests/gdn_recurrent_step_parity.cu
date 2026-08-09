@@ -37,7 +37,7 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/gated_delta_net.hpp"
+#include "ssm/gated_delta_net.hpp"
 
 namespace kernels = pie_cuda_driver::kernels;
 
@@ -246,7 +246,7 @@ void run_case(const Case& c, int K_d, int V_d, unsigned seed) {
     // express the shape without a materialised expansion, so skip it.
     if (K_h == V_h) {
         reset();
-        kernels::launch_recurrent_gated_delta_step_batched_state_bf16(
+        kernels::ssm::recurrent_gated_delta_step_batched_state_bf16(
             d.q, d.k, d.v, d.g, d.beta, d.state, d.slots, slot_stride,
             d.out, R, V_h, K_d, V_d, nullptr);
         RT(cudaDeviceSynchronize());
@@ -255,7 +255,7 @@ void run_case(const Case& c, int K_d, int V_d, unsigned seed) {
     }
 
     reset();
-    kernels::launch_recurrent_gated_delta_step_batched_gqa_state_bf16(
+    kernels::ssm::recurrent_gated_delta_step_batched_gqa_state_bf16(
         d.q, d.k, d.v, d.g, d.beta, d.state, d.slots, slot_stride,
         d.out, R, K_h, V_h, K_d, V_d, nullptr);
     RT(cudaDeviceSynchronize());

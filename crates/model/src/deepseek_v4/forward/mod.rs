@@ -26,7 +26,8 @@
 pub mod facts;
 
 use self::facts::Dsv4Facts;
-use model_compiler::dsl::{self, matmul, rmsnorm, MatW, NormW};
+use model_compiler::dsl::{
+    WeightRepr,self, matmul, MatW, NormW};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct Dsv4LayerW {
@@ -52,6 +53,7 @@ impl Dsv4LayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         let n = |name: &str| NormW {
             name: w(name),
@@ -116,11 +118,11 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             // the reference's `q *= rsqrt(...)`, which is a different
             // statement from an rmsnorm with a weight.
             let q_a = matmul(&x, &w.wq_a);
-            let q_a = rmsnorm(&q_a, &w.q_norm);
+            let q_a = dsl::cuda::rmsnorm(&q_a, &w.q_norm);
             let q = matmul(&q_a, &w.wq_b);
             let q = dsl::cuda::per_head_rmsnorm(&q, "", a.heads, a.head_dim);
             let kv = matmul(&x, &w.wkv);
-            let kv = rmsnorm(&kv, &w.kv_norm);
+            let kv = dsl::cuda::rmsnorm(&kv, &w.kv_norm);
             // Partial rope on the LAST channels of each head.
             let q = dsl::cuda::rope_partial_last(&q, a.heads, a.qk_rope_head_dim);
             let kv = dsl::cuda::rope_partial_last(&kv, a.heads, a.qk_rope_head_dim);
@@ -189,6 +191,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                         name: format!("layer.{l}.expert.{{e}}.gate_up"),
                         width: 2 * facts.moe.moe_intermediate,
                         layer: Some(l),
+                        repr: WeightRepr::Bf16,
                     },
                     &experts,
                     facts.moe.top_k,
@@ -200,6 +203,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                         name: format!("layer.{l}.expert.{{e}}.down"),
                         width: facts.hidden,
                         layer: Some(l),
+                        repr: WeightRepr::Bf16,
                     },
                     &experts,
                     facts.moe.top_k,
@@ -211,7 +215,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
 
         // The streams fold into one.
         let y = dsl::cuda::hc_head(&streams, &streams, facts.hidden);
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".to_string(),

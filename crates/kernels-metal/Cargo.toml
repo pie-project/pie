@@ -29,3 +29,8 @@ native = []
 
 [dependencies]
 kernels = { path = "../kernels" }
+
+[dev-dependencies]
+# The table test resolves through `sig_in`, which is the shared crate's, to
+# check the lookup `model-compiler` actually calls rather than a copy of it.
+kernels = { path = "../kernels" }

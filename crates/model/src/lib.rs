@@ -76,8 +76,6 @@
 #[cfg(feature = "contract")]
 pub mod builder;
 #[cfg(feature = "contract")]
-pub mod facts;
-#[cfg(feature = "contract")]
 pub mod mlx;
 #[cfg(feature = "contract")]
 pub mod moe;
@@ -85,6 +83,17 @@ pub mod moe;
 pub mod policy;
 #[cfg(feature = "contract")]
 pub mod probe;
+
+// ── The descriptor aspect ────────────────────────────────────────────
+// `pie.model/1`: HuggingFace `config.json` in, the descriptor out, and
+// nothing but serde behind it. Its own feature rather than `contract`'s
+// because `worker` writes a descriptor for a plain snapshot without
+// authoring anything, and because being reachable with no graph attached is
+// the whole point — see the module doc.
+#[cfg(feature = "config")]
+pub mod config;
+#[cfg(feature = "contract")]
+pub mod facts;
 
 // ── The shared root: the chat aspect ─────────────────────────────────
 #[cfg(feature = "chat")]
@@ -117,6 +126,12 @@ pub mod families;
 /// that traces one has no business owning the door.
 #[cfg(feature = "forward")]
 pub mod ffi;
+
+/// The committed static-C++ emissions, as one list — `bin/emit-cuda.rs`
+/// writes it, `tests/generated_cuda.rs` checks it, and neither holds a
+/// copy of its own.
+#[cfg(feature = "forward")]
+pub mod emissions;
 
 // ── The registries ───────────────────────────────────────────────────
 #[cfg(feature = "contract")]

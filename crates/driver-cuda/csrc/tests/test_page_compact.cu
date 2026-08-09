@@ -1,6 +1,6 @@
 // PTIR Layer 4 -- page-CSR compaction under a page mask.
 //
-// `launch_compact_page_csr` is what turns Quest's `attn_page_mask` from an
+// `compact_page_csr` is what turns Quest's `attn_page_mask` from an
 // observation into an eviction: it gathers a fire's paged-KV table down to the
 // pages the mask keeps, and the resulting table is what FlashInfer attends
 // over. Every failure mode here is silent at runtime -- a reordered page list
@@ -18,9 +18,9 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/page_compact.hpp"
+#include "attn/page_compact.hpp"
 
-using pie_cuda_driver::kernels::launch_compact_page_csr;
+using pie_cuda_driver::kernels::attn::compact_page_csr;
 
 namespace {
 
@@ -140,7 +140,7 @@ Csr run_device(
     RT(cudaMemset(d.out_last_lens, 0xEE, std::max(R, 1) * 4));
 
     RT(cudaMalloc(&d.counts, std::max(R, 1) * 4));
-    launch_compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep, d.counts,
+    compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep, d.counts,
                             stride, R, d.out_indices, d.out_indptr,
                             d.out_last_lens, nullptr);
     RT(cudaDeviceSynchronize());
@@ -230,7 +230,7 @@ void bench(int requests, int pages_per_request) {
 
     const int iters = 200;
     for (int i = 0; i < 20; ++i) {
-        launch_compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep,
+        compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep,
                                 d.counts, stride, requests, d.out_indices,
                                 d.out_indptr, d.out_last_lens, nullptr);
     }
@@ -241,7 +241,7 @@ void bench(int requests, int pages_per_request) {
     RT(cudaEventCreate(&end));
     RT(cudaEventRecord(beg, nullptr));
     for (int i = 0; i < iters; ++i) {
-        launch_compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep,
+        compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep,
                                 d.counts, stride, requests, d.out_indices,
                                 d.out_indptr, d.out_last_lens, nullptr);
     }

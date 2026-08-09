@@ -123,6 +123,55 @@ impl Context {
         &self.residency
     }
 
+    /// The same residency set, as an owning handle.
+    ///
+    /// For the allocations that have to take themselves back out of it when
+    /// they die. Borrowing would tie their lifetime to this context, and the
+    /// point of holding it is precisely that they may outlive it: a residency
+    /// set released while it still names a live allocation is the one order
+    /// in which the removal cannot be done.
+    #[must_use]
+    pub fn residency_handle(&self) -> Retained<ProtocolObject<dyn MTLResidencySet>> {
+        self.residency.clone()
+    }
+
+    /// A number that identifies the GPU a compiled binary is valid on.
+    ///
+    /// FNV-1a over the device name, then over the eight bytes of the registry
+    /// ID. Both, because neither is enough on its own: two machines with the
+    /// same model of GPU share a name, and the registry ID is an IOKit entry
+    /// identifier rather than a hardware serial -- it distinguishes two
+    /// devices in one machine but promises nothing across a boot.
+    ///
+    /// The consequence of including the registry ID is worth being explicit
+    /// about, because it is a cost and not a free safety margin: if a reboot
+    /// renumbers the registry, every pipeline archive on disk becomes
+    /// unreachable and the next start recompiles. That is the right way round
+    /// -- a stale key costs one slow start, a colliding key hands one GPU's
+    /// binaries to another -- and the archives are pruned by age anyway.
+    ///
+    /// Only used to salt cache keys, which is why a hash rather than a
+    /// structure: the caller wants a value that differs when the GPU differs,
+    /// not one it can take apart.
+    #[must_use]
+    pub fn cache_id(&self) -> u64 {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = OFFSET;
+        let mut mix = |byte: u8| {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        };
+        for byte in self.device.name().to_string().bytes() {
+            mix(byte);
+        }
+        for byte in self.device.registryID().to_le_bytes() {
+            mix(byte);
+        }
+        hash
+    }
+
     /// What this device will hold resident, in bytes.
     #[must_use]
     pub fn working_set_bytes(&self) -> u64 {

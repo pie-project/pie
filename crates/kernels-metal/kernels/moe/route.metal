@@ -1,0 +1,421 @@
+// Generic MoE routing: select experts, group rows by expert, and combine them.
+//
+// A mixture's problem at prefill is not arithmetic, it is that every (token,
+// slot) pair reads a DIFFERENT expert's weight matrix. The matvec form pays
+// that literally: `rows * experts_per_token` matvecs, each re-reading a whole
+// [N, K] stack slice, so a 512-token prefill reads the same 128 experts four
+// thousand times. Nothing about the shape improves with the batch, which is
+// exactly what the measurements said -- our routed prefill was flat in length
+// where mlx-lm's climbed.
+//
+// The fix is not a wider kernel. It is to put the rows that share an expert
+// NEXT TO EACH OTHER, at which point the projection is an ordinary batched
+// matmul over a contiguous block of rows against one weight slice -- the
+// `affine_qmm_t` this driver already has. The reordering is:
+//
+//   sort    -- a counting sort of the (row, slot) pairs by expert id, laid out
+//              so each expert's run starts on a tile boundary.
+//   gather  -- copy each sorted position's source row into that order.
+//
+// There is no third kernel putting the results back. The sort emits the INVERSE
+// permutation alongside the forward one -- it knows both, at no cost, at the
+// moment it places a pair -- and the combine step reads its k slots through it.
+// Undoing a permutation to feed a kernel that is about to gather anyway is a
+// dispatch and a full-width buffer spent to make an index arithmetic look
+// simpler.
+//
+// Sort and gather also run at M=1. A decode handles eight pairs, which is
+// microseconds -- and it means the routed
+// dataflow has ONE shape rather than a decode shape and a prefill shape that
+// have to be kept agreeing. The batched and unbatched paths differ in exactly
+// one number, `tile_rows`: 1 leaves the sort a pure grouping with no padding
+// and the projections stay matvecs; 16 rounds every expert's run up to a tile
+// and they become matmuls.
+
+#include <metal_stdlib>
+
+using namespace metal;
+
+#include "params.h"
+
+// Top-k over each router-logit row, then a softmax over only the selected
+// values. One threadgroup owns one row and one lane owns one expert.
+//
+// The reduction is threadgroup-wide. Qwen MoE has 128 experts, so reducing
+// independently inside each simdgroup would select four quarter-local maxima;
+// the explicit second level keeps the result correct beyond GPT-OSS's 32.
+constant constexpr uint kRouterMaxTopK = 16;
+constant constexpr uint kRouterMaxSimdgroups = 32;
+
+// SCALED applies Gemma 4's learned per-expert gain after the top-k softmax.
+// Separate instantiations avoid requiring an otherwise-unused scale binding.
+template <typename T, bool SCALED>
+[[kernel]] void router_topk(
+    const device T* logits     [[buffer(0)]],
+    device int* expert_ids     [[buffer(1)]],
+    device T* expert_weights   [[buffer(2)]],
+    constant RouterParams& p   [[buffer(3)]],
+    const device T* per_expert_scale [[buffer(4)]],
+    uint3 lid3 [[thread_position_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint3 tgsize [[threads_per_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]) {
+  const uint lid = lid3.x;
+  const uint n = p.n_experts;
+  const uint k = min(p.experts_per_token, kRouterMaxTopK);
+  const uint n_simd = min((tgsize.x + 31u) / 32u, kRouterMaxSimdgroups);
+  constexpr float NEG_INF = -3.0e38f;
+
+  const uint row = tgid.y;
+  logits += size_t(row) * size_t(p.logits_pitch != 0u ? p.logits_pitch : n);
+  expert_ids += size_t(row) * size_t(k);
+  expert_weights += size_t(row) * size_t(k);
+
+  float v = lid < n ? float(logits[lid]) : NEG_INF;
+
+  threadgroup float part_v[kRouterMaxSimdgroups];
+  threadgroup float part_s[kRouterMaxSimdgroups];
+  threadgroup float all_max;
+  threadgroup float all_sum;
+  threadgroup uint part_i[kRouterMaxSimdgroups];
+  threadgroup float chosen[kRouterMaxTopK];
+  threadgroup uint winner_of_round;
+
+  // `norm_topk_prob: false` wants the softmax taken over EVERY expert and the
+  // top-k read out of it, so the k weights sum to less than one. Take that
+  // denominator here, before the selection loop consumes `v` -- each lane
+  // still holds its own logit and nothing has been knocked out yet.
+  if (p.softmax_over_all != 0u) {
+    const float m0 = simd_max(v);
+    if (simd_lid == 0) part_v[simd_gid] = m0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float best = NEG_INF;
+      for (uint sg = 0; sg < n_simd; ++sg) best = max(best, part_v[sg]);
+      all_max = best;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float e = lid < n ? fast::exp(v - all_max) : 0.0f;
+    const float s0 = simd_sum(e);
+    if (simd_lid == 0) part_s[simd_gid] = s0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      float total = 0.0f;
+      for (uint sg = 0; sg < n_simd; ++sg) total += part_s[sg];
+      all_sum = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (uint r = 0; r < k; ++r) {
+    const float m = simd_max(v);
+    const uint w = simd_min(v == m ? lid : 0xFFFFFFFFu);
+    if (simd_lid == 0) {
+      part_v[simd_gid] = m;
+      part_i[simd_gid] = w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+      float best = NEG_INF;
+      uint best_i = 0xFFFFFFFFu;
+      for (uint sg = 0; sg < n_simd; ++sg) {
+        if (part_v[sg] > best) {
+          best = part_v[sg];
+          best_i = part_i[sg];
+        }
+      }
+      expert_ids[r] = int(best_i);
+      chosen[r] = best;
+      winner_of_round = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == winner_of_round) v = NEG_INF;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (lid == 0) {
+    // Either denominator, one shape: exponentiate against a max and divide by
+    // a sum. Which max and which sum is the whole of `norm_topk_prob`.
+    float mx = all_max;
+    float sum = all_sum;
+    if (p.softmax_over_all == 0u) {
+      mx = NEG_INF;
+      for (uint r = 0; r < k; ++r) mx = max(mx, chosen[r]);
+      sum = 0.0f;
+      for (uint r = 0; r < k; ++r) sum += fast::exp(chosen[r] - mx);
+    }
+    for (uint r = 0; r < k; ++r) {
+      chosen[r] = fast::exp(chosen[r] - mx);
+    }
+    for (uint r = 0; r < k; ++r) {
+      float weight = chosen[r] / sum;
+      if (SCALED) weight *= float(per_expert_scale[uint(expert_ids[r])]);
+      expert_weights[r] = static_cast<T>(weight);
+    }
+  }
+}
+
+#define instantiate_router_topk(name, itype)                       \
+  template [[host_name("router_topk_" #name)]]                     \
+  [[kernel]] void router_topk<itype, false>(                       \
+      const device itype*, device int*, device itype*,             \
+      constant RouterParams&, const device itype*,                 \
+      uint3, uint, uint, uint3, uint3);                            \
+  template [[host_name("router_topk_scaled_" #name)]]              \
+  [[kernel]] void router_topk<itype, true>(                        \
+      const device itype*, device int*, device itype*,             \
+      constant RouterParams&, const device itype*,                 \
+      uint3, uint, uint, uint3, uint3);
+
+instantiate_router_topk(bfloat16, bfloat)
+
+// One lane per expert during the prefix scan, so this is the widest expert
+// count this shape serves. `shared_kernels::kRouterMaxExperts` is the same
+// number and the geometry refuses anything above it.
+constant constexpr uint kMaxExperts = 1024;
+
+/// Group the (row, slot) pairs by expert.
+///
+/// A single threadgroup: the scan is over `n_experts` (tens to hundreds), and
+/// the scatter over `n` (thousands at most), so the parallelism that matters is
+/// in the matmul this feeds, not here. Splitting it would need a global
+/// histogram and a second dispatch to scan it, which is more synchronisation
+/// than the work is worth.
+///
+/// One threadgroup is not the same as one LANE, though, and the difference was
+/// measured: this scan was serial in lane 0 and cost 20 microseconds a layer,
+/// which at 48 layers was most of what the reordering took off decode. There is
+/// one thread per expert, so the prefix over the experts is a two-level simd
+/// scan and each expert writes its own tiles.
+///
+/// Outputs, all indexed by SORTED position:
+///   perm[p]        the (row, slot) pair at p, or -1 for a padding row
+///   row_expert[p]  the expert p reads, for the matvec path
+///   tile_expert[t] the expert tile t reads, or -1 for a tile past the end
+///
+/// and, indexed by PAIR rather than by position, the inverse:
+///
+///   inv[i]         the sorted position of pair i, or -1 if it has no expert
+///
+/// `perm` is a permutation of `[0, n)` followed by padding, never a truncation:
+/// every pair the router chose gets a position, because a pair silently dropped
+/// here is an expert contribution silently zeroed later.
+[[kernel]] void route_sort(
+    const device int* expert_ids [[buffer(0)]],
+    device int* perm            [[buffer(1)]],
+    device int* row_expert      [[buffer(2)]],
+    device int* tile_expert     [[buffer(3)]],
+    constant MoeRouteParams& p  [[buffer(4)]],
+    device int* inv             [[buffer(5)]],
+    uint lid                    [[thread_position_in_threadgroup]],
+    uint nthreads               [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint counts[kMaxExperts];
+    threadgroup uint base[kMaxExperts];
+    threadgroup uint sg_sum[32];
+
+    const uint E = min(p.n_experts, kMaxExperts);
+    const uint tile = p.tile_rows < 1u ? 1u : p.tile_rows;
+    const uint tiles = p.padded / tile;
+
+    // Clear first, and clear EVERYTHING: the padding rows are read by the
+    // gather and the spare tiles by the matmul, so a stale -1 that was never
+    // written is a row of some previous layer's routing.
+    for (uint e = lid; e < E; e += nthreads) atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+    for (uint i = lid; i < p.padded; i += nthreads) {
+        perm[i] = -1;
+        row_expert[i] = 0;
+    }
+    for (uint t = lid; t < tiles; t += nthreads) tile_expert[t] = -1;
+    for (uint i = lid; i < p.n; i += nthreads) inv[i] = -1;
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    for (uint i = lid; i < p.n; i += nthreads) {
+        const int e = expert_ids[i];
+        if (e >= 0 && uint(e) < E) {
+            atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each expert's run, rounded up to a whole tile. An expert nothing routed
+    // to takes no space at all -- the padding is per TOUCHED expert, which is
+    // what keeps the waste bounded when 128 experts see 8 pairs.
+    //
+    // `simd_prefix_exclusive_sum` has to be reached by every lane of the
+    // simdgroup, so the span is computed as zero past `E` rather than branched
+    // around.
+    const uint span = lid < E
+        ? (atomic_load_explicit(&counts[lid], memory_order_relaxed) > 0u
+               ? ((atomic_load_explicit(&counts[lid], memory_order_relaxed) + tile - 1u) / tile) * tile
+               : 0u)
+        : 0u;
+    const uint within = simd_prefix_exclusive_sum(span);
+    const uint sg = lid / 32u;
+    const uint n_sg = (nthreads + 31u) / 32u;
+    // The group total from lane 0 rather than from its last lane. `simd_sum` is
+    // uniform over the whole simdgroup either way, and lane 0 always exists --
+    // where "the last lane" needs a second clause for a partial group that this
+    // dispatch shape can never produce, and so could never be tested.
+    const uint sg_total = simd_sum(span);  // uniform: every lane must reach it
+    if (lid % 32u == 0u) sg_sum[sg] = sg_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // At most 32 simdgroups (1024 threads), so this residual scan is 32 adds in
+    // one lane rather than 1024.
+    if (lid == 0) {
+        uint at = 0;
+        for (uint i = 0; i < n_sg && i < 32u; ++i) {
+            const uint t = sg_sum[i];
+            sg_sum[i] = at;
+            at += t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < E) {
+        const uint at = sg_sum[sg] + within;
+        base[lid] = at;
+        for (uint t = at / tile; t < (at + span) / tile && t < tiles; ++t) {
+            tile_expert[t] = int(lid);
+        }
+        // Reused as the per-expert write cursor by the scatter below.
+        atomic_store_explicit(&counts[lid], 0u, memory_order_relaxed);
+    }
+    // `tile_expert` is device memory but nothing in THIS kernel reads it, and
+    // the device clears above were already published by the first barrier, so
+    // what has to be visible here is `base` and the reset cursors.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lid; i < p.n; i += nthreads) {
+        const int e = expert_ids[i];
+        if (e < 0 || uint(e) >= E) continue;
+        const uint at = base[e] + atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+        if (at < p.padded) {
+            perm[at] = int(i);
+            row_expert[at] = e;
+            inv[i] = int(at);
+        }
+    }
+}
+
+/// Copy each sorted position's source row into sorted order.
+///
+/// `perm[p]` is a (row, slot) pair, so the row it reads is `perm[p] /
+/// experts_per_token` -- the k slots of one token share one activation, which
+/// is why this is a broadcast rather than a permutation of equal sizes.
+///
+/// Padding rows are zeroed rather than left alone. They are multiplied by a
+/// real weight and the result is discarded, so their VALUE never matters -- but
+/// an unwritten row is whatever the pool held, and bf16 garbage can be inf,
+/// which a later `simd_sum` would spread across a tile that does matter.
+[[kernel]] void route_gather(
+    const device bfloat* x     [[buffer(0)]],
+    device bfloat* out         [[buffer(1)]],
+    const device int* perm     [[buffer(2)]],
+    constant MoeRouteParams& p [[buffer(3)]],
+    uint2 gid                  [[thread_position_in_grid]]) {
+    if (gid.x >= p.width || gid.y >= p.padded) return;
+    const int sel = perm[gid.y];
+    const uint k = p.experts_per_token < 1u ? 1u : p.experts_per_token;
+    const uint x_pitch = p.x_pitch != 0u ? p.x_pitch : p.width;
+    out[uint(gid.y) * p.width + gid.x] =
+        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * x_pitch + gid.x];
+}
+
+/// Sum a token's k expert outputs, weighted by the router's softmax, reading
+/// them where the SORT left them.
+///
+/// The same arithmetic as `expert_combine`, and deliberately a separate kernel
+/// rather than that one taught an optional index: every sorted family binds the
+/// inverse, while an unsorted caller should not carry a buffer it never reads.
+///
+/// A slot whose pair never got a position contributes zero. That cannot happen
+/// for a routing the geometry accepted -- every id is in range and every pair
+/// is placed -- but reading `y` at -1 if it ever did would be a wild load, and
+/// the whole reason the sort is a permutation rather than a filter is that a
+/// silently dropped expert is a silently wrong answer.
+[[kernel]] void combine_sorted(
+    const device bfloat* y              [[buffer(0)]],
+    const device bfloat* expert_weights [[buffer(1)]],
+    device bfloat* out                  [[buffer(2)]],
+    constant ExpertCombineParams& p     [[buffer(3)]],
+    const device int* inv               [[buffer(4)]],
+    uint2 gid                           [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  if (c >= p.width) return;
+  const uint row = gid.y;
+  const uint k = p.experts_per_token;
+  float acc = 0;
+  for (uint e = 0; e < k; ++e) {
+    const int at = inv[row * k + e];
+    if (at < 0) continue;
+    acc += float(expert_weights[row * k + e]) * float(y[uint(at) * p.width + c]);
+  }
+  out[row * (p.out_pitch != 0u ? p.out_pitch : p.width) + c] = static_cast<bfloat>(acc);
+}
+
+// ── The shared expert ────────────────────────────────────────────────────────
+//
+// Every routed member of this family -- Qwen3-Next-80B, Qwen3.5-35B-A3B,
+// Qwen3.5-122B-A10B -- runs one DENSE FFN beside the routed bank on every
+// token, and adds it to the mixture's output under a learned gate:
+//
+//   y = routed + sigmoid(shared_expert_gate(x)) * shared_expert(x)
+//
+// The FFN half needs nothing new -- it is the same three projections and the
+// same SwiGLU the dense members of this family already run, at
+// `shared_expert_intermediate_size`. Only this last line is new, and it is new
+// for one reason: the gate is ONE number per token, broadcast across the whole
+// hidden row. `attn_gate` looks like it would serve and does not; its gate is
+// full width, so it would read `hidden` gate values where there is one.
+//
+// Fused rather than a multiply and an add, because the alternative writes the
+// scaled shared output to a full-width scratch buffer that the very next
+// dispatch consumes and nothing else ever reads.
+//
+// The sigmoid is computed in float from a bf16 logit. That matters at the
+// tails: bf16 has eight mantissa bits, so rounding the logit BEFORE the
+// nonlinearity moves the gate by up to a few parts in a thousand, on a term
+// that is added to every token's residual in every routed layer.
+/// The prefill's shape of the same fused line: rows a uniform `row_pitch`
+/// apart, so the whole prompt runs as one dispatch instead of one per token.
+///
+/// The GATE strides too, and that is the part worth stating. It is ONE number
+/// per row, so reading it at `row` rather than `row * row_pitch` looks right
+/// and gives every token row 0's gate -- a plausible answer and the wrong one.
+/// It strides because `qmv_out_size` answers 1 rather than 0 for
+/// `LlSharedGateProj`, which puts it on the projection arm of the prefill's
+/// row-stride binding: its output is written a full pitch apart like every
+/// other projection's.
+[[kernel]] void shared_expert_combine_strided(
+    const device bfloat* routed [[buffer(0)]],
+    const device bfloat* shared [[buffer(1)]],
+    const device bfloat* gate   [[buffer(2)]],
+    device bfloat* out          [[buffer(3)]],
+    constant uint& width        [[buffer(4)]],
+    const constant int& row_pitch [[buffer(5)]],
+    uint2 gid                   [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  if (c >= width) return;
+  const size_t row = size_t(gid.y) * size_t(row_pitch);
+  const float g = 1.0f / (1.0f + metal::exp(-float(gate[row])));
+  const size_t at = row + size_t(c);
+  out[at] = static_cast<bfloat>(float(routed[at]) + g * float(shared[at]));
+}
+
+[[kernel]] void shared_expert_combine(
+    const device bfloat* routed [[buffer(0)]],   // [rows, width]
+    const device bfloat* shared [[buffer(1)]],   // [rows, width]
+    const device bfloat* gate   [[buffer(2)]],   // [rows, 1]
+    device bfloat* out          [[buffer(3)]],   // [rows, width] (may alias routed)
+    constant uint& width        [[buffer(4)]],
+    uint2 gid                   [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  if (c >= width) return;
+  const uint row = gid.y;
+  const float g = 1.0f / (1.0f + metal::exp(-float(gate[row])));
+  const uint at = row * width + c;
+  out[at] = static_cast<bfloat>(float(routed[at]) + g * float(shared[at]));
+}

@@ -167,7 +167,7 @@ fn an_in_place_add_lands_in_the_window_it_reads() {
         .ops
         .iter()
         .find(|o| matches!(&o.kind, OpKind::Launch { kernel, .. }
-                           if kernel == "launch_residual_add_bf16"))
+                           if kernel == "norm::residual_add_bf16"))
         .expect("the plan states the in-place add");
 
     let window = b.offset[sel.outputs[0] as usize];

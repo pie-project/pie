@@ -11,14 +11,14 @@
 //! * **MLA with no rope.** The full-attention half is MLA, and the text
 //!   states no rope on it. That is not an omission: `kimi_k3_forward.cpp`
 //!   says so in its own words ("there is deliberately no
-//!   `launch_rope_bf16` here"), because this family's positional
+//!   `kernels::rope::rope_bf16` here"), because this family's positional
 //!   information rides the KDA layers instead.
 //!
-//! * **SITU, not swiglu.** Every MLP activation here is `launch_situ_bf16`
+//! * **SITU, not swiglu.** Every MLP activation here is `kernels::mlp::situ_bf16`
 //!   / its chunked twin.
 //!
 //! * **An attention-residual BLOCK that spans layers.**
-//!   `launch_attn_res_blend_bf16` blends a block's accumulated prefix
+//!   `kernels::attn::attn_res_blend_bf16` blends a block's accumulated prefix
 //!   back in every `attn_res_block` layers. It is the one statement here
 //!   whose operands are not this layer's — and the reason the block size
 //!   is a fact rather than a loop bound.
@@ -26,7 +26,8 @@
 pub mod facts;
 
 use self::facts::KimiK3Facts;
-use model_compiler::dsl::{self, matmul, rmsnorm, MatW, NormW};
+use model_compiler::dsl::{
+    WeightRepr,self, matmul, MatW, NormW};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct K3LayerW {
@@ -66,6 +67,7 @@ impl K3LayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         let n = |name: &str| NormW {
             name: w(name),
@@ -133,15 +135,15 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     facts.hidden,
                 );
             }
-            let x = rmsnorm(&y, &w.attn_norm);
+            let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
             if facts.is_full_attn(l) {
                 let q_a = matmul(&x, &w.q_a_proj);
-                let q_a_n = rmsnorm(&q_a, &w.q_a_norm);
+                let q_a_n = dsl::cuda::rmsnorm(&q_a, &w.q_a_norm);
                 let q_b = matmul(&q_a_n, &w.q_b_proj);
                 let kv_a = matmul(&x, &w.kv_a_proj);
                 // The split pair, NOT the fused prepare: this family's
-                // MLA carries no rope, and `launch_mla_prepare_bf16` does
+                // MLA carries no rope, and `kernels::attn::mla_prepare_bf16` does
                 // the rope as part of what it fuses.
                 let (kv_c, k_pe) = dsl::cuda::kimi_split_kv_a_norm(
                     &kv_a,
@@ -178,7 +180,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                 // projection produces `[Tokens, width]`. Same elements
                 // per token, different rank, and the DSL has no rank-3
                 // projection and no `cuda::` twin for
-                // `launch_sigmoid_gate_inplace_bf16` (it is an EMITTED
+                // `kernels::mlp::sigmoid_gate_inplace_bf16` (it is an EMITTED
                 // symbol, produced by the lowering from the semantic op,
                 // so it is deliberately not a `kernel!` row either).
                 //
@@ -258,7 +260,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
             }
 
             // ── MLP / MoE ────────────────────────────────────────────
-            let m = rmsnorm(&y, &w.mlp_norm);
+            let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             if !facts.is_moe_layer(l) {
                 let gate = matmul(&m, &w.dense_gate);
                 let _up = matmul(&m, &w.dense_up);
@@ -276,6 +278,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     name: format!("layer.{l}.expert.{{e}}.gate_up"),
                     width: 2 * facts.moe.moe_intermediate,
                     layer: Some(l),
+                    repr: WeightRepr::Bf16,
                 },
                 facts.moe.top_k,
                 facts.moe.moe_intermediate,
@@ -288,6 +291,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     name: format!("layer.{l}.expert.{{e}}.down"),
                     width: facts.hidden,
                     layer: Some(l),
+                    repr: WeightRepr::Bf16,
                 },
                 facts.moe.top_k,
                 facts.hidden,
@@ -306,7 +310,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".to_string(),

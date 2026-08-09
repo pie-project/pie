@@ -21,10 +21,11 @@
 #include <cuda_runtime.h>
 
 #include "support/host_eval.hpp"
-#include "pipeline/tier0/tier0_kernels.cuh"
+#include "ptir/tier0.cuh"
 #include "pipeline/tier0/tier0_launch.hpp"
 
 using namespace pie_cuda_driver::pipeline;
+namespace kernels = pie_cuda_driver::kernels;
 
 namespace {
 
@@ -96,24 +97,24 @@ void check(const std::string& name, const std::vector<T>& got, const std::vector
     }
 }
 
-constexpr int GS(std::uint64_t n, int b = kTier0Block) { return (int)((n + b - 1) / b); }
+constexpr int GS(std::uint64_t n, int b = kernels::ptir::kTier0Block) { return (int)((n + b - 1) / b); }
 
 void test_map() {
     std::vector<float> a{1, 2, 3, 4, 5, 6, -7, 8};
     std::vector<float> b{2, 2, 2, 3, 5, 4,  2, 3};
     float *da = dev_from(a), *db = dev_from(b), *dout = dev_alloc<float>(a.size());
-    for (auto [k, nm] : {std::pair{BinKind::Add, "add"}, {BinKind::Sub, "sub"},
-                         {BinKind::Mul, "mul"}, {BinKind::Div, "div"}, {BinKind::Rem, "rem"}}) {
-        k_binary<float><<<GS(a.size()), kTier0Block>>>(da, db, dout, a.size(), k);
+    for (auto [k, nm] : {std::pair{kernels::ptir::BinKind::Add, "add"}, {kernels::ptir::BinKind::Sub, "sub"},
+                         {kernels::ptir::BinKind::Mul, "mul"}, {kernels::ptir::BinKind::Div, "div"}, {kernels::ptir::BinKind::Rem, "rem"}}) {
+        kernels::ptir::k_binary<float><<<GS(a.size()), kernels::ptir::kTier0Block>>>(da, db, dout, a.size(), k);
         CUDA_OK(cudaDeviceSynchronize());
         check(nm, to_host(dout, a.size()), host_eval::binary(k, a, b));
     }
-    for (auto [k, nm] : {std::pair{UnKind::Neg, "neg"}, {UnKind::Exp, "exp"}, {UnKind::Log, "log"}}) {
+    for (auto [k, nm] : {std::pair{kernels::ptir::UnKind::Neg, "neg"}, {kernels::ptir::UnKind::Exp, "exp"}, {kernels::ptir::UnKind::Log, "log"}}) {
         std::vector<float> pos{0.5f, 1, 2, 3, 4, 5, 6, 7};
         float* dp = dev_from(pos);
-        k_unary<float><<<GS(pos.size()), kTier0Block>>>((k == UnKind::Neg ? da : dp), dout, pos.size(), k);
+        kernels::ptir::k_unary<float><<<GS(pos.size()), kernels::ptir::kTier0Block>>>((k == kernels::ptir::UnKind::Neg ? da : dp), dout, pos.size(), k);
         CUDA_OK(cudaDeviceSynchronize());
-        check(nm, to_host(dout, pos.size()), host_eval::unary(k, (k == UnKind::Neg ? a : pos)));
+        check(nm, to_host(dout, pos.size()), host_eval::unary(k, (k == kernels::ptir::UnKind::Neg ? a : pos)));
         CUDA_OK(cudaFree(dp));
     }
     CUDA_OK(cudaFree(da)); CUDA_OK(cudaFree(db)); CUDA_OK(cudaFree(dout));
@@ -124,32 +125,32 @@ void test_compare_logic_select_cast() {
     std::vector<float> b{1, 3, 2, 4, 1, 3, 9, 0};
     float *da = dev_from(a), *db = dev_from(b);
     std::uint8_t* dbool = dev_alloc<std::uint8_t>(a.size());
-    for (auto [k, nm] : {std::pair{CmpKind::Eq, "eq"}, {CmpKind::Ne, "ne"}, {CmpKind::Lt, "lt"},
-                         {CmpKind::Le, "le"}, {CmpKind::Gt, "gt"}, {CmpKind::Ge, "ge"}}) {
-        k_compare<float><<<GS(a.size()), kTier0Block>>>(da, db, dbool, a.size(), k);
+    for (auto [k, nm] : {std::pair{kernels::ptir::CmpKind::Eq, "eq"}, {kernels::ptir::CmpKind::Ne, "ne"}, {kernels::ptir::CmpKind::Lt, "lt"},
+                         {kernels::ptir::CmpKind::Le, "le"}, {kernels::ptir::CmpKind::Gt, "gt"}, {kernels::ptir::CmpKind::Ge, "ge"}}) {
+        kernels::ptir::k_compare<float><<<GS(a.size()), kernels::ptir::kTier0Block>>>(da, db, dbool, a.size(), k);
         CUDA_OK(cudaDeviceSynchronize());
         check(nm, to_host(dbool, a.size()), host_eval::compare(k, a, b));
     }
     std::vector<std::uint8_t> p{1, 0, 1, 1, 0, 0, 1, 0}, q{1, 1, 0, 1, 0, 1, 1, 0};
     std::uint8_t *dp = dev_from(p), *dq = dev_from(q), *dr = dev_alloc<std::uint8_t>(p.size());
-    for (auto [k, nm] : {std::pair{LogicKind::And, "and"}, {LogicKind::Or, "or"}}) {
-        k_logic<<<GS(p.size()), kTier0Block>>>(dp, dq, dr, p.size(), k);
+    for (auto [k, nm] : {std::pair{kernels::ptir::LogicKind::And, "and"}, {kernels::ptir::LogicKind::Or, "or"}}) {
+        kernels::ptir::k_logic<<<GS(p.size()), kernels::ptir::kTier0Block>>>(dp, dq, dr, p.size(), k);
         CUDA_OK(cudaDeviceSynchronize());
         check(nm, to_host(dr, p.size()), host_eval::logic(k, p, q));
     }
-    k_not<<<GS(p.size()), kTier0Block>>>(dp, dr, p.size());
+    kernels::ptir::k_not<<<GS(p.size()), kernels::ptir::kTier0Block>>>(dp, dr, p.size());
     CUDA_OK(cudaDeviceSynchronize());
     check("not", to_host(dr, p.size()), host_eval::logic_not(p));
 
     // select
     float* dsel = dev_alloc<float>(a.size());
-    k_select<float><<<GS(a.size()), kTier0Block>>>(dp, da, db, dsel, a.size());
+    kernels::ptir::k_select<float><<<GS(a.size()), kernels::ptir::kTier0Block>>>(dp, da, db, dsel, a.size());
     CUDA_OK(cudaDeviceSynchronize());
     check("select", to_host(dsel, a.size()), host_eval::select(p, a, b));
 
     // cast f32 -> i32 and u32 -> f32
     std::int32_t* dcast = dev_alloc<std::int32_t>(a.size());
-    k_cast<float, std::int32_t><<<GS(a.size()), kTier0Block>>>(da, dcast, a.size());
+    kernels::ptir::k_cast<float, std::int32_t><<<GS(a.size()), kernels::ptir::kTier0Block>>>(da, dcast, a.size());
     CUDA_OK(cudaDeviceSynchronize());
     check("cast_f32_i32", to_host(dcast, a.size()), host_eval::cast<float, std::int32_t>(a));
 
@@ -161,7 +162,7 @@ void test_compare_logic_select_cast() {
 void test_index() {
     std::uint32_t n = 300;   // > one block, exercises grid-stride
     std::uint32_t* diota = dev_alloc<std::uint32_t>(n);
-    k_iota<<<GS(n), kTier0Block>>>(diota, n);
+    kernels::ptir::k_iota<<<GS(n), kernels::ptir::kTier0Block>>>(diota, n);
     CUDA_OK(cudaDeviceSynchronize());
     check("iota", to_host(diota, n), host_eval::iota(n));
 
@@ -170,8 +171,8 @@ void test_index() {
     float* dsrc = dev_from(src);
     std::int32_t* didx = dev_from(idx);
     float* dg = dev_alloc<float>(idx.size() * 2);
-    k_gather_axis0<float, std::int32_t><<<
-        GS(idx.size() * 2), kTier0Block>>>(
+    kernels::ptir::k_gather_axis0<float, std::int32_t><<<
+        GS(idx.size() * 2), kernels::ptir::kTier0Block>>>(
         dsrc, didx, dg, idx.size(), 4, 2);
     CUDA_OK(cudaDeviceSynchronize());
     check(
@@ -187,7 +188,7 @@ void test_index() {
     float* dbase = dev_from(base);
     std::int32_t* dsidx = dev_from(sidx);
     float* dvals = dev_from(vals);
-    k_scatter_axis0_serial<float, std::int32_t, false><<<1, 1>>>(
+    kernels::ptir::k_scatter_axis0_serial<float, std::int32_t, false><<<1, 1>>>(
         dbase, dsidx, dvals, sidx.size(), 4, 2, false);
     CUDA_OK(cudaDeviceSynchronize());
     check(
@@ -208,33 +209,33 @@ void test_reduce_scan() {
     float* din = dev_from(in);
 
     float* dred = dev_alloc<float>(rows);
-    for (auto [k, nm] : {std::pair{RedKind::Sum, "reduce_sum"}, {RedKind::Max, "reduce_max"}}) {
-        k_reduce<float><<<rows, kCanonicalReduceWidth>>>(din, dred, rows, len, k);
+    for (auto [k, nm] : {std::pair{kernels::ptir::RedKind::Sum, "reduce_sum"}, {kernels::ptir::RedKind::Max, "reduce_max"}}) {
+        kernels::ptir::k_reduce<float><<<rows, kernels::ptir::kCanonicalReduceWidth>>>(din, dred, rows, len, k);
         CUDA_OK(cudaDeviceSynchronize());
         check(nm, to_host(dred, rows), host_eval::reduce(k, in, rows, len));
     }
     std::uint32_t* darg = dev_alloc<std::uint32_t>(rows);
-    k_reduce_argmax<<<rows, kTier0Block>>>(din, darg, rows, len);
+    kernels::ptir::k_reduce_argmax<<<rows, kernels::ptir::kTier0Block>>>(din, darg, rows, len);
     CUDA_OK(cudaDeviceSynchronize());
     check("reduce_argmax", to_host(darg, rows), host_eval::reduce_argmax(in, rows, len));
 
     std::vector<float> contract{1.0e20f, 1.0f, -1.0e20f, 1.0f};
     float* dcontract = dev_from(contract);
-    k_reduce<float><<<1, kCanonicalReduceWidth>>>(
-        dcontract, dred, 1, contract.size(), RedKind::Sum);
+    kernels::ptir::k_reduce<float><<<1, kernels::ptir::kCanonicalReduceWidth>>>(
+        dcontract, dred, 1, contract.size(), kernels::ptir::RedKind::Sum);
     CUDA_OK(cudaDeviceSynchronize());
     check("reduce_sum canonical tree", to_host(dred, 1), std::vector<float>{2.0f});
     std::vector<float> nan_arg{std::nanf(""), -INFINITY};
     float* dnan_arg = dev_from(nan_arg);
-    k_reduce_argmax<<<1, kTier0Block>>>(dnan_arg, darg, 1, nan_arg.size());
+    kernels::ptir::k_reduce_argmax<<<1, kernels::ptir::kTier0Block>>>(dnan_arg, darg, 1, nan_arg.size());
     CUDA_OK(cudaDeviceSynchronize());
     check("reduce_argmax NaN/-inf", to_host(darg, 1), std::vector<std::uint32_t>{1});
     std::vector<float> signed_zero{-0.0f, 0.0f};
     float* dsigned_zero = dev_from(signed_zero);
     for (auto [kind, negative, name] : {
-             std::tuple{RedKind::Max, false, "reduce_max signed zero"},
-             std::tuple{RedKind::Min, true, "reduce_min signed zero"}}) {
-        k_reduce<float><<<1, kCanonicalReduceWidth>>>(
+             std::tuple{kernels::ptir::RedKind::Max, false, "reduce_max signed zero"},
+             std::tuple{kernels::ptir::RedKind::Min, true, "reduce_min signed zero"}}) {
+        kernels::ptir::k_reduce<float><<<1, kernels::ptir::kCanonicalReduceWidth>>>(
             dsigned_zero, dred, 1, signed_zero.size(), kind);
         CUDA_OK(cudaDeviceSynchronize());
         const float value = to_host(dred, 1)[0];
@@ -249,12 +250,12 @@ void test_reduce_scan() {
     }
 
     float* dscan = dev_alloc<float>(in.size());
-    for (auto [k, nm] : {std::pair{ScanKind::Sum, "cumsum"}, {ScanKind::Prod, "cumprod"}}) {
+    for (auto [k, nm] : {std::pair{kernels::ptir::ScanKind::Sum, "cumsum"}, {kernels::ptir::ScanKind::Prod, "cumprod"}}) {
         // cumprod on small magnitudes to stay finite
         std::vector<float> src = in;
-        if (k == ScanKind::Prod) for (auto& v : src) v = 0.99f + 0.001f * v;
+        if (k == kernels::ptir::ScanKind::Prod) for (auto& v : src) v = 0.99f + 0.001f * v;
         float* ds = dev_from(src);
-        k_scan<float><<<rows, kTier0Block>>>(ds, dscan, rows, len, k);
+        kernels::ptir::k_scan<float><<<rows, kernels::ptir::kTier0Block>>>(ds, dscan, rows, len, k);
         CUDA_OK(cudaDeviceSynchronize());
         check(nm, to_host(dscan, in.size()), host_eval::scan(k, src, rows, len));
         CUDA_OK(cudaFree(ds));
@@ -275,7 +276,7 @@ void test_order_library() {
     std::uint32_t tk = 4;
     float* dtv = dev_alloc<float>((std::size_t)rows * tk);
     std::uint32_t* dti = dev_alloc<std::uint32_t>((std::size_t)rows * tk);
-    k_topk_rows<<<rows, kTier0Block, len * sizeof(std::uint8_t)>>>(dlog, dtv, dti, rows, len, tk);
+    kernels::ptir::k_topk_rows<<<rows, kernels::ptir::kTier0Block, len * sizeof(std::uint8_t)>>>(dlog, dtv, dti, rows, len, tk);
     CUDA_OK(cudaDeviceSynchronize());
     std::vector<float> hv; std::vector<std::uint32_t> hi;
     host_eval::topk(logits, rows, len, tk, hv, hi);
@@ -289,8 +290,8 @@ void test_order_library() {
 // pivot_threshold's three DYNAMIC predicates (tier0_launch.hpp PivotThreshold
 // dispatch): unlike the standalone `rank_le` above (an immediate `k`), the
 // predicate payload here is ALWAYS a resolved device value (scalar or
-// per-row) — exercises k_pivot_rankle<I32/U32> (dynamic k + NaN contract),
-// k_pivot_probge (dynamic threshold), and k_pivot_cummassle (the CTA
+// per-row) — exercises kernels::ptir::k_pivot_rankle<I32/U32> (dynamic k + NaN contract),
+// kernels::ptir::k_pivot_probge (dynamic threshold), and kernels::ptir::k_pivot_cummassle (the CTA
 // selection loop, incl. a 151936-token peaked-vocab scale smoke test — the
 // "practical for 151k vocab" requirement).
 void test_pivot_predicates() {
@@ -306,7 +307,7 @@ void test_pivot_predicates() {
         float* dx = dev_from(x);
         std::uint32_t* dk = dev_from(k);
         std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
-        k_pivot_rankle<std::uint32_t><<<rows, kTier0Block>>>(dx, dout, rows, len, dk, (std::uint32_t)k.size());
+        kernels::ptir::k_pivot_rankle<std::uint32_t><<<rows, kernels::ptir::kTier0Block>>>(dx, dout, rows, len, dk, (std::uint32_t)k.size());
         CUDA_OK(cudaDeviceSynchronize());
         check("pivot.rank_le (u32, per-row, NaN-safe)", to_host(dout, x.size()),
               host_eval::pivot_rankle<std::uint32_t>(x, rows, len, k, (std::uint32_t)k.size()));
@@ -320,7 +321,7 @@ void test_pivot_predicates() {
         float* dx = dev_from(x);
         std::int32_t* dk = dev_from(k);
         std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
-        k_pivot_rankle<std::int32_t><<<rows, kTier0Block>>>(dx, dout, rows, len, dk, 1u);
+        kernels::ptir::k_pivot_rankle<std::int32_t><<<rows, kernels::ptir::kTier0Block>>>(dx, dout, rows, len, dk, 1u);
         CUDA_OK(cudaDeviceSynchronize());
         check("pivot.rank_le (i32, scalar broadcast)", to_host(dout, x.size()),
               host_eval::pivot_rankle<std::int32_t>(x, rows, len, k, 1u));
@@ -347,7 +348,7 @@ void test_pivot_predicates() {
         float* dx = dev_from(x);
         std::uint32_t* dk = dev_from(k);
         std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
-        k_pivot_rankle<std::uint32_t><<<rows, kTier0Block>>>(dx, dout, rows, len, dk, (std::uint32_t)k.size());
+        kernels::ptir::k_pivot_rankle<std::uint32_t><<<rows, kernels::ptir::kTier0Block>>>(dx, dout, rows, len, dk, (std::uint32_t)k.size());
         CUDA_OK(cudaDeviceSynchronize());
         check("pivot.rank_le (ties/±0/NaN, k at clamp bounds)", to_host(dout, x.size()),
               host_eval::pivot_rankle<std::uint32_t>(x, rows, len, k, (std::uint32_t)k.size()));
@@ -377,7 +378,7 @@ void test_pivot_predicates() {
         CUDA_OK(cudaEventCreate(&start));
         CUDA_OK(cudaEventCreate(&stop));
         CUDA_OK(cudaEventRecord(start));
-        k_pivot_rankle<std::uint32_t><<<rows, kTier0Block>>>(dx, dout, rows, len, dk, 1u);
+        kernels::ptir::k_pivot_rankle<std::uint32_t><<<rows, kernels::ptir::kTier0Block>>>(dx, dout, rows, len, dk, 1u);
         CUDA_OK(cudaEventRecord(stop));
         CUDA_OK(cudaEventSynchronize(stop));
         float elapsed_ms = 0.0f;
@@ -410,7 +411,7 @@ void test_pivot_predicates() {
         float* dx = dev_from(x);
         float* dthr = dev_from(thr);
         std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
-        k_pivot_probge<<<GS((std::uint64_t)rows * len), kTier0Block>>>(dx, dout, rows, len, dthr, (std::uint32_t)thr.size());
+        kernels::ptir::k_pivot_probge<<<GS((std::uint64_t)rows * len), kernels::ptir::kTier0Block>>>(dx, dout, rows, len, dthr, (std::uint32_t)thr.size());
         CUDA_OK(cudaDeviceSynchronize());
         check("pivot.prob_ge (per-row)", to_host(dout, x.size()),
               host_eval::pivot_probge(x, rows, len, thr, (std::uint32_t)thr.size()));
@@ -426,7 +427,7 @@ void test_pivot_predicates() {
         float* dx = dev_from(x);
         float* dp = dev_from(p);
         std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
-        k_pivot_cummassle<<<rows, kTier0Block>>>(dx, dout, rows, len, dp, (std::uint32_t)p.size());
+        kernels::ptir::k_pivot_cummassle<<<rows, kernels::ptir::kTier0Block>>>(dx, dout, rows, len, dp, (std::uint32_t)p.size());
         CUDA_OK(cudaDeviceSynchronize());
         check("pivot.cummass_le (ties + NaN, per-row p)", to_host(dout, x.size()),
               host_eval::pivot_cummassle(x, rows, len, p, (std::uint32_t)p.size()));
@@ -449,7 +450,7 @@ void test_pivot_predicates() {
         CUDA_OK(cudaEventCreate(&start));
         CUDA_OK(cudaEventCreate(&stop));
         CUDA_OK(cudaEventRecord(start));
-        k_pivot_cummassle<<<rows, kTier0Block>>>(dx, dout, rows, len, dp, 1u);
+        kernels::ptir::k_pivot_cummassle<<<rows, kernels::ptir::kTier0Block>>>(dx, dout, rows, len, dp, 1u);
         CUDA_OK(cudaEventRecord(stop));
         CUDA_OK(cudaEventSynchronize(stop));
         float elapsed_ms = 0.0f;
@@ -482,10 +483,10 @@ void test_shape_linear() {
     float* dscal = dev_from(scal);
     float* dpr = dev_from(per_row);
     float* dbc = dev_alloc<float>((std::size_t)rows * len);
-    k_broadcast<float><<<GS((std::uint64_t)rows * len), kTier0Block>>>(dscal, dbc, rows, len, 0);
+    kernels::ptir::k_broadcast<float><<<GS((std::uint64_t)rows * len), kernels::ptir::kTier0Block>>>(dscal, dbc, rows, len, 0);
     CUDA_OK(cudaDeviceSynchronize());
     check("broadcast_scalar", to_host(dbc, (std::size_t)rows * len), host_eval::broadcast(scal, rows, len, 0));
-    k_broadcast<float><<<GS((std::uint64_t)rows * len), kTier0Block>>>(dpr, dbc, rows, len, 1);
+    kernels::ptir::k_broadcast<float><<<GS((std::uint64_t)rows * len), kernels::ptir::kTier0Block>>>(dpr, dbc, rows, len, 1);
     CUDA_OK(cudaDeviceSynchronize());
     check("broadcast_row", to_host(dbc, (std::size_t)rows * len), host_eval::broadcast(per_row, rows, len, 1));
 
@@ -495,7 +496,7 @@ void test_shape_linear() {
     float* dm = dev_from(m);
     float* dt = dev_alloc<float>(m.size());
     dim3 blk(16, 16), grd((len + 15) / 16, (rows + 15) / 16);
-    k_transpose<float><<<grd, blk>>>(dm, dt, rows, len);
+    kernels::ptir::k_transpose<float><<<grd, blk>>>(dm, dt, rows, len);
     CUDA_OK(cudaDeviceSynchronize());
     check("transpose", to_host(dt, m.size()), host_eval::transpose(m, rows, len));
 
@@ -508,7 +509,7 @@ void test_shape_linear() {
     float* dB = dev_from(B);
     float* dC = dev_alloc<float>((std::size_t)M * N);
     dim3 mblk(32, 1), mgrd((N + 31) / 32, M);
-    k_matmul<<<mgrd, mblk>>>(dA, dB, dC, M, K, N);
+    kernels::ptir::k_matmul<<<mgrd, mblk>>>(dA, dB, dC, M, K, N);
     CUDA_OK(cudaDeviceSynchronize());
     check("matmul", to_host(dC, (std::size_t)M * N), host_eval::matmul(A, B, M, K, N));
 
@@ -522,8 +523,8 @@ void test_new_ops() {
     std::vector<float> a{1, 5, 3, 8, 2, 6, -7, 4};
     std::vector<float> b{2, 2, 9, 3, 5, 4, -2, 3};
     float *da = dev_from(a), *db = dev_from(b), *dout = dev_alloc<float>(a.size());
-    for (auto [k, nm] : {std::pair{BinKind::MaxElem, "max_elem"}, {BinKind::MinElem, "min_elem"}}) {
-        k_binary<float><<<GS(a.size()), kTier0Block>>>(da, db, dout, a.size(), k);
+    for (auto [k, nm] : {std::pair{kernels::ptir::BinKind::MaxElem, "max_elem"}, {kernels::ptir::BinKind::MinElem, "min_elem"}}) {
+        kernels::ptir::k_binary<float><<<GS(a.size()), kernels::ptir::kTier0Block>>>(da, db, dout, a.size(), k);
         CUDA_OK(cudaDeviceSynchronize());
         check(nm, to_host(dout, a.size()), host_eval::binary(k, a, b));
     }
@@ -643,14 +644,14 @@ void test_new_ops() {
         };
         for (const auto& [kind, name, expected] :
              std::vector<std::tuple<
-                 UnKind,
+                 kernels::ptir::UnKind,
                  const char*,
                  std::vector<std::int32_t>>>{
-                 {UnKind::Neg, "i32.neg", expected_neg},
-                 {UnKind::Abs, "i32.abs", expected_abs},
-                 {UnKind::Sign, "i32.sign", expected_sign},
+                 {kernels::ptir::UnKind::Neg, "i32.neg", expected_neg},
+                 {kernels::ptir::UnKind::Abs, "i32.abs", expected_abs},
+                 {kernels::ptir::UnKind::Sign, "i32.sign", expected_sign},
              }) {
-            k_unary<std::int32_t><<<GS(input.size()), kTier0Block>>>(
+            kernels::ptir::k_unary<std::int32_t><<<GS(input.size()), kernels::ptir::kTier0Block>>>(
                 device_input, device_output, input.size(), kind);
             CUDA_OK(cudaDeviceSynchronize());
             check(name, to_host(device_output, input.size()), expected);
@@ -677,22 +678,22 @@ void test_new_ops() {
         auto* unsigned_device = dev_from(unsigned_input);
         auto* unsigned_output =
             dev_alloc<std::uint32_t>(unsigned_input.size());
-        k_unary<std::uint32_t><<<GS(unsigned_input.size()), kTier0Block>>>(
+        kernels::ptir::k_unary<std::uint32_t><<<GS(unsigned_input.size()), kernels::ptir::kTier0Block>>>(
             unsigned_device,
             unsigned_output,
             unsigned_input.size(),
-            UnKind::Neg);
+            kernels::ptir::UnKind::Neg);
         CUDA_OK(cudaDeviceSynchronize());
         check(
             "u32.neg",
             to_host(unsigned_output, unsigned_input.size()),
             std::vector<std::uint32_t>{
                 0, 0xffffffffu, 0xfeffffffu, 1});
-        k_unary<std::uint32_t><<<GS(unsigned_input.size()), kTier0Block>>>(
+        kernels::ptir::k_unary<std::uint32_t><<<GS(unsigned_input.size()), kernels::ptir::kTier0Block>>>(
             unsigned_device,
             unsigned_output,
             unsigned_input.size(),
-            UnKind::Sign);
+            kernels::ptir::UnKind::Sign);
         CUDA_OK(cudaDeviceSynchronize());
         check(
             "u32.sign",
@@ -766,12 +767,12 @@ void test_new_ops() {
         };
         auto* reduction_device = dev_from(reduction_input);
         auto* reduction_output = dev_alloc<std::int32_t>(rows);
-        k_reduce<std::int32_t><<<rows, kCanonicalReduceWidth>>>(
+        kernels::ptir::k_reduce<std::int32_t><<<rows, kernels::ptir::kCanonicalReduceWidth>>>(
             reduction_device,
             reduction_output,
             rows,
             len,
-            RedKind::Sum);
+            kernels::ptir::RedKind::Sum);
         CUDA_OK(cudaDeviceSynchronize());
         check(
             "i32.reduce_sum",
@@ -797,24 +798,24 @@ void test_new_ops() {
             std::vector<std::int32_t>{
                 std::numeric_limits<std::int32_t>::min(),
                 std::numeric_limits<std::int32_t>::min()});
-        k_reduce<std::int32_t><<<rows, kCanonicalReduceWidth>>>(
+        kernels::ptir::k_reduce<std::int32_t><<<rows, kernels::ptir::kCanonicalReduceWidth>>>(
             reduction_device,
             reduction_output,
             rows,
             len,
-            RedKind::Max);
+            kernels::ptir::RedKind::Max);
         CUDA_OK(cudaDeviceSynchronize());
         check(
             "i32.reduce_max",
             to_host(reduction_output, rows),
             std::vector<std::int32_t>{
                 std::numeric_limits<std::int32_t>::max(), 1});
-        k_reduce<std::int32_t><<<rows, kCanonicalReduceWidth>>>(
+        kernels::ptir::k_reduce<std::int32_t><<<rows, kernels::ptir::kCanonicalReduceWidth>>>(
             reduction_device,
             reduction_output,
             rows,
             len,
-            RedKind::Min);
+            kernels::ptir::RedKind::Min);
         CUDA_OK(cudaDeviceSynchronize());
         check(
             "i32.reduce_min",
@@ -830,8 +831,8 @@ void test_new_ops() {
         CUDA_OK(cudaFree(device_input));
     };
     test_integer_semantics();
-    for (auto [k, nm] : {std::pair{UnKind::Recip, "recip"}, {UnKind::Abs, "abs"}, {UnKind::Sign, "sign"}}) {
-        k_unary<float><<<GS(a.size()), kTier0Block>>>(da, dout, a.size(), k);
+    for (auto [k, nm] : {std::pair{kernels::ptir::UnKind::Recip, "recip"}, {kernels::ptir::UnKind::Abs, "abs"}, {kernels::ptir::UnKind::Sign, "sign"}}) {
+        kernels::ptir::k_unary<float><<<GS(a.size()), kernels::ptir::kTier0Block>>>(da, dout, a.size(), k);
         CUDA_OK(cudaDeviceSynchronize());
         check(nm, to_host(dout, a.size()), host_eval::unary(k, a));
     }
@@ -840,9 +841,9 @@ void test_new_ops() {
     std::vector<float> m{3, 1, 4, 1, 9, 2, 6, 5};
     float* dm = dev_from(m);
     float* dr = dev_alloc<float>(rows);
-    k_reduce<float><<<rows, kCanonicalReduceWidth>>>(dm, dr, rows, len, RedKind::Min);
+    kernels::ptir::k_reduce<float><<<rows, kernels::ptir::kCanonicalReduceWidth>>>(dm, dr, rows, len, kernels::ptir::RedKind::Min);
     CUDA_OK(cudaDeviceSynchronize());
-    check("reduce_min", to_host(dr, rows), host_eval::reduce(RedKind::Min, m, rows, len));
+    check("reduce_min", to_host(dr, rows), host_eval::reduce(kernels::ptir::RedKind::Min, m, rows, len));
 
     // gather_row: one scalar column selection per source row.
     std::vector<float> src{0,1,2, 3,4,5, 6,7,8, 9,10,11};
@@ -850,8 +851,8 @@ void test_new_ops() {
     float* dsrc = dev_from(src);
     std::int32_t* didx = dev_from(idx);
     float* dgr = dev_alloc<float>(idx.size());
-    k_gather_row<float, std::int32_t><<<
-        GS(idx.size()), kTier0Block>>>(
+    kernels::ptir::k_gather_row<float, std::int32_t><<<
+        GS(idx.size()), kernels::ptir::kTier0Block>>>(
         dsrc, didx, dgr, idx.size(), 3);
     CUDA_OK(cudaDeviceSynchronize());
     check(
@@ -868,7 +869,7 @@ void test_new_ops() {
     std::uint32_t* dsidx = dev_from(sidx);
     float* dvals = dev_from(vals);
     CUDA_OK(cudaMemcpy(dbase, base.data(), base.size()*sizeof(float), cudaMemcpyHostToDevice));
-    k_scatter_axis0_serial<float, std::uint32_t, true><<<1,1>>>(
+    kernels::ptir::k_scatter_axis0_serial<float, std::uint32_t, true><<<1,1>>>(
         dbase, dsidx, dvals, sidx.size(), 3, 2, true);
     CUDA_OK(cudaDeviceSynchronize());
     check(
@@ -882,7 +883,7 @@ void test_new_ops() {
     float* dsv = dev_from(sv);
     float* dsval = dev_alloc<float>(sv.size());
     std::uint32_t* dsidx2 = dev_alloc<std::uint32_t>(sv.size());
-    k_topk_rows<<<sr, kTier0Block, sl*sizeof(std::uint8_t)>>>(dsv, dsval, dsidx2, sr, sl, sl);
+    kernels::ptir::k_topk_rows<<<sr, kernels::ptir::kTier0Block, sl*sizeof(std::uint8_t)>>>(dsv, dsval, dsidx2, sr, sl, sl);
     CUDA_OK(cudaDeviceSynchronize());
     std::vector<float> ev; std::vector<std::uint32_t> ei;
     host_eval::sort_desc(sv, sr, sl, ev, ei);
@@ -904,7 +905,7 @@ void test_new_ops() {
     float* adversarial_values = dev_alloc<float>(adversarial.size());
     std::uint32_t* adversarial_indices =
         dev_alloc<std::uint32_t>(adversarial.size());
-    k_topk_rows<<<1, kTier0Block>>>(
+    kernels::ptir::k_topk_rows<<<1, kernels::ptir::kTier0Block>>>(
         adversarial_device,
         adversarial_values,
         adversarial_indices,
@@ -959,7 +960,7 @@ void test_new_ops() {
         CUDA_OK(cudaEventCreate(&start));
         CUDA_OK(cudaEventCreate(&stop));
         CUDA_OK(cudaEventRecord(start));
-        k_topk_rows<<<rows_big, kTier0Block>>>(dbig, dbv, dbi, rows_big, len_big, k_big);
+        kernels::ptir::k_topk_rows<<<rows_big, kernels::ptir::kTier0Block>>>(dbig, dbv, dbi, rows_big, len_big, k_big);
         CUDA_OK(cudaEventRecord(stop));
         CUDA_OK(cudaEventSynchronize(stop));
         float elapsed_ms = 0.0f;
@@ -1012,7 +1013,7 @@ void test_new_ops() {
     float* dplog = dev_from(plog);
     std::uint32_t* dpmask = dev_from(pmask);
     float* dpout = dev_alloc<float>(plog.size());
-    k_mask_apply_packed<<<GS(plog.size()), kTier0Block>>>(dplog, dpmask, dpout, pr, pl, pw);
+    kernels::ptir::k_mask_apply_packed<<<GS(plog.size()), kernels::ptir::kTier0Block>>>(dplog, dpmask, dpout, pr, pl, pw);
     CUDA_OK(cudaDeviceSynchronize());
     check("mask_apply_packed", to_host(dpout, plog.size()), host_eval::mask_apply_packed(plog, pmask, pr, pl, pw));
 
@@ -1021,10 +1022,10 @@ void test_new_ops() {
     std::uint32_t* dstate = dev_from(state);
     std::uint32_t rn = 32;
     float* drk = dev_alloc<float>(rn);
-    k_rng_keyed<<<GS(rn), kTier0Block>>>(dstate, drk, rn, 0);
+    kernels::ptir::k_rng_keyed<<<GS(rn), kernels::ptir::kTier0Block>>>(dstate, drk, rn, 0);
     CUDA_OK(cudaDeviceSynchronize());
     check("rng_keyed.uniform", to_host(drk, rn), host_eval::rng_keyed(state[0], state[1], rn, false));
-    k_rng_keyed<<<GS(rn), kTier0Block>>>(dstate, drk, rn, 1);
+    kernels::ptir::k_rng_keyed<<<GS(rn), kernels::ptir::kTier0Block>>>(dstate, drk, rn, 1);
     CUDA_OK(cudaDeviceSynchronize());
     check("rng_keyed.gumbel", to_host(drk, rn), host_eval::rng_keyed(state[0], state[1], rn, true));
 
@@ -1035,7 +1036,7 @@ void test_new_ops() {
         std::uint32_t* dm1 = dev_from(std::vector<std::uint32_t>(meta1, meta1+8));
         std::uint32_t* ds1 = dev_from(s1);
         std::uint32_t* dbg = dev_alloc<std::uint32_t>(24);
-        k_broadcast_general<std::uint32_t><<<GS(24), kTier0Block>>>(ds1, dbg, dm1, 3, 24);
+        kernels::ptir::k_broadcast_general<std::uint32_t><<<GS(24), kernels::ptir::kTier0Block>>>(ds1, dbg, dm1, 3, 24);
         CUDA_OK(cudaDeviceSynchronize());
         check("broadcast_general[1,1,4]->[2,3,4]", to_host(dbg, 24),
               host_eval::broadcast_general<std::uint32_t>(s1, {1,1,4}, {2,3,4}));
@@ -1043,7 +1044,7 @@ void test_new_ops() {
         std::uint32_t meta2[8] = {2,3,4,1, 3,1,0,0};      // sstride: dim2 broadcast
         std::uint32_t* dm2 = dev_from(std::vector<std::uint32_t>(meta2, meta2+8));
         std::uint32_t* ds2 = dev_from(s2);
-        k_broadcast_general<std::uint32_t><<<GS(24), kTier0Block>>>(ds2, dbg, dm2, 3, 24);
+        kernels::ptir::k_broadcast_general<std::uint32_t><<<GS(24), kernels::ptir::kTier0Block>>>(ds2, dbg, dm2, 3, 24);
         CUDA_OK(cudaDeviceSynchronize());
         check("broadcast_general[2,3,1]->[2,3,4]", to_host(dbg, 24),
               host_eval::broadcast_general<std::uint32_t>(s2, {2,3,1}, {2,3,4}));

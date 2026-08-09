@@ -137,9 +137,9 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             emit(Kernel::LlRouter, L, qmv(g.n_experts));
             { LD l; shared_kernels::router_topk_dispatch(g.n_experts, l.grid, l.tg);
               emit(Kernel::GoRouterTopK, L, l); }
-            { LD l; shared_kernels::moe_route_sort_dispatch(g.n_experts, l.grid, l.tg);
+            { LD l; shared_kernels::route_sort_dispatch(g.n_experts, l.grid, l.tg);
               emit(Kernel::LlMoeSort, L, l); }
-            { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, sorted, l.grid, l.tg);
+            { LD l; shared_kernels::route_rows_dispatch(g.hidden, sorted, l.grid, l.tg);
               emit(Kernel::LlMoeGather, L, l); }
             { LD l; shared_kernels::routed_qmv_dispatch(g.moe_intermediate, 1, l.grid, l.tg,
                                                         sorted);
@@ -147,12 +147,12 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             { LD l; shared_kernels::routed_qmv_dispatch(g.moe_intermediate, 1, l.grid, l.tg,
                                                         sorted);
               emit(Kernel::LlExpertUp, L, l); }
-            { LD l; shared_kernels::moe_route_rows_dispatch(g.moe_intermediate, sorted,
+            { LD l; shared_kernels::route_rows_dispatch(g.moe_intermediate, sorted,
                                                             l.grid, l.tg);
               emit(Kernel::LlExpertSiluMul, L, l); }
             { LD l; shared_kernels::routed_qmv_dispatch(g.hidden, 1, l.grid, l.tg, sorted);
               emit(Kernel::LlExpertDown, L, l); }
-            { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
+            { LD l; shared_kernels::route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
               emit(Kernel::LlMoeCombine, L, l); }
             // The shared expert. A dense FFN over the SAME `FfnRms` output the
             // router read, at its own width, added to the mixture under a gate
@@ -177,7 +177,7 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
                 // five. It is `hidden -> 1`: the cheapest dispatch in the
                 // layer, and the one with the least to gain from overlapping.
                 emit(Kernel::LlSharedGateProj, L, qmv(1));
-                { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
+                { LD l; shared_kernels::route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
                   emit(Kernel::LlSharedCombine, L, l); }
             }
         } else {

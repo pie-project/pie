@@ -14,11 +14,11 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/gather_tokens.hpp"
+#include "layout/gather_tokens.hpp"
 
-using pie_cuda_driver::kernels::GatherTokenOp;
-using pie_cuda_driver::kernels::launch_gather_tokens_bf16;
-using pie_cuda_driver::kernels::launch_gather_tokens_bf16_layers;
+using pie_cuda_driver::kernels::layout::GatherTokenOp;
+using pie_cuda_driver::kernels::layout::launch_gather_tokens_bf16;
+using pie_cuda_driver::kernels::layout::launch_gather_tokens_bf16_layers;
 
 namespace {
 

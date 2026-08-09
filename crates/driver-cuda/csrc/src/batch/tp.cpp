@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "batch/tp.hpp"
 
 #include "batch/forward.hpp"
@@ -900,7 +901,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         throw std::runtime_error(
             "TP follower has no runtime-quant context");
     }
-    ops::ScopedRuntimeQuantContext quant_scope(
+    kernels::gemm::ScopedRuntimeQuantContext quant_scope(
         *engine.runtime_quant_context);
 
     // Sized lazily; R is at most max_workspace_tokens (one request per token).

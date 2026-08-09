@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/kv_paged.hpp"
+#include "attn/kv_paged.hpp"
 #include "store/kv_cache.hpp"
 #include "store/kv_cache_format.hpp"
 #include "tensor.hpp"
@@ -19,7 +19,7 @@ using pie_cuda_driver::DType;
 using pie_cuda_driver::DeviceTensor;
 using pie_cuda_driver::KvCacheScheme;
 using pie_cuda_driver::cuda_check_impl;
-using pie_cuda_driver::kernels::launch_write_kv_to_pages;
+using pie_cuda_driver::kernels::attn::write_kv_to_pages;
 using pie_cuda_driver::kv_cache_format_from_string;
 
 namespace {
@@ -202,11 +202,11 @@ void run_format(const char* dtype) {
     auto* kv_last_page_lens = device_copy<std::uint32_t>({kTotalTokens});
 
     auto layer = cache.layer_view(0);
-    launch_write_kv_to_pages(
+    write_kv_to_pages(
         layer, k_curr.data(), v_curr.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
         kTotalTokens, 1, nullptr);
-    pie_cuda_driver::kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+    pie_cuda_driver::kernels::attn::dequant_kv_cache_layer_to_bf16_active(
         layer, kv_page_indices, 1, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 

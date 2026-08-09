@@ -1,3 +1,4 @@
+#include <vector>
 #include "model/gemma4/declared_forward.hpp"
 
 #include <algorithm>
@@ -233,6 +234,19 @@ Gemma4DeclaredPlan build_gemma4_declared_plan(
     // and built after the model), so the deployment DEFAULT stands in and
     // the executor's fused-post arm refuses if the live view disagrees —
     // qwen3_5's `state_bf16` precedent exactly.
+    // THE SLIDING WINDOW, per layer, handed to the declaration so the
+    // dispatch statements can carry it (`dsl::cuda::attn_at`'s params).
+    // What the executors read instead was this same array, at every
+    // dispatch, through a config nothing stated.
+    //
+    // The empty case broadcasts the config's single `sliding_window`:
+    // `window_left_at` reads a one-element list for every layer, which
+    // is exactly what the drivers' `: fwd_cfg.sliding_window` fallback
+    // meant. The vector outlives the trace calls below.
+    std::vector<std::int32_t> window_left(
+        w.per_layer_window_left.begin(), w.per_layer_window_left.end());
+    cuda.window_left = window_left.data();
+    cuda.window_left_len = static_cast<std::uint32_t>(window_left.size());
     cuda.kv_native_bf16 = 1;
 
     try {

@@ -17,7 +17,7 @@
 //   * `expert_ids[b]`        the expert owning M-block `b`.
 //   * `num_tokens_past_padded[0]` total padded row count; the kernel iterates
 //                            blocks up to `ceil(this / block_size)`.
-// `launch_moe_align_decode` in `kernels/moe_dispatch.hpp` already produces
+// `kernels::moe::moe_align_decode` in `kernels/moe_dispatch.hpp` already produces
 // exactly this.
 
 #include <cstddef>

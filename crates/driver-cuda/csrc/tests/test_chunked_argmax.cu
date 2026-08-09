@@ -4,7 +4,7 @@
 // vocab in slabs must produce BIT-IDENTICAL token ids to argmaxing a
 // materialised logits buffer -- including the tie-break (lowest index wins),
 // which is what makes it substitutable for the sampler. So the reference here
-// is `launch_argmax_bf16` itself, not a host reimplementation, and the gate is
+// is `argmax_bf16` itself, not a host reimplementation, and the gate is
 // exact equality rather than a tolerance.
 //
 // Covers: chunk widths that divide the vocab and ones that leave a ragged
@@ -19,12 +19,12 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "kernels/argmax.hpp"
+#include "sample/argmax.hpp"
 
-using pie_cuda_driver::kernels::kArgmaxAccumSlots;
-using pie_cuda_driver::kernels::launch_argmax_accumulate_bf16;
-using pie_cuda_driver::kernels::launch_argmax_bf16;
-using pie_cuda_driver::kernels::launch_argmax_finalize_bf16;
+using pie_cuda_driver::kernels::sample::kArgmaxAccumSlots;
+using pie_cuda_driver::kernels::sample::argmax_accumulate_bf16;
+using pie_cuda_driver::kernels::sample::argmax_bf16;
+using pie_cuda_driver::kernels::sample::argmax_finalize_bf16;
 
 namespace {
 
@@ -68,12 +68,12 @@ void check_chunked(const char* name, const __nv_bfloat16* d_logits, int rows,
     int chunks = 0;
     for (int base = 0; base < vocab; base += chunk) {
         const int width = (base + chunk <= vocab) ? chunk : (vocab - base);
-        launch_argmax_accumulate_bf16(d_logits + base, rows, width, row_stride,
+        argmax_accumulate_bf16(d_logits + base, rows, width, row_stride,
                                       base, d_acc_val, d_acc_idx, base == 0,
                                       nullptr);
         ++chunks;
     }
-    launch_argmax_finalize_bf16(d_acc_val, d_acc_idx, d_tokens, rows, nullptr);
+    argmax_finalize_bf16(d_acc_val, d_acc_idx, d_tokens, rows, nullptr);
     RT(cudaDeviceSynchronize());
 
     std::vector<std::int32_t> got(rows);
@@ -125,7 +125,7 @@ int main() {
 
     std::int32_t* d_ref = nullptr;
     RT(cudaMalloc(&d_ref, kRows * sizeof(std::int32_t)));
-    launch_argmax_bf16(d_logits, d_ref, kRows, kVocab, nullptr);
+    argmax_bf16(d_logits, d_ref, kRows, kVocab, nullptr);
     RT(cudaDeviceSynchronize());
     std::vector<std::int32_t> reference(kRows);
     RT(cudaMemcpy(reference.data(), d_ref, kRows * sizeof(std::int32_t),
@@ -176,7 +176,7 @@ int main() {
         RT(cudaMemcpy(d_dense, dense.data(),
                       dense.size() * sizeof(__nv_bfloat16),
                       cudaMemcpyHostToDevice));
-        launch_argmax_bf16(d_dense, d_ref, kRows, kNarrowVocab, nullptr);
+        argmax_bf16(d_dense, d_ref, kRows, kNarrowVocab, nullptr);
         RT(cudaDeviceSynchronize());
         std::vector<std::int32_t> narrow_ref(kRows);
         RT(cudaMemcpy(narrow_ref.data(), d_ref, kRows * sizeof(std::int32_t),

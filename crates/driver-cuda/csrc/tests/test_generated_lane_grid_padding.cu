@@ -258,7 +258,7 @@ int main() {
     mask_values_h[3] = reinterpret_cast<std::uint64_t>(mask_canary_src);
     std::uint64_t* mask_values = upload<std::uint64_t>(mask_values_h);
 
-    k_generated_attn_page_mask<float><<<kBucket, kTier0Block>>>(
+    k_generated_attn_page_mask<float><<<kBucket, pie_cuda_driver::kernels::ptir::kTier0Block>>>(
         header, lanes, dests, mask_values, 1u, 0u);
     TEST_CUDA_CHECK(cudaGetLastError());
     TEST_CUDA_CHECK(cudaDeviceSynchronize());

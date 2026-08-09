@@ -101,7 +101,7 @@ const char* kernel_name(Kernel k) {
         case Kernel::RopeK:       return "rope_k";
         case Kernel::KvAppend:    return "kv_append";
         case Kernel::Sdpa:        return "sdpa";
-        case Kernel::AttnGate:    return "attn_gate";
+        case Kernel::AttnGate:    return "gate";
         case Kernel::QmvO:        return "qmv_o";
         case Kernel::FfnRms:      return "ffn_rms";
         case Kernel::QmvGate:     return "qmv_gate";

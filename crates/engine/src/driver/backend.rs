@@ -10,15 +10,11 @@ use anyhow::{Result, anyhow};
 #[cfg(feature = "driver-cuda")]
 mod cuda;
 mod dummy;
-#[cfg(feature = "driver-metal")]
-mod metal;
 mod remote;
 
 #[cfg(feature = "driver-cuda")]
 pub use cuda::CudaDriver;
 pub use dummy::DummyDriver;
-#[cfg(feature = "driver-metal")]
-pub use metal::MetalDriver;
 pub use remote::{RemoteDisconnectHandle, RemoteDriver};
 
 use crate::driver::channel::RegisteredChannel;
@@ -66,8 +62,6 @@ pub enum DriverBackend {
     Dummy(DummyDriver),
     #[cfg(feature = "driver-cuda")]
     Cuda(CudaDriver),
-    #[cfg(feature = "driver-metal")]
-    Metal(MetalDriver),
     Remote(RemoteDriver),
 }
 
@@ -77,8 +71,6 @@ impl DriverBackend {
             Self::Dummy(_) => "dummy",
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(_) => "cuda",
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(_) => "metal",
             Self::Remote(_) => "remote",
         }
     }
@@ -105,11 +97,6 @@ impl DriverBackend {
         Ok((Self::Cuda(driver), facts))
     }
 
-    #[cfg(feature = "driver-metal")]
-    pub fn metal_create(config_bytes: &[u8]) -> Result<(Self, driver_abi::DeviceFacts)> {
-        let (driver, facts) = MetalDriver::create(config_bytes)?;
-        Ok((Self::Metal(driver), facts))
-    }
 
     pub fn load_model(
         &mut self,
@@ -127,16 +114,6 @@ impl DriverBackend {
             }
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.load_model(descs),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => {
-                let [desc] = descs.as_slice() else {
-                    return Err(anyhow!(
-                        "metal model load requires exactly one descriptor, got {}",
-                        descs.len()
-                    ));
-                };
-                driver.load_model(desc)
-            }
             Self::Remote(driver) => driver.load_model(descs),
         }
     }
@@ -148,8 +125,6 @@ impl DriverBackend {
         match self {
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(_) => Some("cuda"),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(_) => Some("metal"),
             // The dummy driver interprets PTIR, and a remote driver's own
             // backend does its generation on the far side.
             _ => None,
@@ -217,8 +192,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.register_program(desc),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.register_program(desc),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.register_program(desc),
             Self::Remote(driver) => driver.register_program(desc),
         }
     }
@@ -231,8 +204,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.register_channel(desc),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.register_channel(desc),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.register_channel(desc),
             Self::Remote(driver) => driver.register_channel(desc),
         }
     }
@@ -242,8 +213,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.bind_instance(desc),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.bind_instance(desc),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.bind_instance(desc),
             Self::Remote(driver) => driver.bind_instance(desc),
         }
     }
@@ -257,8 +226,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.launch(desc),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.launch(desc),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.launch(desc),
             Self::Remote(driver) => driver.launch(desc),
         }
     }
@@ -268,8 +235,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.encode(plan),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.encode(plan),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.encode(plan),
             Self::Remote(driver) => driver.encode(plan),
         }
     }
@@ -279,8 +244,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.copy_kv(desc),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.copy_kv(desc),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.copy_kv(desc),
             Self::Remote(driver) => driver.copy_kv(desc),
         }
     }
@@ -290,8 +253,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.copy_state(desc),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.copy_state(desc),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.copy_state(desc),
             Self::Remote(driver) => driver.copy_state(desc),
         }
     }
@@ -301,8 +262,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.resize_pool(desc),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.resize_pool(desc),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.resize_pool(desc),
             Self::Remote(driver) => driver.resize_pool(desc),
         }
     }
@@ -312,8 +271,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.close_instance(id),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.close_instance(id),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.close_instance(id),
             Self::Remote(driver) => driver.close_instance(id),
         }
     }
@@ -323,8 +280,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.close_channel(id),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.close_channel(id),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.close_channel(id),
             Self::Remote(driver) => driver.close_channel(id),
         }
     }
@@ -334,8 +289,6 @@ impl DriverBackend {
             Self::Dummy(driver) => driver.export_kv_handle(),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.export_kv_handle(),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(_) => None,
             Self::Remote(_) => None,
         }
     }

@@ -39,11 +39,17 @@ use std::path::PathBuf;
 /// excluded, obviously, and so are the aspect modules that are not families.
 fn family_names() -> Vec<String> {
     // A generation is a DIRECTORY module under `src/`; the shared root is the
-    // loose `.rs` files beside them. Two directories are not generations:
-    // `families/` is cross-generation sharing, and `ffi/` is the C boundary —
-    // one door for all of them.
+    // loose `.rs` files beside them. Four directories are not generations:
+    // `families/` is cross-generation sharing, `ffi/` is the C boundary (one
+    // door for all of them), `config/` is the descriptor aspect, and `bin/`
+    // is cargo's, not this crate's layout at all.
+    //
+    // `config/` in particular MUST be here: the word "config" occurs all over
+    // the shared root in code (`crate::config::VERSION` in `facts.rs`), so
+    // leaving it in would make the guard below fire on the very reference
+    // that is correct.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let not_a_generation = ["families", "ffi"];
+    let not_a_generation = ["families", "ffi", "config", "bin"];
     let mut names: Vec<String> = std::fs::read_dir(&root)
         .expect("src/ exists")
         .filter_map(Result::ok)
@@ -95,6 +101,13 @@ const NOT_SHARED: &[(&str, &str)] = &[
         "ffi.rs",
         "a DOOR, not vocabulary: one `extern \"C\"` entry per family is what \
          the C surface of a per-family declaration looks like",
+    ),
+    (
+        "emissions.rs",
+        "a DEPLOYMENT LIST: which families' static forms are committed, from \
+         which fact sets -- shared between the emit-cuda bin and the \
+         regeneration check so neither holds a copy, and per-family by its \
+         nature",
     ),
 ];
 

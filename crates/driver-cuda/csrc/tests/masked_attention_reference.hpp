@@ -3,7 +3,7 @@
 // CPU golden reference for the PTIR masked-attention parity test
 // (overview §5.2/§6.4 fork-sharing enabler).
 //
-// The production path (`ops::launch_attention_flashinfer_prefill_custom`,
+// The production path (`kernels::attn::attention_flashinfer_prefill_custom`,
 // FlashInfer `MaskMode::kCustom`) presents FROZEN fork pages as FULL — they
 // count fully in `kv_len` — and excludes the invalid residual key positions via
 // a per-(query,key) attention mask the inferlet feeds (the same BRLE custom-mask

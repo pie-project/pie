@@ -18,6 +18,15 @@
 //! shell most worth testing and the part a GPU-gated test suite would never
 //! run. The loader is injected ([`splice_with`]) so the tests do not need a
 //! filesystem either.
+//!
+//! # And why the batch is here too
+//!
+//! [`Batch`] reads a whole load's worth of sources and computes the key its
+//! compiled pipelines are cached under. Both halves are string work over
+//! files, and the key in particular has to be decided by the resolved text --
+//! which is a fact about include splicing, not about Metal. Keeping it beside
+//! the splicer is what lets a test prove that editing a header invalidates
+//! the cache without a GPU in the room.
 
 use std::collections::HashSet;
 use std::io;
@@ -152,6 +161,169 @@ where
     out.push_str(&source[cursor..]);
     source = out;
     Ok(source)
+}
+
+/// One entry point wanted out of one source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    /// The `.metal` file to compile.
+    pub path: PathBuf,
+    /// The kernel function to build a pipeline for.
+    pub function: String,
+}
+
+impl Request {
+    /// A request for `function` out of `path`.
+    pub fn new(path: impl Into<PathBuf>, function: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            function: function.into(),
+        }
+    }
+}
+
+/// A batch of requests with each distinct source read exactly once.
+///
+/// A load asks for tens of entry points out of a handful of files, and a file
+/// is a translation unit: two entry points in the same file are two pipelines
+/// off one library. Reading and splicing per request would do that work once
+/// per entry point instead of once per file.
+///
+/// The batch is also what the archive is keyed on, and that is the reason the
+/// sources are kept rather than discarded after the read. The C++ reads every
+/// file twice for this -- once to compute the key and once to compile -- and
+/// the two reads are not guaranteed to see the same bytes.
+#[derive(Debug)]
+pub struct Batch {
+    /// Distinct paths, in first-seen order.
+    paths: Vec<PathBuf>,
+    /// The resolved source of each path, or why it could not be read.
+    sources: Vec<Result<String>>,
+    /// For each request, its index into `paths`.
+    library: Vec<usize>,
+    /// The requested entry point of each request.
+    functions: Vec<String>,
+}
+
+impl Batch {
+    /// Read every distinct source in `requests`.
+    ///
+    /// Never fails as a whole. A file that cannot be read fails the requests
+    /// that name it and no others, because one missing kernel is not a reason
+    /// to refuse the twenty that are present.
+    pub fn load(requests: &[Request]) -> Self {
+        Self::load_with(requests, |path| read_source(path))
+    }
+
+    /// [`Batch::load`] against a caller-supplied reader, for tests.
+    pub fn load_with<L>(requests: &[Request], mut read: L) -> Self
+    where
+        L: FnMut(&Path) -> Result<String>,
+    {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let mut sources: Vec<Result<String>> = Vec::new();
+        let mut library = Vec::with_capacity(requests.len());
+        let mut functions = Vec::with_capacity(requests.len());
+        for request in requests {
+            let index = paths.iter().position(|p| *p == request.path);
+            let index = match index {
+                Some(index) => index,
+                None => {
+                    paths.push(request.path.clone());
+                    sources.push(read(&request.path));
+                    paths.len() - 1
+                }
+            };
+            library.push(index);
+            functions.push(request.function.clone());
+        }
+        Self {
+            paths,
+            sources,
+            library,
+            functions,
+        }
+    }
+
+    /// How many requests this batch was built from.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.library.len()
+    }
+
+    /// Whether the batch has no requests.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.library.is_empty()
+    }
+
+    /// The distinct source files, in first-seen order.
+    #[must_use]
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    /// The resolved source for library `index`.
+    #[must_use]
+    pub fn source(&self, index: usize) -> Option<&Result<String>> {
+        self.sources.get(index)
+    }
+
+    /// The library index and entry point of request `index`.
+    #[must_use]
+    pub fn request(&self, index: usize) -> Option<(usize, &str)> {
+        Some((
+            *self.library.get(index)?,
+            self.functions.get(index)?.as_str(),
+        ))
+    }
+
+    /// A key naming exactly this batch, for use as an archive filename.
+    ///
+    /// Every input that can change the compiled binaries goes in: which entry
+    /// points were asked for out of which files, in order, and the RESOLVED
+    /// text of each of those files. Resolved and not the file's size and
+    /// mtime, because a source that includes another would otherwise keep its
+    /// key when the included file changed and be served a pipeline built from
+    /// the old definition -- which is worse than a slow start, since it looks
+    /// like it worked.
+    ///
+    /// `salt` is for what the caller knows and this module does not: the GPU
+    /// the binaries are for and the language dialect they were compiled as.
+    /// A cache shared between two of either would otherwise collide.
+    ///
+    /// A file that could not be read hashes as its own distinct marker. If it
+    /// hashed as nothing, a batch with a missing file and a batch with an
+    /// empty one would be the same batch.
+    #[must_use]
+    pub fn key(&self, salt: u64) -> u64 {
+        const OFFSET: u64 = 14_695_981_039_346_656_037;
+        let mut hash = OFFSET;
+        let mut eat = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(1_099_511_628_211);
+            }
+        };
+        eat(&salt.to_le_bytes());
+        for (library, function) in self.library.iter().zip(&self.functions) {
+            eat(&library.to_le_bytes());
+            eat(function.as_bytes());
+            // Lengths, so that ("ab","c") and ("a","bc") are not one string.
+            eat(&function.len().to_le_bytes());
+        }
+        for source in &self.sources {
+            match source {
+                Ok(text) => {
+                    eat(&[1]);
+                    eat(text.as_bytes());
+                    eat(&text.len().to_le_bytes());
+                }
+                Err(_) => eat(&[0]),
+            }
+        }
+        hash
+    }
 }
 
 #[cfg(test)]
@@ -353,5 +525,159 @@ mod tests {
     fn reports_a_missing_root_with_its_path() {
         let err = splice_with("k/nope.metal", table(&[])).expect_err("root does not exist");
         assert!(matches!(err, Error::ShaderRead { .. }), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A reader over an in-memory file table.
+    fn files(entries: &[(&str, &str)]) -> impl FnMut(&Path) -> Result<String> + use<> {
+        let map: HashMap<PathBuf, String> = entries
+            .iter()
+            .map(|(k, v)| (PathBuf::from(*k), (*v).to_string()))
+            .collect();
+        move |path: &Path| {
+            map.get(path)
+                .cloned()
+                .ok_or_else(|| Error::ShaderRead {
+                    path: path.to_path_buf(),
+                    source: io::Error::new(io::ErrorKind::NotFound, "absent"),
+                })
+        }
+    }
+
+    /// The same table, as the `io::Result` loader `splice_with` wants.
+    fn raw(entries: &[(&str, &str)]) -> impl FnMut(&Path) -> io::Result<String> + use<> {
+        let map: HashMap<PathBuf, String> = entries
+            .iter()
+            .map(|(k, v)| (PathBuf::from(*k), (*v).to_string()))
+            .collect();
+        move |path: &Path| {
+            map.get(path)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.display().to_string()))
+        }
+    }
+
+    fn requests(pairs: &[(&str, &str)]) -> Vec<Request> {
+        pairs.iter().map(|(p, f)| Request::new(*p, *f)).collect()
+    }
+
+    #[test]
+    fn a_file_named_by_several_requests_is_read_once() {
+        let mut reads = 0;
+        let mut read = files(&[("a.metal", "A"), ("b.metal", "B")]);
+        let batch = Batch::load_with(
+            &requests(&[
+                ("a.metal", "one"),
+                ("b.metal", "two"),
+                ("a.metal", "three"),
+            ]),
+            |path| {
+                reads += 1;
+                read(path)
+            },
+        );
+        assert_eq!(reads, 2, "three requests out of two files is two reads");
+        assert_eq!(batch.paths().len(), 2);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.request(0), Some((0, "one")));
+        assert_eq!(batch.request(1), Some((1, "two")));
+        assert_eq!(
+            batch.request(2),
+            Some((0, "three")),
+            "the third request shares the first request's library"
+        );
+    }
+
+    #[test]
+    fn one_unreadable_file_fails_only_its_own_requests() {
+        let batch = Batch::load_with(
+            &requests(&[("here.metal", "k"), ("gone.metal", "k")]),
+            files(&[("here.metal", "A")]),
+        );
+        assert!(matches!(batch.source(0), Some(Ok(text)) if text == "A"));
+        assert!(matches!(
+            batch.source(1),
+            Some(Err(Error::ShaderRead { .. }))
+        ));
+    }
+
+    #[test]
+    fn editing_a_source_changes_the_key() {
+        let asked = requests(&[("a.metal", "k")]);
+        let before = Batch::load_with(&asked, files(&[("a.metal", "kernel void k() {}")]));
+        let after = Batch::load_with(&asked, files(&[("a.metal", "kernel void k() { ; }")]));
+        assert_ne!(before.key(0), after.key(0));
+    }
+
+    #[test]
+    fn editing_an_included_file_changes_the_key() {
+        // The whole reason the key is over RESOLVED text: `a.metal` itself is
+        // byte for byte identical in both, and only the header moved.
+        let asked = requests(&[("a.metal", "k")]);
+        let root = "#include \"h.h\"\nkernel void k() {}";
+        let before = Batch::load_with(&asked, |path| {
+            splice_with(path, raw(&[("a.metal", root), ("h.h", "#define N 1")]))
+        });
+        let after = Batch::load_with(&asked, |path| {
+            splice_with(path, raw(&[("a.metal", root), ("h.h", "#define N 2")]))
+        });
+        assert_ne!(
+            before.key(0),
+            after.key(0),
+            "an archive keyed to the old header would serve a stale pipeline"
+        );
+    }
+
+    #[test]
+    fn asking_for_a_different_entry_point_changes_the_key() {
+        let one = Batch::load_with(&requests(&[("a.metal", "one")]), files(&[("a.metal", "A")]));
+        let two = Batch::load_with(&requests(&[("a.metal", "two")]), files(&[("a.metal", "A")]));
+        assert_ne!(one.key(0), two.key(0));
+    }
+
+    #[test]
+    fn the_order_of_the_requests_is_part_of_the_key() {
+        // The results are positional, so a batch asked in a different order
+        // is a different batch even though it builds the same pipelines.
+        let entries = [("a.metal", "A"), ("b.metal", "B")];
+        let forward = Batch::load_with(
+            &requests(&[("a.metal", "x"), ("b.metal", "y")]),
+            files(&entries),
+        );
+        let backward = Batch::load_with(
+            &requests(&[("b.metal", "y"), ("a.metal", "x")]),
+            files(&entries),
+        );
+        assert_ne!(forward.key(0), backward.key(0));
+    }
+
+    #[test]
+    fn the_salt_is_part_of_the_key() {
+        let batch = Batch::load_with(&requests(&[("a.metal", "k")]), files(&[("a.metal", "A")]));
+        assert_ne!(
+            batch.key(1),
+            batch.key(2),
+            "two GPUs, or two dialects, must not share an archive"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_not_an_empty_one() {
+        let asked = requests(&[("a.metal", "k")]);
+        let missing = Batch::load_with(&asked, files(&[]));
+        let empty = Batch::load_with(&asked, files(&[("a.metal", "")]));
+        assert_ne!(missing.key(0), empty.key(0));
+    }
+
+    #[test]
+    fn an_empty_batch_is_empty() {
+        let batch = Batch::load_with(&[], files(&[]));
+        assert!(batch.is_empty());
+        assert_eq!(batch.request(0), None);
     }
 }

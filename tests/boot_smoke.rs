@@ -101,8 +101,13 @@ async fn boot() -> Result<pie::StandaloneHandle> {
 }
 
 fn build_direct_channel_inferlet() -> Result<(PathBuf, PathBuf)> {
-    let workspace =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
+    // `pie` IS the workspace root package, so its manifest dir is the repo
+    // root — the `../../` these two paths carried was correct only while the
+    // crate sat two levels down, and pointed outside the checkout after
+    // `restructure 1/N`. The failure was `No such file or directory` from
+    // `Command::status`, which reads as a missing toolchain rather than a
+    // missing directory, so it survived a while.
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/engine/tests/inferlets");
     let status = Command::new("cargo")
         .args([
             "build",
@@ -123,7 +128,7 @@ fn build_direct_channel_inferlet() -> Result<(PathBuf, PathBuf)> {
 }
 
 fn build_chat_completion_inferlet() -> Result<(PathBuf, PathBuf)> {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/inferlets");
     let crate_dir = workspace.join("chat-completion");
     let status = Command::new("cargo")
         .args([

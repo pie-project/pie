@@ -195,7 +195,7 @@ int main() {
 
     std::string err;
     const Pso pso =
-        ctx->compile_pso_from_file(kernels_dir + "/moe_route.metal",
+        ctx->compile_pso_from_file(kernels_dir + "/moe/route.metal",
                                    "router_topk_bfloat16", &err);
     if (!expect(pso.valid(), "router_topk_bfloat16 compiles: " + err)) return 1;
 

@@ -1095,8 +1095,8 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     g_.vocab = simple_->vocab();
     std::string pso_err;
     ptir_logits_copy_pso_ = ctx_->compile_ptir_pso_from_file(
-        (std::filesystem::path(kernels_dir) / "ptir_logits_copy.metal").string(),
-        "ptir_copy_logits_bf16", &pso_err);
+        (std::filesystem::path(kernels_dir) / "ptir/logits_copy.metal").string(),
+        "copy_logits_bf16", &pso_err);
     if (!ptir_logits_copy_pso_.valid()) {
         if (err) *err = "compiling the logits staging copy: " + pso_err;
         return false;
@@ -1449,8 +1449,8 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         return false;
     }
     ptir_logits_copy_pso_ = ctx_->compile_ptir_pso_from_file(
-        (std::filesystem::path(kernels_dir) / "ptir_logits_copy.metal").string(),
-        "ptir_copy_logits_bf16",
+        (std::filesystem::path(kernels_dir) / "ptir/logits_copy.metal").string(),
+        "copy_logits_bf16",
         &load_err);
     ptir_logits_copy_params_ =
         ctx_->create_standalone_buffer(

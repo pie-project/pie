@@ -1,5 +1,6 @@
 // CSM IModel impl. See csm_model.hpp.
 
+#include "attention_workspace.hpp"
 #include "model/csm/csm_model.hpp"
 
 #include <stdexcept>
@@ -9,7 +10,7 @@
 namespace pie_cuda_driver::model {
 
 void CsmModel::body(Workspace&, KvCache&, AttentionWorkspace&,
-                    ops::CublasHandle&, const ForwardFn::ForwardInputs&) {
+                    kernels::gemm::CublasHandle&, const ForwardFn::ForwardInputs&) {
     // CSM does not support the per-step batched text forward. It is driven
     // exclusively through `generate_audio`. A regular ForwardRequest routed
     // here is a wiring error.

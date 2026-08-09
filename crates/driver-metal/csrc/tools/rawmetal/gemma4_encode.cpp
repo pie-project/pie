@@ -35,30 +35,30 @@ std::vector<PsoSpec> specs_4bit() {
         // 4-bit dequant gather, SCALED (gemma4): tied embed_tokens (== lm_head bundle,
         // *sqrt(hidden)) + the per-layer embed table (*sqrt(ple_dim)). The scale (buffer 6)
         // is bound per-dispatch at the consts stage; qwen's unscaled embed_gather is untouched.
-        {"embed_gather.metal", "embed_gather_scaled_4bit_bfloat16_gs_64_b_4",
+        {"layout/embed_gather.metal", "embed_gather_scaled_4bit_bfloat16_gs_64_b_4",
             {Kernel::EmbedGather, Kernel::PleTokenGather}},
         // rms_single_row serves every (plain-rms, plus_one bound false) norm.
-        {"rms_norm.metal", "rms_single_row_bfloat16",
+        {"norm/rms.metal", "rms_single_row_bfloat16",
             {Kernel::PleProjNorm, Kernel::AttnNorm, Kernel::QNorm, Kernel::KNorm,
              Kernel::PostAttnNorm, Kernel::FfnNorm, Kernel::PostFfnNorm,
              Kernel::PleNorm, Kernel::FinalRms}},
         // affine_qmv: every 4-bit linear (q/k/v/o + gate/up/down + PLE projections +
         // tied lm_head logits).
-        {"quantized_qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4",
+        {"quant/qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4",
             {Kernel::PleProjGemv, Kernel::QmvQ, Kernel::QmvK, Kernel::QmvV, Kernel::QmvO,
              Kernel::QmvGate, Kernel::QmvUp, Kernel::QmvDown,
              Kernel::PleGateGemv, Kernel::PleProjLayerGemv, Kernel::LmHead}},
         // alpha's gemma-specific pointwise + sliding SDPA.
-        {"vnorm.metal",        "vnorm_single_row_bfloat16",       {Kernel::VNorm}},
-        {"rope.metal",         "rope_neox_decode_bfloat16",       {Kernel::RopeQ, Kernel::RopeK}},
-        {"kv_append.metal",    "kv_append_bfloat16",              {Kernel::KvAppend}},
-        {"sdpa_sliding.metal", "sdpa_vector_decode_swa_bfloat16_d_256", {Kernel::Sdpa}},
-        {"residual_add.metal", "residual_add_bfloat16",
+        {"norm/vector.metal",        "vnorm_single_row_bfloat16",       {Kernel::VNorm}},
+        {"rope/neox.metal",         "neox_decode_bfloat16",       {Kernel::RopeQ, Kernel::RopeK}},
+        {"attn/kv_write.metal",    "kv_append_bfloat16",              {Kernel::KvAppend}},
+        {"attn/sdpa_sliding.metal", "sdpa_vector_decode_swa_bfloat16_d_256", {Kernel::Sdpa}},
+        {"norm/residual_add.metal", "residual_add_bfloat16",
             {Kernel::AttnResidual, Kernel::FfnResidual, Kernel::PleResidual}},
-        {"geglu_tanh.metal",   "geglu_tanh_bfloat16",             {Kernel::GegluTanh, Kernel::PleGeglu}},
-        {"ple_combine.metal",  "ple_combine_bfloat16",            {Kernel::PleCombine}},
-        {"layer_scalar.metal", "layer_scalar_mul_bfloat16",       {Kernel::LayerScalar}},
-        {"logit_softcap.metal","logit_softcap_bfloat16",          {Kernel::FinalSoftcap}},
+        {"mlp/gated.metal",   "geglu_tanh_bfloat16",             {Kernel::GegluTanh, Kernel::PleGeglu}},
+        {"layout/ple_combine.metal",  "ple_combine_bfloat16",            {Kernel::PleCombine}},
+        {"norm/layer_scalar.metal", "layer_scalar_mul_bfloat16",       {Kernel::LayerScalar}},
+        {"attn/logit_softcap.metal","logit_softcap_bfloat16",          {Kernel::FinalSoftcap}},
     };
 }
 
@@ -91,7 +91,7 @@ bool load_gemma4_psos(RawMetalContext& ctx,
     {
         std::string e;
         Pso pso = ctx.compile_pso_from_file(
-            dir + "sdpa_sliding.metal", "sdpa_vector_decode_swa_bfloat16_d_512", &e);
+            dir + "attn/sdpa_sliding.metal", "sdpa_vector_decode_swa_bfloat16_d_512", &e);
         if (!pso.valid()) {
             if (err) *err = std::string("sdpa_vector_decode_swa_bfloat16_d_512 "
                                         "(sdpa_sliding.metal): ") + e;

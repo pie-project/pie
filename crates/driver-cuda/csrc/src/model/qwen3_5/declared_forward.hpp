@@ -49,6 +49,7 @@
 
 #include <cstdint>
 
+#include "attention_workspace.hpp"
 #include "model/qwen3_5/declared_facts.hpp"
 #include "model/qwen3_5/qwen3_5_moe.hpp"
 
@@ -100,7 +101,7 @@ bool qwen3_5_forward_declared(
     KvCache& cache,
     RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -147,7 +148,7 @@ bool qwen3_5_forward_declared(
     KvCache& cache,
     RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,

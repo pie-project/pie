@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/qwen3_5/qwen3_5_moe_forward.hpp"
 #include "model/stage_hooks.hpp"
 
@@ -16,31 +17,31 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/causal_conv1d.hpp"
-#include "kernels/deinterleave.hpp"
-#include "kernels/embed.hpp"
-#include "kernels/gated_delta_net.hpp"
-#include "kernels/gather_rows.hpp"
-#include "kernels/kv_paged.hpp"
-#include "kernels/moe_dispatch.hpp"
-#include "kernels/moe_grouped_gemm.hpp"
-#include "ops/flashinfer_moe.hpp"
+#include "ssm/causal_conv1d.hpp"
+#include "layout/deinterleave.hpp"
+#include "layout/embed.hpp"
+#include "ssm/gated_delta_net.hpp"
+#include "layout/gather_rows.hpp"
+#include "attn/kv_paged.hpp"
+#include "moe/moe_dispatch.hpp"
+#include "moe/moe_grouped_gemm.hpp"
+#include "moe/flashinfer_moe.hpp"
 #include "model/qwen3_5/qwen3_5_moe.hpp"
-#include "kernels/residual_add.hpp"
+#include "norm/residual_add.hpp"
 #include <mutex>
 #include <set>
 #include <tuple>
 #include <utility>
 
-#include "kernels/rmsnorm.hpp"
-#include "kernels/rope.hpp"
-#include "kernels/slot_ops.hpp"
-#include "kernels/swiglu.hpp"
-#include "kernels/topk_softmax.hpp"
-#include "ops/attention_flashinfer.hpp"
-#include "ops/attention_naive.hpp"
-#include "ops/attention_naive_paged.hpp"
-#include "ops/gemm.hpp"
+#include "norm/rmsnorm.hpp"
+#include "rope/rope.hpp"
+#include "layout/slot_ops.hpp"
+#include "mlp/swiglu.hpp"
+#include "moe/topk_softmax.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "attn/attention_naive.hpp"
+#include "attn/attention_naive_paged.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -472,10 +473,10 @@ inline void rmsnorm_bf16_dispatch(
     int num_rows, int hidden, float eps, cudaStream_t stream)
 {
     if (uses_gemma_rmsnorm(cfg)) {
-        kernels::launch_rmsnorm_gemma_bf16(x, weight, y,
+        kernels::norm::rmsnorm_gemma_bf16(x, weight, y,
             num_rows, hidden, eps, stream);
     } else {
-        kernels::launch_rmsnorm_bf16(x, weight, y,
+        kernels::norm::rmsnorm_bf16(x, weight, y,
             num_rows, hidden, eps, stream);
     }
 }
@@ -565,14 +566,14 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
         ws.aligned_out =
             DeviceBuffer<std::uint16_t>::alloc(ws.aligned_rows_capacity * H);
     }
-    if (ops::flashinfer_cutlass_moe_enabled()) {
+    if (kernels::moe::flashinfer_cutlass_moe_enabled()) {
         // Sized for decode, not for the prefill high-water mark: the fused
         // path only runs on the decode fast path, and its workspace scales
         // with rows * top_k. At tp=1 the whole 68 GB model sits on one
         // device and a prefill-sized workspace does not fit the budget.
         ws.cutlass_max_rows = std::min(max_tokens, kFusedMoeMaxRows);
-        const std::size_t bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
-            ops::MoeActivation::Swiglu, ws.cutlass_max_rows, hidden,
+        const std::size_t bytes = kernels::moe::flashinfer_cutlass_moe_workspace_bytes(
+            kernels::moe::MoeActivation::Swiglu, ws.cutlass_max_rows, hidden,
             moe_intermediate, num_experts, top_k,
             /*tp_size=*/1, /*tp_rank=*/0);
         if (bytes > 0) {
@@ -635,7 +636,7 @@ void linear_attn_body(
     const std::int32_t*  slot_ids_d,
     const std::uint32_t* qo_new_h,
     const std::uint32_t* qo_new_d,
-    ops::CublasHandle& cublas, cudaStream_t stream,
+    kernels::gemm::CublasHandle& cublas, cudaStream_t stream,
     Qwen35MoeForwardProfile* profile,
     const std::int32_t* commit_len = nullptr,
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
@@ -788,22 +789,22 @@ void linear_attn_body(
                     static_cast<const std::uint16_t*>(ws.norm_x.data()) +
                     static_cast<std::size_t>(src0) * H;
                 if (!qwen35_ablate("qkv"))
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                kernels::gemm::act_x_wt_bf16(cublas.handle(),
                     x, Lw.la_in_proj_qkv->data(),
                     la.mixed_qkv.data() +
                         static_cast<std::size_t>(dst0) * conv_dim,
                     rows, conv_dim, H);
                 if (!qwen35_ablate("z"))
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                kernels::gemm::act_x_wt_bf16(cublas.handle(),
                     x, Lw.la_in_proj_z->data(),
                     la.z.data() + static_cast<std::size_t>(src0) * V_dim,
                     rows, V_dim, H);
                 if (!qwen35_ablate("ab")) {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    kernels::gemm::act_x_wt_bf16(cublas.handle(),
                         x, Lw.la_in_proj_a->data(),
                         la.a.data() + static_cast<std::size_t>(dst0) * V_h,
                         rows, V_h, H);
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    kernels::gemm::act_x_wt_bf16(cublas.handle(),
                         x, Lw.la_in_proj_b->data(),
                         la.b.data() + static_cast<std::size_t>(dst0) * V_h,
                         rows, V_h, H);
@@ -921,7 +922,7 @@ void linear_attn_body(
                                 linear_idx,
                                 static_cast<int>(
                                     rs_buffer_slot_ids_h[s0 + j])));
-                        launch_copy_if_valid_slot(
+                        kernels::layout::copy_if_valid_slot(
                             reinterpret_cast<const std::uint8_t*>(
                                 la.mixed_qkv.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * conv_dim),
@@ -930,7 +931,7 @@ void linear_attn_body(
                             static_cast<std::size_t>(count) * conv_dim *
                                 sizeof(std::uint16_t),
                             slot_ids_d, r, stream);
-                        launch_copy_if_valid_slot(
+                        kernels::layout::copy_if_valid_slot(
                             reinterpret_cast<const std::uint8_t*>(
                                 la.a.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h),
@@ -939,7 +940,7 @@ void linear_attn_body(
                             static_cast<std::size_t>(count) * V_h *
                                 sizeof(std::uint16_t),
                             slot_ids_d, r, stream);
-                        launch_copy_if_valid_slot(
+                        kernels::layout::copy_if_valid_slot(
                             reinterpret_cast<const std::uint8_t*>(
                                 la.b.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h),
@@ -961,7 +962,7 @@ void linear_attn_body(
         auto* qkv_post_base = la.mixed_qkv_post.data();
         if (linear_decode) {
             if (slot_ids_d != nullptr) {
-                kernels::launch_causal_conv1d_update_batched_bf16(
+                kernels::ssm::causal_conv1d_update_batched_bf16(
                     qkv_in_base, Lw.la_conv1d_w->data(),
                     Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
                     state_cache.conv_state(layer_idx, /*slot=*/0),
@@ -971,7 +972,7 @@ void linear_attn_body(
                     qkv_post_base,
                     R, conv_dim, conv_K, stream);
             } else {
-                kernels::launch_causal_conv1d_update_bf16(
+                kernels::ssm::causal_conv1d_update_bf16(
                     qkv_in_base, Lw.la_conv1d_w->data(),
                     Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
                     state_cache.conv_state(layer_idx, 0),
@@ -980,7 +981,7 @@ void linear_attn_body(
             }
         } else {
             if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                kernels::launch_causal_conv1d_prefill_batched_bf16(
+                kernels::ssm::causal_conv1d_prefill_batched_bf16(
                     qkv_in_base, Lw.la_conv1d_w->data(),
                     Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
                     qkv_post_base,
@@ -996,7 +997,7 @@ void linear_attn_body(
                     const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
                     if (Nr <= 0) continue;
                     const std::size_t off = static_cast<std::size_t>(t0) * conv_dim;
-                    kernels::launch_causal_conv1d_prefill_bf16(
+                    kernels::ssm::causal_conv1d_prefill_bf16(
                         qkv_in_base + off, Lw.la_conv1d_w->data(),
                         Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
                         qkv_post_base + off,
@@ -1030,7 +1031,7 @@ void linear_attn_body(
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_prep_ms : nullptr,
         stream, [&] {
-        kernels::launch_qwen_gdn_post_conv_prep_bf16(
+        kernels::ssm::qwen_gdn_post_conv_prep_bf16(
             qkv_base, a_data, b_data,
             Lw.la_A_log_fp32, Lw.la_dt_bias->data(),
             la.q_pre.data(), la.k_pre.data(), la.v_fp32.data(),
@@ -1039,9 +1040,9 @@ void linear_attn_body(
 
         if (V_h != K_h && !use_warp_tiled_recurrent &&
             !use_decode_gqa_recurrent) {
-            kernels::launch_repeat_interleave_heads_fp32(
+            kernels::ssm::repeat_interleave_heads_fp32(
                 la.q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d, stream);
-            kernels::launch_repeat_interleave_heads_fp32(
+            kernels::ssm::repeat_interleave_heads_fp32(
                 la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
         }
     });
@@ -1072,7 +1073,7 @@ void linear_attn_body(
                 if (slot_ids_d != nullptr) {
                     if (use_decode_gqa_recurrent) {
                         if (state_bf16) {
-                            kernels::launch_recurrent_gated_delta_step_batched_gqa_state_bf16(
+                            kernels::ssm::recurrent_gated_delta_step_batched_gqa_state_bf16(
                                 la.q_pre.data(),
                                 la.k_pre.data(),
                                 la.v_fp32.data(),
@@ -1084,7 +1085,7 @@ void linear_attn_body(
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d, stream);
                         } else {
-                            kernels::launch_recurrent_gated_delta_step_batched_gqa(
+                            kernels::ssm::recurrent_gated_delta_step_batched_gqa(
                                 la.q_pre.data(),
                                 la.k_pre.data(),
                                 la.v_fp32.data(),
@@ -1098,7 +1099,7 @@ void linear_attn_body(
                         }
                     } else {
                         if (state_bf16) {
-                            kernels::launch_recurrent_gated_delta_step_batched_state_bf16(
+                            kernels::ssm::recurrent_gated_delta_step_batched_state_bf16(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -1110,7 +1111,7 @@ void linear_attn_body(
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d, stream);
                         } else {
-                            kernels::launch_recurrent_gated_delta_step_batched(
+                            kernels::ssm::recurrent_gated_delta_step_batched(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -1125,7 +1126,7 @@ void linear_attn_body(
                     }
                 } else {
                     if (state_bf16) {
-                        kernels::launch_recurrent_gated_delta_step_state_bf16(
+                        kernels::ssm::recurrent_gated_delta_step_state_bf16(
                             q_recur_full,
                             k_recur_full,
                             la.v_fp32.data(),
@@ -1135,7 +1136,7 @@ void linear_attn_body(
                             la.core_out.data(),
                             /*B=*/1, V_h, K_d, V_d, stream);
                     } else {
-                        kernels::launch_recurrent_gated_delta_step(
+                        kernels::ssm::recurrent_gated_delta_step(
                             q_recur_full,
                             k_recur_full,
                             la.v_fp32.data(),
@@ -1161,7 +1162,7 @@ void linear_attn_body(
                         void* state_slot = state_cache.recurrent_state_raw(
                             layer_idx, slot_for(r));
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_state_bf16(
+                            kernels::ssm::chunk_gated_delta_prefill_state_bf16(
                                 q_recur_full + qk_off,
                                 k_recur_full + qk_off,
                                 la.v_fp32.data() + v_off,
@@ -1171,7 +1172,7 @@ void linear_attn_body(
                                 la.core_out.data() + v_off,
                                 Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill(
+                            kernels::ssm::chunk_gated_delta_prefill(
                                 q_recur_full + qk_off,
                                 k_recur_full + qk_off,
                                 la.v_fp32.data() + v_off,
@@ -1192,7 +1193,7 @@ void linear_attn_body(
                     // arithmetic. See qwen3_5_forward.cpp for the argument.
                     if (use_warp_tiled_recurrent) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
+                            kernels::ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
                                 la.q_pre.data(),
                                 la.k_pre.data(),
                                 la.v_fp32.data(),
@@ -1205,7 +1206,7 @@ void linear_attn_body(
                                 R, K_h, V_h, K_d, V_d,
                                 stream, write_state, rs_write_state_mask);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
+                            kernels::ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa(
                                 la.q_pre.data(),
                                 la.k_pre.data(),
                                 la.v_fp32.data(),
@@ -1267,23 +1268,23 @@ void linear_attn_body(
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_post_ms : nullptr,
         stream, [&] {
-    kernels::launch_rmsnorm_gated_fp32_in_bf16(
+    kernels::norm::rmsnorm_gated_fp32_in_bf16(
         core_rows, z_data, Lw.la_norm_w_fp32,
         la.core_out_bf16.data(),
         N_new * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
     // out_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
     // all-reduce + residual-add.
     if (T == 1) {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             la.core_out_bf16.data(), Lw.la_out_proj->data(),
             ws.y.data(), N_new, H, V_dim, /*beta=*/1.f);
     } else {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             la.core_out_bf16.data(), Lw.la_out_proj->data(),
             ws.norm_y.data(), N_new, H, V_dim, /*beta=*/0.f);
         tp->all_reduce_bf16(ws.norm_y.data(),
             static_cast<std::size_t>(N_new) * H, ncclSum, stream);
-        kernels::launch_residual_add_bf16(
+        kernels::norm::residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N_new) * H, stream);
     }
@@ -1298,8 +1299,8 @@ void full_attn_body(
     Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
     KvCache& cache, AttentionWorkspace& attn_ws,
-    const ops::DecodePlanCache* decode_plan,
-    const ops::PrefillPlanCache* prefill_plan,
+    const kernels::attn::DecodePlanCache* decode_plan,
+    const kernels::attn::PrefillPlanCache* prefill_plan,
     int model_layer, int kv_layer, int N, int R,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -1312,7 +1313,7 @@ void full_attn_body(
     const std::uint32_t* w_off_d,
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
-    ops::CublasHandle& cublas, cudaStream_t stream)
+    kernels::gemm::CublasHandle& cublas, cudaStream_t stream)
 {
     const int T  = std::max(1, fwd_cfg.tp_size);
     const int H  = cfg.hidden_size;
@@ -1331,22 +1332,22 @@ void full_attn_body(
     // are the gate logits. Qwen3-MoE (Qwen3-30B-A3B) ships plain q_proj
     // [Hq, H] with no output gate, so the GEMM goes straight into ws.q.
     if (cfg.attn_output_gate) {
-        ops::gemm_act_x_w(cublas.handle(),
+        kernels::gemm::act_x_w(cublas.handle(),
             ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
             la.fa_qg_packed.data(), N, 2 * Hq, H);
-        kernels::launch_split_q_gate_bf16(
+        kernels::layout::split_q_gate_bf16(
             la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
             N, num_q_heads_local, d, stream);
     } else {
-        ops::gemm_act_x_w(cublas.handle(),
+        kernels::gemm::act_x_w(cublas.handle(),
             ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
             ws.q.data(), N, Hq, H);
     }
 
-    ops::gemm_act_x_w(cublas.handle(),
+    kernels::gemm::act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
         ws.k.data(), N, Hk, H);
-    ops::gemm_act_x_w(cublas.handle(),
+    kernels::gemm::act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
         ws.v.data(), N, Hk, H);
 
@@ -1357,7 +1358,7 @@ void full_attn_body(
         ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
         N * num_kv_heads_local, d, eps, stream);
 
-    kernels::launch_rope_partial_bf16(
+    kernels::rope::rope_partial_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
@@ -1373,11 +1374,11 @@ void full_attn_body(
 
     auto kv_view = cache.layer_view(kv_layer);
     if (has_write_desc) {
-        kernels::launch_write_kv_explicit_bf16(
+        kernels::attn::write_kv_explicit_bf16(
             kv_view, ws.k.data(), ws.v.data(),
             w_page_d, w_off_d, N, stream, row_valid_d);
     } else {
-        kernels::launch_write_kv_to_pages(
+        kernels::attn::write_kv_to_pages(
             kv_view, ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             N, R, stream);
@@ -1392,34 +1393,34 @@ void full_attn_body(
         N <= fwd_cfg.small_prefill_naive_attention_max_tokens &&
         kv_view.is_native_bf16() && !kv_view.hnd_layout;
     if (decode_plan) {
-        ops::dispatch_attention_flashinfer_decode(
+        kernels::attn::dispatch_attention_flashinfer_decode(
             *decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            attn_ws, stream);
+            attn_ws.view(), stream);
     } else if (prefill_plan) {
-        ops::dispatch_attention_flashinfer_prefill_bf16(
+        kernels::attn::dispatch_attention_flashinfer_prefill_bf16(
             *prefill_plan,
             ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
             ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            attn_ws, stream);
+            attn_ws.view(), stream);
     } else if (use_small_prefill_naive) {
-        ops::launch_attention_naive_paged_bf16(
+        kernels::attn::attention_naive_paged_bf16(
             ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
             ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             N, R, num_q_heads_local, num_kv_heads_local, d,
             cache.page_size(), stream);
     } else {
-        ops::launch_attention_flashinfer_prefill(
+        kernels::attn::attention_flashinfer_prefill(
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             qo_indptr_h, kv_page_indptr_h,
-            N, R, num_q_heads_local, attn_ws, stream);
+            N, R, num_q_heads_local, attn_ws.view(), stream);
     }
     if (cfg.attn_output_gate) {
-        kernels::launch_sigmoid_gate_inplace_bf16(
+        kernels::mlp::sigmoid_gate_inplace_bf16(
             ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     }
     invoke_stage_hook(
@@ -1431,16 +1432,16 @@ void full_attn_body(
     // o_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
     // all-reduce + residual-add.
     if (T == 1) {
-        ops::gemm_act_x_w(cublas.handle(),
+        kernels::gemm::act_x_w(cublas.handle(),
             ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
             ws.y.data(), N, H, Hq, /*beta=*/1.f);
     } else {
-        ops::gemm_act_x_w(cublas.handle(),
+        kernels::gemm::act_x_w(cublas.handle(),
             ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
             ws.norm_y.data(), N, H, Hq, /*beta=*/0.f);
         tp->all_reduce_bf16(ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, ncclSum, stream);
-        kernels::launch_residual_add_bf16(
+        kernels::norm::residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
     }
@@ -1458,7 +1459,7 @@ bool moe_block(
     Qwen3_5MoeMlpWorkspace& moe_ws,
     int N,
     bool is_pure_decode,
-    ops::CublasHandle& cublas, cudaStream_t stream,
+    kernels::gemm::CublasHandle& cublas, cudaStream_t stream,
     Qwen35MoeForwardProfile* profile)
 {
     const int T = std::max(1, fwd_cfg.tp_size);
@@ -1495,11 +1496,11 @@ bool moe_block(
     // 1. Router logits.
     profile_cuda_stage(profile, profile ? &profile->moe_router_ms : nullptr,
         stream, [&] {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
+            kernels::gemm::act_x_wt_bf16(cublas.handle(),
                 ws.norm_x.data(), Lw.moe_router->data(),
                 moe_ws.router_logits.data(), N, E, H);
             // 2. Top-K + softmax + renormalize.
-            kernels::launch_topk_softmax_bf16(
+            kernels::moe::topk_softmax_bf16(
                 moe_ws.router_logits.data(),
                 moe_ws.topk_idx.data(), moe_ws.topk_weights.data(),
                 N, E, K, stream);
@@ -1557,8 +1558,8 @@ bool moe_block(
                 void* fused_out = add_to_residual ? ws.norm_y.data() : moe_out;
                 if (!moe_ws.cutlass_ws.empty() &&
                     N <= moe_ws.cutlass_max_rows &&
-                    ops::flashinfer_cutlass_moe_bf16(
-                        ops::MoeActivation::Swiglu,
+                    kernels::moe::flashinfer_cutlass_moe_bf16(
+                        kernels::moe::MoeActivation::Swiglu,
                         static_cast<const std::uint16_t*>(ws.norm_x.data()),
                         moe_ws.topk_idx.data(),
                         moe_ws.topk_weights.data(),
@@ -1573,7 +1574,7 @@ bool moe_block(
                         N, H, Im, E, K,
                         /*tp_size=*/1, /*tp_rank=*/0, stream)) {
                     if (add_to_residual) {
-                        kernels::launch_residual_add_bf16(
+                        kernels::norm::residual_add_bf16(
                             moe_out, ws.norm_y.data(),
                             static_cast<std::size_t>(N) * H, stream);
                     }
@@ -1613,7 +1614,7 @@ bool moe_block(
                             profile_cuda_detail_stage(
                                 profile, profile ? &profile->moe_align_ms : nullptr,
                                 stream, [&] {
-                            kernels::launch_moe_align_decode(
+                            kernels::moe::moe_align_decode(
                                 moe_ws.topk_idx.data(),
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_ids.data(),
@@ -1623,7 +1624,7 @@ bool moe_block(
                             profile_cuda_detail_stage(
                                 profile, profile ? &profile->moe_gather_ms : nullptr,
                                 stream, [&] {
-                            kernels::launch_gather_moe_aligned_inputs_bf16(
+                            kernels::moe::gather_moe_aligned_inputs_bf16(
                                 ws.norm_x.data(), moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_in.data(),
                                 routes, aligned_rows, K, H,
@@ -1632,7 +1633,7 @@ bool moe_block(
                             profile_cuda_detail_stage(
                                 profile, profile ? &profile->moe_ptrs_ms : nullptr,
                                 stream, [&] {
-                            kernels::launch_build_moe_ptrs_aligned_bf16(
+                            kernels::moe::build_moe_ptrs_aligned_bf16(
                                 moe_ws.aligned_expert_ids.data(),
                                 Lw.moe_gate_up_proj->data(),
                                 Lw.moe_down_proj->data(),
@@ -1668,23 +1669,23 @@ bool moe_block(
                     const bool grouped_ok =
                         !fold_shared;
                     const bool grouped_gu = grouped_ok &&
-                        kernels::moe_grouped_gemm_bf16_supported(
+                        kernels::moe::moe_grouped_gemm_bf16_supported(
                             block, 2 * Im, H);
                     const bool grouped_dn = grouped_ok &&
-                        kernels::moe_grouped_gemm_bf16_supported(
+                        kernels::moe::moe_grouped_gemm_bf16_supported(
                             block, H, Im);
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_gate_up_ms : nullptr,
                         stream, [&] {
                             if (grouped_gu) {
-                                kernels::launch_moe_grouped_gemm_bf16(
+                                kernels::moe::moe_grouped_gemm_bf16(
                                     moe_ws.aligned_expert_in.data(),
                                     Lw.moe_gate_up_proj->data(),
                                     moe_ws.aligned_gate_up.data(),
                                     moe_ws.aligned_expert_ids.data(),
                                     max_blocks, block, 2 * Im, H, stream);
                             } else {
-                                ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                                kernels::gemm::batched_act_x_wt_bf16(cublas.handle(),
                                     reinterpret_cast<const void* const*>(
                                         moe_ws.b_gu_ptrs.data()),
                                     reinterpret_cast<const void* const*>(
@@ -1697,7 +1698,7 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_act_ms : nullptr,
                         stream, [&] {
-                            kernels::launch_chunked_swiglu_bf16(
+                            kernels::mlp::chunked_swiglu_bf16(
                                 moe_ws.aligned_gate_up.data(),
                                 moe_ws.aligned_act.data(),
                                 aligned_rows, Im, stream,
@@ -1709,14 +1710,14 @@ bool moe_block(
                         profile, profile ? &profile->moe_down_ms : nullptr,
                         stream, [&] {
                             if (grouped_dn) {
-                                kernels::launch_moe_grouped_gemm_bf16(
+                                kernels::moe::moe_grouped_gemm_bf16(
                                     moe_ws.aligned_act.data(),
                                     Lw.moe_down_proj->data(),
                                     moe_ws.aligned_out.data(),
                                     moe_ws.aligned_expert_ids.data(),
                                     max_blocks, block, H, Im, stream);
                             } else {
-                                ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                                kernels::gemm::batched_act_x_wt_bf16(cublas.handle(),
                                     reinterpret_cast<const void* const*>(
                                         moe_ws.b_dn_ptrs.data()),
                                     reinterpret_cast<const void* const*>(
@@ -1729,7 +1730,7 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_reduce_ms : nullptr,
                         stream, [&] {
-                            kernels::launch_reorder_moe_aligned_output_bf16(
+                            kernels::moe::reorder_moe_aligned_output_bf16(
                                 moe_ws.aligned_out.data(),
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.expert_out.data(),
@@ -1739,12 +1740,12 @@ bool moe_block(
                                             : nullptr,
                                 stream);
                             if (add_to_residual) {
-                                kernels::launch_token_batched_weighted_sum_add_bf16(
+                                kernels::moe::token_batched_weighted_sum_add_bf16(
                                     moe_out, moe_ws.expert_out.data(),
                                     moe_ws.topk_weights.data(),
                                     N, K, H, stream);
                             } else {
-                                kernels::launch_token_batched_weighted_sum_bf16(
+                                kernels::moe::token_batched_weighted_sum_bf16(
                                     moe_out, moe_ws.expert_out.data(),
                                     moe_ws.topk_weights.data(),
                                     N, K, H, stream);
@@ -1757,7 +1758,7 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_gate_up_ms : nullptr,
                         stream, [&] {
-                            kernels::launch_moe_gate_up_decode_gemv_bf16(
+                            kernels::moe::moe_gate_up_decode_gemv_bf16(
                                 moe_ws.topk_idx.data(),
                                 ws.norm_x.data(),
                                 Lw.moe_gate_up_proj->data(),
@@ -1768,7 +1769,7 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_act_ms : nullptr,
                         stream, [&] {
-                            kernels::launch_chunked_swiglu_bf16(
+                            kernels::mlp::chunked_swiglu_bf16(
                                 moe_ws.expert_gate_up.data(),
                                 moe_ws.expert_act.data(),
                                 routes, Im, stream,
@@ -1778,7 +1779,7 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_down_ms : nullptr,
                         stream, [&] {
-                            kernels::launch_moe_down_decode_gemv_bf16(
+                            kernels::moe::moe_down_decode_gemv_bf16(
                                 moe_ws.topk_idx.data(),
                                 moe_ws.expert_act.data(),
                                 Lw.moe_down_proj->data(),
@@ -1790,12 +1791,12 @@ bool moe_block(
                         profile, profile ? &profile->moe_reduce_ms : nullptr,
                         stream, [&] {
                             if (add_to_residual) {
-                                kernels::launch_token_batched_weighted_sum_add_bf16(
+                                kernels::moe::token_batched_weighted_sum_add_bf16(
                                     moe_out, moe_ws.expert_out.data(),
                                     moe_ws.topk_weights.data(),
                                     N, K, H, stream);
                             } else {
-                                kernels::launch_token_batched_weighted_sum_bf16(
+                                kernels::moe::token_batched_weighted_sum_bf16(
                                     moe_out, moe_ws.expert_out.data(),
                                     moe_ws.topk_weights.data(),
                                     N, K, H, stream);
@@ -1839,7 +1840,7 @@ bool moe_block(
                         moe_ws.expert_w.data(), wts.data(),
                         Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
 
-                    kernels::launch_gather_bf16_rows(
+                    kernels::layout::gather_bf16_rows(
                         static_cast<const std::uint16_t*>(ws.norm_x.data()),
                         moe_ws.expert_idx.data(),
                         moe_ws.expert_in.data(),
@@ -1865,21 +1866,21 @@ bool moe_block(
                                      Lw.moe_down_proj->data())
                                  + e * expert_stride_dn;
                     }
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    kernels::gemm::act_x_wt_bf16(cublas.handle(),
                         moe_ws.expert_in.data(), gate_up_w,
                         moe_ws.expert_gate_up.data(), Ne, 2 * Im, H);
 
-                    kernels::launch_chunked_swiglu_bf16(
+                    kernels::mlp::chunked_swiglu_bf16(
                         moe_ws.expert_gate_up.data(),
                         moe_ws.expert_act.data(),
                         Ne, Im, stream,
                         /*gate_second=*/moe_gate_up_swapped());
 
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    kernels::gemm::act_x_wt_bf16(cublas.handle(),
                         moe_ws.expert_act.data(), down_w,
                         moe_ws.expert_out.data(), Ne, H, Im);
 
-                    kernels::launch_scatter_add_weighted_bf16(
+                    kernels::moe::scatter_add_weighted_bf16(
                         ws.norm_y.data(), moe_ws.expert_out.data(),
                         moe_ws.expert_idx.data(), moe_ws.expert_w.data(),
                         Ne, H, stream);
@@ -1912,11 +1913,11 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_shared_gate_up_ms : nullptr,
                         stream, [&] {
-                            ops::gemm_act_x_w(cublas.handle(),
+                            kernels::gemm::act_x_w(cublas.handle(),
                                 ws.norm_x.data(),
-                                ops::WeightView(*Lw.shared_gate_up_gate_proj),
+                                WeightView(*Lw.shared_gate_up_gate_proj),
                                 moe_ws.shared_gate_up.data(), N, 2 * Is + 1, H);
-                            kernels::launch_chunked_swiglu_strided_bf16(
+                            kernels::mlp::chunked_swiglu_strided_bf16(
                                 moe_ws.shared_gate_up.data(),
                                 moe_ws.shared_act.data(), N, Is, 2 * Is + 1, stream);
                         });
@@ -1924,10 +1925,10 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_shared_gate_up_ms : nullptr,
                         stream, [&] {
-                            ops::gemm_act_x_w(cublas.handle(),
-                                ws.norm_x.data(), ops::WeightView(*Lw.shared_gate_up_proj),
+                            kernels::gemm::act_x_w(cublas.handle(),
+                                ws.norm_x.data(), WeightView(*Lw.shared_gate_up_proj),
                                 moe_ws.shared_gate_up.data(), N, 2 * Is, H);
-                            kernels::launch_chunked_swiglu_bf16(
+                            kernels::mlp::chunked_swiglu_bf16(
                                 moe_ws.shared_gate_up.data(),
                                 moe_ws.shared_act.data(), N, Is, stream);
                         });
@@ -1935,17 +1936,17 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_shared_gate_up_ms : nullptr,
                         stream, [&] {
-                            ops::gemm_act_x_w(cublas.handle(),
+                            kernels::gemm::act_x_w(cublas.handle(),
                                 ws.norm_x.data(),
                                 make_weight_view(
                                     Lw.shared_gate_proj, Lw.shared_gate_proj_quant),
                                 moe_ws.shared_gate.data(), N, Is, H);
-                            ops::gemm_act_x_w(cublas.handle(),
+                            kernels::gemm::act_x_w(cublas.handle(),
                                 ws.norm_x.data(),
                                 make_weight_view(
                                     Lw.shared_up_proj, Lw.shared_up_proj_quant),
                                 moe_ws.shared_up.data(), N, Is, H);
-                            kernels::launch_swiglu_bf16(
+                            kernels::mlp::swiglu_bf16(
                                 moe_ws.shared_gate.data(), moe_ws.shared_up.data(),
                                 moe_ws.shared_act.data(),
                                 N * Is, stream);
@@ -1955,7 +1956,7 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_shared_down_ms : nullptr,
                         stream, [&] {
-                            ops::gemm_act_x_w(cublas.handle(),
+                            kernels::gemm::act_x_w(cublas.handle(),
                                 moe_ws.shared_act.data(),
                                 make_weight_view(
                                     Lw.shared_down_proj, Lw.shared_down_proj_quant),
@@ -1971,28 +1972,28 @@ bool moe_block(
                             const auto* scalar_gate =
                                 moe_ws.shared_gate_up.data() +
                                 static_cast<std::size_t>(2 * Is);
-                            kernels::launch_sigmoid_scalar_gate_strided_add_bf16(
+                            kernels::mlp::sigmoid_scalar_gate_strided_add_bf16(
                                 moe_out, moe_ws.shared_out.data(),
                                 scalar_gate,
                                 N, H, 2 * Is + 1, stream);
                         } else if (Lw.shared_gate != nullptr &&
                                    N <= kQwen35MoeDecodeFastMaxTokens &&
                                    !Lw.shared_gate_quant.has_value()) {
-                            kernels::launch_sigmoid_dot_scalar_gate_add_bf16(
+                            kernels::mlp::sigmoid_dot_scalar_gate_add_bf16(
                                 ws.norm_x.data(),
                                 Lw.shared_gate->data(),
                                 moe_out,
                                 moe_ws.shared_out.data(),
                                 N, H, stream);
                         } else {
-                            ops::gemm_act_x_w(cublas.handle(),
+                            kernels::gemm::act_x_w(cublas.handle(),
                                 ws.norm_x.data(),
                                 make_weight_view(Lw.shared_gate, Lw.shared_gate_quant),
                                 moe_ws.shared_gate_logit.data(), N, 1, H);
 
                             // shared_out *= sigmoid(scalar_gate[n]) per token,
                             // broadcast across all H channels.
-                            kernels::launch_sigmoid_scalar_gate_add_bf16(
+                            kernels::mlp::sigmoid_scalar_gate_add_bf16(
                                 moe_out, moe_ws.shared_out.data(),
                                 moe_ws.shared_gate_logit.data(),
                                 N, H, stream);
@@ -2024,7 +2025,7 @@ void qwen3_5_moe_forward_paged(
     KvCache& cache,
     RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -2213,16 +2214,16 @@ void qwen3_5_moe_forward_paged(
 
     // Decode plan was refreshed by `prepare_qwen3_5_decode_plan` before
     // this body call. Avoids host work inside any cudaStream capture.
-    const ops::DecodePlanCache* decode_plan =
+    const kernels::attn::DecodePlanCache* decode_plan =
         plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
-    const ops::PrefillPlanCache* prefill_plan =
+    const kernels::attn::PrefillPlanCache* prefill_plan =
         (plan_state.use_prefill_plan && plan_state.prefill_plan)
             ? plan_state.prefill_plan.get()
             : nullptr;
 
     if (!commit_advance) {
         profile_cuda_stage(&profile, &profile.embed_ms, stream, [&] {
-            kernels::launch_embed_bf16(
+            kernels::layout::embed_bf16(
                 token_ids, w.embed->data(), ws.y.data(),
                 N, H, cfg.vocab_size, stream);
         });
@@ -2240,7 +2241,7 @@ void qwen3_5_moe_forward_paged(
                 const std::uint16_t* stash =
                     static_cast<const std::uint16_t*>(
                         state_cache.verify_hidden_stash_layer(linear_idx));
-                kernels::launch_gather_bf16_rows(
+                kernels::layout::gather_bf16_rows(
                     stash, commit_advance_gather,
                     static_cast<std::uint16_t*>(ws.norm_x.data()),
                     N, H, stream);
@@ -2333,7 +2334,7 @@ void qwen3_5_moe_forward_paged(
             cublas, stream, &profile);
         if (!moe_added_to_residual) {
             profile_cuda_stage(&profile, &profile.residual_ms, stream, [&] {
-                kernels::launch_residual_add_bf16(
+                kernels::norm::residual_add_bf16(
                     ws.y.data(), ws.norm_y.data(),
                     (std::size_t)N * H, stream);
             });
@@ -2356,7 +2357,7 @@ void qwen3_5_moe_forward_paged(
         int lm_head_rows = N;
         const void* lm_head_input = ws.norm_x.data();
         if (compact_logits) {
-            kernels::launch_gather_bf16_rows(
+            kernels::layout::gather_bf16_rows(
                 static_cast<const std::uint16_t*>(ws.y.data()),
                 logit_row_indices_d,
                 static_cast<std::uint16_t*>(ws.norm_y.data()),
@@ -2370,7 +2371,7 @@ void qwen3_5_moe_forward_paged(
                 ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
                 N, H, eps, stream);
         }
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             lm_head_input, w.lm_head->data(),
             ws.logits.data(), lm_head_rows, V, H);
         if (!compact_logits) {
@@ -2401,7 +2402,7 @@ void mtp_full_attn_no_cache_moe(
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
     int max_global_tokens,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     cudaStream_t stream)
 {
     const int T = std::max(1, fwd_cfg.tp_size);
@@ -2421,22 +2422,22 @@ void mtp_full_attn_no_cache_moe(
     auto* v_step = static_cast<std::uint16_t*>(ws.v.data()) + kv_step_offset;
 
     if (cfg.attn_output_gate) {
-        ops::gemm_act_x_w(cublas.handle(),
+        kernels::gemm::act_x_w(cublas.handle(),
             ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
             la.fa_qg_packed.data(), N, 2 * Hq, H);
-        kernels::launch_split_q_gate_bf16(
+        kernels::layout::split_q_gate_bf16(
             la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
             N, q_heads, cfg.head_dim, stream);
     } else {
-        ops::gemm_act_x_w(cublas.handle(),
+        kernels::gemm::act_x_w(cublas.handle(),
             ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
             ws.q.data(), N, Hq, H);
     }
 
-    ops::gemm_act_x_w(cublas.handle(),
+    kernels::gemm::act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
         k_step, N, Hk, H);
-    ops::gemm_act_x_w(cublas.handle(),
+    kernels::gemm::act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
         v_step, N, Hk, H);
     rmsnorm_bf16_dispatch(cfg,
@@ -2445,11 +2446,11 @@ void mtp_full_attn_no_cache_moe(
     rmsnorm_bf16_dispatch(cfg,
         k_step, Lw.fa_k_norm->data(), k_step,
         N * kv_heads, d, eps, stream);
-    kernels::launch_rope_partial_bf16(
+    kernels::rope::rope_partial_bf16(
         ws.q.data(), k_step, position_ids,
         N, q_heads, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
     const auto mtp_kv = cache.layer_view(Lw.kv_layer);
-    ops::launch_attention_mtp_paged_history_bf16(
+    kernels::attn::attention_mtp_paged_history_bf16(
         ws.q.data(), mtp_kv.k_bf16_pages, mtp_kv.v_bf16_pages,
         ws.k.data(), ws.v.data(), ws.attn_out.data(),
         position_ids, request_ids,
@@ -2458,21 +2459,21 @@ void mtp_full_attn_no_cache_moe(
         q_heads, kv_heads, d, mtp_kv.hnd_layout,
         fwd_cfg.mtp_global_cache_uses_prefix_position, stream);
     if (cfg.attn_output_gate) {
-        kernels::launch_sigmoid_gate_inplace_bf16(
+        kernels::mlp::sigmoid_gate_inplace_bf16(
             ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     }
 
     if (T == 1) {
-        ops::gemm_act_x_w(cublas.handle(),
+        kernels::gemm::act_x_w(cublas.handle(),
             ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
             ws.y.data(), N, H, Hq, /*beta=*/1.f);
     } else {
-        ops::gemm_act_x_w(cublas.handle(),
+        kernels::gemm::act_x_w(cublas.handle(),
             ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
             ws.norm_y.data(), N, H, Hq, /*beta=*/0.f);
         tp->all_reduce_bf16(ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, ncclSum, stream);
-        kernels::launch_residual_add_bf16(
+        kernels::norm::residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
     }
@@ -2489,7 +2490,7 @@ void qwen3_5_moe_mtp_process_cache(
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
     RecurrentStateCache& state_cache,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -2519,19 +2520,19 @@ void qwen3_5_moe_mtp_process_cache(
     void* pending = state_cache.mtp_pending_hidden(0);
     const void* target_hidden = ws.y.data();
     if (source_row_indices != nullptr) {
-        kernels::launch_gather_bf16_rows(
+        kernels::layout::gather_bf16_rows(
             static_cast<const std::uint16_t*>(ws.y.data()),
             source_row_indices,
             static_cast<std::uint16_t*>(ws.norm_x.data()),
             total_tokens, H, stream);
         target_hidden = ws.norm_x.data();
     }
-    ops::launch_mtp_shift_hidden_bf16(
+    kernels::attn::mtp_shift_hidden_bf16(
         target_hidden, pending, qo_indptr, slot_ids_d, ws.norm_y.data(),
         total_tokens, num_requests, H, stream);
-    ops::launch_mtp_update_pending_hidden_bf16(
+    kernels::attn::mtp_update_pending_hidden_bf16(
         target_hidden, pending, qo_indptr, slot_ids_d, num_requests, H, stream);
-    kernels::launch_embed_bf16(
+    kernels::layout::embed_bf16(
         token_ids, mtp.embed->data(), ws.norm_x.data(),
         total_tokens, H, cfg.vocab_size, stream);
     rmsnorm_bf16_dispatch(cfg,
@@ -2540,28 +2541,28 @@ void qwen3_5_moe_mtp_process_cache(
     rmsnorm_bf16_dispatch(cfg,
         ws.norm_y.data(), mtp.pre_fc_norm_hidden->data(), ws.attn_out.data(),
         total_tokens, H, eps, stream);
-    kernels::launch_concat_bf16_rows(
+    kernels::layout::concat_bf16_rows(
         ws.q.data(), ws.attn_out.data(), ws.mtp_concat.data(),
         total_tokens, H, H, stream);
-    ops::gemm_act_x_w(cublas.handle(),
+    kernels::gemm::act_x_w(cublas.handle(),
         ws.mtp_concat.data(), *mtp.fc, ws.norm_y.data(),
         total_tokens, H, 2 * H);
     rmsnorm_bf16_dispatch(cfg,
         ws.norm_y.data(), Lw.attn_norm_pre->data(), ws.norm_x.data(),
         total_tokens, H, eps, stream);
-    ops::gemm_act_x_w(cublas.handle(),
+    kernels::gemm::act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
         ws.k.data(), total_tokens, Hk, H);
-    ops::gemm_act_x_w(cublas.handle(),
+    kernels::gemm::act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
         ws.v.data(), total_tokens, Hk, H);
     rmsnorm_bf16_dispatch(cfg,
         ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
         total_tokens * kv_heads, d, eps, stream);
-    kernels::launch_rope_partial_bf16(
+    kernels::rope::rope_partial_bf16(
         /*q=*/nullptr, ws.k.data(), positions,
         total_tokens, 0, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
-    kernels::launch_write_kv_to_pages(
+    kernels::attn::write_kv_to_pages(
         cache.layer_view(Lw.kv_layer),
         ws.k.data(), ws.v.data(), qo_indptr, kv_page_indices,
         kv_page_indptr, kv_last_page_lens, total_tokens, num_requests,
@@ -2576,7 +2577,7 @@ void qwen3_5_moe_mtp_forward(
     Qwen3_5LinearAttnWorkspace& la_ws,
     Qwen3_5MoeMlpWorkspace& moe_ws,
     KvCache& cache,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* position_ids,
     const std::int32_t* base_hidden_row_indices,
@@ -2601,12 +2602,12 @@ void qwen3_5_moe_mtp_forward(
     profile.begin(num_tokens, stream);
 
     profile_mtp_stage(profile, profile.input_fc_ms, stream, [&] {
-    kernels::launch_gather_bf16_rows(
+    kernels::layout::gather_bf16_rows(
         static_cast<const std::uint16_t*>(ws.y.data()),
         base_hidden_row_indices,
         static_cast<std::uint16_t*>(ws.norm_y.data()),
         num_tokens, H, stream);
-    kernels::launch_embed_bf16(
+    kernels::layout::embed_bf16(
         token_ids, mtp.embed->data(), ws.norm_x.data(),
         num_tokens, H, cfg.vocab_size, stream);
     rmsnorm_bf16_dispatch(cfg,
@@ -2615,10 +2616,10 @@ void qwen3_5_moe_mtp_forward(
     rmsnorm_bf16_dispatch(cfg,
         ws.norm_y.data(), mtp.pre_fc_norm_hidden->data(), ws.y.data(),
         num_tokens, H, eps, stream);
-    kernels::launch_concat_bf16_rows(
+    kernels::layout::concat_bf16_rows(
         ws.q.data(), ws.y.data(), ws.mtp_concat.data(),
         num_tokens, H, H, stream);
-    ops::gemm_act_x_w(cublas.handle(),
+    kernels::gemm::act_x_w(cublas.handle(),
         ws.mtp_concat.data(), *mtp.fc, ws.y.data(),
         num_tokens, H, 2 * H);
     });
@@ -2641,7 +2642,7 @@ void qwen3_5_moe_mtp_forward(
         Lw, cfg, fwd_cfg, ws, moe_ws, num_tokens,
         /*is_pure_decode=*/true, cublas, stream, /*profile=*/nullptr);
     if (!moe_added_to_residual) {
-        kernels::launch_residual_add_bf16(
+        kernels::norm::residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(num_tokens) * H, stream);
     }
@@ -2651,7 +2652,7 @@ void qwen3_5_moe_mtp_forward(
     rmsnorm_bf16_dispatch(cfg,
         ws.y.data(), mtp.norm->data(), ws.norm_x.data(),
         num_tokens, H, eps, stream);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
+    kernels::gemm::act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), w.lm_head->data(),
         ws.logits.data(), num_tokens, V, H);
     CUDA_CHECK(cudaMemcpyAsync(

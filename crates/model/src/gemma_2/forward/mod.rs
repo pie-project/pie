@@ -26,8 +26,9 @@
 pub mod facts;
 
 use self::facts::Gemma2Facts;
-use model_compiler::dsl::{self, matmul, rmsnorm, MatW, NormW};
-use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
+use model_compiler::dsl::{
+    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct G2LayerW {
     attn_norm: NormW,
@@ -50,6 +51,7 @@ impl G2LayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         let n = |name: &str| NormW {
             name: w(name),
@@ -87,11 +89,20 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
         dsl::seam(t, &dsl::seam::IN, &[], None);
         let embedded = dsl::embed_with(t, "embed", facts.hidden);
         // `sqrt(hidden)` on the embedding — a launch, not a fold.
-        let mut y = dsl::cuda::scalar_mul(&embedded, "embed_scale");
+        let mut y = dsl::cuda::scalar_mul(
+            &embedded,
+            "embed_scale",
+            Some((facts.hidden as f32).sqrt()),
+        );
 
         for l in 0..facts.layers {
+            // THIS LAYER's sliding window, `-1` for none — a
+            // load-time fact the dispatch statements carry, where four
+            // executors used to re-derive it per launch.
+            let window_left =
+                model_compiler::facts::window_left_at(&facts.window_left, l);
             let w = G2LayerW::new(l, facts);
-            let x = rmsnorm(&y, &w.attn_norm);
+            let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
             let q = matmul(&x, &w.q_proj);
             let k = matmul(&x, &w.k_proj);
@@ -109,41 +120,41 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
                     per_head: Some(a.head_dim),
                     layer: Some(l),
                 };
-                (rmsnorm(&q, &qn), rmsnorm(&k, &kn))
+                (dsl::cuda::rmsnorm(&q, &qn), dsl::cuda::rmsnorm(&k, &kn))
             } else {
                 (q, k)
             };
             // The pre-attention query scale is its OWN launch.
             let q = if a.query_pre_attn_scale {
-                dsl::cuda::scalar_mul(&q, &format!("layer.{l}.query_scale"))
+                dsl::cuda::scalar_mul(&q, &format!("layer.{l}.query_scale"), None)
             } else {
                 q
             };
-            let (q, k) = dsl::rope(&q, &k, RopeKind::Standard);
+            let (q, k) = dsl::cuda::rope(&q, &k);
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&k, &v, &kv);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
             // The attention logit softcap rides HERE, as a dispatch
             // parameter — see the module doc on why it is not a
             // statement of its own.
-            let o = dsl::cuda::attention_flashinfer_decode(&q, &kv)
+            let o = dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left)
                 .expect("a plain attention statement produces its value");
             dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
             let o = matmul(&o, &w.o_proj);
             // The POST norm, then an explicit add — gemma's pair.
-            let o = rmsnorm(&o, &w.post_attn_norm);
+            let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);
             y = dsl::cuda::residual_add(&y, &o, facts.hidden);
 
-            let m = rmsnorm(&y, &w.mlp_norm);
+            let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             let gate = matmul(&m, &w.gate_proj);
             let up = matmul(&m, &w.up_proj);
             let act = dsl::cuda::geglu_tanh_pair(&gate, &up, facts.intermediate);
             let mlp = matmul(&act, &w.down_proj);
-            let mlp = rmsnorm(&mlp, &w.post_mlp_norm);
+            let mlp = dsl::cuda::rmsnorm(&mlp, &w.post_mlp_norm);
             y = dsl::cuda::residual_add(&y, &mlp, facts.hidden);
         }
 
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".to_string(),

@@ -2,13 +2,13 @@
 
 #include <cstdint>
 
-#include "ops/attention_workspace.hpp"
-#include "ops/attention_flashinfer.hpp"
+#include "attention_workspace.hpp"
+#include "attn/attention_flashinfer.hpp"
 #include "distributed.hpp"
 #include "store/kv_cache.hpp"
 #include "store/dsv4_compress_cache.hpp"
 #include "model/deepseek_v4/deepseek_v4.hpp"
-#include "ops/gemm.hpp"
+#include "gemm/gemm.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::model {
@@ -84,7 +84,7 @@ struct DsV4Workspace {
     // once per forward (the geometry is identical on every layer) and
     // reused across layers.
     // Built by DsV4Model::prepare(), consumed by the (capturable) body.
-    ops::PrefillPlanCachePtr swa_plan;
+    kernels::attn::PrefillPlanCachePtr swa_plan;
     bool swa_plan_valid = false;
     int swa_plan_tokens = -1;
     int swa_plan_requests = -1;
@@ -150,7 +150,7 @@ void dsv4_forward_paged(
     KvCache& kv_cache,
     DsV4CompressCache& comp_cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     void* logits_out,
     const std::int32_t* token_ids,
     const std::int32_t* positions,

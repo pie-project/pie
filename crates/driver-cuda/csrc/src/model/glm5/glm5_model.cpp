@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/glm5/glm5_model.hpp"
 
 #include <algorithm>
@@ -50,7 +51,7 @@ void Glm5Model::prepare(AttentionWorkspace& attn_ws,
 void Glm5Model::body(Workspace& ws,
                      KvCache& /*kv*/,
                      AttentionWorkspace& attn_ws,
-                     ops::CublasHandle& cublas,
+                     kernels::gemm::CublasHandle& cublas,
                      const ForwardFn::ForwardInputs& in) {
     glm5_forward_paged(
         weights_, hf_config_, fwd_cfg_, mla_plan_, ws_,

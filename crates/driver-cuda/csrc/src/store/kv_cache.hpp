@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "kv_cache_format.hpp"
-#include "kernels/kv_cache_view.hpp"
+#include "attn/kv_cache_view.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {

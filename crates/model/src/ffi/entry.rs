@@ -23,6 +23,7 @@ use crate::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeF
 use crate::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
 use crate::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
 use crate::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts};
+use model_compiler::dsl::{ScaleLayout, WeightRepr};
 use model_compiler::facts::{NormPlacement, QkNorm};
 use model_compiler::trace::{FireClass, NormVariant, RopeKind};
 
@@ -136,12 +137,100 @@ pub struct PieForwardLlamaLikeCudaFacts {
     /// non-zero is true. Appended field: existing zero-initialized C
     /// callers read as false.
     pub head_dim_padded: u8,
+    /// The head width the attention kernels run at, or 0 when that is
+    /// the logical one. See `LlamaLikeCudaFacts::head_dim_kernel`.
+    pub head_dim_kernel: u32,
     /// The checkpoint bound a packed gate‖up bank, so the MLP activation
     /// is the chunked swiglu over one buffer rather than the pair form
     /// over two. Appended field, same zero-init rule — and note the
     /// default is the UNFUSED form, which is the conservative one: it
     /// reads the two narrow buffers a decliner writes.
     pub gate_up_fused: u8,
+    /// How the linear projections are STORED
+    /// ([`PieForwardWeightRepr`]). Appended, and the zero-init rule is
+    /// what makes it safe: 0 is `Bf16`, the dense reading every caller
+    /// written before this field already meant.
+    pub proj_repr: u32,
+    /// The checkpoint carries zero-points beside the scales; non-zero is
+    /// true. Ignored unless `proj_repr` is one of the `Scaled` kinds.
+    pub proj_zero_point: u8,
+    /// Elements per scale under `PerGroup`; zero otherwise.
+    pub proj_group: u32,
+    /// Which axis `PerChannel` runs along. Zero — the output rows — for
+    /// every row-major `[N, K]` checkpoint this driver reads.
+    pub proj_axis: u32,
+    /// Ranks this deployment shards across (`tp_size`); 0 or 1 is a
+    /// single GPU. See `LlamaLikeCudaFacts::tp_size`.
+    pub tp_size: u32,
+    /// Rows below which an all-reduce takes the P2P kernel; 0 is
+    /// always-NCCL. See `LlamaLikeCudaFacts::all_reduce_p2p_max_rows`.
+    pub all_reduce_p2p_max_rows: u32,
+    /// The per-layer sliding window (`-1` for none), as a pointer and a
+    /// length. Null/0 is "no window". See `read_window_left`.
+    pub window_left: *const i32,
+    pub window_left_len: u32,
+}
+
+/// Mirrors [`model_compiler::dsl::WeightRepr`]'s discriminants, flattened
+/// to the wire the way every enum here crosses: appended-only, and 0 is
+/// the reading a zero-initialized caller already meant.
+///
+/// The variant's PAYLOAD rides beside it (`proj_group`, `proj_axis`,
+/// `proj_zero_point`) rather than in a union, because C's tagged unions
+/// and this ABI's zero-init rule do not mix.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieForwardWeightRepr {
+    Bf16 = 0,
+    ScaledPerTensor = 1,
+    ScaledPerChannel = 2,
+    ScaledPerGroup = 3,
+    Mxfp4Marlin = 4,
+}
+
+/// The four wire fields into the repr they spell.
+///
+/// A free function over the fields rather than a method on one facts
+/// struct, because more than one family carries the axis and the wire
+/// shape is the same in each — `proj_repr` plus the payload that rides
+/// beside it.
+/// The per-layer sliding-window list a caller states.
+///
+/// A pointer plus a length, which is how every variable-length input
+/// crosses this boundary. Null or zero-length is "no window" — the
+/// reading every caller written before this field already meant.
+///
+/// # Safety
+/// The caller must keep `[ptr, ptr+len)` alive and readable across the
+/// trace call; nothing here retains it (the values are copied out).
+unsafe fn read_window_left(ptr: *const i32, len: u32) -> Vec<i32> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec()
+}
+
+fn read_weight_repr(repr: u32, group: u32, axis: u32, zero_point: u8) -> WeightRepr {
+    let scaled = |layout| WeightRepr::Scaled {
+        layout,
+        group,
+        axis,
+        zero_point: zero_point != 0,
+    };
+    match repr {
+        0 => WeightRepr::Bf16,
+        1 => scaled(ScaleLayout::PerTensor),
+        2 => scaled(ScaleLayout::PerChannel),
+        3 => scaled(ScaleLayout::PerGroup),
+        4 => WeightRepr::Mxfp4Marlin,
+        // Refusing beats defaulting: a repr this build does not know is
+        // a driver newer than this library, and reading it as dense
+        // would hand the checkpoint's packed nibbles to a bf16 GEMM.
+        other => panic!(
+            "pie_forward: the driver states weight representation {other}, \
+             which this build's vocabulary does not carry"
+        ),
+    }
 }
 
 fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
@@ -150,8 +239,16 @@ fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
         decode_fused_post: facts.decode_fused_post != 0,
         rope_table: facts.rope_table != 0,
         head_dim_padded: facts.head_dim_padded != 0,
+        head_dim_kernel: facts.head_dim_kernel,
         force_prefill_path: facts.force_prefill_path != 0,
         gate_up_fused: facts.gate_up_fused != 0,
+        proj_repr: read_weight_repr(facts.proj_repr, facts.proj_group,
+                                    facts.proj_axis, facts.proj_zero_point),
+        tp_size: facts.tp_size,
+        all_reduce_p2p_max_rows: facts.all_reduce_p2p_max_rows,
+        window_left: unsafe {
+            read_window_left(facts.window_left, facts.window_left_len)
+        },
     }
 }
 
@@ -433,6 +530,17 @@ pub struct PieForwardQwen35CudaFacts {
     pub moe_force_general: u8,
     /// The dense MLP bound a packed gate_up bank.
     pub gate_up_fused: u8,
+    /// How the linear projections are STORED ([`PieForwardWeightRepr`]),
+    /// with the payload that rides beside it. Same wire shape and same
+    /// zero-init rule as [`PieForwardLlamaLikeCudaFacts`]'s four.
+    pub proj_repr: u32,
+    pub proj_zero_point: u8,
+    pub proj_group: u32,
+    pub proj_axis: u32,
+    /// The per-layer sliding window (`-1` for none), as a pointer and a
+    /// length. Null/0 is "no window". See `read_window_left`.
+    pub window_left: *const i32,
+    pub window_left_len: u32,
 }
 
 fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts {
@@ -449,6 +557,11 @@ fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts 
         moe_streamed_experts: facts.moe_streamed_experts != 0,
         moe_force_general: facts.moe_force_general != 0,
         gate_up_fused: facts.gate_up_fused != 0,
+        proj_repr: read_weight_repr(facts.proj_repr, facts.proj_group,
+                                    facts.proj_axis, facts.proj_zero_point),
+        window_left: unsafe {
+            read_window_left(facts.window_left, facts.window_left_len)
+        },
     }
 }
 
@@ -768,6 +881,10 @@ pub struct PieForwardGemma4CudaFacts {
     /// The KV cache is native bf16, so the fused decode post may write
     /// pages directly.
     pub kv_native_bf16: u8,
+    /// The per-layer sliding window (`-1` for none), as a pointer and a
+    /// length. Null/0 is "no window". See `read_window_left`.
+    pub window_left: *const i32,
+    pub window_left_len: u32,
 }
 
 fn read_gemma4_facts(facts: &PieForwardGemma4Facts) -> Gemma4Facts {
@@ -817,6 +934,9 @@ pub unsafe extern "C" fn pie_forward_trace_gemma4_cuda(
             fused_qkv: c.fused_qkv != 0,
             gate_up_fused: c.gate_up_fused != 0,
             kv_native_bf16: c.kv_native_bf16 != 0,
+            window_left: unsafe {
+                read_window_left(c.window_left, c.window_left_len)
+            },
         };
         let class = match class {
             0 => FireClass::Decode,
@@ -871,6 +991,10 @@ pub struct PieForwardGptOssCudaFacts {
     /// `mxfp4_decode_max_routes`: the fused leg's admission threshold in
     /// ROUTES (`N * top_k`).
     pub mxfp4_decode_max_routes: u32,
+    /// The per-layer sliding window (`-1` for none), as a pointer and a
+    /// length. Null/0 is "no window". See `read_window_left`.
+    pub window_left: *const i32,
+    pub window_left_len: u32,
 }
 
 fn read_gpt_oss_facts(facts: &PieForwardGptOssFacts) -> GptOssFacts {
@@ -924,6 +1048,9 @@ pub unsafe extern "C" fn pie_forward_trace_gpt_oss_cuda(
             mxfp4_decode_gemv: c.mxfp4_decode_gemv != 0,
             mxfp4_decode_max_routes: c.mxfp4_decode_max_routes,
             streamed_experts: c.streamed_experts != 0,
+            window_left: unsafe {
+                read_window_left(c.window_left, c.window_left_len)
+            },
         };
         // The text ASSERTS both of these, and an assert that fires here
         // is a panic across the ABI. Answer them as an argument error

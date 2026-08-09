@@ -6,7 +6,7 @@
 #include <pie_driver_abi.h>
 
 #include "entry_validation.hpp"
-#include "kernels/slot_ops.hpp"
+#include "layout/slot_ops.hpp"
 #include "pie/driver/validate.hpp"
 #include "pie/driver/fire/geometry.hpp"
 #include "store/recurrent_state_cache.hpp"

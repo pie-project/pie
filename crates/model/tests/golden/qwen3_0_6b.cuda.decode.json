@@ -6606,7 +6606,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_standard_table"
+          "kernel": "rope::rope_standard_table"
         }
       },
       "inputs": [],
@@ -6617,9 +6617,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.0.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.0.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -6716,7 +6718,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.0.q_norm",
             "layer.0.k_norm"
@@ -6752,7 +6754,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -6769,7 +6771,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -6827,11 +6829,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 0
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -6843,11 +6848,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 0
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -6859,11 +6867,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 0
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -6949,7 +6960,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.0.q_norm",
             "layer.0.k_norm"
@@ -6985,7 +6996,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -7002,7 +7013,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -7048,11 +7059,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 0
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7064,11 +7078,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 0
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7121,7 +7138,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.0.q_norm",
             "layer.0.k_norm"
@@ -7159,7 +7176,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.0.q_norm",
             "layer.0.k_norm"
@@ -7195,7 +7212,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -7212,7 +7229,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -7258,11 +7275,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 0
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7274,11 +7294,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 0
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7318,9 +7341,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.0.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.0.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7349,7 +7374,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7378,9 +7403,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.1.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.1.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -7477,7 +7504,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.1.q_norm",
             "layer.1.k_norm"
@@ -7513,7 +7540,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -7530,7 +7557,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -7588,11 +7615,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 1
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7604,11 +7634,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 1
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7620,11 +7653,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 1
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7710,7 +7746,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.1.q_norm",
             "layer.1.k_norm"
@@ -7746,7 +7782,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -7763,7 +7799,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -7809,11 +7845,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 1
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7825,11 +7864,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 1
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7882,7 +7924,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.1.q_norm",
             "layer.1.k_norm"
@@ -7920,7 +7962,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.1.q_norm",
             "layer.1.k_norm"
@@ -7956,7 +7998,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -7973,7 +8015,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -8019,11 +8061,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 1
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8035,11 +8080,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 1
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8079,9 +8127,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.1.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.1.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -8110,7 +8160,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8139,9 +8189,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.2.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.2.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -8238,7 +8290,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.2.q_norm",
             "layer.2.k_norm"
@@ -8274,7 +8326,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -8291,7 +8343,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -8349,11 +8401,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 2
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8365,11 +8420,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 2
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8381,11 +8439,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 2
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8471,7 +8532,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.2.q_norm",
             "layer.2.k_norm"
@@ -8507,7 +8568,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -8524,7 +8585,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -8570,11 +8631,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 2
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8586,11 +8650,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 2
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8643,7 +8710,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.2.q_norm",
             "layer.2.k_norm"
@@ -8681,7 +8748,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.2.q_norm",
             "layer.2.k_norm"
@@ -8717,7 +8784,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -8734,7 +8801,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -8780,11 +8847,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 2
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8796,11 +8866,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 2
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -8840,9 +8913,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.2.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.2.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -8871,7 +8946,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8900,9 +8975,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.3.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -8999,7 +9076,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.3.q_norm",
             "layer.3.k_norm"
@@ -9035,7 +9112,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -9052,7 +9129,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -9110,11 +9187,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 3
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9126,11 +9206,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 3
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9142,11 +9225,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 3
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9232,7 +9318,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.3.q_norm",
             "layer.3.k_norm"
@@ -9268,7 +9354,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -9285,7 +9371,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -9331,11 +9417,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 3
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9347,11 +9436,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 3
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9404,7 +9496,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.3.q_norm",
             "layer.3.k_norm"
@@ -9442,7 +9534,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.3.q_norm",
             "layer.3.k_norm"
@@ -9478,7 +9570,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -9495,7 +9587,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -9541,11 +9633,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 3
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9557,11 +9652,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 3
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9601,9 +9699,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.3.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -9632,7 +9732,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9661,9 +9761,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.4.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -9760,7 +9862,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.4.q_norm",
             "layer.4.k_norm"
@@ -9796,7 +9898,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -9813,7 +9915,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -9871,11 +9973,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 4
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9887,11 +9992,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 4
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9903,11 +10011,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 4
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9993,7 +10104,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.4.q_norm",
             "layer.4.k_norm"
@@ -10029,7 +10140,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -10046,7 +10157,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -10092,11 +10203,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 4
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10108,11 +10222,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 4
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10165,7 +10282,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.4.q_norm",
             "layer.4.k_norm"
@@ -10203,7 +10320,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.4.q_norm",
             "layer.4.k_norm"
@@ -10239,7 +10356,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -10256,7 +10373,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -10302,11 +10419,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 4
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10318,11 +10438,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 4
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10362,9 +10485,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.4.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -10393,7 +10518,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10422,9 +10547,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.5.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -10521,7 +10648,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.5.q_norm",
             "layer.5.k_norm"
@@ -10557,7 +10684,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -10574,7 +10701,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -10632,11 +10759,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 5
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10648,11 +10778,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 5
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10664,11 +10797,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 5
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10754,7 +10890,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.5.q_norm",
             "layer.5.k_norm"
@@ -10790,7 +10926,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -10807,7 +10943,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -10853,11 +10989,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 5
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10869,11 +11008,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 5
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10926,7 +11068,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.5.q_norm",
             "layer.5.k_norm"
@@ -10964,7 +11106,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.5.q_norm",
             "layer.5.k_norm"
@@ -11000,7 +11142,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -11017,7 +11159,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -11063,11 +11205,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 5
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11079,11 +11224,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 5
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11123,9 +11271,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.5.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -11154,7 +11304,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11183,9 +11333,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.6.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.6.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -11282,7 +11434,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.6.q_norm",
             "layer.6.k_norm"
@@ -11318,7 +11470,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -11335,7 +11487,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -11393,11 +11545,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 6
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11409,11 +11564,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 6
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11425,11 +11583,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 6
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11515,7 +11676,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.6.q_norm",
             "layer.6.k_norm"
@@ -11551,7 +11712,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -11568,7 +11729,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -11614,11 +11775,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 6
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11630,11 +11794,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 6
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11687,7 +11854,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.6.q_norm",
             "layer.6.k_norm"
@@ -11725,7 +11892,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.6.q_norm",
             "layer.6.k_norm"
@@ -11761,7 +11928,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -11778,7 +11945,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -11824,11 +11991,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 6
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11840,11 +12010,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 6
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11884,9 +12057,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.6.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.6.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -11915,7 +12090,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11944,9 +12119,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.7.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.7.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -12043,7 +12220,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.7.q_norm",
             "layer.7.k_norm"
@@ -12079,7 +12256,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -12096,7 +12273,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -12154,11 +12331,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 7
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12170,11 +12350,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 7
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12186,11 +12369,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 7
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12276,7 +12462,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.7.q_norm",
             "layer.7.k_norm"
@@ -12312,7 +12498,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -12329,7 +12515,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -12375,11 +12561,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 7
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12391,11 +12580,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 7
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12448,7 +12640,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.7.q_norm",
             "layer.7.k_norm"
@@ -12486,7 +12678,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.7.q_norm",
             "layer.7.k_norm"
@@ -12522,7 +12714,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -12539,7 +12731,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -12585,11 +12777,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 7
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12601,11 +12796,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 7
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12645,9 +12843,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.7.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.7.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -12676,7 +12876,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -12705,9 +12905,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.8.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.8.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -12804,7 +13006,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.8.q_norm",
             "layer.8.k_norm"
@@ -12840,7 +13042,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -12857,7 +13059,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -12915,11 +13117,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 8
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12931,11 +13136,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 8
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -12947,11 +13155,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 8
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13037,7 +13248,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.8.q_norm",
             "layer.8.k_norm"
@@ -13073,7 +13284,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -13090,7 +13301,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -13136,11 +13347,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 8
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13152,11 +13366,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 8
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13209,7 +13426,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.8.q_norm",
             "layer.8.k_norm"
@@ -13247,7 +13464,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.8.q_norm",
             "layer.8.k_norm"
@@ -13283,7 +13500,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -13300,7 +13517,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -13346,11 +13563,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 8
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13362,11 +13582,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 8
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13406,9 +13629,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.8.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.8.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -13437,7 +13662,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -13466,9 +13691,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.9.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.9.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -13565,7 +13792,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.9.q_norm",
             "layer.9.k_norm"
@@ -13601,7 +13828,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -13618,7 +13845,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -13676,11 +13903,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 9
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13692,11 +13922,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 9
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13708,11 +13941,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 9
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13798,7 +14034,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.9.q_norm",
             "layer.9.k_norm"
@@ -13834,7 +14070,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -13851,7 +14087,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -13897,11 +14133,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 9
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13913,11 +14152,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 9
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -13970,7 +14212,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.9.q_norm",
             "layer.9.k_norm"
@@ -14008,7 +14250,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.9.q_norm",
             "layer.9.k_norm"
@@ -14044,7 +14286,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -14061,7 +14303,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -14107,11 +14349,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 9
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14123,11 +14368,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 9
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14167,9 +14415,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.9.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.9.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -14198,7 +14448,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -14227,9 +14477,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.10.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.10.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -14326,7 +14578,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.10.q_norm",
             "layer.10.k_norm"
@@ -14362,7 +14614,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -14379,7 +14631,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -14437,11 +14689,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 10
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14453,11 +14708,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 10
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14469,11 +14727,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 10
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14559,7 +14820,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.10.q_norm",
             "layer.10.k_norm"
@@ -14595,7 +14856,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -14612,7 +14873,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -14658,11 +14919,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 10
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14674,11 +14938,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 10
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14731,7 +14998,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.10.q_norm",
             "layer.10.k_norm"
@@ -14769,7 +15036,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.10.q_norm",
             "layer.10.k_norm"
@@ -14805,7 +15072,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -14822,7 +15089,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -14868,11 +15135,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 10
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14884,11 +15154,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 10
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -14928,9 +15201,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.10.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.10.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -14959,7 +15234,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -14988,9 +15263,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.11.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.11.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -15087,7 +15364,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.11.q_norm",
             "layer.11.k_norm"
@@ -15123,7 +15400,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -15140,7 +15417,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -15198,11 +15475,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 11
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15214,11 +15494,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 11
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15230,11 +15513,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 11
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15320,7 +15606,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.11.q_norm",
             "layer.11.k_norm"
@@ -15356,7 +15642,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -15373,7 +15659,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -15419,11 +15705,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 11
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15435,11 +15724,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 11
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15492,7 +15784,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.11.q_norm",
             "layer.11.k_norm"
@@ -15530,7 +15822,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.11.q_norm",
             "layer.11.k_norm"
@@ -15566,7 +15858,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -15583,7 +15875,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -15629,11 +15921,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 11
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15645,11 +15940,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 11
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15689,9 +15987,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.11.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.11.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -15720,7 +16020,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -15749,9 +16049,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.12.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.12.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -15848,7 +16150,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.12.q_norm",
             "layer.12.k_norm"
@@ -15884,7 +16186,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -15901,7 +16203,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -15959,11 +16261,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 12
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15975,11 +16280,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 12
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -15991,11 +16299,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 12
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16081,7 +16392,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.12.q_norm",
             "layer.12.k_norm"
@@ -16117,7 +16428,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -16134,7 +16445,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -16180,11 +16491,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 12
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16196,11 +16510,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 12
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16253,7 +16570,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.12.q_norm",
             "layer.12.k_norm"
@@ -16291,7 +16608,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.12.q_norm",
             "layer.12.k_norm"
@@ -16327,7 +16644,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -16344,7 +16661,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -16390,11 +16707,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 12
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16406,11 +16726,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 12
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16450,9 +16773,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.12.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.12.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -16481,7 +16806,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -16510,9 +16835,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.13.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.13.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -16609,7 +16936,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.13.q_norm",
             "layer.13.k_norm"
@@ -16645,7 +16972,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -16662,7 +16989,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -16720,11 +17047,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 13
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16736,11 +17066,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 13
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16752,11 +17085,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 13
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16842,7 +17178,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.13.q_norm",
             "layer.13.k_norm"
@@ -16878,7 +17214,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -16895,7 +17231,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -16941,11 +17277,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 13
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -16957,11 +17296,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 13
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17014,7 +17356,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.13.q_norm",
             "layer.13.k_norm"
@@ -17052,7 +17394,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.13.q_norm",
             "layer.13.k_norm"
@@ -17088,7 +17430,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -17105,7 +17447,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -17151,11 +17493,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 13
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17167,11 +17512,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 13
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17211,9 +17559,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.13.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.13.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -17242,7 +17592,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -17271,9 +17621,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.14.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.14.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -17370,7 +17722,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.14.q_norm",
             "layer.14.k_norm"
@@ -17406,7 +17758,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -17423,7 +17775,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -17481,11 +17833,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 14
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17497,11 +17852,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 14
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17513,11 +17871,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 14
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17603,7 +17964,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.14.q_norm",
             "layer.14.k_norm"
@@ -17639,7 +18000,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -17656,7 +18017,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -17702,11 +18063,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 14
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17718,11 +18082,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 14
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17775,7 +18142,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.14.q_norm",
             "layer.14.k_norm"
@@ -17813,7 +18180,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.14.q_norm",
             "layer.14.k_norm"
@@ -17849,7 +18216,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -17866,7 +18233,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -17912,11 +18279,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 14
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17928,11 +18298,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 14
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -17972,9 +18345,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.14.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.14.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -18003,7 +18378,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -18032,9 +18407,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.15.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.15.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -18131,7 +18508,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.15.q_norm",
             "layer.15.k_norm"
@@ -18167,7 +18544,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -18184,7 +18561,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -18242,11 +18619,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 15
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -18258,11 +18638,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 15
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -18274,11 +18657,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 15
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -18364,7 +18750,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.15.q_norm",
             "layer.15.k_norm"
@@ -18400,7 +18786,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -18417,7 +18803,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -18463,11 +18849,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 15
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -18479,11 +18868,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 15
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -18536,7 +18928,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.15.q_norm",
             "layer.15.k_norm"
@@ -18574,7 +18966,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.15.q_norm",
             "layer.15.k_norm"
@@ -18610,7 +19002,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -18627,7 +19019,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -18673,11 +19065,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 15
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -18689,11 +19084,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 15
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -18733,9 +19131,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.15.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.15.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -18764,7 +19164,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -18793,9 +19193,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.16.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.16.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -18892,7 +19294,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.16.q_norm",
             "layer.16.k_norm"
@@ -18928,7 +19330,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -18945,7 +19347,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -19003,11 +19405,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 16
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19019,11 +19424,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 16
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19035,11 +19443,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 16
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19125,7 +19536,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.16.q_norm",
             "layer.16.k_norm"
@@ -19161,7 +19572,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -19178,7 +19589,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -19224,11 +19635,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 16
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19240,11 +19654,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 16
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19297,7 +19714,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.16.q_norm",
             "layer.16.k_norm"
@@ -19335,7 +19752,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.16.q_norm",
             "layer.16.k_norm"
@@ -19371,7 +19788,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -19388,7 +19805,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -19434,11 +19851,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 16
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19450,11 +19870,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 16
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19494,9 +19917,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.16.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.16.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -19525,7 +19950,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -19554,9 +19979,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.17.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.17.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -19653,7 +20080,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.17.q_norm",
             "layer.17.k_norm"
@@ -19689,7 +20116,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -19706,7 +20133,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -19764,11 +20191,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 17
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19780,11 +20210,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 17
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19796,11 +20229,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 17
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -19886,7 +20322,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.17.q_norm",
             "layer.17.k_norm"
@@ -19922,7 +20358,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -19939,7 +20375,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -19985,11 +20421,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 17
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20001,11 +20440,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 17
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20058,7 +20500,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.17.q_norm",
             "layer.17.k_norm"
@@ -20096,7 +20538,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.17.q_norm",
             "layer.17.k_norm"
@@ -20132,7 +20574,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -20149,7 +20591,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -20195,11 +20637,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 17
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20211,11 +20656,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 17
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20255,9 +20703,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.17.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.17.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -20286,7 +20736,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -20315,9 +20765,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.18.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.18.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -20414,7 +20866,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.18.q_norm",
             "layer.18.k_norm"
@@ -20450,7 +20902,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -20467,7 +20919,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -20525,11 +20977,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 18
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20541,11 +20996,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 18
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20557,11 +21015,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 18
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20647,7 +21108,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.18.q_norm",
             "layer.18.k_norm"
@@ -20683,7 +21144,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -20700,7 +21161,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -20746,11 +21207,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 18
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20762,11 +21226,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 18
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20819,7 +21286,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.18.q_norm",
             "layer.18.k_norm"
@@ -20857,7 +21324,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.18.q_norm",
             "layer.18.k_norm"
@@ -20893,7 +21360,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -20910,7 +21377,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -20956,11 +21423,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 18
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -20972,11 +21442,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 18
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -21016,9 +21489,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.18.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.18.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -21047,7 +21522,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -21076,9 +21551,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.19.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.19.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -21175,7 +21652,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.19.q_norm",
             "layer.19.k_norm"
@@ -21211,7 +21688,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -21228,7 +21705,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -21286,11 +21763,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 19
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -21302,11 +21782,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 19
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -21318,11 +21801,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 19
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -21408,7 +21894,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.19.q_norm",
             "layer.19.k_norm"
@@ -21444,7 +21930,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -21461,7 +21947,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -21507,11 +21993,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 19
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -21523,11 +22012,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 19
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -21580,7 +22072,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.19.q_norm",
             "layer.19.k_norm"
@@ -21618,7 +22110,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.19.q_norm",
             "layer.19.k_norm"
@@ -21654,7 +22146,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -21671,7 +22163,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -21717,11 +22209,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 19
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -21733,11 +22228,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 19
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -21777,9 +22275,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.19.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.19.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -21808,7 +22308,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -21837,9 +22337,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.20.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.20.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -21936,7 +22438,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.20.q_norm",
             "layer.20.k_norm"
@@ -21972,7 +22474,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -21989,7 +22491,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -22047,11 +22549,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 20
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22063,11 +22568,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 20
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22079,11 +22587,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 20
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22169,7 +22680,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.20.q_norm",
             "layer.20.k_norm"
@@ -22205,7 +22716,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -22222,7 +22733,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -22268,11 +22779,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 20
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22284,11 +22798,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 20
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22341,7 +22858,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.20.q_norm",
             "layer.20.k_norm"
@@ -22379,7 +22896,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.20.q_norm",
             "layer.20.k_norm"
@@ -22415,7 +22932,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -22432,7 +22949,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -22478,11 +22995,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 20
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22494,11 +23014,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 20
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22538,9 +23061,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.20.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.20.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -22569,7 +23094,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -22598,9 +23123,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.21.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.21.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -22697,7 +23224,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.21.q_norm",
             "layer.21.k_norm"
@@ -22733,7 +23260,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -22750,7 +23277,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -22808,11 +23335,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 21
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22824,11 +23354,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 21
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22840,11 +23373,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 21
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -22930,7 +23466,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.21.q_norm",
             "layer.21.k_norm"
@@ -22966,7 +23502,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -22983,7 +23519,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -23029,11 +23565,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 21
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23045,11 +23584,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 21
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23102,7 +23644,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.21.q_norm",
             "layer.21.k_norm"
@@ -23140,7 +23682,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.21.q_norm",
             "layer.21.k_norm"
@@ -23176,7 +23718,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -23193,7 +23735,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -23239,11 +23781,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 21
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23255,11 +23800,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 21
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23299,9 +23847,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.21.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.21.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -23330,7 +23880,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -23359,9 +23909,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.22.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.22.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -23458,7 +24010,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.22.q_norm",
             "layer.22.k_norm"
@@ -23494,7 +24046,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -23511,7 +24063,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -23569,11 +24121,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 22
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23585,11 +24140,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23601,11 +24159,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 22
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23691,7 +24252,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.22.q_norm",
             "layer.22.k_norm"
@@ -23727,7 +24288,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -23744,7 +24305,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -23790,11 +24351,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 22
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23806,11 +24370,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -23863,7 +24430,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.22.q_norm",
             "layer.22.k_norm"
@@ -23901,7 +24468,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.22.q_norm",
             "layer.22.k_norm"
@@ -23937,7 +24504,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -23954,7 +24521,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -24000,11 +24567,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 22
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24016,11 +24586,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24060,9 +24633,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.22.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.22.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -24091,7 +24666,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -24120,9 +24695,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.23.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.23.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -24219,7 +24796,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.23.q_norm",
             "layer.23.k_norm"
@@ -24255,7 +24832,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -24272,7 +24849,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -24330,11 +24907,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 23
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24346,11 +24926,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 23
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24362,11 +24945,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 23
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24452,7 +25038,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.23.q_norm",
             "layer.23.k_norm"
@@ -24488,7 +25074,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -24505,7 +25091,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -24551,11 +25137,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 23
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24567,11 +25156,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 23
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24624,7 +25216,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.23.q_norm",
             "layer.23.k_norm"
@@ -24662,7 +25254,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.23.q_norm",
             "layer.23.k_norm"
@@ -24698,7 +25290,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -24715,7 +25307,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -24761,11 +25353,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 23
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24777,11 +25372,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 23
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -24821,9 +25419,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.23.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.23.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -24852,7 +25452,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -24881,9 +25481,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.24.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.24.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -24980,7 +25582,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.24.q_norm",
             "layer.24.k_norm"
@@ -25016,7 +25618,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 24
@@ -25033,7 +25635,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 24
@@ -25091,11 +25693,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 24
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25107,11 +25712,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 24
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25123,11 +25731,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 24
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25213,7 +25824,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.24.q_norm",
             "layer.24.k_norm"
@@ -25249,7 +25860,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 24
@@ -25266,7 +25877,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 24
@@ -25312,11 +25923,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 24
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25328,11 +25942,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 24
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25385,7 +26002,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.24.q_norm",
             "layer.24.k_norm"
@@ -25423,7 +26040,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.24.q_norm",
             "layer.24.k_norm"
@@ -25459,7 +26076,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 24
@@ -25476,7 +26093,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 24
@@ -25522,11 +26139,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 24
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25538,11 +26158,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 24
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25582,9 +26205,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.24.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.24.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -25613,7 +26238,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -25642,9 +26267,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.25.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.25.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -25741,7 +26368,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.25.q_norm",
             "layer.25.k_norm"
@@ -25777,7 +26404,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 25
@@ -25794,7 +26421,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 25
@@ -25852,11 +26479,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 25
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25868,11 +26498,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 25
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25884,11 +26517,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 25
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -25974,7 +26610,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.25.q_norm",
             "layer.25.k_norm"
@@ -26010,7 +26646,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 25
@@ -26027,7 +26663,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 25
@@ -26073,11 +26709,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 25
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26089,11 +26728,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 25
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26146,7 +26788,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.25.q_norm",
             "layer.25.k_norm"
@@ -26184,7 +26826,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.25.q_norm",
             "layer.25.k_norm"
@@ -26220,7 +26862,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 25
@@ -26237,7 +26879,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 25
@@ -26283,11 +26925,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 25
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26299,11 +26944,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 25
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26343,9 +26991,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.25.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.25.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -26374,7 +27024,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -26403,9 +27053,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.26.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.26.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -26502,7 +27154,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.26.q_norm",
             "layer.26.k_norm"
@@ -26538,7 +27190,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 26
@@ -26555,7 +27207,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 26
@@ -26613,11 +27265,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 26
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26629,11 +27284,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 26
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26645,11 +27303,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 26
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26735,7 +27396,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.26.q_norm",
             "layer.26.k_norm"
@@ -26771,7 +27432,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 26
@@ -26788,7 +27449,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 26
@@ -26834,11 +27495,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 26
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26850,11 +27514,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 26
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -26907,7 +27574,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.26.q_norm",
             "layer.26.k_norm"
@@ -26945,7 +27612,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.26.q_norm",
             "layer.26.k_norm"
@@ -26981,7 +27648,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 26
@@ -26998,7 +27665,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 26
@@ -27044,11 +27711,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 26
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27060,11 +27730,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 26
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27104,9 +27777,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.26.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.26.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -27135,7 +27810,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -27164,9 +27839,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.27.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.27.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -27263,7 +27940,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.27.q_norm",
             "layer.27.k_norm"
@@ -27299,7 +27976,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 27
@@ -27316,7 +27993,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 27
@@ -27374,11 +28051,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 27
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27390,11 +28070,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 27
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27406,11 +28089,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 27
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27496,7 +28182,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.27.q_norm",
             "layer.27.k_norm"
@@ -27532,7 +28218,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 27
@@ -27549,7 +28235,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 27
@@ -27595,11 +28281,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 27
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27611,11 +28300,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 27
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27668,7 +28360,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "kernel": "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
           "weights": [
             "layer.27.q_norm",
             "layer.27.k_norm"
@@ -27706,7 +28398,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_qk_rmsnorm_rope_bf16",
+          "kernel": "rope::qk_rmsnorm_rope_bf16",
           "weights": [
             "layer.27.q_norm",
             "layer.27.k_norm"
@@ -27742,7 +28434,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 27
@@ -27759,7 +28451,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 27
@@ -27805,11 +28497,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode_capture",
+          "kernel": "attn::dispatch_attention_flashinfer_decode_capture",
           "state": {
             "store": "KvCache",
             "layer": 27
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27821,11 +28516,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_decode",
+          "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 27
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -27865,9 +28563,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.27.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.27.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -27896,7 +28596,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -27925,9 +28625,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "final_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "final_norm"
+          ]
         }
       },
       "inputs": [

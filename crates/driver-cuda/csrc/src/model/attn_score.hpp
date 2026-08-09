@@ -137,11 +137,11 @@ struct ScoreBuffers {
 //
 //     model::LayerScoreCapture capture(hooks, L, num_q_heads, stream);
 //     if (capture.active()) {
-//         ops::dispatch_attention_flashinfer_decode_capture(
+//         kernels::attn::dispatch_attention_flashinfer_decode_capture(
 //             ..., capture.raw(), capture.indptr_d(), ...);
 //         capture.publish(kv_page_indptr_d, kv_last_page_lens_d, page_size);
 //     } else {
-//         ops::dispatch_attention_flashinfer_decode(...);
+//         kernels::attn::dispatch_attention_flashinfer_decode(...);
 //     }
 //     invoke_stage_hook(hooks, OnAttn, ..., {.scores = capture.scores()});
 //

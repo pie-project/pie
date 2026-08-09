@@ -21,7 +21,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: cumsum/cumprod widened from F32-only to every numeric dtype; the m1 runtime's scan block now branches on the operand dtype instead of loading every lane through m1_load_f. The oracle dumps change only because that block is embedded verbatim in every emitted source -- no emitted structure moved, and the f32 path is byte-for-byte the arithmetic the oracle recorded.
+#   reason: additive corpus growth: the lora_prologue stage (stage-4 lora sink) joined the shared corpus and the MSL dumps were never re-pinned for it, while the CUDA ones were -- the same reason those carry. The case list gains exactly lora_prologue#0's five entries and loses none; every pre-existing case keeps its identity, its order and its emitted text.
 === beam_epilogue#0 singleton#0
 function_name: ptir_m2_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -929,6 +929,135 @@ kernel void ptir_m2_f2566cc0c1e0529a_r0(
   ptir_m1_execute(146u, status, descriptors, params + 5, scratch + offsets[3], scratch, scratch, pending_1, scratch, temporary);
   if (status->state != 1) return;
   current_1 = pending_1;
+}
+=== end
+=== lora_prologue#0 singleton#0
+function_name: ptir_m2_26849b68dee54237_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+source: bytes=41405 prefix=@runtime tail_bytes=906
+kernel void ptir_m2_26849b68dee54237_r0(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device M1OpParams* params [[buffer(2)]],
+    const device uint* offsets [[buffer(3)]],
+    device uchar* scratch [[buffer(4)]],
+    device uchar* temporary [[buffer(5)]],
+    const device uchar* logits [[buffer(6)]],
+    const device uchar* committed_0 [[buffer(7)]],
+    device uchar* pending_0 [[buffer(8)]],
+    const device uchar* committed_1 [[buffer(9)]],
+    device uchar* pending_1 [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device uchar* current_0 = committed_0;
+  const device uchar* current_1 = committed_1;
+  ptir_m1_execute(145u, status, descriptors, params + 0, current_0, scratch, scratch, scratch + offsets[0], scratch, temporary);
+  if (status->state != 1) return;
+}
+=== end
+=== lora_prologue#0 singleton#2
+function_name: ptir_m2_26849b68dee54237_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+source: bytes=41403 prefix=@runtime tail_bytes=904
+kernel void ptir_m2_26849b68dee54237_r2(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device M1OpParams* params [[buffer(2)]],
+    const device uint* offsets [[buffer(3)]],
+    device uchar* scratch [[buffer(4)]],
+    device uchar* temporary [[buffer(5)]],
+    const device uchar* logits [[buffer(6)]],
+    const device uchar* committed_0 [[buffer(7)]],
+    device uchar* pending_0 [[buffer(8)]],
+    const device uchar* committed_1 [[buffer(9)]],
+    device uchar* pending_1 [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device uchar* current_0 = committed_0;
+  const device uchar* current_1 = committed_1;
+  ptir_m1_execute(129u, status, descriptors, params + 2, scratch, scratch, scratch, scratch + offsets[2], scratch, temporary);
+  if (status->state != 1) return;
+}
+=== end
+=== lora_prologue#0 singleton#3
+function_name: ptir_m2_26849b68dee54237_r3
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
+ok: true
+source: bytes=41429 prefix=@runtime tail_bytes=930
+kernel void ptir_m2_26849b68dee54237_r3(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device M1OpParams* params [[buffer(2)]],
+    const device uint* offsets [[buffer(3)]],
+    device uchar* scratch [[buffer(4)]],
+    device uchar* temporary [[buffer(5)]],
+    const device uchar* logits [[buffer(6)]],
+    const device uchar* committed_0 [[buffer(7)]],
+    device uchar* pending_0 [[buffer(8)]],
+    const device uchar* committed_1 [[buffer(9)]],
+    device uchar* pending_1 [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device uchar* current_0 = committed_0;
+  const device uchar* current_1 = committed_1;
+  ptir_m1_execute(162u, status, descriptors, params + 3, scratch + offsets[0], scratch + offsets[1], scratch + offsets[2], scratch, scratch, temporary);
+  if (status->state != 1) return;
+}
+=== end
+=== lora_prologue#0 fused#0
+function_name: ptir_m2_26849b68dee54237_r0
+region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
+ok: true
+source: bytes=41729 prefix=@runtime tail_bytes=1230
+kernel void ptir_m2_26849b68dee54237_r0(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device M1OpParams* params [[buffer(2)]],
+    const device uint* offsets [[buffer(3)]],
+    device uchar* scratch [[buffer(4)]],
+    device uchar* temporary [[buffer(5)]],
+    const device uchar* logits [[buffer(6)]],
+    const device uchar* committed_0 [[buffer(7)]],
+    device uchar* pending_0 [[buffer(8)]],
+    const device uchar* committed_1 [[buffer(9)]],
+    device uchar* pending_1 [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device uchar* current_0 = committed_0;
+  const device uchar* current_1 = committed_1;
+  ptir_m1_execute(145u, status, descriptors, params + 0, current_0, scratch, scratch, scratch + offsets[0], scratch, temporary);
+  if (status->state != 1) return;
+  ptir_m1_execute(145u, status, descriptors, params + 1, current_1, scratch, scratch, scratch + offsets[1], scratch, temporary);
+  if (status->state != 1) return;
+  ptir_m1_execute(129u, status, descriptors, params + 2, scratch, scratch, scratch, scratch + offsets[2], scratch, temporary);
+  if (status->state != 1) return;
+}
+=== end
+=== lora_prologue#0 fused#1
+function_name: ptir_m2_26849b68dee54237_r1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
+ok: true
+source: bytes=41429 prefix=@runtime tail_bytes=930
+kernel void ptir_m2_26849b68dee54237_r1(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device M1OpParams* params [[buffer(2)]],
+    const device uint* offsets [[buffer(3)]],
+    device uchar* scratch [[buffer(4)]],
+    device uchar* temporary [[buffer(5)]],
+    const device uchar* logits [[buffer(6)]],
+    const device uchar* committed_0 [[buffer(7)]],
+    device uchar* pending_0 [[buffer(8)]],
+    const device uchar* committed_1 [[buffer(9)]],
+    device uchar* pending_1 [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device uchar* current_0 = committed_0;
+  const device uchar* current_1 = committed_1;
+  ptir_m1_execute(162u, status, descriptors, params + 3, scratch + offsets[0], scratch + offsets[1], scratch + offsets[2], scratch, scratch, temporary);
+  if (status->state != 1) return;
 }
 === end
 === matrix_mask_apply_packed#0 singleton#0

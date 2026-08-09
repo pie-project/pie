@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/qwen3_vl/qwen3_vl_model.hpp"
 
 #include <utility>
@@ -5,7 +6,7 @@
 
 #include "model/qwen3_vl/qwen3_vl_vision_adapter.hpp"  // to_vis_raw_qwen
 #include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"   // Qwen3VLVisionInputs, scatter
-#include "ops/gemm.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -37,7 +38,7 @@ Qwen3VLModel::Qwen3VLModel(
     // only a dense BF16 head can be reduced as it is produced.
     caps_.supports_fused_lm_head_argmax =
         weights_.lm_head != nullptr &&
-        ops::lm_head_argmax_supported(*weights_.lm_head);
+        kernels::gemm::lm_head_argmax_supported(*weights_.lm_head);
 }
 
 void Qwen3VLModel::prepare(AttentionWorkspace& attn_ws,
@@ -68,7 +69,7 @@ void Qwen3VLModel::prepare(AttentionWorkspace& attn_ws,
 void Qwen3VLModel::body(Workspace& ws,
                         KvCache& kv,
                         AttentionWorkspace& attn_ws,
-                        ops::CublasHandle& cublas,
+                        kernels::gemm::CublasHandle& cublas,
                         const ForwardFn::ForwardInputs& in) {
     cudaStream_t stream = cublas.stream();
     const int H = hf_config_.hidden_size;

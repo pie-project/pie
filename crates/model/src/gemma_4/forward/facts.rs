@@ -251,6 +251,16 @@ pub struct Gemma4CudaFacts {
     /// declaration's own (`partial` is a layer-kind fact, hooks and the
     /// fire class are class/guard vocabulary).
     pub kv_native_bf16: bool,
+    /// The SLIDING WINDOW each layer attends over, `-1` for none —
+    /// read through [`model_compiler::facts::window_left_at`], which is
+    /// where the shape of this list is documented.
+    ///
+    /// The dispatch statements carry it, so no executor reaches into
+    /// `fwd_cfg.per_layer_window_left` for it. Serde-defaulted, and
+    /// empty reads as "no window", which is what every fixture written
+    /// before this field meant.
+    #[serde(default)]
+    pub window_left: Vec<i32>,
 }
 
 impl Gemma4CudaFacts {
@@ -261,6 +271,9 @@ impl Gemma4CudaFacts {
     /// guess on first boot.
     pub fn gemma_4_e4b_synthetic() -> Self {
         Self {
+            // The fixture attends the whole context; a live gemma-4
+            // deployment states its per-layer list.
+            window_left: Vec::new(),
             fused_qkv: true,
             gate_up_fused: true,
             kv_native_bf16: true,

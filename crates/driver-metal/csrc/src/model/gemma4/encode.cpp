@@ -296,7 +296,7 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
     if (is_routed(d.kind)) {
         if (const int bn = gemma4_moe_qmm_bn(d.kind, g, N, d.layer); bn > 0) {
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
-            const int bm = shared_kernels::moe_bm_slot(gemma4_moe_tile_rows(g, N));
+            const int bm = shared_kernels::bm_slot(gemma4_moe_tile_rows(g, N));
             if (g4.qmm_routed[bm][slot].valid()) return g4.qmm_routed[bm][slot];
         }
         return g4.qmv_routed;
@@ -533,10 +533,10 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
             shared_kernels::router_topk_dispatch(g.n_experts, grid, tg, N);
             return;
         case Kind::ExpertSort:
-            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            shared_kernels::route_sort_dispatch(g.n_experts, grid, tg);
             return;
         case Kind::ExpertGather:
-            shared_kernels::moe_route_rows_dispatch(g.hidden, gemma4_moe_sorted_rows(g, N), grid, tg);
+            shared_kernels::route_rows_dispatch(g.hidden, gemma4_moe_sorted_rows(g, N), grid, tg);
             return;
         case Kind::ExpertGeglu:
             // The slot axis is gone -- a sorted row IS a slot -- so this is the
@@ -675,10 +675,10 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
             shared_kernels::router_topk_dispatch(g.n_experts, grid, tg, 1);
             return;
         case Kind::ExpertSort:
-            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            shared_kernels::route_sort_dispatch(g.n_experts, grid, tg);
             return;
         case Kind::ExpertGather:
-            shared_kernels::moe_route_rows_dispatch(g.hidden, gemma4_moe_sorted_rows(g, 1), grid, tg);
+            shared_kernels::route_rows_dispatch(g.hidden, gemma4_moe_sorted_rows(g, 1), grid, tg);
             return;
         case Kind::ExpertGeglu:
             elementwise_dispatch(g.moe_intermediate * gemma4_moe_sorted_rows(g, 1), grid, tg);

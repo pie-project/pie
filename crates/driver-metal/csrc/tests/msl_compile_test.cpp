@@ -152,7 +152,7 @@ bool parse_golden(const std::string& name, const std::string& text, const std::s
     return true;
 }
 
-/// Expand `#include "ptir_rng.generated.metal"`, exactly as the driver does at
+/// Expand `#include "ptir/ptir_rng.generated.metal"`, exactly as the driver does at
 /// library-build time (`m1_runtime.cpp`): Metal's runtime shader compiler does
 /// no filesystem include lookup, so an unexpanded include is a compile error
 /// rather than a missing symbol.

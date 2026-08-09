@@ -14,7 +14,7 @@
 //! `bin/pie`), which construct a [`TopologyMode`] (via [`TopologyMode::distributed`]
 //! or [`TopologyMode::SingleNode`]) and hand it to [`connect`]. Building the
 //! actual control connection (dial vs in-proc embed) is the engine boot path's
-//! job ([`super::start_engine`]).
+//! job ([`crate::engine::start_engine`]).
 
 use anyhow::{Result, bail};
 use controller_api::Role;
@@ -79,7 +79,7 @@ pub fn addr_from_host_port(host: &str, port: u16) -> String {
 
 /// Resolved control-plane topology plus the worker's `host:port` identity.
 ///
-/// Carried into the engine boot path ([`super::start_engine`]), which builds the
+/// Carried into the engine boot path ([`crate::engine::start_engine`]), which builds the
 /// actual control connection on the engine's async runtime — dialing the
 /// controller for distributed mode, or (for an in-proc embedder) taking an
 /// injected control link. Keeping the connection out of here means no
@@ -115,7 +115,7 @@ impl Coordinator {
 }
 
 /// Resolve `mode` into a [`Coordinator`]. The control connection itself is built
-/// later, on the engine runtime, by [`super::start_engine`] — this only carries
+/// later, on the engine runtime, by [`crate::engine::start_engine`] — this only carries
 /// the resolved topology + advertised address.
 pub fn connect(mode: &TopologyMode, control_addr: String) -> Result<Coordinator> {
     Ok(Coordinator {

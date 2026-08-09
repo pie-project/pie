@@ -114,8 +114,8 @@ ArchSpec arch_spec_for(PieArch arch, const ModelConfig& c) {
             apply_gemma_norms(s);
             // Gemma-4 DROPPED the Gemma-2/3 (1 + w) RMSNorm convention: its
             // norms apply the weight directly (`w * x_hat`), matching cuda's
-            // gemma4 path (launch_rmsnorm_bf16, WEIGHT_PLUS_ONE=false) vs
-            // gemma2's launch_rmsnorm_gemma_bf16 (=true). Plain norm here.
+            // gemma4 path (kernels::norm::rmsnorm_bf16, WEIGHT_PLUS_ONE=false) vs
+            // gemma2's kernels::norm::rmsnorm_gemma_bf16 (=true). Plain norm here.
             s.norm_weight_plus_one = false;
             s.has_qk_norm = true;
             if (c.query_pre_attn_scalar) s.query_pre_attn_scalar = *c.query_pre_attn_scalar;

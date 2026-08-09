@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "decode_abi.hpp"  // delta owns this (pure C++); Region / IoSlot / bind / Kernel
+#include "pie/kernels/grid.h"          // kernels-metal owns the launch-shape PODs
 
 namespace pie::metal {
 
@@ -66,8 +67,12 @@ struct SlotHandle {
 struct Pso { void* obj = nullptr; bool valid() const { return obj != nullptr; } };
 
 // 3D launch geometry.
-struct Grid { uint32_t x = 1, y = 1, z = 1; };
-struct Threadgroup { uint32_t x = 1, y = 1, z = 1; };
+// A launch shape is the kernel's, so the PODs are `kernels-metal`'s and this
+// is an alias, not a second declaration. Every `Grid{...}` in this driver is
+// unchanged; what moved is which crate gets to say what the shape of a
+// dispatch is. See `pie/kernels/grid.h`.
+using pie::kernels::Grid;
+using pie::kernels::Threadgroup;
 
 // Barrier cache-visibility for the intra-encoder compute->compute hazard. Pure-C++
 // mirror of MTL4VisibilityOptions (no Obj-C in this header); mapped in mtl4_context.mm.

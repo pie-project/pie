@@ -20,8 +20,9 @@
 pub mod facts;
 
 use self::facts::{NemotronHFacts, NemotronLayerKind};
-use model_compiler::dsl::{self, matmul, rmsnorm, MatW, NormW};
-use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
+use model_compiler::dsl::{
+    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct NhLayerW {
     norm: NormW,
@@ -49,6 +50,7 @@ impl NhLayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         let n = |name: &str| NormW {
             name: w(name),
@@ -86,14 +88,19 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
         }
     );
     let mb = facts.mamba.clone();
-    let at = facts.attn.clone();
+    let _at = facts.attn.clone();
     dsl::trace_named(&family, |t| {
         dsl::seam(t, &dsl::seam::IN, &[], None);
         let mut y = dsl::embed_with(t, "embed", facts.hidden);
 
         for l in 0..facts.layers() {
+            // THIS LAYER's sliding window, `-1` for none — a
+            // load-time fact the dispatch statements carry, where four
+            // executors used to re-derive it per launch.
+            let window_left =
+                model_compiler::facts::window_left_at(&facts.window_left, l);
             let w = NhLayerW::new(l, facts);
-            let x = rmsnorm(&y, &w.norm);
+            let x = dsl::cuda::rmsnorm(&y, &w.norm);
 
             match facts.kind(l) {
                 NemotronLayerKind::Mamba => {
@@ -146,11 +153,11 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     let q = matmul(&x, &w.q_proj);
                     let k = matmul(&x, &w.k_proj);
                     let v = matmul(&x, &w.v_proj);
-                    let (q, k) = dsl::rope(&q, &k, RopeKind::Standard);
+                    let (q, k) = dsl::cuda::rope(&q, &k);
                     let kv = dsl::Kv::at(t, l);
                     dsl::cuda::write_kv_to_pages(&k, &v, &kv);
                     dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-                    let o = dsl::cuda::attention_flashinfer_decode(&q, &kv)
+                    let o = dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left)
                         .expect("a plain attention statement produces its value");
                     dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
                     y += matmul(&o, &w.o_proj);
@@ -166,8 +173,13 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
             }
 
             // ── MoE, on the mixer layers ─────────────────────────────
-            let m = rmsnorm(&y, &w.norm);
-            let logits = matmul(&m, &w.router);
+            let m = dsl::cuda::rmsnorm(&y, &w.norm);
+            // FP32 logits — `nemotron_h_forward.cpp` fires
+            // `act_x_wt_bf16_out_fp32` for the router because
+            // `topk_sigmoid_bias_fp32` consumes fp32. The first
+            // transcription stated a plain (bf16) matmul here; the
+            // executor port caught the dtype seam before it ever ran.
+            let logits = dsl::cuda::gemm_out_fp32(&m, &w.router.name, facts.moe.num_experts);
             let (experts, weights) = dsl::cuda::topk_sigmoid_bias(
                 &logits,
                 &format!("layer.{l}.router_bias"),
@@ -179,6 +191,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     name: format!("layer.{l}.expert.{{e}}.up"),
                     width: facts.moe.moe_intermediate,
                     layer: Some(l),
+                    repr: WeightRepr::Bf16,
                 },
                 &experts,
                 facts.moe.top_k,
@@ -190,6 +203,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     name: format!("layer.{l}.expert.{{e}}.down"),
                     width: facts.hidden,
                     layer: Some(l),
+                    repr: WeightRepr::Bf16,
                 },
                 &experts,
                 facts.moe.top_k,
@@ -207,7 +221,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".to_string(),

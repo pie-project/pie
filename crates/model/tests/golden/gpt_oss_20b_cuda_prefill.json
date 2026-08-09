@@ -5372,9 +5372,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.0.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.0.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -5388,7 +5390,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.0.q_proj",
             "layer.0.q_bias"
@@ -5406,7 +5408,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.0.k_proj",
             "layer.0.k_bias"
@@ -5424,7 +5426,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.0.v_proj",
             "layer.0.v_bias"
@@ -5442,7 +5444,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -5458,7 +5460,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -5488,7 +5490,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -5507,7 +5509,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.0.attn_sinks"
           ]
@@ -5567,9 +5569,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.0.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.0.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -5583,7 +5587,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.0.router",
             "layer.0.router_bias"
@@ -5601,7 +5605,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -5616,7 +5620,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -5630,7 +5634,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.0.expert_gate_up_bank"
           ]
@@ -5649,7 +5653,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -5664,7 +5671,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -5678,7 +5685,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.0.expert_down_bank"
           ]
@@ -5696,7 +5703,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -5711,12 +5718,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        22,
-        11
+        11,
+        22
       ],
       "outputs": [
         23
@@ -5725,9 +5732,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.1.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.1.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -5741,7 +5750,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.1.q_proj",
             "layer.1.q_bias"
@@ -5759,7 +5768,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.1.k_proj",
             "layer.1.k_bias"
@@ -5777,7 +5786,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.1.v_proj",
             "layer.1.v_bias"
@@ -5795,7 +5804,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -5811,7 +5820,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -5841,7 +5850,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -5860,7 +5869,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.1.attn_sinks"
           ]
@@ -5920,9 +5929,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.1.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.1.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -5936,7 +5947,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.1.router",
             "layer.1.router_bias"
@@ -5954,7 +5965,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -5969,7 +5980,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -5983,7 +5994,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.1.expert_gate_up_bank"
           ]
@@ -6002,7 +6013,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -6017,7 +6031,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -6031,7 +6045,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.1.expert_down_bank"
           ]
@@ -6049,7 +6063,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -6064,12 +6078,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        45,
-        34
+        34,
+        45
       ],
       "outputs": [
         46
@@ -6078,9 +6092,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.2.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.2.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -6094,7 +6110,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.2.q_proj",
             "layer.2.q_bias"
@@ -6112,7 +6128,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.2.k_proj",
             "layer.2.k_bias"
@@ -6130,7 +6146,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.2.v_proj",
             "layer.2.v_bias"
@@ -6148,7 +6164,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -6164,7 +6180,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -6194,7 +6210,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -6213,7 +6229,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.2.attn_sinks"
           ]
@@ -6273,9 +6289,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.2.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.2.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6289,7 +6307,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.2.router",
             "layer.2.router_bias"
@@ -6307,7 +6325,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -6322,7 +6340,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -6336,7 +6354,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.2.expert_gate_up_bank"
           ]
@@ -6355,7 +6373,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -6370,7 +6391,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -6384,7 +6405,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.2.expert_down_bank"
           ]
@@ -6402,7 +6423,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -6417,12 +6438,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        68,
-        57
+        57,
+        68
       ],
       "outputs": [
         69
@@ -6431,9 +6452,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.3.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -6447,7 +6470,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.3.q_proj",
             "layer.3.q_bias"
@@ -6465,7 +6488,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.3.k_proj",
             "layer.3.k_bias"
@@ -6483,7 +6506,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.3.v_proj",
             "layer.3.v_bias"
@@ -6501,7 +6524,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -6517,7 +6540,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -6547,7 +6570,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -6566,7 +6589,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.3.attn_sinks"
           ]
@@ -6626,9 +6649,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.3.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6642,7 +6667,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.3.router",
             "layer.3.router_bias"
@@ -6660,7 +6685,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -6675,7 +6700,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -6689,7 +6714,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.3.expert_gate_up_bank"
           ]
@@ -6708,7 +6733,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -6723,7 +6751,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -6737,7 +6765,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.3.expert_down_bank"
           ]
@@ -6755,7 +6783,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -6770,12 +6798,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        91,
-        80
+        80,
+        91
       ],
       "outputs": [
         92
@@ -6784,9 +6812,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.4.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -6800,7 +6830,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.4.q_proj",
             "layer.4.q_bias"
@@ -6818,7 +6848,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.4.k_proj",
             "layer.4.k_bias"
@@ -6836,7 +6866,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.4.v_proj",
             "layer.4.v_bias"
@@ -6854,7 +6884,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -6870,7 +6900,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -6900,7 +6930,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -6919,7 +6949,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.4.attn_sinks"
           ]
@@ -6979,9 +7009,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.4.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6995,7 +7027,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.4.router",
             "layer.4.router_bias"
@@ -7013,7 +7045,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -7028,7 +7060,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -7042,7 +7074,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.4.expert_gate_up_bank"
           ]
@@ -7061,7 +7093,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -7076,7 +7111,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -7090,7 +7125,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.4.expert_down_bank"
           ]
@@ -7108,7 +7143,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -7123,12 +7158,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        114,
-        103
+        103,
+        114
       ],
       "outputs": [
         115
@@ -7137,9 +7172,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.5.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -7153,7 +7190,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.5.q_proj",
             "layer.5.q_bias"
@@ -7171,7 +7208,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.5.k_proj",
             "layer.5.k_bias"
@@ -7189,7 +7226,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.5.v_proj",
             "layer.5.v_bias"
@@ -7207,7 +7244,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -7223,7 +7260,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -7253,7 +7290,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -7272,7 +7309,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.5.attn_sinks"
           ]
@@ -7332,9 +7369,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.5.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7348,7 +7387,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.5.router",
             "layer.5.router_bias"
@@ -7366,7 +7405,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -7381,7 +7420,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -7395,7 +7434,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.5.expert_gate_up_bank"
           ]
@@ -7414,7 +7453,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -7429,7 +7471,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -7443,7 +7485,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.5.expert_down_bank"
           ]
@@ -7461,7 +7503,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -7476,12 +7518,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        137,
-        126
+        126,
+        137
       ],
       "outputs": [
         138
@@ -7490,9 +7532,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.6.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.6.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -7506,7 +7550,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.6.q_proj",
             "layer.6.q_bias"
@@ -7524,7 +7568,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.6.k_proj",
             "layer.6.k_bias"
@@ -7542,7 +7586,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.6.v_proj",
             "layer.6.v_bias"
@@ -7560,7 +7604,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -7576,7 +7620,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -7606,7 +7650,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -7625,7 +7669,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.6.attn_sinks"
           ]
@@ -7685,9 +7729,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.6.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.6.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7701,7 +7747,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.6.router",
             "layer.6.router_bias"
@@ -7719,7 +7765,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -7734,7 +7780,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -7748,7 +7794,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.6.expert_gate_up_bank"
           ]
@@ -7767,7 +7813,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -7782,7 +7831,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -7796,7 +7845,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.6.expert_down_bank"
           ]
@@ -7814,7 +7863,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -7829,12 +7878,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        160,
-        149
+        149,
+        160
       ],
       "outputs": [
         161
@@ -7843,9 +7892,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.7.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.7.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -7859,7 +7910,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.7.q_proj",
             "layer.7.q_bias"
@@ -7877,7 +7928,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.7.k_proj",
             "layer.7.k_bias"
@@ -7895,7 +7946,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.7.v_proj",
             "layer.7.v_bias"
@@ -7913,7 +7964,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -7929,7 +7980,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -7959,7 +8010,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -7978,7 +8029,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.7.attn_sinks"
           ]
@@ -8038,9 +8089,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.7.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.7.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -8054,7 +8107,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.7.router",
             "layer.7.router_bias"
@@ -8072,7 +8125,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -8087,7 +8140,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -8101,7 +8154,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.7.expert_gate_up_bank"
           ]
@@ -8120,7 +8173,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -8135,7 +8191,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -8149,7 +8205,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.7.expert_down_bank"
           ]
@@ -8167,7 +8223,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -8182,12 +8238,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        183,
-        172
+        172,
+        183
       ],
       "outputs": [
         184
@@ -8196,9 +8252,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.8.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.8.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -8212,7 +8270,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.8.q_proj",
             "layer.8.q_bias"
@@ -8230,7 +8288,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.8.k_proj",
             "layer.8.k_bias"
@@ -8248,7 +8306,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.8.v_proj",
             "layer.8.v_bias"
@@ -8266,7 +8324,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -8282,7 +8340,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -8312,7 +8370,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -8331,7 +8389,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.8.attn_sinks"
           ]
@@ -8391,9 +8449,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.8.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.8.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -8407,7 +8467,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.8.router",
             "layer.8.router_bias"
@@ -8425,7 +8485,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -8440,7 +8500,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -8454,7 +8514,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.8.expert_gate_up_bank"
           ]
@@ -8473,7 +8533,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -8488,7 +8551,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -8502,7 +8565,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.8.expert_down_bank"
           ]
@@ -8520,7 +8583,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -8535,12 +8598,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        206,
-        195
+        195,
+        206
       ],
       "outputs": [
         207
@@ -8549,9 +8612,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.9.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.9.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -8565,7 +8630,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.9.q_proj",
             "layer.9.q_bias"
@@ -8583,7 +8648,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.9.k_proj",
             "layer.9.k_bias"
@@ -8601,7 +8666,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.9.v_proj",
             "layer.9.v_bias"
@@ -8619,7 +8684,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -8635,7 +8700,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -8665,7 +8730,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -8684,7 +8749,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.9.attn_sinks"
           ]
@@ -8744,9 +8809,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.9.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.9.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -8760,7 +8827,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.9.router",
             "layer.9.router_bias"
@@ -8778,7 +8845,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -8793,7 +8860,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -8807,7 +8874,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.9.expert_gate_up_bank"
           ]
@@ -8826,7 +8893,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -8841,7 +8911,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -8855,7 +8925,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.9.expert_down_bank"
           ]
@@ -8873,7 +8943,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -8888,12 +8958,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        229,
-        218
+        218,
+        229
       ],
       "outputs": [
         230
@@ -8902,9 +8972,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.10.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.10.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -8918,7 +8990,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.10.q_proj",
             "layer.10.q_bias"
@@ -8936,7 +9008,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.10.k_proj",
             "layer.10.k_bias"
@@ -8954,7 +9026,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.10.v_proj",
             "layer.10.v_bias"
@@ -8972,7 +9044,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -8988,7 +9060,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -9018,7 +9090,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -9037,7 +9109,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.10.attn_sinks"
           ]
@@ -9097,9 +9169,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.10.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.10.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -9113,7 +9187,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.10.router",
             "layer.10.router_bias"
@@ -9131,7 +9205,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -9146,7 +9220,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -9160,7 +9234,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.10.expert_gate_up_bank"
           ]
@@ -9179,7 +9253,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -9194,7 +9271,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -9208,7 +9285,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.10.expert_down_bank"
           ]
@@ -9226,7 +9303,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -9241,12 +9318,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        252,
-        241
+        241,
+        252
       ],
       "outputs": [
         253
@@ -9255,9 +9332,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.11.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.11.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -9271,7 +9350,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.11.q_proj",
             "layer.11.q_bias"
@@ -9289,7 +9368,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.11.k_proj",
             "layer.11.k_bias"
@@ -9307,7 +9386,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.11.v_proj",
             "layer.11.v_bias"
@@ -9325,7 +9404,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -9341,7 +9420,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -9371,7 +9450,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -9390,7 +9469,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.11.attn_sinks"
           ]
@@ -9450,9 +9529,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.11.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.11.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -9466,7 +9547,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.11.router",
             "layer.11.router_bias"
@@ -9484,7 +9565,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -9499,7 +9580,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -9513,7 +9594,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.11.expert_gate_up_bank"
           ]
@@ -9532,7 +9613,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -9547,7 +9631,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -9561,7 +9645,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.11.expert_down_bank"
           ]
@@ -9579,7 +9663,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -9594,12 +9678,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        275,
-        264
+        264,
+        275
       ],
       "outputs": [
         276
@@ -9608,9 +9692,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.12.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.12.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -9624,7 +9710,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.12.q_proj",
             "layer.12.q_bias"
@@ -9642,7 +9728,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.12.k_proj",
             "layer.12.k_bias"
@@ -9660,7 +9746,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.12.v_proj",
             "layer.12.v_bias"
@@ -9678,7 +9764,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -9694,7 +9780,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -9724,7 +9810,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -9743,7 +9829,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.12.attn_sinks"
           ]
@@ -9803,9 +9889,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.12.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.12.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -9819,7 +9907,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.12.router",
             "layer.12.router_bias"
@@ -9837,7 +9925,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -9852,7 +9940,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -9866,7 +9954,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.12.expert_gate_up_bank"
           ]
@@ -9885,7 +9973,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -9900,7 +9991,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -9914,7 +10005,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.12.expert_down_bank"
           ]
@@ -9932,7 +10023,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -9947,12 +10038,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        298,
-        287
+        287,
+        298
       ],
       "outputs": [
         299
@@ -9961,9 +10052,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.13.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.13.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -9977,7 +10070,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.13.q_proj",
             "layer.13.q_bias"
@@ -9995,7 +10088,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.13.k_proj",
             "layer.13.k_bias"
@@ -10013,7 +10106,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.13.v_proj",
             "layer.13.v_bias"
@@ -10031,7 +10124,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -10047,7 +10140,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -10077,7 +10170,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -10096,7 +10189,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.13.attn_sinks"
           ]
@@ -10156,9 +10249,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.13.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.13.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -10172,7 +10267,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.13.router",
             "layer.13.router_bias"
@@ -10190,7 +10285,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -10205,7 +10300,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -10219,7 +10314,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.13.expert_gate_up_bank"
           ]
@@ -10238,7 +10333,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -10253,7 +10351,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -10267,7 +10365,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.13.expert_down_bank"
           ]
@@ -10285,7 +10383,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -10300,12 +10398,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        321,
-        310
+        310,
+        321
       ],
       "outputs": [
         322
@@ -10314,9 +10412,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.14.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.14.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -10330,7 +10430,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.14.q_proj",
             "layer.14.q_bias"
@@ -10348,7 +10448,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.14.k_proj",
             "layer.14.k_bias"
@@ -10366,7 +10466,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.14.v_proj",
             "layer.14.v_bias"
@@ -10384,7 +10484,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -10400,7 +10500,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -10430,7 +10530,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -10449,7 +10549,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.14.attn_sinks"
           ]
@@ -10509,9 +10609,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.14.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.14.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -10525,7 +10627,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.14.router",
             "layer.14.router_bias"
@@ -10543,7 +10645,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -10558,7 +10660,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -10572,7 +10674,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.14.expert_gate_up_bank"
           ]
@@ -10591,7 +10693,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -10606,7 +10711,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -10620,7 +10725,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.14.expert_down_bank"
           ]
@@ -10638,7 +10743,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -10653,12 +10758,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        344,
-        333
+        333,
+        344
       ],
       "outputs": [
         345
@@ -10667,9 +10772,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.15.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.15.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -10683,7 +10790,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.15.q_proj",
             "layer.15.q_bias"
@@ -10701,7 +10808,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.15.k_proj",
             "layer.15.k_bias"
@@ -10719,7 +10826,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.15.v_proj",
             "layer.15.v_bias"
@@ -10737,7 +10844,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -10753,7 +10860,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -10783,7 +10890,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -10802,7 +10909,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.15.attn_sinks"
           ]
@@ -10862,9 +10969,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.15.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.15.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -10878,7 +10987,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.15.router",
             "layer.15.router_bias"
@@ -10896,7 +11005,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -10911,7 +11020,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -10925,7 +11034,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.15.expert_gate_up_bank"
           ]
@@ -10944,7 +11053,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -10959,7 +11071,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -10973,7 +11085,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.15.expert_down_bank"
           ]
@@ -10991,7 +11103,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -11006,12 +11118,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        367,
-        356
+        356,
+        367
       ],
       "outputs": [
         368
@@ -11020,9 +11132,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.16.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.16.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -11036,7 +11150,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.16.q_proj",
             "layer.16.q_bias"
@@ -11054,7 +11168,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.16.k_proj",
             "layer.16.k_bias"
@@ -11072,7 +11186,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.16.v_proj",
             "layer.16.v_bias"
@@ -11090,7 +11204,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -11106,7 +11220,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -11136,7 +11250,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -11155,7 +11269,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.16.attn_sinks"
           ]
@@ -11215,9 +11329,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.16.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.16.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -11231,7 +11347,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.16.router",
             "layer.16.router_bias"
@@ -11249,7 +11365,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -11264,7 +11380,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -11278,7 +11394,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.16.expert_gate_up_bank"
           ]
@@ -11297,7 +11413,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -11312,7 +11431,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -11326,7 +11445,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.16.expert_down_bank"
           ]
@@ -11344,7 +11463,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -11359,12 +11478,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        390,
-        379
+        379,
+        390
       ],
       "outputs": [
         391
@@ -11373,9 +11492,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.17.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.17.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -11389,7 +11510,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.17.q_proj",
             "layer.17.q_bias"
@@ -11407,7 +11528,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.17.k_proj",
             "layer.17.k_bias"
@@ -11425,7 +11546,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.17.v_proj",
             "layer.17.v_bias"
@@ -11443,7 +11564,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -11459,7 +11580,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -11489,7 +11610,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -11508,7 +11629,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.17.attn_sinks"
           ]
@@ -11568,9 +11689,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.17.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.17.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -11584,7 +11707,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.17.router",
             "layer.17.router_bias"
@@ -11602,7 +11725,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -11617,7 +11740,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -11631,7 +11754,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.17.expert_gate_up_bank"
           ]
@@ -11650,7 +11773,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -11665,7 +11791,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -11679,7 +11805,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.17.expert_down_bank"
           ]
@@ -11697,7 +11823,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -11712,12 +11838,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        413,
-        402
+        402,
+        413
       ],
       "outputs": [
         414
@@ -11726,9 +11852,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.18.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.18.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -11742,7 +11870,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.18.q_proj",
             "layer.18.q_bias"
@@ -11760,7 +11888,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.18.k_proj",
             "layer.18.k_bias"
@@ -11778,7 +11906,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.18.v_proj",
             "layer.18.v_bias"
@@ -11796,7 +11924,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -11812,7 +11940,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -11842,7 +11970,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -11861,7 +11989,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.18.attn_sinks"
           ]
@@ -11921,9 +12049,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.18.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.18.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -11937,7 +12067,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.18.router",
             "layer.18.router_bias"
@@ -11955,7 +12085,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -11970,7 +12100,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -11984,7 +12114,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.18.expert_gate_up_bank"
           ]
@@ -12003,7 +12133,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -12018,7 +12151,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -12032,7 +12165,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.18.expert_down_bank"
           ]
@@ -12050,7 +12183,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -12065,12 +12198,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        436,
-        425
+        425,
+        436
       ],
       "outputs": [
         437
@@ -12079,9 +12212,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.19.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.19.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -12095,7 +12230,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.19.q_proj",
             "layer.19.q_bias"
@@ -12113,7 +12248,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.19.k_proj",
             "layer.19.k_bias"
@@ -12131,7 +12266,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.19.v_proj",
             "layer.19.v_bias"
@@ -12149,7 +12284,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -12165,7 +12300,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -12195,7 +12330,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -12214,7 +12349,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.19.attn_sinks"
           ]
@@ -12274,9 +12409,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.19.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.19.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -12290,7 +12427,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.19.router",
             "layer.19.router_bias"
@@ -12308,7 +12445,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -12323,7 +12460,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -12337,7 +12474,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.19.expert_gate_up_bank"
           ]
@@ -12356,7 +12493,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -12371,7 +12511,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -12385,7 +12525,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.19.expert_down_bank"
           ]
@@ -12403,7 +12543,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -12418,12 +12558,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        459,
-        448
+        448,
+        459
       ],
       "outputs": [
         460
@@ -12432,9 +12572,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.20.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.20.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -12448,7 +12590,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.20.q_proj",
             "layer.20.q_bias"
@@ -12466,7 +12608,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.20.k_proj",
             "layer.20.k_bias"
@@ -12484,7 +12626,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.20.v_proj",
             "layer.20.v_bias"
@@ -12502,7 +12644,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -12518,7 +12660,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -12548,7 +12690,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -12567,7 +12709,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.20.attn_sinks"
           ]
@@ -12627,9 +12769,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.20.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.20.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -12643,7 +12787,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.20.router",
             "layer.20.router_bias"
@@ -12661,7 +12805,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -12676,7 +12820,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -12690,7 +12834,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.20.expert_gate_up_bank"
           ]
@@ -12709,7 +12853,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -12724,7 +12871,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -12738,7 +12885,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.20.expert_down_bank"
           ]
@@ -12756,7 +12903,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -12771,12 +12918,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        482,
-        471
+        471,
+        482
       ],
       "outputs": [
         483
@@ -12785,9 +12932,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.21.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.21.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -12801,7 +12950,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.21.q_proj",
             "layer.21.q_bias"
@@ -12819,7 +12968,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.21.k_proj",
             "layer.21.k_bias"
@@ -12837,7 +12986,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.21.v_proj",
             "layer.21.v_bias"
@@ -12855,7 +13004,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -12871,7 +13020,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -12901,7 +13050,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -12920,7 +13069,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.21.attn_sinks"
           ]
@@ -12980,9 +13129,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.21.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.21.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -12996,7 +13147,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.21.router",
             "layer.21.router_bias"
@@ -13014,7 +13165,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -13029,7 +13180,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -13043,7 +13194,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.21.expert_gate_up_bank"
           ]
@@ -13062,7 +13213,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -13077,7 +13231,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -13091,7 +13245,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.21.expert_down_bank"
           ]
@@ -13109,7 +13263,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -13124,12 +13278,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        505,
-        494
+        494,
+        505
       ],
       "outputs": [
         506
@@ -13138,9 +13292,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.22.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.22.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -13154,7 +13310,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.22.q_proj",
             "layer.22.q_bias"
@@ -13172,7 +13328,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.22.k_proj",
             "layer.22.k_bias"
@@ -13190,7 +13346,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.22.v_proj",
             "layer.22.v_bias"
@@ -13208,7 +13364,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -13224,7 +13380,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -13254,7 +13410,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -13273,7 +13429,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.22.attn_sinks"
           ]
@@ -13333,9 +13489,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.22.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.22.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -13349,7 +13507,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.22.router",
             "layer.22.router_bias"
@@ -13367,7 +13525,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -13382,7 +13540,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -13396,7 +13554,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.22.expert_gate_up_bank"
           ]
@@ -13415,7 +13573,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -13430,7 +13591,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -13444,7 +13605,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.22.expert_down_bank"
           ]
@@ -13462,7 +13623,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -13477,12 +13638,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        528,
-        517
+        517,
+        528
       ],
       "outputs": [
         529
@@ -13491,9 +13652,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.23.attn_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.23.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -13507,7 +13670,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.23.q_proj",
             "layer.23.q_bias"
@@ -13525,7 +13688,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.23.k_proj",
             "layer.23.k_bias"
@@ -13543,7 +13706,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.23.v_proj",
             "layer.23.v_bias"
@@ -13561,7 +13724,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_rope_yarn_original_bf16"
+          "kernel": "rope::rope_yarn_original_bf16"
         }
       },
       "inputs": [
@@ -13577,7 +13740,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -13607,7 +13770,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::launch_attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -13626,7 +13789,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_attention_sink_rescale_bf16",
+          "kernel": "attn::attention_sink_rescale_bf16",
           "weights": [
             "layer.23.attn_sinks"
           ]
@@ -13686,9 +13849,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.23.mlp_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.23.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -13702,7 +13867,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ops::gemm_act_x_wt_bias_bf16",
+          "kernel": "gemm::act_x_wt_bias_bf16",
           "weights": [
             "layer.23.router",
             "layer.23.router_bias"
@@ -13720,7 +13885,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_topk_softmax_bf16"
+          "kernel": "moe::topk_softmax_bf16"
         }
       },
       "inputs": [
@@ -13735,7 +13900,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -13749,7 +13914,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_gate_up_decode_bf16",
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
           "weights": [
             "layer.23.expert_gate_up_bank"
           ]
@@ -13768,7 +13933,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_gpt_oss_glu_bf16"
+          "kernel": "mlp::gpt_oss_glu_bf16",
+          "params": [
+            1088421888
+          ]
         }
       },
       "inputs": [
@@ -13783,7 +13951,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_bf16_to_fp16"
+          "kernel": "quant::bf16_to_fp16"
         }
       },
       "inputs": [
@@ -13797,7 +13965,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_mxfp4_moe_down_decode_bf16",
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
           "weights": [
             "layer.23.expert_down_bank"
           ]
@@ -13815,7 +13983,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_token_batched_weighted_sum_bf16"
+          "kernel": "moe::token_batched_weighted_sum_bf16"
         }
       },
       "inputs": [
@@ -13830,12 +13998,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_residual_add_bf16"
+          "kernel": "norm::residual_add_bf16"
         }
       },
       "inputs": [
-        551,
-        540
+        540,
+        551
       ],
       "outputs": [
         552
@@ -13844,9 +14012,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "final_norm",
-          "variant": "Plain"
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "final_norm"
+          ]
         }
       },
       "inputs": [

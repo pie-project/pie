@@ -78,7 +78,7 @@ fn write_snapshot(dir: &Path) {
 /// Spelled out here rather than normalized from a `config.json` fixture: this
 /// test is about the ABI, and what crosses it is the descriptor. The fields
 /// are the ones `ModelFacts::from_descriptor` projects; the rest of the
-/// schema is `model-config`'s business and has its own tests.
+/// schema is `model::config`'s business and has its own tests.
 ///
 /// A `&'static str` so `bytes()` can borrow it for the whole call, the way a
 /// driver borrows the buffer it read the file into.

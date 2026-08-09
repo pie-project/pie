@@ -10,6 +10,7 @@
 
 #include <string>
 
+#include "attention_workspace.hpp"
 #include "model/config.hpp"
 #include "model/gemma4/gemma4.hpp"
 #include "pie_forward/plan.hpp"
@@ -52,7 +53,7 @@ bool gemma4_forward_declared(
     Gemma4MoeMlpWorkspace& moe_ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,

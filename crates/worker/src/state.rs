@@ -20,7 +20,7 @@
 //! **Entries do not nest.** Two entries whose paths contain one another would
 //! double-count in a size report and delete each other in a reclaim, so the
 //! ones carved out of `cache/` are subtracted from it via [`Entry::keep`] and
-//! [`entries_are_disjoint`] pins that.
+//! the `entries_are_disjoint` test pins that.
 
 use std::path::PathBuf;
 

@@ -60,7 +60,7 @@ pub struct KimiCudaFacts {
     /// half — neither latent is a contiguous block of the result.
     pub q_kv_a_fused: bool,
     /// The config asks for YaRN (`rope_scaling_kind`), so the rope is
-    /// `launch_rope_yarn_original_bf16` rather than the plain one.
+    /// `kernels::rope::rope_yarn_original_bf16` rather than the plain one.
     pub rope_yarn_original: bool,
 }
 

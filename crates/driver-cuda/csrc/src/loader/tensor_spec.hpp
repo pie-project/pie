@@ -35,7 +35,7 @@ enum class TensorOwnershipKind {
 /// `validate_invariants`; `ownership` and `backing_tensor` drive erase and
 /// alias resolution. Fields that only ever round-tripped through the artifact
 /// codec (layout, tensor-parallel kind, a second quantization description)
-/// were removed — the live quant metadata is `ops::QuantMeta`, which the GEMM
+/// were removed — the live quant metadata is `QuantMeta`, which the GEMM
 /// path actually reads.
 struct TensorDecl {
     std::string name;

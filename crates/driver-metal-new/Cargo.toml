@@ -25,6 +25,37 @@ path = "src/lib.rs"
 [features]
 default = []
 
+# Portable, so it goes in the plain dependency table rather than the Apple one:
+# `facts.rs` reads a descriptor document and needs no GPU to do it.
+[dependencies]
+serde_json = "1.0"
+
+# The pipeline interpreter is pure CPU logic and reuses the launch/IR source of
+# truth rather than re-porting the C++ `pie::driver::launch` mirror:
+# `driver-abi` owns the adopted launch-package types (`LaunchPackage` and its
+# members) and the `PIE_*` ABI constants, and `tensor-ir` owns the op table,
+# dtypes, intrinsic ids and the canonical RNG contract. Both are host-portable,
+# so they belong here in the plain (non-Apple) table.
+driver-abi = { path = "../driver-abi" }
+tensor-ir = { path = "../tensor-ir" }
+
+# The kernel contract vocabulary: `LaunchRule` (which grid shape a row states)
+# and `sig_in` (how an instantiated point resolves to its row). Tables only --
+# no shader is built by reading one.
+kernels = { path = "../kernels" }
+
+# The load-plan path calls the loader in-process where the C++ went through
+# the C ABI: `model` owns the author registry (the `contract` feature alone --
+# no chat aspect, so no tokenizer or image decoders ride along), and
+# `model-loader` owns the plan compiler and the checkpoint readers. Both are
+# host-portable.
+# The lowering the executor runs: `model_compiler::lower` states a fire as a
+# flat list of launches naming kernel symbols. Host-portable — reading a
+# lowered trace builds no shader.
+model-compiler = { path = "../model-compiler" }
+model = { path = "../model", default-features = false, features = ["contract"] }
+model-loader = { path = "../model-loader" }
+
 # Apple-only. Everything that names a Metal type lives under `src/metal/` and
 # is gated on this cfg, so the crate still builds -- and its portable half
 # still tests -- on the Linux boxes the rest of the workspace is developed on.
@@ -37,6 +68,8 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSError",
     "NSString",
     "NSArray",
+    # `resolveCounterRange:` answers with an `NSData` of packed ticks.
+    "NSData",
     "NSObject",
     "NSRange",
     "NSURL",
@@ -95,6 +128,10 @@ features = [
     # `MTLStages` and the encoder barrier live here; the MTL4 encoder's barrier
     # methods are gated on it even though nothing else in this driver is.
     "MTLCommandEncoder",
+    # `MTLSparseTextureMappingMode` and, transitively, the MTL4 queue's
+    # sparse-remap operation struct. Named for a texture encoder this driver
+    # never uses; the enum is what elastic buffers need.
+    "MTLResourceStateCommandEncoder",
     # the Metal 4 stack this driver is written against
     "MTL4CommandQueue",
     "MTL4CommandBuffer",
@@ -117,3 +154,19 @@ features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+# The PSO plan's names are held against the shipped signature table, so a
+# name no shader instantiates fails in CI on any host. Table only, no Metal.
+kernels-metal = { path = "../kernels-metal", default-features = false }
+
+
+# Tests only. The driver deliberately does not depend on the compiler at build
+# time -- see the `identity::Versions` comment -- but `pipeline::status` mirrors
+# the compiler's fault-code table, and a hand-copied table that nothing checks
+# drifts. The dev-dependency makes the mirror a test rather than a promise.
+tensor-compiler = { path = "../tensor-compiler" }
+
+# Tests only. The binder is proved against a REAL lowering, and the texts live
+# behind `model`'s `forward` feature -- which the driver itself does not need,
+# so it is enabled here rather than in the dependency table above.
+model = { path = "../model", default-features = false, features = ["contract", "forward"] }

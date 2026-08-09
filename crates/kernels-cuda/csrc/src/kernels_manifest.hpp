@@ -34,6 +34,21 @@ constexpr bool attn_decode_gqa_instantiated(int gqa) {
         ;
 }
 
+/// Whether routing a decode of this GQA ratio through FlashInfer is a win.
+///
+/// Only the instantiated ratios are, so this is `attn_decode_gqa_instantiated`
+/// under the name the admission checks ask the question in. It lived beside
+/// `AttentionWorkspace` while that class was in this crate; the class went
+/// home to the driver and this stayed, because which kernels were built is a
+/// fact about this crate and nothing the driver can answer.
+constexpr bool flashinfer_decode_supports_gqa(int gqa) {
+    return attn_decode_gqa_instantiated(gqa);
+}
+
+/// `PIE_CUDA_XQA_DECODE` override. Defaults to enabled; when false the driver
+/// forces the FlashInfer paged decode kernel on every arch.
+inline bool xqa_decode_enabled_by_env() { return true; }
+
 /// Smallest instantiated head_dim that can hold `head_dim`, or `head_dim`
 /// itself when none can -- callers then surface the dispatch error rather than
 /// silently mis-sizing. Padding up is safe because the extra lanes are zero-

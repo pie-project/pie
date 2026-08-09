@@ -181,6 +181,140 @@ fn visit_sources(root: &Path, relative: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+/// The one allowlisted path that is generated rather than committed.
+///
+/// `tensor-compiler` owns the preamble's text and commits it once, under
+/// `include/`. Metal's runtime shader compiler resolves a `#include "..."`
+/// against the including file's directory and nothing else, so a shader that
+/// lives in the runtime shader directory can only reach the preamble if a copy
+/// sits there too: `kernels-metal/build.rs` writes that copy on a `native`
+/// build and `.gitignore` keeps it from becoming a second committed source.
+///
+/// It is therefore an owner — the contract's own text, at the second place the
+/// contract requires it — and the only entry [`allowlisted_paths_still_exist`]
+/// exempts, because a checkout that has not built it is not a broken checkout.
+const STAGED_RNG_PREAMBLE: &str = "crates/kernels-metal/kernels/ptir/ptir_rng.generated.metal";
+
+/// The four allowlists [`rng_magic_is_owned_by_the_contract`] reads, named so
+/// that [`allowlisted_paths_still_exist`] can check the same lists rather than
+/// a copy of them.
+struct Allowlists {
+    owners: &'static [&'static str],
+    stride: &'static [&'static str],
+    mask: &'static [&'static str],
+    shift: &'static [&'static str],
+}
+
+impl Allowlists {
+    fn lists(&self) -> [(&'static str, &'static [&'static str]); 4] {
+        [
+            ("owners", self.owners),
+            ("unrelated_stride_users", self.stride),
+            ("unrelated_mask_users", self.mask),
+            ("unrelated_shift_users", self.shift),
+        ]
+    }
+}
+
+fn path_in(list: &[&str], relative: &Path) -> bool {
+    list.iter().any(|entry| Path::new(entry) == relative)
+}
+
+fn allowlists() -> Allowlists {
+    Allowlists {
+        // Repo-wide on purpose: the point is that nobody outside the contract
+        // — a driver, a kernel, the engine — re-types these constants.
+        owners: &[
+            "crates/tensor-ir/src/rng.rs",
+            "crates/tensor-compiler/include/rng_contract.generated.h",
+            "crates/tensor-compiler/include/ptir_rng.generated.metal",
+            // See `STAGED_RNG_PREAMBLE`: the same generated text, at the second
+            // place the contract requires it.
+            STAGED_RNG_PREAMBLE,
+        ],
+        stride: &[
+            "crates/driver-cuda/csrc/src/batch/forward_graph.hpp",
+            "crates/driver-cuda/csrc/src/loader/weight_store_codec.hpp",
+            "crates/gateway/src/route.rs",
+            "crates/engine/src/inferlet/linker.rs",
+            // splitmix64 id generation: the canonical splitmix increment
+            // happens to be the same golden-ratio word; not a keyed-RNG
+            // transcription.
+            "crates/engine/src/pipeline/offload.rs",
+            // Same word, same reason: two splitmix mixers fingerprinting what a
+            // captured graph body bakes (the NS-3 spatial-split plan, and the
+            // staged lora table). Added by `f4a63579b` / `d7df4b575` without a
+            // row here, which is why this guard only started reporting them
+            // once the workspace test sweep could reach this suite again.
+            "crates/driver-cuda/csrc/src/model/llama_like/llama_like.cpp",
+            // The RUST ports of the two mixers the line above names — the
+            // NS-3 spatial-split layout key and the staged lora table's
+            // fingerprint, each transcribed branch for branch with its
+            // splitmix finalizer. Same word, same reason, and they are here
+            // rather than deduplicated because a port that reached for a
+            // shared helper would no longer be a transcription of the
+            // function it has to agree with.
+            "crates/driver-cuda-new/src/model/llama_like.rs",
+            "crates/driver-cuda-new/src/model/lora.rs",
+            // boost-style `hash_combine` for the GEMM autotune cache key; the
+            // golden-ratio word again, and nothing to do with the PTIR stream.
+            // These have moved twice — `driver-cuda/ops/` to `kernels-cuda/ops/`
+            // when the kernel crate split, then into the family layout — and
+            // both times `allowlisted_paths_still_exist` named the stale entry
+            // instead of letting the guard fail somewhere unrelated.
+            "crates/kernels-cuda/csrc/src/gemm/gemm.cpp",
+            "crates/kernels-cuda/csrc/src/tuning_cache.hpp",
+            // And again, for the stage-hook fingerprint's `hash_combine`.
+            "crates/driver-cuda/csrc/src/pipeline/dispatch.cu",
+        ],
+        mask: &[
+            "crates/driver-cuda/csrc/tests/ptir_tier0_test.cu",
+            "crates/grammar/src/brle.rs",
+        ],
+        // The float conversion's shift is the weakest needle here: any 64-bit
+        // -> float reduction that wants 24 mantissa bits writes it. A murmur3
+        // finalizer in a driver test is not a PTIR stream.
+        //
+        // (Spelled in fragments at the use site like every other constant, and
+        // for the reason this guard exists: writing it out in a comment makes
+        // THIS file a transcription, which is exactly what the first draft of
+        // this comment did and what the guard then reported.)
+        shift: &["crates/driver-metal/csrc/tests/llama_numerics_test.cpp"],
+    }
+}
+
+/// An allowlist keyed by path rots silently, and this is what stops it.
+///
+/// Every entry above says "the magic in THIS file is not a transcription". When
+/// the file moves, the entry does not follow it: the entry becomes dead, the
+/// file reappears at a new path the guard has never heard of, and
+/// [`rng_magic_is_owned_by_the_contract`] fails somewhere far from the move
+/// that caused it. That happened three times over one refactor — `ops/gemm.cpp`
+/// and `ops/tuning_cache.hpp` moved to `kernels-cuda`, `program_identity.hpp`
+/// was deleted outright, and the staged MSL preamble moved to `kernels-metal` —
+/// and each was found by the failure rather than by the move.
+///
+/// So the list is checked against the tree it describes. A rename now fails
+/// HERE, naming the entry, in the commit that renamed it.
+#[test]
+fn allowlisted_paths_still_exist() {
+    let root = repo_root();
+    for (name, list) in allowlists().lists() {
+        for entry in list {
+            // The one generated entry: absent until a `native` build stages it,
+            // and a checkout that has not built is not a broken checkout.
+            if *entry == STAGED_RNG_PREAMBLE {
+                continue;
+            }
+            assert!(
+                root.join(entry).exists(),
+                "`{name}` allowlists {entry}, which no longer exists. Point the \
+                 entry at the file's new home, or drop it if the file is gone."
+            );
+        }
+    }
+}
+
 #[test]
 fn rng_magic_is_owned_by_the_contract() {
     if std::env::var("PTIR_REGEN").is_ok() {
@@ -190,51 +324,9 @@ fn rng_magic_is_owned_by_the_contract() {
     let mut files = Vec::new();
     visit_sources(&root, Path::new(""), &mut files);
 
-    // Repo-wide on purpose: the point is that nobody outside the contract — a
-    // driver, a kernel, the engine — re-types these constants.
-    let owners = [
-        Path::new("crates/tensor-ir/src/rng.rs"),
-        Path::new("crates/tensor-compiler/include/rng_contract.generated.h"),
-        Path::new("crates/tensor-compiler/include/ptir_rng.generated.metal"),
-        // Staged into crates/driver-metal/csrc/src/kernels by CMake at configure time so
-        // ptir_m0.metal / ptir_m1_runtime.metal can `#include` it by name.
-        Path::new("crates/driver-metal/csrc/src/kernels/ptir_rng.generated.metal"),
-    ];
-    let unrelated_stride_users = [
-        Path::new("crates/driver-cuda/csrc/src/batch/forward_graph.hpp"),
-        Path::new("crates/driver-cuda/csrc/src/loader/weight_store_codec.hpp"),
-        Path::new("crates/driver-cuda/csrc/src/pipeline/program_identity.hpp"),
-        Path::new("crates/gateway/src/route.rs"),
-        Path::new("crates/engine/src/inferlet/linker.rs"),
-        // splitmix64 id generation: the canonical splitmix increment happens
-        // to be the same golden-ratio word; not a keyed-RNG transcription.
-        Path::new("crates/engine/src/pipeline/offload.rs"),
-        // Same word, same reason: two splitmix mixers fingerprinting what a
-        // captured graph body bakes (the NS-3 spatial-split plan, and the
-        // staged lora table). Added by `f4a63579b` / `d7df4b575` without a
-        // row here, which is why this guard only started reporting them once
-        // the workspace test sweep could reach this suite again.
-        Path::new("crates/driver-cuda/csrc/src/model/llama_like/llama_like.cpp"),
-        // boost-style `hash_combine` for the GEMM autotune cache key; the
-        // golden-ratio word again, and nothing to do with the PTIR stream.
-        Path::new("crates/driver-cuda/csrc/src/ops/gemm.cpp"),
-        Path::new("crates/driver-cuda/csrc/src/ops/tuning_cache.hpp"),
-        // And again, for the stage-hook fingerprint's `hash_combine`.
-        Path::new("crates/driver-cuda/csrc/src/pipeline/dispatch.cu"),
-    ];
-    let unrelated_mask_users = [
-        Path::new("crates/driver-cuda/csrc/tests/ptir_tier0_test.cu"),
-        Path::new("crates/grammar/src/brle.rs"),
-    ];
-    // The float conversion's shift is the weakest needle here: any 64-bit ->
-    // float reduction that wants 24 mantissa bits writes it. A murmur3
-    // finalizer in a driver test is not a PTIR stream.
-    //
-    // (Spelled in fragments below like every other constant, and for the
-    // reason this guard exists: writing it out in a comment makes THIS file a
-    // transcription, which is exactly what the first draft of this comment
-    // did and what the guard then reported.)
-    let unrelated_shift_users = [Path::new("crates/driver-metal/csrc/tests/llama_numerics_test.cpp")];
+    let allow = allowlists();
+    let owner = |relative: &Path| path_in(allow.owners, relative);
+
     let stride = ["9e37", "79b9", "7f4a", "7c15"].concat();
     let ambient_mask = ["a5a5", "a5a5"].concat();
     let float_shift = [">>", "40"].concat();
@@ -255,16 +347,16 @@ fn rng_magic_is_owned_by_the_contract() {
             .flat_map(char::to_lowercase)
             .collect();
         for needle in &magic {
-            if !normalized.contains(needle) || owners.contains(&relative.as_path()) {
+            if !normalized.contains(needle) || owner(&relative) {
                 continue;
             }
-            if needle == &stride && unrelated_stride_users.contains(&relative.as_path()) {
+            if needle == &stride && path_in(allow.stride, &relative) {
                 continue;
             }
-            if needle == &ambient_mask && unrelated_mask_users.contains(&relative.as_path()) {
+            if needle == &ambient_mask && path_in(allow.mask, &relative) {
                 continue;
             }
-            if needle == &float_shift && unrelated_shift_users.contains(&relative.as_path()) {
+            if needle == &float_shift && path_in(allow.shift, &relative) {
                 continue;
             }
             panic!(

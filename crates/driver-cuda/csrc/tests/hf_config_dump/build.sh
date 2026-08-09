@@ -49,7 +49,7 @@ find_nlohmann() {
     fi
     # CMake's FetchContent leaves it under a build tree; take the newest.
     local found
-    found="$(find "${CARGO_TARGET_DIR:-$driver/../../target}" "$HOME/.cache" /home/files 2>/dev/null \
+    found="$(find "${CARGO_TARGET_DIR:-$driver/../../../target}" "$HOME/.cache" /home/files 2>/dev/null \
         -path '*json-src/single_include/nlohmann/json.hpp' -print -quit || true)"
     if [[ -n "$found" ]]; then
         dirname "$(dirname "$found")"
@@ -62,9 +62,13 @@ find_nlohmann() {
 inc="$(find_nlohmann)"
 # `${a[@]+"${a[@]}"}` rather than a bare `"${a[@]}"`: macOS ships bash 3.2,
 # where expanding an EMPTY array under `set -u` is an unbound-variable error.
+#
+# `kernels-cuda/csrc/src` joined the include path when `kernels_manifest.hpp`
+# went home to the kernels crate (kernel-refactor §7 step 2b) —
+# `descriptor.cpp` reads `round_up_attn_head_dim` from it.
 args=(-std=c++20 -O1 -o "$out"
       "$main" ${extra[@]+"${extra[@]}"}
-      -I "$driver/src" -I "$here")
+      -I "$driver/src" -I "$driver/../../kernels-cuda/csrc/src" -I "$here")
 [[ -n "$inc" ]] && args+=(-I "$inc")
 
 echo "building $out" >&2

@@ -130,7 +130,7 @@ fn an_incomplete_tokenizer_is_refused_by_name() {
 /// The `pie.model/1` descriptor survives the artifact, and says what the C++
 /// normalizer says.
 ///
-/// The differential in `model-config` proves the normalizer agrees with
+/// The differential in `model::config` proves the normalizer agrees with
 /// `config.cpp`; this proves the agreement survives being written into a `.zt`
 /// and read back out — and that `head_dim_kernel`, which is a property of a
 /// driver build rather than of a checkpoint, is *not* along for the ride.

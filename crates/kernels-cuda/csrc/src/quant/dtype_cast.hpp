@@ -1,0 +1,160 @@
+#pragma once
+
+// Element-wise dtype casts used by the loader to bring non-bf16
+// checkpoints into our standard bf16 format, plus the element-wise scale
+// the loader's `Scale` tile map dispatches to.
+
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime.h>
+
+namespace pie_cuda_driver::kernels::quant {
+
+/// `dst[i] = (bf16)src[i]` for `n` elements.
+void cast_fp16_to_bf16(
+    const void*   src_fp16,
+    void*         dst_bf16,
+    std::size_t   n,
+    cudaStream_t  stream);
+
+/// `dst[i] = (bf16)src[i]` for `n` fp32 elements. Used when ckpts ship
+/// projection scales as fp32 but our GEMM dispatcher (or the cuBLASLt
+/// scale path) expects bf16.
+void cast_fp32_to_bf16(
+    const void*   src_fp32,
+    void*         dst_bf16,
+    std::size_t   n,
+    cudaStream_t  stream);
+
+/// `dst[i] = (fp32)src[i]` for `n` bf16 elements. Used by the
+/// compressed-tensors FP8 loader when scales ship as bf16 but the
+/// dispatcher (cuBLASLt scale-pointer / dequant fallback) requires
+/// fp32. Equivalent to `(int32(bf16_bits) << 16) reinterpreted as fp32`.
+/// `rows x width` bf16 buffer scaled in place by a bf16 vector:
+/// `buf[r, c] *= l[c]` — the adapter SCALE form's (IA3) per-site apply.
+void scale_rows_bf16(
+    void*         buf_bf16,
+    const void*   l_bf16,
+    int           rows,
+    int           width,
+    cudaStream_t  stream);
+
+void cast_bf16_to_fp32(
+    const void*   src_bf16,
+    void*         dst_fp32,
+    std::size_t   n,
+    cudaStream_t  stream);
+
+/// `dst[i] = 2^(src[i] - 127)` for `n` E8M0 elements. Block-scaled FP8
+/// checkpoints (DeepSeek-V4) ship their per-tile scales in OCP Microscaling's
+/// exponent-only format, while the FP8 GEMM wants fp32 scales.
+void cast_e8m0_to_fp32(
+    const void*   src_e8m0,
+    void*         dst_fp32,
+    std::size_t   n,
+    cudaStream_t  stream);
+
+/// `dst[i] = src[i] * factor` for `n` elements, in the dtype named by the
+/// suffix. Backs the loader's `Scale` tile map, which is how a contract says
+/// "fold this constant into the weight" instead of the driver copying the
+/// tensor to the host, multiplying it there and uploading the result.
+///
+/// The arithmetic is done in fp32 for every input dtype, matching the loader's
+/// host executor exactly so the two can be compared bit for bit. `src` and
+/// `dst` may be the same pointer.
+void scale_bf16(
+    const void*   src_bf16,
+    void*         dst_bf16,
+    std::size_t   n,
+    float         factor,
+    cudaStream_t  stream);
+
+/// `dst[i] = src[i] * factor` for `n` fp32 elements. See `scale_bf16`.
+void scale_fp32(
+    const void*   src_fp32,
+    void*         dst_fp32,
+    std::size_t   n,
+    float         factor,
+    cudaStream_t  stream);
+
+/// `dst[i] = src[i] * factor` for `n` fp16 elements. See `scale_bf16`.
+void scale_fp16(
+    const void*   src_fp16,
+    void*         dst_fp16,
+    std::size_t   n,
+    float         factor,
+    cudaStream_t  stream);
+
+/// In-place marlin scale permutation. Marlin's gptq W4A16 kernel reads
+/// per-group scales in a specific 64-wide column-interleaved layout
+/// rather than the row-major `[groups, N]` shape that GPTQ checkpoints
+/// ship. This kernel applies the same permutation as vLLM's
+/// `marlin_permute_scales` (see `vllm/model_executor/layers/
+/// quantization/utils/marlin_utils.py::get_scale_perms`):
+///
+///   For per-group (group_size < size_k):
+///     Flatten to `[-1, 64]`, permute columns by
+///         perm[i*8 + j] = i + 8*j   for i,j in 0..8.
+///   For per-channel (group_size == -1 or == size_k):
+///     Use a different 64-wide perm. Not implemented yet — refuse.
+///
+/// Runs in-place: `bf16_scales` shape `[groups, size_n]` is rewritten.
+void marlin_permute_scales_bf16(
+    void*         bf16_scales,
+    int           groups,
+    int           size_n,
+    int           group_size,
+    int           size_k,
+    cudaStream_t  stream);
+
+/// Direct AWQ dequant to bf16 — bypasses marlin entirely. Produces
+/// `bf16[N, K]` (HF Linear-compatible row-major) from the AWQ triplet
+/// (qweight, qzeros, scales). Used as a drop-in replacement for the
+/// marlin path on sm80 where the marlin pipeline is broken; trades the
+/// memory savings of W4 for correctness. Numerically identical to the
+/// numpy reference: `(unpack(qweight) - unpack(qzeros)[g(k)]) *
+/// scales[g(k), n]`.
+///
+/// Inputs:
+///   * `qweight_in`  — `[K, N/8]` int32 (AWQ packing).
+///   * `qzeros_in`   — `[groups, N/8]` int32 (AWQ packing).
+///   * `scales_in`   — `[groups, N]` bf16. (FP16 scales must be cast
+///                     to bf16 by the caller.)
+///   * `bf16_out`    — `[N, K]` bf16 (transposed for HF Linear).
+void awq_dequant_to_bf16(
+    const void*   qweight_in,
+    const void*   qzeros_in,
+    const void*   scales_in,
+    void*         bf16_out,        // [N, K] bf16
+    int           size_k,
+    int           size_n,
+    int           group_size,
+    cudaStream_t  stream);
+
+/// Direct GPTQ dequant to bf16. GPTQ packs nibbles along K axis (axis 0
+/// of qweight) sequentially (no interleave). Supports both `desc_act=
+/// false` (g_idx = nullptr → use g = k / group_size) and `desc_act=true`
+/// (g_idx[k] is the per-row scale group lookup). Symmetric (kU4B8)
+/// ckpts ship qzeros set to 8 everywhere — the kernel applies
+/// (nibble - zp) uniformly so this works for both sym and asym.
+///
+/// Inputs:
+///   * `qweight_in` — `[K/8, N]` int32 (GPTQ packing along K).
+///   * `qzeros_in`  — `[groups, N/8]` int32 (packing along N).
+///   * `scales_in`  — `[groups, N]` bf16.
+///   * `g_idx_in`   — `[K]` int32 or nullptr. When non-null, this is
+///                    desc_act=true (act-order); each row k of the
+///                    dequanted weight uses scale group g_idx[k].
+///   * `bf16_out`   — `[N, K]` bf16 (transposed for HF Linear).
+void gptq_dequant_to_bf16(
+    const void*   qweight_in,
+    const void*   qzeros_in,
+    const void*   scales_in,
+    const void*   g_idx_in,        // nullable
+    void*         bf16_out,        // [N, K] bf16
+    int           size_k,
+    int           size_n,
+    int           group_size,
+    cudaStream_t  stream);
+
+}  // namespace pie_cuda_driver::kernels::quant

@@ -11,7 +11,7 @@
 
 #include <string>
 
-#include "affine_format.hpp"
+#include "quant/affine_format.hpp"
 #include "decode_step.hpp"
 #include "mtl4_context.hpp"
 

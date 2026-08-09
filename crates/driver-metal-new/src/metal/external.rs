@@ -64,7 +64,14 @@ pub fn page_size() -> u64 {
 }
 
 /// Add `buffer` to the residency set and ask for it to be made resident.
-fn add(residency: &ProtocolObject<dyn MTLResidencySet>, buffer: &ProtocolObject<dyn MTLBuffer>) {
+///
+/// `pub(super)` so the ring, which allocates its own buffers rather than
+/// adopting someone else's, keeps them resident through the same three calls
+/// instead of a fourth copy of them.
+pub(super) fn add(
+    residency: &ProtocolObject<dyn MTLResidencySet>,
+    buffer: &ProtocolObject<dyn MTLBuffer>,
+) {
     let allocation: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(buffer);
     residency.addAllocation(allocation);
     residency.commit();
@@ -72,7 +79,10 @@ fn add(residency: &ProtocolObject<dyn MTLResidencySet>, buffer: &ProtocolObject<
 }
 
 /// Drop `buffer` from the residency set.
-fn remove(residency: &ProtocolObject<dyn MTLResidencySet>, buffer: &ProtocolObject<dyn MTLBuffer>) {
+pub(super) fn remove(
+    residency: &ProtocolObject<dyn MTLResidencySet>,
+    buffer: &ProtocolObject<dyn MTLBuffer>,
+) {
     let allocation: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(buffer);
     residency.removeAllocation(allocation);
     residency.commit();

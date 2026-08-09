@@ -11,8 +11,6 @@
 // and eight more. `as _` because there is nothing to call.
 #[cfg(feature = "driver-cuda")]
 extern crate driver_cuda as _;
-#[cfg(feature = "driver-metal")]
-extern crate driver_metal as _;
 
 pub mod bootstrap;
 pub mod driver;

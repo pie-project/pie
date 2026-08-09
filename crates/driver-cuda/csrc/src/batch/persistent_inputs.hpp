@@ -23,7 +23,7 @@
 #include <cstdint>
 
 #include "device_buffer.hpp"
-#include "kernels/pack_dense_mask.hpp"
+#include "attn/pack_dense_mask.hpp"
 
 namespace pie_cuda_driver {
 
@@ -64,16 +64,16 @@ struct PersistentInputs {
     DeviceBuffer<std::uint32_t> mask_suffix_kv_page_indptr;
     DeviceBuffer<std::int32_t>  custom_mask_indptr;
     // Stable staging for a device-derived dense bool mask before
-    // `launch_pack_dense_mask` writes `custom_mask`. One byte per source bit;
+    // `kernels::attn::pack_dense_mask` writes `custom_mask`. One byte per source bit;
     // sized from the packed-mask budget at startup so graph-era fires never
     // allocate a transient source pointer.
     DeviceBuffer<std::uint8_t>  dense_mask;
     DeviceBuffer<std::uint32_t> structured_mask_klen;
-    DeviceBuffer<kernels::StructuredMaskParams> structured_masks;
+    DeviceBuffer<kernels::attn::StructuredMaskParams> structured_masks;
 
     // Explicit KV-write descriptor (device-geometry WSlot/WOff lowering, B2).
     // Per-lane physical page id + offset-in-page for the single new-token K/V
-    // write, consumed by `launch_write_kv_explicit_bf16` when a device-geometry
+    // write, consumed by `kernels::attn::write_kv_explicit_bf16` when a device-geometry
     // program binds the WSlot/WOff ports. Capacity = max_workspace_tokens
     // because prefill descriptors carry one target per token row.
     DeviceBuffer<std::uint32_t> w_page;

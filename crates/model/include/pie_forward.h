@@ -276,6 +276,21 @@ enum class PieForwardGuardPred : uint32_t {
   HasLora = 6,
 };
 
+/// Mirrors [`model_compiler::dsl::WeightRepr`]'s discriminants, flattened
+/// to the wire the way every enum here crosses: appended-only, and 0 is
+/// the reading a zero-initialized caller already meant.
+///
+/// The variant's PAYLOAD rides beside it (`proj_group`, `proj_axis`,
+/// `proj_zero_point`) rather than in a union, because C's tagged unions
+/// and this ABI's zero-init rule do not mix.
+enum class PieForwardWeightRepr : uint32_t {
+  Bf16 = 0,
+  ScaledPerTensor = 1,
+  ScaledPerChannel = 2,
+  ScaledPerGroup = 3,
+  Mxfp4Marlin = 4,
+};
+
 /// The llama_like facts, as C states them. Mirrors
 /// [`crate::families::llama_like::forward::facts::LlamaLikeFacts`] field for field.
 ///
@@ -389,7 +404,7 @@ struct PieForwardIdRange {
 /// both rest at 0 on every trace that predates them, so a pre-qwen3.5
 /// consumer reading only param0 still reads what it always did. A partial
 /// `Rope` (param1 != 0) rotates only the first param1 channels of each
-/// head (`launch_rope_partial_bf16`'s `rotary_dim`).
+/// head (`kernels::rope::rope_partial_bf16`'s `rotary_dim`).
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
@@ -424,6 +439,18 @@ struct PieForwardOp {
   /// operand ranges index — ids are just u32s; what a range means is
   /// the field's contract). Empty for every other kind.
   PieForwardIdRange aux_names;
+  /// `Launch` only: the stated kernel's SCALAR arguments — a rotary
+  /// width, a padded head dim — as a range of RAW VALUES in the flat
+  /// id array (the same array the operand ranges index; what a range
+  /// means is the field's contract, and `aux_names` above is the same
+  /// array read as NAME indices).
+  ///
+  /// A `Launch`'s two params are spoken for by the state mark, and a
+  /// scalar with nowhere to ride is a scalar the driver re-derives
+  /// from its config. Appended per the ABI discipline; pre-params
+  /// consumers read an empty range, which is what every statement
+  /// without one carries anyway.
+  PieForwardIdRange aux_params;
   /// Values consumed, in operand order.
   /// The op's role under the DEPTH axis ([`model_compiler::trace::DepthRole`]
   /// as wire values: 0 = none, 1 = windowed, 2 = prefix-plan-swap).
@@ -510,12 +537,38 @@ struct PieForwardLlamaLikeCudaFacts {
   /// non-zero is true. Appended field: existing zero-initialized C
   /// callers read as false.
   uint8_t head_dim_padded;
+  /// The head width the attention kernels run at, or 0 when that is
+  /// the logical one. See `LlamaLikeCudaFacts::head_dim_kernel`.
+  uint32_t head_dim_kernel;
   /// The checkpoint bound a packed gate‖up bank, so the MLP activation
   /// is the chunked swiglu over one buffer rather than the pair form
   /// over two. Appended field, same zero-init rule — and note the
   /// default is the UNFUSED form, which is the conservative one: it
   /// reads the two narrow buffers a decliner writes.
   uint8_t gate_up_fused;
+  /// How the linear projections are STORED
+  /// ([`PieForwardWeightRepr`]). Appended, and the zero-init rule is
+  /// what makes it safe: 0 is `Bf16`, the dense reading every caller
+  /// written before this field already meant.
+  uint32_t proj_repr;
+  /// The checkpoint carries zero-points beside the scales; non-zero is
+  /// true. Ignored unless `proj_repr` is one of the `Scaled` kinds.
+  uint8_t proj_zero_point;
+  /// Elements per scale under `PerGroup`; zero otherwise.
+  uint32_t proj_group;
+  /// Which axis `PerChannel` runs along. Zero — the output rows — for
+  /// every row-major `[N, K]` checkpoint this driver reads.
+  uint32_t proj_axis;
+  /// Ranks this deployment shards across (`tp_size`); 0 or 1 is a
+  /// single GPU. See `LlamaLikeCudaFacts::tp_size`.
+  uint32_t tp_size;
+  /// Rows below which an all-reduce takes the P2P kernel; 0 is
+  /// always-NCCL. See `LlamaLikeCudaFacts::all_reduce_p2p_max_rows`.
+  uint32_t all_reduce_p2p_max_rows;
+  /// The per-layer sliding window (`-1` for none), as a pointer and a
+  /// length. Null/0 is "no window". See `read_window_left`.
+  const int32_t *window_left;
+  uint32_t window_left_len;
 };
 
 /// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
@@ -659,6 +712,10 @@ struct PieForwardGemma4CudaFacts {
   /// The KV cache is native bf16, so the fused decode post may write
   /// pages directly.
   uint8_t kv_native_bf16;
+  /// The per-layer sliding window (`-1` for none), as a pointer and a
+  /// length. Null/0 is "no window". See `read_window_left`.
+  const int32_t *window_left;
+  uint32_t window_left_len;
 };
 
 /// gpt-oss's shape, as C states it. Mirrors [`crate::gpt_oss::forward::facts::GptOssFacts`]
@@ -699,6 +756,10 @@ struct PieForwardGptOssCudaFacts {
   /// `mxfp4_decode_max_routes`: the fused leg's admission threshold in
   /// ROUTES (`N * top_k`).
   uint32_t mxfp4_decode_max_routes;
+  /// The per-layer sliding window (`-1` for none), as a pointer and a
+  /// length. Null/0 is "no window". See `read_window_left`.
+  const int32_t *window_left;
+  uint32_t window_left_len;
 };
 
 /// The CUDA backend facts for a LOWERED qwen3_5 hybrid trace, as C
@@ -745,6 +806,17 @@ struct PieForwardQwen35CudaFacts {
   uint8_t moe_force_general;
   /// The dense MLP bound a packed gate_up bank.
   uint8_t gate_up_fused;
+  /// How the linear projections are STORED ([`PieForwardWeightRepr`]),
+  /// with the payload that rides beside it. Same wire shape and same
+  /// zero-init rule as [`PieForwardLlamaLikeCudaFacts`]'s four.
+  uint32_t proj_repr;
+  uint8_t proj_zero_point;
+  uint32_t proj_group;
+  uint32_t proj_axis;
+  /// The per-layer sliding window (`-1` for none), as a pointer and a
+  /// length. Null/0 is "no window". See `read_window_left`.
+  const int32_t *window_left;
+  uint32_t window_left_len;
 };
 
 /// One row of a fire as the engine's seriation ordered them — the input
@@ -866,6 +938,16 @@ struct PieForwardLowered {
   /// buffers without first being rewritten to walk rectangles.
   const size_t *value_offsets;
   size_t value_offsets_len;
+  /// For each value, the value that OWNS its bytes — see
+  /// `Lowered::value_owner`. Values sharing an owner share a buffer
+  /// and must be bound together.
+  const uint32_t *value_owners;
+  size_t value_owners_len;
+  /// The epilogue's two intermediates, as byte offsets into the
+  /// same arena — see `Buffers::epilogue_gather`. `SIZE_MAX` when
+  /// this fire needs neither.
+  size_t epilogue_gather;
+  size_t epilogue_norm;
   /// Non-zero when the fire could not be lowered; `launches` is then
   /// empty and the value says which rule refused.
   PieForwardUncovered uncovered;

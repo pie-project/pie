@@ -282,6 +282,20 @@ pub struct Lowered {
     /// been rewritten to walk rectangles — two migrations chained where
     /// one will do.
     pub value_offset: Vec<usize>,
+    /// For each value, the value that OWNS the bytes it lives in.
+    ///
+    /// Most values own their own; the exceptions are the constructs
+    /// whose meaning is that the output does not get memory of its own,
+    /// and they CHAIN — a residual stream is a run of in-place adds, all
+    /// one owner. A driver reading `value_offset` alone cannot tell two
+    /// chains that reuse a slot at different times apart from one chain;
+    /// this says which values must move together, and is what makes a
+    /// per-chain question askable at all.
+    pub value_owner: Vec<ValueId>,
+    /// The epilogue's two intermediates — see [`Buffers::epilogue_gather`].
+    /// `usize::MAX` when this fire needs neither.
+    pub epilogue_gather: usize,
+    pub epilogue_norm: usize,
     /// Every launch's operands, concatenated; [`Launch::args`] indexes
     /// it. Flat rather than per-launch so the whole frame is two arrays
     /// and a table — which is the shape a driver can walk without
@@ -351,6 +365,9 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Un
     };
     let arena_bytes = out.buffers.bytes;
     let value_offset = out.buffers.offset.clone();
+    let epilogue_gather = out.buffers.epilogue_gather;
+    let epilogue_norm = out.buffers.epilogue_norm;
+    let value_owner = alias_owners(plan);
     out.region(0..plan.ops.len(), 0..n)?;
     Ok(Lowered {
         rectangles: out.launches.len(),
@@ -358,6 +375,9 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Un
         kernels: out.kernels,
         arena_bytes,
         value_offset,
+        value_owner,
+        epilogue_gather,
+        epilogue_norm,
         args: out.args,
         structural: out.structural,
         residue: out.residue,
@@ -655,10 +675,10 @@ impl Lowerer<'_> {
         }
         let out = 0..sampled;
         if sampled < window.len() as u32 {
-            self.emit(at, "launch_gather_bf16_rows", op, &out)?;
+            self.emit(at, "layout::gather_bf16_rows", op, &out)?;
         }
-        self.emit(at, "launch_rmsnorm_bf16", op, &out)?;
-        self.emit(at, "gemm_act_x_w", op, &out)?;
+        self.emit(at, "norm::rmsnorm_bf16", op, &out)?;
+        self.emit(at, "gemm::act_x_w", op, &out)?;
         Ok(())
     }
 
@@ -808,9 +828,9 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // table kernel. Stating that bracket is what `seam!` is for.
         HookSite { .. } => Semantic::Structural,
 
-        Embed { .. } => Semantic::Kernels(&["launch_embed_bf16"]),
-        AddBias { .. } => Semantic::Kernels(&["launch_add_bias_bf16"]),
-        ResidualAdd => Semantic::Kernels(&["launch_residual_add_bf16"]),
+        Embed { .. } => Semantic::Kernels(&["layout::embed_bf16"]),
+        AddBias { .. } => Semantic::Kernels(&["norm::add_bias_bf16"]),
+        ResidualAdd => Semantic::Kernels(&["norm::residual_add_bf16"]),
 
         // The GDN and full-attention kinds. Each is ONE kernel with no
         // branch — no fact to read, no variant to dispatch on, nothing
@@ -821,10 +841,10 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // Their operand plumbing (the per-layer `la.*` scratch, the fp32
         // parameter banks) is the EMITTER's, exactly as it is for the
         // kinds above — naming the symbol is what the lowering owes.
-        GdnPrep { .. } => Semantic::Kernels(&["launch_qwen_gdn_post_conv_prep_bf16"]),
-        RmsnormGated { .. } => Semantic::Kernels(&["launch_rmsnorm_gated_fp32_in_bf16"]),
-        SplitQGate { .. } => Semantic::Kernels(&["launch_split_q_gate_bf16"]),
-        SigmoidGateMul => Semantic::Kernels(&["launch_sigmoid_gate_inplace_bf16"]),
+        GdnPrep { .. } => Semantic::Kernels(&["ssm::qwen_gdn_post_conv_prep_bf16"]),
+        RmsnormGated { .. } => Semantic::Kernels(&["norm::rmsnorm_gated_fp32_in_bf16"]),
+        SplitQGate { .. } => Semantic::Kernels(&["layout::split_q_gate_bf16"]),
+        SigmoidGateMul => Semantic::Kernels(&["mlp::sigmoid_gate_inplace_bf16"]),
 
         // Gemma folds `(1 + w)` — different arithmetic, so a different
         // kernel, but the same signature and the same row space. The
@@ -838,9 +858,9 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // both kinds fan onto the same pair.
         Rmsnorm { variant, .. } | RmsnormPerHead { variant, .. } => {
             Semantic::Kernels(if variant.is_plain() {
-                &["launch_rmsnorm_bf16"]
+                &["norm::rmsnorm_bf16"]
             } else {
-                &["launch_rmsnorm_gemma_bf16"]
+                &["norm::rmsnorm_gemma_bf16"]
             })
         }
 
@@ -849,9 +869,9 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // what asks for it, so the lowering states it rather than the
         // driver deriving it from a window pointer.
         SplitQkv { .. } => Semantic::Kernels(if peel_tail {
-            &["launch_split_qkv_bf16_devwin"]
+            &["attn::split_qkv_bf16_devwin"]
         } else {
-            &["launch_split_qkv_bf16"]
+            &["attn::split_qkv_bf16"]
         }),
 
         // Partial rope IS a different kernel, and the trace already says
@@ -863,9 +883,9 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
             if !matches!(kind, crate::trace::RopeKind::Standard) {
                 Semantic::Unlowered("only standard rope is emitted")
             } else if partial.is_some() {
-                Semantic::Kernels(&["launch_rope_partial_bf16"])
+                Semantic::Kernels(&["rope::rope_partial_bf16"])
             } else {
-                Semantic::Kernels(&["launch_rope_bf16"])
+                Semantic::Kernels(&["rope::rope_bf16"])
             }
         }
 
@@ -874,13 +894,13 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // shape, chosen per fire.
         Matmul { selector, .. } => {
             if selector.is_none() {
-                Semantic::Kernels(&["gemm_act_x_w"])
+                Semantic::Kernels(&["gemm::act_x_w"])
             } else {
                 // A selector makes the weight per-token, and the grouped
                 // GEMM is that op's lowering. It used to be a refusal
                 // because no text stated the kernel; `moe_mlp_body_cuda`'s
                 // general leg does now.
-                Semantic::Kernels(&["launch_moe_grouped_gemm_bf16"])
+                Semantic::Kernels(&["moe::moe_grouped_gemm_bf16"])
             }
         }
 
@@ -912,16 +932,16 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // The router. One launch, and the semantic reading takes the
         // softmax form -- a text that wants the sigmoid or sqrt-softplus
         // router states it as a `Launch` instead.
-        TopK { .. } => Semantic::Kernels(&["launch_topk_softmax_bf16"]),
+        TopK { .. } => Semantic::Kernels(&["moe::topk_softmax_bf16"]),
         // The combine, in its TOKEN-BATCHED form. The two other forms --
         // the per-expert scatter-add and the fused +residual -- are what a
         // CUDA text states as launches when its binding takes them; this
         // is the reading a SEMANTIC trace gets, the same way `Swiglu`'s
         // unpacked form is.
-        WeightedSum { .. } => Semantic::Kernels(&["launch_token_batched_weighted_sum_bf16"]),
+        WeightedSum { .. } => Semantic::Kernels(&["moe::token_batched_weighted_sum_bf16"]),
         // The shared expert's landing: `sigmoid(x·g)` scaling the shared
         // output onto the routed sum, one launch.
-        SigmoidGateAdd => Semantic::Kernels(&["launch_sigmoid_dot_scalar_gate_add_bf16"]),
+        SigmoidGateAdd => Semantic::Kernels(&["mlp::sigmoid_dot_scalar_gate_add_bf16"]),
 
         // Handled by `Lowerer::epilogue`, which needs the row counts and
         // so cannot answer from the kind alone.
@@ -1049,6 +1069,23 @@ pub struct Buffers {
     /// Value ids a seam statement exposes, which therefore may not be
     /// recycled under a name outside machinery cannot follow.
     pub pinned: Vec<ValueId>,
+    /// The epilogue's two intermediates, as byte offsets into the same
+    /// arena — [`Buffers::NAMED`] when this fire needs neither.
+    ///
+    /// These are the ONLY buffers here that belong to no traced value,
+    /// and the reason is that they belong to no traced STATEMENT either.
+    /// One `LmHead` lowers to a row gather, a norm and a GEMM, and
+    /// whether the gather runs at all is a fact about the FIRE's rows
+    /// (`Row::samples`), not about the text — so the text cannot name
+    /// what sits between them, and the lowering has to.
+    ///
+    /// Every CUDA executor reached for a workspace field here
+    /// (`ws.norm_y`, `ws.norm_x`), each with its own apologetic comment,
+    /// because the flat list handed all three rectangles the same
+    /// operand run: `(activation, logits)`, which is true of the GEMM
+    /// and of neither of the others.
+    pub epilogue_gather: usize,
+    pub epilogue_norm: usize,
 }
 
 impl Buffers {
@@ -1186,23 +1223,61 @@ impl Buffers {
                 size[out as usize] = want;
                 continue;
             }
-            // An IN-PLACE kernel writes over an operand, so its output
-            // is that operand's bytes — `kernel!`'s `in_place` says
-            // which. Giving it an allocation of its own would be a copy
+            // An IN-PLACE op writes over an operand, so its output is
+            // that operand's bytes. Giving it an allocation of its own
+            // would be a copy
             // the model does not make, and for a text that accumulates
             // into a `select` window it would be worse than wasteful:
             // the window would keep its pre-update value and the streams
             // would silently never see the add.
-            if let OpKind::Launch { kernel, .. } = &op.kind {
-                if let Some(idx) = crate::kernels::in_place_operand(plan, kernel) {
+            //
+            // Read from the SAME two tables `alias_owners` reads —
+            // the `kernel!` row for a stated symbol, the kind itself for
+            // a semantic one. They were not the same for a while: the
+            // owner table joined a semantic rope's operand and result
+            // while this loop, which only knew about `Launch`, handed
+            // the result a block of its own. Liveness then freed one
+            // buffer for what placement had made two, and the rotated k
+            // was written to an address nothing read.
+            {
+                let pairs = match &op.kind {
+                    OpKind::Launch { kernel, .. } => {
+                        crate::kernels::in_place_pairs(plan, kernel)
+                    }
+                    other => crate::kernels::semantic_in_place(other),
+                };
+                let mut aliased = false;
+                for &(o, i) in pairs {
+                    // A pair outside this statement's arity is not an
+                    // error: one symbol serves a q-only site and a q/k
+                    // pair, and the row states the widest form.
                     if let (Some(&src), Some(&out)) =
-                        (op.inputs.get(idx as usize), op.outputs.first())
+                        (op.inputs.get(i as usize), op.outputs.get(o as usize))
                     {
                         offset[out as usize] = offset[src as usize];
                         size[out as usize] =
                             value_bytes(plan, out, n_tokens, n_requests);
-                        continue;
+                        aliased = true;
                     }
+                }
+                if aliased {
+                    // Outputs this kernel does NOT write in place still
+                    // need buffers of their own.
+                    for (o, &v) in op.outputs.iter().enumerate() {
+                        if pairs.iter().any(|&(oi, _)| oi as usize == o) {
+                            continue;
+                        }
+                        if pinned.binary_search(&v).is_ok() {
+                            offset[v as usize] = Self::NAMED;
+                            continue;
+                        }
+                        let want = value_bytes(plan, v, n_tokens, n_requests);
+                        let at = take_block(&mut free, &mut used, want);
+                        offset[v as usize] = at;
+                        size[v as usize] = want;
+                        live.push(v);
+                    }
+                    continue;
                 }
             }
             for &v in &op.outputs {
@@ -1214,54 +1289,79 @@ impl Buffers {
                     continue;
                 }
                 let want = value_bytes(plan, v, n_tokens, n_requests);
-                // BEST fit, and SPLIT the remainder back.
-                //
-                // First-fit-and-keep-the-whole-block was costing 4-15x
-                // at the fire shape that sizes the driver's activation
-                // block (`arena_soundness.rs` prices it per family): a
-                // freed logits-sized block satisfying a one-row norm
-                // retired the rest of itself, so the walk bump-allocated
-                // almost everything. It read as cheap because the ratio
-                // had been measured on an eight-row all-sampled fire,
-                // where the logits dominate the arena AND the floor and
-                // the loss hides inside both.
-                let at = match free
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, block)| block.1 >= want)
-                    .min_by_key(|(_, block)| block.1)
-                    .map(|(i, _)| i)
-                {
-                    Some(f) => {
-                        let (off, size_of) = free.remove(f);
-                        // The tail keeps the block's alignment, so a
-                        // split never hands out an address the bump path
-                        // would not have.
-                        let tail = (off + want).div_ceil(256) * 256;
-                        if tail < off + size_of {
-                            insert_free(&mut free, (tail, off + size_of - tail));
-                        }
-                        off
-                    }
-                    None => {
-                        // 256-byte alignment, and BUMP only: a decode
-                        // body runs inside a capture, so the same plan
-                        // must land the same value at the same address
-                        // on every fire.
-                        let at = used.div_ceil(256) * 256;
-                        used = at + want;
-                        at
-                    }
-                };
+                let at = take_block(&mut free, &mut used, want);
                 offset[v as usize] = at;
                 size[v as usize] = want;
                 live.push(v);
             }
         }
+        // The epilogue's scratch, sized from the statement it serves.
+        // Allocated LAST and never freed: it is live across the three
+        // rectangles that make up one statement, and nothing else in
+        // the fire runs between them.
+        let mut epilogue_gather = Self::NAMED;
+        let mut epilogue_norm = Self::NAMED;
+        for op in &plan.ops {
+            if !matches!(op.kind, OpKind::LmHead { .. }) {
+                continue;
+            }
+            let Some(&input) = op.inputs.first() else { continue };
+            let width = value_bytes(plan, input, 1, 1);
+            let sampled = rows.iter().filter(|r| r.samples).count().max(1);
+            let want = width * sampled;
+            if want == 0 {
+                continue;
+            }
+            epilogue_gather = take_block(&mut free, &mut used, want);
+            epilogue_norm = take_block(&mut free, &mut used, want);
+            break;
+        }
+
         Buffers {
             offset,
             bytes: used,
             pinned,
+            epilogue_gather,
+            epilogue_norm,
+        }
+    }
+}
+
+/// Take `want` bytes from the pool, or bump.
+///
+/// BEST fit, and SPLIT the remainder back. First-fit-and-keep-the-whole-
+/// block was costing 4-15x at the fire shape that sizes the driver's
+/// activation block (`arena_soundness.rs` prices it per family): a freed
+/// logits-sized block satisfying a one-row norm retired the rest of
+/// itself, so the walk bump-allocated almost everything. It read as
+/// cheap because the ratio had been measured on an eight-row
+/// all-sampled fire, where the logits dominate the arena AND the floor
+/// and the loss hides inside both.
+fn take_block(free: &mut Vec<(usize, usize)>, used: &mut usize, want: usize) -> usize {
+    match free
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.1 >= want)
+        .min_by_key(|(_, block)| block.1)
+        .map(|(i, _)| i)
+    {
+        Some(f) => {
+            let (off, size_of) = free.remove(f);
+            // The tail keeps the block's alignment, so a split never
+            // hands out an address the bump path would not have.
+            let tail = (off + want).div_ceil(256) * 256;
+            if tail < off + size_of {
+                insert_free(free, (tail, off + size_of - tail));
+            }
+            off
+        }
+        None => {
+            // 256-byte alignment, and BUMP only: a decode body runs
+            // inside a capture, so the same plan must land the same
+            // value at the same address on every fire.
+            let at = used.div_ceil(256) * 256;
+            *used = at + want;
+            at
         }
     }
 }
@@ -1294,18 +1394,20 @@ fn insert_free(free: &mut Vec<(usize, usize)>, block: (usize, usize)) {
 
 /// For each value, the value that OWNS the bytes it lives in.
 ///
-/// Most values own their own. The exceptions are the two constructs
+/// Most values own their own. The exceptions are the three constructs
 /// whose meaning is that the output does not get memory of its own: a
-/// [`OpKind::Select`] output is a window of its operand, and a launcher
-/// the `kernel!` table marks in-place writes over the operand it
-/// accumulates into. Both chain — a residual stream is a run of in-place
-/// adds — so this is a union-find, and the owner is always the EARLIER
-/// value, i.e. the one whose allocation the rest inherit.
+/// [`OpKind::Select`] output is a window of its operand; a launcher the
+/// `kernel!` table marks in-place writes over the operand it
+/// accumulates into; and a semantic kind that rewrites its operand says
+/// so through [`crate::kernels::semantic_in_place`]. All chain — a
+/// residual stream is a run of in-place adds — so this is a union-find,
+/// and the owner is always the EARLIER value, i.e. the one whose
+/// allocation the rest inherit.
 ///
 /// Buffer assignment needs this in two places: the live range of a
 /// shared buffer is the union's, not any one member's, and only the
 /// owner may return those bytes to the free pool.
-fn alias_owners(plan: &ForwardPlan) -> Vec<ValueId> {
+pub(crate) fn alias_owners(plan: &ForwardPlan) -> Vec<ValueId> {
     let mut owner: Vec<ValueId> = (0..plan.values.len() as ValueId).collect();
 
     fn find(owner: &mut [ValueId], v: ValueId) -> ValueId {
@@ -1319,25 +1421,39 @@ fn alias_owners(plan: &ForwardPlan) -> Vec<ValueId> {
     }
 
     for op in &plan.ops {
-        let joined = match &op.kind {
-            OpKind::Select { .. } => op.inputs.first().copied(),
-            OpKind::Launch { kernel, .. } => crate::kernels::in_place_operand(plan, kernel)
-                .and_then(|idx| op.inputs.get(idx as usize).copied()),
-            _ => None,
+        let joined: Vec<(ValueId, ValueId)> = match &op.kind {
+            OpKind::Select { .. } => match (op.inputs.first(), op.outputs.first()) {
+                (Some(&src), Some(&out)) => vec![(src, out)],
+                _ => Vec::new(),
+            },
+            OpKind::Launch { kernel, .. } => crate::kernels::in_place_pairs(plan, kernel)
+                .iter()
+                .filter_map(|&(o, i)| {
+                    Some((*op.inputs.get(i as usize)?, *op.outputs.get(o as usize)?))
+                })
+                .collect(),
+            // The kinds that name no kernel but still write over their
+            // operand — see `kernels::semantic_in_place`. Read the same
+            // way as the table's, because it is the same fact.
+            other => crate::kernels::semantic_in_place(other)
+                .iter()
+                .filter_map(|&(o, i)| {
+                    Some((*op.inputs.get(i as usize)?, *op.outputs.get(o as usize)?))
+                })
+                .collect(),
         };
-        let (Some(src), Some(&out)) = (joined, op.outputs.first()) else {
-            continue;
-        };
-        if src as usize >= owner.len() || out as usize >= owner.len() {
-            continue;
-        }
-        let (a, b) = (find(&mut owner, src), find(&mut owner, out));
-        if a != b {
-            // The earlier value keeps the allocation; SSA numbering makes
-            // "earlier" and "smaller id" the same thing, and the ops are
-            // walked in order anyway.
-            let (keep, drop) = if a <= b { (a, b) } else { (b, a) };
-            owner[drop as usize] = keep;
+        for (src, out) in joined {
+            if src as usize >= owner.len() || out as usize >= owner.len() {
+                continue;
+            }
+            let (a, b) = (find(&mut owner, src), find(&mut owner, out));
+            if a != b {
+                // The earlier value keeps the allocation; SSA numbering
+                // makes "earlier" and "smaller id" the same thing, and
+                // the ops are walked in order anyway.
+                let (keep, drop) = if a <= b { (a, b) } else { (b, a) };
+                owner[drop as usize] = keep;
+            }
         }
     }
     for v in 0..owner.len() {

@@ -33,7 +33,7 @@
 #include "pipeline/grouped_copy.hpp"
 #include "pipeline/library_region.hpp"
 #include "pipeline/program_runtime.hpp"
-#include "pipeline/tier0/tier0_kernels.cuh"
+#include "ptir/tier0.cuh"
 
 namespace pie_cuda_driver::pipeline {
 
@@ -397,7 +397,7 @@ static __global__ void k_materialize_bf16_rows(
     }
 }
 
-// Value accessor for `t0_block_topk_fast`: a grouped top_k row is either a
+// Value accessor for `kernels::ptir::t0_block_topk_fast`: a grouped top_k row is either a
 // plain float span or a BF16 read-out that has to be decoded per element.
 struct GroupedTopkValue {
     const float* source;
@@ -435,14 +435,14 @@ static __global__ void k_grouped_topk(
     GroupedRowShape row_shape,
     std::uint32_t vocab,
     std::uint8_t input_kind) {
-    __shared__ float shared_values[kTier0Block];
-    __shared__ std::uint32_t shared_indices[kTier0Block];
-    __shared__ std::uint8_t shared_nan[kTier0Block];
+    __shared__ float shared_values[kernels::ptir::kTier0Block];
+    __shared__ std::uint32_t shared_indices[kernels::ptir::kTier0Block];
+    __shared__ std::uint8_t shared_nan[kernels::ptir::kTier0Block];
     __shared__ float previous_value;
     __shared__ std::uint32_t previous_index;
     __shared__ std::uint8_t previous_nan;
     __shared__ std::uint8_t previous_valid;
-    __shared__ std::uint64_t shared_pair[kTopkFastMaxK];
+    __shared__ std::uint64_t shared_pair[kernels::ptir::kTopkFastMaxK];
     __shared__ std::uint32_t shared_hist[256];
     __shared__ std::uint32_t shared_state[2];
     __shared__ std::uint32_t shared_count;
@@ -481,7 +481,7 @@ static __global__ void k_grouped_topk(
     const GroupedTopkValue value_of{
         source, lanes, mtp_rows, mtp_offsets, lane,
         static_cast<std::uint64_t>(row) * len, vocab, input_kind};
-    if (t0_block_topk_fast(value_of, len, k, output_value, output_index,
+    if (kernels::ptir::t0_block_topk_fast(value_of, len, k, output_value, output_index,
                            shared_pair, shared_hist, shared_state,
                            &shared_count)) {
         return;
@@ -512,12 +512,12 @@ static __global__ void k_grouped_topk(
             const bool value_nan = isnan(value);
             const bool available =
                 !prior_valid ||
-                t0_desc_before(
+                kernels::ptir::t0_desc_before(
                     prior_value, prior_index, prior_nan,
                     value, index, value_nan);
             if (available &&
                 (best_index == UINT32_MAX ||
-                 t0_desc_before(
+                 kernels::ptir::t0_desc_before(
                      value, index, value_nan,
                      best, best_index, best_nan))) {
                 best = value;
@@ -536,7 +536,7 @@ static __global__ void k_grouped_topk(
                     shared_indices[threadIdx.x + stride];
                 if (other_index != UINT32_MAX &&
                     (shared_indices[threadIdx.x] == UINT32_MAX ||
-                     t0_desc_before(
+                     kernels::ptir::t0_desc_before(
                          shared_values[threadIdx.x + stride],
                          other_index,
                          shared_nan[threadIdx.x + stride] != 0,
@@ -573,21 +573,21 @@ __device__ __forceinline__ void grouped_nucleus_reduce(
     const float* source,
     std::uint32_t len,
     std::uint8_t logits_kind,
-    RedKind kind,
+    kernels::ptir::RedKind kind,
     bool exponentials,
     float maximum,
     float logit_scale,
-    float levels[kCanonicalReduceLevels][kCanonicalReduceWidth],
-    float tile[kCanonicalReduceWidth],
-    std::uint32_t counts[kCanonicalReduceLevels],
+    float levels[kernels::ptir::kCanonicalReduceLevels][kernels::ptir::kCanonicalReduceWidth],
+    float tile[kernels::ptir::kCanonicalReduceWidth],
+    std::uint32_t counts[kernels::ptir::kCanonicalReduceLevels],
     float* result) {
     const std::uint32_t thread_lane = threadIdx.x;
-    if (thread_lane < kCanonicalReduceLevels) counts[thread_lane] = 0;
+    if (thread_lane < kernels::ptir::kCanonicalReduceLevels) counts[thread_lane] = 0;
     __syncwarp();
     for (std::uint32_t base = 0; base < len;
-         base += kCanonicalReduceWidth) {
+         base += kernels::ptir::kCanonicalReduceWidth) {
         const std::uint32_t index = base + thread_lane;
-        float value = red_identity<float>(kind);
+        float value = kernels::ptir::red_identity<float>(kind);
         if (index < len) {
             value = logits_kind == 0
                 ? source[index]
@@ -600,19 +600,19 @@ __device__ __forceinline__ void grouped_nucleus_reduce(
         }
         tile[thread_lane] = value;
         const std::uint32_t tile_count =
-            len - base < kCanonicalReduceWidth
+            len - base < kernels::ptir::kCanonicalReduceWidth
                 ? len - base
-                : kCanonicalReduceWidth;
-        const float partial = reduce_canonical_slot(
+                : kernels::ptir::kCanonicalReduceWidth;
+        const float partial = kernels::ptir::reduce_canonical_slot(
             tile, thread_lane, tile_count, kind);
         if (thread_lane == 0) levels[0][counts[0]++] = partial;
         __syncwarp();
         for (std::uint32_t level = 0;
-             level + 1 < kCanonicalReduceLevels;
+             level + 1 < kernels::ptir::kCanonicalReduceLevels;
              ++level) {
-            if (counts[level] != kCanonicalReduceWidth) break;
-            const float carry = reduce_canonical_slot(
-                levels[level], thread_lane, kCanonicalReduceWidth, kind);
+            if (counts[level] != kernels::ptir::kCanonicalReduceWidth) break;
+            const float carry = kernels::ptir::reduce_canonical_slot(
+                levels[level], thread_lane, kernels::ptir::kCanonicalReduceWidth, kind);
             if (thread_lane == 0) {
                 counts[level] = 0;
                 levels[level + 1][counts[level + 1]++] = carry;
@@ -621,13 +621,13 @@ __device__ __forceinline__ void grouped_nucleus_reduce(
         }
     }
     for (std::uint32_t level = 0;
-         level + 1 < kCanonicalReduceLevels;
+         level + 1 < kernels::ptir::kCanonicalReduceLevels;
          ++level) {
         const std::uint32_t count = counts[level];
         if (count == 0) continue;
         bool higher = false;
         for (std::uint32_t next = level + 1;
-             next < kCanonicalReduceLevels;
+             next < kernels::ptir::kCanonicalReduceLevels;
              ++next) {
             higher = higher || counts[next] != 0;
         }
@@ -636,7 +636,7 @@ __device__ __forceinline__ void grouped_nucleus_reduce(
             __syncwarp();
             return;
         }
-        const float carry = reduce_canonical_slot(
+        const float carry = kernels::ptir::reduce_canonical_slot(
             levels[level], thread_lane, count, kind);
         if (thread_lane == 0) {
             counts[level] = 0;
@@ -645,9 +645,9 @@ __device__ __forceinline__ void grouped_nucleus_reduce(
         __syncwarp();
     }
     if (thread_lane == 0) {
-        *result = counts[kCanonicalReduceLevels - 1] == 0
-            ? red_identity<float>(kind)
-            : levels[kCanonicalReduceLevels - 1][0];
+        *result = counts[kernels::ptir::kCanonicalReduceLevels - 1] == 0
+            ? kernels::ptir::red_identity<float>(kind)
+            : levels[kernels::ptir::kCanonicalReduceLevels - 1][0];
     }
     __syncwarp();
 }
@@ -708,7 +708,7 @@ static __global__ void k_grouped_nucleus_max_chunks(
         : nullptr;
     const float logit_scale = grouped_nucleus_logit_scale(
         values, value_count, lane, row, launch);
-    float local_max = t0_neg_inf();
+    float local_max = kernels::ptir::t0_neg_inf();
     for (std::uint32_t index =
              chunk * blockDim.x + threadIdx.x;
          index < launch.len;
@@ -751,7 +751,7 @@ static __global__ void k_grouped_nucleus_weight_chunks(
         *grouped_commit(lanes, lane) == 0) {
         return;
     }
-    float maximum = t0_neg_inf();
+    float maximum = kernels::ptir::t0_neg_inf();
     for (std::uint32_t part = 0;
          part < kFastNucleusChunks;
          ++part) {
@@ -868,7 +868,7 @@ static __global__ void k_grouped_nucleus_inverse_sample(
         if (threadIdx.x == 0) {
             candidate_index = UINT32_MAX;
             owner_thread = UINT32_MAX;
-            const float target = t0_hash_uniform(
+            const float target = kernels::ptir::t0_hash_uniform(
                 seed64,
                 static_cast<int>(
                     static_cast<std::uint64_t>(row) * kMaxAttempts +
@@ -956,7 +956,7 @@ static __global__ void k_grouped_nucleus_inverse_sample(
         __syncthreads();
     }
     if (done == 0) {
-        NucleusCandidate best{t0_neg_inf(), 0, 0};
+        NucleusCandidate best{kernels::ptir::t0_neg_inf(), 0, 0};
         for (std::uint32_t index = threadIdx.x; index < launch.len;
              index += blockDim.x) {
             const float probability = row_weights[index];
@@ -996,13 +996,13 @@ static __global__ void k_grouped_nucleus_sample(
     const std::uint64_t* values,
     std::uint32_t value_count,
     GroupedNucleusLaunch launch) {
-    __shared__ float levels[kCanonicalReduceLevels][kCanonicalReduceWidth];
-    __shared__ float tile[kCanonicalReduceWidth];
-    __shared__ std::uint32_t counts[kCanonicalReduceLevels];
-    __shared__ float candidates[kCanonicalReduceWidth];
-    __shared__ std::uint32_t candidate_indices[kCanonicalReduceWidth];
-    __shared__ std::uint8_t candidate_nan[kCanonicalReduceWidth];
-    __shared__ std::uint8_t candidate_have[kCanonicalReduceWidth];
+    __shared__ float levels[kernels::ptir::kCanonicalReduceLevels][kernels::ptir::kCanonicalReduceWidth];
+    __shared__ float tile[kernels::ptir::kCanonicalReduceWidth];
+    __shared__ std::uint32_t counts[kernels::ptir::kCanonicalReduceLevels];
+    __shared__ float candidates[kernels::ptir::kCanonicalReduceWidth];
+    __shared__ std::uint32_t candidate_indices[kernels::ptir::kCanonicalReduceWidth];
+    __shared__ std::uint8_t candidate_nan[kernels::ptir::kCanonicalReduceWidth];
+    __shared__ std::uint8_t candidate_have[kernels::ptir::kCanonicalReduceWidth];
     __shared__ float maximum;
     __shared__ float sum;
     __shared__ float previous_value;
@@ -1028,12 +1028,12 @@ static __global__ void k_grouped_nucleus_sample(
         values, value_count, lane, row, launch);
     grouped_nucleus_reduce(
         lanes, mtp_rows, mtp_offsets, lane, row, logits, launch.len,
-        launch.logits_kind, RedKind::Max, false, 0.0f,
+        launch.logits_kind, kernels::ptir::RedKind::Max, false, 0.0f,
         logit_scale,
         levels, tile, counts, &maximum);
     grouped_nucleus_reduce(
         lanes, mtp_rows, mtp_offsets, lane, row, logits, launch.len,
-        launch.logits_kind, RedKind::Sum, true, maximum,
+        launch.logits_kind, kernels::ptir::RedKind::Sum, true, maximum,
         logit_scale,
         levels, tile, counts, &sum);
 
@@ -1041,7 +1041,7 @@ static __global__ void k_grouped_nucleus_sample(
         values, value_count, lane, launch.top_p)[
         launch.top_p_numel <= 1 ? 0 : row];
     if (threadIdx.x == 0) {
-        previous_value = t0_pos_inf();
+        previous_value = kernels::ptir::t0_pos_inf();
         previous_index = 0;
         previous_nan = 0;
         exclusive_mass = 0.0f;
@@ -1056,7 +1056,7 @@ static __global__ void k_grouped_nucleus_sample(
         std::uint32_t best_index = none;
         bool best_nan = false;
         for (std::uint32_t index = threadIdx.x; index < launch.len;
-             index += kCanonicalReduceWidth) {
+             index += kernels::ptir::kCanonicalReduceWidth) {
             const float logit = (launch.logits_kind == 0
                 ? logits[index]
                 : grouped_direct_bf16_load(
@@ -1066,13 +1066,13 @@ static __global__ void k_grouped_nucleus_sample(
             const float probability = expf(logit - maximum) / sum;
             const bool probability_nan = isnan(probability);
             if (selected_any != 0 &&
-                !t0_desc_before(
+                !kernels::ptir::t0_desc_before(
                     previous_value, previous_index, previous_nan != 0,
                     probability, index, probability_nan)) {
                 continue;
             }
             if (best_index == none ||
-                t0_desc_before(
+                kernels::ptir::t0_desc_before(
                     probability, index, probability_nan,
                     best, best_index, best_nan)) {
                 best = probability;
@@ -1084,7 +1084,7 @@ static __global__ void k_grouped_nucleus_sample(
         candidate_indices[threadIdx.x] = best_index;
         candidate_nan[threadIdx.x] = best_nan;
         __syncwarp();
-        for (std::uint32_t offset = kCanonicalReduceWidth / 2;
+        for (std::uint32_t offset = kernels::ptir::kCanonicalReduceWidth / 2;
              offset > 0;
              offset >>= 1) {
             if (threadIdx.x < offset) {
@@ -1092,7 +1092,7 @@ static __global__ void k_grouped_nucleus_sample(
                     candidate_indices[threadIdx.x + offset];
                 if (other != none &&
                     (candidate_indices[threadIdx.x] == none ||
-                     t0_desc_before(
+                     kernels::ptir::t0_desc_before(
                          candidates[threadIdx.x + offset], other,
                          candidate_nan[threadIdx.x + offset] != 0,
                          candidates[threadIdx.x],
@@ -1125,11 +1125,11 @@ static __global__ void k_grouped_nucleus_sample(
         values, value_count, lane, launch.rng_state);
     const unsigned long long seed64 =
         ptir_rng_keyed_seed(state[0], state[1]);
-    float best_score = t0_neg_inf();
+    float best_score = kernels::ptir::t0_neg_inf();
     std::uint32_t best_token = 0;
     bool have = false;
     for (std::uint32_t index = threadIdx.x; index < launch.len;
-         index += kCanonicalReduceWidth) {
+         index += kernels::ptir::kCanonicalReduceWidth) {
         const float logit = (launch.logits_kind == 0
             ? logits[index]
             : grouped_direct_bf16_load(
@@ -1141,15 +1141,15 @@ static __global__ void k_grouped_nucleus_sample(
         const bool selected =
             selected_any != 0 &&
             (index == previous_index ||
-             t0_desc_before(
+             kernels::ptir::t0_desc_before(
                  probability, index, probability_nan,
                  previous_value, previous_index, previous_nan != 0));
-        const float uniform = t0_hash_uniform(
+        const float uniform = kernels::ptir::t0_hash_uniform(
             seed64, static_cast<int>(
                 static_cast<std::uint64_t>(row) * launch.len + index));
         const float noise = -logf(-logf(uniform));
         const float score =
-            (selected ? logit : t0_neg_inf()) + noise;
+            (selected ? logit : kernels::ptir::t0_neg_inf()) + noise;
         if (!isnan(score) &&
             (!have || score > best_score ||
              (score == best_score && index < best_token))) {
@@ -1162,7 +1162,7 @@ static __global__ void k_grouped_nucleus_sample(
     candidate_indices[threadIdx.x] = best_token;
     candidate_have[threadIdx.x] = have;
     __syncwarp();
-    for (std::uint32_t offset = kCanonicalReduceWidth / 2;
+    for (std::uint32_t offset = kernels::ptir::kCanonicalReduceWidth / 2;
          offset > 0;
          offset >>= 1) {
         if (threadIdx.x < offset) {
@@ -1203,7 +1203,7 @@ inline std::uint32_t grouped_grid(std::uint64_t total) {
         std::max<std::uint64_t>(
             1,
             std::min<std::uint64_t>(
-                (total + kTier0Block - 1) / kTier0Block, 65535)));
+                (total + kernels::ptir::kTier0Block - 1) / kernels::ptir::kTier0Block, 65535)));
 }
 
 inline std::size_t grouped_dtype_size(std::uint8_t dtype) {

@@ -14,17 +14,17 @@
 // host with no reference kernel to trust. The weights go through the REAL
 // repack chain the loader uses (`transcode_engine.hpp:1328-1336`):
 //
-//     raw MXFP4 --launch_mxfp4_weight_to_gptq_w4--> GPTQ staging
+//     raw MXFP4 --kernels::quant::mxfp4_weight_to_gptq_w4--> GPTQ staging
 //               --launch_gptq_repack_w4_no_perm--> Marlin tiles
-//     raw E8M0  --launch_mxfp4_scales_to_marlin_e8m0--> Marlin scales
+//     raw E8M0  --kernels::quant::mxfp4_scales_to_marlin_e8m0--> Marlin scales
 //
 // Build (~40 s):
 //   nvcc -O3 -std=c++20 -arch=sm_80 --expt-relaxed-constexpr \
 //        -I driver/cuda/src -I driver/cuda/third_party/marlin_moe \
 //        -I driver/cuda/third_party/marlin \
 //        -o /tmp/marlin_verify driver/cuda/bench/marlin_moe_verify.cu \
-//        driver/cuda/src/kernels/mxfp4_marlin.cu \
-//        driver/cuda/src/kernels/moe_dispatch.cu \
+//        driver/cuda/src/quant/mxfp4_marlin.cu \
+//        driver/cuda/src/moe/moe_dispatch.cu \
 //        driver/cuda/third_party/marlin_moe/ops.cu \
 //        driver/cuda/third_party/marlin_moe/marlin_moe_wrapper.cpp \
 //        driver/cuda/third_party/marlin/gptq_marlin_repack.cu \
@@ -43,8 +43,8 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-#include "kernels/mxfp4_marlin.hpp"
-#include "kernels/moe_dispatch.hpp"
+#include "quant/mxfp4_marlin.hpp"
+#include "moe/moe_dispatch.hpp"
 #include "marlin_moe_wrapper.hpp"
 
 // Declared rather than pulled in via `marlin_wrapper.hpp`: that header's other
@@ -109,10 +109,10 @@ int main(int argc, char** argv) {
     const int K     = argc > 3 ? std::atoi(argv[3]) : 256;   // reduction dim
     const int E     = argc > 4 ? std::atoi(argv[4]) : 1;     // experts
     const int top_k = argc > 5 ? std::atoi(argv[5]) : 1;
-    // scale_mode 0 = the loader's repack (launch_mxfp4_scales_to_marlin_e8m0,
+    // scale_mode 0 = the loader's repack (kernels::quant::mxfp4_scales_to_marlin_e8m0,
     // which applies Marlin's 64-wide + 4-lane permutation).
     // scale_mode 1 = a PLAIN [N, groups] -> [groups, N] transpose, which is
-    // what `launch_transpose_expert_scales_u8` does at runtime in
+    // what `kernels::moe::transpose_expert_scales_u8` does at runtime in
     // mixtral.cpp. If 0 passes and 1 fails, the runtime path is feeding
     // Marlin unpermuted scales and that is the gpt-oss native bug.
     const int scale_mode = argc > 6 ? std::atoi(argv[6]) : 0;
@@ -229,30 +229,30 @@ int main(int argc, char** argv) {
     void* d_marl_s = dalloc(std::size_t(E) * marl_s_stride);
 
     for (int e = 0; e < E; ++e) {
-        kernels::launch_mxfp4_weight_to_gptq_w4(
+        kernels::quant::mxfp4_weight_to_gptq_w4(
             static_cast<const std::uint8_t*>(d_raw_w) + e * w_stride, d_gptq,
             /*source_rows=*/N, /*source_row_offset=*/0,
             /*selected_rows=*/N, /*valid_rows=*/N, /*source_stride_k=*/K,
             /*source_col_offset=*/0, /*source_k=*/K, /*target_k=*/K,
-            kernels::Mxfp4RowSelect::Identity, /*stream=*/0);
+            kernels::quant::Mxfp4RowSelect::Identity, /*stream=*/0);
         ::marlin::pie_gptq_marlin_repack_w4_no_perm(
             static_cast<const std::uint32_t*>(d_gptq),
             reinterpret_cast<std::uint32_t*>(
                 static_cast<std::uint8_t*>(d_marl_w) + e * marl_w_stride),
             /*size_k=*/K, /*size_n=*/N, /*stream=*/0);
         if (scale_mode == 0) {
-            kernels::launch_mxfp4_scales_to_marlin_e8m0(
+            kernels::quant::mxfp4_scales_to_marlin_e8m0(
                 static_cast<const std::uint8_t*>(d_raw_s) + e * s_stride,
                 static_cast<std::uint8_t*>(d_marl_s) + e * marl_s_stride,
                 /*source_rows=*/N, /*source_row_offset=*/0,
                 /*selected_rows=*/N, /*valid_rows=*/N,
                 /*source_stride_groups=*/groups,
                 /*source_group_offset=*/0, /*source_groups=*/groups,
-                /*target_groups=*/groups, kernels::Mxfp4RowSelect::Identity,
+                /*target_groups=*/groups, kernels::quant::Mxfp4RowSelect::Identity,
                 /*stream=*/0);
         } else if (scale_mode == 1) {
             // Plain [N, groups] -> [groups, N], no Marlin lane permutation --
-            // the shape `launch_transpose_expert_scales_u8` produces.
+            // the shape `kernels::moe::transpose_expert_scales_u8` produces.
             std::vector<std::uint8_t> t(marl_s_stride);
             for (int n = 0; n < N; ++n)
                 for (int g = 0; g < groups; ++g)
@@ -266,13 +266,13 @@ int main(int argc, char** argv) {
             // transposes it AGAIN believing the label. If mode 0 passes and
             // this fails, that double transform is the gpt-oss native bug.
             void* tmp = dalloc(marl_s_stride);
-            kernels::launch_mxfp4_scales_to_marlin_e8m0(
+            kernels::quant::mxfp4_scales_to_marlin_e8m0(
                 static_cast<const std::uint8_t*>(d_raw_s) + e * s_stride, tmp,
                 /*source_rows=*/N, /*source_row_offset=*/0,
                 /*selected_rows=*/N, /*valid_rows=*/N,
                 /*source_stride_groups=*/groups,
                 /*source_group_offset=*/0, /*source_groups=*/groups,
-                /*target_groups=*/groups, kernels::Mxfp4RowSelect::Identity,
+                /*target_groups=*/groups, kernels::quant::Mxfp4RowSelect::Identity,
                 /*stream=*/0);
             CHECK(cudaDeviceSynchronize());
             std::vector<std::uint8_t> packed(marl_s_stride), t(marl_s_stride);
@@ -294,7 +294,7 @@ int main(int argc, char** argv) {
     void* d_sorted  = dalloc(std::size_t(max_blocks) * block * 4);
     void* d_experts = dalloc(std::size_t(max_blocks) * 4);
     void* d_npast   = dalloc(sizeof(std::int32_t));
-    kernels::launch_moe_align_decode(
+    kernels::moe::moe_align_decode(
         static_cast<const std::int32_t*>(d_topk),
         static_cast<std::int32_t*>(d_sorted),
         static_cast<std::int32_t*>(d_experts), nullptr, routes, E, block,

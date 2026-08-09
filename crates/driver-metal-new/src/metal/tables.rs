@@ -58,6 +58,16 @@ pub struct Tables {
     /// were set nor what they hold, and an entry that was never written reads
     /// as address zero -- which a kernel dereferences like any other.
     bound: BTreeMap<u32, u32>,
+    /// What was written, kept beside the mask rather than in place of it.
+    ///
+    /// The mask alone answers "was this wired up", which is what a coverage
+    /// test over the DAG asks. It cannot answer "is it wired up to the right
+    /// thing", and that is the failure that actually happens: two ordinals
+    /// that should share a residual buffer are each bound to something, both
+    /// report bound, and the model produces plausible garbage. Zero is not
+    /// usable as the "never written" sentinel here because zero is also what
+    /// an unwritten Metal entry reads as -- hence a mask AND a value.
+    addresses: BTreeMap<u32, [u64; MAX_BINDINGS]>,
 }
 
 impl Tables {
@@ -105,6 +115,9 @@ impl Tables {
         table.bind_address(index, address)?;
         // `index` is below MAX_BINDINGS, which is 31, so the shift is in range.
         *self.bound.entry(ordinal).or_default() |= 1u32 << index;
+        self.addresses
+            .entry(ordinal)
+            .or_insert_with(|| [0; MAX_BINDINGS])[index] = address;
         Ok(())
     }
 
@@ -125,6 +138,20 @@ impl Tables {
                  previous one's addresses"
             ),
         })
+    }
+
+    /// The address written at `index` of `ordinal`, or `None` if none was.
+    ///
+    /// `None` and `Some(0)` are different answers and the distinction is the
+    /// reason this returns an `Option`: an entry nobody bound reads as zero
+    /// from Metal, so a bare `u64` would report "never wired" and "wired to
+    /// a null address" identically.
+    #[must_use]
+    pub fn address(&self, ordinal: u32, index: usize) -> Option<u64> {
+        if !self.is_bound(ordinal, index) {
+            return None;
+        }
+        self.addresses.get(&ordinal).map(|slots| slots[index])
     }
 
     /// Whether `index` of `ordinal` has had an address written to it.
@@ -149,6 +176,7 @@ impl Tables {
     /// Its addresses go with it, which is the point: a graph that is rebuilt
     /// must not inherit a stale binding from the one before.
     pub fn forget(&mut self, ordinal: u32) -> bool {
+        self.addresses.remove(&ordinal);
         self.bound.remove(&ordinal);
         self.tables.remove(&ordinal).is_some()
     }

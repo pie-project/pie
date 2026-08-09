@@ -39,6 +39,10 @@ include = [
     # Guard predicates cross in `Guard.param0`; no exported struct holds
     # one by type.
     "PieForwardGuardPred",
+    # The weight-representation tag behind the `proj_repr` field of both
+    # backend fact structs -- another caller-written `uint32_t`, same
+    # reason as the four above.
+    "PieForwardWeightRepr",
 ]
 
 # Public constants of `model` that are not part of the C surface. `model`

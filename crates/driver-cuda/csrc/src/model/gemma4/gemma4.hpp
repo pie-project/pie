@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "attention_workspace.hpp"
 #include "device_buffer.hpp"
 #include "distributed.hpp"
 #include "model/config.hpp"
@@ -47,9 +48,9 @@
 #include "model/llama_like/llama_like.hpp"
 #include "model/llama_like/qwen3.hpp"
 #include "model/workspace.hpp"
-#include "ops/attention_flashinfer.hpp"
-#include "ops/attention_flashinfer_hopper.hpp"
-#include "ops/gemm.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "attn/attention_flashinfer_hopper.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver {
 struct PrecomputedEmbeddingInputs;
@@ -176,22 +177,22 @@ struct Gemma4MoeMlpWorkspace {
     std::vector<std::uint32_t> h_row_decode_kv_page_indices;
     std::vector<std::uint32_t> h_row_decode_kv_page_indptr;
     std::vector<std::uint32_t> h_row_decode_kv_last_page_lens;
-    ops::DecodePlanCachePtr decode_plan_sliding;
-    ops::DecodePlanCachePtr decode_plan_full;
-    ops::DecodePlanCachePtr row_decode_plan_sliding;
-    ops::DecodePlanCachePtr row_decode_plan_full;
+    kernels::attn::DecodePlanCachePtr decode_plan_sliding;
+    kernels::attn::DecodePlanCachePtr decode_plan_full;
+    kernels::attn::DecodePlanCachePtr row_decode_plan_sliding;
+    kernels::attn::DecodePlanCachePtr row_decode_plan_full;
     bool decode_plans_prepared = false;
     // FA3 (SM90) decode plan for the sliding layers. gemma-4 attends there at
     // head_dim 256 with a window, which is the shape FlashAttention serves at
     // roofline and FlashInfer's paged-decode kernel does not. Built once per
     // fire beside the decode plans; `valid == false` means fall back.
-    ops::HopperPrefillPlan hopper_decode_plan_sliding;
+    kernels::attn::HopperPrefillPlan hopper_decode_plan_sliding;
     std::vector<std::uint32_t> hopper_qo_indptr_h;
     // The KV split, expressed as a batch: `kGemma4HopperSplits`
     // pseudo-requests, one token of Q each (broadcast, not copied) over
     // disjoint page ranges. One request times num_kv_heads is eight CTAs on an
     // H100, which leaves the decode kernel idle; the split fills it and
-    // `merge_attention_states_bf16` folds the partials back.
+    // `kernels::attn::merge_attention_states_bf16` folds the partials back.
     int hopper_splits = 0;
     // The layer window this plan was built FOR. The split rewrites
     // `window_left` into a per-chunk value, so the plan's own field no longer
@@ -201,7 +202,7 @@ struct Gemma4MoeMlpWorkspace {
     // (head_dim 512) but underfill the device even harder: two KV heads is
     // two CTAs. These ride FlashInfer's own decode plan, built for
     // `full_splits` pseudo-requests.
-    ops::DecodePlanCachePtr full_split_plan;
+    kernels::attn::DecodePlanCachePtr full_split_plan;
     int full_splits = 0;
     std::vector<std::uint32_t> full_split_kv_indptr_h;
     std::vector<std::uint32_t> full_split_last_h;
@@ -212,12 +213,12 @@ struct Gemma4MoeMlpWorkspace {
     // and the kernel masks the window itself, which is what the decode
     // splitter cannot do -- see gemma4.cpp. Measured 72.1 -> 14.4 us at ctx
     // 1024 and 283 -> 14.4 at ctx 4096, flat because the window bounds it.
-    ops::PrefillPlanCachePtr sliding_prefill_plan;
+    kernels::attn::PrefillPlanCachePtr sliding_prefill_plan;
     // The FULL layers need it just as badly: gemma-4 runs TWO kv heads on
     // those, so an unsplit fire is two CTAs on 148 SMs (their own comment
     // says so). Separate plan because their kv-head count differs from the
     // sliding layers'.
-    ops::PrefillPlanCachePtr full_prefill_plan;
+    kernels::attn::PrefillPlanCachePtr full_prefill_plan;
     bool full_prefill_ready = false;
     std::vector<std::uint32_t> sliding_qo_indptr_h;
     DeviceBuffer<std::uint32_t> sliding_qo_indptr_d;
@@ -232,7 +233,7 @@ struct Gemma4MoeMlpWorkspace {
     // truncated to it and the OLDEST chunk takes one extra page; that lets a
     // single `window_left` start chunk 0 exactly at the window while being too
     // large to mask anything in the later, shorter chunks.
-    ops::DecodePlanCachePtr sliding_split_plan;
+    kernels::attn::DecodePlanCachePtr sliding_split_plan;
     int sliding_splits = 0;
     int sliding_split_window = -1;
     std::vector<std::uint32_t> sliding_split_kv_indptr_h;
@@ -484,7 +485,7 @@ void gemma4_forward_paged(
     Gemma4MoeMlpWorkspace& moe_ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,

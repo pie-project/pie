@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/slot_ops.hpp"
+#include "layout/slot_ops.hpp"
 
 namespace pie_cuda_driver {
 
@@ -211,7 +211,7 @@ void RecurrentStateCache::reset_slots_if_fresh(
     if (num_linear_layers_ > 0) {
         const std::size_t conv_bytes = conv_slot_stride_bytes();
         const std::size_t rec_bytes = recurrent_slot_stride_bytes();
-        launch_zero_slots_if_fresh(
+        kernels::layout::zero_slots_if_fresh(
             reinterpret_cast<std::uint8_t*>(conv_states_.data()),
             conv_bytes,
             conv_bytes * static_cast<std::size_t>(max_slots_),
@@ -223,7 +223,7 @@ void RecurrentStateCache::reset_slots_if_fresh(
         auto* rec_base = recurrent_state_bf16_
             ? reinterpret_cast<std::uint8_t*>(recurrent_states_bf16_.data())
             : reinterpret_cast<std::uint8_t*>(recurrent_states_.data());
-        launch_zero_slots_if_fresh(
+        kernels::layout::zero_slots_if_fresh(
             rec_base,
             rec_bytes,
             rec_bytes * static_cast<std::size_t>(max_slots_),
@@ -236,7 +236,7 @@ void RecurrentStateCache::reset_slots_if_fresh(
     if (mtp_pending_hidden_.data() != nullptr && hidden_size_ > 0) {
         const std::size_t hidden_bytes =
             static_cast<std::size_t>(hidden_size_) * sizeof(std::uint16_t);
-        launch_zero_slots_if_fresh(
+        kernels::layout::zero_slots_if_fresh(
             reinterpret_cast<std::uint8_t*>(mtp_pending_hidden_.data()),
             hidden_bytes,
             hidden_bytes * static_cast<std::size_t>(max_slots_),

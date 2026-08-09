@@ -3,10 +3,10 @@
 //! The `pie` CLI binary (`src/main.rs`) is one consumer; the upcoming
 //! `pie-server` pyo3 wheel under `sdk/server/python/` is another.
 //! Both link against this lib, so the engine boot logic
-//! ([`serve::start_engine`]) has a single source of truth.
+//! ([`engine::start_engine`]) has a single source of truth.
 //!
 //! Modules are `pub` so external callers (the pyo3 wheel) can reach
-//! the surface they need — `serve::start_engine`, `config::Config`,
+//! the surface they need — `engine::start_engine`, `config::Config`,
 //! and native-driver bootstrap helpers.
 
 /// The process-wide allocator for every engine entry point.

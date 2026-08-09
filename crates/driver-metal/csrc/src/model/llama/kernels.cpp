@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "pie/kernels/entrypoint.h"
+
 namespace pie::metal::llama {
 
 bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
@@ -19,46 +21,50 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // The head width is the geometry's, not a literal: see `LlamaPsos::sdpa`.
     // A width with no instantiation fails here, by name, instead of running a
     // pipeline built for a different one.
-    const std::string d = "_d_" + std::to_string(g.head_dim);
-    const std::string q = g.quant.kernel_suffix();
-    const std::string sdpa_name = "sdpa_vector_decode_bfloat16" + d;
+    using namespace ::pie::kernels;
+    const std::string sdpa_name =
+        entrypoint("sdpa_vector_decode", {bf16(), head_dim(g.head_dim)});
     const std::string paged_name =
-        "sdpa_paged_decode_bfloat16" + d + (g.kv_page_size == 32 ? "_p32" : "");
-    const std::string tiled_name = "sdpa_paged_tiled_bfloat16" + d;
+        entrypoint("sdpa_paged_decode",
+                   {bf16(), head_dim(g.head_dim), page32(g.kv_page_size == 32)});
+    const std::string tiled_name =
+        entrypoint("sdpa_paged_tiled", {bf16(), head_dim(g.head_dim)});
     std::vector<Spec> specs = {
-        {"sdpa_vector.metal", sdpa_name, &out.sdpa},
-        {"sdpa_paged.metal", paged_name, &out.sdpa_paged},
-        {"sdpa_paged.metal", tiled_name, &out.sdpa_paged_tiled},
-        {"row_gather.metal", "row_gather_bfloat16", &out.row_gather},
+        {"attn/sdpa_vector.metal", sdpa_name, &out.sdpa},
+        {"attn/sdpa_paged.metal", paged_name, &out.sdpa_paged},
+        {"attn/sdpa_paged.metal", tiled_name, &out.sdpa_paged_tiled},
+        {"layout/row_gather.metal", "row_gather_bfloat16", &out.row_gather},
     };
     if (g.head_dim == 64 && g.kv_page_size == 32) {
         specs.push_back(
-            {"sdpa_paged.metal", paged_name + "_sg8", &out.sdpa_paged_sg8});
+            {"attn/sdpa_paged.metal", paged_name + "_sg8", &out.sdpa_paged_sg8});
     }
     if (g.rope_freq_table) {
-        specs.push_back({"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs});
-        specs.push_back({"rope.metal", "rope_neox_freqs_mb_bfloat16", &out.rope_freqs_mb});
+        specs.push_back({"rope/neox.metal", "neox_freqs_decode_bfloat16", &out.rope_freqs});
+        specs.push_back({"rope/neox.metal", "neox_freqs_mb_bfloat16", &out.rope_freqs_mb});
     }
     // Only for a routed checkpoint. A dense one never dispatches these, and
     // compiling them anyway would let an unrelated shader error fail a load
     // that would otherwise have worked.
     if (g.is_moe()) {
-        specs.push_back({"moe_route.metal", "router_topk_bfloat16", &out.router_topk});
-        specs.push_back({"quantized_qmv.metal", "affine_qmv_routed" + q, &out.qmv_routed});
-        specs.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});
-        specs.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});
-        specs.push_back({"moe_route.metal", "moe_combine_sorted", &out.moe_combine});
+        specs.push_back({"moe/route.metal", "router_topk_bfloat16", &out.router_topk});
+        specs.push_back({"quant/qmv.metal",
+                         entrypoint("affine_qmv_routed", {affine(g.quant)}),
+                         &out.qmv_routed});
+        specs.push_back({"moe/route.metal", "route_sort", &out.moe_sort});
+        specs.push_back({"moe/route.metal", "route_gather", &out.moe_gather});
+        specs.push_back({"moe/route.metal", "combine_sorted", &out.moe_combine});
         // The batched form's three column tiles, at each of the two tile
         // widths `moe_tile_rows` can pick. `bm` is what the sort padded every
         // expert's run to -- naming it here would be a second statement of the
         // same number, so it is spelled from the shared table.
         for (int t = 0; t < 3; ++t) {
-            const std::string routed_bm =
-                "affine_qmm_t_routed" + q + "_bm_" +
-                std::to_string(shared_kernels::kMoeTileWidths[t]);
             for (int i = 0; i < 3; ++i) {
-                specs.push_back({"quantized_qmm_t.metal",
-                                 routed_bm + "_bn_" + std::to_string(16 << i),
+                specs.push_back({"quant/qmm_t.metal",
+                                 entrypoint("affine_qmm_t_routed",
+                                            {affine(g.quant),
+                                             tile(shared_kernels::kMoeTileWidths[t],
+                                                  16 << i)}),
                                  &out.qmm_routed[t][i]});
             }
         }

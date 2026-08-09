@@ -1,5 +1,6 @@
 //! The declared drive is token-identical to the hand-written pass, for
-//! the families whose gate is still opt-in: gemma-4 and gpt-oss.
+//! the families whose gate is still opt-in: gemma-4, gpt-oss and
+//! qwen3.5.
 //!
 //! `cuda_declared_forward_parity` is the same claim for llama_like, and
 //! this file differs from it in one way that matters. That harness
@@ -50,9 +51,10 @@
 //! ```
 //!
 //! and the same shape for `gemma4_e2b` (same gate), `gpt_oss`
-//! (`PIE_DECLARED_FORWARD_GPT_OSS`) and `qwen35_moe`
-//! (`PIE_DECLARED_MOE`). Note `gemma4_declared` rather than `gemma4` --
-//! the shorter filter matches the e2b row too, which is two tests.
+//! (`PIE_DECLARED_FORWARD_GPT_OSS`), `qwen35_dense`
+//! (`PIE_DECLARED_FORWARD`) and `qwen35_moe` (`PIE_DECLARED_MOE`). Note
+//! `gemma4_declared` rather than `gemma4` -- the shorter filter matches
+//! the e2b row too, which is two tests.
 
 mod common;
 
@@ -81,6 +83,16 @@ struct Family {
     /// files both invocations under one slot and compares a run against
     /// itself — the failure this harness exists to make impossible.
     default_on: bool,
+    /// The family folds a RECURRENT state, so it must be driven through
+    /// `pie:inferlet/forward-hybrid`. `naive-baseline` builds its pass
+    /// through the attention-only interface, which such a deployment
+    /// refuses at the first fire ("Attention-only state algorithms are
+    /// not valid on a folded recurrent state") — so this picks
+    /// `generate-gdn` instead, the inferlet that binds BOTH working sets.
+    ///
+    /// It compares TOKENS rather than text, because that is what
+    /// `generate-gdn` returns; the claim is unchanged.
+    hybrid: bool,
 }
 
 const GEMMA4: Family = Family {
@@ -88,6 +100,7 @@ const GEMMA4: Family = Family {
     hub_dir: "models--google--gemma-4-E4B-it",
     gate: "PIE_DECLARED_FORWARD_GEMMA4",
     default_on: true,
+    hybrid: false,
 };
 
 /// gemma-4's SECOND geometry, and the reason it earns a row: 35 layers
@@ -100,6 +113,7 @@ const GEMMA4_E2B: Family = Family {
     hub_dir: "models--google--gemma-4-E2B-it",
     gate: "PIE_DECLARED_FORWARD_GEMMA4",
     default_on: true,
+    hybrid: false,
 };
 
 const GPT_OSS: Family = Family {
@@ -107,6 +121,7 @@ const GPT_OSS: Family = Family {
     hub_dir: "models--openai--gpt-oss-20b",
     gate: "PIE_DECLARED_FORWARD_GPT_OSS",
     default_on: false,
+    hybrid: false,
 };
 
 /// qwen3.5's MoE deployment, and the reason it earns a row: it is the
@@ -130,6 +145,39 @@ const QWEN35_MOE: Family = Family {
     hub_dir: "models--Qwen--Qwen3.5-35B-A3B",
     gate: "PIE_DECLARED_MOE",
     default_on: false,
+    hybrid: false,
+};
+
+/// qwen3.5 DENSE, and the row that makes the qwen3_5 executor gateable
+/// at all.
+///
+/// The MoE row above cannot run here — 67G of bf16 against a 46G card —
+/// and it had been the only one, which left the family's executor with
+/// no A/B while it was being converted to the value arena. That is the
+/// situation the note above describes as waiting on a machine, and it
+/// hid something simpler: the MoE row's own comment says the hybrid
+/// attention under it "is the same one the dense qwen3.5 rows already
+/// cover", and 0.8B is that dense deployment, present in this cache and
+/// already loaded by five other GPU tests.
+///
+/// What it covers is most of the executor: the GDN backbone (conv, prep,
+/// the gated-delta recurrence, the fold), the full-attention layers, and
+/// the dense MLP. What it does NOT cover is the routed block — the
+/// permutation, the two grouped GEMMs, the reorder, the shared expert's
+/// gate — which stays owed to the MoE row.
+///
+/// `default_on: true` — `qwen35_declared_forward_enabled()` is
+/// llama_like's polarity verbatim, so an UNSET `PIE_DECLARED_FORWARD`
+/// arms the drive and `=0` disarms it. (The prose above that function
+/// still describes the opt-in it used to be; the code is what this
+/// mirrors, because reading it the wrong way files both invocations
+/// under one slot and compares a run against itself.)
+const QWEN35_DENSE: Family = Family {
+    name: "qwen3_5_dense",
+    hub_dir: "models--Qwen--Qwen3.5-0.8B",
+    gate: "PIE_DECLARED_FORWARD",
+    default_on: true,
+    hybrid: true,
 };
 
 /// A checkpoint snapshot in the HF cache. Unlike the qwen resolver this
@@ -242,22 +290,24 @@ async fn run_family(family: &Family) -> Result<()> {
         family.name, pie.listen_addr
     );
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
+    let (ws, pkg, wasm, manifest) = if family.hybrid {
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/engine/tests/inferlets");
+        let wasm = ws.join("target/wasm32-wasip2/release/generate_gdn.wasm");
+        let manifest = ws.join("generate-gdn/Pie.toml");
+        (ws, "generate-gdn", wasm, manifest)
+    } else {
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
+        let wasm = ws.join("target/wasm32-wasip2/release/naive_baseline.wasm");
+        let manifest = ws.join("naive-baseline/Pie.toml");
+        (ws, "naive-baseline", wasm, manifest)
+    };
     let ok = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            "wasm32-wasip2",
-            "-p",
-            "naive-baseline",
-        ])
+        .args(["build", "--release", "--target", "wasm32-wasip2", "-p", pkg])
         .current_dir(&ws)
         .status()?
         .success();
-    anyhow::ensure!(ok, "naive-baseline wasm build failed");
-    let wasm = ws.join("target/wasm32-wasip2/release/naive_baseline.wasm");
-    let manifest = ws.join("naive-baseline/Pie.toml");
+    anyhow::ensure!(ok, "{pkg} wasm build failed");
 
     let client =
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
@@ -272,18 +322,32 @@ async fn run_family(family: &Family) -> Result<()> {
     // Single request, fixed seed, sampled SAMPLES times. Same request
     // every time: what varies between runs is the deployment's own
     // warm-up, and reproducing THAT is the claim.
-    let input = format!(
-        "{{\"prompt\": \"The old clockmaker examined the strange timepiece \
-         carefully\", \"max_tokens\": {MAX_TOKENS}, \"seed\": 7}}"
-    );
+    let (program, input) = if family.hybrid {
+        ("generate-gdn@0.1.0".to_string(), MAX_TOKENS.to_string())
+    } else {
+        (
+            "naive-baseline@0.1.0".to_string(),
+            format!(
+                "{{\"prompt\": \"The old clockmaker examined the strange \
+                 timepiece carefully\", \"max_tokens\": {MAX_TOKENS}, \
+                 \"seed\": 7}}"
+            ),
+        )
+    };
     let mut texts = Vec::with_capacity(SAMPLES);
     for i in 0..SAMPLES {
         let mut proc = client
-            .launch_process("naive-baseline@0.1.0".to_string(), input.clone(), true)
+            .launch_process(program.clone(), input.clone(), true)
             .await
             .context("launch")?;
         let json = proc.wait_for_return().await.context("wait_for_return")?;
-        let text = parse_text(&json).with_context(|| format!("no text in result: {json}"))?;
+        // `generate-gdn` returns a token list, `naive-baseline` a text.
+        // Either is a sampled SEQUENCE, which is all the record needs.
+        let text = if family.hybrid {
+            json.clone()
+        } else {
+            parse_text(&json).with_context(|| format!("no text in result: {json}"))?
+        };
         eprintln!(
             "[family-parity/{}] sample {i}: {:?}",
             family.name,
@@ -376,4 +440,10 @@ async fn gemma4_e2b_declared_forward_parity() -> Result<()> {
 #[ignore = "needs a CUDA GPU with >=80G + Qwen3.5-35B-A3B; run gate-OFF then gate-ON"]
 async fn qwen35_moe_declared_forward_parity() -> Result<()> {
     run_family(&QWEN35_MOE).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a CUDA GPU + Qwen3.5-0.8B; run gate-OFF then gate-ON"]
+async fn qwen35_dense_declared_forward_parity() -> Result<()> {
+    run_family(&QWEN35_DENSE).await
 }

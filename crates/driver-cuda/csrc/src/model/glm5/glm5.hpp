@@ -12,7 +12,7 @@
 // projection (MLA Q/KV, routed/shared experts, MoE) as FP8_E4M3 with a
 // companion `weight_scale_inv` per-channel tensor. We carry an optional
 // `QuantMeta` alongside each weight pointer; the forward path picks the
-// right `ops::WeightView` via `make_weight_view` (see qwen3.hpp).
+// right `WeightView` via `make_weight_view` (see qwen3.hpp).
 
 #include <cstdint>
 #include <memory>

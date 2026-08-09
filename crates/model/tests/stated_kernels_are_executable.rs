@@ -15,6 +15,11 @@
 //! it takes to run rather than in whatever week someone next boots that
 //! family.
 //!
+//! Since the four registries became one (`declared/registry.hpp`), this
+//! reads that header, and the question it asks got stronger: a symbol
+//! any family states must be resolvable by the ONE lookup every family
+//! goes through.
+//!
 //! Reading C++ as text is the same liberty `kernels_table.rs` takes, for
 //! the same reason: the vocabulary genuinely lives on both sides of the
 //! FFI, and a test that only reads one side cannot see a drift.
@@ -47,34 +52,34 @@ use model_compiler::trace::{ForwardPlan, OpKind};
 use model_compiler::trace::FireClass;
 use std::collections::BTreeSet;
 
-/// The `if (k == "...")` / `if (kernel == "...")` chain a family's
-/// `resolve_*_kernel` is written as. Deliberately dumb: a registry that
-/// stops being a chain of literal compares should make this test fail
-/// loudly (empty set) rather than pass by finding nothing to check.
-fn registry(family_dir: &str) -> BTreeSet<String> {
+/// The `if (k == "...")` chain `declared::resolve_kernel` is written as.
+///
+/// ONE registry now, where this read four — and the merge is what made
+/// `AttnFlashinferPrefill` naming two DIFFERENT kernels visible
+/// (qwen3.5's planned dispatch, gemma-4's and gpt-oss's plan-free
+/// wrapper). Four copies of a table is four places a symbol can mean
+/// something else, and nothing to notice it until they meet.
+///
+/// Deliberately dumb: a registry that stops being a chain of literal
+/// compares should make this test fail loudly (empty set) rather than
+/// pass by finding nothing to check.
+fn registry() -> BTreeSet<String> {
     let path = format!(
-        "{}/../driver-cuda/csrc/src/model/{family_dir}/declared_forward.cpp",
+        "{}/../driver-cuda/csrc/src/model/declared/registry.hpp",
         env!("CARGO_MANIFEST_DIR")
     );
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     let mut out = BTreeSet::new();
-    for (i, _) in text.match_indices("== \"") {
-        let before = &text[..i];
-        let is_kernel_compare = before.ends_with("k ")
-            || before.ends_with("kernel ");
-        if !is_kernel_compare {
-            continue;
-        }
-        let rest = &text[i + 4..];
-        if let Some(end) = rest.find('"') {
-            out.insert(rest[..end].to_string());
+    for (i, _) in text.match_indices("k == \"") {
+        if let Some(end) = text[i + 6..].find('"') {
+            out.insert(text[i + 6..i + 6 + end].to_string());
         }
     }
     assert!(
         !out.is_empty(),
-        "{family_dir}: found no `k == \"...\"` compares — the registry \
-         changed shape and this test is no longer reading it"
+        "found no `k == \"...\"` compares — the registry changed shape \
+         and this test is no longer reading it"
     );
     out
 }
@@ -89,8 +94,8 @@ fn stated(plan: &ForwardPlan) -> BTreeSet<String> {
         .collect()
 }
 
-fn check(family: &str, family_dir: &str, plans: &[(FireClass, ForwardPlan)]) {
-    let known = registry(family_dir);
+fn check(family: &str, _family_dir: &str, plans: &[(FireClass, ForwardPlan)]) {
+    let known = registry();
     let mut missing: Vec<String> = Vec::new();
     for (class, plan) in plans {
         for k in stated(plan) {

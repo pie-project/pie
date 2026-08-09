@@ -22,7 +22,7 @@
 
 #include "pie/driver/launch/op_table.hpp"
 #include <rng_contract.generated.h>
-#include "pipeline/tier0/tier0_kernels.cuh"  // for the BinKind/UnKind/... enums (host-safe)
+#include "ptir/tier0.cuh"  // for the kernels::ptir::BinKind/kernels::ptir::UnKind/... enums (host-safe)
 
 namespace pie_cuda_driver::pipeline::host_eval {
 
@@ -46,62 +46,62 @@ inline float neg_inf() { return -std::numeric_limits<float>::infinity(); }
 
 // ─────────────────────────── map / element-wise ──────────────────────────
 template <class T>
-std::vector<T> binary(BinKind k, const std::vector<T>& a, const std::vector<T>& b) {
+std::vector<T> binary(kernels::ptir::BinKind k, const std::vector<T>& a, const std::vector<T>& b) {
     std::vector<T> o(a.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
         switch (k) {
-            case BinKind::Add: o[i] = a[i] + b[i]; break;
-            case BinKind::Sub: o[i] = a[i] - b[i]; break;
-            case BinKind::Mul: o[i] = a[i] * b[i]; break;
-            case BinKind::Div: o[i] = a[i] / b[i]; break;
-            case BinKind::Rem:
+            case kernels::ptir::BinKind::Add: o[i] = a[i] + b[i]; break;
+            case kernels::ptir::BinKind::Sub: o[i] = a[i] - b[i]; break;
+            case kernels::ptir::BinKind::Mul: o[i] = a[i] * b[i]; break;
+            case kernels::ptir::BinKind::Div: o[i] = a[i] / b[i]; break;
+            case kernels::ptir::BinKind::Rem:
                 if constexpr (std::is_floating_point_v<T>) o[i] = std::fmod(a[i], b[i]);
                 else o[i] = a[i] - (a[i] / b[i]) * b[i];
                 break;
-            case BinKind::MaxElem: o[i] = a[i] > b[i] ? a[i] : b[i]; break;
-            case BinKind::MinElem: o[i] = a[i] < b[i] ? a[i] : b[i]; break;
+            case kernels::ptir::BinKind::MaxElem: o[i] = a[i] > b[i] ? a[i] : b[i]; break;
+            case kernels::ptir::BinKind::MinElem: o[i] = a[i] < b[i] ? a[i] : b[i]; break;
         }
     }
     return o;
 }
 template <class T>
-std::vector<T> unary(UnKind k, const std::vector<T>& a) {
+std::vector<T> unary(kernels::ptir::UnKind k, const std::vector<T>& a) {
     std::vector<T> o(a.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
         switch (k) {
-            case UnKind::Neg:   o[i] = -a[i]; break;
-            case UnKind::Exp:   o[i] = (T)std::exp((float)a[i]); break;
-            case UnKind::Log:   o[i] = (T)std::log((float)a[i]); break;
-            case UnKind::Recip: o[i] = (T)(1.0f / (float)a[i]); break;
-            case UnKind::Abs:   o[i] = (T)std::fabs((float)a[i]); break;
-            case UnKind::Sign:  o[i] = (T)(((float)a[i] > 0.0f) - ((float)a[i] < 0.0f)); break;
+            case kernels::ptir::UnKind::Neg:   o[i] = -a[i]; break;
+            case kernels::ptir::UnKind::Exp:   o[i] = (T)std::exp((float)a[i]); break;
+            case kernels::ptir::UnKind::Log:   o[i] = (T)std::log((float)a[i]); break;
+            case kernels::ptir::UnKind::Recip: o[i] = (T)(1.0f / (float)a[i]); break;
+            case kernels::ptir::UnKind::Abs:   o[i] = (T)std::fabs((float)a[i]); break;
+            case kernels::ptir::UnKind::Sign:  o[i] = (T)(((float)a[i] > 0.0f) - ((float)a[i] < 0.0f)); break;
         }
     }
     return o;
 }
 template <class T>
-std::vector<std::uint8_t> compare(CmpKind k, const std::vector<T>& a, const std::vector<T>& b) {
+std::vector<std::uint8_t> compare(kernels::ptir::CmpKind k, const std::vector<T>& a, const std::vector<T>& b) {
     std::vector<std::uint8_t> o(a.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
         bool r = false;
         switch (k) {
-            case CmpKind::Eq: r = a[i] == b[i]; break;
-            case CmpKind::Ne: r = a[i] != b[i]; break;
-            case CmpKind::Lt: r = a[i] <  b[i]; break;
-            case CmpKind::Le: r = a[i] <= b[i]; break;
-            case CmpKind::Gt: r = a[i] >  b[i]; break;
-            case CmpKind::Ge: r = a[i] >= b[i]; break;
+            case kernels::ptir::CmpKind::Eq: r = a[i] == b[i]; break;
+            case kernels::ptir::CmpKind::Ne: r = a[i] != b[i]; break;
+            case kernels::ptir::CmpKind::Lt: r = a[i] <  b[i]; break;
+            case kernels::ptir::CmpKind::Le: r = a[i] <= b[i]; break;
+            case kernels::ptir::CmpKind::Gt: r = a[i] >  b[i]; break;
+            case kernels::ptir::CmpKind::Ge: r = a[i] >= b[i]; break;
         }
         o[i] = r ? 1u : 0u;
     }
     return o;
 }
-inline std::vector<std::uint8_t> logic(LogicKind k, const std::vector<std::uint8_t>& a,
+inline std::vector<std::uint8_t> logic(kernels::ptir::LogicKind k, const std::vector<std::uint8_t>& a,
                                        const std::vector<std::uint8_t>& b) {
     std::vector<std::uint8_t> o(a.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
         std::uint8_t x = a[i] ? 1u : 0u, y = b[i] ? 1u : 0u;
-        o[i] = (k == LogicKind::And) ? (x & y) : (x | y);
+        o[i] = (k == kernels::ptir::LogicKind::And) ? (x & y) : (x | y);
     }
     return o;
 }
@@ -196,20 +196,20 @@ inline float canonical_min(float left, float right) {
 }
 
 template <class T>
-std::vector<T> reduce(RedKind k, const std::vector<T>& in, std::uint32_t rows, std::uint32_t len) {
+std::vector<T> reduce(kernels::ptir::RedKind k, const std::vector<T>& in, std::uint32_t rows, std::uint32_t len) {
     std::vector<T> o(rows);
     for (std::uint32_t r = 0; r < rows; ++r) {
         const T* row = in.data() + (std::size_t)r * len;
-        const T identity = k == RedKind::Sum ? (T)0
-                         : k == RedKind::Max ? std::numeric_limits<T>::lowest()
+        const T identity = k == kernels::ptir::RedKind::Sum ? (T)0
+                         : k == kernels::ptir::RedKind::Max ? std::numeric_limits<T>::lowest()
                                              : std::numeric_limits<T>::max();
         o[r] = canonical_reduce(row, len, identity, [k](T left, T right) {
-            if (k == RedKind::Sum) return (T)(left + right);
+            if (k == kernels::ptir::RedKind::Sum) return (T)(left + right);
             if constexpr (std::is_same_v<T, float>) {
-                return k == RedKind::Max ? canonical_max(left, right)
+                return k == kernels::ptir::RedKind::Max ? canonical_max(left, right)
                                          : canonical_min(left, right);
             } else {
-                return k == RedKind::Max ? std::max(left, right)
+                return k == kernels::ptir::RedKind::Max ? std::max(left, right)
                                          : std::min(left, right);
             }
         });
@@ -237,14 +237,14 @@ inline std::vector<std::uint32_t> reduce_argmax(const std::vector<float>& in, st
     return o;
 }
 template <class T>
-std::vector<T> scan(ScanKind k, const std::vector<T>& in, std::uint32_t rows, std::uint32_t len) {
+std::vector<T> scan(kernels::ptir::ScanKind k, const std::vector<T>& in, std::uint32_t rows, std::uint32_t len) {
     std::vector<T> o(in.size());
     for (std::uint32_t r = 0; r < rows; ++r) {
         const T* ri = in.data() + (std::size_t)r * len;
         T* ro = o.data() + (std::size_t)r * len;
-        T acc = (k == ScanKind::Sum) ? (T)0 : (T)1;
+        T acc = (k == kernels::ptir::ScanKind::Sum) ? (T)0 : (T)1;
         for (std::uint32_t i = 0; i < len; ++i) {
-            acc = (k == ScanKind::Sum) ? (T)(acc + ri[i]) : (T)(acc * ri[i]);
+            acc = (k == kernels::ptir::ScanKind::Sum) ? (T)(acc + ri[i]) : (T)(acc * ri[i]);
             ro[i] = acc;
         }
     }

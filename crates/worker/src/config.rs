@@ -2,8 +2,8 @@
 //!
 //! Same TOML the legacy Python server consumed. Embedded drivers
 //! ([`DriverKind::CudaNative`] / [`DriverKind::Metal`] / [`DriverKind::Dummy`])
-//! are dispatched in [`crate::serve::start_engine`] via
-//! [`crate::serve::topology::resolve_flavor`].
+//! are dispatched in [`crate::engine::start_engine`] via
+//! [`crate::preflight::resolve_flavor`].
 //!
 //! The Rust [`Config`] type below is the user-facing TOML schema; the
 //! conversion to `::engine::bootstrap::Config` (the runtime's own config)

@@ -183,10 +183,10 @@ void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Thread
             router_topk_dispatch(g.n_experts, grid, tg);
             return;
         case Kind::ExpertSort:
-            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            shared_kernels::route_sort_dispatch(g.n_experts, grid, tg);
             return;
         case Kind::ExpertGather:
-            shared_kernels::moe_route_rows_dispatch(
+            shared_kernels::route_rows_dispatch(
                 g.hidden, gptoss_moe_sorted_rows(g, 1), grid, tg);
             return;
         case Kind::ExpertSwiGlu:
@@ -382,7 +382,7 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
     const int m = d.kind == Kind::LmHead ? S : N;
     if (const int bn = gptoss_moe_qmm_bn(d.kind, g, N); bn > 0) {
         const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
-        const int bm = shared_kernels::moe_bm_slot(gptoss_moe_tile_rows(g, N));
+        const int bm = shared_kernels::bm_slot(gptoss_moe_tile_rows(g, N));
         if (go.qmm_routed_bias[bm][slot].valid()) return go.qmm_routed_bias[bm][slot];
     }
     if (const int bn = gptoss_qmm_bn(d.kind, g, m); bn > 0) {
@@ -473,10 +473,10 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
             router_topk_dispatch(g.n_experts, grid, tg, N);
             return;
         case Kind::ExpertSort:
-            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            shared_kernels::route_sort_dispatch(g.n_experts, grid, tg);
             return;
         case Kind::ExpertGather:
-            shared_kernels::moe_route_rows_dispatch(
+            shared_kernels::route_rows_dispatch(
                 g.hidden, gptoss_moe_sorted_rows(g, N), grid, tg);
             return;
         case Kind::ExpertSwiGlu:

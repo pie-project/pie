@@ -2,10 +2,10 @@
 
 #include "batch/forward.hpp"
 #include "device_buffer.hpp"
-#include "kernels/dtype_cast.hpp"
-#include "kernels/gather_rows.hpp"
+#include "quant/dtype_cast.hpp"
+#include "layout/gather_rows.hpp"
 #include "model/workspace.hpp"
-#include "ops/gemm.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver {
 
@@ -22,14 +22,14 @@ const float* gather_selected_logits_f32(
     if (engine.ptir_logits_f32.size() < n_conv) {
         engine.ptir_logits_f32 = DeviceBuffer<float>::alloc(n_conv);
     }
-    kernels::launch_gather_bf16_rows(
+    kernels::layout::gather_bf16_rows(
         static_cast<const std::uint16_t*>(engine.ws.logits.data()),
         engine.inputs.sample_idx.data(),
         engine.ptir_logits_bf16.data(),
         num_sampling,
         static_cast<int>(vocab),
         engine.cublas.stream());
-    kernels::launch_cast_bf16_to_fp32(
+    kernels::quant::cast_bf16_to_fp32(
         engine.ptir_logits_bf16.data(),
         engine.ptir_logits_f32.data(),
         n_conv,

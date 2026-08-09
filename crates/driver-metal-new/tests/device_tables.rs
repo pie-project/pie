@@ -275,3 +275,58 @@ fn the_cache_knows_which_entries_were_written() {
     );
     assert!(tables.get(4).is_none());
 }
+
+#[test]
+fn a_binding_reports_the_address_it_was_given_not_just_that_it_happened() {
+    let Ok(context) = Context::new() else {
+        println!("no Metal device; skipped");
+        return;
+    };
+    let mut heap = Heap::new(&context, 1 << 20).expect("heap");
+    let first = heap
+        .alloc(&context, 4096, 256)
+        .expect("first")
+        .gpu_address();
+    let second = heap
+        .alloc(&context, 4096, 256)
+        .expect("second")
+        .gpu_address();
+    assert_ne!(first, second);
+
+    let mut tables = Tables::new();
+    tables.bind_address(&context, 7, 0, first).expect("bind");
+    tables.bind_address(&context, 42, 0, second).expect("bind");
+
+    // The failure this exists to catch: both ordinals report bound, and the
+    // one that was supposed to share the first buffer is on another one.
+    assert_eq!(tables.address(7, 0), Some(first));
+    assert_eq!(tables.address(42, 0), Some(second));
+    assert!(tables.is_bound(7, 0) && tables.is_bound(42, 0));
+
+    // Never written is not the same answer as written-with-zero.
+    assert_eq!(tables.address(7, 1), None);
+    tables.bind_address(&context, 7, 1, 0).expect("bind zero");
+    assert_eq!(tables.address(7, 1), Some(0));
+
+    // Rebinding replaces rather than accumulating. The two values here are
+    // deliberately not neighbours: two consecutive heap allocations differ in
+    // one low bit, so an implementation that OR-ed the new address into the
+    // old would still report the right answer for them and only go wrong
+    // once the addresses were far apart.
+    tables
+        .bind_address(&context, 9, 0, 0x0000_FF00_0000_0000)
+        .expect("bind");
+    tables
+        .bind_address(&context, 9, 0, 0x0000_00FF_0000_0000)
+        .expect("rebind");
+    assert_eq!(
+        tables.address(9, 0),
+        Some(0x0000_00FF_0000_0000),
+        "a rebind was merged with what was there instead of replacing it"
+    );
+
+    // And forgetting an ordinal forgets its addresses too, so a later
+    // coverage check cannot pass on a table that no longer exists.
+    assert!(tables.forget(7));
+    assert_eq!(tables.address(7, 0), None);
+}

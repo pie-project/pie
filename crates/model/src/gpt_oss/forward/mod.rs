@@ -6,8 +6,8 @@ use self::facts::{
     GptOssCudaFacts, GptOssFacts,
 };
 use model_compiler::dsl::{
-    self, matmul,
-    rmsnorm, MatW, NormW, Val,
+    WeightRepr,
+    self, matmul, MatW, NormW, Val,
 };
 use model_compiler::trace::{
     FireClass, ForwardPlan, NormVariant, RopeKind,
@@ -45,6 +45,7 @@ impl GptOssLayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         let d = f.head_dim;
         Self {
@@ -141,12 +142,17 @@ pub fn gpt_oss_cuda(
         let mut y = dsl::embed_with(t, "embed", hidden);
 
         for l in 0..facts.layers {
+            // THIS LAYER's sliding window, `-1` for none — a
+            // load-time fact the dispatch statements carry, where four
+            // executors used to re-derive it per launch.
+            let window_left =
+                model_compiler::facts::window_left_at(&cuda.window_left, l);
             let w = GptOssLayerW::new(l, facts);
             let kv = dsl::Kv::at(t, l);
-            let normed = rmsnorm(&y, &w.attn_norm);
+            let normed = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 
             // The q/k/v biases FOLD INTO the projection's epilogue
-            // (`gemm_act_x_wt_bias_bf16`): at decode these route to the
+            // (`kernels::gemm::act_x_wt_bias_bf16`): at decode these route to the
             // warp-per-row GEMV, which absorbs the bias for free. Stating
             // them as separate AddBias ops — which this text did until a
             // census of its own golden was read against the driver — is
@@ -169,7 +175,7 @@ pub fn gpt_oss_cuda(
             // `attn.qv`'s position rule is that the correction lands on the
             // BASE projection, not on base + bias. When `attention_bias` is
             // set this family folds the bias into the GEMM's own epilogue
-            // (`gemm_act_x_wt_bias_bf16`), so there is no point in the trace
+            // (`kernels::gemm::act_x_wt_bias_bf16`), so there is no point in the trace
             // where the base projection exists as a value: the first thing
             // that exists is already base + bias.
             //
@@ -186,7 +192,7 @@ pub fn gpt_oss_cuda(
             // gpt-oss scales, and the driver had to be TAUGHT to: this
             // family shares llama_like's cfg, where `apply_rope_config`
             // had already resolved the scaling, and `mixtral.cpp` spelled
-            // a plain `launch_rope_bf16` anyway. The declaration states
+            // a plain `kernels::rope::rope_bf16` anyway. The declaration states
             // the kernel the fixed pass fires.
             let (q, k) = if facts.rope_yarn_original {
                 dsl::cuda::rope_yarn_original(&q, &k)
@@ -214,8 +220,8 @@ pub fn gpt_oss_cuda(
                 dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks)
             } else {
                 match class {
-                    FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&q, &kv),
-                    _ => dsl::cuda::attention_flashinfer_prefill_planless(&q, &kv),
+                    FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left),
+                    _ => dsl::cuda::attention_flashinfer_prefill_planless(&q, &kv, window_left),
                 }
                 .expect("the class states its attention")
             };
@@ -227,7 +233,7 @@ pub fn gpt_oss_cuda(
 
             // o_proj folds the RESIDUAL (beta=1) and not its bias: the
             // hand-written tp=1 arm calls the plain gemm and then
-            // `launch_add_bias_bf16`. The one place in this layer where
+            // `kernels::norm::add_bias_bf16`. The one place in this layer where
             // the split spelling is the truthful one.
             y += matmul(&a, &w.o_proj);
             if facts.attention_bias {
@@ -235,7 +241,7 @@ pub fn gpt_oss_cuda(
             }
 
             // ── The MoE block ───────────────────────────────────────
-            let mlp_in = rmsnorm(&y, &w.mlp_norm);
+            let mlp_in = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             let logits = proj(&mlp_in, &w.router, &w.router_bias);
             let (experts, weights) = dsl::cuda::topk(&logits, facts.top_k);
 
@@ -248,7 +254,7 @@ pub fn gpt_oss_cuda(
                 facts.intermediate,
             );
             // The clamp is the whole fork, and a checkpoint without one
-            // takes `launch_swiglu_bf16`'s PAIR form — a spelling no
+            // takes `kernels::mlp::swiglu_bf16`'s PAIR form — a spelling no
             // statement carries yet. Refused by name rather than guessed:
             // every gpt-oss release so far clamps, so an unclamped one
             // would be the first thing this text had never seen.
@@ -257,7 +263,13 @@ pub fn gpt_oss_cuda(
                 "gpt_oss without a swiglu limit states no activation yet"
             );
             let routed =
-                dsl::cuda::gpt_oss_glu(&gate, &up, facts.top_k, facts.intermediate);
+                dsl::cuda::gpt_oss_glu(
+                &gate,
+                &up,
+                facts.top_k,
+                facts.intermediate,
+                facts.swiglu_limit,
+            );
             let routed = dsl::cuda::bf16_to_fp16(&routed);
             let out = dsl::cuda::mxfp4_moe_down_decode(
                 &routed,
@@ -270,10 +282,19 @@ pub fn gpt_oss_cuda(
             // launch — mixtral's tp=1 shape. (The `_add` fused form
             // exists, and this pass does not take it.)
             let combined = dsl::cuda::weighted_sum(&weights, &out, hidden, None);
-            y = dsl::cuda::residual_add(&combined, &y, hidden);
+            // STREAM FIRST. `residual_add` lands on operand 0 -- the
+            // `kernel!` row aliases output 0 over input 0 -- so the
+            // order is not a caller's preference, it says which buffer
+            // holds the sum. Written the other way round this claimed
+            // the stream lands on the MoE output's bytes, which no
+            // driver does and which the stream does not mean; it went
+            // unnoticed while both operands were pinned workspace
+            // fields and the arm added into `ws.y` regardless. Every
+            // other family already spells it this way.
+            y = dsl::cuda::residual_add(&y, &combined, hidden);
         }
 
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".into(),

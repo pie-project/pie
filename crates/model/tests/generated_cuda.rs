@@ -4,6 +4,7 @@
 //! happen quietly. Regenerate with `cargo run -p pie-forward --bin
 //! emit-cuda` and review the diff; then re-run the three-way parity gate.
 
+use model_compiler::dsl::WeightRepr;
 use model::families::llama_like::forward::emit::emit_llama_like_cuda_inc;
 use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 
@@ -54,7 +55,14 @@ fn committed_incs_are_regeneration_clean() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: false,
+                head_dim_kernel: 0,
                 gate_up_fused: true,
+                proj_repr: WeightRepr::Bf16,
+                // Single GPU.
+                tp_size: 1,
+                // Every emission target attends the whole context.
+                window_left: Vec::new(),
+                all_reduce_p2p_max_rows: 0,
             },
             "olmo2_1b",
         ),
@@ -69,7 +77,14 @@ fn committed_incs_are_regeneration_clean() {
                 rope_table: true,
                 force_prefill_path: true,
                 head_dim_padded: false,
+                head_dim_kernel: 0,
                 gate_up_fused: true,
+                proj_repr: WeightRepr::Bf16,
+                // Single GPU.
+                tp_size: 1,
+                // Every emission target attends the whole context.
+                window_left: Vec::new(),
+                all_reduce_p2p_max_rows: 0,
             },
             "qwen2_5_1_5b",
         ),
@@ -84,7 +99,14 @@ fn committed_incs_are_regeneration_clean() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: false,
+                head_dim_kernel: 0,
                 gate_up_fused: true,
+                proj_repr: WeightRepr::Bf16,
+                // Single GPU.
+                tp_size: 1,
+                // Every emission target attends the whole context.
+                window_left: Vec::new(),
+                all_reduce_p2p_max_rows: 0,
             },
             "mistral_7b_v03",
         ),
@@ -99,7 +121,14 @@ fn committed_incs_are_regeneration_clean() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: true,
+                head_dim_kernel: 128,
                 gate_up_fused: true,
+                proj_repr: WeightRepr::Bf16,
+                // Single GPU.
+                tp_size: 1,
+                // Every emission target attends the whole context.
+                window_left: Vec::new(),
+                all_reduce_p2p_max_rows: 0,
             },
             "phi3_mini",
         ),
@@ -109,6 +138,8 @@ fn committed_incs_are_regeneration_clean() {
         &model::qwen_3_5::forward::emit::emit_qwen35_cuda_inc(
             &model::qwen_3_5::forward::facts::Qwen35HybridFacts::qwen3_5_0_8b(),
             &model::qwen_3_5::forward::facts::Qwen35CudaFacts {
+                // Attends the whole context.
+                window_left: Vec::new(),
                 state_bf16: true,
                 warp_tiled: false,
                 warp_tiled_max: 64,
@@ -124,6 +155,7 @@ fn committed_incs_are_regeneration_clean() {
                 moe_streamed_experts: false,
                 moe_force_general: false,
                 gate_up_fused: true,
+                proj_repr: WeightRepr::Bf16,
             },
             "qwen3_5_0_8b",
         ),

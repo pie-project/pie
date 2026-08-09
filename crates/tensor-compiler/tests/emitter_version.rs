@@ -60,9 +60,20 @@ use tensor_compiler::codegen::program::{Backend, emit_program};
 // oracle dumps (`golden-cuda/`, `golden-msl/`) show that growth was purely
 // additive. Bumping the constants for that would discard every driver's
 // compile cache over sources they would re-emit identically.
+//
+// Re-pinned again WITH both bumps already made, which is the case this file's
+// preamble says it cannot force and here did not have to: cumsum/cumprod
+// widened from F32-only to every numeric dtype, the m1 runtime's scan block
+// now branches on the operand dtype, and that block is spliced verbatim into
+// every emitted source on both backends. Whoever made it bumped `cuda` 19 -> 21
+// and `metal` 35 -> 36 and re-pinned the oracle dumps — `golden-cuda/` and
+// `golden-msl/` both carry that reason — and left only this table behind. So
+// the versions below are restatements of constants that already describe their
+// output, not a judgement about whether a cache should be discarded; the
+// judgement was made and is recorded in the dumps.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 19, 0xd17b_b3da_e6c4_aff4),
-    ("metal", 35, 0xf737_01d0_a63d_5c52),
+    ("cuda", 21, 0xc5b4_c70e_a9f1_b8bb),
+    ("metal", 36, 0x0f81_7250_caff_2a71),
 ];
 
 /// Everything a driver receives for both corpora, hashed.

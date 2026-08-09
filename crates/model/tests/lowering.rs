@@ -464,7 +464,7 @@ fn a_captured_fire_emits_both_peel_regions() {
         !host
             .launches
             .iter()
-            .any(|l| l.kernel_is(&host, "launch_qkv_decode_qk_norm_rope_write_kv_bf16")),
+            .any(|l| l.kernel_is(&host, "attn::qkv_decode_qk_norm_rope_write_kv_bf16")),
         "an empty prefix launches nothing when the host's count is the truth"
     );
 
@@ -481,7 +481,7 @@ fn a_captured_fire_emits_both_peel_regions() {
     let fused: Vec<_> = captured
         .launches
         .iter()
-        .filter(|l| l.kernel_is(&captured, "launch_qkv_decode_qk_norm_rope_write_kv_bf16"))
+        .filter(|l| l.kernel_is(&captured, "attn::qkv_decode_qk_norm_rope_write_kv_bf16"))
         .collect();
     assert!(!fused.is_empty(), "the captured graph carries the prefix");
     assert!(fused
@@ -520,7 +520,7 @@ fn the_epilogue_is_a_row_count_not_a_branch() {
     let plan = decode_plan();
     // The epilogue's launches are the ones carrying the LmHead
     // statement's index. Identifying them by SYMBOL would not work:
-    // its projection is `gemm_act_x_w`, the same launcher every
+    // its projection is `kernels::gemm::act_x_w`, the same launcher every
     // body matmul takes.
     let at_op = plan
         .ops
@@ -542,8 +542,8 @@ fn the_epilogue_is_a_row_count_not_a_branch() {
     assert_eq!(
         all,
         vec![
-            ("launch_rmsnorm_bf16".to_string(), 0..4),
-            ("gemm_act_x_w".to_string(), 0..4),
+            ("norm::rmsnorm_bf16".to_string(), 0..4),
+            ("gemm::act_x_w".to_string(), 0..4),
         ]
     );
 
@@ -553,9 +553,9 @@ fn the_epilogue_is_a_row_count_not_a_branch() {
     assert_eq!(
         epilogue(&gathered(4)),
         vec![
-            ("launch_gather_bf16_rows".to_string(), 0..1),
-            ("launch_rmsnorm_bf16".to_string(), 0..1),
-            ("gemm_act_x_w".to_string(), 0..1),
+            ("layout::gather_bf16_rows".to_string(), 0..1),
+            ("norm::rmsnorm_bf16".to_string(), 0..1),
+            ("gemm::act_x_w".to_string(), 0..1),
         ]
     );
 
@@ -576,7 +576,7 @@ fn a_plain_fire_is_one_rectangle_per_statement() {
     assert!(out.rectangles > 0);
     assert!(out.launches.iter().all(|l| l.rows == (0..8)));
     // The frame's kernel table is what the driver would index.
-    assert!(out.kernels.contains(&"dispatch_attention_flashinfer_decode".to_string()));
+    assert!(out.kernels.contains(&"attn::dispatch_attention_flashinfer_decode".to_string()));
     // Every launch names a layer the trace tagged.
     assert!(out.launches.iter().all(|l| l.layers.end == l.layers.start + 1));
 }
@@ -638,7 +638,7 @@ fn a_whole_kernel_refuses_a_row_window() {
         plan.ops.iter().any(|op| matches!(
             &op.kind,
             OpKind::Launch { kernel, .. }
-                if kernel == "launch_attention_xqa_decode_bf16_prepared"
+                if kernel == "attn::attention_xqa_decode_bf16_prepared"
         )),
         "this deployment states XQA"
     );

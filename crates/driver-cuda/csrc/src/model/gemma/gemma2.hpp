@@ -22,14 +22,15 @@
 #include <cstdint>
 #include <vector>
 
+#include "attention_workspace.hpp"
 #include "distributed.hpp"
 #include "model/loaded_model.hpp"
 #include "store/kv_cache.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/llama_like/qwen3.hpp"
 #include "model/workspace.hpp"
-#include "ops/attention_flashinfer.hpp"
-#include "ops/gemm.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -118,7 +119,7 @@ void gemma2_forward_paged(
     Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,

@@ -114,7 +114,7 @@ int main() {
     }
 
     std::string err;
-    const Pso pso = ctx->compile_pso_from_file(kernels_dir + "/quantized_qmv.metal",
+    const Pso pso = ctx->compile_pso_from_file(kernels_dir + "/quant/qmv.metal",
                                                "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", &err);
     if (!pso.valid()) {
         expect(false, "the MXFP4 matvec builds: " + err);

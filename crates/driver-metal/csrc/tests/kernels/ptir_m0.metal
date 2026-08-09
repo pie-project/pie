@@ -1,5 +1,15 @@
 #include <metal_stdlib>
-#include "../../src/kernels/ptir_rng.generated.metal"
+// The RNG contract's generated device text, spliced in by
+// `read_metal_source_at` — Metal's runtime shader compiler resolves nothing
+// from the filesystem itself, and the splicer resolves a quoted include
+// against the including file's directory.
+//
+// This reaches `tensor-compiler`'s committed copy, which is the OWNER, rather
+// than the copy `kernels-metal/build.rs` stages beside the runtime shaders:
+// that one exists so the shaders under `PIE_METAL_KERNELS_DIR` can reach the
+// preamble by bare name, and this fixture does not live there. Pointing at the
+// owner also keeps the fixture independent of whether a `native` build has run.
+#include "../../../../tensor-compiler/include/ptir_rng.generated.metal"
 using namespace metal;
 
 struct PtirRngCase {

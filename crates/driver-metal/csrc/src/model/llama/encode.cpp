@@ -308,7 +308,7 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             const int bn = llama_moe_qmm_bn(d.kind, g, R);
             if (bn == 0) return ll.qmv_routed;
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
-            const int bm = shared_kernels::moe_bm_slot(llama_moe_tile_rows(g, R));
+            const int bm = shared_kernels::bm_slot(llama_moe_tile_rows(g, R));
             return ll.qmm_routed[bm][slot].valid() ? ll.qmm_routed[bm][slot]
                                                    : ll.qmv_routed;
         }
@@ -671,10 +671,10 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
         // above, which answers for them: they reach here only if that ever
         // stops being true.
         case Kind::ExpertSort:
-            moe_route_sort_dispatch(g.n_experts, grid, tg);
+            route_sort_dispatch(g.n_experts, grid, tg);
             return;
         case Kind::ExpertGather:
-            moe_route_rows_dispatch(g.hidden, llama_moe_sorted_rows(g, R), grid, tg);
+            route_rows_dispatch(g.hidden, llama_moe_sorted_rows(g, R), grid, tg);
             return;
         case Kind::ExpertSiluMul:
             // The slot axis is gone -- a sorted row IS a slot -- so this is the

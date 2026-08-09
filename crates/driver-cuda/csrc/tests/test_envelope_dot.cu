@@ -17,12 +17,12 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-#include "kernels/envelope.hpp"
+#include "layout/envelope.hpp"
 
-using pie_cuda_driver::kernels::launch_envelope_dot_f32;
-using pie_cuda_driver::kernels::launch_envelope_merge_written_bf16;
-using pie_cuda_driver::kernels::launch_envelope_recompute_bf16;
-using pie_cuda_driver::kernels::launch_envelope_update_appended_bf16;
+using pie_cuda_driver::kernels::layout::launch_envelope_dot_f32;
+using pie_cuda_driver::kernels::layout::launch_envelope_merge_written_bf16;
+using pie_cuda_driver::kernels::layout::launch_envelope_recompute_bf16;
+using pie_cuda_driver::kernels::layout::launch_envelope_update_appended_bf16;
 
 namespace {
 
@@ -271,7 +271,7 @@ void check_update_appended(const char* name, int num_pages, int page_size,
 // The claim it has to earn is that merging fire by fire ends up where a full
 // recompute of the finished pages would. So this simulates a whole sequence --
 // a prefill fire followed by `decode_fires` one-token fires -- feeding each one
-// through the merge exactly as `launch_write_kv_explicit_bf16` does, and then
+// through the merge exactly as `kernels::attn::write_kv_explicit_bf16` does, and then
 // compares against `envelope_recompute` over the final live lengths.
 //
 // It also plants garbage in the envelopes of every page the sequence will use,

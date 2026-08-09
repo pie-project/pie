@@ -869,6 +869,13 @@ fn c_cuda_facts_synthetic() -> PieForwardQwen35CudaFacts {
         moe_streamed_experts: 0,
         moe_force_general: 0,
         gate_up_fused: 1,
+        // Dense, which is what a zero-initialized C caller means too.
+        proj_repr: 0,
+        proj_zero_point: 0,
+        proj_group: 0,
+        proj_axis: 0,
+        window_left: std::ptr::null(),
+        window_left_len: 0,
     }
 }
 
@@ -902,7 +909,7 @@ fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
         .find(|op| {
             op.layer == 0
                 && op.kind == PieForwardOpKind::Launch
-                && view::name(&out, op.weight_name) == "launch_causal_conv1d_update_batched_bf16"
+                && view::name(&out, op.weight_name) == "ssm::causal_conv1d_update_batched_bf16"
         })
         .expect("decode class states the batched conv update");
     let aux = view::ids(&out, conv.aux_names);
@@ -920,7 +927,7 @@ fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
             op.layer == 0
                 && op.kind == PieForwardOpKind::Launch
                 && view::name(&out, op.weight_name)
-                    == "launch_recurrent_gated_delta_step_batched_state_bf16"
+                    == "ssm::recurrent_gated_delta_step_batched_state_bf16"
         })
         .expect("decode class states the batched recurrence step");
     assert_eq!(step.param0, 2);
@@ -943,7 +950,7 @@ fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
         .find(|op| {
             op.layer == 3
                 && op.kind == PieForwardOpKind::Launch
-                && view::name(&out, op.weight_name) == "launch_write_kv_explicit_bf16"
+                && view::name(&out, op.weight_name) == "attn::write_kv_explicit_bf16"
         })
         .expect("the guard's then-region states the explicit write");
     assert_eq!(write.param0, 1); // kv-cache state...
@@ -953,7 +960,7 @@ fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
         .find(|op| {
             op.layer == 3
                 && op.kind == PieForwardOpKind::Launch
-                && view::name(&out, op.weight_name) == "dispatch_attention_flashinfer_decode"
+                && view::name(&out, op.weight_name) == "attn::dispatch_attention_flashinfer_decode"
         })
         .expect("decode class states the FlashInfer decode dispatch");
     assert_eq!(attn.param0, 1);
@@ -1099,7 +1106,19 @@ fn lowered_trace_round_trips_through_the_arena() {
         rope_table: 1,
         force_prefill_path: 0,
         head_dim_padded: 0,
+        head_dim_kernel: 0,
         gate_up_fused: 1,
+        // Dense, which is what a zero-initialized C caller means too.
+        proj_repr: 0,
+        proj_zero_point: 0,
+        proj_group: 0,
+        proj_axis: 0,
+        tp_size: 1,
+        all_reduce_p2p_max_rows: 0,
+        // No window: null pointer, zero length -- what a caller written
+        // before this field states by zero-init.
+        window_left: std::ptr::null(),
+        window_left_len: 0,
     };
     let mut out = PieForwardPlan::default();
     assert_eq!(
@@ -1121,12 +1140,22 @@ fn lowered_trace_round_trips_through_the_arena() {
     // capture variant, so no WantsAttnScore guard) = 421, plus ONE
     // swiglu per layer now that the activation states its kernel from
     // the gate_up binding fact instead of leaving the choice to a
-    // workspace read (+28) = 449. The trace's op TOTAL is unchanged:
-    // every one of those was already a `Swiglu` statement.
-    assert_eq!(launches.len(), 449);
+    // workspace read (+28) = 449, plus the ROW NORMS now that
+    // `cuda::rmsnorm` states its fold: two per layer (attn_norm,
+    // mlp_norm) plus the final norm = +57 = 506.
+    //
+    // q_norm and k_norm are NOT among them, and that is the handle
+    // doing its job: qwen3-0.6b's are per-head, so they stay the
+    // semantic kind — `head_dim` has nowhere to ride on a `Launch`.
+    // olmo2's are row-wise and would count here.
+    //
+    // The trace's op TOTAL is unchanged in both steps: every one of
+    // these was already a statement, and what moved is whether it names
+    // its kernel.
+    assert_eq!(launches.len(), 506);
 
     let table = launches[0];
-    assert_eq!(view::name(&out, table.weight_name), "launch_rope_standard_table");
+    assert_eq!(view::name(&out, table.weight_name), "rope::rope_standard_table");
     assert_eq!(table.param0, 0); // no implicit state
     assert_eq!(table.aux_names.len, 0);
     let table_out = view::ids(&out, table.outputs)[0];
@@ -1134,7 +1163,7 @@ fn lowered_trace_round_trips_through_the_arena() {
     let posts: Vec<_> = launches
         .iter()
         .filter(|op| {
-            view::name(&out, op.weight_name) == "launch_qkv_decode_qk_norm_rope_write_kv_bf16"
+            view::name(&out, op.weight_name) == "attn::qkv_decode_qk_norm_rope_write_kv_bf16"
         })
         .collect();
     assert_eq!(posts.len(), 28);
@@ -1152,7 +1181,7 @@ fn lowered_trace_round_trips_through_the_arena() {
     let attn = launches
         .iter()
         .find(|op| {
-            view::name(&out, op.weight_name) == "launch_attention_xqa_decode_bf16_prepared"
+            view::name(&out, op.weight_name) == "attn::attention_xqa_decode_bf16_prepared"
         })
         .expect("decode class states XQA");
     assert_eq!(attn.param0, 1);
@@ -1248,7 +1277,19 @@ fn traced_cuda_decode() -> PieForwardPlan {
         rope_table: 1,
         force_prefill_path: 0,
         head_dim_padded: 0,
+        head_dim_kernel: 0,
         gate_up_fused: 1,
+        // Dense, which is what a zero-initialized C caller means too.
+        proj_repr: 0,
+        proj_zero_point: 0,
+        proj_group: 0,
+        proj_axis: 0,
+        tp_size: 1,
+        all_reduce_p2p_max_rows: 0,
+        // No window: null pointer, zero length -- what a caller written
+        // before this field states by zero-init.
+        window_left: std::ptr::null(),
+        window_left_len: 0,
     };
     let mut out = PieForwardPlan::default();
     assert_eq!(
@@ -1280,9 +1321,9 @@ fn the_lowering_crosses_the_abi() {
     assert!(view.iter().all(|(_, _, lo, hi)| *lo == 0 && *hi == 4));
     // Both the stated kernels and the semantic statements' launchers are
     // named — the list is what the fire RUNS, not what it states.
-    assert!(view.iter().any(|(k, ..)| k == "dispatch_attention_flashinfer_decode"));
-    assert!(view.iter().any(|(k, ..)| k == "launch_chunked_swiglu_bf16"));
-    assert!(view.iter().any(|(k, ..)| k == "gemm_act_x_w"));
+    assert!(view.iter().any(|(k, ..)| k == "attn::dispatch_attention_flashinfer_decode"));
+    assert!(view.iter().any(|(k, ..)| k == "mlp::chunked_swiglu_bf16"));
+    assert!(view.iter().any(|(k, ..)| k == "gemm::act_x_w"));
     // Every rectangle points at a real statement.
     let ops = view::ops(&plan).len() as u32;
     assert!(view.iter().all(|(_, at, ..)| *at < ops));

@@ -83,13 +83,12 @@ fn aliases(plan: &ForwardPlan) -> Alias {
                 }
             }
             OpKind::Launch { kernel, .. } => {
-                let Some(idx) = model_compiler::kernels::in_place_operand(plan, kernel) else {
-                    continue;
-                };
-                if let (Some(&src), Some(&out)) =
-                    (op.inputs.get(idx as usize), op.outputs.first())
-                {
-                    alias.join(src, out);
+                for &(o, i) in model_compiler::kernels::in_place_pairs(plan, kernel) {
+                    if let (Some(&src), Some(&out)) =
+                        (op.inputs.get(i as usize), op.outputs.get(o as usize))
+                    {
+                        alias.join(src, out);
+                    }
                 }
             }
             _ => {}
@@ -537,6 +536,8 @@ fn what_gemma_4_e2b_asks_for_at_one_row() {
             // E2B binds no packed banks: the two-gemm MLP pair and the
             // unfused QKV, which is the branch E4B does not take.
             &facts::Gemma4CudaFacts {
+                // Attends the whole context.
+                window_left: Vec::new(),
                 fused_qkv: false,
                 gate_up_fused: false,
                 kv_native_bf16: true,
@@ -829,5 +830,310 @@ fn which_values_are_read_wider_than_they_are_written() {
                 plan.values.len()
             ),
         }
+    }
+}
+
+/// A value must be placed INSIDE the bytes its owner holds.
+///
+/// Two facts, from two places that had drifted apart: `alias_owners`
+/// decides who shares a buffer, and the placement loop decides where
+/// each buffer is. Liveness reads only the first, so when the second
+/// disagreed the arena freed ONE block for what it had allocated as
+/// TWO, and handed the survivor's bytes to a later value.
+///
+/// Containment and not equality, because the two ways of sharing share
+/// differently. An in-place write lands on the owner's own address; a
+/// `Select` window lands at an index INTO it, which is the whole of
+/// what the op means. What both owe is that the bytes come out of the
+/// owner's allocation — that is what makes freeing the owner's block
+/// free all of them, which is the property liveness is relying on.
+///
+/// The drift was found the expensive way — a bisect over a real gemma-4
+/// fire, narrowed to one owner, whose two members printed two
+/// addresses — and it is a property of the TEXT. So it is checkable
+/// here, at every fire width, for every family, without a GPU.
+#[test]
+fn an_alias_lands_inside_its_owner() {
+    use model_compiler::lower::{lower, Buffers, Fire};
+
+    for (name, class, plan) in families() {
+        for n in [1usize, 8] {
+            let rows = plain(n);
+            let requests = n.max(1);
+            let Ok(out) = lower(&plan, &rows, Fire::default()) else {
+                continue; // a text that will not lower places nothing
+            };
+            let mut checked = 0usize;
+            for v in 0..out.value_owner.len() {
+                let own = out.value_owner[v] as usize;
+                if own == v {
+                    continue;
+                }
+                checked += 1;
+                // NAMED is not an address, and an alias set that is
+                // exposed must be exposed WHOLE: half a set placed and
+                // half of it bound by the backend is the same defect
+                // wearing the seam's clothes.
+                assert_eq!(
+                    out.value_offset[v] == Buffers::NAMED,
+                    out.value_offset[own] == Buffers::NAMED,
+                    "{name} {class:?} at {n} rows: v{v} and its owner v{own} \
+                     disagree about whether the arena places them"
+                );
+                if out.value_offset[v] == Buffers::NAMED {
+                    continue;
+                }
+                let at = out.value_offset[v];
+                let root = out.value_offset[own];
+                let end = at + value_bytes(&plan, v as ValueId, n, requests);
+                let root_end = root + value_bytes(&plan, own as ValueId, n, requests);
+                assert!(
+                    at >= root && end <= root_end,
+                    "{name} {class:?} at {n} rows: v{v} is owned by v{own} \
+                     but lies at [{at}, {end}) outside its owner's \
+                     [{root}, {root_end}) — one buffer by liveness, two \
+                     by placement"
+                );
+            }
+            println!("{name:12} {class:?} n={n}: {checked} aliases inside their owner");
+        }
+    }
+}
+
+/// A value-producing guard's result must be WRITTEN inside its regions.
+///
+/// The ABI says the regions are flat and consecutive and that "the
+/// guard's outputs are the ONE producer whichever region runs — region
+/// launches bind the same output buffer and record no outputs of their
+/// own". A driver that wants to route those writes has only the span to
+/// go on, and the qwen3.5 executor found the span and the fire
+/// disagreeing: one value-producing guard per layer spanning two ops,
+/// while the attention dispatch whose result the guard owns executed
+/// six ops later.
+///
+/// This asks the same question of the TEXT, without a GPU: for every
+/// guard that produces a value, every launch that could bind it should
+/// lie in `[guard + 1, guard + 1 + span)`. Printed rather than asserted
+/// on the first pass — the point is to find out which of the two is
+/// wrong before deciding which to call the bug.
+#[test]
+fn what_a_value_producing_guard_spans() {
+    for (name, class, plan) in families() {
+        for (i, op) in plan.ops.iter().enumerate() {
+            let OpKind::Guard { arms, else_ops } = &op.kind else {
+                continue;
+            };
+            if op.outputs.is_empty() {
+                continue;
+            }
+            let n_arms = arms.len();
+            let span: usize =
+                arms.iter().map(|a| a.ops as usize).sum::<usize>() + *else_ops as usize;
+            let body = (i + 1)..(i + 1 + span);
+            // Who READS the guard's result, and how far past the span
+            // that sits. A reader inside the body would be stranger
+            // still; what is expected is a reader just after it.
+            let out = op.outputs[0];
+            let reader = plan
+                .ops
+                .iter()
+                .enumerate()
+                .find(|(_, o)| o.inputs.contains(&out))
+                .map(|(j, _)| j);
+            println!(
+                "{name:12} {class:?} guard@{i} arms={n_arms} else={else_ops} \
+                 span={span} body={body:?} out=v{out} first_reader={reader:?}"
+            );
+            for j in body.clone() {
+                if let Some(o) = plan.ops.get(j) {
+                    println!("    body op {j}: {:?}", short(&o.kind));
+                }
+            }
+            if let Some(r) = reader {
+                for j in body.end..r.min(body.end + 8) {
+                    if let Some(o) = plan.ops.get(j) {
+                        println!("    AFTER op {j}: {:?}", short(&o.kind));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn short(k: &OpKind) -> String {
+    match k {
+        OpKind::Launch { kernel, .. } => format!("Launch({kernel})"),
+        other => format!("{other:?}").chars().take(40).collect(),
+    }
+}
+
+/// A statement that lowers to SEVERAL rectangles gives every one of
+/// them the same operands — and for the epilogue that is not true of
+/// the kernels it emits.
+///
+/// `Lowerer::emit` resolves a launch's args from `op.inputs ++
+/// op.outputs`, once per rectangle. That is right for a statement whose
+/// rectangles are row or layer slices of one kernel. The epilogue is
+/// not that: it emits a row GATHER, a norm and a GEMM from one
+/// `LmHead`, and the gather's destination is neither of the op's
+/// operands — it is the compacted activation the GEMM then reads.
+///
+/// So the flat list says the gather writes the LOGITS, which it does
+/// not, and every driver quietly ignores those args and uses a
+/// workspace field (`ws.norm_y` in three of the four executors, each
+/// with the same apologetic comment). This test pins the discrepancy
+/// down so the fix has something to satisfy: it prints, per family, the
+/// epilogue's rectangles and the operands each was handed.
+#[test]
+fn what_the_epilogue_hands_each_of_its_rectangles() {
+    use model_compiler::lower::{lower, Arg, Fire};
+
+    for (name, class, plan) in families() {
+        // A fire whose sampled rows are a strict SUBSET, which is what
+        // makes the epilogue emit its gather at all.
+        let mut rows = plain(8);
+        for r in rows.iter_mut().skip(2) {
+            r.samples = false;
+            r.multi_token = true;
+        }
+        let Ok(out) = lower(&plan, &rows, Fire::default()) else {
+            continue;
+        };
+        for l in &out.launches {
+            let kernel = &out.kernels[l.kernel as usize];
+            // The EPILOGUE's gather by exact symbol: `contains("gather")`
+            // also catches deepseek_v4's paged compress-gather, which is
+            // a body statement and lowers one-to-one.
+            if kernel != "layout::gather_bf16_rows" {
+                continue;
+            }
+            let peers: Vec<&str> = out
+                .launches
+                .iter()
+                .filter(|p| p.op == l.op)
+                .map(|p| out.kernels[p.kernel as usize].as_str())
+                .collect();
+            let args: Vec<String> = out.args[l.args.start as usize..l.args.end as usize]
+                .iter()
+                .map(|a| match a {
+                    Arg::Arena { at, width } => format!("arena@{at}/w{width}"),
+                    Arg::Named { value, width } => format!("named(v{value})/w{width}"),
+                    Arg::Weight(w) => format!("weight({w})"),
+                })
+                .collect();
+            println!("{name:12} {class:?} op {} -> {peers:?}", l.op);
+            println!("    every rectangle is handed: {args:?}");
+            // The ONE thing that is true and has to stay true: the last
+            // rectangle really does write the op's output. If that ever
+            // stops holding, the flat list has no truthful operand left
+            // at all.
+            let last = out
+                .launches
+                .iter()
+                .filter(|p| p.op == l.op)
+                .next_back()
+                .expect("the epilogue emits at least the gemm");
+            assert!(
+                out.kernels[last.kernel as usize].contains("gemm"),
+                "{name} {class:?}: the epilogue's last rectangle is {}, \
+                 not the gemm — the operand run describes that one and \
+                 nothing else",
+                out.kernels[last.kernel as usize]
+            );
+        }
+    }
+}
+
+/// WHICH OP KINDS A FAMILY'S TEXT ACTUALLY STATES.
+///
+/// A green parity gate says the declared drive matches the hand-written
+/// one on the model the harness loads. It says nothing about arms that
+/// model never reaches, and this arc has now converted three of those
+/// without noticing until afterwards: llama_like's `RmsnormPerHead` and
+/// semantic `Rope` arms are dead on qwen3-0.6b, which states the FUSED
+/// `rope::qk_rmsnorm_rope_bf16` instead.
+///
+/// One of them was converted with no pin entry, so the arm would have
+/// written host-assigned bytes nothing else reads — on a deployment the
+/// gate cannot load. That is the failure this census exists to make
+/// cheap to check: before converting an arm, ask whether the text the
+/// A/B runs even contains its op.
+#[test]
+fn which_op_kinds_each_family_states() {
+    use std::collections::BTreeMap;
+    for (name, class, plan) in families() {
+        let mut census: BTreeMap<String, usize> = BTreeMap::new();
+        for op in &plan.ops {
+            let key = match &op.kind {
+                OpKind::Launch { kernel, .. } => format!("Launch:{kernel}"),
+                other => format!("{other:?}")
+                    .split(|c: char| !c.is_alphanumeric())
+                    .next()
+                    .unwrap_or("?")
+                    .to_string(),
+            };
+            *census.entry(key).or_default() += 1;
+        }
+        let mut line: Vec<String> =
+            census.iter().map(|(k, n)| format!("{k}x{n}")).collect();
+        line.sort();
+        println!("{name:12} {class:?}: {}", line.join(" "));
+    }
+}
+
+/// WHICH VALUES A PIN PASS OWES, and what produces them.
+///
+/// `Buffers::assign` leaves a value NAMED when a seam exposes it (plus
+/// everything sharing its buffer). Those are exactly the values a
+/// driver's pin pass must bind: the arena refuses to invent an address
+/// for them, loudly, at load —
+///
+///   declared value arena: value 17 is one the lowering left to the
+///   backend, and no pin pass bound it
+///
+/// which is what llama_like's attention-query conversion hit. Reading
+/// that error requires knowing what value 17 IS, and nothing said so.
+/// This does: per family, the NAMED values and the op kind that writes
+/// each, which is the key a pin pass switches on.
+#[test]
+fn which_values_a_pin_pass_owes() {
+    use std::collections::BTreeMap;
+    for (name, class, plan) in families() {
+        let rows = plain(8);
+        let buffers = Buffers::assign(&plan, &rows);
+        let mut producer: BTreeMap<ValueId, String> = BTreeMap::new();
+        for op in &plan.ops {
+            for &v in &op.outputs {
+                producer.entry(v).or_insert_with(|| match &op.kind {
+                    OpKind::Launch { kernel, .. } => format!("Launch:{kernel}"),
+                    other => format!("{other:?}")
+                        .split(|c: char| !c.is_alphanumeric())
+                        .next()
+                        .unwrap_or("?")
+                        .to_string(),
+                });
+            }
+        }
+        let mut by_kind: BTreeMap<String, Vec<ValueId>> = BTreeMap::new();
+        for (v, &at) in buffers.offset.iter().enumerate() {
+            if at != Buffers::NAMED {
+                continue;
+            }
+            let v = v as ValueId;
+            let who = producer
+                .get(&v)
+                .cloned()
+                .unwrap_or_else(|| "(no producer)".to_string());
+            by_kind.entry(who).or_default().push(v);
+        }
+        let summary: Vec<String> = by_kind
+            .iter()
+            .map(|(k, vs)| {
+                let head: Vec<String> =
+                    vs.iter().take(4).map(|v| format!("v{v}")).collect();
+                format!("{k}x{} [{}...]", vs.len(), head.join(","))
+            })
+            .collect();
+        println!("{name:12} {class:?}: {}", summary.join("  "));
     }
 }

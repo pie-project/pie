@@ -116,6 +116,19 @@ pub enum Error {
         /// What the device says it will hold.
         working_set: u64,
     },
+
+    /// A launch program the interpreter cannot run.
+    ///
+    /// Distinct from every other variant because nothing here is the
+    /// machine's fault: the device is fine, the memory is fine, and the text
+    /// that arrived describes an operation, a shape, or a stage graph that
+    /// does not make sense. Folding it into [`Error::Create`] would send a
+    /// reader looking at budgets and descriptors for a fault whose fix is in
+    /// the program.
+    Program {
+        /// What the interpreter could not make sense of.
+        message: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -160,6 +173,9 @@ impl fmt::Display for Error {
                 f,
                 "{what} span of {bytes} bytes at offset {offset} leaves a region of {len} bytes"
             ),
+            Self::Program { message } => {
+                write!(f, "launch program cannot be interpreted: {message}")
+            }
             Self::WorkingSetExceeded {
                 requested,
                 working_set,

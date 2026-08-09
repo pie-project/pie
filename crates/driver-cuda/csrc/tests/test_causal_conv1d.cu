@@ -1,4 +1,4 @@
-#include "kernels/causal_conv1d.hpp"
+#include "ssm/causal_conv1d.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -107,7 +107,7 @@ bool run_decode_reference(
             x.data() + static_cast<std::size_t>(t) * C,
             static_cast<std::size_t>(C));
         if (!upload(d_x, x_t)) return false;
-        pie_cuda_driver::kernels::launch_causal_conv1d_update_bf16(
+        pie_cuda_driver::kernels::ssm::causal_conv1d_update_bf16(
             d_x, d_weight, d_bias, d_state,
             d_y + static_cast<std::size_t>(t) * C,
             C, K, nullptr);
@@ -171,7 +171,7 @@ bool test_single_prefill_t1_matches_decode_with_prior_state() {
     if (!upload(d_state, std::span<const std::uint16_t>(state))) return false;
     CHK(cudaMalloc(&d_y, x.size() * sizeof(std::uint16_t)));
 
-    pie_cuda_driver::kernels::launch_causal_conv1d_prefill_bf16(
+    pie_cuda_driver::kernels::ssm::causal_conv1d_prefill_bf16(
         d_x, d_weight, d_bias, d_y, d_state, T, C, K, nullptr);
     CHK(cudaGetLastError());
     CHK(cudaDeviceSynchronize());
@@ -268,7 +268,7 @@ bool test_batched_prefill_mixed_t_matches_decode_with_prior_state() {
     if (!upload(d_qo, std::span<const std::uint32_t>(qo))) return false;
     CHK(cudaMalloc(&d_y, x.size() * sizeof(std::uint16_t)));
 
-    pie_cuda_driver::kernels::launch_causal_conv1d_prefill_batched_bf16(
+    pie_cuda_driver::kernels::ssm::causal_conv1d_prefill_batched_bf16(
         d_x, d_weight, d_bias, d_y, d_state, d_slots, d_qo,
         static_cast<long long>(K * C), R, C, K, nullptr);
     CHK(cudaGetLastError());

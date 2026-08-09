@@ -31,8 +31,9 @@
 pub mod facts;
 
 use self::facts::Gemma3nFacts;
-use model_compiler::dsl::{self, matmul, rmsnorm, MatW, NormW, Val};
-use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
+use model_compiler::dsl::{
+    WeightRepr,self, matmul, MatW, NormW, Val};
+use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct G3nLayerW {
     altup_norm: NormW,
@@ -68,6 +69,7 @@ impl G3nLayerW {
             name: w(name),
             width,
             layer: Some(l),
+            repr: WeightRepr::Bf16,
         };
         let n = |name: &str| NormW {
             name: w(name),
@@ -119,10 +121,10 @@ impl G3nLayerW {
 /// IS one shape: the halves differ only in which weights they read and
 /// how the result unpacks.
 fn altup_coefs(x: &Val, norm: &NormW, router: &MatW, coefs: &MatW, scale: &str) -> Val {
-    let n = rmsnorm(x, norm);
-    let n = dsl::cuda::scalar_mul(&n, scale);
+    let n = dsl::cuda::rmsnorm(x, norm);
+    let n = dsl::cuda::scalar_mul(&n, scale, None);
     let modality = matmul(&n, router);
-    let modality = dsl::cuda::tanh(&modality, router.width);
+    let modality = dsl::cuda::tanh(&modality);
     matmul(&modality, coefs)
 }
 
@@ -143,6 +145,11 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
         let mut streams = dsl::cuda::hc_expand(&embedded, k, facts.hidden);
 
         for l in 0..facts.layers() {
+            // THIS LAYER's sliding window, `-1` for none — a
+            // load-time fact the dispatch statements carry, where four
+            // executors used to re-derive it per launch.
+            let window_left =
+                model_compiler::facts::window_left_at(&facts.window_left, l);
             let w = G3nLayerW::new(l, facts);
             let active_in = dsl::select(&streams, active);
 
@@ -162,35 +169,35 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             // `gemma3n.cpp` it is `predictions + active * N * H`, a
             // pointer offset with no kernel behind it.
             let p_active = dsl::select(&predictions, active);
-            let x = rmsnorm(&p_active, &w.attn_norm);
+            let x = dsl::cuda::rmsnorm(&p_active, &w.attn_norm);
 
             let lau = matmul(&x, &w.laurel_left);
             let lau = matmul(&lau, &w.laurel_right);
-            let lau = rmsnorm(&lau, &w.laurel_post_norm);
+            let lau = dsl::cuda::rmsnorm(&lau, &w.laurel_post_norm);
 
             let q = matmul(&x, &w.q_proj);
             let kk = matmul(&x, &w.k_proj);
             let v = matmul(&x, &w.v_proj);
-            let q = rmsnorm(&q, &w.q_norm);
-            let kk = rmsnorm(&kk, &w.k_norm);
+            let q = dsl::cuda::rmsnorm(&q, &w.q_norm);
+            let kk = dsl::cuda::rmsnorm(&kk, &w.k_norm);
             // The value takes the SCALE-LESS norm: gemma3n norms v too,
             // and with no gamma.
             let v = dsl::cuda::rmsnorm_no_scale(&v);
-            let (q, kk) = dsl::rope(&q, &kk, RopeKind::Standard);
+            let (q, kk) = dsl::cuda::rope(&q, &kk);
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&kk, &v, &kv);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            let o = dsl::cuda::attention_flashinfer_decode(&q, &kv)
+            let o = dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left)
                 .expect("a plain attention statement produces its value");
             dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
             let o = matmul(&o, &w.o_proj);
-            let o = rmsnorm(&o, &w.post_attn_norm);
+            let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);
             let mid = dsl::cuda::residual_add(&p_active, &o, facts.hidden);
             let mid = dsl::cuda::residual_add(&mid, &lau, facts.hidden);
-            let mid = dsl::cuda::scalar_mul(&mid, &format!("layer.{l}.laurel_scale"));
+            let mid = dsl::cuda::scalar_mul(&mid, &format!("layer.{l}.laurel_scale"), None);
 
             // ── MLP ──────────────────────────────────────────────────
-            let m = rmsnorm(&mid, &w.mlp_norm);
+            let m = dsl::cuda::rmsnorm(&mid, &w.mlp_norm);
             let gate = matmul(&m, &w.gate_proj);
             let up = matmul(&m, &w.up_proj);
             let gate = if facts.is_sparse(l) {
@@ -200,7 +207,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             };
             let act = dsl::cuda::geglu_tanh_pair(&gate, &up, facts.intermediate(l));
             let mlp = matmul(&act, &w.down_proj);
-            let mlp = rmsnorm(&mlp, &w.post_mlp_norm);
+            let mlp = dsl::cuda::rmsnorm(&mlp, &w.post_mlp_norm);
             let activated = dsl::cuda::residual_add(&mid, &mlp, facts.hidden);
 
             // ── AltUp.correct ────────────────────────────────────────
@@ -240,7 +247,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
         let target = dsl::cuda::compute_rms(&active_final);
         let y = dsl::cuda::mean_streams(&streams, facts.hidden);
         let y = dsl::cuda::magnitude_rescale(&y, &target, facts.hidden);
-        let normed = rmsnorm(
+        let normed = dsl::cuda::rmsnorm(
             &y,
             &NormW {
                 name: "final_norm".to_string(),

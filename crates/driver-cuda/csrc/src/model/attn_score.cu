@@ -9,7 +9,7 @@
 #include "model/attn_observation.hpp"
 #include "model/hook_sideband_arena.hpp"
 #include "model/stage_hooks.hpp"
-#include "ops/attention_flashinfer.hpp"
+#include "attn/attention_flashinfer.hpp"
 #include "store/kv_cache.hpp"
 
 namespace pie_cuda_driver {
@@ -329,7 +329,7 @@ void LayerScoreCapture::publish(
         throw std::runtime_error(
             "attention score capture lost its fire geometry mid-layer");
     }
-    ops::launch_attn_score_fold_heads(
+    kernels::attn::attn_score_fold_heads(
         buf_.raw, buf_.indptr_d, kv_page_indptr_d, kv_last_page_lens_d,
         page_size, obs->num_requests, static_cast<int>(num_q_heads_),
         buf_.folded, stream_);

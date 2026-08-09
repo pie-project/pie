@@ -12,7 +12,7 @@
 //! is absent). Root cause is in the driver, NOT this inferlet:
 //!   - The device-geometry AttnMask dense-pack (executor.cpp ~L2788) computes
 //!     `lanes = qo_indptr.size() - 1` = number of SEQUENCES and packs ONE mask
-//!     row per lane (`launch_pack_dense_mask(.., lanes, stride, ..)`). It is
+//!     row per lane (`kernels::attn::pack_dense_mask(.., lanes, stride, ..)`). It is
 //!     DECODE-SHAPED: it cannot express an `[N_query, KV]` prefill mask (a single
 //!     sequence with N query rows collapses to lanes=1 + a garbled stride).
 //!   - The explicit-KV-write descriptor (executor.cpp ~L2838) is "the single

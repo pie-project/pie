@@ -2,6 +2,7 @@
 //! layer schedule and the CUDA deployment's bindings.
 
 use serde::{Deserialize, Serialize};
+use model_compiler::dsl::WeightRepr;
 use model_compiler::trace::NormVariant;
 
 /// Facts for one qwen3_5_moe-family MoE MLP block — a traced FRAGMENT, not
@@ -99,7 +100,7 @@ pub struct Qwen35GdnFacts {
     /// the same way).
     pub fused_in_proj: bool,
     /// qwen3.5/3.6 use the Gemma `(1 + w)` fold for the block norms
-    /// (`launch_rmsnorm_gemma_bf16` on the pre-attention norm). The GATED
+    /// (`kernels::norm::rmsnorm_gemma_bf16` on the pre-attention norm). The GATED
     /// norm inside the block is not governed by this: its weight fold is
     /// plain by kernel contract (`rmsnorm.hpp`).
     pub norm_variant: NormVariant,
@@ -143,7 +144,7 @@ impl Qwen35GdnFacts {
     /// * `fused_in_proj: false` is the live default binding
     ///   (`PIE_QWEN35_FUSED_GDN_PROJ` unset — see the field doc).
     /// * `norm_variant: Gemma`: `qwen3_5_forward.cpp` launches
-    ///   `launch_rmsnorm_gemma_bf16` for every block norm, and the Metal
+    ///   `kernels::norm::rmsnorm_gemma_bf16` for every block norm, and the Metal
     ///   port states "All RMSNorm gains use the Gemma (1+w) convention"
     ///   (`crates/driver-metal/csrc/tests/mlx/model/qwen3_5.hpp`).
     pub fn qwen3_5_0_8b() -> Self {
@@ -166,11 +167,11 @@ impl Qwen35GdnFacts {
 /// This is NOT llama_like's attention, which is why it gets its own facts
 /// instead of a `LlamaLikeFacts` configuration: the q projection is 2× wide
 /// with an interleaved per-head `[query | gate]` split
-/// (`launch_split_q_gate_bf16`), the attention output is multiplied by
-/// `sigmoid(gate)` (`launch_sigmoid_gate_inplace_bf16` — no residual, not
+/// (`kernels::layout::split_q_gate_bf16`), the attention output is multiplied by
+/// `sigmoid(gate)` (`kernels::mlp::sigmoid_gate_inplace_bf16` — no residual, not
 /// the shared-expert `SigmoidGateAdd`), rope is PARTIAL
-/// (`partial_rotary_factor`, `launch_rope_partial_bf16`), and the per-head
-/// q/k norms fold Gemma-style (`launch_rmsnorm_gemma_bf16` over `N * heads`
+/// (`partial_rotary_factor`, `kernels::rope::rope_partial_bf16`), and the per-head
+/// q/k norms fold Gemma-style (`kernels::norm::rmsnorm_gemma_bf16` over `N * heads`
 /// rows of `head_dim`). The qk-norm is not a tri-state here: the
 /// hand-written `full_attn_layer_body` launches the per-head pair
 /// unconditionally, so the declaration does too, and only the fold is a
@@ -197,11 +198,11 @@ pub struct Qwen35FullAttnFacts {
     /// matmuls; with the join enabled it writes Matmul(qgkv) + SplitQkv
     /// whose "q" leg is the 2×-wide `[query | gate]` bank
     /// (`full_attn_layer_body`'s `use_fused_qgkv` branch:
-    /// `launch_split_qkv_bf16(packed, qg, k, v, N, 2*Hq, Hk)`).
+    /// `kernels::attn::split_qkv_bf16(packed, qg, k, v, N, 2*Hq, Hk)`).
     pub fused_qkv: bool,
     /// qwen3.5 folds `(1 + w)` on every norm of this block — the
     /// pre-attention norm AND the per-head q/k norms
-    /// (`launch_rmsnorm_gemma_bf16` throughout `full_attn_layer_body`).
+    /// (`kernels::norm::rmsnorm_gemma_bf16` throughout `full_attn_layer_body`).
     pub norm_variant: NormVariant,
 }
 
@@ -235,7 +236,7 @@ impl Qwen35FullAttnFacts {
     /// * `fused_qkv: false` is the live default binding
     ///   (`PIE_QWEN35_FUSED_FULL_ATTN_QGKV` unset — see the field doc).
     /// * `norm_variant: Gemma`: `full_attn_layer_body` launches
-    ///   `launch_rmsnorm_gemma_bf16` for the block norm and both per-head
+    ///   `kernels::norm::rmsnorm_gemma_bf16` for the block norm and both per-head
     ///   q/k norms, and the Metal port states "All RMSNorm gains use the
     ///   Gemma (1+w) convention" (`crates/driver-metal/csrc/tests/mlx/model/qwen3_5.hpp`).
     pub fn qwen3_5_0_8b() -> Self {
@@ -327,7 +328,7 @@ pub struct Qwen35HybridFacts {
 pub struct Qwen35CudaFacts {
     /// The recurrent-state store dtype is bf16 (vs fp32) — the
     /// `state_bf16` parameter every GDN recurrence launcher family
-    /// suffixes (`launch_recurrent_gated_delta_step_batched[_state_bf16]`
+    /// suffixes (`kernels::ssm::recurrent_gated_delta_step_batched[_state_bf16]`
     /// and the chunked prefill families).
     pub state_bf16: bool,
     /// The warp-tiled prefill arm EXISTS at all: `K_d <= 256` && the
@@ -365,7 +366,7 @@ pub struct Qwen35CudaFacts {
     #[serde(default)]
     pub verify_stash: bool,
     /// `Qwen3_5MoeMlpWorkspace::cutlass_max_rows` — `min(max_tokens, 512)`
-    /// when `ops::flashinfer_cutlass_moe_enabled()` sized a workspace,
+    /// when `kernels::moe::flashinfer_cutlass_moe_enabled()` sized a workspace,
     /// else 0. Zero means the fused leg does not exist on this
     /// deployment; non-zero is the ROW BOUND of the MoE text, and fires
     /// above it decline rather than the declaration guessing which of
@@ -420,6 +421,25 @@ pub struct Qwen35CudaFacts {
     /// form outright.
     #[serde(default)]
     pub gate_up_fused: bool,
+    /// How this deployment STORES its linear projections — the weight
+    /// representation axis ([`model_compiler::dsl::WeightRepr`]).
+    ///
+    /// [`LlamaLikeCudaFacts::proj_repr`]'s reasoning applies verbatim,
+    /// and this family had EIGHT of the eighteen `make_weight_view`
+    /// sites the axis removes. Serde-defaulted to dense (append-only
+    /// discipline).
+    #[serde(default)]
+    pub proj_repr: WeightRepr,
+    /// The SLIDING WINDOW each layer attends over, `-1` for none —
+    /// read through [`model_compiler::facts::window_left_at`], which is
+    /// where the shape of this list is documented.
+    ///
+    /// The dispatch statements carry it, so no executor reaches into
+    /// `fwd_cfg.per_layer_window_left` for it. Serde-defaulted, and
+    /// empty reads as "no window", which is what every fixture written
+    /// before this field meant.
+    #[serde(default)]
+    pub window_left: Vec<i32>,
 }
 
 impl Qwen35CudaFacts {
@@ -444,6 +464,8 @@ impl Qwen35CudaFacts {
     /// with a real threshold), which the live-default set would erase.
     pub fn qwen3_5_0_8b_synthetic() -> Self {
         Self {
+            // 0.8B attends the whole context.
+            window_left: Vec::new(),
             state_bf16: true,
             warp_tiled: true,
             warp_tiled_max: 64,
@@ -467,6 +489,9 @@ impl Qwen35CudaFacts {
             // same `dense_fused_projection_joins` contract llama_like's
             // does), so the chunked form is the golden's shape.
             gate_up_fused: true,
+            // Dense, and for the same contract reason: a group the join
+            // packs is a BF16 one.
+            proj_repr: WeightRepr::Bf16,
         }
     }
 }

@@ -12,10 +12,11 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/kv_cache_view.hpp"
-#include "kernels/kv_paged.hpp"
-#include "kernels/rope.hpp"
-#include "kernels/split_packed.hpp"
+#include "attn/kv_cache_view.hpp"
+#include "attn/kv_paged.hpp"
+#include "rope/rope.hpp"
+#include "attn/qkv_fused.hpp"
+#include "attn/split_packed.hpp"
 
 using namespace pie_cuda_driver;
 
@@ -38,7 +39,7 @@ void run_host_window(KvCacheLayerView layer, const std::uint16_t* k_d,
                      cudaStream_t s) {
     const std::uint16_t* k_off = k_d + static_cast<long long>(start) * kRow;
     const std::uint16_t* v_off = v_d + static_cast<long long>(start) * kRow;
-    kernels::launch_write_kv_explicit_bf16(
+    kernels::attn::write_kv_explicit_bf16(
         layer, k_off, v_off, wp_d + start, wo_d + start, len, s,
         /*row_valid=*/nullptr);
 }
@@ -115,7 +116,7 @@ int main() {
                 static_cast<std::uint32_t>(w[1])};
             CUDA_CHECK(cudaMemcpyAsync(win_d, win_h, 8,
                                        cudaMemcpyHostToDevice, s));
-            kernels::launch_write_kv_explicit_bf16_devwin(
+            kernels::attn::write_kv_explicit_bf16_devwin(
                 layer, k_d, v_d, wp_d, wo_d, win_d, kLanes, s,
                 /*row_valid=*/nullptr);
 
@@ -159,7 +160,7 @@ int main() {
             for (auto* buf : {ka, va, kb, vb}) {
                 CUDA_CHECK(cudaMemset(buf, 0xCD, kLanes * kKv * 2));
             }
-            kernels::launch_split_qkv_bf16(
+            kernels::attn::split_qkv_bf16(
                 packed_d + static_cast<long long>(w[0]) * kStride,
                 qa + static_cast<long long>(w[0]) * kQ,
                 ka + static_cast<long long>(w[0]) * kKv,
@@ -170,7 +171,7 @@ int main() {
                 static_cast<std::uint32_t>(w[1])};
             CUDA_CHECK(cudaMemcpyAsync(win_d, win_h, 8,
                                        cudaMemcpyHostToDevice, s));
-            kernels::launch_split_qkv_bf16_devwin(
+            kernels::attn::split_qkv_bf16_devwin(
                 packed_d, qb, kb, vb, win_d, kLanes, kQ, kKv, s);
             CUDA_CHECK(cudaStreamSynchronize(s));
             auto cmp = [](const void* x, const void* y, std::size_t n) {
@@ -225,7 +226,7 @@ int main() {
                                   cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(kb, kk_h.data(), kk_h.size() * 2,
                                   cudaMemcpyHostToDevice));
-            kernels::launch_qk_rmsnorm_rope_bf16(
+            kernels::rope::qk_rmsnorm_rope_bf16(
                 qa + static_cast<long long>(w[0]) * kQH * kD,
                 ka + static_cast<long long>(w[0]) * kKH * kD,
                 wq, wk, pos_d + w[0], w[1], kQH, kKH, kD,
@@ -235,7 +236,7 @@ int main() {
                 static_cast<std::uint32_t>(w[1])};
             CUDA_CHECK(cudaMemcpyAsync(win_d, win_h, 8,
                                        cudaMemcpyHostToDevice, s));
-            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+            kernels::rope::qk_rmsnorm_rope_bf16_devwin(
                 qb, kb, wq, wk, pos_d, win_d, kLanes, kQH, kKH, kD,
                 10000.f, 1e-6f, s);
             CUDA_CHECK(cudaStreamSynchronize(s));
@@ -311,7 +312,7 @@ int main() {
                     CUDA_CHECK(cudaMemset(cva, 0xAB, cache_elems * 2));
                     CUDA_CHECK(cudaMemset(ckb, 0xAB, cache_elems * 2));
                     CUDA_CHECK(cudaMemset(cvb, 0xAB, cache_elems * 2));
-                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16(
                         packed_d, qa, cka, cva, wq, wk, pos_d,
                         /*rope_table=*/nullptr,
                         /*kv_page_indices=*/nullptr,
@@ -325,7 +326,7 @@ int main() {
                         static_cast<std::uint32_t>(kLanes - c)};
                     CUDA_CHECK(cudaMemcpyAsync(win_d, win_h, 8,
                                                cudaMemcpyHostToDevice, s));
-                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+                    kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                         packed_d, qb, ckb, cvb, wq, wk, pos_d,
                         nullptr, nullptr, nullptr, nullptr,
                         wp_d, wo_d, nullptr,
@@ -398,7 +399,7 @@ int main() {
 
                 layer.k_pages = cache_a_k;
                 layer.v_pages = cache_a_v;
-                kernels::launch_write_kv_to_pages(
+                kernels::attn::write_kv_to_pages(
                     layer, k_d, v_d, qo_d, kvpi_d, kvpp_d, kvlpl_d,
                     kLanes, kLanes, s, /*row_valid=*/nullptr,
                     /*first_token=*/c);
@@ -410,7 +411,7 @@ int main() {
                     static_cast<std::uint32_t>(kLanes - c)};
                 CUDA_CHECK(cudaMemcpyAsync(win_d, win_h, 8,
                                            cudaMemcpyHostToDevice, s));
-                kernels::launch_write_kv_to_pages_bf16_devwin(
+                kernels::attn::write_kv_to_pages_bf16_devwin(
                     layer, k_d, v_d, qo_d, kvpi_d, kvpp_d, kvlpl_d,
                     win_d, kLanes, kLanes, s, /*row_valid=*/nullptr);
 

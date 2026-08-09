@@ -87,6 +87,13 @@ void encode_gemma4_vision(const Gemma4VisionInputs& in,
 //   grp      : i32  [n_patch]              (precomputed 2D-pool group id per patch)
 //   out_proj : bf16 [out_len, text_hidden] (written; out_len = n_patch/pool_k^2)
 // Allocates internal scratch (first-cut; a workspace arena is a follow-up).
+// Optional staged tap, for a parity harness that wants the intermediates.
+// Null in production and costs a null check per stage. It exists so the
+// harness can test THIS function instead of keeping its own copy of it --
+// which is what it used to do, and which meant a passing parity run said
+// nothing about the code that ships.
+using VisDebugTap = void (*)(const char* tag, const __nv_bfloat16* d, long n);
+
 void run_gemma4_vision(const VisRawWeights& w,
                        const __nv_bfloat16* pixel,
                        const float* pos,
@@ -94,6 +101,7 @@ void run_gemma4_vision(const VisRawWeights& w,
                        int n_patch,
                        int out_len,
                        __nv_bfloat16* out_proj,
-                       cudaStream_t stream = 0);
+                       cudaStream_t stream = 0,
+                       VisDebugTap dbg = nullptr);
 
 }  // namespace pie_cuda_driver::model

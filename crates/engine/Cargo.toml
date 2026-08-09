@@ -23,7 +23,6 @@ tensor-compiler = { path = "../tensor-compiler" }
 # The native execution shells, for their archives alone -- see the feature
 # comments above and the `extern crate ... as _` in lib.rs.
 driver-cuda = { path = "../driver-cuda", optional = true }
-driver-metal = { path = "../driver-metal", optional = true }
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7"
@@ -115,7 +114,6 @@ default = []
 #
 # The crate that declares an `extern "C"` is the crate that owes the symbol.
 driver-cuda = ["dep:driver-cuda"]
-driver-metal = ["dep:driver-metal"]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in

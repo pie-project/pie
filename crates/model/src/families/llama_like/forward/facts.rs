@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 // is written in these words. Re-exported so a declaration reaches its
 // facts and the words they are stated in from one place.
 pub use model_compiler::facts::{NormPlacement, QkNorm};
+use model_compiler::dsl::WeightRepr;
 use model_compiler::trace::{NormVariant, RopeKind};
 
 /// The llama_like family's facts: covers qwen3, mistral3, phi3, olmo2/3
@@ -68,6 +69,11 @@ impl LlamaLikeFacts {
             qk_norm: self.qk_norm,
             norm_variant: self.norm_variant,
             tied_embeddings: self.tied_embeddings,
+            // DENSE, because these are the SEMANTIC facts: a trace with
+            // no backend cannot name the kernel a scaled weight needs,
+            // so the representation reaches the namespace from the
+            // BACKEND facts (`llama_like_cuda` overrides it below).
+            proj_repr: model_compiler::dsl::WeightRepr::Bf16,
         }
     }
 
@@ -212,7 +218,7 @@ impl LlamaLikeFacts {
     ///   `post_attention_layernorm` + `post_feedforward_layernorm` and NO
     ///   `input_layernorm`; each sub-layer reads the residual stream raw,
     ///   norms its own output, and a separate residual add lands it
-    ///   (`launch_residual_add_bf16` in the hand-written post-norm walk).
+    ///   (`kernels::norm::residual_add_bf16` in the hand-written post-norm walk).
     /// * `qk_norm: Global` — the checkpoint's `q_norm`/`k_norm` weights
     ///   are shape `[2048]` = heads x head_dim (verified against the
     ///   safetensors header), NOT `[128]`: one RMSNorm over the flattened
@@ -299,6 +305,21 @@ pub struct LlamaLikeCudaFacts {
     /// Serde-defaulted (append-only discipline).
     #[serde(default)]
     pub head_dim_padded: bool,
+    /// The head width the ATTENTION kernels run at (Phi-3-mini: 128 for
+    /// a logical 96), or 0 for a deployment that runs at the logical
+    /// one.
+    ///
+    /// [`Self::head_dim_padded`] is exactly `head_dim_kernel != 0`, and
+    /// both are here because the bool is in the digest and the WIDTH is
+    /// what a statement needs: `cuda::pad_head_dim` produces a value
+    /// whose shape is `heads * head_dim_kernel`, and a shape is not
+    /// something a boolean gives. Sixteen executor sites read the bool
+    /// and re-derived the width from config; the pads and the strip are
+    /// statements now, so the width crosses with them.
+    ///
+    /// Serde-defaulted (append-only discipline).
+    #[serde(default)]
+    pub head_dim_kernel: u32,
     /// The checkpoint materialised a packed gate‖up bank
     /// (`w.layers[l].gate_up_proj_fused != nullptr`), so the MLP's packed
     /// GEMM lands in one buffer and the activation is the CHUNKED swiglu
@@ -320,6 +341,83 @@ pub struct LlamaLikeCudaFacts {
     /// Serde-defaulted (append-only discipline).
     #[serde(default)]
     pub gate_up_fused: bool,
+    /// How this deployment STORES its linear projections — the weight
+    /// representation axis ([`model_compiler::dsl::WeightRepr`]).
+    ///
+    /// A pure binding fact, like [`Self::gate_up_fused`], and the last
+    /// one the driver was answering for itself: `make_weight_view` built
+    /// a `WeightView` out of a per-layer `QuantMeta` the statement never
+    /// mentioned and `gemm::act_x_w` routed on it — ten call sites here
+    /// and eight in qwen3.5, every one of them the driver knowing
+    /// something the declaration did not.
+    ///
+    /// ONE repr for the whole deployment rather than one per projection,
+    /// because a checkpoint quantizes uniformly and the build gate
+    /// refuses a mixed binding by name. Where a checkpoint ever does
+    /// mix, this becomes a field per projection and the text asks the
+    /// facts per handle — nothing else changes, which is the point of
+    /// putting the axis on the WEIGHT.
+    ///
+    /// Serde-defaulted to dense (append-only discipline), so a fixture
+    /// written before this field reads exactly as it did.
+    #[serde(default)]
+    pub proj_repr: WeightRepr,
+    /// How many ranks this deployment shards its layers across
+    /// (`LlamaLikeForwardCfg::tp_size`), or 0/1 for a single GPU.
+    ///
+    /// SHARDING NEEDS NO VOCABULARY: a rank's trace states ITS widths,
+    /// and the text divides by this the way it divides by anything
+    /// else. What needs vocabulary is the point where the shards are
+    /// recombined, because that is a launch — `dist::all_reduce_bf16`
+    /// and its two friends, which the text states.
+    ///
+    /// So this fact does two things and neither is a switch the driver
+    /// reads: it narrows the projection widths, and it decides whether
+    /// the landing statements exist at all.
+    ///
+    /// Serde-defaulted (append-only discipline); 0 reads as one rank.
+    #[serde(default)]
+    pub tp_size: u32,
+    /// The SLIDING WINDOW each layer attends over, `-1` for none.
+    ///
+    /// Empty means every layer is `-1` — a deployment with no window at
+    /// all — which is why the accessor and not the field is what texts
+    /// read ([`Self::window_left_at`]).
+    ///
+    /// A load-time fact: a config's `sliding_window`, or its per-layer
+    /// list where the architecture alternates (OLMo-3, Mistral). Eleven
+    /// executor sites across four families derived it by reaching into
+    /// `fwd_cfg.per_layer_window_left` — a per-layer array no statement
+    /// mentioned — and the dispatch statements carry it now.
+    ///
+    /// The per-FIRE override (`runtime_window_left`) is NOT this. That
+    /// is a runtime input and wants a guard predicate;
+    /// `DeclineReason::SlidingWindow` still names it.
+    ///
+    /// Serde-defaulted (append-only discipline).
+    #[serde(default)]
+    pub window_left: Vec<i32>,
+    /// Rows below which an all-reduce takes the NVLink P2P kernel
+    /// instead of NCCL, or 0 for a deployment that always takes NCCL.
+    ///
+    /// `NcclComm::all_reduce_bf16` asks `can_handle(bytes)` and routes
+    /// on the answer — a driver picking between two implementations,
+    /// which is what this replaces. The text states the pair as a guard
+    /// and this is its predicate's payload.
+    ///
+    /// It is a ROW count and the kernel's test is BYTES, which is the
+    /// same question once `hidden` is known: a row is `hidden` bf16
+    /// elements. Converting here rather than in the arm is the point —
+    /// a load-time fact becomes a trace-time constant.
+    ///
+    /// ZERO also covers the deployment that registered no P2P buffers.
+    /// The kernel reads only registered memory, which is a placement
+    /// fact rather than a size one, and a deployment that has none has
+    /// no threshold either.
+    ///
+    /// Serde-defaulted (append-only discipline).
+    #[serde(default)]
+    pub all_reduce_p2p_max_rows: u32,
 }
 
 /// The METAL backend's load-time facts — what the Metal deployment
@@ -330,7 +428,7 @@ pub struct LlamaLikeCudaFacts {
 /// The Metal driver cannot even build on the box we have (`xcrun --find
 /// metal` fails — the shader compiler ships with full Xcode), so every
 /// field here is read off the driver's SOURCE
-/// (`crates/driver-metal/csrc/src/kernels/decode_psos.cpp`, `model/qwen3_5/decode_step.hpp`)
+/// (`crates/driver-metal/csrc/src/batch/decode_psos.cpp`, `model/qwen3_5/decode_step.hpp`)
 /// rather than measured. `.wiki/tart/macos.md` records the ladder; the
 /// precedent for refusing to call an unmeasured fact set measured is
 /// [`Qwen35CudaFacts::qwen3_5_0_8b_synthetic`].
@@ -364,6 +462,16 @@ impl LlamaLikeMetalFacts {
 }
 
 impl LlamaLikeCudaFacts {
+    /// The window layer `l` attends over, `-1` for none.
+    ///
+    /// A short list is not an error: a deployment whose config carries
+    /// ONE `sliding_window` states a one-element list and every layer
+    /// reads it, which is what the drivers' `per_layer_window_left`
+    /// fallback meant.
+    pub fn window_left_at(&self, l: u32) -> i32 {
+        model_compiler::facts::window_left_at(&self.window_left, l)
+    }
+
     /// Qwen3-0.6B on L40S, default env — MEASURED 2026-08-02 against the
     /// driver's own derivation via the rung-3 digest print
     /// (`PIE_DECLARED_FORWARD_TRACE=1` + `..._GENERATED=1`; the live
@@ -387,6 +495,7 @@ impl LlamaLikeCudaFacts {
             rope_table: true,
             force_prefill_path: false,
             head_dim_padded: false,
+            head_dim_kernel: 0,
             // The loader's `dense_fused_projection_joins` contract packs
             // BF16 dense groups and declines quantized ones, so a plain
             // BF16 deployment carries the bank. VERIFIED LIVE, not
@@ -394,6 +503,16 @@ impl LlamaLikeCudaFacts {
             // so, and the digest refuses the deployment if this fixture
             // and the binding disagree.
             gate_up_fused: true,
+            // Dense. The same contract line says so: a group it packs is
+            // a BF16 one, so a deployment that carries the bank cannot
+            // be quantized.
+            proj_repr: WeightRepr::Bf16,
+            // One rank: the L40S fixture is a single GPU.
+            tp_size: 1,
+            // qwen3-0.6B attends over the whole prefix.
+            window_left: Vec::new(),
+            // Single GPU: no collective, so no threshold.
+            all_reduce_p2p_max_rows: 0,
         }
     }
 }

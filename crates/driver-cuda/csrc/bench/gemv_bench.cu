@@ -20,7 +20,7 @@
 // Build (~15s):
 //   nvcc -O3 -std=c++20 -arch=sm_100 --expt-relaxed-constexpr \
 //        -I driver/cuda/src -o /tmp/gemv_bench \
-//        driver/cuda/bench/gemv_bench.cu driver/cuda/src/kernels/gemv.cu \
+//        driver/cuda/bench/gemv_bench.cu driver/cuda/src/gemm/gemv.cu \
 //        -lcublas -lcublasLt
 //
 // Run:
@@ -40,7 +40,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "kernels/gemv.hpp"
+#include "gemm/gemv.hpp"
 
 namespace {
 
@@ -132,7 +132,7 @@ void run_pie(void* p) {
     __nv_bfloat16* w = c->w[c->it++ % c->w.size()];
     // The driver's own entry point: picks the row-per-warp or the K-split
     // form by `PIE_GEMV_SPLITK_MAX_ROWS`, exactly as the engine would.
-    pie_cuda_driver::kernels::launch_gemv_bf16(
+    pie_cuda_driver::kernels::gemm::gemv_bf16(
         w, c->x, /*bias=*/nullptr, c->y, c->n, c->k, /*stream=*/nullptr,
         /*beta=*/0.f);
 }
@@ -270,7 +270,7 @@ void sweep(const Shape& sh) {
         auto fn = [](void* p) {
             Arg* a = static_cast<Arg*>(p);
             __nv_bfloat16* w = a->c->w[a->c->it++ % a->c->w.size()];
-            pie_cuda_driver::kernels::launch_gemv_bf16_tuned(
+            pie_cuda_driver::kernels::gemm::gemv_bf16_tuned(
                 w, a->c->x, nullptr, a->c->y, a->c->n, a->c->k, a->w, a->u,
                 nullptr);
         };
@@ -301,18 +301,35 @@ void sweep_splitk(const Shape& sh) {
     const double bytes = static_cast<double>(wn) * 2.0;
     std::printf("%-18s N=%6d K=%6d  %4.0f MB  [split-K]\n", sh.what, sh.n,
                 sh.k, wbytes / 1e6);
-    for (int w : {2, 4, 8, 16, 32}) {
+    // Exactly the (warps, unroll) pairs gemv.cu instantiates. This used to
+    // sweep warps alone over {2,4,8,16,32}: 32 is not instantiated, so that
+    // row measured `gemv_splitk_tuned` returning false without launching, and
+    // reported the empty time as a bandwidth number. The `unroll` parameter
+    // was added so it could be measured on Blackwell (gemv.cu:565) and this,
+    // its only caller, was never taught to pass it.
+    static constexpr struct { int w, u; } kTuned[] = {
+        {2,1}, {4,1}, {8,1}, {16,1},
+        {2,2}, {4,2}, {8,2}, {16,2},
+        {2,4}, {4,4}, {8,4},
+    };
+    for (auto t : kTuned) {
         c.it = 0;
-        struct Arg { Ctx* c; int w; } arg{&c, w};
+        struct Arg { Ctx* c; int w, u; } arg{&c, t.w, t.u};
         auto fn = [](void* p) {
             Arg* a = static_cast<Arg*>(p);
             __nv_bfloat16* wt = a->c->w[a->c->it++ % a->c->w.size()];
-            pie_cuda_driver::kernels::launch_gemv_splitk_tuned(
-                wt, a->c->x, nullptr, a->c->y, a->c->n, a->c->k, a->w, nullptr);
+            if (!pie_cuda_driver::kernels::gemm::gemv_splitk_tuned(
+                    wt, a->c->x, nullptr, a->c->y, a->c->n, a->c->k,
+                    a->w, a->u, nullptr)) {
+                std::fprintf(stderr, "gemv_splitk_tuned declined warps=%d unroll=%d\n",
+                             a->w, a->u);
+                std::abort();  // a silent decline is what produced the bogus row
+            }
         };
         const float ms = time_ms(fn, &arg);
-        std::printf("   warps=%-3d %8.1f us  %5.2f TB/s%s\n", w, ms * 1e3,
-                    bytes / (ms * 1e-3) / 1e12, w == 8 ? "   <- shipping" : "");
+        std::printf("   warps=%-3d unroll=%-2d %8.1f us  %5.2f TB/s%s\n",
+                    t.w, t.u, ms * 1e3, bytes / (ms * 1e-3) / 1e12,
+                    (t.w == 8 && t.u == 1) ? "   <- shipping" : "");
     }
     for (__nv_bfloat16* w : c.w) CHECK(cudaFree(w));
     CHECK(cudaFree(c.x)); CHECK(cudaFree(c.y));

@@ -1,0 +1,146 @@
+#pragma once
+
+// Depthwise causal 1D convolution used by the Qwen3.5 GatedDeltaNet
+// in-projection step. Two entry points:
+//
+//   * `causal_conv1d_prefill_bf16`: full-prefill of N tokens
+//     for a single request. Each output position t convolves the K
+//     prior input positions (0-padded for t < K-1). Fused silu.
+//     Optionally writes the trailing K elements of input into the
+//     conv_state buffer for downstream decode steps.
+//
+//   * `causal_conv1d_update_bf16`: single-token (T=1) update
+//     for decode. Shifts conv_state left by 1, appends the new x,
+//     emits one silu(conv) output token, and persists the updated
+//     state. Used per request per linear-attn layer.
+//
+// Memory layout (channels-last, matches the GatedDeltaNet in-proj
+// output shape after the linear: x[N, C] flat, then split by the
+// caller into Q/K/V chunks along C):
+//
+//     x       : [N, C]    bf16 — N tokens, C channels (= 2*K_dim + V_dim)
+//     weight  : [C, K]    bf16 — per-channel kernel of length K
+//     bias    : [C]       bf16 — optional per-channel bias (nullptr = none)
+//     state   : [K, C]    bf16 — last K input rows, oldest first
+//     y       : [N, C]    bf16 — conv output
+
+#include <cstdint>
+#include <cuda_runtime.h>
+
+namespace pie_cuda_driver::kernels::ssm {
+
+// Single-request prefill. `state_out` may be nullptr to skip persisting
+// the trailing K-window into a state buffer.
+void causal_conv1d_prefill_bf16(
+    const void* x,
+    const void* weight,
+    const void* bias,
+    void*       y,
+    void*       state_out,
+    int N,
+    int C,
+    int K,
+    cudaStream_t stream);
+
+// The same convolution with the silu left off.
+//
+// Gemma-4's audio lconv1d wants exactly this and had its own copy of it
+// (`k_depthwise_causal` in `model/gemma4/gemma4_audio_forward.cu`) --
+// same [N, C] layout, same [C, K] per-channel weight, same
+// `t - (K-1) + j` indexing, same zero pad. The only thing that made it a
+// second kernel was the activation this file had fused in, so the
+// activation became a template parameter and the copy went away.
+//
+// `bias` may be nullptr and `state_out` may be nullptr, which together are
+// the plain zero-padded form that caller wants.
+//
+// It belongs in a `conv/` family rather than under `ssm/` -- it is a
+// convolution, and now with two unrelated callers it is visibly not a
+// state-space detail. It has not moved because the family rename would
+// carry `ssm::causal_conv1d_*` through the kernel table, `dsl::cuda`, the
+// model emitters and their generated .inc, which is a wider change than
+// deleting a duplicate.
+void causal_conv1d_prefill_noact_bf16(
+    const void* x,
+    const void* weight,
+    const void* bias,
+    void*       y,
+    void*       state_out,
+    int N,
+    int C,
+    int K,
+    cudaStream_t stream);
+
+// Single-token decode update. Reads state, appends `x` (one row),
+// writes the conv output to `y` (one row), updates `state` in place.
+void causal_conv1d_update_bf16(
+    const void* x,
+    const void* weight,
+    const void* bias,
+    void*       state,
+    void*       y,
+    int C,
+    int K,
+    cudaStream_t stream);
+
+// Multi-request batched decode update. Replaces the host-loop of R
+// single-request `_update_bf16` calls with one kernel launch:
+//
+//     x          : [R, C]            bf16 — one new token per request
+//     y          : [R, C]            bf16 — outputs
+//     state_base : [num_slots, K, C] bf16 — slot 0's address; the kernel
+//                  picks slot `slot_ids[r]` for each request r and reads
+//                  / writes its [K, C] slab in-place
+//     slot_ids   : [R]               int32 (device-resident)
+//     slot_stride_elems : K * C — stride between consecutive slots in
+//                  the state buffer, in bf16 elements
+//
+// Eliminates `R × num_linear_layers` per-token launch overhead on the
+// decode hot path.
+void causal_conv1d_update_batched_bf16(
+    const void* x,
+    const void* weight,
+    const void* bias,
+    void*       state_base,
+    const std::int32_t* slot_ids,
+    long long   slot_stride_elems,
+    void*       y,
+    int R, int C, int K,
+    cudaStream_t stream);
+
+// Multi-request batched prefill. Replaces the host-loop of R
+// single-request `_prefill_bf16` calls with one kernel launch:
+//
+//     x              : [N_total, C]      bf16 — concatenated request tokens
+//     y              : [N_total, C]      bf16 — outputs
+//     state_out_base : [num_slots, K, C] bf16 — slot 0's address
+//     slot_ids       : [R]               int32 device — slot per request
+//     qo_indptr      : [R+1]             u32 device — token offsets per req
+//     slot_stride_elems : K * C bf16 elements
+//
+// Each (channel, request) block reads its own (t0_r, Nr_r) window from
+// qo_indptr and walks tokens internally. The trailing K-window is
+// persisted into the request's state slab for the follow-up decode.
+// write_state=false runs a frozen verify: compute y but leave the committed
+// conv state at its pre-verify value (the repair forward advances it through
+// [input|accepted]). Default true = normal trailing-window writeback.
+void causal_conv1d_prefill_batched_bf16(
+    const void* x,
+    const void* weight,
+    const void* bias,
+    void*       y,
+    void*       state_out_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long   slot_stride_elems,
+    int R, int C, int K,
+    cudaStream_t stream, bool write_state = true,
+    // Boundary-write for the commit-advance: if non-null, request r folds only
+    // commit_len[r] tokens (the confirmed [input|accepted] prefix) into the
+    // conv state.
+    const int* commit_len = nullptr,
+    // Per-row refinement of `write_state`: row r persists only if the mask is
+    // null or `mask[r] != 0`. A MIXED fire folds some rows and buffers others.
+    const std::uint8_t* write_state_mask = nullptr);
+
+}  // namespace pie_cuda_driver::kernels::ssm

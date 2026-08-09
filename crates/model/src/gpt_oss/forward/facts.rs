@@ -100,6 +100,15 @@ pub struct GptOssCudaFacts {
     /// round-trip that decides what to page in — so a streamed
     /// deployment is outside the flat list until that is stated.
     pub streamed_experts: bool,
+    /// The SLIDING WINDOW each layer attends over, `-1` for none —
+    /// read through [`model_compiler::facts::window_left_at`], which is
+    /// where the shape of this list is documented.
+    ///
+    /// The dispatch statements carry it, so no executor reaches into
+    /// `fwd_cfg.per_layer_window_left` for it. Serde-defaulted, and
+    /// empty reads as "no window", which is what every fixture written
+    /// before this field meant.
+    pub window_left: Vec<i32>,
 }
 
 impl GptOssCudaFacts {
@@ -109,6 +118,9 @@ impl GptOssCudaFacts {
     /// contract for every `*_synthetic` fixture in this file.
     pub fn gpt_oss_20b_synthetic() -> Self {
         Self {
+            // The fixture attends the whole context; a live gpt-oss
+            // states its alternating list.
+            window_left: Vec::new(),
             mxfp4_decode_gemv: true,
             mxfp4_decode_max_routes: 32 * 32,
             streamed_experts: false,

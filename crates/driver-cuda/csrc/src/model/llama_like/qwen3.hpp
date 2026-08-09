@@ -16,7 +16,8 @@
 #include <vector>
 
 #include "model/loaded_model.hpp"
-#include "ops/gemm.hpp"
+#include "layout/split_gate_up.hpp"
+#include "gemm/gemm.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::model {
@@ -34,7 +35,7 @@ struct Qwen3LayerWeights {
 
     // Optional QKV bias terms. Set on Qwen-2 / OLMo-3 / GPT-OSS, null on
     // Llama-3 / Qwen-3 / Phi-3 / Mistral. When non-null, applied
-    // post-projection via `launch_add_bias_bf16`.
+    // post-projection via `kernels::norm::add_bias_bf16`.
     const DeviceTensor* q_bias = nullptr;      // [num_q_heads*head_dim]
     const DeviceTensor* k_bias = nullptr;      // [num_kv_heads*head_dim]
     const DeviceTensor* v_bias = nullptr;      // [num_kv_heads*head_dim]
@@ -54,7 +55,7 @@ struct Qwen3LayerWeights {
     // of 3 / 2 narrow gemms — pulls the matmul out of cuBLAS's small-M
     // `gemvx` fallback and into the tensor-core gemm path. The packed
     // gemm output is then sliced into per-projection workspaces via
-    // `kernels::launch_split_qkv_bf16` / `launch_split_gate_up_bf16`.
+    // `kernels::attn::split_qkv_bf16` / `kernels::layout::split_gate_up_bf16`.
     //
     //   qkv_proj_fused      : [num_q_heads*head_dim + 2*num_kv_heads*head_dim,
     //                         hidden]
@@ -62,7 +63,7 @@ struct Qwen3LayerWeights {
     //
     // Null when (a) the model is loaded into per-rank q/k/v slices under
     // TP > 1, (b) the projections are quantized (fp8 / int4 paths route
-    // through `gemm_act_x_w` with per-weight `QuantMeta` and aren't fused
+    // through `kernels::gemm::act_x_w` with per-weight `QuantMeta` and aren't fused
     // yet), or (c) the bind helper for this arch hasn't opted in. Forward
     // code must keep the unfused fallback for these cases.
     const DeviceTensor* qkv_proj_fused      = nullptr;
@@ -70,7 +71,7 @@ struct Qwen3LayerWeights {
 
     // Optional QuantMeta companions for each weight. Null when the
     // weight is plain bf16 (the common case). When set, the forward
-    // pass routes the corresponding GEMM through ops::gemm_act_x_w with
+    // pass routes the corresponding GEMM through kernels::gemm::act_x_w with
     // a quantized WeightView (FP8 / INT4 / etc.). Bind functions
     // populate these by calling `engine.quant_meta(weight_name)` after
     // resolving each pointer. The QuantMeta value lives in the engine's
@@ -89,12 +90,12 @@ struct Qwen3LayerWeights {
 // quantized view that the GEMM dispatcher routes to the appropriate
 // kernel (cuBLASLt FP8, marlin int4, …). Same call shape works for
 // every model that wires QuantMeta companions in.
-inline ops::WeightView make_weight_view(const DeviceTensor* w,
+inline WeightView make_weight_view(const DeviceTensor* w,
                                         const std::optional<QuantMeta>& meta) {
     if (meta.has_value()) {
-        return ops::WeightView::quantized(*w, *meta);
+        return WeightView::quantized(*w, *meta);
     }
-    return ops::WeightView(*w);
+    return WeightView(*w);
 }
 
 struct Qwen3Weights {

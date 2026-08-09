@@ -522,7 +522,7 @@ pub struct PieForwardIdRange {
 /// both rest at 0 on every trace that predates them, so a pre-qwen3.5
 /// consumer reading only param0 still reads what it always did. A partial
 /// `Rope` (param1 != 0) rotates only the first param1 channels of each
-/// head (`launch_rope_partial_bf16`'s `rotary_dim`).
+/// head (`kernels::rope::rope_partial_bf16`'s `rotary_dim`).
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
@@ -559,6 +559,18 @@ pub struct PieForwardOp {
     /// operand ranges index — ids are just u32s; what a range means is
     /// the field's contract). Empty for every other kind.
     pub aux_names: PieForwardIdRange,
+    /// `Launch` only: the stated kernel's SCALAR arguments — a rotary
+    /// width, a padded head dim — as a range of RAW VALUES in the flat
+    /// id array (the same array the operand ranges index; what a range
+    /// means is the field's contract, and `aux_names` above is the same
+    /// array read as NAME indices).
+    ///
+    /// A `Launch`'s two params are spoken for by the state mark, and a
+    /// scalar with nowhere to ride is a scalar the driver re-derives
+    /// from its config. Appended per the ABI discipline; pre-params
+    /// consumers read an empty range, which is what every statement
+    /// without one carries anyway.
+    pub aux_params: PieForwardIdRange,
     /// Values consumed, in operand order.
     /// The op's role under the DEPTH axis ([`model_compiler::trace::DepthRole`]
     /// as wire values: 0 = none, 1 = windowed, 2 = prefix-plan-swap).
@@ -784,6 +796,16 @@ pub struct PieForwardLowered {
     /// buffers without first being rewritten to walk rectangles.
     pub value_offsets: *const usize,
     pub value_offsets_len: usize,
+    /// For each value, the value that OWNS its bytes — see
+    /// `Lowered::value_owner`. Values sharing an owner share a buffer
+    /// and must be bound together.
+    pub value_owners: *const u32,
+    pub value_owners_len: usize,
+    /// The epilogue's two intermediates, as byte offsets into the
+    /// same arena — see `Buffers::epilogue_gather`. `SIZE_MAX` when
+    /// this fire needs neither.
+    pub epilogue_gather: usize,
+    pub epilogue_norm: usize,
     /// Non-zero when the fire could not be lowered; `launches` is then
     /// empty and the value says which rule refused.
     pub uncovered: PieForwardUncovered,
@@ -804,6 +826,10 @@ impl Default for PieForwardLowered {
             arena_bytes: 0,
             value_offsets: std::ptr::null(),
             value_offsets_len: 0,
+            value_owners: std::ptr::null(),
+            value_owners_len: 0,
+            epilogue_gather: usize::MAX,
+            epilogue_norm: usize::MAX,
             uncovered: PieForwardUncovered::None,
         }
     }

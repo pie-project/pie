@@ -50,7 +50,7 @@ use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use model_loader::types::Visibility;
 use model::facts::ModelFacts;
 use model::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
-use model_config::DESCRIPTOR_OBJECT;
+use model::config::DESCRIPTOR_OBJECT;
 
 use super::import::{
     ProgressLine, Spool, artifact_path, compile_descriptor, compile_tokenizer, pie_version,

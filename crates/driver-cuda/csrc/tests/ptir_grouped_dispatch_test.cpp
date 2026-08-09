@@ -913,7 +913,11 @@ void run_declared_phase_case(
             "model without attention hook coverage rejects registration");
     }
     Dispatch dispatch;
-    dispatch.set_attention_hook_coverage(true, 2);
+    // Was `2` back when this took a layer COUNT. It takes the layer IDS now,
+    // and derives the count from their size (dispatch.cu:4135) -- the ids are
+    // used as real layer indices (`invocation.layer = id`), so a two-layer
+    // model is {0, 1} rather than any pair of the right length.
+    dispatch.set_attention_hook_coverage(true, {0, 1});
     error.clear();
     expect(
         dispatch.register_program(

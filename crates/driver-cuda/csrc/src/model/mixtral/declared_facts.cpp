@@ -1,3 +1,4 @@
+#include <vector>
 #include "model/mixtral/declared_forward.hpp"
 
 #include <cstdio>
@@ -139,6 +140,28 @@ GptOssDeclaredPlan build_gpt_oss_declared_plan(
     int max_routes = w.mxfp4_decode_max_routes;
     if (max_routes == 0) max_routes = 32 * num_experts;
     cuda.mxfp4_decode_max_routes = static_cast<std::uint32_t>(max_routes);
+    // THE SLIDING WINDOW, per layer, handed to the declaration so the
+    // dispatch statements can carry it (`dsl::cuda::attn_at`'s params).
+    // What the executors read instead was this same array, at every
+    // dispatch, through a config nothing stated.
+    //
+    // The empty case broadcasts the config's single `sliding_window`:
+    // `window_left_at` reads a one-element list for every layer, which
+    // is exactly what the drivers' `: fwd_cfg.sliding_window` fallback
+    // meant. The vector outlives the trace calls below.
+    std::vector<std::int32_t> window_left(
+        fwd_cfg.per_layer_window_left.begin(),
+        fwd_cfg.per_layer_window_left.end());
+    // A NEGATIVE single window is the same statement as no list at
+    // all, and the two must not print differently: the digest carries
+    // this list, so an empty-vs-`[-1]` disagreement between the two
+    // printers would mean no generated TU ever matched.
+    if (window_left.empty() && fwd_cfg.sliding_window >= 0) {
+        window_left.push_back(
+            static_cast<std::int32_t>(fwd_cfg.sliding_window));
+    }
+    cuda.window_left = window_left.data();
+    cuda.window_left_len = static_cast<std::uint32_t>(window_left.size());
     out.max_routes = max_routes;
 
     try {

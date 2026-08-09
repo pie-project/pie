@@ -7,7 +7,7 @@
 #include <string>
 
 #include "cuda_check.hpp"
-#include "kernels/gated_delta_net.hpp"
+#include "ssm/gated_delta_net.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -62,7 +62,7 @@ DeviceTensor to_bf16(const DeviceTensor& t) {
     if (t.dtype() == DType::BF16) {
         CUDA_CHECK(cudaMemcpy(out.data(), t.data(), n * 2, cudaMemcpyDeviceToDevice));
     } else if (t.dtype() == DType::FP32) {
-        kernels::launch_fp32_to_bf16(static_cast<const float*>(t.data()), out.data(), n,
+        kernels::ssm::fp32_to_bf16(static_cast<const float*>(t.data()), out.data(), n,
                                      /*stream=*/0);
         CUDA_CHECK(cudaDeviceSynchronize());
     } else {
@@ -82,7 +82,7 @@ DeviceBuffer<float> to_fp32(const DeviceTensor& t) {
         CUDA_CHECK(cudaMemcpy(buf.data(), t.data(), n * sizeof(float),
                               cudaMemcpyDeviceToDevice));
     } else if (t.dtype() == DType::BF16) {
-        kernels::launch_bf16_to_fp32(t.data(), buf.data(), n, /*stream=*/0);
+        kernels::ssm::bf16_to_fp32(t.data(), buf.data(), n, /*stream=*/0);
         CUDA_CHECK(cudaDeviceSynchronize());
     } else {
         throw std::runtime_error("kimi_k3: unsupported dtype for fp32 conversion");

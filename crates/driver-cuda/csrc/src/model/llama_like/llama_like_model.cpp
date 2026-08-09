@@ -1,7 +1,8 @@
+#include "attention_workspace.hpp"
 #include "model/llama_like/llama_like_model.hpp"
 
 #include "model/stage_hooks.hpp"
-#include "ops/gemm.hpp"
+#include "gemm/gemm.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -193,7 +194,7 @@ LlamaLikeModel::LlamaLikeModel(
     // by then the graph key and the epilogue's token source are committed.
     caps_.supports_fused_lm_head_argmax =
         weights_.lm_head != nullptr &&
-        ops::lm_head_argmax_supported(*weights_.lm_head);
+        kernels::gemm::lm_head_argmax_supported(*weights_.lm_head);
     // force_prefill decode rides the plan-free BatchPrefill dispatch whose
     // capture-time launch config binds the synthetic lattice shape — those
     // pre-captured buckets replay pathologically (see the capability's
@@ -234,7 +235,7 @@ void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
 void LlamaLikeModel::body(Workspace& ws,
                           KvCache& kv,
                           AttentionWorkspace& attn_ws,
-                          ops::CublasHandle& cublas,
+                          kernels::gemm::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
     // The declared executor covers the hand-written path's vocabulary;
     // anything it cannot express falls back, per fire, to the
@@ -420,7 +421,7 @@ std::uint64_t LlamaLikeModel::lora_stage(Workspace& ws,
 bool LlamaLikeModel::supergraph_body(Workspace& ws,
                                      KvCache& kv,
                                      AttentionWorkspace& attn_ws,
-                                     ops::CublasHandle& cublas,
+                                     kernels::gemm::CublasHandle& cublas,
                                      const ForwardFn::ForwardInputs& in,
                                      batch::SupergraphBuilder& sg) {
     // The declared gate's terms, restated (the capture calls this

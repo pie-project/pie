@@ -23,11 +23,12 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/split_packed.hpp"
-#include "ops/attention_flashinfer.hpp"
+#include "attention_workspace.hpp"
+#include "attn/qkv_fused.hpp"
+#include "attn/attention_flashinfer.hpp"
 
 using pie_cuda_driver::AttentionWorkspace;
-namespace ops = pie_cuda_driver::ops;
+namespace kernels = pie_cuda_driver::kernels;
 namespace k = pie_cuda_driver::kernels;
 
 namespace {
@@ -171,7 +172,7 @@ ChainResult run_chain(const std::vector<Req>& reqs, int first, int R, int num_st
         RT(cudaMemcpy(d_pos, positions_h.data(), R*4, cudaMemcpyHostToDevice));
         RT(cudaMemcpy(d_klpl, kv_last_page_lens_h.data(), R*4, cudaMemcpyHostToDevice));
         RT(cudaMemcpy(d_packed, packed.data(), packed.size()*2, cudaMemcpyHostToDevice));
-        k::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        k::attn::qkv_decode_qk_norm_rope_write_kv_bf16(
             d_packed, d_qout, d_k, d_v, d_qw, d_kw, d_pos, /*rope_table=*/nullptr,
             d_kpi, d_kpp, d_klpl,
             /*w_page=*/nullptr, /*w_off=*/nullptr, /*row_valid=*/nullptr,
@@ -185,11 +186,11 @@ ChainResult run_chain(const std::vector<Req>& reqs, int first, int R, int num_st
         kv_last_page_lens_h[i] = static_cast<std::uint32_t>(prefill[i] + num_steps);
     RT(cudaMemcpy(d_klpl, kv_last_page_lens_h.data(), R*4, cudaMemcpyHostToDevice));
     auto ws = AttentionWorkspace::allocate(256ull*1024*1024, 32ull*1024*1024);
-    auto plan = ops::make_decode_plan();
-    ops::plan_attention_flashinfer_decode(*plan, kv_page_indptr_h.data(), R, HQ, HKV, D, PAGE,
-        ws, nullptr, false, /*full_attention_variant=*/true, false);
-    ops::dispatch_attention_flashinfer_decode_bf16(
-        *plan, d_qout, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws, nullptr);
+    auto plan = kernels::attn::make_decode_plan();
+    kernels::attn::plan_attention_flashinfer_decode(*plan, kv_page_indptr_h.data(), R, HQ, HKV, D, PAGE,
+        ws.view(), nullptr, false, /*full_attention_variant=*/true, false);
+    kernels::attn::dispatch_attention_flashinfer_decode_bf16(
+        *plan, d_qout, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws.view(), nullptr);
     RT(cudaDeviceSynchronize());
 
     // Download the KV pool + o; extract each request's LAST decode-slot K/V + attn_out.

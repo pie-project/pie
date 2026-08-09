@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/nemotron_h/nemotron_h_forward.hpp"
 #include "model/nemotron_h/nemotron_h.hpp"
 #include "model/stage_hooks.hpp"
@@ -17,20 +18,20 @@
 #include "cuda_check.hpp"
 #include "distributed.hpp"
 #include "store/kv_cache.hpp"
-#include "kernels/causal_conv1d.hpp"
-#include "kernels/embed.hpp"
-#include "kernels/gather_rows.hpp"
-#include "kernels/kv_paged.hpp"
-#include "kernels/moe_dispatch.hpp"
-#include "kernels/nemotron_h.hpp"
-#include "kernels/residual_add.hpp"
-#include "kernels/rmsnorm.hpp"
-#include "kernels/rope.hpp"
-#include "kernels/swiglu.hpp"
-#include "kernels/topk_softmax.hpp"
-#include "ops/attention_flashinfer.hpp"
-#include "ops/flashinfer_mamba.hpp"
-#include "ops/flashinfer_moe.hpp"
+#include "ssm/causal_conv1d.hpp"
+#include "layout/embed.hpp"
+#include "layout/gather_rows.hpp"
+#include "attn/kv_paged.hpp"
+#include "moe/moe_dispatch.hpp"
+#include "ssm/nemotron_h.hpp"
+#include "norm/residual_add.hpp"
+#include "norm/rmsnorm.hpp"
+#include "rope/rope.hpp"
+#include "mlp/swiglu.hpp"
+#include "moe/topk_softmax.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "ssm/flashinfer_mamba.hpp"
+#include "moe/flashinfer_moe.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -180,7 +181,7 @@ void attention_layer(
     Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
     const std::uint32_t* kv_page_indices,
@@ -208,14 +209,14 @@ void attention_layer(
     const int Hk = num_kv_heads_local * cfg.head_dim;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
+    kernels::gemm::act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.q_proj->data(), ws.q.data(), N, Hq, H);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
+    kernels::gemm::act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.k_proj->data(), ws.k.data(), N, Hk, H);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
+    kernels::gemm::act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.v_proj->data(), ws.v.data(), N, Hk, H);
 
-    kernels::launch_rope_bf16(
+    kernels::rope::rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads_local, num_kv_heads_local,
         cfg.head_dim, cfg.rope_theta, stream);
@@ -232,7 +233,7 @@ void attention_layer(
         static_cast<std::uint32_t>(model_layer), stream);
 
     auto kv_view = cache.layer_view(Lw.kv_layer);
-    kernels::launch_write_kv_to_pages(
+    kernels::attn::write_kv_to_pages(
         kv_view, ws.k.data(), ws.v.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
         N, R, stream, row_valid_d);
@@ -248,35 +249,35 @@ void attention_layer(
         : nullptr;
 
     if (use_decode_path && decode_plan != nullptr) {
-        ops::dispatch_attention_flashinfer_decode(
+        kernels::attn::dispatch_attention_flashinfer_decode(
             *decode_plan, ws.q.data(), kv_view, ws.attn_out.data(),
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            attn_ws, stream);
+            attn_ws.view(), stream);
     } else if (custom_mask_d) {
         if (!plan_state.use_prefill_plan || prefill_plan == nullptr) {
             throw std::runtime_error(
                 "custom attention mask has no prepared prefill plan");
         }
-        ops::dispatch_attention_flashinfer_prefill_custom(
+        kernels::attn::dispatch_attention_flashinfer_prefill_custom(
             *prefill_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            custom_mask_d, custom_mask_indptr_d, attn_ws, stream);
+            custom_mask_d, custom_mask_indptr_d, attn_ws.view(), stream);
     } else if (plan_state.use_prefill_plan && prefill_plan != nullptr) {
         const int num_pages_in_batch = kv_page_indptr_h[R];
-        kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kernels::attn::dequant_kv_cache_layer_to_bf16_active(
             kv_view, kv_page_indices, num_pages_in_batch, stream);
-        ops::dispatch_attention_flashinfer_prefill_bf16(
+        kernels::attn::dispatch_attention_flashinfer_prefill_bf16(
             *prefill_plan, ws.q.data(), kv_view.k_bf16_pages,
             kv_view.v_bf16_pages, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            attn_ws, stream);
+            attn_ws.view(), stream);
     } else {
-        ops::launch_attention_flashinfer_prefill(
+        kernels::attn::attention_flashinfer_prefill(
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             qo_indptr_h, kv_page_indptr_h,
-            N, R, num_q_heads_local, attn_ws, stream);
+            N, R, num_q_heads_local, attn_ws.view(), stream);
     }
     invoke_stage_hook(
         hooks,
@@ -286,11 +287,11 @@ void attention_layer(
         static_cast<std::uint32_t>(model_layer), stream);
 
     if (T == 1) {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), Lw.o_proj->data(), ws.y.data(),
             N, H, Hq, /*beta=*/1.f);
     } else {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), Lw.o_proj->data(), ws.norm_y.data(),
             N, H, Hq, /*beta=*/0.f);
         auto* fused_ar = tp->custom_all_reduce();
@@ -305,12 +306,12 @@ void attention_layer(
                 ws.norm_y.data(), ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
             if (next_norm_w != nullptr) {
-                kernels::launch_residual_add_rmsnorm_bf16(
+                kernels::norm::residual_add_rmsnorm_bf16(
                     ws.y.data(), ws.norm_x.data(), next_norm_w,
                     ws.norm_x.data(), N, H, eps, stream);
                 if (produced_next_norm != nullptr) *produced_next_norm = true;
             } else {
-                kernels::launch_residual_add_bf16(
+                kernels::norm::residual_add_bf16(
                     ws.y.data(), ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, stream);
             }
@@ -325,7 +326,7 @@ void mamba_layer(
     Workspace& ws,
     NemotronHWorkspace& nem_ws,
     RecurrentStateCache& state_cache,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::uint32_t* qo_indptr,
     int layer_idx,
     int N,
@@ -365,13 +366,13 @@ void mamba_layer(
 
     profile_cuda_stage(profile, profile ? &profile->mamba_inproj_ms : nullptr,
         stream, [&] {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), in_proj_w,
             nem_ws.mamba_projected.data(), N, projection_dim, H);
     });
     profile_cuda_stage(profile, profile ? &profile->mamba_split_ms : nullptr,
         stream, [&] {
-        kernels::launch_nemotron_mamba_split_bf16(
+        kernels::ssm::nemotron_mamba_split_bf16(
             nem_ws.mamba_projected.data(),
             nullptr,
             nem_ws.mamba_conv_in.data(),
@@ -383,7 +384,7 @@ void mamba_layer(
         stream, [&] {
         if (is_pure_decode) {
             if (slot_ids_d != nullptr) {
-                kernels::launch_causal_conv1d_update_batched_bf16(
+                kernels::ssm::causal_conv1d_update_batched_bf16(
                     nem_ws.mamba_conv_in.data(),
                     conv_w,
                     conv_b,
@@ -394,7 +395,7 @@ void mamba_layer(
                     nem_ws.mamba_conv_out.data(),
                     R, conv_dim, cfg.mamba_conv_kernel, stream);
             } else {
-                kernels::launch_causal_conv1d_update_bf16(
+                kernels::ssm::causal_conv1d_update_bf16(
                     nem_ws.mamba_conv_in.data(),
                     conv_w,
                     conv_b,
@@ -403,7 +404,7 @@ void mamba_layer(
                     conv_dim, cfg.mamba_conv_kernel, stream);
             }
         } else {
-            kernels::launch_causal_conv1d_prefill_batched_bf16(
+            kernels::ssm::causal_conv1d_prefill_batched_bf16(
                 nem_ws.mamba_conv_in.data(),
                 conv_w,
                 conv_b,
@@ -422,7 +423,7 @@ void mamba_layer(
         const float* dt_precomputed = nullptr;
         const float* dA_precomputed = nullptr;
         if (!is_pure_decode) {
-            kernels::launch_nemotron_prepare_mamba_dt_da(
+            kernels::ssm::nemotron_prepare_mamba_dt_da(
                 nem_ws.mamba_dt.data(),
                 Lw.mamba_A.data(),
                 Lw.mamba_dt_bias_f32.data(),
@@ -434,7 +435,7 @@ void mamba_layer(
         }
         const bool used_flashinfer_ssu =
             is_pure_decode && dt_precomputed == nullptr &&
-            ops::flashinfer_mamba_ssu_bf16(
+            kernels::ssm::flashinfer_mamba_ssu_bf16(
                 nem_ws.mamba_conv_out.data(),
                 nem_ws.mamba_dt.data(),
                 Lw.mamba_A.data(),
@@ -448,7 +449,7 @@ void mamba_layer(
                 m_groups, conv_dim, m_intermediate,
                 state_cache.max_slots(), stream);
         if (!used_flashinfer_ssu) {
-            kernels::launch_nemotron_mamba_ssm_batched_bf16(
+            kernels::ssm::nemotron_mamba_ssm_batched_bf16(
                 nem_ws.mamba_conv_out.data(),
                 nem_ws.mamba_dt.data(),
                 Lw.mamba_A.data(),
@@ -468,7 +469,7 @@ void mamba_layer(
 
     profile_cuda_stage(profile, profile ? &profile->mamba_norm_ms : nullptr,
         stream, [&] {
-        kernels::launch_zamba_rmsnorm_gated_bf16(
+        kernels::ssm::zamba_rmsnorm_gated_bf16(
             nem_ws.mamba_core.data(), nem_ws.mamba_projected.data(),
             norm_w, nem_ws.mamba_core.data(),
             N, m_intermediate, projection_dim,
@@ -479,7 +480,7 @@ void mamba_layer(
     profile_cuda_stage(profile, profile ? &profile->mamba_outproj_ms : nullptr,
         stream, [&] {
         if (Lw.mamba_tp_sharded && tp != nullptr) {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
+            kernels::gemm::act_x_wt_bf16(cublas.handle(),
                 nem_ws.mamba_core.data(), out_proj_w,
                 ws.norm_y.data(), N, H, m_intermediate, /*beta=*/0.f);
             auto* fused_ar = tp->custom_all_reduce();
@@ -494,18 +495,18 @@ void mamba_layer(
                     ws.norm_y.data(), ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
                 if (next_norm_w != nullptr) {
-                    kernels::launch_residual_add_rmsnorm_bf16(
+                    kernels::norm::residual_add_rmsnorm_bf16(
                         ws.y.data(), ws.norm_x.data(), next_norm_w,
                         ws.norm_x.data(), N, H, eps, stream);
                     if (produced_next_norm != nullptr) *produced_next_norm = true;
                 } else {
-                    kernels::launch_residual_add_bf16(
+                    kernels::norm::residual_add_bf16(
                         ws.y.data(), ws.norm_x.data(),
                         static_cast<std::size_t>(N) * H, stream);
                 }
             }
         } else {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
+            kernels::gemm::act_x_wt_bf16(cublas.handle(),
                 nem_ws.mamba_core.data(), out_proj_w,
                 ws.y.data(), N, H, m_intermediate, /*beta=*/1.f);
         }
@@ -518,7 +519,7 @@ void moe_layer(
     const LlamaLikeForwardCfg& fwd_cfg,
     Workspace& ws,
     NemotronHWorkspace& nem_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     int N,
     bool is_pure_decode,
     const void* next_norm_w,
@@ -539,14 +540,14 @@ void moe_layer(
 
     profile_cuda_stage(profile, profile ? &profile->moe_router_ms : nullptr,
         stream, [&] {
-        ops::gemm_act_x_wt_bf16_out_fp32(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16_out_fp32(cublas.handle(),
             ws.norm_x.data(), Lw.router->data(),
             nem_ws.router_logits.data(), N, E, H);
         if (cfg.n_group != 1 || cfg.topk_group != 1) {
             throw std::runtime_error(
                 "nemotron_h: CUDA router currently supports n_group=topk_group=1");
         }
-        kernels::launch_topk_sigmoid_bias_fp32(
+        kernels::moe::topk_sigmoid_bias_fp32(
             nem_ws.router_logits.data(),
             static_cast<const float*>(Lw.router_correction_bias->data()),
             nem_ws.topk_idx.data(),
@@ -558,14 +559,14 @@ void moe_layer(
     profile_cuda_stage(profile, profile ? &profile->moe_routed_ms : nullptr,
         stream, [&] {
         const int routes = N * K;
-        if (ops::flashinfer_cutlass_moe_enabled() &&
+        if (kernels::moe::flashinfer_cutlass_moe_enabled() &&
             !is_pure_decode &&
             Lw.expert_up_packed != nullptr &&
             Lw.expert_down_packed != nullptr &&
             !nem_ws.flashinfer_moe_workspace.empty() &&
             !nem_ws.flashinfer_moe_map.empty()) {
-            const bool ran = ops::flashinfer_cutlass_moe_bf16(
-                ops::MoeActivation::Relu2,
+            const bool ran = kernels::moe::flashinfer_cutlass_moe_bf16(
+                kernels::moe::MoeActivation::Relu2,
                 static_cast<const std::uint16_t*>(ws.norm_x.data()),
                 nem_ws.topk_idx.data(),
                 nem_ws.topk_weights.data(),
@@ -579,7 +580,7 @@ void moe_layer(
             if (ran) return;
         }
         if (is_pure_decode && N == 1) {
-            kernels::launch_build_nemotron_moe_ptrs_decode_batched_bf16(
+            kernels::ssm::build_nemotron_moe_ptrs_decode_batched_bf16(
                 nem_ws.topk_idx.data(),
                 nem_ws.topk_weights.data(),
                 reinterpret_cast<const void* const*>(Lw.expert_up_ptrs.data()),
@@ -597,20 +598,20 @@ void moe_layer(
                 nem_ws.route_weights.data(),
                 N, K, H, I, stream);
 
-            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+            kernels::gemm::batched_act_x_wt_bf16(cublas.handle(),
                 reinterpret_cast<const void* const*>(nem_ws.b_up_ptrs.data()),
                 reinterpret_cast<const void* const*>(nem_ws.a_up_ptrs.data()),
                 reinterpret_cast<void* const*>(nem_ws.c_up_ptrs.data()),
                 /*M=*/1, /*N=*/I, /*K=*/H, routes);
-            kernels::launch_relu2_bf16(
+            kernels::mlp::relu2_bf16(
                 nem_ws.expert_up.data(), nem_ws.expert_act.data(),
                 routes * I, stream);
-            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+            kernels::gemm::batched_act_x_wt_bf16(cublas.handle(),
                 reinterpret_cast<const void* const*>(nem_ws.b_down_ptrs.data()),
                 reinterpret_cast<const void* const*>(nem_ws.a_down_ptrs.data()),
                 reinterpret_cast<void* const*>(nem_ws.c_down_ptrs.data()),
                 /*M=*/1, /*N=*/H, /*K=*/I, routes);
-            kernels::launch_token_batched_weighted_sum_bf16(
+            kernels::moe::token_batched_weighted_sum_bf16(
                 ws.norm_y.data(), nem_ws.expert_out.data(),
                 nem_ws.route_weights.data(), N, K, H, stream);
         } else {
@@ -619,7 +620,7 @@ void moe_layer(
                 std::int32_t* route_to_sorted_row =
                     sorted_route_ids + routes;
                 std::int32_t* counts_d = route_to_sorted_row + routes;
-                kernels::launch_moe_bucket_exact(
+                kernels::moe::moe_bucket_exact(
                     nem_ws.topk_idx.data(),
                     sorted_route_ids,
                     route_to_sorted_row,
@@ -679,7 +680,7 @@ void moe_layer(
                 }
 
                 if (offset > 0) {
-                    kernels::launch_gather_moe_aligned_inputs_bf16(
+                    kernels::moe::gather_moe_aligned_inputs_bf16(
                         ws.norm_x.data(), sorted_route_ids,
                         nem_ws.expert_in.data(), routes, offset,
                         K, H, /*shared_row_begin=*/-1,
@@ -694,7 +695,7 @@ void moe_layer(
                         std::span<std::uint16_t* const>(
                             out_ptrs.data(), out_ptrs.size()));
 
-                    ops::gemm_grouped_act_x_wt_bf16(
+                    kernels::gemm::grouped_act_x_wt_bf16(
                         cublas.handle(),
                         reinterpret_cast<const void* const*>(
                             nem_ws.b_up_ptrs.data()),
@@ -705,7 +706,7 @@ void moe_layer(
                         rows_per_expert.data(),
                         static_cast<int>(rows_per_expert.size()), I, H);
 
-                    kernels::launch_relu2_bf16(
+                    kernels::mlp::relu2_bf16(
                         nem_ws.expert_up.data(), nem_ws.expert_act.data(),
                         offset * I, stream);
 
@@ -713,7 +714,7 @@ void moe_layer(
                         const int e = active_experts[i];
                         const int row_offset = row_offsets[i];
                         const int Ne = rows_per_expert[i];
-                        ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        kernels::gemm::act_x_wt_bf16(cublas.handle(),
                             nem_ws.expert_act.data() +
                                 static_cast<long long>(row_offset) * I,
                             Lw.expert_down[static_cast<std::size_t>(e)]->data(),
@@ -722,7 +723,7 @@ void moe_layer(
                             Ne, H, I);
                     }
 
-                    kernels::launch_token_batched_weighted_sum_aligned_bf16(
+                    kernels::moe::token_batched_weighted_sum_aligned_bf16(
                         ws.norm_y.data(), nem_ws.expert_out.data(),
                         nem_ws.topk_weights.data(), route_to_sorted_row,
                         N, K, H, stream);
@@ -740,16 +741,16 @@ void moe_layer(
                 std::int32_t* expert_ids = sorted_route_ids + aligned_rows;
                 std::int32_t* route_to_aligned_row = expert_ids + max_blocks;
 
-                kernels::launch_moe_align_decode(
+                kernels::moe::moe_align_decode(
                     nem_ws.topk_idx.data(), sorted_route_ids, expert_ids,
                     route_to_aligned_row,
                     routes, E, block_size, max_blocks, /*num_tokens_past_padded=*/nullptr, stream);
-                kernels::launch_gather_moe_aligned_inputs_bf16(
+                kernels::moe::gather_moe_aligned_inputs_bf16(
                     ws.norm_x.data(), sorted_route_ids,
                     nem_ws.expert_in.data(), routes, aligned_rows,
                     K, H, /*shared_row_begin=*/-1,
                     /*num_tokens=*/0, stream);
-                kernels::launch_build_nemotron_moe_ptrs_aligned_bf16(
+                kernels::ssm::build_nemotron_moe_ptrs_aligned_bf16(
                     expert_ids,
                     reinterpret_cast<const void* const*>(Lw.expert_up_ptrs.data()),
                     reinterpret_cast<const void* const*>(Lw.expert_down_ptrs.data()),
@@ -764,20 +765,20 @@ void moe_layer(
                     reinterpret_cast<const void**>(nem_ws.b_down_ptrs.data()),
                     reinterpret_cast<void**>(nem_ws.c_down_ptrs.data()),
                     max_blocks, block_size, H, I, stream);
-                ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                kernels::gemm::batched_act_x_wt_bf16(cublas.handle(),
                     reinterpret_cast<const void* const*>(nem_ws.b_up_ptrs.data()),
                     reinterpret_cast<const void* const*>(nem_ws.a_up_ptrs.data()),
                     reinterpret_cast<void* const*>(nem_ws.c_up_ptrs.data()),
                     block_size, I, H, max_blocks);
-                kernels::launch_relu2_bf16(
+                kernels::mlp::relu2_bf16(
                     nem_ws.expert_up.data(), nem_ws.expert_act.data(),
                     aligned_rows * I, stream);
-                ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                kernels::gemm::batched_act_x_wt_bf16(cublas.handle(),
                     reinterpret_cast<const void* const*>(nem_ws.b_down_ptrs.data()),
                     reinterpret_cast<const void* const*>(nem_ws.a_down_ptrs.data()),
                     reinterpret_cast<void* const*>(nem_ws.c_down_ptrs.data()),
                     block_size, H, I, max_blocks);
-                kernels::launch_token_batched_weighted_sum_aligned_bf16(
+                kernels::moe::token_batched_weighted_sum_aligned_bf16(
                     ws.norm_y.data(), nem_ws.expert_out.data(),
                     nem_ws.topk_weights.data(), route_to_aligned_row,
                     N, K, H, stream);
@@ -835,22 +836,22 @@ void moe_layer(
                     nem_ws.expert_idx.data() + offset;
                 const float* expert_w_d =
                     nem_ws.expert_w.data() + offset;
-                kernels::launch_gather_bf16_rows(
+                kernels::layout::gather_bf16_rows(
                     static_cast<const std::uint16_t*>(ws.norm_x.data()),
                     expert_idx_d,
                     nem_ws.expert_in.data(), Ne, H, stream);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                kernels::gemm::act_x_wt_bf16(cublas.handle(),
                     nem_ws.expert_in.data(),
                     Lw.expert_up[static_cast<std::size_t>(e)]->data(),
                     nem_ws.expert_up.data(), Ne, I, H);
-                kernels::launch_relu2_bf16(
+                kernels::mlp::relu2_bf16(
                     nem_ws.expert_up.data(), nem_ws.expert_act.data(),
                     Ne * I, stream);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                kernels::gemm::act_x_wt_bf16(cublas.handle(),
                     nem_ws.expert_act.data(),
                     Lw.expert_down[static_cast<std::size_t>(e)]->data(),
                     nem_ws.expert_out.data(), Ne, H, I);
-                kernels::launch_scatter_add_weighted_bf16(
+                kernels::moe::scatter_add_weighted_bf16(
                     ws.norm_y.data(), nem_ws.expert_out.data(),
                     expert_idx_d, expert_w_d,
                     Ne, H, stream);
@@ -861,16 +862,16 @@ void moe_layer(
     profile_cuda_stage(profile, profile ? &profile->moe_shared_ms : nullptr,
         stream, [&] {
     if (Is > 0) {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), Lw.shared_up->data(),
             nem_ws.shared_up.data(), N, Is, H);
-        kernels::launch_relu2_bf16(
+        kernels::mlp::relu2_bf16(
             nem_ws.shared_up.data(), nem_ws.shared_act.data(),
             N * Is, stream);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             nem_ws.shared_act.data(), Lw.shared_down->data(),
             nem_ws.shared_out.data(), N, H, Is);
-        kernels::launch_residual_add_bf16(
+        kernels::norm::residual_add_bf16(
             ws.norm_y.data(), nem_ws.shared_out.data(),
             static_cast<std::size_t>(N) * H, stream);
     }
@@ -891,7 +892,7 @@ void moe_layer(
                     ws.norm_y.data(), ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
                 if (next_norm_w != nullptr) {
-                    kernels::launch_residual_add_rmsnorm_bf16(
+                    kernels::norm::residual_add_rmsnorm_bf16(
                         ws.y.data(), ws.norm_x.data(), next_norm_w,
                         ws.norm_x.data(), N, H, eps, stream);
                     if (produced_next_norm != nullptr) *produced_next_norm = true;
@@ -899,12 +900,12 @@ void moe_layer(
             }
         });
         if (produced_next_norm == nullptr || !*produced_next_norm) {
-            kernels::launch_residual_add_bf16(
+            kernels::norm::residual_add_bf16(
                 ws.y.data(), ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, stream);
         }
     } else {
-        kernels::launch_residual_add_bf16(
+        kernels::norm::residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
     }
@@ -971,10 +972,10 @@ NemotronHWorkspace NemotronHWorkspace::allocate(
     ws.b_down_ptrs = DeviceBuffer<const std::uint16_t*>::alloc(routes);
     ws.c_down_ptrs = DeviceBuffer<std::uint16_t*>::alloc(routes);
     ws.route_weights = DeviceBuffer<float>::alloc(routes);
-    if (ops::flashinfer_cutlass_moe_enabled()) {
+    if (kernels::moe::flashinfer_cutlass_moe_enabled()) {
         ws.flashinfer_moe_workspace_bytes =
-            ops::flashinfer_cutlass_moe_workspace_bytes(
-            ops::MoeActivation::Relu2,
+            kernels::moe::flashinfer_cutlass_moe_workspace_bytes(
+            kernels::moe::MoeActivation::Relu2,
                 static_cast<int>(N), static_cast<int>(H),
                 static_cast<int>(I), static_cast<int>(E),
                 static_cast<int>(K), T, 0);
@@ -1038,9 +1039,9 @@ std::size_t nemotron_h_workspace_bytes(
     bytes += u16(N * Is);
     bytes += u16(N * H);
     bytes += routes * (6 * sizeof(void*) + sizeof(float));
-    if (ops::flashinfer_cutlass_moe_enabled()) {
-        bytes += ops::flashinfer_cutlass_moe_workspace_bytes(
-            ops::MoeActivation::Relu2,
+    if (kernels::moe::flashinfer_cutlass_moe_enabled()) {
+        bytes += kernels::moe::flashinfer_cutlass_moe_workspace_bytes(
+            kernels::moe::MoeActivation::Relu2,
             static_cast<int>(N), static_cast<int>(H), static_cast<int>(I),
             static_cast<int>(E), static_cast<int>(K), T, 0);
         bytes += i32(routes);
@@ -1063,7 +1064,7 @@ void nemotron_h_forward_paged(
     KvCache& cache,
     RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -1113,7 +1114,7 @@ void nemotron_h_forward_paged(
     }
 
     profile_cuda_stage(&profile, &profile.embed_ms, stream, [&] {
-        kernels::launch_embed_bf16(
+        kernels::layout::embed_bf16(
             token_ids, w.embed->data(), ws.y.data(),
             N, H, cfg.vocab_size, stream);
     });
@@ -1125,7 +1126,7 @@ void nemotron_h_forward_paged(
             have_norm_x = false;
         } else {
             profile_cuda_stage(&profile, &profile.norm_ms, stream, [&] {
-                kernels::launch_rmsnorm_bf16(
+                kernels::norm::rmsnorm_bf16(
                     ws.y.data(), Lw.norm->data(), ws.norm_x.data(),
                     N, H, eps, stream);
             });
@@ -1173,21 +1174,21 @@ void nemotron_h_forward_paged(
         int lm_head_rows = N;
         const void* lm_head_input = ws.norm_y.data();
         if (compact_logits) {
-            kernels::launch_gather_bf16_rows(
+            kernels::layout::gather_bf16_rows(
                 static_cast<const std::uint16_t*>(ws.y.data()),
                 logit_row_indices_d,
                 static_cast<std::uint16_t*>(ws.norm_x.data()),
                 num_logit_rows, H, stream);
-            kernels::launch_rmsnorm_bf16(
+            kernels::norm::rmsnorm_bf16(
                 ws.norm_x.data(), w.final_norm->data(), ws.norm_y.data(),
                 num_logit_rows, H, eps, stream);
             lm_head_rows = num_logit_rows;
         } else {
-            kernels::launch_rmsnorm_bf16(
+            kernels::norm::rmsnorm_bf16(
                 ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
                 N, H, eps, stream);
         }
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             lm_head_input, w.lm_head->data(),
             ws.logits.data(), lm_head_rows, V, H);
     });

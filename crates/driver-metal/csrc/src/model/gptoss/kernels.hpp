@@ -18,6 +18,7 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "../../mtl4_context.hpp"
+#include "pie/kernels/attn.h"
 #include "../shared_kernels.hpp"
 #include "geometry.hpp"
 
@@ -133,11 +134,12 @@ inline void qmv_dispatch(int N, int slots, Grid& g, Threadgroup& tg, int rows = 
     shared_kernels::routed_qmv_dispatch(N, slots, g, tg, rows);
 }
 
-/// `sdpa_vector_decode_sink`: one threadgroup of 1024 per query head. The grid
-/// is in THREADS, so the head count multiplies the threadgroup width.
-inline void sdpa_sink_dispatch(int n_q_heads, Grid& g, Threadgroup& tg, int rows = 1) {
-    g = Grid{std::uint32_t(n_q_heads) * 1024, std::uint32_t(rows < 1 ? 1 : rows), 1};
-    tg = Threadgroup{1024, 1, 1};
+/// The sink form takes the SAME shape as every other `sdpa_vector` form. It had
+/// a body here, byte-identical to gemma4's `sdpa_sliding_dispatch`; both are
+/// now names for the one in `pie/kernels/attn.h`.
+inline void sdpa_sink_dispatch(int n_q_heads, Grid& g, Threadgroup& tg,
+                               int rows = 1) {
+    pie::kernels::attn::sdpa_dispatch(n_q_heads, g, tg, rows);
 }
 
 }  // namespace pie::metal::gptoss

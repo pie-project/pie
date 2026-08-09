@@ -5,14 +5,18 @@
 // per-stage math is transcribed from transformers 5.9 `modeling_gemma4.py`
 // (Gemma4AudioModel / Gemma4AudioLayer / Gemma4AudioAttention /
 // Gemma4AudioLightConv1d / Gemma4AudioSubSampleConvProjection) and checked
-// shape-wise against scripts/gemma4_audio_parity_ref.py
-// (199 mel frames → SSCP → 50 frames → 50 tokens → [50, 2560]).
+// shape-wise against scripts/gemma4_audio_parity_ref.py.
 //
 // CUDA-only includes (no model/loader headers) so nvcc never sees toml++.
 //
-// PARITY (bf16-vs-bf16 verified — standalone harness vs /tmp/gemma4_audio_parity/*.npy:
-// sscp 1.00000 / layer0 0.99999 / layer5 0.99998 / layer11 0.99957 /
-// encoder_out 0.99925 / projected 0.99924, matching HF's own bf16 stability):
+// PARITY (bf16-vs-bf16, `gemma4_audio_full_parity` vs
+// /tmp/gemma4_audio_parity/*.npy at 188 mel frames → 47 audio tokens):
+// sscp 1.00000 / layer0 1.00000 / layer5 0.99999 / layer11 0.99997 /
+// encoder_out 0.99997 / projected 0.99997, rel_rms 0.744% — HF's own bf16
+// stability. An earlier revision of this block quoted 199 frames → 50 tokens
+// and cosines around 0.9992 from a script that was never committed;
+// `gemma4_audio_parity_ref.py` exists now and these are its numbers.
+// The stages verified:
 //   * chunked-attention masking — the HF 5D blocked local mask
 //     (chunk 12 / past 12 / future 0) + `_rel_shift` collapses, for this config,
 //     to a plain causal sliding window: query t attends keys j with
@@ -35,6 +39,10 @@
 #include <string>
 #include <vector>
 
+#include "ssm/causal_conv1d.hpp"
+
+#include "model/gemma4/gemma4_naive_kernels.cuh"
+
 namespace pie_cuda_driver::model {
 
 // ── Per-stage checkpoint hook (parity debugging). See .hpp. ─────────────────
@@ -48,8 +56,6 @@ namespace {
 
 typedef __nv_bfloat16 bf;
 #define ACK(x) do{cudaError_t e=(x);if(e)throw std::runtime_error(std::string("gemma4_audio: ")+cudaGetErrorString(e));}while(0)
-__device__ __forceinline__ float F(bf x){return __bfloat162float(x);}
-__device__ __forceinline__ bf   Bf(float x){return __float2bfloat16(x);}
 
 class DeviceScratch {
 public:
@@ -72,28 +78,13 @@ private:
 };
 
 // ── Shared elementwise / GEMM / norm kernels (vision-style) ──────────────────
-__global__ void k_matmul(const bf* x,const bf* W,bf* y,int N,int K,int O){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,o=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||o>=O)return;
-    const bf* xr=x+(long)n*K;const bf* wr=W+(long)o*K;float a=0;for(int k=0;k<K;k++)a+=F(xr[k])*F(wr[k]);y[(long)n*O+o]=Bf(a);}
 __global__ void k_matmul_bias(const bf* x,const bf* W,const bf* b,bf* y,int N,int K,int O){
     int n=blockIdx.y*blockDim.y+threadIdx.y,o=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||o>=O)return;
     const bf* xr=x+(long)n*K;const bf* wr=W+(long)o*K;float a=b?F(b[o]):0.f;for(int k=0;k<K;k++)a+=F(xr[k])*F(wr[k]);y[(long)n*O+o]=Bf(a);}
-__global__ void k_clamp(const bf* x,bf* o,const bf* lo,const bf* hi,long t){
-    long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i>=t)return;
-    float v=F(x[i]),l=lo?F(*lo):-CUDART_INF_F,h=hi?F(*hi):CUDART_INF_F;o[i]=Bf(v<l?l:(v>h?h:v));}
 // Plain RMSNorm: `w` may be null (parameterless, gamma=1).
-__global__ void k_rms(const bf* x,const bf* w,bf* o,int R,int D,float eps){
-    int r=blockIdx.x;if(r>=R)return;const bf* xr=x+(long)r*D;bf* orow=o+(long)r*D;
-    float loc=0;for(int d=threadIdx.x;d<D;d+=blockDim.x){float v=F(xr[d]);loc+=v*v;}
-    for(int s=warpSize/2;s>0;s>>=1)loc+=__shfl_down_sync(0xffffffff,loc,s);
-    __shared__ float warp[32],ss;if((threadIdx.x&31)==0)warp[threadIdx.x>>5]=loc;__syncthreads();
-    if(threadIdx.x==0){float t=0;int nw=(blockDim.x+31)/32;for(int i=0;i<nw;i++)t+=warp[i];ss=rsqrtf(t/D+eps);}__syncthreads();
-    float inv=ss;for(int d=threadIdx.x;d<D;d+=blockDim.x)orow[d]=Bf(F(xr[d])*inv*(w?F(w[d]):1.f));}
 __global__ void k_silu(const bf* x,bf* o,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t){float v=F(x[i]);o[i]=Bf(v/(1.f+__expf(-v)));}}
-__global__ void k_f32_to_bf16(const float* a,bf* o,long n){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<n)o[i]=Bf(a[i]);}
 // out = a + scale*b   (residual add with macaron weight).
 __global__ void k_axpy(bf* a,const bf* b,float scale,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t)a[i]=Bf(F(a[i])+scale*F(b[i]));}
-__global__ void k_add(bf* a,const bf* b,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t)a[i]=Bf(F(a[i])+F(b[i]));}
 // GLU over last dim: o[n,d] = x[n,d] * sigmoid(x[n, d+D]) for d in [0,D).
 __global__ void k_glu(const bf* x,bf* o,int N,int D){
     int n=blockIdx.y*blockDim.y+threadIdx.y,d=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||d>=D)return;
@@ -151,13 +142,9 @@ __global__ void k_sscp_flatten(const bf* in,bf* out,int OC,int To,int Fo){
     out[(long)to*FoOC+j]=in[((long)oc*To+to)*Fo+fo];
 }
 
-// Depthwise CAUSAL conv1d over [T, C] with kernel [C,1,K], left-pad K-1.
-// out[t,c] = sum_{j=0}^{K-1} in[t-(K-1)+j, c] * w[c, 0, j].
-__global__ void k_depthwise_causal(const bf* in,const bf* W,bf* out,int T,int C,int K){
-    int t=blockIdx.y*blockDim.y+threadIdx.y,c=blockIdx.x*blockDim.x+threadIdx.x;if(t>=T||c>=C)return;
-    float acc=0;for(int j=0;j<K;j++){int ti=t-(K-1)+j;if(ti<0)continue;acc+=F(in[(long)ti*C+c])*F(W[(long)c*K+j]);}
-    out[(long)t*C+c]=Bf(acc);
-}
+// `k_depthwise_causal` was here. It is `kernels::ssm::causal_conv1d_prefill_
+// noact_bf16` -- bit for bit the same accumulation in the same order -- and
+// the call site says so.
 
 dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 
@@ -334,7 +321,14 @@ void run_gemma4_audio(const AudioRawWeights& w,
         k_rms<<<N,256,0,S>>>(h,L.lconv_pre_ln,hn,N,Hd,EPS);
         clin(hn,start,xc,L.lconv_start,N,Hd,2*Hd);            // [N, 2*hidden]
         k_glu<<<G2(Hd,N),B2,0,S>>>(start,glu,N,Hd);            // GLU → [N, hidden]
-        k_depthwise_causal<<<G2(Hd,N),B2,0,S>>>(glu,L.depthwise_conv,conv,N,Hd,w.conv_kernel);
+        // Was `k_depthwise_causal`, a local copy of this: same [N, C] layout,
+        // same [C, K] per-channel weight, same `t-(K-1)+j` indexing, same zero
+        // pad. The library's only difference was a fused silu, which is a
+        // template parameter there now. bias and state are nullptr -- this
+        // caller has neither.
+        kernels::ssm::causal_conv1d_prefill_noact_bf16(
+            glu, L.depthwise_conv, /*bias=*/nullptr, conv, /*state_out=*/nullptr,
+            N, Hd, w.conv_kernel, S);
         // clamp(±finfo_max) is a no-op in bf16 range → skip; conv_norm + silu
         k_rms<<<N,256,0,S>>>(conv,L.lconv_conv_norm,conv,N,Hd,EPS);
         k_silu<<<((long)N*Hd+255)/256,256,0,S>>>(conv,conv,(long)N*Hd);

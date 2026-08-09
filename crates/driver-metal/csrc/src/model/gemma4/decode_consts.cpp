@@ -53,37 +53,6 @@ std::size_t k_head_stride(const Gemma4Geometry& g, int layer) {
 
 }  // namespace
 
-KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
-    const int H = g.hidden;
-    const int hd = layer >= 0 ? g.head_dim_of(layer) : g.head_dim;
-    const int q_dim = g.n_q_heads * hd;
-    // Per layer: the full-attention layers use `num_global_key_value_heads`,
-    // which on gemma-4-26B is 2 against the sliding layers' 8.
-    const int kv_dim = (layer >= 0 ? g.n_kv_heads_of(layer) : g.n_kv_heads) * hd;
-    const int inter = layer >= 0 ? g.intermediate_of(layer) : g.intermediate;
-    const int ple_total = g.n_layers * g.per_layer_emb_dim;
-    switch (k) {
-        case Kind::QmvQ: return {H, q_dim};
-        case Kind::QmvK: return {H, kv_dim};
-        case Kind::QmvV: return {H, kv_dim};
-        case Kind::QmvO: return {q_dim, H};
-        case Kind::QmvGate: return {H, inter};
-        case Kind::QmvUp: return {H, inter};
-        case Kind::QmvDown: return {inter, H};
-        case Kind::LmHead: return {H, g.vocab};
-        // PLE: the model projection fans hidden out to the whole table; the
-        // per-layer gate and projection work one layer's slice at a time.
-        case Kind::PleProjGemv: return {H, ple_total};
-        case Kind::PleGateGemv: return {H, g.per_layer_emb_dim};
-        case Kind::PleProjLayerGemv: return {g.per_layer_emb_dim, H};
-        // ── the mixture ──
-        case Kind::RouterGemv: return {H, g.n_experts};
-        case Kind::ExpertGate: return {H, g.moe_intermediate};
-        case Kind::ExpertUp: return {H, g.moe_intermediate};
-        case Kind::ExpertDown: return {g.moe_intermediate, H};
-        default: return {0, 0};
-    }
-}
 
 int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                        const Gemma4Geometry& g, int rows, bool paged, int head_rows) {

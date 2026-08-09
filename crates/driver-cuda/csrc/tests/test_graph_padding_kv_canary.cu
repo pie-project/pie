@@ -5,9 +5,9 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/kv_paged.hpp"
-#include "kernels/mla_paged.hpp"
-#include "kernels/split_packed.hpp"
+#include "attn/kv_paged.hpp"
+#include "attn/mla_paged.hpp"
+#include "attn/qkv_fused.hpp"
 
 namespace k = pie_cuda_driver::kernels;
 
@@ -192,7 +192,7 @@ int main() {
     bool ok = true;
 
     const auto llama_fused = [&] {
-        k::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        k::attn::qkv_decode_qk_norm_rope_write_kv_bf16(
             in.packed, in.q, in.k_pages, in.v_pages, in.q_weight, in.k_weight,
             in.positions, nullptr, in.page_indices, in.page_indptr,
             in.last_page_lens, nullptr, nullptr, in.row_valid, kRows, kQHeads,
@@ -203,7 +203,7 @@ int main() {
     ok &= run_graph_canary("Qwen3VLModel", in, llama_fused);
 
     const auto explicit_write = [&] {
-        k::launch_write_kv_explicit_bf16(
+        k::attn::write_kv_explicit_bf16(
             in.layer(), in.packed, in.packed, in.write_page, in.write_offset,
             kRows, in.stream, in.row_valid);
     };
@@ -211,7 +211,7 @@ int main() {
     ok &= run_graph_canary("Qwen35MoeModel", in, explicit_write);
 
     const auto gemma_fused = [&] {
-        k::launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
+        k::attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
             in.packed, in.q, in.k_pages, in.v_pages, in.q_weight, in.k_weight,
             in.positions, in.page_indices, in.page_indptr, in.last_page_lens,
             in.row_valid, kRows, kQHeads, kKvHeads, kHeadDim, kPageSize, false,
@@ -220,7 +220,7 @@ int main() {
     ok &= run_graph_canary("Gemma4Model/fused", in, gemma_fused);
 
     const auto generic_write = [&] {
-        k::launch_write_kv_to_pages(
+        k::attn::write_kv_to_pages(
             in.layer(), in.packed, in.packed, in.qo_indptr, in.page_indices,
             in.page_indptr, in.last_page_lens, kRows, kRows, in.stream,
             in.row_valid);
@@ -229,7 +229,7 @@ int main() {
     ok &= run_graph_canary("NemotronHModel", in, generic_write);
 
     const auto mla_write = [&] {
-        k::launch_write_mla_to_pages_bf16(
+        k::attn::write_mla_to_pages_bf16(
             in.k_pages, in.v_pages, in.packed, in.packed,
             in.qo_indptr, in.page_indices, in.page_indptr,
             in.last_page_lens, kRows, kRows, kPageSize,

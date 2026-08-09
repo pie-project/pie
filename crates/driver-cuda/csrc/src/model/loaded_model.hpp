@@ -114,13 +114,13 @@ private:
     std::unique_ptr<GroupStreamCache> group_cache_;
 };
 
-namespace ops { struct RuntimeQuantScratchSpec; }
+namespace kernels::gemm { struct RuntimeQuantScratchSpec; }
 
 // Derive the runtime-quant scratch spec by scanning the loaded model's
 // quantized weights and recording the widest FP8/INT8 weight shape we'd
 // need to dequantize on the fly. `max_tokens` is the row dimension for
 // the on-the-fly dequant scratch.
-ops::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engine,
+kernels::gemm::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engine,
                                                        std::size_t max_tokens);
 
 }  // namespace pie_cuda_driver

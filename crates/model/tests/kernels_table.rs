@@ -27,6 +27,7 @@ fn launch(symbol: &str) -> Op {
             kernel: symbol.to_string(),
             weights: vec![],
             state: None,
+            params: vec![],
         },
         inputs: vec![],
         outputs: vec![],
@@ -66,11 +67,11 @@ fn the_check_is_not_vacuous() {
         outputs: vec![],
         layer: Some(0),
     };
-    let xqa = "launch_attention_xqa_decode_bf16_prepared";
+    let xqa = "attn::attention_xqa_decode_bf16_prepared";
     let problems = check_plan(&plan_of(vec![
         peel,
         launch(xqa),
-        launch("dispatch_attention_flashinfer_decode"),
+        launch("attn::dispatch_attention_flashinfer_decode"),
     ]));
     assert_eq!(problems.len(), 1, "{problems:#?}");
     assert!(problems[0].contains("whole"), "{}", problems[0]);
@@ -94,12 +95,16 @@ fn the_backend_is_read_off_the_family() {
     assert_eq!(Backend::of_family("qwen3_5_moe_mlp_block"), None);
 }
 
-/// Metal's table is empty, and that REFUSES rather than permits: a
-/// `llama_like.metal.*` text cannot state a kernel it has not
-/// declared. This is the discipline that will fill the table when
-/// the first Metal text is written.
+/// The backend table is a GATE, not a wall: it admits exactly the symbols
+/// it declares and refuses everything else, so a `llama_like.metal.*` text
+/// cannot state a kernel nobody wrote a row for.
+///
+/// Metal's table holds only the rows a first such text would need, so most
+/// of the MSL entrypoints `decode_psos.cpp` compiles are still undeclared.
+/// That is safe precisely because of the refusal half: an undeclared symbol
+/// fails the trace at load rather than silently resolving to nothing.
 #[test]
-fn an_empty_backend_table_refuses() {
+fn the_metal_table_admits_its_rows_and_refuses_the_rest() {
     let mut p = plan_of(vec![launch("metal_gemm_bf16")]);
     p.family = "llama_like.metal.decode".to_string();
     // (the same symbol under CUDA's table is refused too — this is
@@ -107,9 +112,54 @@ fn an_empty_backend_table_refuses() {
     let problems = check_plan(&p);
     assert_eq!(problems.len(), 1, "{problems:#?}");
     assert!(problems[0].contains("metal"), "{}", problems[0]);
+
+    // And the other half, without which the above would also pass on a table
+    // that refuses everything: a declared entrypoint goes through.
+    //
+    // Spelled from `entrypoints()` rather than from `symbol`, because a Metal
+    // row's symbol is a BASE and a base is not something a text can launch —
+    // every point of every axis contributes text, so `attn_gate` names a
+    // kernel and `attn_gate_bfloat16` names the dispatch.
+    let declared = KERNELS_METAL
+        .first()
+        .expect("Metal's table declares at least one kernel")
+        .entrypoints();
+    let declared = declared.first().expect("and that kernel has an entrypoint");
+    let mut ok = plan_of(vec![launch(declared)]);
+    ok.family = "llama_like.metal.decode".to_string();
+    assert_eq!(check_plan(&ok), Vec::<String>::new());
 }
 
-/// The table is exactly the set of symbols `dsl::cuda` can record.
+/// Rows no `dsl::cuda` text states, and why each one is in the table.
+///
+/// This list is the seam between the table's TWO jobs, which stopped being
+/// one job when the ABI pilot landed. The compiler's job is to plan against
+/// symbols a declaration can record; `driver-cuda-new`'s
+/// `every_launcher_the_header_declares_has_a_row` gives the table a second
+/// one — being the operand contract for every launcher a HEADER declares,
+/// whether a declaration reaches it or not. A row can now be real and
+/// unstated, so the invariant below is a containment plus this pinned
+/// remainder rather than an equality.
+///
+/// Sorted, because it is compared against a sorted difference.
+/// SORTED, because the assertion compares against a sorted remainder.
+const UNSTATED_ROWS: &[&str] = &[
+    // The collectives came OUT (3). `dist::` and `comm::` joined the
+    // prefix scan above, which is what this test measures: a symbol a
+    // `dsl::cuda` wrapper RECORDS. Whether a model text calls one is a
+    // different question, and the goldens are where it is answered --
+    // `mistral_7b_v03.cuda.tp2.decode` is llama_like's sharded trace,
+    // and it fires both all-reduce spellings 32 times each.
+    //
+    // Two remain recorded-but-uncalled, and neither has an entry here
+    // because the scan cannot tell: `comm::all_reduce_residual_rmsnorm_bf16`
+    // (the fused landing, waiting on a guard whose arms produce a PAIR)
+    // and `dist::all_gather_bf16` (no text gathers; column-parallel
+    // outputs here are consumed shard-local).
+    "rope::rope_partial_bf16_position_delta",
+];
+
+/// The table covers every symbol `dsl::cuda` can record.
 ///
 /// This is the argument that [`check_plan`]'s coverage rule — which
 /// runs at LOAD and fails the trace — can never fire spuriously on a
@@ -118,8 +168,18 @@ fn an_empty_backend_table_refuses() {
 /// is the guard that makes the table's other three declarations get
 /// written: a new `cuda::` wrapper fails this test until its
 /// contract exists.
+///
+/// The containment direction is the load-bearing one and takes no
+/// exceptions. The reverse is pinned to [`UNSTATED_ROWS`] rather than
+/// asserted empty, for the reason that list gives — and it still fires on
+/// a new wrapper, which lands in the remainder until its author either
+/// states it or names it there with a reason. This is the same shape the
+/// Metal table has carried all along (see
+/// `the_metal_table_admits_its_rows_and_refuses_the_rest`): declared ⊇
+/// stated is safe precisely because of the refusal half, since a symbol
+/// nothing states is a symbol nothing can reach.
 #[test]
-fn the_table_is_exactly_the_dsl_surface() {
+fn the_table_covers_the_dsl_surface() {
     let dsl = include_str!("../../model-compiler/src/dsl.rs");
     let mut stated: Vec<&str> = dsl
         .split('"')
@@ -160,6 +220,25 @@ fn the_table_is_exactly_the_dsl_surface() {
                 "flashinfer_",
                 "pie_lora",
                 "qwen35_verify",
+                // One line per family as step 3 lands; when the last
+                // `launch_` is gone the first five entries can go too.
+                "rope::",
+                "gemm::",
+                "attn::",
+                "moe::",
+                "quant::",
+                "layout::",
+                "norm::",
+                "ssm::",
+                "mlp::",
+                "sample::",
+                // The COLLECTIVES' namespaces. Their absence here was a
+                // hole in the coverage rule rather than a fact about
+                // them: `dsl::cuda::all_reduce` and friends record
+                // these symbols like any other, and without the prefix
+                // the scan simply could not see them.
+                "dist::",
+                "comm::",
             ]
                 .iter()
                 .any(|p| s.starts_with(p))
@@ -169,9 +248,29 @@ fn the_table_is_exactly_the_dsl_surface() {
     stated.dedup();
     let mut declared: Vec<&str> = KERNELS.iter().map(|k| k.symbol).collect();
     declared.sort_unstable();
+
+    let unbacked: Vec<&str> = stated
+        .iter()
+        .filter(|s| !declared.contains(s))
+        .copied()
+        .collect();
+    assert!(
+        unbacked.is_empty(),
+        "dsl::cuda records symbols the kernel! table does not declare, so \
+         `check_plan` would refuse them at LOAD: {unbacked:?}"
+    );
+
+    let unstated: Vec<&str> = declared
+        .iter()
+        .filter(|d| !stated.contains(d))
+        .copied()
+        .collect();
     assert_eq!(
-        stated, declared,
-        "the kernel! table and dsl::cuda's stated symbols have drifted"
+        unstated, UNSTATED_ROWS,
+        "the table's rows that no dsl::cuda text states have changed. A row \
+         that arrived here needs either a text that states it or an entry in \
+         `UNSTATED_ROWS` saying why it is real without one; a row that left \
+         needs its entry deleted"
     );
 }
 
@@ -212,7 +311,7 @@ fn the_depth_axis_derives_from_the_layer_tag() {
         plan.ops.iter().filter(|op| plan.depth_prefix_plan(op)).all(|op| matches!(
             &op.kind,
             OpKind::Launch { kernel, .. }
-                if kernel == "dispatch_attention_flashinfer_decode"
+                if kernel == "attn::dispatch_attention_flashinfer_decode"
         )),
         "only the planned decode dispatch swaps"
     );
@@ -252,6 +351,11 @@ fn the_depth_axis_derives_from_the_layer_tag() {
         &facts,
         &LlamaLikeCudaFacts {
             head_dim_padded: true,
+            // SYNTHETIC: this fixture's model facts are qwen3-0.6B's
+            // (head_dim 128), which pads nowhere. The width only has to
+            // be wider than the logical one for the pad statements to
+            // be well-formed; what the test is about is the AXIS.
+            head_dim_kernel: 256,
             ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
         },
         FireClass::Prefill,
@@ -333,4 +437,115 @@ fn live_traces_satisfy_the_table() {
         let problems = check_plan(plan);
         assert!(problems.is_empty(), "{problems:#?}");
     }
+}
+
+/// A quantized weight makes its statement name MORE tensors, and a
+/// dense one names exactly what it did before.
+///
+/// The quantization axis lives on the weight handle
+/// (`MatW::repr`), so `matmul(x, &w)` resolves to a stated symbol at
+/// TRACE time and the scales ride as declared weights. This asserts the
+/// two halves that matter: the dense path is untouched (every existing
+/// golden depends on that), and each representation names a symbol the
+/// `kernel!` table declares — which is what stops `check_plan` refusing
+/// it at load.
+#[test]
+fn a_weight_representation_states_its_kernel() {
+    use model_compiler::dsl::{MatW, ScaleLayout, WeightRepr};
+
+    let dense = MatW::dense("layer.0.q_proj".into(), 2048, Some(0));
+    assert_eq!(dense.gemm_symbol(), None, "a dense weight chooses nothing");
+    assert!(dense.scale_names().is_empty());
+
+    let cases = [
+        (
+            WeightRepr::Scaled {
+                layout: ScaleLayout::PerGroup,
+                group: 128,
+                axis: 0,
+                zero_point: true,
+            },
+            "gemm::act_x_wt_grouped_scaled",
+            2,
+        ),
+        (
+            WeightRepr::Scaled {
+                layout: ScaleLayout::PerChannel,
+                group: 0,
+                axis: 0,
+                zero_point: false,
+            },
+            "gemm::act_x_wt_channel_scaled",
+            1,
+        ),
+        (WeightRepr::Mxfp4Marlin, "gemm::act_x_wt_mxfp4_marlin", 1),
+    ];
+    for (repr, symbol, extra) in cases {
+        let w = dense.clone().with_repr(repr.clone());
+        assert_eq!(
+            w.gemm_symbol(),
+            Some(symbol),
+            "{repr:?} must name the kernel that can read it"
+        );
+        assert_eq!(
+            w.scale_names().len(),
+            extra,
+            "{repr:?} names its scales (and zero-points) as weights"
+        );
+        // The name the loader already looks for, derived off the
+        // weight's own — not a second naming convention.
+        assert!(w.scale_names()[0].starts_with("layer.0.q_proj."));
+        assert!(
+            sig_in(Backend::Cuda, symbol).is_some(),
+            "{symbol} needs a kernel! row or `check_plan` refuses it at load"
+        );
+    }
+}
+
+/// Every kernel a SEMANTIC op kind can fan to has a row.
+///
+/// A semantic kind names no symbol, so the driver picks one — and the
+/// table's coverage rule cannot see those picks, because `check_plan`
+/// only walks `OpKind::Launch`. That is the hole this closes: a kernel
+/// reachable only through a driver's fan has no operand contract
+/// anywhere, and nothing notices.
+///
+/// It found exactly one pair when written — `norm::rmsnorm_bf16` and
+/// `norm::rmsnorm_gemma_bf16`, the two `OpKind::Rmsnorm` chooses
+/// between from its variant. Every other fan target is also stated by
+/// some `dsl::cuda` wrapper, so it already had a row for that reason.
+///
+/// The list is written by hand because there is no machine-readable
+/// link from a kind to the kernels its arms call; a kind that grows a
+/// third spelling has to be added here, and that is the point — the
+/// addition is where someone notices the driver is choosing.
+#[test]
+fn the_kernels_a_semantic_kind_fans_to_are_declared() {
+    // (kind, the symbols its driver arms pick between)
+    const FANS: &[(&str, &[&str])] = &[
+        ("Rmsnorm", &["norm::rmsnorm_bf16", "norm::rmsnorm_gemma_bf16"]),
+        (
+            "RmsnormPerHead",
+            &["norm::rmsnorm_bf16", "norm::rmsnorm_gemma_bf16"],
+        ),
+        ("Rope", &["rope::rope_bf16", "rope::rope_partial_bf16"]),
+        (
+            "SplitGdn",
+            &["layout::split_bf16_rows", "layout::split_qwen_gdn_ba_bf16"],
+        ),
+    ];
+    let mut missing: Vec<String> = Vec::new();
+    for (kind, symbols) in FANS {
+        for s in *symbols {
+            if sig_in(Backend::Cuda, s).is_none() {
+                missing.push(format!("{kind} -> {s}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "a semantic kind fans to kernels with no `kernel!` row, so their \
+         operand contract is written nowhere and `check_plan` cannot see \
+         them (it walks Launch only): {missing:?}"
+    );
 }

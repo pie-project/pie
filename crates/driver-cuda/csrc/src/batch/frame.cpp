@@ -29,9 +29,9 @@
 #include "batch/tp.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
-#include "kernels/argmax.hpp"
-#include "kernels/graph_pad.hpp"
-#include "kernels/pack_dense_mask.hpp"
+#include "sample/argmax.hpp"
+#include "layout/graph_pad.hpp"
+#include "attn/pack_dense_mask.hpp"
 #include "model/loaded_model.hpp"
 #include "model/attn_observation.hpp"
 #include "model/attn_score.hpp"
@@ -41,7 +41,7 @@
 #include "store/kv_cache.hpp"
 #include "store/recurrent_state_cache.hpp"
 #include "model/workspace.hpp"
-#include "ops/gemm.hpp"
+#include "gemm/gemm.hpp"
 #include "pipeline/batch_compose.hpp"
 #include "pipeline/dispatch.hpp"
 
@@ -354,7 +354,7 @@ void enqueue_mtp_draft_logits(
         cudaMemcpyDeviceToDevice,
         stream));
     for (const MtpDraftWork& item : plan.work) {
-        kernels::launch_argmax_bf16(
+        kernels::sample::argmax_bf16(
             logits + static_cast<std::size_t>(item.seed_row) * vocab,
             reinterpret_cast<std::int32_t*>(engine.inputs.sampled.data()),
             1,
@@ -439,7 +439,7 @@ void enqueue_mtp_draft_logits(
                 1,
                 static_cast<int>(draft),
                 max_global_tokens);
-            kernels::launch_argmax_bf16(
+            kernels::sample::argmax_bf16(
                 logits,
                 reinterpret_cast<std::int32_t*>(
                     engine.inputs.sampled.data()),
@@ -880,7 +880,7 @@ struct PreparedStep::Impl {
     DeviceBuffer<std::uint8_t>::StagedUpload up_custom_mask{};
     DeviceBuffer<std::int32_t>::StagedUpload up_mask_indptr{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_klen{};
-    DeviceBuffer<kernels::StructuredMaskParams>::StagedUpload
+    DeviceBuffer<kernels::attn::StructuredMaskParams>::StagedUpload
         up_struct_masks{};
     DeviceBuffer<std::uint8_t>::StagedUpload up_dense_mask{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_dense_klen{};
@@ -1160,7 +1160,7 @@ void prepare_step(
     // refusing the step. A mask-free decode/prefill lane attends causally
     // by construction (its KV extent never exceeds position+1), so its
     // absent descriptor fills with Causal and the per-lane pack kernel
-    // (`launch_pack_structured_mask`, kind==1) reproduces its semantics
+    // (`kernels::attn::pack_structured_mask`, kind==1) reproduces its semantics
     // exactly. The recon's alternative — admitting the mix only when the
     // SHARED runtime-window override succeeds — was REJECTED by
     // measurement (stage1-notes.md, Stage 2 "Measured"): the override was
@@ -1731,7 +1731,7 @@ void prepare_step(
             static_cast<std::size_t>(lanes), 0);
         std::vector<std::int32_t> mindptr(
             static_cast<std::size_t>(lanes) + 1, 0);
-        std::vector<kernels::StructuredMaskParams> masks(
+        std::vector<kernels::attn::StructuredMaskParams> masks(
             static_cast<std::size_t>(lanes));
         const std::uint32_t page =
             static_cast<std::uint32_t>(kv_cache.page_size());
@@ -1776,7 +1776,7 @@ void prepare_step(
         s.up_klen = pi.structured_mask_klen.stage_from_host(
             std::span<const std::uint32_t>(klen));
         s.up_struct_masks = pi.structured_masks.stage_from_host(
-            std::span<const kernels::StructuredMaskParams>(masks));
+            std::span<const kernels::attn::StructuredMaskParams>(masks));
         s.up_mask_indptr = pi.custom_mask_indptr.stage_from_host(
             std::span<const std::int32_t>(mindptr));
         s.pack_structured = true;
@@ -1863,7 +1863,7 @@ void prepare_step(
     // program's mask at its composed SUFFIX positions — prefix rows get
     // zero-length indptr entries (klen 0, the pack kernel no-ops them and
     // the split body never reads them). The dense source is staged PADDED
-    // to fire-lane indexing so `launch_pack_dense_mask` needs no offset
+    // to fire-lane indexing so `kernels::attn::pack_dense_mask` needs no offset
     // parameter. Shape contract, enforced loudly: exactly ONE masked
     // device-geometry program, its rows exactly the planned suffix.
     // Per-wave reset: these are harvested only by the spatial pack below;
@@ -3041,7 +3041,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     if (s.pack_structured) {
         pi.structured_mask_klen.commit_staged(s.up_klen);
         pi.structured_masks.commit_staged(s.up_struct_masks);
-        kernels::launch_pack_structured_mask(
+        kernels::attn::pack_structured_mask(
             pi.positions.data(),
             pi.structured_mask_klen.data(),
             pi.qo_indptr.data(),
@@ -3057,7 +3057,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         pi.custom_mask_indptr.commit_staged(s.up_dense_indptr);
         CUDA_CHECK(cudaMemsetAsync(pi.custom_mask.data(), 0,
                                    s.pack_dense_bytes, cublas.stream()));
-        kernels::launch_pack_dense_mask(
+        kernels::attn::pack_dense_mask(
             pi.dense_mask.data(),
             pi.structured_mask_klen.data(),
             pi.qo_indptr.data(),

@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/gemma/gemma2.hpp"
 #include "model/stage_hooks.hpp"
 
@@ -8,14 +9,14 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/embed.hpp"
-#include "kernels/kv_paged.hpp"
-#include "kernels/residual_add.hpp"
-#include "kernels/rmsnorm.hpp"
-#include "kernels/rope.hpp"
-#include "kernels/scalar_mul.hpp"
-#include "kernels/softcap.hpp"
-#include "kernels/swiglu.hpp"
+#include "layout/embed.hpp"
+#include "attn/kv_paged.hpp"
+#include "norm/residual_add.hpp"
+#include "norm/rmsnorm.hpp"
+#include "rope/rope.hpp"
+#include "norm/scalar_mul.hpp"
+#include "attn/softcap.hpp"
+#include "mlp/swiglu.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -86,7 +87,7 @@ void gemma2_forward_paged(
     Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
@@ -119,19 +120,19 @@ void gemma2_forward_paged(
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
 
     // Step 1: embed and Gemma's √hidden_size scale.
-    kernels::launch_embed_bf16(
+    kernels::layout::embed_bf16(
         token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
-    kernels::launch_scalar_mul_bf16(
+    kernels::norm::scalar_mul_bf16(
         ws.y.data(), std::sqrt(static_cast<float>(H)),
         static_cast<std::size_t>(N) * H, stream);
 
-    ops::DecodePlanCachePtr decode_plan;
+    kernels::attn::DecodePlanCachePtr decode_plan;
     if (use_decode_path) {
-        decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode(
+        decode_plan = kernels::attn::make_decode_plan();
+        kernels::attn::plan_attention_flashinfer_decode(
             *decode_plan, kv_page_indptr_h, R,
             num_q_heads_local, num_kv_heads_local, d,
-            cache.page_size(), attn_ws, stream,
+            cache.page_size(), attn_ws.view(), stream,
             /*enable_cuda_graph=*/true,
             /*full_attention_variant=*/false,
             cache.hnd_layout());
@@ -151,34 +152,34 @@ void gemma2_forward_paged(
 
         // ── Attention block ──
         // 1a. pre-attn norm.
-        kernels::launch_rmsnorm_gemma_bf16(
+        kernels::norm::rmsnorm_gemma_bf16(
             ws.y.data(), layer.attn_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
 
         // 1b. QKV projection.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.q_proj->data(), ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
 
         // Per-head q/k RMSNorm (Gemma-3+) — applied before the query
         // pre-scale and before RoPE, matching HF's
         // `Gemma3Attention.forward`.
         if (fwd_cfg.use_qk_norm && layer.q_norm) {
-            kernels::launch_rmsnorm_gemma_bf16(
+            kernels::norm::rmsnorm_gemma_bf16(
                 ws.q.data(), layer.q_norm->data(), ws.q.data(),
                 N * num_q_heads_local, d, eps, stream);
         }
         if (fwd_cfg.use_qk_norm && layer.k_norm) {
-            kernels::launch_rmsnorm_gemma_bf16(
+            kernels::norm::rmsnorm_gemma_bf16(
                 ws.k.data(), layer.k_norm->data(), ws.k.data(),
                 N * num_kv_heads_local, d, eps, stream);
         }
 
         if (need_q_pre_scale) {
-            kernels::launch_scalar_mul_bf16(
+            kernels::norm::scalar_mul_bf16(
                 ws.q.data(), q_pre_scale,
                 static_cast<std::size_t>(N) * Hq, stream);
         }
@@ -191,7 +192,7 @@ void gemma2_forward_paged(
                 ? fwd_cfg.per_layer_rope_theta[L]
                 : cfg.rope_theta;
 
-        kernels::launch_rope_bf16(
+        kernels::rope::rope_bf16(
             ws.q.data(), ws.k.data(), positions,
             N, num_q_heads_local, num_kv_heads_local, d,
             layer_rope_theta, stream);
@@ -208,7 +209,7 @@ void gemma2_forward_paged(
             static_cast<std::uint32_t>(L), stream);
 
         auto kv_view = cache.layer_view(L);
-        kernels::launch_write_kv_to_pages(
+        kernels::attn::write_kv_to_pages(
             kv_view, ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             N, R, stream);
@@ -220,24 +221,24 @@ void gemma2_forward_paged(
                 : -1;
 
         if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode(
+            kernels::attn::dispatch_attention_flashinfer_decode(
                 *decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                attn_ws, stream, layer_window_left, fwd_cfg.attn_logit_softcap);
+                attn_ws.view(), stream, layer_window_left, fwd_cfg.attn_logit_softcap);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom(
+            kernels::attn::attention_flashinfer_prefill_custom(
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, attn_ws, stream);
+                N, R, num_q_heads_local, attn_ws.view(), stream);
         } else {
-            ops::launch_attention_flashinfer_prefill(
+            kernels::attn::attention_flashinfer_prefill(
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws.view(), stream,
                 layer_window_left, fwd_cfg.attn_logit_softcap);
         }
         invoke_stage_hook(
@@ -250,61 +251,61 @@ void gemma2_forward_paged(
         // 1c. o_proj → norm_x scratch (NOT into y), apply post-attn norm,
         //     then residual-add into y. Under TP this is row-parallel; we
         //     all-reduce the partial sum before the post-attn norm sees it.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
             N, H, Hq, /*beta=*/0.f);
         if (T > 1) {
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
         }
-        kernels::launch_rmsnorm_gemma_bf16(
+        kernels::norm::rmsnorm_gemma_bf16(
             ws.norm_x.data(), layer.attn_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);
-        kernels::launch_residual_add_bf16(
+        kernels::norm::residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
 
         // ── MLP block ──
         // 2a. pre-MLP norm.
-        kernels::launch_rmsnorm_gemma_bf16(
+        kernels::norm::rmsnorm_gemma_bf16(
             ws.y.data(), layer.mlp_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
 
         // 2b. GeGLU(tanh): gate / up GEMMs, GeLU-tanh-glu, down.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.gate_proj->data(), ws.gate.data(), N, I, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.up_proj->data(),   ws.up.data(),   N, I, H);
-        kernels::launch_geglu_tanh_bf16(
+        kernels::mlp::geglu_tanh_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
             N * I, stream);
 
         // 2c. down → norm_x scratch, apply post-MLP norm, residual-add.
         // Same row-parallel + all-reduce dance as o_proj.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),
             ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
             N, H, I, /*beta=*/0.f);
         if (T > 1) {
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
         }
-        kernels::launch_rmsnorm_gemma_bf16(
+        kernels::norm::rmsnorm_gemma_bf16(
             ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);
-        kernels::launch_residual_add_bf16(
+        kernels::norm::residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
     }
 
-    kernels::launch_rmsnorm_gemma_bf16(
+    kernels::norm::rmsnorm_gemma_bf16(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
+    kernels::gemm::act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
         N, V, H);
 
     if (fwd_cfg.final_logit_softcap > 0.f) {
-        kernels::launch_logit_softcap_bf16(
+        kernels::attn::logit_softcap_bf16(
             ws.logits.data(), fwd_cfg.final_logit_softcap,
             static_cast<std::size_t>(N) * V, stream);
     }

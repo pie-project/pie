@@ -64,9 +64,20 @@ mod native {
 
         let mut cfg = cmake::Config::new(&csrc);
         cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("kernels-cuda"));
+        // `ptir/tier0.cuh` includes `rng_contract.generated.h`: the bit mapping
+        // tier-0 must reproduce exactly, because tier-1 emits the same RNG
+        // through NVRTC and the two are diffed. That is a CONTRACT, not driver
+        // machinery -- the same shape as `kernels.def` being read by both C++
+        // and CMake -- so it is declared here rather than reached for by a
+        // relative path, exactly as `driver-cuda/build.rs` declares it.
+        let ptir_include = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tensor-compiler/include");
         cfg.build_target("pie_kernels_cuda")
             .define("BUILD_SHARED_LIBS", "OFF")
-            .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
+            .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
+            .define("PIE_PTIR_INCLUDE_DIR", &ptir_include);
 
         let build_dir = cfg.build().join("build");
         emit_link_search_paths(&build_dir);

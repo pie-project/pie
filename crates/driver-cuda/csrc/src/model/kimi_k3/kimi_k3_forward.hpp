@@ -39,8 +39,8 @@
 #include <cstdint>
 
 #include "distributed.hpp"
-#include "ops/attention_workspace.hpp"
-#include "ops/gemm.hpp"
+#include "attention_workspace.hpp"
+#include "gemm/gemm.hpp"
 #include "store/kv_cache.hpp"
 #include "store/mla_cache.hpp"
 #include "store/recurrent_state_cache.hpp"
@@ -145,7 +145,7 @@ void kimi_k3_forward_paged(
     MlaCache& mla_cache,
     RecurrentStateCache& kda_cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     void* logits_out,
     const std::int32_t* token_ids,
     const std::int32_t* positions,

@@ -1,7 +1,8 @@
+#include "attention_workspace.hpp"
 #include "model/qwen3_5/qwen3_5_moe_model.hpp"
 #include "model/qwen3_5/declared_forward.hpp"
 #include <algorithm>
-#include "ops/flashinfer_moe.hpp"
+#include "moe/flashinfer_moe.hpp"
 
 #include <cstdlib>
 #include <utility>
@@ -86,7 +87,7 @@ void Qwen35MoeModel::prepare(AttentionWorkspace& attn_ws,
 void Qwen35MoeModel::body(Workspace& ws,
                           KvCache& kv,
                           AttentionWorkspace& attn_ws,
-                          ops::CublasHandle& cublas,
+                          kernels::gemm::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
     // Arc 2, MoE half. Behind its own gate and OFF by default: the dense
     // arc has an A/B behind it, this one is new, and a MoE fire that
@@ -111,7 +112,7 @@ void Qwen35MoeModel::body(Workspace& ws,
         } else if (in.has_write_desc &&
                    (in.w_page_d == nullptr || in.w_off_d == nullptr)) {
             fallback_reason = "write descriptors missing";
-        } else if (ops::flashinfer_cutlass_moe_enabled() &&
+        } else if (kernels::moe::flashinfer_cutlass_moe_enabled() &&
                    moe_ws_.cutlass_max_rows > 0 &&
                    in.total_tokens <= moe_ws_.cutlass_max_rows) {
             fallback_reason = "fire fits the fused CUTLASS leg";
@@ -223,7 +224,7 @@ void Qwen35MoeModel::wire_system_drafter(
         };
     drafter.draft_step =
         [this, prefix_global_cache](
-            Workspace& ws, KvCache& cache, ops::CublasHandle& cublas,
+            Workspace& ws, KvCache& cache, kernels::gemm::CublasHandle& cublas,
             const std::int32_t* tok, const std::int32_t* pos,
             const std::int32_t* base_hidden_row_indices,
             const std::int32_t* request_ids,

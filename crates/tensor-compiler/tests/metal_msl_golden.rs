@@ -51,9 +51,10 @@ use msl_corpus::{CorpusStage, corpus_stages, is_library, op_tag, region_shape};
 
 /// FNV-1a 64, the hash the oracle header records for the shared prefixes.
 /// The embedded runtime template must be the same bytes the C++ emitter read
-/// from `crates/driver-metal/csrc/src/kernels/ptir_m1_runtime.metal`. Everything else here
-/// compares kernel *tails* with the shared prefix elided, so without this the
-/// two could diverge on the 34 KB nobody diffs.
+/// from disk when the dump was frozen; the file is
+/// `crates/tensor-compiler/runtime/metal/ptir_m1_runtime.metal` now. Everything
+/// else here compares kernel *tails* with the shared prefix elided, so without
+/// this the two could diverge on the 34 KB nobody diffs.
 #[test]
 fn embedded_runtime_matches_the_oracle() {
     let dump = std::fs::read_to_string(golden_msl_dir().join("emit_singleton_region_msl.txt"))
@@ -81,8 +82,8 @@ fn embedded_runtime_matches_the_oracle() {
     assert_eq!(
         (runtime.len(), tensor_ir::fnv1a64(runtime.as_bytes())),
         field("# @runtime:"),
-        "crates/tensor-compiler/runtime/metal/ptir_m1_runtime.metal has drifted from the copy \
-         the C++ oracle read out of crates/driver-metal/csrc/src/kernels/"
+        "crates/tensor-compiler/runtime/metal/ptir_m1_runtime.metal has drifted from the \
+         frozen C++ oracle dump"
     );
 
     let grouped = grouped_preamble();

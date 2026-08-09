@@ -11,7 +11,7 @@
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg}
 #include "decode_dispatch_mb.hpp"
 #include "mtl4_context.hpp"
-#include "gdn_params.h"
+#include "ssm/gdn_params.h"
 #include "../shared_kernels.hpp"
 
 namespace pie::metal {

@@ -4094,9 +4094,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.0.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.0.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -4170,7 +4172,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.0.conv"
           ],
@@ -4251,7 +4253,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 0
@@ -4271,7 +4273,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 0
@@ -4291,7 +4293,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 0
@@ -4354,9 +4356,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.0.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.0.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -4385,7 +4389,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -4414,9 +4418,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.1.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.1.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -4490,7 +4496,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.1.conv"
           ],
@@ -4571,7 +4577,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 1
@@ -4591,7 +4597,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 1
@@ -4611,7 +4617,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 1
@@ -4674,9 +4680,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.1.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.1.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -4705,7 +4713,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -4734,9 +4742,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.2.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.2.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -4810,7 +4820,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.2.conv"
           ],
@@ -4891,7 +4901,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 2
@@ -4911,7 +4921,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 2
@@ -4931,7 +4941,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 2
@@ -4994,9 +5004,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.2.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.2.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -5025,7 +5037,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5054,9 +5066,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.3.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.3.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -5162,9 +5176,11 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard",
-          "partial": 64
+        "Launch": {
+          "kernel": "rope::rope_partial_bf16",
+          "params": [
+            64
+          ]
         }
       },
       "inputs": [
@@ -5209,7 +5225,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -5226,7 +5242,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -5243,11 +5259,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 3
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -5300,9 +5319,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.3.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.3.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -5331,7 +5352,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5360,9 +5381,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.4.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.4.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -5436,7 +5459,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.4.conv"
           ],
@@ -5517,7 +5540,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 4
@@ -5537,7 +5560,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 4
@@ -5557,7 +5580,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 4
@@ -5620,9 +5643,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.4.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.4.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -5651,7 +5676,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5680,9 +5705,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.5.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.5.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -5756,7 +5783,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.5.conv"
           ],
@@ -5837,7 +5864,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 5
@@ -5857,7 +5884,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 5
@@ -5877,7 +5904,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 5
@@ -5940,9 +5967,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.5.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.5.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -5971,7 +6000,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6000,9 +6029,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.6.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.6.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -6076,7 +6107,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.6.conv"
           ],
@@ -6157,7 +6188,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 6
@@ -6177,7 +6208,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 6
@@ -6197,7 +6228,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 6
@@ -6260,9 +6291,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.6.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.6.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6291,7 +6324,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6320,9 +6353,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.7.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.7.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -6428,9 +6463,11 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard",
-          "partial": 64
+        "Launch": {
+          "kernel": "rope::rope_partial_bf16",
+          "params": [
+            64
+          ]
         }
       },
       "inputs": [
@@ -6475,7 +6512,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -6492,7 +6529,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -6509,11 +6546,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 7
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -6566,9 +6606,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.7.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.7.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6597,7 +6639,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6626,9 +6668,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.8.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.8.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -6702,7 +6746,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.8.conv"
           ],
@@ -6783,7 +6827,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 8
@@ -6803,7 +6847,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 8
@@ -6823,7 +6867,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 8
@@ -6886,9 +6930,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.8.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.8.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6917,7 +6963,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6946,9 +6992,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.9.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.9.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -7022,7 +7070,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.9.conv"
           ],
@@ -7103,7 +7151,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 9
@@ -7123,7 +7171,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 9
@@ -7143,7 +7191,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 9
@@ -7206,9 +7254,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.9.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.9.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7237,7 +7287,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7266,9 +7316,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.10.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.10.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -7342,7 +7394,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.10.conv"
           ],
@@ -7423,7 +7475,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 10
@@ -7443,7 +7495,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 10
@@ -7463,7 +7515,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 10
@@ -7526,9 +7578,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.10.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.10.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7557,7 +7611,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7586,9 +7640,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.11.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.11.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -7694,9 +7750,11 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard",
-          "partial": 64
+        "Launch": {
+          "kernel": "rope::rope_partial_bf16",
+          "params": [
+            64
+          ]
         }
       },
       "inputs": [
@@ -7741,7 +7799,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -7758,7 +7816,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -7775,11 +7833,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 11
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -7832,9 +7893,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.11.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.11.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7863,7 +7926,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7892,9 +7955,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.12.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.12.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -7968,7 +8033,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.12.conv"
           ],
@@ -8049,7 +8114,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 12
@@ -8069,7 +8134,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 12
@@ -8089,7 +8154,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 12
@@ -8152,9 +8217,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.12.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.12.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -8183,7 +8250,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8212,9 +8279,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.13.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.13.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -8288,7 +8357,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.13.conv"
           ],
@@ -8369,7 +8438,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 13
@@ -8389,7 +8458,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 13
@@ -8409,7 +8478,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 13
@@ -8472,9 +8541,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.13.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.13.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -8503,7 +8574,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8532,9 +8603,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.14.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.14.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -8608,7 +8681,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.14.conv"
           ],
@@ -8689,7 +8762,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 14
@@ -8709,7 +8782,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 14
@@ -8729,7 +8802,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 14
@@ -8792,9 +8865,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.14.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.14.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -8823,7 +8898,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8852,9 +8927,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.15.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.15.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -8960,9 +9037,11 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard",
-          "partial": 64
+        "Launch": {
+          "kernel": "rope::rope_partial_bf16",
+          "params": [
+            64
+          ]
         }
       },
       "inputs": [
@@ -9007,7 +9086,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -9024,7 +9103,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -9041,11 +9120,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 15
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -9098,9 +9180,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.15.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.15.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -9129,7 +9213,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9158,9 +9242,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.16.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.16.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -9234,7 +9320,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.16.conv"
           ],
@@ -9315,7 +9401,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 16
@@ -9335,7 +9421,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 16
@@ -9355,7 +9441,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 16
@@ -9418,9 +9504,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.16.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.16.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -9449,7 +9537,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9478,9 +9566,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.17.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.17.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -9554,7 +9644,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.17.conv"
           ],
@@ -9635,7 +9725,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 17
@@ -9655,7 +9745,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 17
@@ -9675,7 +9765,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 17
@@ -9738,9 +9828,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.17.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.17.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -9769,7 +9861,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9798,9 +9890,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.18.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.18.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -9874,7 +9968,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.18.conv"
           ],
@@ -9955,7 +10049,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 18
@@ -9975,7 +10069,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 18
@@ -9995,7 +10089,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 18
@@ -10058,9 +10152,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.18.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.18.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -10089,7 +10185,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10118,9 +10214,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.19.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.19.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -10226,9 +10324,11 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard",
-          "partial": 64
+        "Launch": {
+          "kernel": "rope::rope_partial_bf16",
+          "params": [
+            64
+          ]
         }
       },
       "inputs": [
@@ -10273,7 +10373,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -10290,7 +10390,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -10307,11 +10407,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 19
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -10364,9 +10467,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.19.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.19.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -10395,7 +10500,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10424,9 +10529,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.20.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.20.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -10500,7 +10607,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.20.conv"
           ],
@@ -10581,7 +10688,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 20
@@ -10601,7 +10708,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 20
@@ -10621,7 +10728,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 20
@@ -10684,9 +10791,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.20.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.20.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -10715,7 +10824,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10744,9 +10853,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.21.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.21.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -10820,7 +10931,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.21.conv"
           ],
@@ -10901,7 +11012,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 21
@@ -10921,7 +11032,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 21
@@ -10941,7 +11052,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 21
@@ -11004,9 +11115,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.21.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.21.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -11035,7 +11148,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11064,9 +11177,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.22.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.22.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -11140,7 +11255,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "kernel": "ssm::causal_conv1d_prefill_batched_bf16",
           "weights": [
             "layer.22.conv"
           ],
@@ -11221,7 +11336,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 22
@@ -11241,7 +11356,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_cached_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 22
@@ -11261,7 +11376,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "kernel": "ssm::chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 22
@@ -11324,9 +11439,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.22.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.22.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -11355,7 +11472,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11384,9 +11501,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.23.attn_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.23.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -11492,9 +11611,11 @@
     },
     {
       "kind": {
-        "Rope": {
-          "kind": "Standard",
-          "partial": 64
+        "Launch": {
+          "kernel": "rope::rope_partial_bf16",
+          "params": [
+            64
+          ]
         }
       },
       "inputs": [
@@ -11539,7 +11660,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_explicit_bf16",
+          "kernel": "attn::write_kv_explicit_bf16",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -11556,7 +11677,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_write_kv_to_pages",
+          "kernel": "attn::write_kv_to_pages",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -11573,11 +11694,14 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
             "store": "KvCache",
             "layer": 23
-          }
+          },
+          "params": [
+            4294967295
+          ]
         }
       },
       "inputs": [
@@ -11630,9 +11754,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "layer.23.mlp_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.23.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -11661,7 +11787,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11690,9 +11816,11 @@
     },
     {
       "kind": {
-        "Rmsnorm": {
-          "weight": "final_norm",
-          "variant": "Gemma"
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "final_norm"
+          ]
         }
       },
       "inputs": [

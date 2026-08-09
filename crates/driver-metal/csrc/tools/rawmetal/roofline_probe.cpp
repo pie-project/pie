@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "decode_abi.hpp"
+#include "pie/kernels/entrypoint.h"
 #include "harness.hpp"
 #include "mtl4_context.hpp"
 
@@ -83,7 +84,7 @@ int main(int argc, char** argv) {
     const int BM = getenv("PROBE_BM") ? atoi(getenv("PROBE_BM")) : 16;
     // Warp shape. The default 2x2 is 128 threads; a suffixed variant spreads
     // the same tile over eight simdgroups, which is the occupancy question.
-    const char* WSUF = getenv("PROBE_WSUF") ? getenv("PROBE_WSUF") : "";
+    const std::string WSUF = getenv("PROBE_WSUF") ? getenv("PROBE_WSUF") : "";
     const int WM = getenv("PROBE_WM") ? atoi(getenv("PROBE_WM")) : 2;
     const int WN = getenv("PROBE_WN") ? atoi(getenv("PROBE_WN")) : 2;
 
@@ -97,22 +98,33 @@ int main(int argc, char** argv) {
                                             "stream_read_bf16", &err);
     if (!stream.valid()) { printf("FAIL stream compile: %s\n", err.c_str()); return 1; }
     Pso qmm = ctx->compile_pso_from_file(
-        dir + "/quantized_qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_" + std::to_string(BM) + "_bn_" +
-            std::to_string(BN) + WSUF, &err);
+        dir + "/quant/qmm_t.metal",
+        pie::kernels::entrypoint(
+            "affine_qmm_t",
+            {pie::kernels::affine(pie::metal::AffineFormat{4, 64}),
+             pie::kernels::tile(BM, BN), WSUF}),
+        &err);
     if (!qmm.valid()) { printf("FAIL qmm compile: %s\n", err.c_str()); return 1; }
-    Pso qmv = ctx->compile_pso_from_file(dir + "/quantized_qmv.metal",
+    Pso qmv = ctx->compile_pso_from_file(dir + "/quant/qmv.metal",
                                          "affine_qmv_fast_bfloat16_gs_64_b_4", &err);
     if (!qmv.valid()) { printf("FAIL qmv compile: %s\n", err.c_str()); return 1; }
     Pso qsk, qred;
     if (SPLIT > 1) {
         const std::string sp = std::to_string(SPLIT);
         qsk = ctx->compile_pso_from_file(
-            dir + "/quantized_qmm_t.metal",
-            "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_16_bn_" +
-                std::to_string(BN) + "_sp_" + sp, &err);
-        qred = ctx->compile_pso_from_file(dir + "/quantized_qmm_t.metal",
-                                          "qmm_splitk_reduce_bfloat16_sp_" + sp, &err);
+            dir + "/quant/qmm_t.metal",
+            // `_sp_<split>` had been dead for some time: no shader
+            // instantiates it. The split count is a DISPATCH argument, not a
+            // name, and the entrypoint is the plain splitk one.
+            pie::kernels::entrypoint(
+                "affine_qmm_t_splitk",
+                {pie::kernels::affine(pie::metal::AffineFormat{4, 64}),
+                 pie::kernels::tile(16, BN)}),
+            &err);
+        qred = ctx->compile_pso_from_file(
+            dir + "/quant/qmm_t.metal",
+            pie::kernels::entrypoint("qmm_splitk_reduce", {pie::kernels::bf16()}),
+            &err);
         if (!qsk.valid() || !qred.valid()) {
             printf("FAIL splitk compile: %s\n", err.c_str());
             return 1;

@@ -45,6 +45,8 @@
 #include <string>
 #include <vector>
 
+#include "model/csm/csm_naive_kernels.cuh"
+
 namespace pie_cuda_driver::model {
 
 // ── Optional parity-debug checkpoint hook ────────────────────────────────────
@@ -65,8 +67,6 @@ namespace {
 
 typedef __nv_bfloat16 bf;
 #define MCK(x) do{cudaError_t e=(x);if(e)throw std::runtime_error(std::string("mimi_decoder: ")+cudaGetErrorString(e));}while(0)
-__device__ __forceinline__ float F(bf x){return __bfloat162float(x);}
-__device__ __forceinline__ bf   Bf(float x){return __float2bfloat16(x);}
 
 dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 
@@ -74,13 +74,6 @@ dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 __global__ void k_elu(const bf* x,bf* o,long n){
     long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i>=n)return;
     float v=F(x[i]);o[i]=Bf(v>0.f?v:(__expf(v)-1.f));}     // ELU(alpha=1)
-__global__ void k_gelu(const bf* x,bf* o,long n){
-    long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i>=n)return;
-    float v=F(x[i]);
-    // exact (erf) GELU — transformers ACT2FN["gelu"] is the erf form.
-    o[i]=Bf(0.5f*v*(1.f+erff(v*0.70710678118f)));}
-__global__ void k_add(bf* a,const bf* b,long n){
-    long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<n)a[i]=Bf(F(a[i])+F(b[i]));}
 __global__ void k_bf16_to_f32(const bf* a,float* o,long n){
     long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<n)o[i]=F(a[i]);}
 // out[c,t] += scale[c] * x[c,t]  (per-CHANNEL layer scale on a [C, T] tensor)
@@ -95,25 +88,8 @@ __global__ void k_layerscale_add_rd(bf* res,const bf* x,const bf* scale,int R,in
     if(r>=R||d>=D)return;long i=(long)r*D+d;res[i]=Bf(F(res[i])+F(scale[d])*F(x[i]));}
 
 // Standard matmul y[n,o] = sum_k x[n,k]*W[o,k]   (W is [O, K], row-major).
-__global__ void k_matmul(const bf* x,const bf* W,bf* y,int N,int K,int O){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,o=blockIdx.x*blockDim.x+threadIdx.x;
-    if(n>=N||o>=O)return;const bf* xr=x+(long)n*K;const bf* wr=W+(long)o*K;
-    float a=0;for(int k=0;k<K;k++)a+=F(xr[k])*F(wr[k]);y[(long)n*O+o]=Bf(a);}
-
 // LayerNorm over the feature axis (with weight + bias), on a [R, D] row-major
 // tensor (one feature vector per row). transformers nn.LayerNorm.
-__global__ void k_layernorm(const bf* x,const bf* w,const bf* b,bf* o,int R,int D,float eps){
-    int r=blockIdx.x;if(r>=R)return;const bf* xr=x+(long)r*D;bf* orow=o+(long)r*D;
-    float m=0;for(int d=threadIdx.x;d<D;d+=blockDim.x)m+=F(xr[d]);
-    for(int s=warpSize/2;s>0;s>>=1)m+=__shfl_down_sync(0xffffffff,m,s);
-    __shared__ float wm[32],wv[32],mean,inv;if((threadIdx.x&31)==0)wm[threadIdx.x>>5]=m;__syncthreads();
-    if(threadIdx.x==0){float t=0;int nw=(blockDim.x+31)/32;for(int i=0;i<nw;i++)t+=wm[i];mean=t/D;}__syncthreads();
-    float v=0;for(int d=threadIdx.x;d<D;d+=blockDim.x){float dd=F(xr[d])-mean;v+=dd*dd;}
-    for(int s=warpSize/2;s>0;s>>=1)v+=__shfl_down_sync(0xffffffff,v,s);
-    if((threadIdx.x&31)==0)wv[threadIdx.x>>5]=v;__syncthreads();
-    if(threadIdx.x==0){float t=0;int nw=(blockDim.x+31)/32;for(int i=0;i<nw;i++)t+=wv[i];inv=rsqrtf(t/D+eps);}__syncthreads();
-    for(int d=threadIdx.x;d<D;d+=blockDim.x)orow[d]=Bf((F(xr[d])-mean)*inv*F(w[d])+F(b[d]));}
-
 // ── RVQ dequantize ───────────────────────────────────────────────────────────
 // For one RVQ GROUP: sum the per-codebook embedding rows (codebook_dim=256)
 // over its codebooks, into a [codebook_dim, T] residual (channels-first to feed
@@ -229,7 +205,7 @@ __global__ void k_rope_inplace(bf* q,bf* kk,int T,int H,int KVH,int hd,float the
 }
 // Naive causal attention with GQA + sliding window. out[t,h,:] over keys
 // j in [max(0,t-window+1), t]. scaling = 1/sqrt(head_dim).
-__global__ void k_attn(const bf* q,const bf* kk,const bf* v,bf* out,
+__global__ void k_attn_sliding_window(const bf* q,const bf* kk,const bf* v,bf* out,
                        int T,int H,int KVH,int hd,int window,float scale){
     int h=blockIdx.y,t=blockIdx.x*blockDim.x+threadIdx.x;if(h>=H||t>=T)return;
     int kvh=h/(H/KVH);
@@ -317,7 +293,7 @@ int run_mimi_decoder(const MimiDecoderRawWeights& w,
         k_matmul<<<G2(KVH*hd,Tu),B2,0,S>>>(ln,L.v,vv,Tu,HID,KVH*hd);
         { dim3 g((hd/2+15)/16,(Tu+15)/16);
           k_rope_inplace<<<g,B2,0,S>>>(q,kk,Tu,H,KVH,hd,w.xf_rope_theta); }
-        { dim3 g((Tu+127)/128,H); k_attn<<<g,128,0,S>>>(q,kk,vv,ao,Tu,H,KVH,hd,
+        { dim3 g((Tu+127)/128,H); k_attn_sliding_window<<<g,128,0,S>>>(q,kk,vv,ao,Tu,H,KVH,hd,
                                                         w.xf_sliding_window,ascale); }
         k_matmul<<<G2(HID,Tu),B2,0,S>>>(ao,L.o,proj,Tu,H*hd,HID);
         // layer_scale (per-channel) then residual. proj/hs are [Tu, HID]
@@ -328,7 +304,7 @@ int run_mimi_decoder(const MimiDecoderRawWeights& w,
         // mlp (pre-norm)
         k_layernorm<<<Tu,128,0,S>>>(hs,L.post_ln_w,L.post_ln_b,ln,Tu,HID,EPS);
         k_matmul<<<G2(IM,Tu),B2,0,S>>>(ln,L.fc1,mid,Tu,HID,IM);
-        k_gelu<<<((long)Tu*IM+255)/256,256,0,S>>>(mid,mid,(long)Tu*IM);
+        k_gelu_erf<<<((long)Tu*IM+255)/256,256,0,S>>>(mid,mid,(long)Tu*IM);
         k_matmul<<<G2(HID,Tu),B2,0,S>>>(mid,L.fc2,mlp,Tu,IM,HID);
         { dim3 g((HID+15)/16,(Tu+15)/16);
           k_layerscale_add_rd<<<g,B2,0,S>>>(hs,mlp,L.mlp_scale,Tu,HID); }

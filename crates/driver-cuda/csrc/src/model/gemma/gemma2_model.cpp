@@ -1,3 +1,4 @@
+#include "attention_workspace.hpp"
 #include "model/gemma/gemma2_model.hpp"
 
 #include <utility>
@@ -12,7 +13,7 @@ Gemma2Model::Gemma2Model(Gemma2Weights weights,
 void Gemma2Model::body(Workspace& ws,
                        KvCache& kv,
                        AttentionWorkspace& attn_ws,
-                       ops::CublasHandle& cublas,
+                       kernels::gemm::CublasHandle& cublas,
                        const ForwardFn::ForwardInputs& in) {
     gemma2_forward_paged(
         weights_, hf_config_, fwd_cfg_,

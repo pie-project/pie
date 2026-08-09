@@ -29,6 +29,7 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "../../mtl4_context.hpp"
+#include "pie/kernels/moe.h"
 #include "../shared_kernels.hpp"
 #include "geometry.hpp"
 
@@ -41,8 +42,8 @@ using shared_kernels::RouterParams;
 using shared_kernels::RowGatherParams;
 using shared_kernels::elementwise_dispatch;
 using shared_kernels::expert_combine_dispatch;
-using shared_kernels::moe_route_rows_dispatch;
-using shared_kernels::moe_route_sort_dispatch;
+using shared_kernels::route_rows_dispatch;
+using shared_kernels::route_sort_dispatch;
 using shared_kernels::routed_qmv_dispatch;
 using shared_kernels::router_topk_dispatch;
 
@@ -135,15 +136,6 @@ std::vector<float> llama3_inv_freq(const LlamaGeometry& g);
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
 
-/// The routed SiLU-mul, over the whole [rows * k, moe_intermediate] stack. It
-/// is one flat elementwise dispatch precisely because gate, up and out share a
-/// layout -- the slot axis needs no special handling.
-inline void expert_silu_dispatch(int moe_intermediate, int experts_per_token, Grid& g,
-                                 Threadgroup& tg, int rows = 1) {
-    const std::size_t n = std::size_t(moe_intermediate > 0 ? moe_intermediate : 1) *
-                          std::size_t(experts_per_token > 0 ? experts_per_token : 1) *
-                          std::size_t(rows > 0 ? rows : 1);
-    elementwise_dispatch(static_cast<std::uint32_t>(n), g, tg);
-}
+using pie::kernels::moe::expert_silu_dispatch;
 
 }  // namespace pie::metal::llama

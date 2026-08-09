@@ -7,15 +7,15 @@
 //   nvcc -O3 -std=c++20 -arch=sm_80 --expt-relaxed-constexpr \
 //        -I crates/driver-cuda/csrc/src -o /tmp/moe_bench \
 //        crates/driver-cuda/csrc/bench/moe_bench.cu \
-//        crates/driver-cuda/csrc/src/kernels/dequant_fp4.cu \
-//        crates/driver-cuda/csrc/src/kernels/moe_dispatch.cu
+//        crates/driver-cuda/csrc/src/quant/dequant_fp4.cu \
+//        crates/driver-cuda/csrc/src/moe/moe_dispatch.cu
 //
 // Build with the Marlin MoE candidate (~2-3 min, only when it changes):
 //   nvcc -O3 -std=c++20 -arch=sm_80 --expt-relaxed-constexpr -DWITH_MARLIN_MOE \
 //        -I crates/driver-cuda/csrc/src -I crates/driver-cuda/csrc/third_party/marlin_moe \
 //        -o /tmp/moe_bench crates/driver-cuda/csrc/bench/moe_bench.cu \
-//        crates/driver-cuda/csrc/src/kernels/dequant_fp4.cu \
-//        crates/driver-cuda/csrc/src/kernels/moe_dispatch.cu \
+//        crates/driver-cuda/csrc/src/quant/dequant_fp4.cu \
+//        crates/driver-cuda/csrc/src/moe/moe_dispatch.cu \
 //        crates/driver-cuda/csrc/third_party/marlin_moe/ops.cu \
 //        crates/driver-cuda/csrc/third_party/marlin_moe/marlin_moe_wrapper.cpp
 //
@@ -38,8 +38,8 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/dequant_fp4.hpp"
-#include "kernels/moe_dispatch.hpp"
+#include "quant/dequant_fp4.hpp"
+#include "moe/moe_dispatch.hpp"
 
 #ifdef WITH_MARLIN_MOE
   #include "marlin_moe_wrapper.hpp"
@@ -169,19 +169,19 @@ void run_shape(const Shape& sh, const std::vector<int>& batch_sizes) {
 
     using namespace pie_cuda_driver;
     auto per_route = [&](cudaStream_t s) {
-      kernels::launch_mxfp4_moe_gate_up_decode_bf16(
+      kernels::quant::mxfp4_moe_gate_up_decode_bf16(
           d_act, static_cast<const std::int32_t*>(d_topk),
           static_cast<const std::uint8_t* const*>(d_w_ptrs),
           static_cast<const std::uint8_t* const*>(d_s_ptrs),
           nullptr, nullptr, d_gate, d_up, N, K, H, Ip, s);
     };
     auto grouped = [&](cudaStream_t s) {
-      kernels::launch_moe_bucket_exact(
+      kernels::moe::moe_bucket_exact(
           static_cast<const std::int32_t*>(d_topk),
           static_cast<std::int32_t*>(d_sorted),
           static_cast<std::int32_t*>(d_r2r),
           static_cast<std::int32_t*>(d_counts), routes, E, s);
-      kernels::launch_mxfp4_moe_gate_up_decode_grouped_bf16(
+      kernels::quant::mxfp4_moe_gate_up_decode_grouped_bf16(
           d_act, static_cast<const std::int32_t*>(d_sorted),
           static_cast<const std::int32_t*>(d_counts),
           static_cast<const std::uint8_t* const*>(d_w_ptrs),
@@ -207,7 +207,7 @@ void run_shape(const Shape& sh, const std::vector<int>& batch_sizes) {
       void* d_out = dalloc(std::size_t(routes) * Ip * 2);
       void* d_out2 = dalloc(std::size_t(routes) * Ip * 2);
       void* d_ws = dalloc(marlin_moe::marlin_moe_workspace_bytes(Ip, block));
-      kernels::launch_moe_align_decode(
+      kernels::moe::moe_align_decode(
           static_cast<const std::int32_t*>(d_topk),
           static_cast<std::int32_t*>(d_msorted),
           static_cast<std::int32_t*>(d_mexpert), nullptr, routes, E, block,

@@ -852,12 +852,12 @@ std::unique_ptr<M1Runtime> M1Runtime::create(
     // The host emitter embeds the M1 runtime template into every emitted
     // source (`tensor-compiler's codegen/src/metal/preamble.rs`), so the driver no
     // longer keeps its own copy on disk. But that template still carries
-    // `#include "ptir_rng.generated.metal"` — the RNG preamble is emitted
+    // `#include "ptir/ptir_rng.generated.metal"` — the RNG preamble is emitted
     // once from `crates/tensor-ir/src/rng.rs` and staged into `kernels_dir` by
     // CMake's `configure_file`, and Metal's runtime shader compiler does
     // no filesystem include lookup, so we splice it in ourselves later.
     const std::filesystem::path rng_path =
-        std::filesystem::path(kernels_dir) / "ptir_rng.generated.metal";
+        std::filesystem::path(kernels_dir) / "ptir/ptir_rng.generated.metal";
     if (!read_metal_source(
             rng_path.string(), impl->ptir_rng_preamble, &error) ||
         impl->ptir_rng_preamble.empty()) {

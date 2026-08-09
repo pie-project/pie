@@ -49,33 +49,6 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
             // machine sooner, so the tile crossover moves down. Measured with
             // `roofline_probe`; the table is in `device_tuning.hpp`.
             t.qmm_bn_crossover_tg = 96;
-            // Both crossovers, because 8 is what this device measured and
-            // shipped with while there was one of them, and a mixture ran it
-            // too. Splitting the constant may not move a device that was
-            // measured before the split existed: the M4's routed half is
-            // unmeasured, and leaving it at 12 here would be a change dressed
-            // as a default.
-            t.qmm_min_batch_moe = 8;
-            break;
-        case 8:
-            // M2 generation. Measured on an M2 Max (38 cores), one binary via
-            // the env overrides, arms alternated within each batch, three
-            // reps: eight is the first batch where the GEMM beats the GEMV on
-            // all four dense checkpoints (Llama-1B +17.6%, Llama-3B +19.2%,
-            // Qwen3-1.7B +14.4%, gemma-4-E2B +4.6%) and the first with no
-            // regression on any of them.
-            //
-            // The ROUTED crossover stays at the M1 number, and that is the
-            // finding rather than an omission: at the same batches the GEMV
-            // still wins on every mixture measured -- Qwen3-30B by 8%,
-            // gemma-4-26B by 12%, gpt-oss-20B by nothing either way. See
-            // `DeviceTuning::qmm_min_batch_moe` for the runs.
-            //
-            // Only this one constant. The rest of the table is still the M1's
-            // on this machine because nothing here has measured them, and a
-            // family entry that guessed at the others would be worse than the
-            // default it replaced.
-            t.qmm_min_batch = 8;
             break;
         case 8:
             // M2 generation. The DENSE crossover here is eight, which is now

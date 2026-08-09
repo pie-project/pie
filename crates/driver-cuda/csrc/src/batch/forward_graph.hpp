@@ -35,7 +35,7 @@ bool prefill_graph_pad_enabled();
 //      happens *only at capture time*; replay just re-issues the recorded
 //      kernels. flashinfer's `DecodePlan` violates this — it allocates
 //      host vectors, runs work estimation, fills `page_locked_int`. So we
-//      hoist the plan out (`plan_attention_flashinfer_decode_bf16` runs
+//      hoist the plan out (`kernels::attn::plan_attention_flashinfer_decode_bf16` runs
 //      *before* graph launch); only the dispatch is captured.
 //   3. **Stable kernel sequence.** The graph encodes the exact kernel
 //      list of one fire shape. Different `(R, num_pages, …)` shapes need

@@ -10,11 +10,12 @@
 //     out           = sum_e (top_k_w * Expert_e(norm_y))
 //
 // We loop the experts on the host: for each expert e, gather the rows
-// routed to it (via `launch_gather_bf16_rows`), run the expert's
+// routed to it (via `kernels::layout::gather_bf16_rows`), run the expert's
 // gate/up/down GEMMs through cuBLAS, then `launch_scatter_add_weighted`
 // the result back into the residual stream. Top-K and renormalization
-// happen on-device via `launch_topk_softmax_bf16`.
+// happen on-device via `kernels::moe::topk_softmax_bf16`.
 
+#include "attention_workspace.hpp"
 #include "device_buffer.hpp"
 #include <cstdint>
 #include <vector>
@@ -23,8 +24,8 @@
 #include "store/kv_cache.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/llama_like/qwen3.hpp"
-#include "ops/attention_flashinfer.hpp"
-#include "ops/gemm.hpp"
+#include "attn/attention_flashinfer.hpp"
+#include "gemm/gemm.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -167,7 +168,7 @@ void mixtral_forward_paged(
     Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    ops::CublasHandle& cublas,
+    kernels::gemm::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,

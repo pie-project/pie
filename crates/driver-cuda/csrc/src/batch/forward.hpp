@@ -17,6 +17,7 @@
 #include <map>
 #include <unordered_map>
 
+#include "attention_workspace.hpp"
 #include "cuda_check.hpp"
 #include "distributed.hpp"
 #include "batch/forward_graph.hpp"
@@ -54,9 +55,9 @@ struct LoraTable;
 class HookSidebandArena;
 }  // namespace model
 
-namespace ops {
+namespace kernels::gemm {
 class CublasHandle;
-}  // namespace ops
+}  // namespace kernels::gemm
 
 // Type-erased forward call. Two-phase API to support CUDA-graph capture
 // without staleness bugs:
@@ -136,7 +137,7 @@ struct ForwardFn {
         // Optional: explicit KV-write descriptor (device-geometry WSlot/WOff,
         // B2). When `has_write_desc`, the per-layer KV append lands each lane's
         // new-token K/V at the EXPLICIT (physical page id `w_page_d[lane]`,
-        // offset `w_off_d[lane]`) target via `launch_write_kv_explicit_bf16`,
+        // offset `w_off_d[lane]`) target via `kernels::attn::write_kv_explicit_bf16`,
         // instead of re-deriving the position from the page-table +
         // last_page_len. Required for beam fork/freeze correctness (a frozen
         // fork's cell must not be overwritten by the standard derivation).
@@ -344,7 +345,7 @@ struct ForwardFn {
     void invoke_body(model::Workspace& ws,
                      KvCache& kv,
                      AttentionWorkspace& aws,
-                     ops::CublasHandle& cublas,
+                     kernels::gemm::CublasHandle& cublas,
                      const ForwardInputs& in);
     std::uint64_t invoke_lora_stage(model::Workspace& ws,
                                     const model::LoraTable* lora,
@@ -353,7 +354,7 @@ struct ForwardFn {
     bool invoke_supergraph_body(model::Workspace& ws,
                                 KvCache& kv,
                                 AttentionWorkspace& aws,
-                                ops::CublasHandle& cublas,
+                                kernels::gemm::CublasHandle& cublas,
                                 const ForwardInputs& in,
                                 batch::SupergraphBuilder& sg);
     std::uint32_t invoke_graph_layout();
@@ -368,7 +369,7 @@ struct ForwardFn {
 struct NativeSystemCommitInputs {
     model::Workspace& target_ws;
     KvCache& kv_cache;
-    ops::CublasHandle& cublas;
+    kernels::gemm::CublasHandle& cublas;
     const std::int32_t* token_ids = nullptr;
     const std::int32_t* positions = nullptr;
     const std::uint32_t* qo_indptr = nullptr;
@@ -388,7 +389,7 @@ struct NativeSystemDrafter {
     using DraftStepFn = std::function<void(
         model::Workspace&,
         KvCache&,
-        ops::CublasHandle&,
+        kernels::gemm::CublasHandle&,
         const std::int32_t*  /* token_ids device */,
         const std::int32_t*  /* position_ids device */,
         const std::int32_t*  /* base_hidden_row_indices device */,
@@ -434,7 +435,7 @@ struct BatchEngine {
                 model::Workspace& ws,
                 KvCache& kv_cache,
                 AttentionWorkspace& attn_ws,
-                ops::CublasHandle& cublas,
+                kernels::gemm::CublasHandle& cublas,
                 int max_workspace_tokens,
                 int max_forward_requests,
                 int graph_pad_page,
@@ -446,7 +447,7 @@ struct BatchEngine {
                 ForwardGraphCache* graph_cache = nullptr,
                 NcclComm* tp_comm = nullptr,
                 std::string tp_cpu_gate_key = {},
-                ops::RuntimeQuantContext* runtime_quant_context = nullptr,
+                kernels::gemm::RuntimeQuantContext* runtime_quant_context = nullptr,
                 RecurrentStateCache* rs_cache = nullptr)
         : loaded_model(loaded_model),
           ws(ws),
@@ -471,7 +472,7 @@ struct BatchEngine {
     model::Workspace& ws;
     KvCache& kv_cache;
     AttentionWorkspace& attn_ws;
-    ops::CublasHandle& cublas;
+    kernels::gemm::CublasHandle& cublas;
     int max_workspace_tokens;
     int max_forward_requests;
     // Invalid-row dummy page. Row-validity-safe native graph paths alias page
@@ -507,7 +508,7 @@ struct BatchEngine {
     // before entering their NCCL receive. This prevents idle followers from
     // burning GPU cycles while rank 0 is between requests.
     std::string tp_cpu_gate_key;
-    ops::RuntimeQuantContext* runtime_quant_context = nullptr;
+    kernels::gemm::RuntimeQuantContext* runtime_quant_context = nullptr;
 
     // Runtime-managed rs_cache storage. Null on models without
     // recurrent-state slots.

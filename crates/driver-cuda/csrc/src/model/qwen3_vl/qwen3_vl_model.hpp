@@ -4,6 +4,7 @@
 #include <optional>
 #include <span>
 
+#include "attention_workspace.hpp"
 #include "device_buffer.hpp"
 #include "model/imodel.hpp"
 #include "model/llama_like/llama_like.hpp"
@@ -39,7 +40,7 @@ public:
     void body(Workspace& ws,
               KvCache& kv,
               AttentionWorkspace& attn_ws,
-              ops::CublasHandle& cublas,
+              kernels::gemm::CublasHandle& cublas,
               const ForwardFn::ForwardInputs& in) override;
 
     ModelCapabilities capabilities() const override { return caps_; }

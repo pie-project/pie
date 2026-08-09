@@ -45,16 +45,25 @@ fn main() {
         .define("PIE_PTIR_INCLUDE_DIR", sibling("tensor-compiler").join("include"))
         .define("PIE_PTIR_RUNTIME_DIR", sibling("tensor-compiler").join("runtime"))
         .define("PIE_REPO_ROOT", repo_root())
-        // The shader directory, from cargo rather than by walking out of this
-        // tree. It becomes both an include dir (the `*_params.h` a shader and
-        // its host caller must agree on) and PIE_METAL_KERNELS_DIR_DEFAULT,
-        // the path baked into the binary for the runtime shader compiler.
+        // The shader tree, from cargo rather than by walking out of this tree.
+        // It is an include dir (for the `*_params.h` a shader and its host
+        // caller must agree on) and PIE_METAL_KERNELS_DIR_DEFAULT, the path
+        // baked into the binary for the runtime shader compiler.
         .define(
             "PIE_KERNELS_METAL_DIR",
             std::env::var("DEP_PIE_KERNELS_METAL_KERNELS_DIR").expect(
                 "kernels-metal's build.rs publishes the shader directory as \
                  cargo:kernels_dir",
             ),
+        )
+        // The HOST library, which is a different tree: `include/pie/kernels/`
+        // holds the launch shapes, the entrypoint name grammar and the `Grid`
+        // PODs -- ordinary C++ this shell compiles against, with no Metal in
+        // it. They were one directory until §4 of
+        // .wiki/kernel-metal-refactor.md separated the two roles.
+        .define(
+            "PIE_KERNELS_METAL_INCLUDE_DIR",
+            metal_include_dir(),
         );
 
     // CPM cache is read by the CMakeLists via `$ENV{CPM_SOURCE_CACHE}`;
@@ -228,4 +237,22 @@ fn walk(dir: &Path, out: &mut std::collections::HashSet<PathBuf>) {
     if has_archive {
         out.insert(dir.to_path_buf());
     }
+}
+
+/// The host include root out of `DEP_PIE_KERNELS_METAL_INCLUDE`.
+///
+/// `kernels-metal` publishes `cargo:include` as a `;`-separated list — the host
+/// library first, the shader tree second — because a C++ include path is
+/// naturally plural and cargo gives a `links` crate one key per name. CMake
+/// takes them as two variables, so this picks the first and the shader tree
+/// arrives through `PIE_KERNELS_METAL_DIR` above.
+fn metal_include_dir() -> String {
+    let published = std::env::var("DEP_PIE_KERNELS_METAL_INCLUDE").expect(
+        "kernels-metal's build.rs publishes the host include roots as cargo:include",
+    );
+    published
+        .split(';')
+        .next()
+        .expect("cargo:include is not empty")
+        .to_string()
 }

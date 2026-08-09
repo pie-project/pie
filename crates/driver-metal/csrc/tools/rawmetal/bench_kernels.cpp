@@ -66,10 +66,10 @@ int main(int argc, char** argv) {
     if (!ctx) { printf("FAIL: no context\n"); return 1; }
 
     std::string err;
-    Pso rms = ctx->compile_pso_from_file(kernels_dir + "/rms_norm.metal",
+    Pso rms = ctx->compile_pso_from_file(kernels_dir + "/norm/rms.metal",
                                          "rms_single_row_bfloat16", &err);
     if (!rms.valid()) { printf("FAIL rms compile: %s\n", err.c_str()); return 1; }
-    Pso qmv = ctx->compile_pso_from_file(kernels_dir + "/quantized_qmv.metal",
+    Pso qmv = ctx->compile_pso_from_file(kernels_dir + "/quant/qmv.metal",
                                          "affine_qmv_fast_bfloat16_gs_64_b_4", &err);
     if (!qmv.valid()) { printf("FAIL qmv compile: %s\n", err.c_str()); return 1; }
     printf("runtime MSL compile OK (rms_single_row_bfloat16, affine_qmv_fast_bf16_g64)\n\n");

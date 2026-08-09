@@ -42,21 +42,35 @@
 )]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod batch;
 pub mod bump;
 mod error;
+pub mod facts;
+pub mod loader;
+pub mod model;
+pub mod pipeline;
 pub mod region;
 pub mod shader;
+pub mod store;
 pub mod tuning;
 
 pub use error::{Error, Result};
+pub use facts::{ModelFacts, ModelFamily};
 pub use region::Region;
+pub use shader::{Batch, Request};
 
 #[cfg(target_vendor = "apple")]
 pub mod metal;
 
 #[cfg(target_vendor = "apple")]
 pub use metal::{
-    ArgumentTable, Compiler, Context, DeviceInfo, External, Externals, Feedback, Feedbacks, Heap,
-    MAX_BINDINGS, Mapped, Pool, PoolStats, Slot, StepEncoder, Stepper, Tables, Transient,
-    Visibility,
+    Archived, Archives, Arena, ArgumentTable, Budget, CHUNK, Compiled, Compiler, Context,
+    DeviceInfo, DeviceInputs, Elastic, Execution, External, Externals, Feedback, Feedbacks,
+    FusedExecutable, Granularity, GroupStats, GroupedExecutable, Handle, Heap, Keepalive,
+    LaneCandidate, M2Command, M3Group, MAX_BINDINGS, MAX_FUSED_CHANNELS, MAX_LANES,
+    MAX_REGIONS_PER_PROGRAM, MAX_REGIONS_PER_STAGE, MIN_DEPTH, MIN_THREADGROUPS, Mapped, Math,
+    Memory, Mode, Need, ORDINAL_BASE, PAGE, Pool, PoolStats, Prepare, PreparedFire, Pressure,
+    ProgramExecutable, ProgramStage, Pso, RegionExecutable, Ring, Runtime, Slot, StageExecutable,
+    StepEncoder, Stepper, THREADS_PER_THREADGROUP, TILE, Tables, Timestamps, Timing, Transient,
+    Visibility, create_elastic, pages_for_bytes,
 };

@@ -28,10 +28,11 @@
 
 #include <cuda_runtime.h>
 
-#include "ops/attention_flashinfer.hpp"
+#include "attention_workspace.hpp"
+#include "attn/attention_flashinfer.hpp"
 
 using pie_cuda_driver::AttentionWorkspace;
-namespace ops = pie_cuda_driver::ops;
+namespace kernels = pie_cuda_driver::kernels;
 
 namespace {
 
@@ -175,18 +176,18 @@ Run run_batch(const std::vector<Req>& reqs, bool full_attn, bool capture) {
 
     auto ws = AttentionWorkspace::allocate(256ull * 1024 * 1024,
                                            32ull * 1024 * 1024);
-    auto plan = ops::make_decode_plan();
-    ops::plan_attention_flashinfer_decode(
-        *plan, kv_page_indptr_h.data(), R, HQ, HKV, D, PAGE, ws,
+    auto plan = kernels::attn::make_decode_plan();
+    kernels::attn::plan_attention_flashinfer_decode(
+        *plan, kv_page_indptr_h.data(), R, HQ, HKV, D, PAGE, ws.view(),
         /*stream=*/nullptr, /*enable_cuda_graph=*/false,
         /*full_attention_variant=*/full_attn, /*hnd_layout=*/false);
     if (capture) {
-        ops::dispatch_attention_flashinfer_decode_capture_bf16(
-            *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+        kernels::attn::dispatch_attention_flashinfer_decode_capture_bf16(
+            *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws.view(),
             /*stream=*/nullptr, d_scores, d_sindptr);
     } else {
-        ops::dispatch_attention_flashinfer_decode_bf16(
-            *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+        kernels::attn::dispatch_attention_flashinfer_decode_bf16(
+            *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws.view(),
             /*stream=*/nullptr);
     }
     RT(cudaDeviceSynchronize());
@@ -197,12 +198,12 @@ Run run_batch(const std::vector<Req>& reqs, bool full_attn, bool capture) {
         RT(cudaEventCreate(&end));
         for (int warm = 0; warm < 3; ++warm) {
             if (capture) {
-                ops::dispatch_attention_flashinfer_decode_capture_bf16(
-                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+                kernels::attn::dispatch_attention_flashinfer_decode_capture_bf16(
+                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws.view(),
                     nullptr, d_scores, d_sindptr);
             } else {
-                ops::dispatch_attention_flashinfer_decode_bf16(
-                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+                kernels::attn::dispatch_attention_flashinfer_decode_bf16(
+                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws.view(),
                     nullptr);
             }
         }
@@ -210,12 +211,12 @@ Run run_batch(const std::vector<Req>& reqs, bool full_attn, bool capture) {
         RT(cudaEventRecord(beg));
         for (int it = 0; it < g_bench_iters; ++it) {
             if (capture) {
-                ops::dispatch_attention_flashinfer_decode_capture_bf16(
-                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+                kernels::attn::dispatch_attention_flashinfer_decode_capture_bf16(
+                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws.view(),
                     nullptr, d_scores, d_sindptr);
             } else {
-                ops::dispatch_attention_flashinfer_decode_bf16(
-                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+                kernels::attn::dispatch_attention_flashinfer_decode_bf16(
+                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws.view(),
                     nullptr);
             }
         }

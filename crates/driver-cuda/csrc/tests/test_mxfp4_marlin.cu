@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/mxfp4_marlin.hpp"
+#include "quant/mxfp4_marlin.hpp"
 
 namespace {
 
@@ -47,8 +47,8 @@ std::vector<T> host_from_device(const T* device, std::size_t count) {
     return host;
 }
 
-int select_row(int row, pie_cuda_driver::kernels::Mxfp4RowSelect mode) {
-    using pie_cuda_driver::kernels::Mxfp4RowSelect;
+int select_row(int row, pie_cuda_driver::kernels::quant::Mxfp4RowSelect mode) {
+    using pie_cuda_driver::kernels::quant::Mxfp4RowSelect;
     switch (mode) {
         case Mxfp4RowSelect::Identity: return row;
         case Mxfp4RowSelect::Even: return 2 * row;
@@ -58,7 +58,7 @@ int select_row(int row, pie_cuda_driver::kernels::Mxfp4RowSelect mode) {
 }
 
 void test_weight_even_row_offset_and_valid_padding() {
-    using pie_cuda_driver::kernels::Mxfp4RowSelect;
+    using pie_cuda_driver::kernels::quant::Mxfp4RowSelect;
     constexpr int source_rows = 8;
     constexpr int source_row_offset = 1;
     constexpr int selected_rows = 4;
@@ -84,7 +84,7 @@ void test_weight_even_row_offset_and_valid_padding() {
     std::uint32_t* d_out = nullptr;
     CUDA_CHECK(cudaMalloc(
         &d_out, target_packs * selected_rows * sizeof(std::uint32_t)));
-    pie_cuda_driver::kernels::launch_mxfp4_weight_to_gptq_w4(
+    pie_cuda_driver::kernels::quant::mxfp4_weight_to_gptq_w4(
         d_raw, d_out, source_rows, source_row_offset, selected_rows,
         valid_rows, source_stride_k, source_col_offset, source_k, target_k,
         Mxfp4RowSelect::Even, nullptr);
@@ -108,7 +108,7 @@ void test_weight_even_row_offset_and_valid_padding() {
 }
 
 void test_weight_column_offset_and_target_padding() {
-    using pie_cuda_driver::kernels::Mxfp4RowSelect;
+    using pie_cuda_driver::kernels::quant::Mxfp4RowSelect;
     constexpr int source_rows = 3;
     constexpr int selected_rows = 3;
     constexpr int valid_rows = 3;
@@ -134,7 +134,7 @@ void test_weight_column_offset_and_target_padding() {
     std::uint32_t* d_out = nullptr;
     CUDA_CHECK(cudaMalloc(
         &d_out, target_packs * selected_rows * sizeof(std::uint32_t)));
-    pie_cuda_driver::kernels::launch_mxfp4_weight_to_gptq_w4(
+    pie_cuda_driver::kernels::quant::mxfp4_weight_to_gptq_w4(
         d_raw, d_out, source_rows, 0, selected_rows, valid_rows,
         source_stride_k, source_col_offset, source_k, target_k,
         Mxfp4RowSelect::Identity, nullptr);
@@ -157,7 +157,7 @@ void test_weight_column_offset_and_target_padding() {
 }
 
 void test_scale_group_offset_permutation_and_valid_padding() {
-    using pie_cuda_driver::kernels::Mxfp4RowSelect;
+    using pie_cuda_driver::kernels::quant::Mxfp4RowSelect;
     constexpr int source_rows = 4;
     constexpr int source_row_offset = 1;
     constexpr int selected_rows = 8;
@@ -179,7 +179,7 @@ void test_scale_group_offset_permutation_and_valid_padding() {
     auto* d_raw = device_from_host(raw);
     std::uint8_t* d_out = nullptr;
     CUDA_CHECK(cudaMalloc(&d_out, total));
-    pie_cuda_driver::kernels::launch_mxfp4_scales_to_marlin_e8m0(
+    pie_cuda_driver::kernels::quant::mxfp4_scales_to_marlin_e8m0(
         d_raw, d_out, source_rows, source_row_offset, selected_rows,
         valid_rows, source_stride_groups, source_group_offset, source_groups,
         target_groups, Mxfp4RowSelect::Identity, nullptr);
@@ -211,7 +211,7 @@ void test_scale_group_offset_permutation_and_valid_padding() {
 }
 
 void test_bf16_row_gather_odd_offset_and_valid_padding() {
-    using pie_cuda_driver::kernels::Mxfp4RowSelect;
+    using pie_cuda_driver::kernels::quant::Mxfp4RowSelect;
     constexpr int batch = 2;
     constexpr int source_rows = 8;
     constexpr int source_row_offset = 1;
@@ -229,7 +229,7 @@ void test_bf16_row_gather_odd_offset_and_valid_padding() {
     auto* d_raw = device_from_host(raw);
     std::uint16_t* d_out = nullptr;
     CUDA_CHECK(cudaMalloc(&d_out, batch * selected_rows * sizeof(std::uint16_t)));
-    pie_cuda_driver::kernels::launch_bf16_row_map_to_dense(
+    pie_cuda_driver::kernels::quant::bf16_row_map_to_dense(
         d_raw, d_out, batch, source_rows, source_row_offset, selected_rows,
         valid_rows, Mxfp4RowSelect::Odd, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());

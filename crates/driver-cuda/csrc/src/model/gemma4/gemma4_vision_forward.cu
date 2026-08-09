@@ -17,13 +17,17 @@
 #include <string>
 #include <vector>
 
+#include "gemm/gemm.hpp"
+#include "mlp/swiglu.hpp"
+#include "norm/residual_add.hpp"
+#include "norm/rmsnorm.hpp"
+#include "model/gemma4/gemma4_naive_kernels.cuh"
+
 namespace pie_cuda_driver::model {
 namespace {
 
 typedef __nv_bfloat16 bf;
 #define VCK(x) do{cudaError_t e=(x);if(e)throw std::runtime_error(std::string("gemma4_vision: ")+cudaGetErrorString(e));}while(0)
-__device__ __forceinline__ float F(bf x){return __bfloat162float(x);}
-__device__ __forceinline__ bf   Bf(float x){return __float2bfloat16(x);}
 
 class DeviceScratch {
 public:
@@ -46,24 +50,11 @@ private:
 };
 
 __global__ void k_scale(const bf* p,bf* o,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t)o[i]=Bf(2.f*(F(p[i])-0.5f));}
-__global__ void k_matmul(const bf* x,const bf* W,bf* y,int N,int K,int O){
-    int n=blockIdx.y*blockDim.y+threadIdx.y,o=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||o>=O)return;
-    const bf* xr=x+(long)n*K;const bf* wr=W+(long)o*K;float a=0;for(int k=0;k<K;k++)a+=F(xr[k])*F(wr[k]);y[(long)n*O+o]=Bf(a);}
-__global__ void k_addpos(bf* y,const bf* tb,const float* pos,int N,int O,int P){
+__global__ void k_addpos_grid2d(bf* y,const bf* tb,const float* pos,int N,int O,int P){
     int n=blockIdx.y*blockDim.y+threadIdx.y,o=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||o>=O)return;
     long x=(long)llrintf(pos[2L*n]),yy=(long)llrintf(pos[2L*n+1]);if(x<0)x=0;if(yy<0)yy=0;
     y[(long)n*O+o]=Bf(F(y[(long)n*O+o])+F(tb[(0L*P+x)*O+o])+F(tb[(1L*P+yy)*O+o]));}
-__global__ void k_clamp(const bf* x,bf* o,const bf* lo,const bf* hi,long t){
-    long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i>=t)return;
-    float v=F(x[i]),l=lo?F(*lo):-CUDART_INF_F,h=hi?F(*hi):CUDART_INF_F;o[i]=Bf(v<l?l:(v>h?h:v));}
-__global__ void k_rms(const bf* x,const bf* w,bf* o,int R,int D,float eps){
-    int r=blockIdx.x;if(r>=R)return;const bf* xr=x+(long)r*D;bf* orow=o+(long)r*D;
-    float loc=0;for(int d=threadIdx.x;d<D;d+=blockDim.x){float v=F(xr[d]);loc+=v*v;}
-    for(int s=warpSize/2;s>0;s>>=1)loc+=__shfl_down_sync(0xffffffff,loc,s);
-    __shared__ float warp[32],ss;if((threadIdx.x&31)==0)warp[threadIdx.x>>5]=loc;__syncthreads();
-    if(threadIdx.x==0){float t=0;int nw=(blockDim.x+31)/32;for(int i=0;i<nw;i++)t+=warp[i];ss=rsqrtf(t/D+eps);}__syncthreads();
-    float inv=ss;for(int d=threadIdx.x;d<D;d+=blockDim.x)orow[d]=Bf(F(xr[d])*inv*(w?F(w[d]):1.f));}
-__global__ void k_rope(bf* q,const float* pos,int N,int H,float theta){
+__global__ void k_rope_axial2d(bf* q,const float* pos,int N,int H,float theta){
     int n=blockIdx.z,head=blockIdx.y,c=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||head>=H||c>=16)return;
     bf* v=q+(((long)n*H+head)*64);float px=pos[2L*n],py=pos[2L*n+1];float invf=powf(theta,-(float)c/16.f);
     float cx=cosf(px*invf),sx=sinf(px*invf),cy=cosf(py*invf),sy=sinf(py*invf);
@@ -87,7 +78,6 @@ __global__ void k_av(const float* s,const bf* v,bf* o,int N,int H,int head){
     const float* sr=s+(long)n*N;float a=0;for(int j=0;j<N;j++)a+=sr[j]*F(v[((long)j*H+head)*64+d]);
     o[((long)n*H+head)*64+d]=Bf(a);}
 __global__ void k_gelu_mul(const bf* g,const bf* u,bf* o,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t){float x=F(g[i]);float gl=0.5f*x*(1.f+tanhf(0.7978845608f*(x+0.044715f*x*x*x)));o[i]=Bf(gl*F(u[i]));}}
-__global__ void k_add(bf* h,const bf* x,long t){long i=blockIdx.x*(long)blockDim.x+threadIdx.x;if(i<t)h[i]=Bf(F(h[i])+F(x[i]));}
 __global__ void k_pool(const bf* h,const int* grp,float* o,int N,int D,float k2){
     int n=blockIdx.y*blockDim.y+threadIdx.y,d=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||d>=D)return;
     atomicAdd(&o[(long)grp[n]*D+d],F(h[(long)n*D+d])/k2);}
@@ -99,11 +89,15 @@ dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 
 void run_gemma4_vision(const VisRawWeights& w,
                        const bf* pixel,const float* pos,const int* grp,
-                       int N,int OUTL,bf* out_proj,cudaStream_t S){
+                       int N,int OUTL,bf* out_proj,cudaStream_t S,VisDebugTap dbg){
+    auto tap=[&](const char* tag,const bf* d,long n){
+        if(!dbg) return;
+        VCK(cudaStreamSynchronize(S)); dbg(tag,d,n); };
     const int Hd=w.hidden, NH=w.heads, IM=w.intermediate, TXT=w.text_hidden, PT=w.pos_table_size;
     const float EPS=w.eps, THETA=w.theta;
     if(Hd!=768||NH!=12) throw std::runtime_error("gemma4_vision: unexpected dims (expected hidden=768, heads=12)");
 
+    kernels::gemm::CublasHandle cublas(S);
     DeviceScratch scratch;
     auto MAL=[&](long n){return scratch.alloc<bf>(n);};
     bf *h=MAL((long)N*Hd),*hn=MAL((long)N*Hd),*xc=MAL((long)N*IM),*q=MAL((long)N*Hd),*k=MAL((long)N*Hd),*v=MAL((long)N*Hd),
@@ -111,40 +105,41 @@ void run_gemma4_vision(const VisRawWeights& w,
     float* scr=scratch.alloc<float>((long)N*N);
     auto clin=[&](const bf* x,bf* out,const VisClipRaw& c,int Kin,int Out){
         k_clamp<<<((long)N*Kin+255)/256,256,0,S>>>(x,xc,c.imin,c.imax,(long)N*Kin);
-        k_matmul<<<G2(Out,N),B2,0,S>>>(xc,c.w,out,N,Kin,Out);
+        kernels::gemm::act_x_wt_bf16(cublas.handle(),xc,c.w,out,N,Out,Kin);
         k_clamp<<<((long)N*Out+255)/256,256,0,S>>>(out,out,c.omin,c.omax,(long)N*Out);};
 
     k_scale<<<((long)N*Hd+255)/256,256,0,S>>>(pixel,hn,(long)N*Hd);
-    k_matmul<<<G2(Hd,N),B2,0,S>>>(hn,w.patch_w,h,N,Hd,Hd);
-    k_addpos<<<G2(Hd,N),B2,0,S>>>(h,w.pos_table,pos,N,Hd,PT);
+    kernels::gemm::act_x_wt_bf16(cublas.handle(),hn,w.patch_w,h,N,Hd,Hd);
+    k_addpos_grid2d<<<G2(Hd,N),B2,0,S>>>(h,w.pos_table,pos,N,Hd,PT);
+    int li=0;
     for(const auto& L:w.layers){
-        k_rms<<<N,256,0,S>>>(h,L.in_ln,hn,N,Hd,EPS);
+        kernels::norm::rmsnorm_bf16(h,L.in_ln,hn,N,Hd,EPS,S);
         clin(hn,q,L.q,Hd,Hd);clin(hn,k,L.k,Hd,Hd);clin(hn,v,L.v,Hd,Hd);
-        k_rms<<<N*NH,64,0,S>>>(q,L.q_norm,q,N*NH,64,EPS);k_rms<<<N*NH,64,0,S>>>(k,L.k_norm,k,N*NH,64,EPS);k_rms<<<N*NH,64,0,S>>>(v,nullptr,v,N*NH,64,EPS);
-        dim3 rg(1,NH,N);k_rope<<<rg,32,0,S>>>(q,pos,N,NH,THETA);k_rope<<<rg,32,0,S>>>(k,pos,N,NH,THETA);
+        kernels::norm::rmsnorm_bf16(q,L.q_norm,q,N*NH,64,EPS,S);kernels::norm::rmsnorm_bf16(k,L.k_norm,k,N*NH,64,EPS,S);kernels::norm::rmsnorm_no_scale_bf16(v,v,N*NH,64,EPS,S);
+        dim3 rg(1,NH,N);k_rope_axial2d<<<rg,32,0,S>>>(q,pos,N,NH,THETA);k_rope_axial2d<<<rg,32,0,S>>>(k,pos,N,NH,THETA);
         for(int hh=0;hh<NH;hh++){k_qk<<<G2(N,N),B2,0,S>>>(q,k,scr,N,NH,hh,1.0f);k_softmax<<<N,256,0,S>>>(scr,N);k_av<<<G2(64,N),B2,0,S>>>(scr,v,attn,N,NH,hh);}
         clin(attn,tmp,L.o,Hd,Hd);
-        k_rms<<<N,256,0,S>>>(tmp,L.post_attn_ln,tmp,N,Hd,EPS);
-        k_add<<<((long)N*Hd+255)/256,256,0,S>>>(h,tmp,(long)N*Hd);
-        k_rms<<<N,256,0,S>>>(h,L.pre_ff_ln,hn,N,Hd,EPS);
+        kernels::norm::rmsnorm_bf16(tmp,L.post_attn_ln,tmp,N,Hd,EPS,S);
+        kernels::norm::residual_add_bf16(h,tmp,(long)N*Hd,S);
+        kernels::norm::rmsnorm_bf16(h,L.pre_ff_ln,hn,N,Hd,EPS,S);
         clin(hn,gate,L.gate,Hd,IM);clin(hn,up,L.up,Hd,IM);
-        k_gelu_mul<<<((long)N*IM+255)/256,256,0,S>>>(gate,up,act,(long)N*IM);
+        kernels::mlp::geglu_tanh_bf16(gate,up,act,(long)N*IM,S);
         clin(act,tmp,L.down,IM,Hd);
-        k_rms<<<N,256,0,S>>>(tmp,L.post_ff_ln,tmp,N,Hd,EPS);
-        k_add<<<((long)N*Hd+255)/256,256,0,S>>>(h,tmp,(long)N*Hd);
+        kernels::norm::rmsnorm_bf16(tmp,L.post_ff_ln,tmp,N,Hd,EPS,S);
+        kernels::norm::residual_add_bf16(h,tmp,(long)N*Hd,S);
+        if(li++==0) tap("layer0",h,(long)N*Hd);
     }
+    tap("layer_last",h,(long)N*Hd);
     float* pf=scratch.alloc<float>((long)OUTL*Hd);VCK(cudaMemsetAsync(pf,0,(long)OUTL*Hd*4,S));
     k_pool<<<G2(Hd,N),B2,0,S>>>(h,grp,pf,N,Hd,9.f);
     bf* pooled=MAL((long)OUTL*Hd);k_pool_finish<<<((long)OUTL*Hd+255)/256,256,0,S>>>(pf,pooled,sqrtf((float)Hd),(long)OUTL*Hd);
-    bf* pn=MAL((long)OUTL*Hd);k_rms<<<OUTL,256,0,S>>>(pooled,nullptr,pn,OUTL,Hd,EPS);
-    k_matmul<<<G2(TXT,OUTL),B2,0,S>>>(pn,w.embed_proj,out_proj,OUTL,Hd,TXT);
+    tap("pooled_last_hidden",pooled,(long)OUTL*Hd);
+    bf* pn=MAL((long)OUTL*Hd);kernels::norm::rmsnorm_no_scale_bf16(pooled,pn,OUTL,Hd,EPS,S);
+    kernels::gemm::act_x_wt_bf16(cublas.handle(),pn,w.embed_proj,out_proj,OUTL,TXT,Hd);
     VCK(cudaStreamSynchronize(S));
 }
 
 namespace {
-__global__ void k_f32_to_bf16(const float* a, bf* o, long n){
-    long i=blockIdx.x*(long)blockDim.x+threadIdx.x; if(i<n) o[i]=Bf(a[i]);
-}
 }  // namespace
 
 void scatter_gemma4_vision(const Gemma4VisionInputs& vin, bf* hidden,

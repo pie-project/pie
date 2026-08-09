@@ -1,61 +1,150 @@
-//! METAL's kernel signature table — one row per launcher symbol in `csrc/`.
+//! METAL's kernel signature table — one row per KERNEL in `kernels/`, and one
+//! row is many entrypoints.
 //!
-//! Sparse next to CUDA's, and that is where Metal is rather than a gap in the
-//! table: Metal has no lowered text yet. It consumes the SEMANTIC trace and
-//! re-derives its dispatch selection in C++
-//! (`crates/driver-metal/csrc/src/model/llama_like/declared_dag.hpp`) — the
-//! same "the driver decides" shape the CUDA side is being cured of, from the
-//! other end. What is declared here is what a first `llama_like.metal.*` text
-//! would state.
+//! ## Why this is not shaped like CUDA's
 //!
-//! The rows are still binding. `model-compiler`'s `kernels::check_plan`
-//! refuses any launched symbol no row declares, so such a text CANNOT be
-//! written without declaring the kernels it states — the same discipline the
-//! CUDA table enforces, arriving before the text that needs it.
+//! `kernels-cuda` has one row per launcher symbol, because a CUDA launcher is
+//! an authored C++ function and there is nothing else it could be. An MSL
+//! entrypoint is generated: `quantized_qmm_t.metal` holds one template body and
+//! a macro that stamps it over `(group × bits × row tile × column tile)`, so 54
+//! of its entrypoints are one kernel evaluated at 54 points.
 //!
-//! The words a row is written in are `kernels`'; `default-features = false`
-//! gives the table without the shader build, for the same reason it does on
-//! the CUDA side.
+//! Measured by `scripts/metal-kernel-audit.py`: **480 entrypoints over 99
+//! kernels in 28 files.** Enumerating the 480 would state the macro's job a
+//! second time, by hand, and `.wiki/kernel-refactor.md` §5's own test — *would
+//! the two share one C++ definition?* — answers that they are not distinct
+//! kernels. So a row carries its [`Axis`]es and the product is the entrypoint
+//! set. `.wiki/kernel-metal-refactor.md` §2 is the argument in full.
+//!
+//! The consequence worth stating on the way in: **the table is now where the
+//! shader tree's coverage is written down.** `qmv_fast` is compiled for six
+//! affine formats and `qmv_routed` for one; before this that difference existed
+//! only as a name the driver would fail to find at model load.
+//!
+//! ## What keeps it honest
+//!
+//! Three checks, at three distances:
+//!
+//! * `kernels`' own unit tests pin the matcher — that a row covers every point
+//!   of its axes and refuses a partial or permuted spelling.
+//! * `tests/entrypoints.rs` pins the table's product against
+//!   `entrypoints.generated.txt`.
+//! * `scripts/metal-kernel-audit.py` pins that file against the shaders, by
+//!   preprocessing them the way the Metal runtime does.
+//!
+//! And from the other end, `model-compiler`'s `kernels::check_plan` refuses any
+//! launched symbol no row declares, so a lowered `*.metal.*` text cannot state
+//! a kernel this table has not heard of.
+//!
+//! ## Reading this without a Mac
+//!
+//! All of the above runs on Linux. Metal compiles its shaders at RUN time, so
+//! `default-features = false` gives the table and nothing else — which is what
+//! `model-compiler` wants and all it wants — and `native` adds only the staging
+//! of `ptir_rng.generated.metal` out of `tensor-compiler`.
 
-pub use kernels::{Cap, KernelSig, Prepare};
-use kernels::kernel;
+pub use kernels::{Axis, Cap, KernelSig, Prepare};
 
-/// Every kernel a lowered `*.metal.*` declaration may state.
-pub static KERNELS: &[KernelSig] = &[
-    // ── io ─────────────────────────────────────────────────────────
-    kernel!(embed_gather "embed_gather_4bit"),
-    kernel!(embed_gather_mb "embed_gather_mb_4bit"),
+pub mod axes;
 
-    // ── norms / activation / residual ──────────────────────────────
-    // One entrypoint serves attn_norm, mlp_norm, q_norm, k_norm and
-    // final_norm — the driver fans five `Kernel` kinds onto it.
-    kernel!(rms_norm "rms_single_row_bfloat16"),
-    kernel!(silu_mul "silu_mul_bfloat16"),
-    kernel!(residual_add "residual_add_bfloat16"),
+pub mod attn;
+pub mod layout;
+pub mod mlp;
+pub mod moe;
+pub mod norm;
+pub mod ptir;
+pub mod quant;
+pub mod rope;
+pub mod sample;
+pub mod ssm;
 
-    // ── projections ────────────────────────────────────────────────
-    // The `_residual` forms fold the block residual in the GEMV/GEMM
-    // epilogue, which is what a `beta_one` matmul is on this backend.
-    // The readout takes this one too — `lm_head` is a projection, and
-    // the driver has no separate entrypoint for it.
-    kernel!(qmv "affine_qmv_fast"),
-    kernel!(qmv_residual "affine_qmv_fast_residual"),
-    kernel!(qmm "affine_qmm_t"),
-    kernel!(qmm_residual "affine_qmm_t_residual"),
+/// The family tables, concatenated.
+///
+/// A `const fn` fold rather than a `Vec`, so the whole table stays a `&'static`
+/// the compiler can read at load with no allocation — the same shape
+/// `kernels-cuda` uses for the same reason.
+pub static KERNELS: &[KernelSig] = &CONCAT;
 
-    // ── rope / kv ──────────────────────────────────────────────────
-    kernel!(rope_decode "rope_neox_decode_bfloat16"),
-    kernel!(rope_mb "rope_neox_mb_bfloat16"),
-    kernel!(kv_append "kv_append_bfloat16"),
-    kernel!(kv_append_paged "kv_append_paged_bfloat16"),
-
-    // ── attention ──────────────────────────────────────────────────
-    // No `sink` on either: Metal has no page-mask substitution path, so
-    // an `attn.q` tap with PageMaskSink is unservable here — the
-    // declaration says so instead of a C++ throw discovering it. No
-    // capture variant exists either, so neither can publish scores.
-    kernel!(sdpa_vector "sdpa_vector_decode_bfloat16_d_256",
-        lacks = &[Cap::Scores, Cap::PageMaskSink]),
-    kernel!(sdpa_paged "sdpa_paged_decode_bfloat16_d_256",
-        lacks = &[Cap::Scores, Cap::PageMaskSink]),
+const FAMILIES: &[&[KernelSig]] = &[
+    attn::KERNELS,
+    layout::KERNELS,
+    mlp::KERNELS,
+    moe::KERNELS,
+    norm::KERNELS,
+    ptir::KERNELS,
+    quant::KERNELS,
+    rope::KERNELS,
+    sample::KERNELS,
+    ssm::KERNELS,
 ];
+
+const fn total() -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < FAMILIES.len() {
+        n += FAMILIES[i].len();
+        i += 1;
+    }
+    n
+}
+
+const N: usize = total();
+
+const EMPTY: KernelSig = KernelSig {
+    name: "",
+    symbol: "",
+    file: None,
+    launch: kernels::LaunchRule::Unstated,
+    whole: false,
+    needs: Prepare::None,
+    lacks: &[],
+    sink: None,
+    in_place: &[],
+    depth_prefix_plan: false,
+    operands: &[],
+    returns: "",
+    axes: &[],
+};
+
+const fn copy_sig(k: &KernelSig) -> KernelSig {
+    KernelSig {
+        name: k.name,
+        symbol: k.symbol,
+        file: k.file,
+        launch: k.launch,
+        whole: k.whole,
+        needs: k.needs,
+        lacks: k.lacks,
+        sink: k.sink,
+        in_place: k.in_place,
+        depth_prefix_plan: k.depth_prefix_plan,
+        operands: k.operands,
+        returns: k.returns,
+        axes: k.axes,
+    }
+}
+
+const CONCAT: [KernelSig; N] = {
+    let mut out = [EMPTY; N];
+    let mut at = 0;
+    let mut f = 0;
+    while f < FAMILIES.len() {
+        let family = FAMILIES[f];
+        let mut i = 0;
+        while i < family.len() {
+            out[at] = copy_sig(&family[i]);
+            at += 1;
+            i += 1;
+        }
+        f += 1;
+    }
+    out
+};
+
+/// Every entrypoint the table names, sorted. The set
+/// `scripts/metal-kernel-audit.py` compares against the shader tree.
+pub fn entrypoints() -> Vec<String> {
+    let mut out: Vec<String> = KERNELS.iter().flat_map(KernelSig::entrypoints).collect();
+    out.sort();
+    out
+}
