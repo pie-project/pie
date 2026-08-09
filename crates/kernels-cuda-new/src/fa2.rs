@@ -145,15 +145,7 @@ impl DecodeGeometry {
         let lanes = bdx * bdy;
         let num_threads = if lanes > 128 { lanes } else { 128 };
         let bdz = num_threads / lanes;
-        let tile_size_per_bdx = if group_size == 1 {
-            if kv.0 == 1 {
-                2
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let tile_size_per_bdx = if group_size == 1 { if kv.0 == 1 { 2 } else { 4 } } else { 1 };
         let num_stages_smem = if dev.cc_major >= 8 { 2 } else { 1 };
         let staged = 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim * kv.0;
         let offsets = tile_size_per_bdx * num_threads * KvWidth::POINTER;
@@ -292,20 +284,26 @@ impl PrefillGeometry {
             && (kv.0 == 2 || cta_tile_q > 16);
         let vo_split_dispatch = num_mma_d_vo > 16 && num_mma_d_vo % num_warps_kv_ == 0;
 
-        let per_mma_kv = (if kv_shared {
-            head_dim * 16 * num_warps_kv_ * kv.0
-        } else {
-            (head_dim + head_dim) * 16 * num_warps_kv_ * kv.0
-        }) + (if use_repack { head_dim * 16 * num_warps_kv_ * q_width } else { 0 })
-            + (if vo_split_dispatch { cta_tile_q * num_warps_kv_ * 16 * q_width } else { 0 });
+        let per_mma_kv =
+            (if kv_shared {
+                head_dim * 16 * num_warps_kv_ * kv.0
+            } else {
+                (head_dim + head_dim) * 16 * num_warps_kv_ * kv.0
+            }) + (if use_repack { head_dim * 16 * num_warps_kv_ * q_width } else { 0 })
+                + (if vo_split_dispatch { cta_tile_q * num_warps_kv_ * 16 * q_width } else { 0 });
 
-        let vo_split_fixed = if vo_split_dispatch { num_warps_kv_ * cta_tile_q * 8 + 2048 } else { 0 };
+        let vo_split_fixed =
+            if vo_split_dispatch { num_warps_kv_ * cta_tile_q * 8 + 2048 } else { 0 };
         let shared_rope_freq = 0;
         let fixed_smem = cta_tile_q * head_dim * q_width + vo_split_fixed + shared_rope_freq;
 
         let min_valid_mma_kv = if kv.0 == 1 && num_warps_q_ > 2 { num_warps_q_ / 2 } else { 1 };
-        let ctas_per_sm =
-            if dev.max_smem_per_sm >= 2 * (fixed_smem + min_valid_mma_kv * per_mma_kv) { 2 } else { 1 };
+        let ctas_per_sm = if dev.max_smem_per_sm >= 2 * (fixed_smem + min_valid_mma_kv * per_mma_kv)
+        {
+            2
+        } else {
+            1
+        };
         let per_block = {
             let a = dev.max_smem_per_sm / ctas_per_sm;
             if a < dev.max_smem_per_block_optin { a } else { dev.max_smem_per_block_optin }
@@ -321,7 +319,8 @@ impl PrefillGeometry {
             });
         }
         let max_mma_kv_smem = (per_block - fixed_smem) / per_mma_kv;
-        let budget = if max_mma_kv_smem < max_mma_kv_reg { max_mma_kv_smem } else { max_mma_kv_reg };
+        let budget =
+            if max_mma_kv_smem < max_mma_kv_reg { max_mma_kv_smem } else { max_mma_kv_reg };
         let num_mma_kv = if budget >= 8 {
             8
         } else if budget >= 4 {

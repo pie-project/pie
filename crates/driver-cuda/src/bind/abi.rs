@@ -367,13 +367,13 @@ pub enum Mxfp4RowSelect {
 /// here rather than inside the host program so that the program's parameter
 /// list still reads as the kernel's.
 ///
-/// The [`Fired`](kernels_cuda_new::x::Fired) answer is dropped rather than
-/// returned, and that is this function's own decision rather than an
-/// oversight: the C++ launcher returned `void` and its guard was silent, the
-/// callers in `pools/kv_cache_live.rs` pass extents the cache allocated
-/// against and cannot be empty, and a `Result` here would be a new refusal
-/// channel for a condition no caller can act on. `#[must_use]` on the enum is
-/// what makes dropping it a decision spelled out loud.
+/// The routine's `Result` is dropped rather than returned, and that is this
+/// function's own decision rather than an oversight: the C++ launcher returned
+/// `void` and its guard was silent, the callers in `pools/kv_cache_live.rs`
+/// pass extents the cache allocated against and cannot be empty, and a
+/// `Result` here would be a new refusal channel for a condition no caller can
+/// act on. `#[must_use]` on `Result` is what makes dropping it a decision
+/// spelled out loud.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn seed_envelopes_empty(
     env_min: *mut u16,
@@ -383,16 +383,17 @@ pub fn seed_envelopes_empty(
     head_dim: i32,
     stream: crate::device::StreamRef<'_>,
 ) {
-    let _ = unsafe {
-        kernels_cuda_new::x::layout::envelope_seed_empty(
-            env_min.cast(),
-            env_max.cast(),
-            num_pages,
-            num_kv_heads,
-            head_dim,
-            stream.as_raw().cast(),
-        )
-    };
+    // SAFETY: `stream` outlives the launch, and the two envelope planes are
+    // the cache's own allocation for `num_pages * num_kv_heads * head_dim`.
+    let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream.as_raw().cast()) };
+    let _ = kernels_cuda_new::x::layout::envelope_seed_empty(
+        &ctx,
+        env_min.cast(),
+        env_max.cast(),
+        num_pages,
+        num_kv_heads,
+        head_dim,
+    );
 }
 
 #[cfg(test)]

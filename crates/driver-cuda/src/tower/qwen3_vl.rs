@@ -94,10 +94,12 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
-use kernels_cuda_new::ArgValue;
+use kernels_cuda_new::x::vision;
 
-use super::{fire, fire_stated, p, pm, rect};
-use crate::device::{Allocator, DeviceBuffer, StreamRef, copy_raw_span, fill_raw_span, read_raw_span};
+use super::call;
+use crate::device::{
+    Allocator, DeviceBuffer, StreamRef, copy_raw_span, fill_raw_span, read_raw_span,
+};
 use crate::{Error, Result};
 
 /// The tower's name, in ONE place — `tower::gemma4_vision::WHO`'s reason.
@@ -396,10 +398,7 @@ impl Weights {
         }
         let deepstack = (0..num_deep)
             .map(|d| {
-                Merger::of(
-                    &deepstack_w[d * SLOTS_PER_MERGER..(d + 1) * SLOTS_PER_MERGER],
-                    true,
-                )
+                Merger::of(&deepstack_w[d * SLOTS_PER_MERGER..(d + 1) * SLOTS_PER_MERGER], true)
             })
             .collect();
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -450,11 +449,6 @@ impl Weights {
             .filter(|v| *v > 0)
             .ok_or_else(|| Error::invalid(WHO, "spatial_merge_size is zero or overflowed"))
     }
-}
-
-/// A non-negative extent as the `u32` a `Dims` field is.
-fn extent(what: &'static str, value: i32) -> Result<u32> {
-    u32::try_from(value).map_err(|_| Error::invalid(WHO, format!("{what}: {value} is not an extent")))
 }
 
 /// A count as `usize`, refusing a negative rather than saturating.
@@ -553,11 +547,7 @@ fn interp_pos_embed(
     let idx = |gh: i32, gw: i32| (gh * side + gw).max(0) as usize;
     // `linspace(0, side-1, n)` evaluated at `i`.
     let frac = |n: i32, i: i32| -> f32 {
-        if n == 1 {
-            0.0
-        } else {
-            i as f32 * (side - 1) as f32 / (n - 1) as f32
-        }
+        if n == 1 { 0.0 } else { i as f32 * (side - 1) as f32 / (n - 1) as f32 }
     };
     // The per-(row, col) interpolated embedding, in ROW-MAJOR (un-reordered)
     // order; the gather below puts it in spatial-merge order.
@@ -786,7 +776,8 @@ impl Res {
             let (gt, gh, gw) = key;
             let merge = w.spatial_merge_size;
             let rope_h = vision_rope_positions(gt, gh, gw, merge);
-            let pe_h = interp_pos_embed(&self.table, w.num_grid_per_side, w.hidden, gt, gh, gw, merge);
+            let pe_h =
+                interp_pos_embed(&self.table, w.num_grid_per_side, w.hidden, gt, gh, gw, merge);
             // f32 -> bf16 on the HOST, as the C++ did: this is a one-off per
             // grid, and `k_f32_to_bf16` is for the pixel plane, which is per
             // forward. Truncating rather than round-to-nearest-even, which is
@@ -798,8 +789,9 @@ impl Res {
             // SAFETY: `f32` is plain data with no padding, so the run is
             // readable as bytes for its own length. `Scratch::upload_f32s`
             // makes the same reinterpretation.
-            let rope_bytes =
-                unsafe { std::slice::from_raw_parts(rope_h.as_ptr().cast::<u8>(), rope_h.len() * 4) };
+            let rope_bytes = unsafe {
+                std::slice::from_raw_parts(rope_h.as_ptr().cast::<u8>(), rope_h.len() * 4)
+            };
             let mut rope = self.alloc.alloc(rope_bytes.len().max(1))?;
             rope.copy_from_host(rope_bytes, stream)?;
             let mut pe = self.alloc.alloc(pe_bf.len().max(1))?;
@@ -886,16 +878,10 @@ fn gemm_bias(
     }
     // `qwen3_vl_tower.cu:122` —
     // `vd::k_bias<bfd><<<((long)M*O+255)/256,256,0,S>>>(D(y),D(lin.b),(long)M,O);`
-    // `LaunchRule::Elementwise` evaluates `rows * width` to the same
-    // `ceil(M*O/256)` blocks of 256. `m` crosses as `Usize` and `o` as `I32`,
-    // which is the kernel's own asymmetry: the bias index is `i % n` on a
-    // 64-bit `i`.
-    fire(
-        "vision::k_bias_bf16",
-        rect(extent("bias rows", m)?, extent("bias width", o)?),
-        &[pm(y), p(lin.b), ArgValue::Usize(count("bias rows", m)?), ArgValue::I32(o)],
-        stream,
-    )
+    // `m` crosses as a `usize` and `o` as an `int`, which is the kernel's own
+    // asymmetry: the bias index is `i % n` on a 64-bit `i`.
+    let rows = count("bias rows", m)?;
+    call("vision::k_bias_bf16", stream, |ctx| vision::k_bias_bf16(ctx, y, lin.b, rows, o))
 }
 
 /// `fc1 -> GELU -> fc2`, with bias on both — `qwen3_vl_tower.cu:143-150`.
@@ -924,25 +910,18 @@ fn mlp(
     let elems = count("mlp rows", n)?
         .checked_mul(count("mlp width", d_mid)?)
         .ok_or_else(|| Error::invalid(WHO, "N * Dmid overflowed"))?;
-    let shape = rect(extent("mlp rows", n)?, extent("mlp width", d_mid)?);
     if erf_gelu {
         // `:147` —
         // `vd::k_gelu_erf<bfd><<<((long)N*Dmid+255)/256,256,0,S>>>(D(mid),D(mid),(long)N*Dmid);`
-        fire(
-            "vision::k_gelu_erf_bf16",
-            shape,
-            &[p(mid.cast_const()), pm(mid), ArgValue::Usize(elems)],
-            stream,
-        )?;
+        call("vision::k_gelu_erf_bf16", stream, |ctx| {
+            vision::k_gelu_erf_bf16(ctx, mid.cast_const(), mid, elems)
+        })?;
     } else {
         // `:148` —
         // `vd::k_gelu_tanh<bfd><<<((long)N*Dmid+255)/256,256,0,S>>>(D(mid),D(mid),(long)N*Dmid);`
-        fire(
-            "vision::k_gelu_tanh_bf16",
-            shape,
-            &[p(mid.cast_const()), pm(mid), ArgValue::Usize(elems)],
-            stream,
-        )?;
+        call("vision::k_gelu_tanh_bf16", stream, |ctx| {
+            vision::k_gelu_tanh_bf16(ctx, mid.cast_const(), mid, elems)
+        })?;
     }
     gemm_bias(cublas, mid.cast_const(), fc2, out, n, d_out, d_mid, stream)
 }
@@ -984,75 +963,47 @@ fn run_merger(
     let grouped = st.slot(S_MERGE_GROUPED, group_elems * 2)?;
     let mid = st.slot(S_MERGE_MID, group_elems * 2)?;
 
-    let patches = extent("merger patches", n_patch)?;
-    let tokens = extent("merged tokens", n_token)?;
-    let hidden_u = extent("hidden", hidden)?;
-    let width_u = extent("merged width", width)?;
     // The gather's geometry, at both call sites, is
     // `dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}`
     // from `qwen3_vl_tower.cu:139`, so `<<<G2(W,n_token),B2,0,S>>>` is
-    // `dim3((W+15)/16, (n_token+15)/16)` over `dim3(16,16)` — which is
-    // `LaunchRule::Tile16` at `rows = n_token, width = W` exactly.
-    let gather = [
-        ArgValue::I32(n_token),
-        ArgValue::I32(merge_unit),
-        ArgValue::I32(hidden),
-    ];
+    // `dim3((W+15)/16, (n_token+15)/16)` over `dim3(16,16)` — and `W` is the
+    // `merge_unit * hidden` the routine recovers from its own operands.
     if m.is_postshuffle {
         // `:168` — `vd::k_merge_gather<bfd><<<G2(W,n_token),B2,0,S>>>(D(h),D(grouped),n_token,merge_unit,hidden);`
-        fire(
-            "vision::k_merge_gather_bf16",
-            rect(tokens, width_u),
-            &[p(h), pm(grouped), gather[0], gather[1], gather[2]],
-            stream,
-        )?;
+        call("vision::k_merge_gather_bf16", stream, |ctx| {
+            vision::k_merge_gather_bf16(ctx, h, grouped, n_token, merge_unit, hidden)
+        })?;
         // `:169` — `vd::k_layernorm<bfd><<<n_token,256,0,S>>>(D(grouped),D(m.norm.g),D(m.norm.b),D(grouped),n_token,W,eps);`
-        // `LaunchRule::PerRow` is `grid[rows,1,1] block[256,1,1] smem 0`, the
-        // same launch; the kernel's `__shared__` is static, so zero dynamic
-        // bytes is the whole contract.
-        fire(
-            "vision::k_layernorm_bf16",
-            rect(tokens, width_u),
-            &[
-                p(grouped.cast_const()),
-                p(m.norm.g),
-                p(m.norm.b),
-                pm(grouped),
-                ArgValue::I32(n_token),
-                ArgValue::I32(width),
-                ArgValue::F32(eps),
-            ],
-            stream,
-        )?;
+        // The kernel's `__shared__` is static, so zero dynamic bytes is the
+        // whole contract.
+        call("vision::k_layernorm_bf16", stream, |ctx| {
+            vision::k_layernorm_bf16(
+                ctx,
+                grouped.cast_const(),
+                m.norm.g,
+                m.norm.b,
+                grouped,
+                n_token,
+                width,
+                eps,
+            )
+        })?;
     } else {
         // `:164` — `vd::k_layernorm<bfd><<<n_patch,256,0,S>>>(D(h),D(m.norm.g),D(m.norm.b),D(normed),n_patch,hidden,eps);`
-        fire(
-            "vision::k_layernorm_bf16",
-            rect(patches, hidden_u),
-            &[
-                p(h),
-                p(m.norm.g),
-                p(m.norm.b),
-                pm(normed),
-                ArgValue::I32(n_patch),
-                ArgValue::I32(hidden),
-                ArgValue::F32(eps),
-            ],
-            stream,
-        )?;
+        call("vision::k_layernorm_bf16", stream, |ctx| {
+            vision::k_layernorm_bf16(ctx, h, m.norm.g, m.norm.b, normed, n_patch, hidden, eps)
+        })?;
         // `:165` — `vd::k_merge_gather<bfd><<<G2(W,n_token),B2,0,S>>>(D(normed),D(grouped),n_token,merge_unit,hidden);`
-        fire(
-            "vision::k_merge_gather_bf16",
-            rect(tokens, width_u),
-            &[
-                p(normed.cast_const()),
-                pm(grouped),
-                gather[0],
-                gather[1],
-                gather[2],
-            ],
-            stream,
-        )?;
+        call("vision::k_merge_gather_bf16", stream, |ctx| {
+            vision::k_merge_gather_bf16(
+                ctx,
+                normed.cast_const(),
+                grouped,
+                n_token,
+                merge_unit,
+                hidden,
+            )
+        })?;
     }
     // `:171` — the mergers take the ERF gelu.
     mlp(
@@ -1152,22 +1103,14 @@ fn run(
     let attn_out = st.slot(S_ATTN, hidden_elems * 2)?;
     let mid = st.slot(S_MID, inter_elems * 2)?;
 
-    let rows_u = extent("patch rows", n)?;
-    let hidden_u = extent("hidden", hd)?;
-    let inter_u = extent("intermediate", im_width)?;
-
     // `:226` — patch embed: the Conv3d as a matmul `[hidden, PATCH_DIM]`
     // (+bias) over `pixel[N, PATCH_DIM]`.
     gemm_bias(cublas, pixel, &w.patch, h, n, hd, patch_dim, stream)?;
     // `:236` — `vd::k_add_pe<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(pos_embed_interp),(long)N*Hd);`
-    // The `pe` operand is the HOST-interpolated table; `Elementwise` recovers
-    // the same `ceil(N*Hd/256)` blocks of 256 from `rows * width`.
-    fire(
-        "vision::k_add_pe_bf16",
-        rect(rows_u, hidden_u),
-        &[pm(h), p(pos_embed_interp), ArgValue::Usize(hidden_elems)],
-        stream,
-    )?;
+    // The `pe` operand is the HOST-interpolated table.
+    call("vision::k_add_pe_bf16", stream, |ctx| {
+        vision::k_add_pe_bf16(ctx, h, pos_embed_interp, hidden_elems)
+    })?;
 
     let mut deep_written = 0usize;
     for (li, layer) in w.blocks.iter().enumerate() {
@@ -1179,165 +1122,85 @@ fn run(
         // `h += attn @ Wo^T` in place — only the o-bias remains as a kernel.
         //
         // `:246` — `vd::k_layernorm<bfd><<<N,256,0,S>>>(D(h),D(L.norm1.g),D(L.norm1.b),D(hn),N,Hd,EPS);`
-        fire(
-            "vision::k_layernorm_bf16",
-            rect(rows_u, hidden_u),
-            &[
-                p(h.cast_const()),
-                p(layer.norm1.g),
-                p(layer.norm1.b),
-                pm(hn),
-                ArgValue::I32(n),
-                ArgValue::I32(hd),
-                ArgValue::F32(eps),
-            ],
-            stream,
-        )?;
+        call("vision::k_layernorm_bf16", stream, |ctx| {
+            vision::k_layernorm_bf16(
+                ctx,
+                h.cast_const(),
+                layer.norm1.g,
+                layer.norm1.b,
+                hn,
+                n,
+                hd,
+                eps,
+            )
+        })?;
         // `:247` — cuBLAS, no `<<<>>>`; the bias is NOT applied here, which
         // is why this is `gemm` and not `gemm_bias`.
-        gemm(
-            cublas,
-            hn.cast_const(),
-            layer.qkv.w,
-            qkv,
-            n,
-            3 * hd,
-            hd,
-            0.0,
-        );
+        gemm(cublas, hn.cast_const(), layer.qkv.w, qkv, n, 3 * hd, hd, 0.0);
         // `:249` —
         // `vd::k_split_rope_qkv<bfd><<<dim3(NH,N),HEAD/2,0,S>>>(D(qkv),D(L.qkv.b),D(q),D(k),D(v),rope_pos,N,NH,HEAD,THETA);`
         //
-        // `LaunchRule::Unstated`, and `families/vision.rs`'s row says why at
-        // length: the GRID is `PerHead`'s `[heads, rows, 1]` and the BLOCK is
-        // `HEAD/2` against `per_head`'s fixed 128, so no rule states it and
-        // the driver states it instead. `HEAD/2` and not 128 because widening
-        // it would be a performance decision taken on the tower owner's
-        // behalf — 96 idle lanes over a 32-wide half, correct and four times
-        // the launch.
-        fire_stated(
-            "vision::k_split_rope_qkv_bf16",
-            [extent("heads", nh)?, rows_u, 1],
-            [extent("half a head", head / 2)?, 1, 1],
-            0,
-            &[
-                p(qkv.cast_const()),
-                p(layer.qkv.b),
-                pm(q),
-                pm(k),
-                pm(v),
-                p(rope_pos),
-                ArgValue::I32(n),
-                ArgValue::I32(nh),
-                ArgValue::I32(head),
-                ArgValue::F32(theta),
-            ],
-            stream,
-        )?;
+        // The GRID is one block per (head, row) and the BLOCK is `HEAD/2` —
+        // not 128, because widening it would be a performance decision taken
+        // on the tower owner's behalf: 96 idle lanes over a 32-wide half,
+        // correct and four times the launch.
+        call("vision::k_split_rope_qkv_bf16", stream, |ctx| {
+            vision::k_split_rope_qkv_bf16(
+                ctx,
+                qkv.cast_const(),
+                layer.qkv.b,
+                q,
+                k,
+                v,
+                rope_pos,
+                n,
+                nh,
+                head,
+                theta,
+            )
+        })?;
         // `:254` — full bidirectional attention over each image's patches.
         // The softmax scale is applied INSIDE flashinfer, which is why
         // nothing here scales the scores.
-        attn::attend(
-            q.cast_const(),
-            k,
-            v,
-            attn_out,
-            n_patch_h,
-            nh,
-            head,
-            stream,
-        )?;
+        attn::attend(q.cast_const(), k, v, attn_out, n_patch_h, nh, head, stream)?;
         // `:256` — `beta = 1.0f`: the residual add, fused into the GEMM.
-        gemm(
-            cublas,
-            attn_out.cast_const(),
-            layer.o.w,
-            h,
-            n,
-            hd,
-            hd,
-            1.0,
-        );
+        gemm(cublas, attn_out.cast_const(), layer.o.w, h, n, hd, hd, 1.0);
         if !layer.o.b.is_null() {
             // `:257` — `vd::k_bias<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(L.o.b),(long)N,Hd);`
-            fire(
-                "vision::k_bias_bf16",
-                rect(rows_u, hidden_u),
-                &[
-                    pm(h),
-                    p(layer.o.b),
-                    ArgValue::Usize(rows),
-                    ArgValue::I32(hd),
-                ],
-                stream,
-            )?;
+            call("vision::k_bias_bf16", stream, |ctx| {
+                vision::k_bias_bf16(ctx, h, layer.o.b, rows, hd)
+            })?;
         }
         // ── mlp: norm2 -> fc1 -> gelu(+bias) -> fc2 -> residual ──
         //
         // `:259` — `vd::k_layernorm<bfd><<<N,256,0,S>>>(D(h),D(L.norm2.g),D(L.norm2.b),D(hn),N,Hd,EPS);`
-        fire(
-            "vision::k_layernorm_bf16",
-            rect(rows_u, hidden_u),
-            &[
-                p(h.cast_const()),
-                p(layer.norm2.g),
-                p(layer.norm2.b),
-                pm(hn),
-                ArgValue::I32(n),
-                ArgValue::I32(hd),
-                ArgValue::F32(eps),
-            ],
-            stream,
-        )?;
+        call("vision::k_layernorm_bf16", stream, |ctx| {
+            vision::k_layernorm_bf16(
+                ctx,
+                h.cast_const(),
+                layer.norm2.g,
+                layer.norm2.b,
+                hn,
+                n,
+                hd,
+                eps,
+            )
+        })?;
         // `:260` — cuBLAS; fc1's bias folds into the activation below.
-        gemm(
-            cublas,
-            hn.cast_const(),
-            layer.fc1.w,
-            mid,
-            n,
-            im_width,
-            hd,
-            0.0,
-        );
+        gemm(cublas, hn.cast_const(), layer.fc1.w, mid, n, im_width, hd, 0.0);
         // `:261` — `vd::k_gelu_bias<bfd><<<((long)N*IM+255)/256,256,0,S>>>(D(mid),D(L.fc1.b),N,IM);`
-        // Fired unconditionally, bias or not: the row says `b: Buf | null`
-        // and the kernel adds nothing when it is null.
-        fire(
-            "vision::k_gelu_bias_bf16",
-            rect(rows_u, inter_u),
-            &[
-                pm(mid),
-                p(layer.fc1.b),
-                ArgValue::I32(n),
-                ArgValue::I32(im_width),
-            ],
-            stream,
-        )?;
+        // Fired unconditionally, bias or not: the bias is nullable and the
+        // kernel adds nothing when it is null.
+        call("vision::k_gelu_bias_bf16", stream, |ctx| {
+            vision::k_gelu_bias_bf16(ctx, mid, layer.fc1.b, n, im_width)
+        })?;
         // `:262` — `beta = 1.0f` again: the second residual, fused.
-        gemm(
-            cublas,
-            mid.cast_const(),
-            layer.fc2.w,
-            h,
-            n,
-            hd,
-            im_width,
-            1.0,
-        );
+        gemm(cublas, mid.cast_const(), layer.fc2.w, h, n, hd, im_width, 1.0);
         if !layer.fc2.b.is_null() {
             // `:263` — `vd::k_bias<bfd><<<((long)N*Hd+255)/256,256,0,S>>>(D(h),D(L.fc2.b),(long)N,Hd);`
-            fire(
-                "vision::k_bias_bf16",
-                rect(rows_u, hidden_u),
-                &[
-                    pm(h),
-                    p(layer.fc2.b),
-                    ArgValue::Usize(rows),
-                    ArgValue::I32(hd),
-                ],
-                stream,
-            )?;
+            call("vision::k_bias_bf16", stream, |ctx| {
+                vision::k_bias_bf16(ctx, h, layer.fc2.b, rows, hd)
+            })?;
         }
         // ── deepstack tap: post-block, before the next layer, per image ──
         //
@@ -1358,9 +1221,7 @@ fn run(
             };
             let merger = *merger;
             for (image, &ni) in n_patch_h.iter().enumerate() {
-                let base = count("image row offset", off[image])?
-                    * count("hidden", hd)?
-                    * 2;
+                let base = count("image row offset", off[image])? * count("hidden", hd)? * 2;
                 let dst = count("image token offset", tok[image])? * count("out_hidden", out)? * 2;
                 run_merger(
                     st,
@@ -1545,18 +1406,10 @@ pub fn scatter(
         let pix_bf = st.slot(S_PIX_BF, n_floats * 2)?;
         // `:498` (and `:459`, the dead batched arm's identical launch) —
         // `vd::k_f32_to_bf16<bfd><<<(n_floats+255)/256,256,0,S>>>(pix_f32_d,D(pix_bf_d),n_floats);`
-        // The row's input is `F32s` and not `Buf`: this kernel's source is
-        // float whatever the row's element type is.
-        fire(
-            "vision::k_f32_to_bf16_bf16",
-            rect(
-                u32::try_from(n_floats)
-                    .map_err(|_| Error::invalid(WHO, "the pixel count overflowed"))?,
-                1,
-            ),
-            &[pm(pix_f32), pm(pix_bf), ArgValue::Usize(n_floats)],
-            stream,
-        )?;
+        // The SOURCE is float whatever the destination's element type is.
+        call("vision::k_f32_to_bf16_bf16", stream, |ctx| {
+            vision::k_f32_to_bf16_bf16(ctx, pix_f32.cast_const(), pix_bf, n_floats)
+        })?;
         // `:499` — the cached rope ids and interpolated position embeddings.
         let (rope_d, pe_d) = st.grid(w, key, stream)?;
         let token_bytes = n_token

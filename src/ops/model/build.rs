@@ -527,7 +527,8 @@ mod tests {
             .expect("driver-vulkan carries a name table");
         assert_eq!(
             wgpu, vulkan,
-            "the two drivers no longer spell weights the same way, so one              `--backend` arm can no longer author for both"
+            "the two drivers no longer spell weights the same way, so one \
+             `--backend` arm can no longer author for both"
         );
         // A control: the file is not empty, so the equality above is an
         // equality of CONTENT rather than of two failed reads.

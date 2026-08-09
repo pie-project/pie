@@ -120,10 +120,7 @@ impl Dev {
         // zero-length allocation legal so a degenerate shape still has a
         // distinct, freeable pointer to hand cuBLAS.
         unsafe {
-            assert_eq!(
-                cudaMalloc(&raw mut p, bytes.max(16)),
-                cudaError::cudaSuccess
-            );
+            assert_eq!(cudaMalloc(&raw mut p, bytes.max(16)), cudaError::cudaSuccess);
             if bytes > 0 {
                 assert_eq!(
                     cudaMemcpy(p, src, bytes, cudaMemcpyKind::cudaMemcpyHostToDevice),
@@ -215,9 +212,9 @@ fn ctx_of(cublas: *mut c_void) -> DispatchCtx {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-          moe_ptrs: std::cell::Cell::new(None),
-      moe_ptrs: std::cell::Cell::new(None),
-}
+        moe_ptrs: std::cell::Cell::new(None),
+        moe_ptrs: std::cell::Cell::new(None),
+    }
 }
 
 // ── the shape table, spelled as the oracle spells it ───────────────────────
@@ -286,8 +283,9 @@ fn transcript() -> Vec<String> {
             // §5 step 5 moved the body to `kernels_cuda_new::x::gemm`, where
             // it takes the handle directly instead of reading `ctx.cublas`.
             // The bytes this test hashes are the same bytes.
+            let gctx = kernels_cuda_new::jit::Ctx::on(std::ptr::null_mut()).with_cublas(ctx.cublas);
             kernels_cuda_new::x::gemm::act_x_wt_bf16_out_fp32(
-                ctx.cublas,
+                &gctx,
                 dact.0,
                 dw.0,
                 dy.0.cast(),
@@ -301,11 +299,7 @@ fn transcript() -> Vec<String> {
         sync();
         dy.back_f32(&mut y);
         let bytes: Vec<u8> = y.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        rows.push(format!(
-            "out_fp32 m={m} n={n} k={k} {:016x} {}",
-            fnv1a(&bytes),
-            bytes.len()
-        ));
+        rows.push(format!("out_fp32 m={m} n={n} k={k} {:016x} {}", fnv1a(&bytes), bytes.len()));
     }
 
     for &(ms, n, k, beta) in GROUPED {
@@ -340,8 +334,10 @@ fn transcript() -> Vec<String> {
         // SAFETY: the three arrays are `groups` long and outlive the call;
         // `ms` is the host row-count array the row declares.
         unsafe {
+            let gctx =
+                kernels_cuda_new::jit::Ctx::on(std::ptr::null_mut()).with_cublas(handle.cast());
             kernels_cuda_new::x::gemm::grouped_act_x_wt_bf16(
-                handle.cast(),
+                &gctx,
                 actp.as_ptr(),
                 wp.as_ptr(),
                 yp.as_ptr(),
@@ -479,30 +475,17 @@ fn the_shapes_are_not_one_shape() {
     let ms: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.0).collect();
     let ns: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.1).collect();
     let ks: std::collections::BTreeSet<i32> = DENSE.iter().map(|d| d.2).collect();
-    assert!(
-        ms.len() >= 5 && ns.len() >= 5 && ks.len() >= 5,
-        "M, N and K each move"
-    );
+    assert!(ms.len() >= 5 && ns.len() >= 5 && ks.len() >= 5, "M, N and K each move");
     assert!(ms.contains(&0), "M=0 is the empty rectangle");
-    assert!(
-        ns.contains(&1) && ks.contains(&1),
-        "N=1 and K=1 are degenerate axes"
-    );
-    assert!(
-        GROUPED.iter().any(|g| g.0.is_empty()),
-        "group_count=0 is the archive's early return"
-    );
-    assert!(
-        GROUPED.iter().any(|g| g.3 != 0.0),
-        "beta != 0 reads the output and so pins ldc"
-    );
+    assert!(ns.contains(&1) && ks.contains(&1), "N=1 and K=1 are degenerate axes");
+    assert!(GROUPED.iter().any(|g| g.0.is_empty()), "group_count=0 is the archive's early return");
+    assert!(GROUPED.iter().any(|g| g.3 != 0.0), "beta != 0 reads the output and so pins ldc");
     assert!(
         MLA.iter().any(|m| m.0 == 0) && MLA.iter().any(|m| m.1 == 0),
         "tokens=0 and heads=0 are both halves of the absorbs' early return"
     );
     assert!(
-        MLA.iter()
-            .any(|m| m.2 != m.3 && m.3 != m.4 && m.2 != m.4 && m.0 != m.1),
+        MLA.iter().any(|m| m.2 != m.3 && m.3 != m.4 && m.2 != m.4 && m.0 != m.1),
         "at least one MLA shape has no two dims equal, so a swapped stride cannot hide"
     );
 }
@@ -601,11 +584,7 @@ fn the_lost_bias_fusion_cost_no_answer() {
             .and_then(|s| s.parse().ok())
             .expect("differing= count");
         assert_eq!(differing, 0, "{differing} cells differ: {r}");
-        let n: usize = r
-            .split("of ")
-            .nth(1)
-            .and_then(|s| s.trim().parse().ok())
-            .expect("of <n>");
+        let n: usize = r.split("of ").nth(1).and_then(|s| s.trim().parse().ok()).expect("of <n>");
         launched += 1;
         values += n;
     }

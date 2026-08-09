@@ -40,6 +40,10 @@
 //! all — a row must be writable next to its kernel without dragging a
 //! dependency graph along.
 
+pub mod routine;
+
+pub use routine::{Arg, Backend, Env, KernelFn, Provenance, Refusal, Routine};
+
 /// A capability a seam may ask of the kernel covering its rows. Named after
 /// the seam vocabulary (`.wiki/tart/dsl.md` ①), because that is what a
 /// `lacks` line refuses to serve.
@@ -1967,6 +1971,28 @@ pub struct KernelSig {
     /// trace, restating a fact about the KERNEL. Migration step 5 moved it
     /// here.
     pub depth_prefix_plan: bool,
+    /// The arguments the routine takes, in the order its `fn` takes them, and
+    /// who supplies each.
+    ///
+    /// DERIVED, from [`routine::KernelFn::ARGS`], so it cannot disagree with
+    /// the body. Empty means the row was written by hand — the three tables
+    /// that predate the routine shape — and not that the routine is nullary.
+    ///
+    /// Not [`Self::operands`] said twice. That column is the launch ABI in the
+    /// order a DRIVER binds it, sourced per slot; this one is the signature,
+    /// in the order the `fn` reads it. The two orders differ, which is why
+    /// [`Self::in_place`] is stated in trace-operand indices rather than
+    /// derived from here.
+    ///
+    /// THE PROVENANCE HALF IS NOT YET USABLE AS A CHECK, and the reason is a
+    /// property of the routines rather than of this column: no routine wraps
+    /// an argument in [`routine::Env`], so every position derives as
+    /// [`Provenance::Trace`] — including the head widths, position vectors and
+    /// cache descriptors that driver-cuda's arms read off the fire because no
+    /// statement carries them. There is no arm in which the statement supplies
+    /// every argument, so until the wrappers land a rule reading this column
+    /// would demand of every statement arguments it cannot have.
+    pub args: &'static [(Ty, Provenance)],
     /// The operands `symbol` takes, in order — the launch ABI, as data.
     ///
     /// Empty means UNSTATED, not "takes nothing": a launcher that genuinely
@@ -2313,6 +2339,7 @@ macro_rules! kernel {
                 sink: None,
                 in_place: &[],
                 depth_prefix_plan: false,
+                args: &[],
                 operands: &[],
                 axes: &[],
                 grid_param: None,

@@ -141,10 +141,7 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     let cluster_size: i32 = if avg_packed_qo_len > 64 { 2 } else { 1 };
     let num_clusters = device.num_sm / cluster_size as u32;
     if num_clusters == 0 {
-        return Err(Error::MergeCtasExceedSm {
-            counter: 0,
-            num_sm: i64::from(device.num_sm),
-        });
+        return Err(Error::MergeCtasExceedSm { counter: 0, num_sm: i64::from(device.num_sm) });
     }
     const CTA_TILE_Q: i32 = 64;
     let cluster_tile_q = cluster_size * CTA_TILE_Q;
@@ -222,13 +219,10 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
                     let base = (req.qo_indptr[i as usize] as u32)
                         .wrapping_mul(req.num_heads)
                         .wrapping_add((qo_tile_idx * cluster_tile_q) as u32);
-                    merge_packed_offset_start[slot] =
-                        base.wrapping_add(offset_start as u32) as i32;
-                    merge_packed_offset_end[slot] = base
-                        .wrapping_add(
-                            offset_start.wrapping_add(row_chunk_size).min(current_q_tile_end) as u32,
-                        )
-                        as i32;
+                    merge_packed_offset_start[slot] = base.wrapping_add(offset_start as u32) as i32;
+                    merge_packed_offset_end[slot] = base.wrapping_add(
+                        offset_start.wrapping_add(row_chunk_size).min(current_q_tile_end) as u32,
+                    ) as i32;
                     merge_partial_packed_offset_start[slot] =
                         partial_o_nnz.wrapping_add(offset_start);
                     merge_partial_packed_offset_end[slot] = partial_o_nnz.wrapping_add(
@@ -243,10 +237,7 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
             while remaining_len > 0 || zero_kv_len {
                 let (cluster_idx, accum_cost) = heap.pop();
                 let actual_len = remaining_len.min(kv_len_limit);
-                heap.insert((
-                    cluster_idx,
-                    accum_cost + cost_function(cluster_tile_q, actual_len),
-                ));
+                heap.insert((cluster_idx, accum_cost + cost_function(cluster_tile_q, actual_len)));
                 let cluster = &mut clusters[cluster_idx as usize];
                 cluster.q_len.push(qo_len);
                 cluster.kv_len.push(kv_len);

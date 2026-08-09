@@ -39,10 +39,10 @@
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::{ArgValue, Dims};
+use kernels_cuda_new::x::{norm, vision};
 use model::shared::tower_names::VISION_SLOTS_PER_LAYER;
 
-use super::{Scratch, fire, p, pm, rect};
+use super::{Scratch, call};
 use crate::device::{StreamRef, read_raw_span};
 use crate::{Error, Result};
 
@@ -83,13 +83,7 @@ pub struct Clip {
 impl Clip {
     /// Five consecutive slots — `gemma4_towers_c.cpp`'s `clip_of`.
     fn of(t: &[*const c_void]) -> Self {
-        Self {
-            w: t[0],
-            imin: t[1],
-            imax: t[2],
-            omin: t[3],
-            omax: t[4],
-        }
+        Self { w: t[0], imin: t[1], imax: t[2], omin: t[3], omax: t[4] }
     }
 }
 
@@ -263,22 +257,19 @@ fn rms(
     eps: f32,
     stream: StreamRef<'_>,
 ) -> Result<()> {
-    let rows_u = extent("rms rows", rows)?;
-    let hidden_u = extent("rms hidden", hidden)?;
-    fire(
-        "norm::rmsnorm_strided_bf16",
-        rect(rows_u, hidden_u),
-        &[
-            p(x),
-            p(weight),
-            pm(y),
-            ArgValue::I32(hidden),
-            ArgValue::I32(hidden),
-            ArgValue::I32(hidden),
-            ArgValue::F32(eps),
-        ],
-        stream,
-    )
+    call("norm::rmsnorm_strided_bf16", stream, |ctx| {
+        norm::rmsnorm_strided_bf16(
+            ctx,
+            x.cast(),
+            weight.cast(),
+            y.cast(),
+            rows,
+            hidden,
+            hidden,
+            hidden,
+            eps,
+        )
+    })
 }
 
 /// A non-negative extent as the `u32` a `Dims` field is.
@@ -334,7 +325,12 @@ fn run(
     // and it must be — `inter_elems` below is built from `im` and would
     // otherwise size three scratch buffers off a sign-extended cast.
     extent("intermediate", im)?;
-    let out_len_u = extent("pooled rows", out_len)?;
+    // `out_len_u` went the same way as `im_u` above and for the same reason:
+    // its readers were `rect` calls the fn-world crossing deleted. `out_len`
+    // itself is still read below — `pooled_elems`, the two `gemm` extents —
+    // through `try_from`, which is why only the unsigned copy is gone and not
+    // the check.
+    extent("pooled rows", out_len)?;
     let nz = usize::try_from(n).unwrap_or(0);
     let hidden_elems = nz * hd as usize;
     let inter_elems = nz * im as usize;
@@ -353,33 +349,14 @@ fn run(
     let tmp = scratch.bf16(hidden_elems)?;
     let scr = scratch.f32s(nz * nz)?;
 
-    // `gemma4_vision.cu:193` — `k_scale<<<((long)N*Hd+255)/256, 256, 0, S>>>`,
-    // which `LaunchRule::Elementwise` evaluates from the same `N * Hd`.
-    fire(
-        "vision::k_scale_bf16",
-        rect(n_u, hd_u),
-        &[p(pixel), pm(hn), ArgValue::Usize(hidden_elems)],
-        stream,
-    )?;
+    // `gemma4_vision.cu:193` — the patch pixels rescaled into `hn`.
+    call("vision::k_scale_bf16", stream, |ctx| vision::k_scale_bf16(ctx, pixel, hn, hidden_elems))?;
     // `:194` — cuBLAS, no `<<<>>>`. See the module header.
     gemm(cublas, hn.cast_const(), w.patch_w, h, n, hd, hd);
-    // `:195` — `vd::k_addpos_grid2d<bfd><<<G2(Hd,N),B2,0,S>>>(D(h),D(w.pos_table),pos,N,Hd,PT);`
-    // with, from `gemma4_vision.cu:138`,
-    // `dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}`.
-    // `LaunchRule::Tile16` at `rows = N, width = Hd` is the same rectangle.
-    fire(
-        "vision::k_addpos_grid2d_bf16",
-        rect(n_u, hd_u),
-        &[
-            pm(h),
-            p(w.pos_table),
-            pm(pos),
-            ArgValue::I32(n),
-            ArgValue::I32(hd),
-            ArgValue::I32(pt),
-        ],
-        stream,
-    )?;
+    // `:195` — the two axial position-table rows, added in place on `h`.
+    call("vision::k_addpos_grid2d_bf16", stream, |ctx| {
+        vision::k_addpos_grid2d_bf16(ctx, h, w.pos_table, pos.cast_const(), n, hd, pt)
+    })?;
 
     for layer in &w.layers {
         rms(h.cast_const(), layer.in_ln, hn, n, hd, eps, stream)?;
@@ -388,9 +365,8 @@ fn run(
         clin(cublas, hn.cast_const(), v, xc, &layer.v, n, hd, hd, stream)?;
         // `:200` — the per-head norms are `rows = N * NH` of 64, which is the
         // `hidden, hidden, hidden` strides at a head's width.
-        let head_rows = n
-            .checked_mul(nh)
-            .ok_or_else(|| Error::invalid(WHO, "N * NH overflowed"))?;
+        let head_rows =
+            n.checked_mul(nh).ok_or_else(|| Error::invalid(WHO, "N * NH overflowed"))?;
         let head_dim = hd / nh;
         rms(q.cast_const(), layer.q_norm, q, head_rows, head_dim, eps, stream)?;
         rms(k.cast_const(), layer.k_norm, k, head_rows, head_dim, eps, stream)?;
@@ -398,79 +374,35 @@ fn run(
         // `LaunchRule::RowsPerHead` with an ABSENT `stated_head_dim` is
         // `grid[rows,1,1] block[256,1,1]`, and the head width is the operand
         // the C++ passed as `64` rather than an extent the rule recovers.
-        fire(
-            "norm::rmsnorm_no_scale_bf16",
-            rect(extent("N*NH", head_rows)?, extent("head", head_dim)?),
-            &[p(v.cast_const()), pm(v), ArgValue::I32(head_dim), ArgValue::F32(eps)],
-            stream,
-        )?;
+        call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
+            norm::rmsnorm_no_scale_bf16(
+                ctx,
+                v.cast_const().cast(),
+                v.cast(),
+                head_rows,
+                head_dim,
+                0,
+                eps,
+            )
+        })?;
         // `:201` — one C++ line, two launches, one tensor each:
         // `dim3 rg(1,NH,N);vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(q),pos,N,NH,THETA);vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(k),pos,N,NH,THETA);`
-        // `axial_rope` is `grid[1, kv_heads, rows] block[32,1,1]`; `head_dim`
-        // is checked by `headed` and not read, because a warp is a warp.
-        let rope_dims = Dims {
-            rows: n_u,
-            kv_heads: extent("heads", nh)?,
-            head_dim: extent("head", head_dim)?,
-            ..Dims::default()
-        };
         for tensor in [q, k] {
-            fire(
-                "vision::k_rope_axial2d_bf16",
-                rope_dims,
-                &[
-                    pm(tensor),
-                    pm(pos),
-                    ArgValue::I32(n),
-                    ArgValue::I32(nh),
-                    ArgValue::F32(theta),
-                ],
-                stream,
-            )?;
+            call("vision::k_rope_axial2d_bf16", stream, |ctx| {
+                vision::k_rope_axial2d_bf16(ctx, tensor, pos.cast_const(), n, nh, theta)
+            })?;
         }
         // `:202` — the head loop, three launches per head. The host varies
-        // `hh` across twelve fires of one row; `families/vision.rs`'s `k_qk`
-        // row is where that is argued.
+        // `hh` across twelve calls of one routine, because the head is an
+        // operand and not a grid axis at any of the three.
         for head in 0..nh {
-            // `k_qk<<<G2(N,N), B2, 0, S>>>` — the SCORE matrix's rectangle,
-            // square in `N`.
-            fire(
-                "vision::k_qk_bf16",
-                rect(n_u, n_u),
-                &[
-                    p(q.cast_const()),
-                    p(k.cast_const()),
-                    pm(scr),
-                    ArgValue::I32(n),
-                    ArgValue::I32(nh),
-                    ArgValue::I32(head),
-                    ArgValue::F32(1.0),
-                ],
-                stream,
-            )?;
-            // `k_softmax<<<N, 256, 0, S>>>` — `LaunchRule::PerRow`, static
-            // shared memory, so zero dynamic bytes is the contract.
-            fire(
-                "vision::k_softmax_bf16",
-                rect(n_u, n_u),
-                &[pm(scr), ArgValue::I32(n)],
-                stream,
-            )?;
-            // `k_av<<<G2(64,N), B2, 0, S>>>` — the width is ONE HEAD's 64 and
-            // not the tower's 768; the head axis is walked by this loop.
-            fire(
-                "vision::k_av_bf16",
-                rect(n_u, extent("head", head_dim)?),
-                &[
-                    pm(scr),
-                    p(v.cast_const()),
-                    pm(attn),
-                    ArgValue::I32(n),
-                    ArgValue::I32(nh),
-                    ArgValue::I32(head),
-                ],
-                stream,
-            )?;
+            call("vision::k_qk_bf16", stream, |ctx| {
+                vision::k_qk_bf16(ctx, q.cast_const(), k.cast_const(), scr, n, nh, head, 1.0)
+            })?;
+            call("vision::k_softmax_bf16", stream, |ctx| vision::k_softmax_bf16(ctx, scr, n))?;
+            call("vision::k_av_bf16", stream, |ctx| {
+                vision::k_av_bf16(ctx, scr.cast_const(), v.cast_const(), attn, n, nh, head)
+            })?;
         }
         clin(cublas, attn.cast_const(), tmp, xc, &layer.o, n, hd, hd, stream)?;
         rms(tmp.cast_const(), layer.post_attn_ln, tmp, n, hd, eps, stream)?;
@@ -489,21 +421,21 @@ fn run(
         // last parameter, so the `try_from` that refuses an `N * IM` too big
         // for the kernel's `int` stays exactly where it was. It has to: the
         // host program takes an `i32`, and a silent `as` here would launch a
-        // negative extent that `Fired::Declined(Empty)` would then report as
-        // an empty tensor.
-        let fired = unsafe {
-            kernels_cuda_new::x::mlp::geglu_tanh_bf16(
-                gate.cast_const().cast(),
-                up.cast_const().cast(),
-                act.cast(),
-                i32::try_from(inter_elems)
-                    .map_err(|_| Error::invalid(WHO, "N * IM does not fit the kernel's int"))?,
-                stream.as_raw().cast(),
-            )
-        };
-        if let kernels_cuda_new::x::Fired::Declined(why) = fired {
-            return Err(Error::invalid("mlp::geglu_tanh_bf16", format!("{why:?}")));
-        }
+        // negative extent that `Refusal::Empty` would then report as an empty
+        // tensor.
+        //
+        // SAFETY: `stream` outlives the launch, and the three pointers address
+        // this tower's own arena for `inter_elems` bf16 elements.
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream.as_raw().cast()) };
+        kernels_cuda_new::x::mlp::geglu_tanh_bf16(
+            &ctx,
+            gate.cast_const().cast(),
+            up.cast_const().cast(),
+            act.cast(),
+            i32::try_from(inter_elems)
+                .map_err(|_| Error::invalid(WHO, "N * IM does not fit the kernel's int"))?,
+        )
+        .map_err(|why| Error::invalid("mlp::geglu_tanh_bf16", format!("{why:?}")))?;
         clin(cublas, act.cast_const(), tmp, xc, &layer.down, n, im, hd, stream)?;
         rms(tmp.cast_const(), layer.post_ff_ln, tmp, n, hd, eps, stream)?;
         residual_add(h, tmp.cast_const(), hidden_elems, n_u, hd_u, stream)?;
@@ -513,51 +445,24 @@ fn run(
     // `:215` — `cudaMemsetAsync(pf, 0, OUTL*Hd*4, S)` on the accumulator the
     // pool `atomicAdd`s into.
     let pf = scratch.zeroed_f32s(pooled_elems, stream)?;
-    // `:216` — `k_pool<<<G2(Hd,N), B2, 0, S>>>`. The INPUT rectangle: the
-    // grid covers the patches being scattered, and `9.f` is the C++'s own
-    // literal rather than `pool_kernel * pool_kernel`.
-    fire(
-        "vision::k_pool_bf16",
-        rect(n_u, hd_u),
-        &[
-            p(h.cast_const()),
-            pm(grp),
-            pm(pf),
-            ArgValue::I32(n),
-            ArgValue::I32(hd),
-            ArgValue::F32(9.0),
-        ],
-        stream,
-    )?;
+    // `:216` — the pooling scatter, over the INPUT rectangle. `9.f` is the
+    // C++'s own literal rather than `pool_kernel * pool_kernel`.
+    call("vision::k_pool_bf16", stream, |ctx| {
+        vision::k_pool_bf16(ctx, h.cast_const(), grp.cast_const(), pf, n, hd, 9.0)
+    })?;
     let pooled = scratch.bf16(pooled_elems)?;
-    // `:217` — `k_pool_finish<<<((long)OUTL*Hd+255)/256, 256, 0, S>>>`, with
-    // `sqrtf((float)Hd)` computed on the host as an operand.
+    // `:217` — the accumulator scaled and narrowed, with `sqrtf((float)Hd)`
+    // computed on the host as an operand.
     #[allow(clippy::cast_precision_loss)]
     let scale = (hd as f32).sqrt();
-    fire(
-        "vision::k_pool_finish_bf16",
-        rect(out_len_u, hd_u),
-        &[
-            pm(pf),
-            pm(pooled),
-            ArgValue::F32(scale),
-            ArgValue::Usize(pooled_elems),
-        ],
-        stream,
-    )?;
+    call("vision::k_pool_finish_bf16", stream, |ctx| {
+        vision::k_pool_finish_bf16(ctx, pf.cast_const(), pooled, scale, pooled_elems)
+    })?;
     let pn = scratch.bf16(pooled_elems)?;
     // `:219` — `rmsnorm_no_scale<bfd,256><<<dim3(OUTL), dim3(256), 0, S>>>`.
-    fire(
-        "norm::rmsnorm_no_scale_bf16",
-        rect(out_len_u, hd_u),
-        &[
-            p(pooled.cast_const()),
-            pm(pn),
-            ArgValue::I32(hd),
-            ArgValue::F32(eps),
-        ],
-        stream,
-    )?;
+    call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
+        norm::rmsnorm_no_scale_bf16(ctx, pooled.cast_const().cast(), pn.cast(), out_len, hd, 0, eps)
+    })?;
     // `:220` — the third and last cuBLAS call.
     gemm(cublas, pn.cast_const(), w.embed_proj, out_proj, out_len, txt, hd);
     // `:221`. The arena is dropped after this, which is the order the C++
@@ -570,9 +475,7 @@ fn run(
 /// A clipped linear — `gemma4_vision.cu:188-191`'s `clin` lambda.
 ///
 /// Clamp the input into the shared `xc` staging buffer, GEMM it against the
-/// clip's weight, clamp the output in place. Both clamps are
-/// `k_clamp<<<((long)N*W+255)/256, 256, 0, S>>>`, which `Elementwise`
-/// evaluates from the `N` by `W` rectangle.
+/// clip's weight, clamp the output in place.
 #[allow(clippy::too_many_arguments)]
 fn clin(
     cublas: *mut c_void,
@@ -585,36 +488,21 @@ fn clin(
     out_width: i32,
     stream: StreamRef<'_>,
 ) -> Result<()> {
-    let n_u = extent("clin rows", n)?;
-    let in_u = extent("clin in", k_in)?;
-    let out_u = extent("clin out", out_width)?;
+    // The three extents are checked HERE and not left to the routine: the two
+    // element counts below are built from them, and a negative `k_in` would
+    // size a clamp off a sign-extended cast before any routine saw it.
+    extent("clin rows", n)?;
+    extent("clin in", k_in)?;
+    extent("clin out", out_width)?;
     let in_elems = usize::try_from(n).unwrap_or(0) * k_in as usize;
     let out_elems = usize::try_from(n).unwrap_or(0) * out_width as usize;
-    fire(
-        "vision::k_clamp_bf16",
-        rect(n_u, in_u),
-        &[
-            p(x),
-            pm(xc),
-            p(c.imin),
-            p(c.imax),
-            ArgValue::Usize(in_elems),
-        ],
-        stream,
-    )?;
+    call("vision::k_clamp_bf16", stream, |ctx| {
+        vision::k_clamp_bf16(ctx, x, xc, c.imin, c.imax, in_elems)
+    })?;
     gemm(cublas, xc.cast_const(), c.w, out, n, out_width, k_in);
-    fire(
-        "vision::k_clamp_bf16",
-        rect(n_u, out_u),
-        &[
-            p(out.cast_const()),
-            pm(out),
-            p(c.omin),
-            p(c.omax),
-            ArgValue::Usize(out_elems),
-        ],
-        stream,
-    )
+    call("vision::k_clamp_bf16", stream, |ctx| {
+        vision::k_clamp_bf16(ctx, out.cast_const(), out, c.omin, c.omax, out_elems)
+    })
 }
 
 /// `kernels::gemm::act_x_wt_bf16` — `beta` defaulted to `0.f` as the C++
@@ -663,12 +551,10 @@ fn residual_add(
     if elems == 0 {
         return Ok(());
     }
-    fire(
-        "norm::residual_add_bf16",
-        rect(rows, width),
-        &[pm(y), p(x), ArgValue::Usize(elems)],
-        stream,
-    )
+    let _ = (rows, width);
+    call("norm::residual_add_bf16", stream, |ctx| {
+        norm::residual_add_bf16(ctx, y.cast(), x.cast(), elems)
+    })
 }
 
 /// The encode-ABI entry: host pixels in, host bf16 embedding rows out.
@@ -701,10 +587,7 @@ pub fn encode(
 ) -> Result<()> {
     let num_images = output_row_indptr.len().saturating_sub(1);
     if num_images == 0 || pixel_byte_indptr.len() < num_images + 1 {
-        return Err(Error::invalid(
-            WHO,
-            "invalid standalone encode inputs",
-        ));
+        return Err(Error::invalid(WHO, "invalid standalone encode inputs"));
     }
     let pk = usize::try_from(w.pool_kernel)
         .map_err(|_| Error::invalid(WHO, "pool_kernel is negative"))?;
@@ -739,10 +622,7 @@ pub fn encode(
             .and_then(|r| r.checked_mul(row_bytes))
             .ok_or_else(|| Error::invalid(WHO, "output row count overflowed"))?;
         if want > output_rows.len() {
-            return Err(Error::invalid(
-                WHO,
-                "encode output buffer too small",
-            ));
+            return Err(Error::invalid(WHO, "encode output buffer too small"));
         }
         if patch_positions.len() < (patch_off + n_patch) * 2 {
             return Err(Error::invalid(
@@ -755,19 +635,11 @@ pub fn encode(
         let mut scratch = Scratch::new();
         let pix_f32 = scratch.upload_bytes(&pixels[blo..bhi], stream)?;
         let pix_bf = scratch.bf16(n_floats)?;
-        // `:280` — `k_f32_to_bf16<<<(n_floats+255)/256, 256, 0, S>>>`. The
-        // input is `F32s` and not `Buf`: this kernel's source is float
-        // whatever the row's element type is.
-        fire(
-            "vision::k_f32_to_bf16_bf16",
-            rect(
-                u32::try_from(n_floats)
-                    .map_err(|_| Error::invalid(WHO, "pixel count overflowed"))?,
-                1,
-            ),
-            &[pm(pix_f32), pm(pix_bf), ArgValue::Usize(n_floats)],
-            stream,
-        )?;
+        // `:280` — the uploaded plane narrowed to the tower's format. The
+        // SOURCE is float whatever the destination's element type is.
+        call("vision::k_f32_to_bf16_bf16", stream, |ctx| {
+            vision::k_f32_to_bf16_bf16(ctx, pix_f32.cast_const(), pix_bf, n_floats)
+        })?;
 
         // `:283-296` — the host's own arithmetic: the positions widened to
         // float for the two kernels that consume them as trigonometric

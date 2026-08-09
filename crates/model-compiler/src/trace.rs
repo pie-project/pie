@@ -524,9 +524,7 @@ pub enum OpKind {
     /// Per-token combine of the k routed expert outputs:
     /// `out[t] = sum_j w[t, j] * x[t, j, :]`, collapsing `[Tokens, k, d]`
     /// to `[Tokens, d]`. The hand-written MoE pass's
-    /// `kernels::moe::token_batched_weighted_sum_bf16` (the prefill path's
-    /// per-expert `scatter_add_weighted` loop is a lowering of the same
-    /// combine, chosen with the grouped GEMM it follows).
+    /// `kernels::moe::token_batched_weighted_sum_bf16`.
     WeightedSum { k: u32 },
     /// Shared-expert landing: `out = base + sigmoid(gate) * x`, the scalar
     /// per-token gate broadcast over the hidden dim. Operands `[x, gate,

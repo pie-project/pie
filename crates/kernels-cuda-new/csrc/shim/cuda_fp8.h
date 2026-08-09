@@ -470,6 +470,62 @@ struct __nv_fp8_e5m2 {
 /// Two E4M3 values, low byte first.
 struct __nv_fp8x2_e4m3 {
     __nv_fp8x2_storage_t __x;
+
+    __nv_fp8x2_e4m3() = default;
+
+    /// The bits, as the bits.
+    explicit __device__ __forceinline__ __nv_fp8x2_e4m3(__nv_fp8x2_storage_t bits) : __x(bits) {}
+
+    /// `__nv_fp8x2_e4m3{f}` -- `mhaUtils.cuh:371`'s store of a converted
+    /// pair. One `cvt.rn.satfinite.e4m3x2.f32`, via the free function that
+    /// already spells it.
+    explicit __device__ __forceinline__ __nv_fp8x2_e4m3(const float2 f)
+        : __x(__nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3)) {}
+
+#if defined(__CUDA_FP16_TYPES_EXIST__)
+    /// `xqa/utils.cuh:217` -- an fp16 pair down to an fp8 pair.
+    ///
+    /// Through fp32 rather than `cvt.rn.satfinite.e4m3x2.f16x2`, because
+    /// widening fp16 to fp32 is exact and the `f32` form is the one this
+    /// header already states; both round once, in the same place.
+    explicit __device__ __forceinline__ __nv_fp8x2_e4m3(const __half2 v) {
+        const __half2_raw raw = static_cast<__half2_raw>(v);
+        float2 f;
+        f.x = __pie_fp8_halfbits_to_float(raw.x);
+        f.y = __pie_fp8_halfbits_to_float(raw.y);
+        __x = __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+    }
+
+    /// Both lanes at once -- `xqa/utils.cuh:209`'s `half2(fp8x2)`.
+    ///
+    /// One `cvt.rn.f16x2.e4m3x2`, which is the instruction
+    /// `__nv_cvt_fp8_to_halfraw` already issues and then throws half of away.
+    /// Widening e4m3 to fp16 is exact, so there is no rounding to argue about.
+    explicit __device__ __forceinline__ operator __half2() const {
+        unsigned int pair;
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(pair) : "h"(__x));
+        __half2_raw raw;
+        raw.x = (unsigned short)(pair & 0xFFFFu);
+        raw.y = (unsigned short)(pair >> 16);
+        return static_cast<__half2>(raw);
+    }
+#endif
+
+#if defined(__CUDA_BF16_TYPES_EXIST__)
+    /// `xqa/utils.cuh:229` -- a bf16 pair down to an fp8 pair.
+    ///
+    /// bf16 widens to fp32 by appending sixteen zero bits, so the only
+    /// rounding is the `cvt` itself. Spelled with the bits rather than with
+    /// `__bfloat1622float2`, for the reason `__nv_fp8_e4m3(__nv_bfloat16)`
+    /// above is: this header includes nothing.
+    explicit __device__ __forceinline__ __nv_fp8x2_e4m3(const __nv_bfloat162 v) {
+        const __nv_bfloat162_raw raw = static_cast<__nv_bfloat162_raw>(v);
+        float2 f;
+        f.x = __int_as_float((int)(((unsigned int)raw.x) << 16));
+        f.y = __int_as_float((int)(((unsigned int)raw.y) << 16));
+        __x = __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+    }
+#endif
 };
 
 /// Two E5M2 values, low byte first.

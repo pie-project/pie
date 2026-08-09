@@ -41,7 +41,7 @@ use std::ffi::{CStr, CString};
 
 use cudarc::driver::sys as dr;
 use cudarc::nvrtc::sys as nv;
-use kernels_cuda_new::runtime::cache;
+use kernels_cuda_new::jit::cache;
 use kernels_cuda_new::source;
 
 /// IEEE-754 binary16 → binary32, from the definition.
@@ -129,7 +129,7 @@ fn negative_zero_stays_negative() {
 /// this file spelled the Itanium mangling by hand and got the namespace's
 /// length prefix wrong, which `cuModuleGetFunction` reported as
 /// `CUDA_ERROR_NOT_FOUND`: a true statement about a mistake nothing in it
-/// names. `nvrtcGetLoweredName` is what `runtime::nvrtc` asks, and it is what
+/// names. `nvrtcGetLoweredName` is what `jit`'s compiler asks, and it is what
 /// this asks.
 struct Probe {
     image: Vec<u8>,

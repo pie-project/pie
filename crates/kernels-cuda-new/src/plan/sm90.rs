@@ -84,9 +84,7 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
         });
     }
     let batch_size = req.batch_size as usize;
-    for (array, len) in
-        [("qo_indptr", req.qo_indptr.len()), ("kv_indptr", req.kv_indptr.len())]
-    {
+    for (array, len) in [("qo_indptr", req.qo_indptr.len()), ("kv_indptr", req.kv_indptr.len())] {
         if len < batch_size + 1 {
             return Err(Error::IndptrTooShort { array, needed: batch_size + 1, got: len });
         }
@@ -161,8 +159,7 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
 
     let mut work_indptr = vec![0i32; num_ctas as usize + 1];
     for i in 0..num_ctas as usize {
-        work_indptr[i + 1] =
-            work_indptr[i].wrapping_add(ctas[i].qo_tile_indices.len() as i32);
+        work_indptr[i + 1] = work_indptr[i].wrapping_add(ctas[i].qo_tile_indices.len() as i32);
     }
     let total_num_works = *work_indptr.last().expect("work_indptr has num_sm + 1 entries");
 
@@ -202,8 +199,10 @@ pub fn plan(
 ) -> Result<Plan<PrefillPlanSm90Info>, Error> {
     let sched = schedule(req, device)?;
     let mut staging = Staging::new(workspace.int_bytes);
-    let mut info =
-        PrefillPlanSm90Info { same_schedule_for_all_heads: sched.same_schedule_for_all_heads, ..PrefillPlanSm90Info::default() };
+    let mut info = PrefillPlanSm90Info {
+        same_schedule_for_all_heads: sched.same_schedule_for_all_heads,
+        ..PrefillPlanSm90Info::default()
+    };
 
     let works = 4 * sched.max_total_num_works.max(0) as usize;
     let mut int_alloc = AlignedAllocator::new(workspace.int_bytes);
@@ -236,12 +235,7 @@ pub fn plan(
     }
 
     let int_bytes = int_alloc.used();
-    Ok(Plan {
-        info,
-        int_upload: staging.into_upload(int_bytes),
-        int_bytes,
-        float_bytes: 0,
-    })
+    Ok(Plan { info, int_upload: staging.into_upload(int_bytes), int_bytes, float_bytes: 0 })
 }
 
 #[cfg(test)]

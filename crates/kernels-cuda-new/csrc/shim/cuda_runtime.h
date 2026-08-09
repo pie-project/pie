@@ -110,6 +110,10 @@ typedef unsigned char uchar;
 // regardless, because a name is looked up whether or not its `#if` is taken
 // on some other arch. Whether `griddepcontrol` assembles at all on `sm_89` is
 // UNMEASURED and deliberately not relied on.
+// Under `--relocatable-device-code=true` NVRTC's builtin header DEFINES both,
+// so defining them again is a redefinition. See `cooperative_groups.h` for
+// the other half of the same switch.
+#if !defined(__CUDACC_RDC__)
 __device__ __forceinline__ void cudaGridDependencySynchronize() {
   asm volatile("griddepcontrol.wait;" ::: "memory");
 }
@@ -117,5 +121,6 @@ __device__ __forceinline__ void cudaGridDependencySynchronize() {
 __device__ __forceinline__ void cudaTriggerProgrammaticLaunchCompletion() {
   asm volatile("griddepcontrol.launch_dependents;");
 }
+#endif
 
 #endif  // PIE_NVRTC_CUDA_RUNTIME_H_

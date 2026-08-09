@@ -455,11 +455,20 @@ pub mod moe_grouped;
 // move** — there was none to name, and `_ctx: &DispatchCtx` went unread from
 // the day it was written.
 pub mod page_mask;
+// `recordings` and `scratch` are BEHIND THE SAME GATE AS `launch`, because
+// every reader of either is: `fire::launch` and `serve` are both
+// `feature = "abi"`, and nothing outside them constructs a `Scratch`, reads a
+// `slot::` name or holds a `Recordings`. Ungated they compiled into a build
+// that could not reach them, and rustc said so correctly — sixteen dead-code
+// warnings naming a live subsystem, which is the shape of a warning nobody
+// can act on and everybody learns to skim.
+#[cfg(feature = "abi")]
 pub mod recordings;
 // `split_packed` DELETED. `attn::split_qkv_bf16_devwin` crossed into
 // fn-world with a real bind, so its host program is
 // `kernels_cuda_new::x::attn::split_qkv_bf16_devwin` and the module that
 // held it had nothing else in it.
+#[cfg(feature = "abi")]
 pub mod scratch;
 pub mod sideband_arena;
 pub mod stage_hooks;
@@ -469,8 +478,10 @@ pub mod stage_hooks;
 /// claim that stood in the way — *"this needs nvcc"* — was measured and is
 /// false, and the measurement is in this module's header.
 pub mod supergraph;
-/// XQA's fire-wide prepare — the last `__global__` the `kernels-cuda` archive
-/// held, as a JIT'd kernel with its workspace carve in Rust. Discharges the
+/// XQA's two fires and the attention-workspace carve between them. The kernel
+/// halves are `kernels_cuda_new::x::xqa`'s six roots and two routines; what is
+/// here is the carve, because a workspace is the driver's vocabulary and an
+/// offset into one is not a thing a `Source` can name. Implements the
 /// `Prepare::FireWide` that `attn::attention_xqa_decode_bf16_prepared`'s row
-/// states and that no code implemented on any reachable channel.
+/// states and that no code routes on any reachable channel.
 pub mod xqa;

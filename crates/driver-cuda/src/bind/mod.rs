@@ -18,22 +18,6 @@
 /// what a bound launch is bound TO.
 pub mod abi;
 
-/// Tier A: a kernel loaded from a cubin, its arguments marshalled from the
-/// row, and `cuLaunchKernel`. No host launcher.
-pub mod device;
-
-/// Tier A: the `__global__` templates, compiled at run time and instantiated
-/// by the names the rows state. No entry points either.
-pub mod nvrtc;
-
-/// Stage B: the device headers an `#include` resolves against, carried in the
-/// binary rather than found on a path.
-pub mod headers;
-
-/// Stage C: firing a row through the unit it was compiled into at run time,
-/// instead of through the generated shim.
-pub mod jit;
-
 /// Stage C, the other half: the rows the driver executes ITSELF — cuBLAS
 /// through `cudarc`, and the compositions whose steps it issues in order.
 /// `kernels_cuda_new::execution::Execution::Service` classified them; this
@@ -81,16 +65,15 @@ pub mod service;
 /// `execution::RUST_SERVED`'s spelling test reads that file.
 pub mod quant_gemm;
 
-/// Tier A: the arithmetic a stated [`kernels::LaunchRule`] names — what
-/// the C++ launchers computed inside `<<<>>>`.
-pub mod launch;
-
 /// The driver's answer to `kernels_cuda_new::x::Facts` — the fire's facts,
 /// as a bind body beside a `.cuh` may read them.
 ///
 /// `.wiki/kernel-x/northstar.md` §3.3. The reads are
 /// [`dispatch_generated`]'s scaffolding promoted out of a generated file
 /// and given a name.
+pub mod arms;
+/// The query-only fire vocabulary and the context an arm reads it through.
+pub mod cx;
 pub mod facts;
 
 use std::ffi::c_void;
@@ -244,23 +227,15 @@ pub struct LaunchSpec {
     /// intern lives on the op join, which is `driver-cuda`'s own
     /// per-lowering pass and is already computed once and indexed per fire.
     ///
-    /// It is a [`Route`](kernels_cuda_new::x::Route) and not an
+    /// It is a [`Route`](arms::Route) and not an
     /// `Option<&Entry>` because the question has four answers and an
     /// `Option` has two — see `Route`'s own doc, where the arity is the
     /// thing that made step 4's second half writable.
     ///
     /// [`dispatch`] reads it. **No symbol string is compared at fire time.**
-    pub route: kernels_cuda_new::x::Route,
+    pub route: arms::Route,
 }
 
-/// A wire param read back as `f32`.
-///
-/// `params` is `[u32]` because that is what a wire carries; a float rides
-/// it as its BITS (`f32::to_bits`), never as a rounded integer — which is
-/// the whole reason this is one function rather than a cast at each arm.
-fn param_f32(spec: &LaunchSpec, at: usize) -> Option<f32> {
-    spec.params.get(at).copied().map(f32::from_bits)
-}
 
 /// The window a launch attends over: the STATEMENT's, or the context's
 /// where a statement carries none.
@@ -274,17 +249,14 @@ fn window_of(spec: &LaunchSpec, a: &AttnCtx, layer: u32) -> i32 {
     if let Some(&stated) = spec.params.first() {
         return stated as i32;
     }
-    a.window_left_by_layer
-        .get(layer as usize)
-        .copied()
-        .unwrap_or(a.window_left)
+    a.window_left_by_layer.get(layer as usize).copied().unwrap_or(a.window_left)
 }
 
 /// The per-launch op join over a whole lowering.
 #[derive(Debug, Clone)]
 pub struct DispatchPlan {
     specs: Vec<LaunchSpec>,
-    routes: Vec<kernels_cuda_new::x::Route>,
+    routes: Vec<arms::Route>,
     unfireable: Vec<Unfireable>,
 }
 
@@ -320,7 +292,7 @@ impl core::fmt::Display for Unfireable {
 /// §5 writes this as `lowered.kernels: Vec<&'static Entry>` and is right
 /// about the KEY — the kernel index — and wrong about the owner and the
 /// arity. Both corrections are in
-/// [`Route`](kernels_cuda_new::x::Route)'s doc; the short of it is that
+/// [`Route`](arms::Route)'s doc; the short of it is that
 /// `Lowered` belongs to a GPU-free crate that must not learn which symbols
 /// are JIT'd, and that `Option<&Entry>` cannot say "unknown", which is the
 /// one thing step 4's second half has to be able to say.
@@ -336,12 +308,8 @@ impl core::fmt::Display for Unfireable {
 /// one, and `resolve` is a pure function of the symbol table. That is why
 /// this landed without touching `Cx` at all.
 #[must_use]
-pub fn resolve(lowered: &Lowered) -> Vec<kernels_cuda_new::x::Route> {
-    lowered
-        .kernels
-        .iter()
-        .map(|symbol| kernels_cuda_new::x::route(symbol))
-        .collect()
+pub fn resolve(lowered: &Lowered) -> Vec<arms::Route> {
+    lowered.kernels.iter().map(|symbol| arms::route(symbol)).collect()
 }
 
 impl DispatchPlan {
@@ -380,6 +348,10 @@ impl DispatchPlan {
                 _ => Arg::Named {
                     value: v,
                     width: width_of(v),
+                    bytes: plan
+                        .values
+                        .get(v as usize)
+                        .map_or(2, |i| model_compiler::lower::dtype_bytes(i.dtype)),
                 },
             }
         };
@@ -453,60 +425,30 @@ impl DispatchPlan {
         // used to exist, and the loss surfaces as the `all slots filled`
         // test's message — about filling, not about width.
         let sig_of = |launch: &Launch| -> Option<&'static kernels::KernelSig> {
-            kernels::sig_in(
-                kernels_cuda_new::table::KERNELS,
-                &lowered.kernels[launch.kernel as usize],
-            )
+            kernels::sig_in(kernels_cuda_new::sigs(), &lowered.kernels[launch.kernel as usize])
         };
-        let contract_of = |launch: &Launch| -> Option<&'static kernels_cuda_new::x::Contract> {
-            kernels_cuda_new::x::contract(&lowered.kernels[launch.kernel as usize])
-        };
+        // `publishes_aux` lived on the old `Contract` and had no reader once
+        // the arms moved; nothing sizes the aux vector from a declaration now.
+        let contract_of = |_launch: &Launch| -> Option<&'static kernels::KernelSig> { None };
         // Widest slot any declaration publishes or any row reads, so the
         // vector is sized by the table rather than by a constant this file
         // would have to keep in step with it.
-        let published = lowered
-            .launches
-            .iter()
-            .filter_map(contract_of)
-            .flat_map(|c| c.publishes_aux.iter().map(|&(slot, _)| slot));
-        let consumed = lowered
-            .launches
-            .iter()
-            .filter_map(sig_of)
-            .flat_map(|s| {
-                s.operands.iter().filter_map(|o| match o.source {
-                    kernels::Source::Aux(i) => Some(i),
-                    _ => None,
-                })
-            });
-        let aux_width = published
-            .chain(consumed)
-            .max()
-            .map_or(0, |m| usize::from(m) + 1);
-        let mut aux: std::collections::BTreeMap<u16, Vec<Option<Arg>>> =
+        let published =
+            lowered.launches.iter().filter_map(contract_of).flat_map(|_| [].into_iter());
+        let consumed = lowered.launches.iter().filter_map(sig_of).flat_map(|s| {
+            s.operands.iter().filter_map(|o| match o.source {
+                kernels::Source::Aux(i) => Some(i),
+                _ => None,
+            })
+        });
+        let aux_width = published.chain(consumed).max().map_or(0, |m| usize::from(m) + 1);
+        let aux: std::collections::BTreeMap<u16, Vec<Option<Arg>>> =
             std::collections::BTreeMap::new();
-        for launch in &lowered.launches {
-            let Some(contract) = contract_of(launch) else {
-                continue;
-            };
-            if contract.publishes_aux.is_empty() {
-                continue;
-            }
-            let op = &plan.ops[launch.op as usize];
-            let slots = aux
-                .entry(launch.layers.start)
-                .or_insert_with(|| vec![None; aux_width]);
-            for &(slot, out_ix) in contract.publishes_aux {
-                // Out of range is a trace that does not fit this kernel; the
-                // arity guard reports it, and publishing nothing keeps the
-                // `all slots filled` test below the one that decides.
-                if let Some(&v) = op.outputs.get(usize::from(out_ix))
-                    && let Some(cell) = slots.get_mut(usize::from(slot))
-                {
-                    *cell = Some(out_arg(v));
-                }
-            }
-        }
+        // NOTHING PUBLISHES AUX ANY MORE. The slot pairs lived on the old
+        // `Contract::publishes_aux`, and that column died with the declaration
+        // table: an arm builds its own argument list now, so a statement's
+        // auxiliary outputs are the arm's business and not a row's. The map
+        // stays because the launch walk below reads it; it is simply empty.
         // The LoRA correction's qkv_in: the statement carries only its
         // in-place [q, v]; the INPUT is "the buffer the projections
         // read" (the C++ arm's own words) — the same layer's qkv/q_proj
@@ -552,9 +494,7 @@ impl DispatchPlan {
                 && names_up(weight)
                 && !op.outputs.is_empty()
             {
-                pair_up
-                    .entry(launch.layers.start)
-                    .or_insert_with(|| out_arg(op.outputs[0]));
+                pair_up.entry(launch.layers.start).or_insert_with(|| out_arg(op.outputs[0]));
             }
         }
         let aux_of = |layer: u16| -> Vec<Arg> {
@@ -579,10 +519,7 @@ impl DispatchPlan {
             .iter()
             .zip(&routes)
             .filter_map(|(symbol, route)| {
-                route.refusal().map(|why| Unfireable {
-                    symbol: symbol.clone(),
-                    why,
-                })
+                route.refusal().map(|why| Unfireable { symbol: symbol.clone(), why })
             })
             .collect();
         let specs = lowered
@@ -603,13 +540,10 @@ impl DispatchPlan {
                     | OpKind::AddBias { weight }
                     | OpKind::RmsnormGated { weight }
                     | OpKind::CausalConv1d { weight, .. }
-                    | OpKind::LmHead { weight } => LaunchSpec {
-                        weight: Some(weight.clone()),
-                        ..LaunchSpec::default()
-                    },
-                    OpKind::Matmul {
-                        weight, beta_one, ..
-                    } => LaunchSpec {
+                    | OpKind::LmHead { weight } => {
+                        LaunchSpec { weight: Some(weight.clone()), ..LaunchSpec::default() }
+                    }
+                    OpKind::Matmul { weight, beta_one, .. } => LaunchSpec {
                         weight: Some(weight.clone()),
                         beta_one: *beta_one,
                         ..LaunchSpec::default()
@@ -623,9 +557,7 @@ impl DispatchPlan {
                     // `Arg::Weight`s; the FIRST also rides the spec so
                     // constant-naming arms (`scale.*`) can read the name
                     // the bound pointer lost.
-                    OpKind::Launch {
-                        weights, params, ..
-                    } => LaunchSpec {
+                    OpKind::Launch { weights, params, .. } => LaunchSpec {
                         weight: weights.first().cloned(),
                         weight2: weights.get(1).cloned(),
                         params: params.clone(),
@@ -646,9 +578,7 @@ impl DispatchPlan {
                 // A consumer is a row that READS an aux slot, which is what
                 // `Source::Aux` says. No kernel is named here.
                 if sig_of(launch).is_some_and(|s| {
-                    s.operands
-                        .iter()
-                        .any(|o| matches!(o.source, kernels::Source::Aux(_)))
+                    s.operands.iter().any(|o| matches!(o.source, kernels::Source::Aux(_)))
                 }) {
                     spec.aux = aux_of(launch.layers.start);
                 }
@@ -697,7 +627,7 @@ impl DispatchPlan {
     ///
     /// # What is NOT here, and why the list is honest about it
     ///
-    /// A [`Route::Rows`](kernels_cuda_new::x::Route::Rows) symbol whose
+    /// A [`Route::Rows`](arms::Route::Rows) symbol whose
     /// generated arm does not exist. Whether `emit_rust_dispatch` wrote an
     /// arm is decided by the row's operands all carrying a `Source`, and
     /// re-deriving that rule here would be writing the emitter's decision a
@@ -721,10 +651,7 @@ impl DispatchPlan {
     /// counts what a real deployment actually states.
     #[must_use]
     pub fn sweep_progress(&self) -> (usize, usize) {
-        (
-            self.routes.iter().filter(|r| r.is_row_world()).count(),
-            self.routes.len(),
-        )
+        (self.routes.iter().filter(|r| r.is_row_world()).count(), self.routes.len())
     }
 }
 
@@ -766,9 +693,7 @@ impl DecodePlan {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: Box::into_raw(Box::new(
-                crate::fire::flashinfer_fa2::DecodePlanCache::default(),
-            )),
+            cache: Box::into_raw(Box::new(crate::fire::flashinfer_fa2::DecodePlanCache::default())),
         }
     }
 
@@ -924,9 +849,9 @@ impl PrefillPlan {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: Box::into_raw(Box::new(
-                crate::fire::flashinfer_fa2::PrefillPlanCache::default(),
-            )),
+            cache: Box::into_raw(
+                Box::new(crate::fire::flashinfer_fa2::PrefillPlanCache::default()),
+            ),
         }
     }
 
@@ -1385,10 +1310,7 @@ impl DispatchCtx {
     /// layer, which is all it can know, and whether a family's vector is
     /// short is the driver's to answer.
     pub(crate) fn theta(&self, layer: usize) -> f32 {
-        self.rope_theta_by_layer
-            .get(layer)
-            .copied()
-            .unwrap_or(self.rope_theta)
+        self.rope_theta_by_layer.get(layer).copied().unwrap_or(self.rope_theta)
     }
 
     /// gemma3n's per-layer `gaussian_inverse_cdf(activation_sparsity)` —
@@ -1400,10 +1322,7 @@ impl DispatchCtx {
     /// hand arm REFUSED instead, and refusing is wrong here: a layer
     /// outside the sparse set is the normal case, not a missing fact.
     pub(crate) fn altup_std_mult(&self, layer: usize) -> f32 {
-        self.altup_std_mult_by_layer
-            .get(layer)
-            .copied()
-            .unwrap_or(0.0)
+        self.altup_std_mult_by_layer.get(layer).copied().unwrap_or(0.0)
     }
 }
 
@@ -1811,10 +1730,7 @@ fn fa2_common<'a>(
     }
     let a = attn.ok_or_else(|| DispatchRefusal::NoAttnCtx(kernel.to_string()))?;
     let layer = usize::from(b.layers.start);
-    let kv = *a
-        .layers
-        .get(layer)
-        .ok_or_else(|| DispatchRefusal::NoAttnCtx(kernel.to_string()))?;
+    let kv = *a.layers.get(layer).ok_or_else(|| DispatchRefusal::NoAttnCtx(kernel.to_string()))?;
     let o = if spec.n_out > 0 {
         b.args[spec.n_in].ptr
     } else if a.o_out.is_null() {
@@ -1827,13 +1743,7 @@ fn fa2_common<'a>(
     } else {
         a.o_out
     };
-    Ok(Fa2Common {
-        a,
-        kv,
-        layer: u32::from(b.layers.start),
-        q: b.args[0].ptr.cast_const(),
-        o,
-    })
+    Ok(Fa2Common { a, kv, layer: u32::from(b.layers.start), q: b.args[0].ptr.cast_const(), o })
 }
 
 /// `Source::Or(&Out(1), &Attn("lse_out_d"))` — the decode pair's LSE.
@@ -2248,7 +2158,7 @@ fn mla_absorb(
         i32,
         i32,
         i32,
-    ) -> kernels_cuda_new::x::Fired,
+    ) -> Result<(), kernels_cuda_new::x::Refusal>,
 ) -> Result<(), DispatchRefusal> {
     if spec.n_in < 1 || spec.n_out < 1 || b.args.len() < spec.n_in + spec.n_out + 1 {
         return Err(DispatchRefusal::ArgCount {
@@ -2303,9 +2213,8 @@ fn mla_absorb(
     // or_panic` applies the same rule by panicking -- one of the two should
     // eventually be the other, and neither file owns both.
     match fired {
-        kernels_cuda_new::x::Fired::Launched => Ok(()),
-        kernels_cuda_new::x::Fired::Declined(kernels_cuda_new::x::Refusal::Empty { .. }) => Ok(()),
-        kernels_cuda_new::x::Fired::Declined(why) => Err(DispatchRefusal::ShapeDeclined {
+        Ok(()) | Err(kernels_cuda_new::x::Refusal::Empty { .. }) => Ok(()),
+        Err(why) => Err(DispatchRefusal::ShapeDeclined {
             kernel: kernel.to_string(),
             why: format!("{why:?}"),
         }),
@@ -2391,7 +2300,7 @@ pub fn dispatch<R: Resolver>(
     // the sentence the bind wrote, not a walk down to a hand arm that
     // would fire it with different arithmetic.
     match spec.route {
-        kernels_cuda_new::x::Route::Bound(entry) => {
+        arms::Route::Bound(entry) => {
             // Resolved before the `Cx` exists, because a `Resolver` is `&mut`
             // and `Facts` is not: a bind body that could consult the weight
             // store could also make it answer differently the second time.
@@ -2443,20 +2352,20 @@ pub fn dispatch<R: Resolver>(
                 w_suffixed: &w_suffixed,
             };
             return entry
-                .call(&kernels_cuda_new::x::Cx::new(&fire), ctx.stream)
+                .call(&cx::Cx::new(&fire), ctx.stream)
                 .map_err(|r| DispatchRefusal::NoArm(format!("{}: {r}", bound.kernel)));
         }
         // BOTH ALREADY REFUSED AT LOAD. Reaching one means the lowering was
         // fired without `LoweredFire`'s gate, which is a driver bug and not
         // a model's, so the message names the gate rather than the kernel.
-        kernels_cuda_new::x::Route::Unbound(_, why) => {
+        arms::Route::Unbound(why) => {
             return Err(DispatchRefusal::NoArm(format!(
                 "{}: {why} (load-time refusal; the lowering was fired without \
                  DispatchPlan::unfireable being checked)",
                 bound.kernel
             )));
         }
-        kernels_cuda_new::x::Route::Unknown => {
+        arms::Route::Unknown => {
             return Err(DispatchRefusal::NoArm(format!(
                 "{}: no contract and no row declares it (load-time refusal; \
                  the lowering was fired without DispatchPlan::unfireable \
@@ -2466,7 +2375,7 @@ pub fn dispatch<R: Resolver>(
         }
         // THE DRIVER'S OWN OPS, and the row world. Both fall through to the
         // match below — see the `Route::Driver` note there.
-        kernels_cuda_new::x::Route::Driver | kernels_cuda_new::x::Route::Rows => {}
+        arms::Route::Driver | arms::Route::Rows => {}
     }
 
     // The GDN arms' shared reads: the ctx itself, and the launch's state
@@ -2484,11 +2393,7 @@ pub fn dispatch<R: Resolver>(
     // for the value the GUARD owns (the recurrence three-way's core out).
     // The join's placements window with the args, or a launch reads its
     // input at the window and writes its output at the base.
-    let win = if bound.kernel.ends_with("_devwin") {
-        0
-    } else {
-        bound.rows.start
-    };
+    let win = if bound.kernel.ends_with("_devwin") { 0 } else { bound.rows.start };
 
     // The spec's FOREIGN values (`LaunchSpec::aux`) — nemotron's mamba
     // wiring — resolved exactly like the outs.
@@ -2636,7 +2541,9 @@ pub fn dispatch<R: Resolver>(
         // they must be arena-STABLE: the predicate is folded, so one exec
         // serves a fire that wants scores and one that does not, and an
         // address recorded now has to still be right when it goes true.
-        "attn::dispatch_attention_flashinfer_decode_capture" => fa2_decode_capture(bound, spec, ctx, attn)?,
+        "attn::dispatch_attention_flashinfer_decode_capture" => {
+            fa2_decode_capture(bound, spec, ctx, attn)?
+        }
         // args: [q]; o is guard-owned ([`AttnCtx::o_out`]); the pages are
         // the layer's bf16 MIRRORS — the native alias, the decode lesson.
         "attn::dispatch_attention_flashinfer_prefill_bf16" => fa2_prefill(bound, spec, ctx, attn)?,
@@ -2651,14 +2558,18 @@ pub fn dispatch<R: Resolver>(
         // zero-length, which is what a fire that wants no scores means,
         // and a fire that does want them needs `DecodeScoreCapturePlan`'s
         // layout for both anyway.
-        "attn::dispatch_attention_flashinfer_prefill_capture_bf16" => fa2_prefill_capture(bound, spec, ctx, attn)?,
+        "attn::dispatch_attention_flashinfer_prefill_capture_bf16" => {
+            fa2_prefill_capture(bound, spec, ctx, attn)?
+        }
         // args: [q] with the output guard-owned, or [q, o] as SSA. The
         // custom-mask arm: `HasCustomMask` selects it, and the mask rides
         // the ctx rather than the statement for the same reason the score
         // sink does — the predicate is folded, so one exec serves the fire
         // that stages a mask and the fire that does not, and the address
         // recorded now has to still be right when it goes true.
-        "attn::dispatch_attention_flashinfer_prefill_custom" => fa2_prefill_custom(bound, spec, ctx, attn)?,
+        "attn::dispatch_attention_flashinfer_prefill_custom" => {
+            fa2_prefill_custom(bound, spec, ctx, attn)?
+        }
         // args: [q, o] — the PLANLESS flashinfer prefill (plans
         // internally per fire; reads the host CSR mirrors).
         "attn::attention_flashinfer_prefill" => fa2_prefill_planless(bound, spec, ctx, attn, rows)?,
@@ -2898,7 +2809,7 @@ pub fn dispatch<R: Resolver>(
                     ctx.stream,
                 )
             };
-            if let kernels_cuda_new::x::Fired::Declined(why) = fired {
+            if let Err(why) = fired {
                 return Err(DispatchRefusal::ShapeDeclined {
                     kernel: bound.kernel.to_string(),
                     why: format!("{why:?}"),
@@ -2997,7 +2908,6 @@ pub fn dispatch<R: Resolver>(
 // symbol, which is true and was not sufficient: a body that reaches nothing
 // can still be reachable from nothing.
 
-
 /// A store-backed [`Resolver`]: the per-family MAP, productized. The
 /// loader (or a test) fills it; the executor asks it.
 #[derive(Debug, Default)]
@@ -3090,10 +3000,7 @@ impl<'a> AttnRegions<'a> {
     /// A peeled fire: the prefix uses the fire's state, the tail its own.
     #[must_use]
     pub const fn split(fire: &'a AttnCtx, tail: &'a AttnCtx) -> Self {
-        Self {
-            fire: Some(fire),
-            tail: Some(tail),
-        }
+        Self { fire: Some(fire), tail: Some(tail) }
     }
 
     /// The state a rectangle executes against.
@@ -3102,11 +3009,7 @@ impl<'a> AttnRegions<'a> {
     /// a tail: a peel's prefix starts at row zero and its tail does not.
     #[must_use]
     pub fn of(&self, rows: &std::ops::Range<u32>) -> Option<&'a AttnCtx> {
-        if rows.start == 0 {
-            self.fire
-        } else {
-            self.tail.or(self.fire)
-        }
+        if rows.start == 0 { self.fire } else { self.tail.or(self.fire) }
     }
 }
 
@@ -3134,20 +3037,9 @@ pub fn run<R: Resolver>(
             kernel: kernel(),
             why: RunRefusalKind::Bind(e),
         })?;
-        dispatch(
-            &bound,
-            dplan.spec(i),
-            frame,
-            resolver,
-            ctx,
-            attn.of(&launch.rows),
-            gdn,
-        )
-        .map_err(|e| RunRefusal {
-            launch: i,
-            kernel: kernel(),
-            why: RunRefusalKind::Dispatch(e),
-        })?;
+        dispatch(&bound, dplan.spec(i), frame, resolver, ctx, attn.of(&launch.rows), gdn).map_err(
+            |e| RunRefusal { launch: i, kernel: kernel(), why: RunRefusalKind::Dispatch(e) },
+        )?;
     }
     Ok(lowered.launches.len())
 }
@@ -3255,9 +3147,7 @@ pub fn run_captured<R: Resolver>(
         while stack.len() > close_to {
             builder.end_body().map_err(|e| cuda(i, &kernel, e))?;
             let f = stack.pop().expect("stack is non-empty");
-            builder
-                .close_cond(&f.cond)
-                .map_err(|e| cuda(i, &kernel, e))?;
+            builder.close_cond(&f.cond).map_err(|e| cuda(i, &kernel, e))?;
         }
 
         if let Some(s) = switch_at {
@@ -3274,9 +3164,7 @@ pub fn run_captured<R: Resolver>(
             // Always with_else: the sibling arm may arrive later, and a
             // conditional opened without an else body has nowhere to put
             // it.
-            let cond = builder
-                .open_cond(region.slot, true)
-                .map_err(|e| cuda(i, &kernel, e))?;
+            let cond = builder.open_cond(region.slot, true).map_err(|e| cuda(i, &kernel, e))?;
             let body = arm_body(&cond, &lowered.conds, node);
             builder.begin_body(body).map_err(|e| cuda(i, &kernel, e))?;
             stack.push(OpenCond { cond, node });
@@ -3289,20 +3177,12 @@ pub fn run_captured<R: Resolver>(
             kernel: kernel.clone(),
             why: RunRefusalKind::Bind(e),
         })?;
-        dispatch(
-            &bound,
-            dplan.spec(i),
-            frame,
-            resolver,
-            &ctx,
-            attn.of(&launch.rows),
-            gdn,
-        )
-        .map_err(|e| RunRefusal {
-            launch: i,
-            kernel: kernel.clone(),
-            why: RunRefusalKind::Dispatch(e),
-        })?;
+        dispatch(&bound, dplan.spec(i), frame, resolver, &ctx, attn.of(&launch.rows), gdn)
+            .map_err(|e| RunRefusal {
+                launch: i,
+                kernel: kernel.clone(),
+                why: RunRefusalKind::Dispatch(e),
+            })?;
         // RETAIN THE NODE this launch became.
         //
         // `.wiki/driver/graph.md` §6.2: "what is missing is bookkeeping,
@@ -3325,9 +3205,7 @@ pub fn run_captured<R: Resolver>(
     let last = lowered.launches.len().saturating_sub(1);
     while let Some(f) = stack.pop() {
         builder.end_body().map_err(|e| cuda(last, "<unwind>", e))?;
-        builder
-            .close_cond(&f.cond)
-            .map_err(|e| cuda(last, "<unwind>", e))?;
+        builder.close_cond(&f.cond).map_err(|e| cuda(last, "<unwind>", e))?;
     }
 
     Ok(lowered.launches.len())
@@ -3341,11 +3219,7 @@ fn arm_body(
     node: u32,
 ) -> cudarc::runtime::sys::cudaGraph_t {
     let on_true = conds.get(node as usize).is_none_or(|r| r.on_true);
-    if on_true {
-        cond.if_body()
-    } else {
-        cond.else_body().unwrap_or_else(|| cond.if_body())
-    }
+    if on_true { cond.if_body() } else { cond.else_body().unwrap_or_else(|| cond.if_body()) }
 }
 
 /// Resolve one [`Arg`] — the three rules, shared by [`bind`] and by the
@@ -3383,20 +3257,12 @@ pub fn resolve_arg_windowed<R: Resolver>(
             let skip = row as usize * *width as usize * *bytes as usize;
             let at = *at + skip;
             if at >= frame.arena_bytes {
-                return Err(BindRefusal::ArenaOutOfBounds {
-                    at,
-                    arena_bytes: frame.arena_bytes,
-                });
+                return Err(BindRefusal::ArenaOutOfBounds { at, arena_bytes: frame.arena_bytes });
             }
-            BoundArg {
-                ptr: unsafe { frame.arena.cast::<u8>().add(at) }.cast(),
-                width: *width,
-            }
+            BoundArg { ptr: unsafe { frame.arena.cast::<u8>().add(at) }.cast(), width: *width }
         }
-        Arg::Named { value, width } => BoundArg {
-            ptr: resolver
-                .named(*value)
-                .ok_or(BindRefusal::UnknownNamed(*value))?,
+        Arg::Named { value, width, bytes: _ } => BoundArg {
+            ptr: resolver.named(*value).ok_or(BindRefusal::UnknownNamed(*value))?,
             width: *width,
         },
         Arg::Weight(name) => {
@@ -3405,10 +3271,7 @@ pub fn resolve_arg_windowed<R: Resolver>(
             // reaches the arm through `DispatchCtx::scales`; the operand
             // slot binds a dangling sentinel so the launch's arity holds.
             if name.starts_with("scale.") {
-                BoundArg {
-                    ptr: std::ptr::NonNull::<c_void>::dangling().as_ptr(),
-                    width: 0,
-                }
+                BoundArg { ptr: std::ptr::NonNull::<c_void>::dangling().as_ptr(), width: 0 }
             } else {
                 BoundArg {
                     ptr: resolver
@@ -3454,19 +3317,10 @@ pub fn bind<'a, R: Resolver>(
     // BASE pointers — the grid spans every lane and out-of-window rows
     // early-out on a device word — which is what makes them replayable
     // across splits, so windowing them would offset twice.
-    let row = if kernel.ends_with("_devwin") {
-        0
-    } else {
-        launch.rows.start
-    };
+    let row = if kernel.ends_with("_devwin") { 0 } else { launch.rows.start };
     let mut args = Vec::with_capacity(launch.args.len());
     for arg in &lowered.args[launch.args.start as usize..launch.args.end as usize] {
         args.push(resolve_arg_windowed(arg, frame, resolver, row)?);
     }
-    Ok(BoundLaunch {
-        kernel,
-        rows: launch.rows.clone(),
-        layers: launch.layers.clone(),
-        args,
-    })
+    Ok(BoundLaunch { kernel, rows: launch.rows.clone(), layers: launch.layers.clone(), args })
 }

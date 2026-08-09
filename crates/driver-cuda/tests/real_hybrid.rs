@@ -73,15 +73,12 @@ impl Checkpoint {
         let home = std::env::var_os("HOME")?;
         let snaps =
             PathBuf::from(home).join(format!(".cache/huggingface/hub/{cache_dir}/snapshots"));
-        let snap = std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(Result::ok)
-            .find_map(|e| {
-                let d = e.path();
-                (d.join("model.safetensors").is_file()
-                    || d.join("model.safetensors.index.json").is_file())
-                .then_some(d)
-            })?;
+        let snap = std::fs::read_dir(&snaps).ok()?.filter_map(Result::ok).find_map(|e| {
+            let d = e.path();
+            (d.join("model.safetensors").is_file()
+                || d.join("model.safetensors.index.json").is_file())
+            .then_some(d)
+        })?;
         let files: Vec<PathBuf> = if snap.join("model.safetensors").is_file() {
             vec![snap.join("model.safetensors")]
         } else {
@@ -130,10 +127,7 @@ impl Checkpoint {
     }
 
     fn bytes(&self, name: &str) -> &[u8] {
-        let (f, b, e) = *self
-            .index
-            .get(name)
-            .unwrap_or_else(|| panic!("checkpoint lacks {name}"));
+        let (f, b, e) = *self.index.get(name).unwrap_or_else(|| panic!("checkpoint lacks {name}"));
         &self.raws[f][b..e]
     }
 }
@@ -142,14 +136,8 @@ impl Checkpoint {
 /// — the qwen3_5 binder, `bind_qwen3_5_weight`'s vocabulary as data.
 fn bind(ckpt: &Checkpoint, sink: &mut dyn FnMut(String, Vec<u8>)) {
     let p = "model.language_model";
-    sink(
-        "embed".into(),
-        ckpt.bytes(&format!("{p}.embed_tokens.weight")).to_vec(),
-    );
-    sink(
-        "final_norm".into(),
-        ckpt.bytes(&format!("{p}.norm.weight")).to_vec(),
-    );
+    sink("embed".into(), ckpt.bytes(&format!("{p}.embed_tokens.weight")).to_vec());
+    sink("final_norm".into(), ckpt.bytes(&format!("{p}.norm.weight")).to_vec());
     for n in 0..24u32 {
         let lp = format!("{p}.layers.{n}");
         let mut w =
@@ -260,29 +248,12 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let plan = qwen3_5_hybrid_cuda(&hybrid, &cuda, FireClass::Prefill);
     // A prefill: one request, TOKENS rows -- every row multi-token, which
     // is what `GuardPred::WindowOne` reads (graph.md §4.1).
-    let rows: Vec<Row> = vec![
-        Row {
-            samples: true,
-            multi_token: true,
-            ..Row::default()
-        };
-        TOKENS
-    ];
-    let l = lower(
-        &plan,
-        &rows,
-        Fire {
-            captures_across_splits: false,
-        },
-    )
-    .expect("lowers");
+    let rows: Vec<Row> = vec![Row { samples: true, multi_token: true, ..Row::default() }; TOKENS];
+    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame {
-        arena: arena.as_ptr(),
-        arena_bytes: l.arena_bytes,
-    };
+    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
 
     let up = |data: &[u8]| {
         let mut b = alloc.alloc(data.len()).expect("upload");
@@ -299,13 +270,13 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     // ── The seam-value pool. ──
     let mut named_widths: BTreeMap<ValueId, u32> = BTreeMap::new();
     for a in &l.args {
-        if let Arg::Named { value, width } = a {
+        if let Arg::Named { value, width, .. } = a {
             named_widths.insert(*value, *width);
         }
     }
     for i in 0..l.launches.len() {
         for a in &dplan.spec(i).outs {
-            if let Arg::Named { value, width } = a {
+            if let Arg::Named { value, width, .. } = a {
                 named_widths.insert(*value, *width);
             }
         }
@@ -337,9 +308,8 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         .iter()
         .enumerate()
         .map(|(i, kv)| {
-            let (k, v) = kv
-                .as_ref()
-                .map_or((core::ptr::null_mut(), core::ptr::null_mut()), |(k, v)| {
+            let (k, v) =
+                kv.as_ref().map_or((core::ptr::null_mut(), core::ptr::null_mut()), |(k, v)| {
                     (k.as_ptr(), v.as_ptr())
                 });
             KvCacheLayerView {
@@ -420,10 +390,7 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let csr_lens = up(&u32s(&last_lens_h));
     let qo_indptr = up(&u32s(&qo_indptr_h));
     let row_valid = up(&[1u8; TOKENS]);
-    let ids = up(&prompt
-        .iter()
-        .flat_map(|t| t.to_le_bytes())
-        .collect::<Vec<u8>>());
+    let ids = up(&prompt.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
     let positions = up(&(0i32..7).flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
     let lse = alloc.alloc(TOKENS * Q_HEADS as usize * 4).expect("lse");
 
@@ -539,8 +506,8 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-            moe_ptrs: std::cell::Cell::new(None),
-};
+        moe_ptrs: std::cell::Cell::new(None),
+    };
 
     let mut logits_value: Option<ValueId> = None;
     for i in 0..l.launches.len() {
@@ -551,20 +518,10 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         }
     }
 
-    let mut resolver = Live {
-        weights: &weights,
-        named: &named_bufs,
-    };
-    let ran = run(
-        &l,
-        &dplan,
-        frame,
-        &mut resolver,
-        &ctx,
-        AttnRegions::whole(Some(&attn)),
-        Some(&gdn),
-    )
-    .unwrap_or_else(|e| panic!("the hybrid A/B walk refused: {e:?}"));
+    let mut resolver = Live { weights: &weights, named: &named_bufs };
+    let ran =
+        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
+            .unwrap_or_else(|e| panic!("the hybrid A/B walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len());
     stream.as_ref().synchronize().expect("the fire retires");
 
@@ -592,10 +549,7 @@ fn the_hybrid_matches_transformers_on_real_weights() {
             f32::from_bits(u32::from(bits) << 16)
         };
         let head: Vec<f32> = (0..8).map(|c| h(TOKENS - 1, c)).collect();
-        let norm: f32 = (0..1024)
-            .map(|c| h(TOKENS - 1, c).powi(2))
-            .sum::<f32>()
-            .sqrt();
+        let norm: f32 = (0..1024).map(|c| h(TOKENS - 1, c).powi(2)).sum::<f32>().sqrt();
         eprintln!("ours residual last row head: {head:?} norm={norm:.4}");
     }
 
@@ -603,9 +557,7 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let lv = logits_value.expect("the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits
-        .copy_to_host(&mut back, stream.as_ref())
-        .expect("d2h logits");
+    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let last = TOKENS - 1;
     let logit = |t: usize| {
@@ -649,17 +601,11 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     );
     let our_top8: Vec<usize> = all[..8].iter().map(|(t, _)| *t).collect();
     for t in &ids5 {
-        assert!(
-            our_top8.contains(t),
-            "HF top-5 token {t} missing from our top-8 {our_top8:?}"
-        );
+        assert!(our_top8.contains(t), "HF top-5 token {t} missing from our top-8 {our_top8:?}");
     }
     for (t, hf) in ids5.iter().zip(&vals5) {
         let ours = logit(*t);
-        assert!(
-            (ours - hf).abs() < 1.25,
-            "top-5 token {t}: ours {ours} vs HF {hf}"
-        );
+        assert!((ours - hf).abs() < 1.25, "top-5 token {t}: ours {ours} vs HF {hf}");
     }
     let probes: Vec<usize> = reference["probe_ids"]
         .as_array()
@@ -681,10 +627,7 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         .collect();
     for (t, hf) in probes.iter().zip(&probe_vals) {
         let ours = logit(*t);
-        assert!(
-            (ours - hf).abs() < 0.6,
-            "probe token {t}: ours {ours} vs HF {hf}"
-        );
+        assert!((ours - hf).abs() < 0.6, "probe token {t}: ours {ours} vs HF {hf}");
     }
 
     ws.release(&mut sops);

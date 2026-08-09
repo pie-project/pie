@@ -639,6 +639,7 @@ mod tests {
         sink: None,
         in_place: &[],
         depth_prefix_plan: false,
+        args: &[],
         operands: &[],
         axes: &[],
         grid_param: None,

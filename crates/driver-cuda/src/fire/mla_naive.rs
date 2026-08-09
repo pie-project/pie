@@ -168,7 +168,8 @@
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::runtime::{ArgValue, Launch};
+use kernels_cuda_new::ArgValue;
+use kernels_cuda_new::jit::Launch;
 
 /// `attn::mla_naive_paged` — the scalar arm's device row.
 const NAIVE_DEVICE: &str = "attn::mla_naive_paged";
@@ -386,8 +387,7 @@ pub const fn mma_supported(kv_lora_rank: i32, qk_rope_head_dim: i32, num_heads: 
 pub fn head_group(num_heads: i32, total_tokens: i32) -> i32 {
     let mut g = NAIVE_WARPS;
     while g > 1
-        && (num_heads % g != 0
-            || i64::from(total_tokens) * i64::from(num_heads / g) < WAVE_TARGET)
+        && (num_heads % g != 0 || i64::from(total_tokens) * i64::from(num_heads / g) < WAVE_TARGET)
     {
         g >>= 1;
     }
@@ -519,13 +519,10 @@ pub fn plan(shape: NaiveShape, have_indptr: bool) -> NaivePlan {
         let launch = Launch {
             // `:725` — `dim3 grid(num_heads / kBM, total_tokens);`. Head
             // blocks on x, tokens on y: the transpose of the scalar arm.
-            grid: [
-                (shape.num_heads / MMA_BM).max(0) as u32,
-                shape.total_tokens.max(0) as u32,
-                1,
-            ],
+            grid: [(shape.num_heads / MMA_BM).max(0) as u32, shape.total_tokens.max(0) as u32, 1],
             block: [MMA_THREADS, 1, 1],
             smem: MMA_SMEM_BYTES,
+            cooperative: false,
         };
         return NaivePlan::Mma { launch };
     }
@@ -547,13 +544,10 @@ pub fn plan(shape: NaiveShape, have_indptr: bool) -> NaivePlan {
     #[allow(clippy::cast_sign_loss)]
     let launch = Launch {
         // `:265` — `dim3 grid(total_tokens, num_heads / G);`.
-        grid: [
-            shape.total_tokens.max(0) as u32,
-            (shape.num_heads / g.max(1)).max(1) as u32,
-            1,
-        ],
+        grid: [shape.total_tokens.max(0) as u32, (shape.num_heads / g.max(1)).max(1) as u32, 1],
         block: [NAIVE_BLOCK, 1, 1],
         smem: naive_smem_bytes(ckv),
+        cooperative: false,
     };
     NaivePlan::Scalar { launch, head_group: g }
 }
@@ -572,11 +566,7 @@ pub fn plan(shape: NaiveShape, have_indptr: bool) -> NaivePlan {
 ///
 /// Every pointer in `ptrs` is a device address the caller keeps live across the
 /// launch, and `stream` is the caller's stream.
-pub unsafe fn launch(
-    ptrs: NaivePtrs,
-    shape: NaiveShape,
-    stream: *mut c_void,
-) -> MlaNaive {
+pub unsafe fn launch(ptrs: NaivePtrs, shape: NaiveShape, stream: *mut c_void) -> MlaNaive {
     let have_indptr = !ptrs.qo_indptr.is_null()
         && !ptrs.kv_page_indptr.is_null()
         && !ptrs.kv_last_page_lens.is_null();
@@ -606,7 +596,13 @@ pub unsafe fn launch(
                 ArgValue::F32(shape.sm_scale),
                 ArgValue::Bool(shape.causal),
             ];
-            super::hand::fire(MMA_DEVICE, launch, &values, stream);
+            super::hand::fire(
+                &kernels_cuda_new::x::attn::mla_naive::ROOT,
+                kernels_cuda_new::x::attn::mla_naive::inst::MMA_PAGED,
+                launch,
+                &values,
+                stream,
+            );
             MlaNaive::LaunchedMma
         }
         NaivePlan::Scalar { launch, head_group } => {
@@ -635,7 +631,13 @@ pub unsafe fn launch(
                 ArgValue::Bool(shape.causal),
                 ArgValue::I32(head_group),
             ];
-            super::hand::fire(NAIVE_DEVICE, launch, &values, stream);
+            super::hand::fire(
+                &kernels_cuda_new::x::attn::mla_naive::ROOT,
+                kernels_cuda_new::x::attn::mla_naive::inst::NAIVE_PAGED,
+                launch,
+                &values,
+                stream,
+            );
             MlaNaive::LaunchedScalar
         }
     }

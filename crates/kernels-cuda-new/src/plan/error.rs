@@ -98,10 +98,9 @@ impl fmt::Display for Error {
             Self::TooManyWorks { total, max } => {
                 write!(f, "the schedule produced {total} work items, above the cap of {max}")
             }
-            Self::MergeCtasExceedSm { counter, num_sm } => write!(
-                f,
-                "the schedule wants {counter} merge CTAs on a device with {num_sm} SMs"
-            ),
+            Self::MergeCtasExceedSm { counter, num_sm } => {
+                write!(f, "the schedule wants {counter} merge CTAs on a device with {num_sm} SMs")
+            }
         }
     }
 }

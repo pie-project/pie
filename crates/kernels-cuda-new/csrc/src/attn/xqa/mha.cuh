@@ -19,9 +19,9 @@
 // PIE: because `kernels-cuda-new` holds no translation units: a `.cu` is an
 // PIE: ahead-of-time TU for nvcc, a `.cuh` is device text carried into
 // PIE: NVRTC, and this crate is 120 of the second and none of the first.
-// PIE: The bytes are upstream's; only the name, one guard and two include
-// PIE: spellings differ. When diffing against FlashInfer, diff this
-// PIE: against `csrc/xqa/mha.cu` and expect the rest to agree.
+// PIE: The bytes are upstream's but for the name, one guard, two include
+// PIE: spellings, and `AccType{}` at :1455 -- unmarked, because a marker
+// PIE: there would shift every line below it; MODIFICATIONS numbers it.
 // PIE:
 // PIE: The rename is free because nothing has to be impersonated. NVRTC
 // PIE: resolves an include by matching the literal directive string against
@@ -1452,7 +1452,7 @@ __device__ inline void smemFp16ArraySum(uint32_t idxWarp, Array2D<LdGrain, rows,
 #pragma unroll
   for (uint32_t i = 0; i < nbGrainsPerThrd; i++) {
     Vec<AccType, LdGrain::size> result;
-    result.fill(AccType{0, 0});
+    result.fill(AccType{});
     uint32_t const idx = nbThrds * i + tid;
 #pragma unroll
     for (uint32_t j = 0; j < nbTiles; j++) {

@@ -221,6 +221,7 @@ const EMPTY: KernelSig = KernelSig {
     // consolidated it onto `kernels_cuda_new::x::Contract`, so the reason
     // outlived the field.
 
+    args: &[],
     operands: &[],
     axes: &[],
     grid_param: None,
@@ -241,6 +242,7 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         sink: k.sink,
         in_place: k.in_place,
         depth_prefix_plan: k.depth_prefix_plan,
+        args: k.args,
         operands: k.operands,
         axes: k.axes,
         grid_param: k.grid_param,

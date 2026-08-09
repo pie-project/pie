@@ -1,4 +1,4 @@
-//! The driver's answer to [`kernels_cuda_new::x::Facts`].
+//! The driver's answer to every fact a bind arm can ask for.
 //!
 //! # What this is
 //!
@@ -46,7 +46,9 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use kernels_cuda_new::x::{Facts, KvDType, KvLayer, KvScheme, Plan, Rows, Slab, Yarn};
+use kernels_cuda_new::x::{
+    AttnWorkspace, Gdn, KvDType, KvLayer, KvScheme, MlaLayer, MlaPlan, Plan, Rows, Slab, Yarn,
+};
 
 use super::{AttnCtx, BoundLaunch, DispatchCtx, GdnCtx, LaunchSpec};
 
@@ -92,12 +94,12 @@ pub struct Fire<'a> {
 
 impl Fire<'_> {
     /// This launch's layer, as an index.
-    fn layer_index(&self) -> usize {
+    pub fn layer_index(&self) -> usize {
         usize::from(self.bound.layers.start)
     }
 
     /// The `i`th arg of the run, by absolute index.
-    fn arg(&self, i: usize) -> Option<*mut c_void> {
+    pub fn arg(&self, i: usize) -> Option<*mut c_void> {
         self.bound.args.get(i).map(|a| a.ptr)
     }
 
@@ -108,28 +110,81 @@ impl Fire<'_> {
     /// tensor's") and also what a launch that states a three-dimensional
     /// value carries. Both are "nothing stated a row width here", which is
     /// the sentence `Option` spells and the sentence a `0` did not.
-    fn width(&self, i: usize) -> Option<i32> {
+    pub fn width(&self, i: usize) -> Option<i32> {
         let w = self.bound.args.get(i)?.width;
         i32::try_from(w).ok().filter(|w| *w > 0)
     }
+
+    // ── The seven a fire cannot answer ────────────────────────────────────
+    //
+    // These were DEFAULTS on the `Facts` trait, answering `None` unless a
+    // driver overrode them, and this driver never did. An arm that asked for
+    // one refused every time and nothing in the tree said so. They are
+    // written here now, at the only place that could answer, so that
+    // supplying one is an edit to this file rather than the removal of a
+    // silent default.
+
+    /// The `i`th AUXILIARY buffer this statement publishes or reads.
+    ///
+    /// The aux vector is sized from the arm registry's `publishes_aux`, which
+    /// no longer exists; nothing carries the addresses to a fire.
+    pub const fn aux(&self, _i: usize) -> Option<*mut c_void> {
+        None
+    }
+
+    /// This fire's linear-attention shape and state addressing.
+    ///
+    /// `GdnCtx` is on `self.gdn` and is a different shape; the conversion was
+    /// never written.
+    pub const fn gdn(&self) -> Option<Gdn> {
+        None
+    }
+
+    /// This layer's latent cache — `kv_layer`'s MLA sibling.
+    pub const fn mla_layer(&self) -> Option<MlaLayer> {
+        None
+    }
+
+    /// The plan `Prepare::MlaPlan` built for this fire.
+    pub const fn mla_plan(&self) -> Option<MlaPlan> {
+        None
+    }
+
+    /// The `i`th RESULT placement.
+    pub const fn result(&self, _i: usize) -> Option<*mut c_void> {
+        None
+    }
+
+    /// The statement's bias weight, when it carries one.
+    pub const fn weight_bias(&self) -> Option<*mut c_void> {
+        None
+    }
+
+    /// The WNA16 weight's group size, in elements along K.
+    ///
+    /// The driver holds it on `WeightView::group_size` and nothing hands it
+    /// to a fire, so both WNA16 decode arms refuse.
+    pub const fn wna16_group_size(&self) -> Option<i32> {
+        None
+    }
 }
 
-impl Facts for Fire<'_> {
-    fn arg_in(&self, i: usize) -> Option<*mut c_void> {
+impl Fire<'_> {
+    pub(super) fn arg_in(&self, i: usize) -> Option<*mut c_void> {
         if i >= self.spec.n_in {
             return None;
         }
         self.arg(i)
     }
 
-    fn arg_out(&self, i: usize) -> Option<*mut c_void> {
+    pub(super) fn arg_out(&self, i: usize) -> Option<*mut c_void> {
         if i >= self.spec.n_out {
             return None;
         }
         self.arg(self.spec.n_in + i)
     }
 
-    fn weight(&self, i: usize) -> Option<*mut c_void> {
+    pub(super) fn weight(&self, i: usize) -> Option<*mut c_void> {
         self.arg(self.spec.n_in + self.spec.n_out + i)
     }
 
@@ -143,7 +198,7 @@ impl Facts for Fire<'_> {
     ///
     /// Always `Some`: the field is a `bool` with a deployment default, not an
     /// optional fact, so a refusal here would be inventing an absence.
-    fn moe_norm_topk(&self) -> Option<bool> {
+    pub fn moe_norm_topk(&self) -> Option<bool> {
         Some(self.ctx.moe_norm_topk)
     }
 
@@ -151,7 +206,7 @@ impl Facts for Fire<'_> {
     ///
     /// [`Facts::moe_norm_topk`]'s pair, carried the same way and `Some` for
     /// the same reason.
-    fn moe_routed_scaling(&self) -> Option<f32> {
+    pub fn moe_routed_scaling(&self) -> Option<f32> {
         Some(self.ctx.moe_routed_scaling)
     }
 
@@ -167,7 +222,7 @@ impl Facts for Fire<'_> {
     /// `Refusal::Absent` and an out-of-range index IS an absent operand. A
     /// method that answered `self.rows` for `i = 99` would report a row count
     /// for a buffer the fire does not have.
-    fn in_rows(&self, i: usize) -> Option<i32> {
+    pub fn in_rows(&self, i: usize) -> Option<i32> {
         (i < self.spec.n_in).then_some(self.rows)
     }
 
@@ -177,7 +232,7 @@ impl Facts for Fire<'_> {
     /// is a second field and this query does not choose between them — the
     /// two families that asked both name the decode one, and a query that
     /// picked by guessing which phase a fire is in would be inventing a fact.
-    fn attn_workspace(&self) -> Option<AttnWorkspace> {
+    pub fn attn_workspace(&self) -> Option<AttnWorkspace> {
         let w = self.attn?.workspace;
         Some(AttnWorkspace {
             float_buffer: w.float_buffer,
@@ -188,7 +243,7 @@ impl Facts for Fire<'_> {
     }
 
     /// The softmax scale this fire was planned with.
-    fn sm_scale(&self) -> Option<f32> {
+    pub fn sm_scale(&self) -> Option<f32> {
         Some(self.attn?.sm_scale)
     }
 
@@ -198,12 +253,12 @@ impl Facts for Fire<'_> {
     /// from [`Facts::mla_layer`]: `AttnCtx` has carried them since before
     /// fn-world existed, and the queries were the missing half rather than
     /// the fill.
-    fn first_token(&self) -> Option<i32> {
+    pub fn first_token(&self) -> Option<i32> {
         Some(self.attn?.first_token)
     }
 
     /// The pages this fire's CSR names, which the dequant staging walks.
-    fn num_pages_in_batch(&self) -> Option<i32> {
+    pub fn num_pages_in_batch(&self) -> Option<i32> {
         Some(self.attn?.num_pages_in_batch)
     }
 
@@ -211,14 +266,14 @@ impl Facts for Fire<'_> {
     ///
     /// Null is absence rather than a value: a fire that appends no KV carries
     /// a null here, and a body that took the pointer anyway would index it.
-    fn w_page_d(&self) -> Option<*const u32> {
+    pub fn w_page_d(&self) -> Option<*const u32> {
         let p = self.attn?.w_page_d;
         (!p.is_null()).then_some(p)
     }
 
     /// Per-row offset-in-page for the append. [`Facts::w_page_d`]'s pair, and
     /// null-checked for the same reason.
-    fn w_off_d(&self) -> Option<*const u32> {
+    pub fn w_off_d(&self) -> Option<*const u32> {
         let p = self.attn?.w_off_d;
         (!p.is_null()).then_some(p)
     }
@@ -258,7 +313,7 @@ impl Facts for Fire<'_> {
     /// or checked, and the device text says which. Applied to `lse_out` an
     /// hour before this landed, the same rule correctly refused an `Option`
     /// — because there the producer agreed with the row.
-    fn q_out(&self) -> Option<*mut c_void> {
+    pub fn q_out(&self) -> Option<*mut c_void> {
         let p = self.attn?.q_out;
         (!p.is_null()).then_some(p)
     }
@@ -270,7 +325,7 @@ impl Facts for Fire<'_> {
     /// its three inputs**, because the driver already makes this decision
     /// once per launch and two callers deriving it differently is the class
     /// this port keeps finding.
-    fn window_left(&self) -> Option<i32> {
+    pub fn window_left(&self) -> Option<i32> {
         Some(super::window_of(
             self.spec,
             self.attn?,
@@ -279,7 +334,7 @@ impl Facts for Fire<'_> {
     }
 
     /// The attention logit soft cap.
-    fn logits_soft_cap(&self) -> Option<f32> {
+    pub fn logits_soft_cap(&self) -> Option<f32> {
         Some(self.attn?.logits_soft_cap)
     }
 
@@ -289,7 +344,7 @@ impl Facts for Fire<'_> {
     /// grammar is `Source::AttnNonZero` and admits a null; this one is plain
     /// `Source::Attn` and asserts presence. Returning `None` here would
     /// invent a state the row denies.
-    fn lse_out(&self) -> Option<*mut f32> {
+    pub fn lse_out(&self) -> Option<*mut f32> {
         Some(self.attn?.lse_out_d)
     }
 
@@ -297,12 +352,12 @@ impl Facts for Fire<'_> {
     ///
     /// `DispatchCtx` has carried it since `bind/mod.rs:1193`. Always `Some`:
     /// a config value with a deployment default is not an optional fact.
-    fn glu_limit(&self) -> Option<f32> {
+    pub fn glu_limit(&self) -> Option<f32> {
         Some(self.ctx.glu_limit)
     }
 
     /// The clamped GLU's alpha, carried the same way.
-    fn glu_alpha(&self) -> Option<f32> {
+    pub fn glu_alpha(&self) -> Option<f32> {
         Some(self.ctx.glu_alpha)
     }
 
@@ -315,7 +370,7 @@ impl Facts for Fire<'_> {
     /// **Absence is not an error here** — see [`Cx::weight_suffixed`]. Two of
     /// `quant`'s three suffixes are nullable and one is not, in the same bind
     /// body, so the caller names the refusal.
-    fn weight_suffixed(&self, suffix: &str) -> Option<*mut c_void> {
+    pub fn weight_suffixed(&self, suffix: &str) -> Option<*mut c_void> {
         self.w_suffixed
             .iter()
             .find(|(s, _)| *s == suffix)
@@ -331,7 +386,7 @@ impl Facts for Fire<'_> {
     /// binding site: a statement that names no weight and a store that
     /// lacks the name are different situations with the same answer at this
     /// seam, and telling them apart is the caller's job, not a bind's.
-    fn weight_named(&self, i: usize) -> Option<*mut c_void> {
+    pub fn weight_named(&self, i: usize) -> Option<*mut c_void> {
         let p = match i {
             0 => self.w_named,
             1 => self.w_named2,
@@ -340,14 +395,14 @@ impl Facts for Fire<'_> {
         NonNull::new(p.cast_mut()).map(NonNull::as_ptr)
     }
 
-    fn in_width(&self, i: usize) -> Option<i32> {
+    pub(super) fn in_width(&self, i: usize) -> Option<i32> {
         if i >= self.spec.n_in {
             return None;
         }
         self.width(i)
     }
 
-    fn out_width(&self, i: usize) -> Option<i32> {
+    pub(super) fn out_width(&self, i: usize) -> Option<i32> {
         if i >= self.spec.n_out {
             return None;
         }
@@ -360,7 +415,7 @@ impl Facts for Fire<'_> {
     /// which a `_devwin` launch spans regardless of how many rows its own
     /// region serves. The row world could not state it as a `Source` and
     /// said so; here it is one field of one struct.
-    fn rows(&self) -> Rows {
+    pub fn rows(&self) -> Rows {
         Rows {
             start: i32::try_from(self.bound.rows.start).unwrap_or(0),
             count: self.rows,
@@ -368,18 +423,17 @@ impl Facts for Fire<'_> {
         }
     }
 
-    fn layer(&self) -> usize {
+    pub(super) fn layer(&self) -> usize {
         self.layer_index()
     }
 
     /// `OpKind::Launch::params` — the wire scalars the statement carries.
-    fn param(&self, i: usize) -> Option<u32> {
+    pub fn param(&self, i: usize) -> Option<u32> {
         self.spec.params.get(i).copied()
     }
 
-    fn positions(&self) -> Option<*const i32> {
-        NonNull::new(self.ctx.positions)
-            .map(|p| p.as_ptr().cast_const().cast::<i32>())
+    pub(super) fn positions(&self) -> Option<*const i32> {
+        NonNull::new(self.ctx.positions).map(|p| p.as_ptr().cast_const().cast::<i32>())
     }
 
     /// The fire's token ids.
@@ -394,7 +448,7 @@ impl Facts for Fire<'_> {
     /// than pointing it at an empty allocation.
     ///
     /// [`positions`]: Facts::positions
-    fn token_ids(&self) -> Option<*const i32> {
+    pub fn token_ids(&self) -> Option<*const i32> {
         NonNull::new(self.ctx.token_ids).map(|p| p.as_ptr().cast_const().cast::<i32>())
     }
 
@@ -405,7 +459,7 @@ impl Facts for Fire<'_> {
     /// that bounds-checked against zero would refuse every token.
     ///
     /// [`head_dim`]: Facts::head_dim
-    fn vocab(&self) -> Option<i32> {
+    pub fn vocab(&self) -> Option<i32> {
         (self.ctx.vocab > 0).then_some(self.ctx.vocab)
     }
 
@@ -415,7 +469,7 @@ impl Facts for Fire<'_> {
     /// Already `*const i32` on [`DispatchCtx`], so this is a null test and
     /// nothing else. The row grammar's `Source::SamplingIndices` — a source
     /// spelling with exactly one consumer — is what retires with the row.
-    fn sampling_indices(&self) -> Option<*const i32> {
+    pub fn sampling_indices(&self) -> Option<*const i32> {
         NonNull::new(self.ctx.sampling_indices.cast_mut()).map(|p| p.as_ptr().cast_const())
     }
 
@@ -425,7 +479,7 @@ impl Facts for Fire<'_> {
     /// was `Div(Width(In(0)), CtxNonZero("ple_dim"))`, and `CtxNonZero`
     /// exists because dividing by this field when it is zero faults.
     /// `Option` is that statement in the type system.
-    fn ple_dim(&self) -> Option<i32> {
+    pub fn ple_dim(&self) -> Option<i32> {
         (self.ctx.ple_dim > 0).then_some(self.ctx.ple_dim)
     }
 
@@ -439,7 +493,7 @@ impl Facts for Fire<'_> {
     /// serving different splits. Under a `fn` it is a pointer that is
     /// either there or not, and `qk_rmsnorm_rope_devwin`'s bind reads it in
     /// one line.
-    fn peel_window(&self) -> Option<NonNull<u32>> {
+    pub fn peel_window(&self) -> Option<NonNull<u32>> {
         NonNull::new(self.ctx.peel_window.cast_mut())
     }
 
@@ -449,15 +503,15 @@ impl Facts for Fire<'_> {
     /// and a fire that states no head geometry leaves it at zero, which
     /// every reader refused already. A negative value cannot arise and is
     /// treated the same.
-    fn head_dim(&self) -> Option<i32> {
+    pub fn head_dim(&self) -> Option<i32> {
         (self.ctx.head_dim > 0).then_some(self.ctx.head_dim)
     }
 
-    fn num_q_heads(&self) -> Option<i32> {
+    pub(super) fn num_q_heads(&self) -> Option<i32> {
         (self.ctx.num_q_heads > 0).then_some(self.ctx.num_q_heads)
     }
 
-    fn num_kv_heads(&self) -> Option<i32> {
+    pub(super) fn num_kv_heads(&self) -> Option<i32> {
         (self.ctx.num_kv_heads > 0).then_some(self.ctx.num_kv_heads)
     }
 
@@ -465,7 +519,7 @@ impl Facts for Fire<'_> {
     ///
     /// Rows spelled this `CtxNonZero("rope_theta")` — the `NonZero` was the
     /// row world saying `Option` in the only vocabulary it had.
-    fn rope_theta(&self) -> Option<f32> {
+    pub fn rope_theta(&self) -> Option<f32> {
         (self.ctx.rope_theta > 0.0).then_some(self.ctx.rope_theta)
     }
 
@@ -476,12 +530,12 @@ impl Facts for Fire<'_> {
     /// theta by layer kind (sliding 1e4, full 1e6) and the fallback to the
     /// uniform value is deliberately on this side, because whether a
     /// family's per-layer vector is short is the driver's question.
-    fn theta(&self) -> Option<f32> {
+    pub fn theta(&self) -> Option<f32> {
         let t = self.ctx.theta(self.layer_index());
         (t > 0.0).then_some(t)
     }
 
-    fn rms_eps(&self) -> Option<f32> {
+    pub(super) fn rms_eps(&self) -> Option<f32> {
         (self.ctx.eps > 0.0).then_some(self.ctx.eps)
     }
 
@@ -490,7 +544,7 @@ impl Facts for Fire<'_> {
     /// Zero is absence, not a cap of zero — which is the reading
     /// `Source::CtxNonZero("final_logit_softcap")` already had, moved into
     /// the type. Gemma-2/3/3n are the only deployments that state it.
-    fn final_logit_softcap(&self) -> Option<f32> {
+    pub fn final_logit_softcap(&self) -> Option<f32> {
         (self.ctx.final_logit_softcap > 0.0).then_some(self.ctx.final_logit_softcap)
     }
 
@@ -498,7 +552,7 @@ impl Facts for Fire<'_> {
     ///
     /// A `bool` and not an `Option<bool>`: a fire that states nothing means
     /// NeoX, which is what `false` says, and there is no third answer.
-    fn rope_interleaved(&self) -> bool {
+    pub fn rope_interleaved(&self) -> bool {
         self.ctx.rope_interleaved
     }
 
@@ -509,7 +563,7 @@ impl Facts for Fire<'_> {
     /// `Rope { partial }`, then the fire's per-layer table — the first two
     /// are one fact under two spellings and both are live (qwen3_5's
     /// prefill states the launch, its decode records the semantic op).
-    fn rotary_width(&self) -> Option<i32> {
+    pub fn rotary_width(&self) -> Option<i32> {
         self.spec
             .params
             .first()
@@ -517,11 +571,7 @@ impl Facts for Fire<'_> {
             .filter(|r| *r > 0)
             .or(self.spec.rope_partial)
             .or_else(|| {
-                self.ctx
-                    .rotary_by_layer
-                    .get(self.layer_index())
-                    .copied()
-                    .filter(|r| *r > 0)
+                self.ctx.rotary_by_layer.get(self.layer_index()).copied().filter(|r| *r > 0)
             })
             .and_then(|r| i32::try_from(r).ok())
     }
@@ -533,7 +583,7 @@ impl Facts for Fire<'_> {
     /// (`yarn_factor > 1.f && yarn_original_max_position > 0`), so a bind
     /// that wants the un-ramped branch asks for [`Yarn::NONE`] explicitly
     /// rather than getting it by an accident of zeros.
-    fn yarn(&self) -> Option<Yarn> {
+    pub fn yarn(&self) -> Option<Yarn> {
         let [factor, beta_fast, beta_slow, attention_factor] = self.ctx.yarn;
         (self.ctx.yarn_original_max > 0).then_some(Yarn {
             factor,
@@ -550,7 +600,7 @@ impl Facts for Fire<'_> {
     /// because *"the generator emits the test into the branch GUARD and the
     /// read into the argument list, and a guard cannot bind"*. A `fn` can
     /// bind, so they are one method and the pair's whole reason is gone.
-    fn kv_layer(&self) -> Option<KvLayer> {
+    pub fn kv_layer(&self) -> Option<KvLayer> {
         use crate::bind::abi::KvCacheScheme as S;
         use crate::dtype::DType as D;
         let v = self.attn?.layers.get(self.layer_index())?;
@@ -603,7 +653,7 @@ impl Facts for Fire<'_> {
     /// when the fire has no attention half at all; a fire that has one but
     /// planned no requests answers with `requests: 0`, because zero
     /// requests is a rectangle and not a missing fact.
-    fn plan(&self) -> Option<Plan> {
+    pub fn plan(&self) -> Option<Plan> {
         let a = self.attn?;
         Some(Plan {
             qo_indptr: a.qo_indptr_d,
@@ -621,7 +671,7 @@ impl Facts for Fire<'_> {
     /// `&str` and matched `"conv_state"` / `"recurrent_state"`. Two
     /// variants of an enum here, so the misspelling that would have
     /// silently declined is not writable.
-    fn slab(&self, which: Slab) -> Option<*mut c_void> {
+    pub fn slab(&self, which: Slab) -> Option<*mut c_void> {
         let g = self.gdn?;
         let layer = self.spec.state.as_ref()?.layer as usize;
         let v: &[u64] = match which {

@@ -296,7 +296,8 @@ mod tests {
     /// A bool widens to 0/1 in the vector, and sits in the last slots.
     #[test]
     fn the_bools_widen_and_come_last() {
-        let info = DecodePlanInfo { enable_cuda_graph: true, split_kv: false, ..Default::default() };
+        let info =
+            DecodePlanInfo { enable_cuda_graph: true, split_kv: false, ..Default::default() };
         assert_eq!(info.to_vector()[8], 1);
         assert_eq!(info.to_vector()[9], 0);
     }

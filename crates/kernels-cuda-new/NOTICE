@@ -24,8 +24,8 @@ FlashInfer
     Located at: csrc/src/attn/flashinfer/
     Licence at: csrc/src/attn/flashinfer/LICENSE (upstream's file, unmodified)
 
-The pin is not ours to choose. `crates/kernels-cuda/csrc/CMakeLists.txt`
-fetches the same tree for the ahead-of-time build:
+The pin was not ours to choose. `crates/kernels-cuda/csrc/CMakeLists.txt`
+fetched the same tree for the ahead-of-time build:
 
     CPMAddPackage(
       NAME flashinfer
@@ -37,16 +37,36 @@ fetches the same tree for the ahead-of-time build:
 and the carried files were copied from the tree that command produced --
 `.../build/_deps/flashinfer-src/include/flashinfer/` -- rather than from a
 fresh clone, so that the text carried here is byte-for-byte the text the AOT
-build compiles. Seventeen copies of that tree exist under `target/`, one per
-build hash; all seventeen were compared and are identical.
+build compiled. Seventeen copies of that tree existed under `target/`, one per
+build hash; all seventeen were compared and were identical.
+
+**That crate is gone** -- `85c6c674b` deleted the archive crate, `links` key
+and all -- and the CMakeLists, the CPM block above and the ahead-of-time build
+went with it. So the pin IS ours to choose now, and this paragraph is the only
+place in the repository that states it: nothing else fetches v0.6.15, nothing
+else can disagree with it, and a version bump starts here rather than being
+recorded here afterwards. The block is kept verbatim because it is where the
+carried bytes came from, which remains the answer to *which* v0.6.15.
 
 ### What is carried
 
 Twenty-four files: the transitive `#include` closure, inside the FlashInfer
-tree, of the headers `csrc/src/attn/` names --
-`attention/{cascade,decode,mask,mla,prefill,state,variants,
-default_decode_params,default_prefill_params}.cuh` and
-`{fastdiv,layout,page,pos_enc,utils}.cuh`. 13,662 lines, 589,556 bytes.
+tree, of the nine headers our own text names --
+`attention/{cascade,decode,default_decode_params,default_prefill_params,
+mask,mla,mla_params,prefill,variants}.cuh`, in ten directives across
+`csrc/src/attn/{fa2,attention_mla_fa2,attention_score_capture}.cuh` and
+`csrc/src/cascade/merge_states.cuh`. 13,662 lines, 589,556 bytes.
+
+That seed list used to read `attention/{...,state,...}.cuh` and
+`{fastdiv,layout,page,pos_enc,utils}.cuh`, which described the ahead-of-time
+crate's `.cu` roots rather than ours. Those six are still carried and are
+still reached -- they are inside the closure rather than seeds of it. The set
+does not change; only the reason given for it does. Walking quoted includes
+from the four compilation roots -- `attn/fa2.cuh`, `attn/attention_mla_fa2.cuh`,
+`attn/attention_xqa_mha.cuh`, `cascade/merge_states.cuh` -- reaches **all 38**
+of the internalised files at this revision, both trees, with nothing orphaned.
+It reached 40 of 43 when the four host-only files were still here, which is
+what identified them; there is no such residue now.
 
 It was twenty-eight, and the four that left are the subject of "What was
 deleted" below. `attention/scheduler.cuh` used to be one of the seeds of this
@@ -125,6 +145,16 @@ those would make a strip silently promote OUR text into a file that claims to
 be upstream's. They stay, and they are the reason this section says *removed*
 rather than *all removed*.
 
+Two more stay and are NOT two-sided, which this paragraph did not say:
+`xqa/mha_stdheaders.cuh:20`, an `#ifndef GENERATE_CUBIN` around seven host
+`#include`s that NVRTC skips, and `:976`, an `#if GENERATE_CUBIN` around seven
+`using` aliases that NVRTC takes and that hold no host text at all. Fourteen
+regions, twelve of them two-sided. Both stay for a better reason than the
+twelve: that file is byte-identical to upstream, carries zero markers, and the
+switch is upstream's own -- removing them would turn the one XQA file that
+needs no ledger entry into one that needs markers and a row. `MODIFICATIONS`
+has the classification and its two corrections.
+
 Deleting text a marker names is the one edit a strip cannot undo, and there
 are now twelve files' worth of it rather than two `#include` lines.
 `MODIFICATIONS` states it as step 3 of its transform and says plainly that
@@ -162,19 +192,44 @@ Each change is preceded by a marker of one of two fixed forms:
     // it changes no compile>. This marker is one a strip does NOT undo; see
     // MODIFICATIONS.
 
-One `grep -rn "// PIE:" csrc/src/attn/flashinfer/` finds all 39, of which 40
-across both trees are `REMOVED`. The boilerplate sentence appears once per
-file, on its first marker.
+One `grep -rn "// PIE:" csrc/src/attn/flashinfer/ --include='*.cuh'
+--include='*.h'` finds all 39; 35 of the 39 are `REMOVED`, and 40 across both
+trees are. The `--include` is load-bearing and was missing from this
+sentence: the bare grep answers more than 39, because `MODIFICATIONS` sits in
+that directory and quotes the marker form throughout its own prose -- and
+answers more again after every edit to that page, which is why no number is
+given for it here. The XQA grep below needs no such filter: that directory
+holds sources and `LICENSE` and nothing else. The boilerplate sentence appears
+once per file, on its first marker.
 `csrc/src/attn/flashinfer/MODIFICATIONS` lists the count per file, and the
 property that list asserts -- *strip the markers, the `#ifndef` under each and
 its matching `#endif`, and put back what a REMOVED marker names, and every
 file is byte-for-byte upstream* -- was checked mechanically, per file, against
 the CPM tree before this NOTICE was written.
-`tests/upstream_manifest.rs` re-checks the half of that claim which needs no
-network: every file's guard count, added-line count, line count and byte count
-still match the table, and the strip is still well defined for every file. The
-other half -- that the stripped text equals upstream's -- needs the CPM
-checkout and is a manual step on rebase.
+`tests/upstream_manifest.rs` re-checked the half of that claim which needs no
+network -- every file's guard count, added-line count, line count and byte
+count against the table, and that the strip is still well defined for every
+file -- and **it is deleted**, at `1a08b179a`, with the twelve other test
+files whose subject was machinery that sweep removed. Nothing re-checks the
+table today.
+
+So BOTH halves of the property are manual now: the four columns against `wc
+-l` and `wc -c`, and the stripped text against a CPM checkout. That is the
+largest thing this document lost and it is named rather than left for a rebase
+to discover. The columns were re-derived by hand for this revision and every
+one of the twenty-four rows equals its file; what is gone is the guarantee
+that they will still equal it tomorrow.
+
+One cheap check survives and is worth writing down because it needs no
+network and no table: `git diff 49cb6dfa9..HEAD -- csrc/src/attn/flashinfer
+csrc/src/attn/xqa` is what has happened to either tree since the strip that
+these documents describe. At this revision it is exactly two files --
+`MODIFICATIONS`, which is ours, and one line of `xqa/mha.cuh`, which is the
+undocumented edit the XQA section below now documents. Every other byte in
+both trees is what the strip left. That does not prove the trees equal
+upstream -- only a CPM checkout does -- but it does bound the unexamined
+surface to one line, and bounding it is the half of the deleted test's job
+that `git` can still do.
 
 Two consequences are worth recording because they are not visible in a diff:
 
@@ -270,7 +325,7 @@ was missing. It is below.
 
 ### What is carried
 
-Fourteen files, 6,977 lines, 265,143 bytes:
+Fourteen files, 6,977 lines, 265,152 bytes:
 
     barriers.cuh   defines.h     mha.h        mha_stdheaders.cuh   platform.h
     cuda_hint.cuh  ldgsts.cuh    mhaUtils.cuh mma.cuh              specDec.h
@@ -278,9 +333,23 @@ Fourteen files, 6,977 lines, 265,143 bytes:
 
 It was fifteen. `hostUtils.h` was deleted -- see "What was changed" below --
 and the counts above are the tree as it now stands, re-derived rather than
-adjusted. The previous figure in this document, `274,966 bytes`, was 36 bytes
-under the truth for the fifteen-file tree it described; nothing had a second
-derivation to disagree with it.
+adjusted. Two earlier figures were wrong and both are worth keeping, because
+they failed the same way. `274,966 bytes` was 36 bytes under the truth for the
+fifteen-file tree it described; nothing had a second derivation to disagree
+with it. `265,143 bytes` was 4 bytes over the truth for THIS tree, and it went
+stale for a better reason than a bad measurement -- a later commit edited one
+line of `mha.cuh` and no count was re-run. That edit is the fourth bullet
+under "What was changed" below.
+
+The byte figure counts OUR `// PIE:` prose along with upstream's text, so it
+moves whenever a marker is reworded and not only when code changes -- it went
+265,139 to 265,152 when `mha.cuh`'s header note was corrected to admit the
+edit above. The LINE figure is the stabler of the two and is the one a marker
+is written to preserve: a marker added on its own line shifts every `mha.cu:N`
+citation below it, which is why the `AccType{}` change carries none. Re-derive
+both with
+
+    find csrc/src/attn/xqa -type f ! -name LICENSE -exec cat {} + | wc -lc
 
 Not carried, and deliberately: `gmma.cuh`, `gmma_impl.cuh`, `mha_sm90.cu`,
 `mla_sm120.cu`, `mla_sm120.cuh`, `tensorMap.cpp`, `tensorMap.h`, `tma.h`,
@@ -301,7 +370,13 @@ byte-identical.** Those four are `mha.cuh`, `mha_components.cuh`,
     nothing includes it by its upstream name. Every `mha.cu:N` citation in
     this repo is against upstream; `mha.cuh:N` means our copy. The file's own
     header note gives the offset both ways and it is arithmetic, not memory:
-    3,093 - 3,051 = 42.
+    upstream `mha.cu` is 3,051 lines, this file is 2,853, and the note names
+    the two insertions above every live citation -- its own 23 lines at `:18`
+    and a 3-line include marker at upstream `:28`, so upstream `:409` is
+    `:435` here and `:2757` is `:2783`. (This sentence used to read `3,093 -
+    3,051 = 42`, which was the arithmetic BEFORE the host tail came out: 3,093
+    was our line count then, not upstream's. The note in the file was updated
+    with the strip and this quotation of it was not.)
   * The host tail of `mha.cuh` is **deleted**, not guarded. It used to sit
     under one `#ifndef GENERATE_CUBIN` of ours -- `configureKernel`,
     `launchMHAFlashInfer`, and with them `cudaMemcpyFromSymbol`,
@@ -311,6 +386,32 @@ byte-identical.** Those four are `mha.cuh`, `mha_components.cuh`,
     now, along with upstream's `throw std::runtime_error("not implemented")`
     under `#if USE_INPUT_KV`. The replacement is `driver-cuda/src/fire/xqa.rs`
     and always was.
+  * **`mha.cuh:1455` reads `result.fill(AccType{})` where upstream writes
+    `AccType{0, 0}`**, in `smemFp16ArraySum`. This is the only change in
+    either tree that REPLACES upstream's bytes in place, and the only one that
+    carries NO `// PIE:` marker. Everywhere else our text is added beside
+    upstream's rather than over it -- `attention/mla.cuh`'s two `.template`
+    sites keep upstream's spelling inside the `#ifndef` and put ours in an
+    `#else`, which is why step 1 can still recover the file -- or it removes
+    text a marker names. Here upstream's spelling is simply not there. It was
+    made at `2af552a24`, while getting XQA's device half to compile at all,
+    and no ledger was re-run for it.
+
+    It is OUR shim that made it necessary, not upstream. `AccType` is
+    `mha::conditional_t<useFp32Acc, float2, InputElem2>`, and for the bf16
+    lattice `INPUT_ELEM2` is `__nv_bfloat162` (`xqa/defines.h:41`), which
+    `csrc/shim/cuda_bf16.h:262` aliases to the prelude's `device::bf16x2` --
+    `struct { bf16 x; bf16 y; }`, whose element type declares its
+    constructors `explicit` on purpose so that a stray `bf16 b = 0;` is
+    refused. A braced `{0, 0}` copy-initialises each member and therefore
+    cannot see an `explicit` constructor, while NVIDIA's own `__nv_bfloat162`
+    takes it. `AccType{}` value-initialises and is zero for both arms. That is
+    the reason `2af552a24` records and the type definitions corroborate; it
+    was not compiled against NVIDIA's headers to check the converse.
+
+    It costs 4 bytes and no lines, which is exactly why the byte column caught
+    it and the line column did not. A rebase must re-apply it;
+    `MODIFICATIONS` carries it as a numbered modification for that reason.
   * `utils.h` loses `checkCuda` and `checkCu`, two host error checkers that
     `throw std::runtime_error`. `utils.h` is included by `utils.cuh` and by
     `mha.h`, so it is genuinely inside the include closure -- but the four
@@ -343,7 +444,8 @@ Note the shape of the difference from the FlashInfer side of this document:
 there, the changes began as 33 `#ifndef __CUDACC_RTC__` guards; here there
 were **none**. XQA was written to be compiled as a cubin -- it carries
 upstream's own `GENERATE_CUBIN` switch for exactly that, and
-`src/families/attn.rs` passes `-DGENERATE_CUBIN=1` -- so the JIT needed one
+`src/x/xqa.rs`'s `XQA_COMMON_OPTIONS` passes `-DGENERATE_CUBIN=1` (it was
+`src/families/attn.rs`, which the routine port deleted) -- so the JIT needed one
 guard of ours where FlashInfer's host-facing headers needed thirty-three.
 Both counts are now zero on the XQA side and two on the FlashInfer side, and
 what stood behind them is deleted rather than hidden. Diffing XQA against a
@@ -370,10 +472,17 @@ CCCL, NVIDIA CUDA headers
 -------------------------
 
 Neither is carried, and that is the point of `csrc/shim`. Where
-`examples/flashinfer_probe.rs` reads NVIDIA's `cuda_fp16.h` or FlashInfer's
-own CCCL checkout from disk, it does so at RUN time, in a probe, to separate
-"is this source acceptable to NVRTC" from "is our shim correct". No toolkit
-text is carried in this crate's binary and none is redistributed.
+`examples/halftype_parity.rs` reads NVIDIA's `cuda_fp16.h` and `cuda_bf16.h`
+from `$CUDA_HOME`, it does so at RUN time, in a probe, to separate "is this
+source acceptable to NVRTC" from "is our shim correct". No toolkit text is
+carried in this crate's binary and none is redistributed.
+
+The probe that also read FlashInfer's own CCCL checkout was
+`examples/flashinfer_probe.rs`, deleted at `1a08b179a` with sixteen other
+examples. Only the NVIDIA half of this paragraph still has a running witness;
+the CCCL half is now an unmeasured claim, which does not weaken it -- nothing
+carried has a `cccl` or `cutlass` path, and `csrc/shim` holds no file under
+either -- but it is worth saying which half is checked.
 
 
 The two LICENSE files

@@ -12,8 +12,8 @@
 //!    [`PrefillDispatch`] and still do not fire — that return type is the
 //!    point, not the gap. The fire is
 //!    [`super::flashinfer_fa2::fire_decode`] and
-//!    [`super::flashinfer_fa2::fire_prefill`], which own the module and the
-//!    stream and hand the params to [`super::hand::fire_params`].
+//!    [`super::flashinfer_fa2::fire_prefill`], which own the stream and hand
+//!    the point and the params to [`kernels_cuda_new::x::fa2`].
 //! 2. **`bind/mod.rs`'s `DecodePlan`/`PrefillPlan`** now own a
 //!    [`DecodePlanCache`] / [`PrefillPlanCache`] directly. The seven
 //!    `pie_x_*` entry points and their `plan_lifecycle.cpp` bodies are
@@ -51,9 +51,12 @@
 //! `AttnHd<HD>` is a class template and `HD` had to be a compile-time constant
 //! to name an instantiation; `#include "kernels.def"` expanded one `case` per
 //! head_dim so that a runtime integer could reach one. Under the JIT the
-//! head_dim is a *lookup key* — `families::fa2::decode_symbol(head_dim, group,
-//! arm)` returns a symbol or [`None`] — so the four switches become four calls
-//! and the `kernels.def` expansion has no remaining job.
+//! head_dim is a *lookup key* —
+//! [`kernels_cuda_new::x::fa2::decode_root`] returns a root or [`None`] — so
+//! the four switches become four calls and the `kernels.def` expansion has no
+//! remaining job. The lookup itself is one layer further down than it was:
+//! this module names the POINT and the routine resolves it, because the same
+//! function that picks the root is the one that derives the rectangle.
 //!
 //! # The variant selection is NOT a switch on head_dim and never was
 //!
@@ -68,15 +71,17 @@
 //! # Refusal
 //!
 //! Everything here returns [`Fired`], which is `#[must_use]` and spells
-//! *"declined"* differently from *"ran"*, per `fire/gemv.rs`'s precedent. A
-//! head_dim the lattice does not carry is a [`Decline`], not a panic.
+//! *"declined"* differently from *"ran"*, per `fire/gemv.rs`'s precedent.
+//! What a [`Decline`] can still name is what this module can still see: an
+//! empty plan cache, an SM90 plan, a capture with no sink and a capture that
+//! composes with nothing.
 //!
-//! The other half of that rule lands at the fire rather than here: a symbol
-//! the lattice **does** carry but the loaded module does not export is a
-//! broken JIT, not a declined request, and must panic naming the symbol. This
-//! module cannot enforce it because it never looks a symbol up — it returns
-//! one. [`super::hand::fire_params`] is where `Error::Missing { unit, symbol }`
-//! arrives and where it is not folded into a `Decline`.
+//! **A head_dim the lattice does not carry is no longer one of them**, and
+//! that is where the lattice went rather than a loss: the point is resolved
+//! at the fire, by the routine that also derives the rectangle, and refuses
+//! there with the detail in the log. A `Decline` arm that could only be
+//! produced by re-deriving the geometry a second time would be two
+//! derivations of one fact.
 //!
 //! # What is deliberately not here
 //!
@@ -98,12 +103,11 @@
 //!   the call graph and none from a run. [`Decline::Sm90Unported`] says so
 //!   rather than firing an FA2 symbol at a plan that was not built for it.
 
+use kernels_cuda_new::fa2::Device as FaDevice;
 use kernels_cuda_new::fa2::params::{
     DecodeParams, DecodeScoreParams, PagedKv, PrefillPagedParams, PrefillScoreParams, UintFastdiv,
 };
-use kernels_cuda_new::fa2::{self, Device as FaDevice, KvWidth};
-use kernels_cuda_new::families::fa2 as lattice;
-use kernels_cuda_new::families::fa2::{DecodeArm, PrefillArm};
+use kernels_cuda_new::x::fa2::{DecodeArm, DecodePoint, PrefillArm, PrefillPoint};
 
 use super::flashinfer_fa2::{DecodePlanCache, PrefillPlanCache};
 
@@ -166,14 +170,6 @@ pub enum Decline {
     /// panic because an empty cache is a caller-ordering mistake, which is
     /// recoverable, and not a broken JIT, which is not.
     Unplanned,
-    /// `families::fa2` carries no unit for this (head_dim, GQA group).
-    DecodeLatticePoint { head_dim: u32, group_size: u32 },
-    /// `families::fa2` carries no unit for this (head_dim, tile, NUM_MMA_KV).
-    PrefillLatticePoint { head_dim: u32, cta_tile_q: u32, num_mma_kv: u32 },
-    /// [`fa2::DecodeGeometry::derive`] or [`fa2::PrefillGeometry::derive`]
-    /// refused. The reason is upstream's `static_assert` or dispatch `else`,
-    /// carried as its own type.
-    Geometry(fa2::Refusal),
     /// A score-capturing dispatch asked for with a soft cap or a window.
     ///
     /// `attention_flashinfer.cu:551-560` threw here, in these words: the two
@@ -256,21 +252,9 @@ pub enum Decline {
 impl core::fmt::Display for Decline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
-            Self::Unplanned => write!(
-                f,
-                "flashinfer fa2 dispatch: the plan cache is empty; plan before firing"
-            ),
-            Self::DecodeLatticePoint { head_dim, group_size } => write!(
-                f,
-                "flashinfer fa2 decode: no unit for head_dim {head_dim} at GQA group \
-                 {group_size}"
-            ),
-            Self::PrefillLatticePoint { head_dim, cta_tile_q, num_mma_kv } => write!(
-                f,
-                "flashinfer fa2 prefill: no unit for head_dim {head_dim} at CTA_TILE_Q \
-                 {cta_tile_q}, NUM_MMA_KV {num_mma_kv}"
-            ),
-            Self::Geometry(why) => write!(f, "flashinfer fa2: {why}"),
+            Self::Unplanned => {
+                write!(f, "flashinfer fa2 dispatch: the plan cache is empty; plan before firing")
+            }
             Self::CaptureVariantUnsupported => write!(
                 f,
                 "flashinfer fa2 score capture: not instantiated with a logits soft cap \
@@ -512,7 +496,11 @@ fn make_paged_kv(
 /// window arm is the fallthrough. Reordering these three `if`s is a silent
 /// numerics change.
 #[must_use]
-pub fn decode_arm(full_attention_variant: bool, window_left: i32, logits_soft_cap: f32) -> DecodeArm {
+pub fn decode_arm(
+    full_attention_variant: bool,
+    window_left: i32,
+    logits_soft_cap: f32,
+) -> DecodeArm {
     if full_attention_variant && window_left < 0 && logits_soft_cap <= 0.0 {
         return DecodeArm::Full;
     }
@@ -568,7 +556,11 @@ pub fn prefill_arm(full_attention_variant: bool, causal: bool, logits_soft_cap: 
 /// [`decode_capture_arm`]'s counterpart, with the same `None`: soft cap or
 /// window is an instantiation that does not exist.
 #[must_use]
-pub fn prefill_capture_arm(causal: bool, window_left: i32, logits_soft_cap: f32) -> Option<PrefillArm> {
+pub fn prefill_capture_arm(
+    causal: bool,
+    window_left: i32,
+    logits_soft_cap: f32,
+) -> Option<PrefillArm> {
     if logits_soft_cap > 0.0 || window_left >= 0 {
         return None;
     }
@@ -689,11 +681,8 @@ pub fn make_prefill_params(
     sm_scale: f32,
 ) -> (PrefillPagedParams, Partials) {
     let info = &cache.plan_info;
-    let group = if cache.num_kv_heads > 0 {
-        (cache.num_q_heads / cache.num_kv_heads) as u32
-    } else {
-        1
-    };
+    let group =
+        if cache.num_kv_heads > 0 { (cache.num_q_heads / cache.num_kv_heads) as u32 } else { 1 };
     let mut p = PrefillPagedParams {
         q: bufs.q,
         paged_kv: make_paged_kv(
@@ -793,48 +782,30 @@ pub fn make_prefill_params(
     (p, partials)
 }
 
-/// `NUM_MMA_KV` from the geometry, `prefill.cuh:4280`'s `DISPATCH_NUM_MMA_KV`.
-///
-/// **This is the switch that vanished.** The archive could not compute it: the
-/// macro snapped a runtime smem budget DOWN to `{8, 4, 2, 1}` and instantiated
-/// all four, because the choice depended on a device query. Rust makes the
-/// query once and the fire names one unit — the largest saving of this pass
-/// and invisible in the row count, since the rows for the other three still
-/// exist and simply never compile.
-#[must_use]
-pub fn prefill_num_mma_kv(geometry: &fa2::PrefillGeometry) -> u32 {
-    geometry.num_mma_kv
-}
-
 /// Everything a decode launch needs, and nothing that needs a CUDA context.
 ///
 /// [`decode`] returns this rather than firing, and that is deliberate rather
-/// than unfinished: the geometry, the symbol and the params are the whole of
-/// what this module can know, and the `Module` a symbol is looked up in and
-/// the `Stream` a launch is ordered on belong to the caller. Handing them back
-/// makes the launch one [`super::hand::fire_params`] call at the site that
-/// owns both — and makes *this* testable without a GPU, which nothing that
+/// than unfinished: the lattice point and the params are the whole of what
+/// this module can know, and the stream a launch is ordered on belongs to the
+/// caller. Handing them back makes the launch one
+/// [`kernels_cuda_new::x::fa2::decode`] call at the site that owns the
+/// stream — and makes *this* testable without a GPU, which nothing that
 /// called `cudaLaunchKernel` inline ever was.
+///
+/// **The rectangle is not here any more.** The grid, the block and the shared
+/// allocation are derived from `at` by the routine that fires it, because
+/// they are the kernel's arithmetic rather than the plan's; what this carries
+/// is which point, which arm, and the two grid extents a plan supplies.
 ///
 /// `P` is the `__grid_constant__` struct's type and defaults to
 /// [`DecodeParams`]; [`decode_capture`] returns
 /// `DecodeDispatch<DecodeScoreParams>`. A type parameter rather than a second
 /// struct because the difference between the two is exactly the params type
-/// and nothing else — same grid, same block, same smem derivation.
+/// and nothing else — same point, same arm axis, same derivation.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeDispatch<P = DecodeParams> {
-    /// The mangled `__global__` name, from `families::fa2::decode_symbol`.
-    pub symbol: &'static str,
-    /// `decode.cuh:781` — `dim3(padded_batch_size, num_kv_heads)`.
-    ///
-    /// Read from the launcher's own statement, not from a `<<<>>>`, and note
-    /// `padded_batch_size` is the **plan's**: this is why the plan's
-    /// `int_upload` must have landed before the launch.
-    pub grid: [u32; 3],
-    /// `decode.cuh:782` — `dim3(bdx, bdy, bdz)`.
-    pub block: [u32; 3],
-    /// `decode.cuh:772-775`.
-    pub smem: u32,
+    /// Which lattice point, which arm, and the grid's two extents.
+    pub at: DecodePoint,
     /// The single `__grid_constant__` argument.
     pub params: P,
 }
@@ -842,20 +813,8 @@ pub struct DecodeDispatch<P = DecodeParams> {
 /// Everything a prefill launch needs. See [`DecodeDispatch`].
 #[derive(Clone, Copy, Debug)]
 pub struct PrefillDispatch<P = PrefillPagedParams> {
-    /// The mangled `__global__` name, from `families::fa2::prefill_symbol`.
-    pub symbol: &'static str,
-    /// `prefill.cuh:4203` — `dim3(padded_batch_size, 1, num_kv_heads)`.
-    ///
-    /// **Three axes, with the KV heads in z.** Decode's grid has two and puts
-    /// them in y. They are not the same shape, which is why there is no shared
-    /// helper here.
-    pub grid: [u32; 3],
-    /// `prefill.cuh:4204` — `dim3(32, NUM_WARPS_Q, NUM_WARPS_KV)`.
-    pub block: [u32; 3],
-    /// `prefill.cuh:4297` — `sizeof(KTraits::SharedStoragePaged)`, re-derived
-    /// by [`fa2::PrefillGeometry::shared_storage_paged`] and checked against
-    /// NVRTC's own `sizeof` at one point (49232 == 49232).
-    pub smem: u32,
+    /// Which lattice point, which arm, and the grid's two extents.
+    pub at: PrefillPoint,
     /// The second of the kernel's two template arguments, by value.
     pub params: P,
 }
@@ -878,26 +837,13 @@ pub fn decode(
         return Fired::Declined(Decline::Unplanned);
     }
     let arm = decode_arm(cache.full_attention_variant, window_left, logits_soft_cap);
-    let (symbol, geometry) = match decode_point(cache, device, arm) {
-        Ok(pair) => pair,
-        Err(why) => return Fired::Declined(why),
-    };
 
     let (params, partials) =
         make_decode_params(cache, bufs, window_left, logits_soft_cap, sm_scale, broadcast_q);
 
-    let ready = DecodeDispatch {
-        symbol,
-        grid: [params.padded_batch_size, cache.num_kv_heads as u32, 1],
-        block: [geometry.bdx, geometry.bdy, geometry.bdz],
-        smem: geometry.smem_bytes,
-        params,
-    };
-    if cache.plan_info.split_kv {
-        Fired::Split(ready, partials)
-    } else {
-        Fired::Whole(ready)
-    }
+    let ready =
+        DecodeDispatch { at: decode_at(cache, device, arm, params.padded_batch_size), params };
+    if cache.plan_info.split_kv { Fired::Split(ready, partials) } else { Fired::Whole(ready) }
 }
 
 /// The score-capturing decode dispatch.
@@ -934,10 +880,6 @@ pub fn decode_capture(
     else {
         return Fired::Declined(Decline::CaptureVariantUnsupported);
     };
-    let (symbol, geometry) = match decode_point(cache, device, arm) {
-        Ok(pair) => pair,
-        Err(why) => return Fired::Declined(why),
-    };
 
     let (base, partials) = make_decode_params(cache, bufs, window_left, 0.0, sm_scale, broadcast_q);
     let params = DecodeScoreParams {
@@ -946,46 +888,39 @@ pub fn decode_capture(
         score_indptr: capture.score_indptr,
     };
 
-    let ready = DecodeDispatch {
-        symbol,
-        grid: [params.base.padded_batch_size, cache.num_kv_heads as u32, 1],
-        block: [geometry.bdx, geometry.bdy, geometry.bdz],
-        smem: geometry.smem_bytes,
-        params,
-    };
-    if cache.plan_info.split_kv {
-        Fired::Split(ready, partials)
-    } else {
-        Fired::Whole(ready)
-    }
+    let ready =
+        DecodeDispatch { at: decode_at(cache, device, arm, params.base.padded_batch_size), params };
+    if cache.plan_info.split_kv { Fired::Split(ready, partials) } else { Fired::Whole(ready) }
 }
 
-/// The lattice point a decode fire lands on: its symbol and its geometry.
+/// The lattice point a decode fire lands on, as the routine takes it.
 ///
 /// Factored out of [`decode`] and [`decode_capture`] because the two differ
-/// only in the arm, and a second copy of the KV-width argument is a second
-/// place for it to be wrong.
-fn decode_point(
+/// only in the arm, and a second copy of the GQA division is a second place
+/// for it to be wrong.
+///
+/// This no longer resolves anything: whether the lattice holds the point, and
+/// what geometry it has, are [`kernels_cuda_new::x::fa2`]'s and are answered
+/// at the fire. What is left here is the reading of the PLAN — the head dim,
+/// the GQA group and the two grid extents — which is this crate's vocabulary.
+fn decode_at(
     cache: &DecodePlanCache,
     device: FaDevice,
     arm: DecodeArm,
-) -> Result<(&'static str, fa2::DecodeGeometry), Decline> {
-    let head_dim = cache.head_dim as u32;
-    let group = if cache.num_kv_heads > 0 {
-        (cache.num_q_heads / cache.num_kv_heads) as u32
-    } else {
-        1
-    };
-    let Some(symbol) = lattice::decode_symbol(head_dim, group, arm) else {
-        return Err(Decline::DecodeLatticePoint { head_dim, group_size: group });
-    };
-    // bf16 KV throughout: `kernels.def`'s decode axes carry one KV width and
-    // `families::fa2` rows only that one. An FP8 KV cache is dequantised to
-    // bf16 first, by `dequant_kv_cache_layer_to_bf16_active` — which is why
-    // that kernel's four callers lived in the file this replaces.
-    let geometry = fa2::DecodeGeometry::derive(head_dim, group, KvWidth(2), device)
-        .map_err(Decline::Geometry)?;
-    Ok((symbol, geometry))
+    padded_batch_size: u32,
+) -> DecodePoint {
+    DecodePoint {
+        head_dim: cache.head_dim as u32,
+        group_size: if cache.num_kv_heads > 0 {
+            (cache.num_q_heads / cache.num_kv_heads) as u32
+        } else {
+            1
+        },
+        arm,
+        padded_batch_size,
+        num_kv_heads: cache.num_kv_heads as u32,
+        device,
+    }
 }
 
 /// The prefill dispatch.
@@ -1000,25 +935,15 @@ pub fn prefill(
     logits_soft_cap: f32,
     sm_scale: f32,
 ) -> Fired<PrefillDispatch> {
-    let (symbol, geometry) = match prefill_point(cache, device, arm) {
-        Ok(pair) => pair,
-        Err(why) => return Fired::Declined(why),
-    };
+    if let Err(why) = prefill_plan_usable(cache) {
+        return Fired::Declined(why);
+    }
 
     let (params, partials) = make_prefill_params(cache, bufs, logits_soft_cap, sm_scale);
 
-    let ready = PrefillDispatch {
-        symbol,
-        grid: [params.padded_batch_size, 1, cache.num_kv_heads as u32],
-        block: [32, geometry.num_warps_q, geometry.num_warps_kv],
-        smem: geometry.smem_bytes,
-        params,
-    };
-    if cache.plan_info.split_kv {
-        Fired::Split(ready, partials)
-    } else {
-        Fired::Whole(ready)
-    }
+    let ready =
+        PrefillDispatch { at: prefill_at(cache, device, arm, params.padded_batch_size), params };
+    if cache.plan_info.split_kv { Fired::Split(ready, partials) } else { Fired::Whole(ready) }
 }
 
 /// The score-capturing prefill dispatch.
@@ -1048,10 +973,9 @@ pub fn prefill_capture(
     let Some(arm) = prefill_capture_arm(causal, cache.window_left, logits_soft_cap) else {
         return Fired::Declined(Decline::CaptureVariantUnsupported);
     };
-    let (symbol, geometry) = match prefill_point(cache, device, arm) {
-        Ok(pair) => pair,
-        Err(why) => return Fired::Declined(why),
-    };
+    if let Err(why) = prefill_plan_usable(cache) {
+        return Fired::Declined(why);
+    }
 
     let (base, partials) = make_prefill_params(cache, bufs, 0.0, sm_scale);
     let params = PrefillScoreParams {
@@ -1062,17 +986,10 @@ pub fn prefill_capture(
     };
 
     let ready = PrefillDispatch {
-        symbol,
-        grid: [params.base.padded_batch_size, 1, cache.num_kv_heads as u32],
-        block: [32, geometry.num_warps_q, geometry.num_warps_kv],
-        smem: geometry.smem_bytes,
+        at: prefill_at(cache, device, arm, params.base.padded_batch_size),
         params,
     };
-    if cache.plan_info.split_kv {
-        Fired::Split(ready, partials)
-    } else {
-        Fired::Whole(ready)
-    }
+    if cache.plan_info.split_kv { Fired::Split(ready, partials) } else { Fired::Whole(ready) }
 }
 
 /// The custom-mask prefill dispatch.
@@ -1095,10 +1012,9 @@ pub fn prefill_custom(
     sm_scale: f32,
 ) -> Fired<PrefillDispatch> {
     let arm = prefill_custom_arm(logits_soft_cap);
-    let (symbol, geometry) = match prefill_point(cache, device, arm) {
-        Ok(pair) => pair,
-        Err(why) => return Fired::Declined(why),
-    };
+    if let Err(why) = prefill_plan_usable(cache) {
+        return Fired::Declined(why);
+    }
 
     let (mut params, partials) = make_prefill_params(cache, bufs, logits_soft_cap, sm_scale);
     // `:1150-1155`, `:1163`.
@@ -1106,61 +1022,48 @@ pub fn prefill_custom(
     params.maybe_mask_indptr = mask.mask_indptr;
     params.window_left = -1;
 
-    let ready = PrefillDispatch {
-        symbol,
-        grid: [params.padded_batch_size, 1, cache.num_kv_heads as u32],
-        block: [32, geometry.num_warps_q, geometry.num_warps_kv],
-        smem: geometry.smem_bytes,
-        params,
-    };
-    if cache.plan_info.split_kv {
-        Fired::Split(ready, partials)
-    } else {
-        Fired::Whole(ready)
-    }
+    let ready =
+        PrefillDispatch { at: prefill_at(cache, device, arm, params.padded_batch_size), params };
+    if cache.plan_info.split_kv { Fired::Split(ready, partials) } else { Fired::Whole(ready) }
 }
 
-/// The lattice point a prefill fire lands on: its symbol and its geometry.
+/// The two plan-validity refusals, in the order the C++ made them.
 ///
-/// Shared by the three prefill entry points, and the place the two
-/// plan-validity refusals live so that all three make them in the same order:
-/// `:780` tests `cache.valid` and `:783` tests `cache.use_sm90`, and
+/// Shared by the three prefill entry points so that all three make them the
+/// same way: `:780` tests `cache.valid` and `:783` tests `cache.use_sm90`, and
 /// `dispatch_attention_flashinfer_prefill_custom_bf16:1132` tests both in one
-/// `if`.
-fn prefill_point(
-    cache: &PrefillPlanCache,
-    device: FaDevice,
-    arm: PrefillArm,
-) -> Result<(&'static str, fa2::PrefillGeometry), Decline> {
+/// `if`. Both read the PLAN, which is why they stayed here when the lattice
+/// lookup and the geometry went down to [`kernels_cuda_new::x::fa2`].
+fn prefill_plan_usable(cache: &PrefillPlanCache) -> Result<(), Decline> {
     if !cache.valid {
         return Err(Decline::Unplanned);
     }
     if cache.use_sm90 {
         return Err(Decline::Sm90Unported);
     }
-    let head_dim = cache.head_dim as u32;
-    let geometry = fa2::PrefillGeometry::derive(
-        head_dim,
-        cache.cta_tile_q,
-        KvWidth(2),
-        // `use_fp16_qk_reduction`: false at every pie call site. `prefill.cuh`'s
-        // `std::conditional` at `:4208-4210` also requires `is_same_v<DTypeQ,
-        // half>`, and this lattice is bf16 throughout, so true would be
-        // unreachable rather than merely unused.
-        false,
-        device,
-    )
-    .map_err(Decline::Geometry)?;
-    let num_mma_kv = prefill_num_mma_kv(&geometry);
+    Ok(())
+}
 
-    let Some(symbol) = lattice::prefill_symbol(head_dim, cache.cta_tile_q, num_mma_kv, arm) else {
-        return Err(Decline::PrefillLatticePoint {
-            head_dim,
-            cta_tile_q: cache.cta_tile_q,
-            num_mma_kv,
-        });
-    };
-    Ok((symbol, geometry))
+/// The lattice point a prefill fire lands on, as the routine takes it.
+///
+/// [`decode_at`]'s twin, and the same division of labour: `NUM_MMA_KV` is not
+/// here, because it is derived from the shared-memory budget by
+/// [`kernels_cuda_new::fa2::PrefillGeometry::derive`] and naming it twice is a
+/// second place for it to be wrong.
+fn prefill_at(
+    cache: &PrefillPlanCache,
+    device: FaDevice,
+    arm: PrefillArm,
+    padded_batch_size: u32,
+) -> PrefillPoint {
+    PrefillPoint {
+        head_dim: cache.head_dim as u32,
+        cta_tile_q: cache.cta_tile_q,
+        arm,
+        padded_batch_size,
+        num_kv_heads: cache.num_kv_heads as u32,
+        device,
+    }
 }
 
 #[cfg(test)]
@@ -1169,7 +1072,7 @@ mod tests {
         Fired, Partials, decode_arm, decode_capture_arm, offset_ptr, prefill_arm,
         prefill_capture_arm, prefill_custom_arm,
     };
-    use kernels_cuda_new::families::fa2::{DecodeArm, PrefillArm};
+    use kernels_cuda_new::x::fa2::{DecodeArm, PrefillArm};
 
     /// The cascade's ORDER, which is the part that can be broken silently.
     ///
@@ -1425,14 +1328,13 @@ pub unsafe fn attn_dispatch_attention_flashinfer_decode(
     // one of these four call sites consumed that return with `let _ =`.
     if let Ok(l) = KvLayer::try_from(&kv_layer) {
         // SAFETY: forwarded unchanged; `:675`.
-        let _ = unsafe {
-            kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-                &l,
-                kv_page_indices_d,
-                plan.num_pages_in_batch,
-                stream,
-            )
-        };
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
+        let _ = kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+            &ctx,
+            &l,
+            kv_page_indices_d,
+            plan.num_pages_in_batch,
+        );
     }
 
     let bufs = fa2_buffers(
@@ -1545,14 +1447,13 @@ pub unsafe fn attn_dispatch_attention_flashinfer_decode_capture(
     // one of these four call sites consumed that return with `let _ =`.
     if let Ok(l) = KvLayer::try_from(&kv_layer) {
         // SAFETY: forwarded unchanged; `:648`.
-        let _ = unsafe {
-            kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-                &l,
-                kv_page_indices_d,
-                plan.num_pages_in_batch,
-                stream,
-            )
-        };
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
+        let _ = kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+            &ctx,
+            &l,
+            kv_page_indices_d,
+            plan.num_pages_in_batch,
+        );
     }
 
     let bufs = fa2_buffers(
@@ -1672,8 +1573,7 @@ pub unsafe fn attn_dispatch_attention_flashinfer_prefill_bf16(
     // is what lets one row serve a causal decoder layer and a bidirectional
     // ViT: `tower/qwen3_vl` plans with `causal_mask: false` and fires this.
     let arm = prefill_arm(plan.full_attention_variant, plan.causal_mask, logits_soft_cap);
-    let fired =
-        prefill(plan, &bufs, ffa2::fa_device(), arm, logits_soft_cap, sm_scale);
+    let fired = prefill(plan, &bufs, ffa2::fa_device(), arm, logits_soft_cap, sm_scale);
     let (mut dispatch, partials) = match fired {
         Fired::Whole(d) => (d, None),
         // The plan split KV. The fire writes per-chunk partials --
@@ -1785,9 +1685,9 @@ pub unsafe fn attn_dispatch_attention_flashinfer_prefill_capture_bf16(
         // the fold after the launch below turns them into the caller's
         // `o`. Both are on this stream, in this order.
         Fired::Split(d, split) => (d, Some(split)),
-        Fired::Declined(why) => panic!(
-            "attn::dispatch_attention_flashinfer_prefill_capture_bf16 declined: {why}"
-        ),
+        Fired::Declined(why) => {
+            panic!("attn::dispatch_attention_flashinfer_prefill_capture_bf16 declined: {why}")
+        }
     };
     // SAFETY: as above.
     unsafe {
@@ -1870,14 +1770,13 @@ pub unsafe fn attn_dispatch_attention_flashinfer_prefill_custom(
     // one of these four call sites consumed that return with `let _ =`.
     if let Ok(l) = KvLayer::try_from(&kv_layer) {
         // SAFETY: forwarded unchanged.
-        let _ = unsafe {
-            kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-                &l,
-                kv_page_indices_d,
-                num_pages_in_batch,
-                stream,
-            )
-        };
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
+        let _ = kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+            &ctx,
+            &l,
+            kv_page_indices_d,
+            num_pages_in_batch,
+        );
     }
 
     let bufs = fa2_buffers(
@@ -1893,8 +1792,7 @@ pub unsafe fn attn_dispatch_attention_flashinfer_prefill_custom(
         workspace,
     );
     let mask = CustomMask { mask: mask_d as u64, mask_indptr: mask_indptr_d as u64 };
-    let fired =
-        prefill_custom(plan, &bufs, &mask, ffa2::fa_device(), logits_soft_cap, sm_scale);
+    let fired = prefill_custom(plan, &bufs, &mask, ffa2::fa_device(), logits_soft_cap, sm_scale);
     let (mut dispatch, partials) = match fired {
         Fired::Whole(d) => (d, None),
         // The plan split KV. The fire writes per-chunk partials --
@@ -1995,14 +1893,13 @@ pub unsafe fn attn_attention_flashinfer_prefill(
     // one of these four call sites consumed that return with `let _ =`.
     if let Ok(l) = KvLayer::try_from(&kv_layer) {
         // SAFETY: forwarded unchanged.
-        let _ = unsafe {
-            kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-                &l,
-                kv_page_indices_d,
-                num_pages_in_batch,
-                stream,
-            )
-        };
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
+        let _ = kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+            &ctx,
+            &l,
+            kv_page_indices_d,
+            num_pages_in_batch,
+        );
     }
 
     let mut plan = ffa2::PrefillPlanCache::new();
@@ -2049,8 +1946,7 @@ pub unsafe fn attn_attention_flashinfer_prefill(
         workspace,
     );
     let arm = prefill_arm(false, true, logits_soft_cap);
-    let fired =
-        prefill(&plan, &bufs, ffa2::fa_device(), arm, logits_soft_cap, sm_scale);
+    let fired = prefill(&plan, &bufs, ffa2::fa_device(), arm, logits_soft_cap, sm_scale);
     let (mut dispatch, partials) = match fired {
         Fired::Whole(d) => (d, None),
         // The plan split KV. The fire writes per-chunk partials --

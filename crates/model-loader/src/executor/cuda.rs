@@ -562,14 +562,13 @@ impl CudaArena {
         // SAFETY: both spans are in bounds, the plan chose this row for an
         // f32 source and a bf16 destination, and the stream is live for the
         // launch.
-        let fired = unsafe {
-            quant::cast_fp32_to_bf16(
-                self.at(op.src.offset).cast(),
-                self.at(op.dst.offset).cast(),
-                n,
-                self.stream.cast(),
-            )
-        };
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(self.stream.cast()) };
+        let fired = quant::cast_fp32_to_bf16(
+            &ctx,
+            self.at(op.src.offset).cast(),
+            self.at(op.dst.offset).cast(),
+            n,
+        );
         declined(CUDA_CAST_FP32_TO_BF16, fired)
     }
 
@@ -598,15 +597,14 @@ impl CudaArena {
         self.bounds(factors.offset, factors.len)?;
         // SAFETY: both spans are in bounds; the kernel writes `dst` in place,
         // which is what the plan checked before naming this row.
-        let fired = unsafe {
-            quant::scale_rows_bf16(
-                self.at(op.dst.offset).cast(),
-                self.at(factors.offset).cast_const().cast(),
-                as_int(rows)?,
-                as_int(cols)?,
-                self.stream.cast(),
-            )
-        };
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(self.stream.cast()) };
+        let fired = quant::scale_rows_bf16(
+            &ctx,
+            self.at(op.dst.offset).cast(),
+            self.at(factors.offset).cast_const().cast(),
+            as_int(rows)?,
+            as_int(cols)?,
+        );
         declined(CUDA_SCALE_ROWS_BF16, fired)
     }
 
@@ -637,16 +635,15 @@ impl CudaArena {
         let scales = self.encode_scales(op)?;
         // SAFETY: every span is bounds-checked by `encode_scales`; the row
         // takes a source, a payload, an E8M0 scale array and one extent.
-        let fired = unsafe {
-            quant::quantize_bf16_to_mxfp4_e2m1_per_block(
-                self.at(op.src.offset).cast_const().cast(),
-                self.at(op.dst.offset).cast(),
-                self.at(scales.offset).cast(),
-                as_int(rows)?,
-                as_int(cols)?,
-                self.stream.cast(),
-            )
-        };
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(self.stream.cast()) };
+        let fired = quant::quantize_bf16_to_mxfp4_e2m1_per_block(
+            &ctx,
+            self.at(op.src.offset).cast_const().cast(),
+            self.at(op.dst.offset).cast(),
+            self.at(scales.offset).cast(),
+            as_int(rows)?,
+            as_int(cols)?,
+        );
         declined(CUDA_QUANTIZE_BF16_TO_MXFP4, fired)
     }
 
@@ -672,16 +669,15 @@ impl CudaArena {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
         // SAFETY: as above; the scales are `f32` for this row.
-        let fired = unsafe {
-            quant::quantize_bf16_to_fp8_e4m3_per_channel(
-                self.at(op.src.offset).cast_const().cast(),
-                self.at(op.dst.offset).cast(),
-                self.at(scales.offset).cast(),
-                as_int(rows)?,
-                as_int(cols)?,
-                self.stream.cast(),
-            )
-        };
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(self.stream.cast()) };
+        let fired = quant::quantize_bf16_to_fp8_e4m3_per_channel(
+            &ctx,
+            self.at(op.src.offset).cast_const().cast(),
+            self.at(op.dst.offset).cast(),
+            self.at(scales.offset).cast(),
+            as_int(rows)?,
+            as_int(cols)?,
+        );
         declined(CUDA_QUANTIZE_BF16_TO_FP8, fired)
     }
 
@@ -783,13 +779,15 @@ fn plan_disagrees(what: &str) -> Error {
 /// function still sees, and it is still an `Err` and not a no-op, exactly as
 /// `launch::eval`'s `Ungeometric::Empty` was: a transform the plan asked for
 /// and the arena did not perform leaves a tensor holding whatever was there.
-fn declined(symbol: &str, fired: kernels_cuda_new::x::Fired) -> Result<(), Error> {
-    match fired {
-        kernels_cuda_new::x::Fired::Launched => Ok(()),
-        kernels_cuda_new::x::Fired::Declined(why) => Err(Error::Contract(format!(
-            "cuda arena: the plan named `{symbol}` and the host program declined it: {why:?}"
-        ))),
-    }
+fn declined(
+    symbol: &str,
+    fired: Result<(), kernels_cuda_new::x::Refusal>,
+) -> Result<(), Error> {
+    fired.map_err(|why| {
+        Error::Contract(format!(
+            "cuda arena: the plan named `{symbol}` and the routine declined it: {why:?}"
+        ))
+    })
 }
 
 #[cfg(test)]

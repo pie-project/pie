@@ -421,7 +421,6 @@ pub unsafe fn build<M: DeviceMemory>(
     bounds: Bounds,
     stream: *mut c_void,
 ) -> Built {
-    use kernels_cuda_new::x::Fired;
     use kernels_cuda_new::x::abi::bf16;
 
     // The shape test is the HOST PROGRAM'S and is made there, not here. What
@@ -434,39 +433,37 @@ pub unsafe fn build<M: DeviceMemory>(
         });
     };
     // SAFETY: the caller's obligation, above.
-    let fired = unsafe {
-        kernels_cuda_new::x::moe::build_moe_ptrs_aligned_bf16(
-            expert_ids.cast::<i32>(),
-            banks.gate_up.cast::<bf16>(),
-            banks.down.cast::<bf16>(),
-            aligned_in.cast::<bf16>(),
-            stage.gate_up.cast::<bf16>(),
-            stage.act.cast::<bf16>(),
-            stage.out.cast::<bf16>(),
-            arrays.a_gu.cast::<*const bf16>(),
-            arrays.b_gu.cast::<*const bf16>(),
-            arrays.c_gu.cast::<*mut bf16>(),
-            arrays.a_dn.cast::<*const bf16>(),
-            arrays.b_dn.cast::<*const bf16>(),
-            arrays.c_dn.cast::<*mut bf16>(),
-            bounds.max_blocks,
-            bounds.block_size,
-            bounds.hidden,
-            bounds.moe_intermediate,
-            bounds.routed_blocks,
-            banks.shared_gate_up.cast::<bf16>(),
-            banks.shared_down.cast::<bf16>(),
-            stream,
-        )
-    };
+    let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
+    let fired = kernels_cuda_new::x::moe::build_moe_ptrs_aligned_bf16(
+        &ctx,
+        expert_ids.cast::<i32>(),
+        banks.gate_up.cast::<bf16>(),
+        banks.down.cast::<bf16>(),
+        aligned_in.cast::<bf16>(),
+        stage.gate_up.cast::<bf16>(),
+        stage.act.cast::<bf16>(),
+        stage.out.cast::<bf16>(),
+        arrays.a_gu.cast::<*const bf16>(),
+        arrays.b_gu.cast::<*const bf16>(),
+        arrays.c_gu.cast::<*mut bf16>(),
+        arrays.a_dn.cast::<*const bf16>(),
+        arrays.b_dn.cast::<*const bf16>(),
+        arrays.c_dn.cast::<*mut bf16>(),
+        bounds.max_blocks,
+        bounds.block_size,
+        bounds.hidden,
+        bounds.moe_intermediate,
+        bounds.routed_blocks,
+        banks.shared_gate_up.cast::<bf16>(),
+        banks.shared_down.cast::<bf16>(),
+    );
     match fired {
-        Fired::Launched => Built::Ready(arrays),
-        // Two spellings of an outcome, and `Fired::ok()` is not the bridge
-        // here because this is not a `bind!` body: a driver op answers its
-        // OWN two-state type, as `fire::flashinfer_moe` does, and the arrays
-        // ride the `Ready` arm because a caller that got a `Declined` must
-        // not be holding them.
-        Fired::Declined(why) => Built::Declined(Decline::Refused(why)),
+        Ok(()) => Built::Ready(arrays),
+        // Two spellings of an outcome, and this is not a `bind!` body: a
+        // driver op answers its OWN two-state type, as `fire::flashinfer_moe`
+        // does, and the arrays ride the `Ready` arm because a caller that got
+        // a `Declined` must not be holding them.
+        Err(why) => Built::Declined(Decline::Refused(why)),
     }
 }
 
@@ -569,8 +566,6 @@ pub unsafe fn build_for_fire(
     ARENA.with(|arena| {
         let mut arena = arena.borrow_mut();
         // SAFETY: the caller's obligation, forwarded unchanged.
-        unsafe {
-            build(&mut arena, &mut mem, expert_ids, aligned_in, banks, stage, bounds, stream)
-        }
+        unsafe { build(&mut arena, &mut mem, expert_ids, aligned_in, banks, stage, bounds, stream) }
     })
 }

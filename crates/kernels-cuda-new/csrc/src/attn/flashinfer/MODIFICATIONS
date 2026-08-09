@@ -10,11 +10,14 @@ byte -- steps 1 and 2 mechanically, step 3 from upstream and not from here:
        `#endif` -- keeping the guarded BODY, which is upstream's, and
        DISCARDING the `#else` branch, if any, which is ours;
     2. rewrite every `#include <pie/...>` back to the spelling upstream
-       wrote, using the map in `tests/upstream_manifest.rs`;
-    3. put back everything a `// PIE: REMOVED` marker names, and the files
-       listed under HOST C++ below.  A strip cannot perform step 3 on its
-       own: removed text leaves nothing to strip, only a marker saying what
-       stood there.  Step 3 needs the upstream tarball; steps 1 and 2 do not.
+       wrote -- the map that held those rewrites was in
+       `tests/upstream_manifest.rs` and was empty; see THE TEST IS GONE
+       below;
+    3. put back everything a `// PIE: REMOVED` marker names, the files listed
+       under HOST C++ below, and the one EDIT listed under THE EDIT THAT IS
+       NOT A REMOVAL.  A strip cannot perform step 3 on its own: removed text
+       leaves nothing to strip, only a marker saying what stood there.  Step 3
+       needs the upstream tarball; steps 1 and 2 do not.
 
 THE DIRECTION OF STEP 3 REVERSED, and this document said the opposite until
 it did.  It used to read "restore `#include "exception.h"` to `page.cuh` and
@@ -29,6 +32,63 @@ directory no longer exists: `csrc/` was narrowed to device text only, which
 left a provenance-named directory nowhere to be, and these 24 files now live
 at `csrc/src/attn/flashinfer/`.  Vendoring became INTERNALISING.  Not one
 byte below changed in that move.
+
+THE TEST IS GONE, AND NOTHING CHECKS THIS FILE ANY MORE.  Every paragraph
+below that says `tests/upstream_manifest.rs` will catch something is now
+saying it about a file that does not exist: `1a08b179a` deleted it, 2,064
+lines, along with twelve other test files whose subject was the declaration
+machinery that sweep removed.  It held the empty `<pie/...>` map step 2 refers
+to and it re-derived all four columns of the table at the bottom of this file
+and compared them to the rows.  That was the ONE check here that ran without a
+network, and it is the check that caught `attention/mla.cuh` -- see ONE ROW WAS
+ALREADY WRONG below, which is an argument for a test that no longer exists.
+
+So the property this document asserts is now entirely manual, in both halves:
+the columns against `wc -l` and `wc -c`, and the stripped text against a CPM
+checkout of v0.6.15.  The columns were re-derived by hand for this revision and
+all twenty-four rows equal their files.  Recording that is not the same as
+enforcing it, and the difference is the whole reason the deleted test was
+written.
+
+THE EDIT THAT IS NOT A REMOVAL, AND IT CARRIED NO MARKER.  Every modification
+this document had described until now was a deletion, a rename, a guard or an
+`#include` spelling.  There is one that is none of those, it is in XQA rather
+than here, and it went in after the strip without a `// PIE:` marker and
+without any count being re-run:
+
+    xqa/mha.cuh:1455    result.fill(AccType{});
+    upstream mha.cu     result.fill(AccType{0, 0});
+
+`2af552a24`, in `smemFp16ArraySum`.  `AccType` is
+`mha::conditional_t<useFp32Acc, float2, InputElem2>`; for the bf16 lattice
+`INPUT_ELEM2` is `__nv_bfloat162` (`xqa/defines.h:41`), which
+`csrc/shim/cuda_bf16.h:262` aliases to the prelude's `device::bf16x2` --
+`struct { bf16 x; bf16 y; }` whose element type declares its constructors
+`explicit`, so a braced `{0, 0}` copy-initialising each member cannot see one.
+NVIDIA's `__nv_bfloat162` takes it; ours refuses it.  `AccType{}`
+value-initialises and is zero for the `float2` arm too.  The cause is OUR shim,
+not upstream, which is what makes this a modification to record rather than a
+bug to report upstream.
+
+It costs 4 bytes and no lines, and it is the reason the XQA byte total in
+`NOTICE` read 265,143 against a tree of 265,139: a line count cannot see it, a
+byte count can, and neither was re-run.  It is step 3 work on a rebase -- put
+`AccType{0, 0}` back and the file is upstream's, and it will not compile here
+until it is changed again.
+
+IT CARRIES NO MARKER, AND THAT IS A DECISION RATHER THAN AN OMISSION.  A
+marker is a line of its own -- step 1 of the recipe above strips whole marker
+lines, so a trailing one on the code line could not be removed without taking
+the code with it -- and `mha.cuh`'s header note pins the arithmetic that makes
+its citations readable: TWO insertions, both above the cited lines, so upstream
+`:409` is `:435` here and `:2757` is `:2783`.  A third insertion at 1454 shifts
+every citation below it and silently falsifies both of those worked examples.
+The cost of the marker is larger than the cost of the record.
+
+So the record is here, and `mha.cuh`'s own header says so at the top of the
+file where a rebaser will read it before touching anything.  What a strip must
+not do is produce a file that claims to be upstream's and is not; naming the
+line in two places it will be read is what prevents that.
 
 HOST C++ IS GONE, AND THAT IS WHY THIS TABLE LOST FOUR ROWS.  The move
 carried 28 files.  Four of them contained no device code at all -- not one
@@ -272,6 +332,61 @@ Errors, measured:
    repair the files citing them, and the six `utils.cuh` citations turned out
    to need no repair, so nothing here touched those files.
 
+   ITS OTHER NUMBER IS A NUMBER FROM THE PARAGRAPH ABOVE IT.  The note says
+   the macros hold "all 13 remaining `std::` tokens in this tree".  There are
+   **12**: `std::cerr` and `std::endl` in `FLASHINFER_CUDA_CALL`
+   (`utils.cuh:62`, `:63`) and ten `std::ostringstream`, nine in `utils.cuh`
+   and one at `mla.cuh:1111`.  13 is the count of surviving
+   `FLASHINFER_CHECK`/`FLASHINFER_ERROR` expansions, which the paragraph two
+   above the note states correctly and which the note then reused for a
+   different quantity.  Both are `\`-continued `#define` lines and neither is
+   ever expanded, so nothing about the argument changes -- only the number.
+   Note also that "in this tree" cannot be read literally for `std::`: the
+   closure holds 104 `std::` tokens.  85 of the other 92 are device text --
+   `is_same_v` 37, `conditional_t` 16, `bit_cast` 14, `is_same` 8,
+   `numeric_limits` 4, the two `_type`s 4, `void_t` and `declval` one each --
+   answered by `csrc/shim`'s `type_traits`, `bit`, `limits` and
+   `cuda/std/limits`, and the remaining 7 are prose INSIDE `// PIE:` markers
+   naming host text that is gone (`std::string`, `std::exception`,
+   `std::make_tuple`, two `std::ostringstream`).  The 12 are the host `std::`
+   still standing in code, which is what the sentence is about.
+
+5. `families/cascade.rs` DOES NOT EXIST, and neither does the directory it
+   sat in.  It is named twice above -- once as the home of the two most-cited
+   un-repairable citations, once as where the extractor's grammar gap was
+   found.  `4f9ccba92` deleted `src/families/` outright, with `unit.rs` and
+   `device.rs`, and the file is now `src/x/cascade.rs`; the two citations are
+   at `:14` and `:19` of it.  Half of what the paragraph above recommended has
+   since
+   happened on its own: `:14` cites `cascade.cuh:637-668` for `MergeStates`
+   and says "upstream's numbering" in the same parenthesis, which is exactly
+   the repair asked for.  `:19` cites `prefill.cuh:4350-4352` for
+   `VariableLengthMergeStates` and does not say it.  `src/families/attn.rs`,
+   named further down as the passer of `-DGENERATE_CUBIN=1`, went the same
+   way; it is `src/x/xqa.rs`'s `XQA_COMMON_OPTIONS` now.
+
+   The census itself has to be re-stamped rather than adjusted, for the reason
+   the CORRECTION under 2 gives at length: a count is only a count AT a
+   commit, and between `55c3e144c` and here the sweep (`1a08b179a`) deleted
+   32,974 lines of tests and examples and the descent took the modules just
+   named.  Re-derived whole at `751a0df11`,
+   over `kernels-cuda-new/src` and `driver-cuda/src`: **141 citations name a
+   file in these two trees, and 54 of them cite a line past the end of the
+   file they name.**  `cascade.cuh` is 564 lines and is cited at 637-736;
+   `prefill.cuh` is 3,788 and is cited at 4,191-4,356.  They are concentrated
+   in four files -- `src/fa2.rs` 15, `src/x/cascade.rs` 15,
+   `driver-cuda/src/fire/flashinfer_fa2_dispatch.rs` 11, `src/x/fa2.rs` 7 --
+   with the last 6 spread over `driver-cuda`'s `device/device.rs`,
+   `fire/merge_states.rs`, `fire/mod.rs` and `tower/qwen3_vl/attn.rs`.
+
+   Past-EOF is a floor and not the whole class: it is the half a walk can
+   settle without knowing the entity's name, and the in-range-but-deleted half
+   needs the names every `// PIE: REMOVED` marker below already carries.  The
+   66/38 split recorded under 2 was over a population that has since halved,
+   so it is left as the measurement it was and not carried forward.  What has
+   not changed is the conclusion: an offset cannot repair any of these, the
+   marker names the entity, and the repair is per citation.
+
 
 `xqa/hostUtils.h` is a fifth whole-file deletion in the shape of the first
 four: one `inline cudaLaunchConfig_t makeLaunchConfig(...)`, zero device text,
@@ -295,18 +410,42 @@ that fit it.  `xqa/mha_stdheaders.cuh:20` and `:976` are one-sided
 are shim-provided), `:976` carries none.  They stay for a different reason
 than the twelve, and it is a better one: that file is byte-identical to
 upstream, carries ZERO `// PIE:` markers, and the guard is UPSTREAM'S OWN
-switch, not ours.  `src/families/attn.rs` passes `-DGENERATE_CUBIN=1`, so
+switch, not ours.  `src/x/xqa.rs` passes `-DGENERATE_CUBIN=1`, so
 NVRTC never reads them.  Removing them would turn the one XQA file that needs
 no entry in any ledger into a modified file needing markers and a row, to
 delete text no compiler reaches.  The owner's own earlier survey recorded
 `mha_stdheaders.cuh` as having 0 real host lines, and that was right about
 the thing that matters.
 
+AND THE SECOND OF THE TWO IS THE OPPOSITE POLARITY, so "NVRTC never reads
+them" is true of one and false of the other.  `:20` is `#ifndef
+GENERATE_CUBIN` and NVRTC skips it.  `:976` is `#if GENERATE_CUBIN` -- the
+arm NVRTC TAKES, seven `using uint8_t = mha::uint8_t;`-shaped aliases that
+promote the file's own device typedefs to global scope, which is how the
+`GENERATE_CUBIN` build gets fixed-width names without `<cstdint>`.  It carries
+no host text, so it stays for the same conclusion by a different route: there
+is nothing there to remove.  The 12/2 split is confirmed -- 14 regions, 12
+with an `#else`, 36 host lines in those twelve arms -- and only the
+description of `:976` was wrong.
+
+`:20`'s inventory was also short.  It carries SEVEN host `#include`s, not
+four: `<algorithm>`, `<array>`, `<cstddef>`, `<cstdint>`, `<limits>`,
+`<type_traits>`, `<utility>`.  Four of the seven have a `csrc/shim` answer
+today (`cstddef`, `cstdint`, `limits`, `type_traits`) and three do not
+(`algorithm`, `array`, `utility`).  The original sentence put `<limits>` on
+the unanswered side, which was true before `c6c3ceab1` added a shim for it and
+has not been since.  Nothing follows from either split while the block is
+skipped; it is recorded because this is the file that says what is in the
+tree, and "four" was a number about a directory that had changed.
+
 Those fourteen are NOT all the host text left in `csrc/` -- an earlier draft
 of this paragraph said they were, and the `DISPATCH_*` macros below are the
-counterexample.  What is left is: fourteen guarded regions here, and ten
-`std::ostringstream` lines inside eleven `#define` bodies that nothing
-expands.  Both sets are named, counted, and argued for.
+counterexample.  What is left is: fourteen guarded regions here, and twelve
+host `std::` tokens -- ten `std::ostringstream`, plus `std::cerr` and
+`std::endl` in an eleventh body that holds no `ostringstream` -- inside eleven
+`#define` bodies that nothing expands.  Both sets are named, counted, and
+argued for.  The "eleven" was right and this sentence undercounted the tokens
+by naming only the `ostringstream`s; item 4 above has the derivation.
 
 THE DISCRIMINATOR CHANGED, and the old one is kept here because it was
 right about the facts and wrong about what to do with them.  It read: "a
@@ -362,7 +501,10 @@ under it were short by the same 20 lines and 1,069 bytes.  The drift is +4
 `added` lines wider than a naive count suggests, because the two `#else`
 branches are ours and step 1 discards them, so they are added lines too.
 `tests/upstream_manifest.rs` would have caught this the moment it ran; it is
-recorded here because the fix and the reason belong in the same place.
+recorded here because the fix and the reason belong in the same place.  That
+test has since been deleted, which makes this the sharpest illustration on the
+page of what its deletion costs: a row that disagreed with its file stood for
+months, a test found it in one run, and there is no such run now.
 
 The reason the transform survived is worth writing down, because the version
 of this note that predicted otherwise was WRONG.  It said: "a file that moves
@@ -381,14 +523,22 @@ learn the new prefix.  They also changed bracket style, `<flashinfer/...>` to
 walk follows quoted spellings and skips angled ones, so quoting these ten put
 the internalised closure inside the graph the tests check.
 
-So step 2 is still the identity, no file below spells `<pie/...>`, and the
-map in `tests/upstream_manifest.rs` is still empty.  It stays because the
-prediction it was built for is DEFERRED, not refuted: separating the device
-stdlib from the attention algorithms still rewrites upstream's lines, and the
-whole risk of that cut is still that internalising quietly becomes a fork.  A
-version bump stays re-fetch plus re-apply.
+So step 2 is still the identity and no file below spells `<pie/...>`.  The map
+it would have used was empty and lived in `tests/upstream_manifest.rs`, which
+is deleted; step 2 stays in the transform because the prediction it was built
+for is DEFERRED, not refuted -- separating the device stdlib from the
+attention algorithms still rewrites upstream's lines, and the whole risk of
+that cut is still that internalising quietly becomes a fork.  With the map's
+file gone, whoever makes that cut writes the map down here, where the rest of
+the transform already is.  A version bump stays re-fetch plus re-apply.
 
-`grep -rn "// PIE:" csrc/src/attn/flashinfer/` finds all 39 markers.
+`grep -rn "// PIE:" csrc/src/attn/flashinfer/ --include='*.cuh' --include='*.h'`
+finds all 39 markers.  The `--include` is not decoration and this sentence went
+without it for some time: THIS FILE sits in the directory being searched and
+quotes the marker form throughout, so the bare grep answers a number larger
+than 39 and larger again after every edit to this page.  The XQA sentence in
+`NOTICE` needs no filter -- that directory holds sources and `LICENSE` and
+nothing else.
 
 Columns: guards, added lines, file lines, file bytes.
 
@@ -470,14 +620,20 @@ What they DO is impersonate a header this compiler does not ship, which is
 also what `cuda_fp16.h`, `cuda_bf16.h`, `cuda_fp8.h`, `cuda_fp4.h`,
 `cooperative_groups.h` and `cuda/{cmath,pipeline,std/limits}` do, and those
 eight sat under `csrc/src/` for the mirror-image reason: our own text asks for
-them too.  All fourteen are now in `csrc/shim/`, filed by role.
+them too.  All fourteen are now in `csrc/shim/`, filed by role.  That
+directory holds twenty-one today, and its own README is the register of what
+was added and retired since; none of the seven additions is upstream's and
+none is counted in the table above.
 
 The move cannot be seen from inside a compile.  NVRTC has no `-I`: it matches
 the literal string in the directive against the names in `includeNames[]`, and
 those names are unchanged, because for a shim THE NAME IS THE CONTRACT -- a
 file called `cuda_fp16.h` is answering for NVIDIA's `cuda_fp16.h` and cannot
 be renamed without ceasing to do its job.  nvcc needed one line: a second
-`-iquote` at each of the four sites that pass the first.
+`-iquote` at each of the four sites that passed the first.  There are no such
+sites left -- nothing in the workspace compiles this device text with nvcc any
+more -- so that sentence is history and `csrc/shim/README.md` records the same
+change at length.
 
 One row in this table changed, and not because of the move: see the
 correction near the top.  Four rows LEFT it, and that was not the move
@@ -492,9 +648,12 @@ what a `// PIE: REMOVED` marker records is what a file no longer contains.
 The property this document asserts is therefore weaker than it was, and it is
 still checkable: every line that REMAINS in the twenty-four files below is
 upstream's, and every line that does not is named, counted and attributed.
-The columns are re-derived from the tree by the same code the test runs, not
-adjusted by hand -- which is the failure this file exists to have caught once
-already, at `attention/mla.cuh`.
+The columns used to be re-derived from the tree by the same code the test ran,
+rather than adjusted by hand -- which is the failure this file exists to have
+caught once already, at `attention/mla.cuh`.  The test is gone and so is that
+code.  For this revision they were re-derived with `wc -l` and `wc -c` and
+every row equals its file; the next reader has to do the same thing, and
+nothing will tell them if they do not.
 The shim group was done first for a reason that turned out to generalise: it
 was the one role whose files are neither upstream's nor included by relative
 path from an upstream file, so it moved without editing a single upstream

@@ -3,21 +3,8 @@ use std::time::{Duration, Instant};
 
 use cudarc::nvrtc::sys as nvrtc;
 
-use crate::device::DeviceKernel;
+use crate::jit::Toolchain;
 use crate::source::Header;
-use crate::unit::{Toolchain, Unit};
-
-/// One unit, compiled.
-pub struct Compiled {
-    /// The image, ready for `runtime::cache` to hand `cuModuleLoadData`.
-    pub cubin: Vec<u8>,
-    /// `(row symbol, mangled name)`, in the order the rows were asked for.
-    pub lowered: Vec<(&'static str, String)>,
-    /// What the compile alone cost.
-    pub elapsed: Duration,
-    /// NVRTC's log, captured whether or not the compile succeeded.
-    pub log: String,
-}
 
 /// Why a unit would not compile.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,10 +64,7 @@ pub fn version() -> Result<Toolchain, CompileError> {
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
         return Err(CompileError::Driver("nvrtcVersion", code as i32));
     }
-    Ok(Toolchain::new(
-        u32::try_from(major).unwrap_or(0),
-        u32::try_from(minor).unwrap_or(0),
-    ))
+    Ok(Toolchain::new(u32::try_from(major).unwrap_or(0), u32::try_from(minor).unwrap_or(0)))
 }
 
 /// Whether the NVRTC this process loaded may compile a unit whose floor is
@@ -96,55 +80,60 @@ pub fn admits(unit: &'static str, floor: Toolchain) -> Result<(), CompileError> 
     }
 }
 
-/// Compile `unit` for `arch` against the header set the unit asked for.
-pub fn compile(unit: &Unit, arch: &str) -> Result<Compiled, CompileError> {
-    let rows: Vec<&DeviceKernel> = unit.rows.iter().collect();
-    compile_with(unit, arch, &rows, unit.header_set())
+/// One compile, described by everything that decides its answer.
+pub struct Job<'a> {
+    /// What a diagnostic calls it.
+    pub name: &'static str,
+    /// The translation unit, root and any appendix already joined.
+    pub source: String,
+    /// The target architecture, as `sm_XY`.
+    pub arch: &'a str,
+    /// Options beyond the ones every compile here carries.
+    pub options: &'a [&'a str],
+    /// The carried headers `#include`s resolve against.
+    pub headers: &'a [Header],
+    /// The oldest NVRTC that may answer.
+    pub floor: Toolchain,
+    /// The instantiations to ask for, as C++ expressions.
+    pub wanted: &'a [String],
+    /// Whether the cubin must be device-linked before it will load.
+    pub device_link: bool,
 }
 
-/// Compile a chosen subset of a unit's rows.
-pub fn compile_rows(
-    unit: &Unit,
-    arch: &str,
-    rows: &[&DeviceKernel],
-) -> Result<Compiled, CompileError> {
-    compile_with(unit, arch, rows, unit.header_set())
+/// One compile, done.
+pub struct Built {
+    /// The image.
+    pub cubin: Vec<u8>,
+    /// The mangled name of each of [`Job::wanted`], in that order.
+    pub lowered: Vec<String>,
+    /// What the compile alone cost.
+    pub elapsed: Duration,
+    /// NVRTC's log.
+    pub log: String,
 }
 
-/// Compile against a doctored header set — the seam every test that proves
-pub fn compile_with(
-    unit: &Unit,
-    arch: &str,
-    rows: &[&DeviceKernel],
-    headers: &[Header],
-) -> Result<Compiled, CompileError> {
-    compile_under(unit, arch, rows, headers, unit.floor())
-}
-
-/// Compile under a stated toolchain floor — the seam a test hands a floor this
-pub fn compile_under(
-    unit: &Unit,
-    arch: &str,
-    rows: &[&DeviceKernel],
-    headers: &[Header],
-    floor: Toolchain,
-) -> Result<Compiled, CompileError> {
-    admits(unit.name, floor)?;
-    if rows.is_empty() {
+/// Compile one translation unit and resolve the names it was asked for.
+///
+/// The one place NVRTC is driven. A unit compile and a per-symbol compile
+/// differ only in what they put in [`Job::wanted`].
+pub fn compile_text(job: &Job<'_>) -> Result<Built, CompileError> {
+    let unit = job.name;
+    let arch = job.arch;
+    let headers = job.headers;
+    admits(unit, job.floor)?;
+    if job.wanted.is_empty() {
         return Err(CompileError::Refused(format!(
-            "`{}` was asked for a cubin with no instantiations in it, which would \
-             be cached under this architecture and satisfy no fire",
-            unit.name
+            "`{unit}` was asked for a cubin with no instantiations in it, which would \
+             be cached under this architecture and satisfy no fire"
         )));
     }
-    let options = options(arch, unit.options)?;
+    let options = options(arch, job.options)?;
 
     let started = Instant::now();
-    let source = unit.source(rows).map_err(CompileError::Refused)?;
-    let root = CString::new(source)
-        .map_err(|_| CompileError::Refused(format!("`{}`'s source contains a NUL", unit.name)))?;
-    let name = CString::new(unit.name)
-        .map_err(|_| CompileError::Refused(format!("the unit name `{}` has a NUL", unit.name)))?;
+    let root = CString::new(job.source.clone())
+        .map_err(|_| CompileError::Refused(format!("`{unit}`'s source contains a NUL")))?;
+    let name = CString::new(unit)
+        .map_err(|_| CompileError::Refused(format!("the unit name `{unit}` has a NUL")))?;
 
     let (header_texts, header_names) =
         crate::source::as_nvrtc_arrays(headers).map_err(CompileError::Refused)?;
@@ -170,24 +159,23 @@ pub fn compile_under(
     }
     let program = Program(handle);
 
-    let wanted: Vec<(&'static str, CString)> = rows
+    let wanted: Vec<CString> = job
+        .wanted
         .iter()
-        .map(|row| {
-            let expr = CString::new(row.instantiation()).map_err(|_| {
+        .map(|expr| {
+            CString::new(expr.as_str()).map_err(|_| {
                 CompileError::Refused(format!(
-                    "`{}` names an instantiation with a NUL in it",
-                    row.sig.symbol
+                    "`{unit}` names the instantiation `{expr}`, which has a NUL in it"
                 ))
-            })?;
-            Ok((row.sig.symbol, expr))
+            })
         })
         .collect::<Result<_, CompileError>>()?;
-    for (symbol, expr) in &wanted {
+    for expr in &wanted {
         // SAFETY: the program is live and `expr` outlives the call.
         let code = unsafe { nvrtc::nvrtcAddNameExpression(program.0, expr.as_ptr()) };
         if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
             return Err(CompileError::Nvrtc(format!(
-                "`{symbol}` names `{}`, which NVRTC would not accept as an expression",
+                "`{unit}` names `{}`, which NVRTC would not accept as an expression",
                 expr.to_string_lossy()
             )));
         }
@@ -213,20 +201,20 @@ pub fn compile_under(
     let log = log.unwrap_or_default();
 
     let mut lowered = Vec::with_capacity(wanted.len());
-    for (symbol, expr) in &wanted {
+    for expr in &wanted {
         let mut mangled: *const c_char = std::ptr::null();
         // SAFETY: the program compiled; `expr` is one of the expressions added
         let code =
             unsafe { nvrtc::nvrtcGetLoweredName(program.0, expr.as_ptr(), &raw mut mangled) };
         if code != nvrtc::nvrtcResult::NVRTC_SUCCESS || mangled.is_null() {
             return Err(CompileError::NoLoweredName {
-                symbol,
+                symbol: unit,
                 instantiation: expr.to_string_lossy().into_owned(),
             });
         }
         // SAFETY: NVRTC returns a NUL-terminated string owned by the program,
         let mangled = unsafe { CStr::from_ptr(mangled) }.to_string_lossy().into_owned();
-        lowered.push((*symbol, mangled));
+        lowered.push(mangled);
     }
 
     let mut size = 0usize;
@@ -241,15 +229,137 @@ pub fn compile_under(
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
         return Err(CompileError::Driver("nvrtcGetCUBIN", code as i32));
     }
-    unassembled_tile_ir(unit.name, &cubin)?;
+    // A leading `&` is how this crate spells a variable's name expression;
+    // a function is named bare. See `attention_mla_fa2.cuh`, which records
+    // `nvrtcAddNameExpression` refusing `smem_bytes_mla<KT>` and accepting
+    // `&smem_bytes_mla<KT>`.
+    let wants_function = job.wanted.iter().any(|w| !w.trim_start().starts_with('&'));
+    unassembled_tile_ir(unit, &cubin, wants_function)?;
+    if job.device_link {
+        cubin = device_link(unit, &cubin)?;
+    }
 
-    Ok(Compiled { cubin, lowered, elapsed: started.elapsed(), log })
+    Ok(Built { cubin, lowered, elapsed: started.elapsed(), log })
+}
+
+/// `libcudadevrt.a`, which a cooperative kernel's `grid.sync()` needs.
+///
+/// `cooperative_groups::this_grid()` lowers to `cudaCGGetIntrinsicHandle`, an
+/// extern device function `nvcc` resolves in its device-link step and NVRTC
+/// does not have: the cubin loads and `ptxas` reports
+/// `Unresolved extern function`. `cuLink` is that step, at runtime.
+fn cudadevrt() -> Result<std::ffi::CString, CompileError> {
+    let roots = ["CUDA_ROOT", "CUDA_HOME", "CUDA_PATH"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .chain(["/usr/local/cuda", "/opt/cuda"].into_iter().map(std::path::PathBuf::from));
+    for root in roots {
+        for lib in ["lib64", "lib"] {
+            let path = root.join(lib).join("libcudadevrt.a");
+            if path.exists() {
+                return std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+                    CompileError::Refused("the path to `libcudadevrt.a` contains a NUL".into())
+                });
+            }
+        }
+    }
+    Err(CompileError::Refused(
+        "a cooperative unit needs `libcudadevrt.a` and none was found under CUDA_ROOT, \
+         CUDA_HOME, CUDA_PATH, /usr/local/cuda or /opt/cuda"
+            .into(),
+    ))
+}
+
+/// Link one relocatable cubin against the CUDA device runtime.
+fn device_link(unit: &str, relocatable: &[u8]) -> Result<Vec<u8>, CompileError> {
+    use cudarc::driver::sys as dr;
+
+    let devrt = cudadevrt()?;
+    let mut state: dr::CUlinkState = std::ptr::null_mut();
+    // SAFETY: no options, so both arrays are null and the count is zero.
+    let code = unsafe {
+        dr::cuLinkCreate_v2(0, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut state)
+    };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return Err(CompileError::Driver("cuLinkCreate", code as i32));
+    }
+
+    struct Link(dr::CUlinkState);
+    impl Drop for Link {
+        fn drop(&mut self) {
+            // SAFETY: created above and destroyed exactly once.
+            unsafe { dr::cuLinkDestroy(self.0) };
+        }
+    }
+    let link = Link(state);
+
+    let name = std::ffi::CString::new(unit).unwrap_or_default();
+    // SAFETY: `relocatable` outlives the call and its length is its own.
+    let code = unsafe {
+        dr::cuLinkAddData_v2(
+            link.0,
+            dr::CUjitInputType::CU_JIT_INPUT_CUBIN,
+            relocatable.as_ptr().cast_mut().cast(),
+            relocatable.len(),
+            name.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return Err(CompileError::Driver("cuLinkAddData", code as i32));
+    }
+
+    // SAFETY: `devrt` names a file that exists and outlives the call.
+    let code = unsafe {
+        dr::cuLinkAddFile_v2(
+            link.0,
+            dr::CUjitInputType::CU_JIT_INPUT_LIBRARY,
+            devrt.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return Err(CompileError::Driver("cuLinkAddFile", code as i32));
+    }
+
+    let mut image: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut size = 0usize;
+    // SAFETY: the state holds both inputs; both out-parameters are live.
+    let code = unsafe { dr::cuLinkComplete(link.0, &raw mut image, &raw mut size) };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return Err(CompileError::Driver("cuLinkComplete", code as i32));
+    }
+    if image.is_null() || size == 0 {
+        return Err(CompileError::Refused(format!("`{unit}` linked to an empty image")));
+    }
+    // SAFETY: `cuLinkComplete` reports an image of `size` bytes owned by the
+    // link state, which `link` keeps alive across this copy.
+    let linked = unsafe { std::slice::from_raw_parts(image.cast::<u8>(), size) }.to_vec();
+    Ok(linked)
 }
 
 /// Refuse an image that is Tile IR rather than SASS.
-fn unassembled_tile_ir(unit: &str, cubin: &[u8]) -> Result<(), CompileError> {
+///
+/// `wants_function` is what makes a missing `.text` a defect. The symptom this
+/// recognises is a kernel that would answer `cuModuleGetFunction` with
+/// NOT_FOUND, and a compile that asked for no kernel has none to lose: an
+/// image holding only `__device__` variables is `.text`-less because there is
+/// nothing to put there. The smem echoes are compiled exactly that way — a
+/// `sizeof` is readable without paying to codegen the 360-symbol kernel that
+/// would otherwise have to come with it — so without this the check refuses a
+/// correct image and names the wrong cause.
+fn unassembled_tile_ir(
+    unit: &str,
+    cubin: &[u8],
+    wants_function: bool,
+) -> Result<(), CompileError> {
     let has = |needle: &[u8]| cubin.windows(needle.len()).any(|w| w == needle);
-    if has(b".note.nv.tkinfo") && !has(b".text.") {
+    if wants_function && has(b".note.nv.tkinfo") && !has(b".text.") {
         return Err(CompileError::Refused(format!(
             "`{unit}` compiled to Tile IR, not SASS: the image carries \
              `.note.nv.tkinfo` and no `.text`, so it would load and then answer \
@@ -383,7 +493,10 @@ pub fn assemble_tile_ir(
         ))
     })?;
 
-    unassembled_tile_ir("assembled tile ir", &cubin)?;
+    // `true`: assembling Tile IR is done to obtain kernels, so an image that
+    // still has no `.text` is `tileiras` having reported a success it did not
+    // deliver — the one case this check was written for.
+    unassembled_tile_ir("assembled tile ir", &cubin, true)?;
     Ok(cubin)
 }
 
@@ -406,9 +519,11 @@ fn options(arch: &str, extra: &[&str]) -> Result<Vec<CString>, CompileError> {
         c"--prec-sqrt=true".to_owned(),
     ];
     for option in extra {
-        all.push(CString::new(*option).map_err(|_| {
-            CompileError::Refused(format!("the option `{option}` contains a NUL"))
-        })?);
+        all.push(
+            CString::new(*option).map_err(|_| {
+                CompileError::Refused(format!("the option `{option}` contains a NUL"))
+            })?,
+        );
     }
     Ok(all)
 }
@@ -445,194 +560,6 @@ impl Drop for Program {
         unsafe { nvrtc::nvrtcDestroyProgram(&raw mut self.0) };
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CompileError, admits, compile_rows, compile_under, options, unassembled_tile_ir, version,
-    };
-    use crate::device::DeviceKernel;
-    use crate::unit::Toolchain;
-    use crate::x::norm::altup_aux::ALTUP_AUX as NORM_ALTUP_AUX;
-
-    /// A compile with no rows is refused, and refused before NVRTC is
-    #[test]
-    fn a_compile_with_no_rows_is_refused() {
-        assert!(!NORM_ALTUP_AUX.rows.is_empty(), "the unit under test is not the empty case");
-
-        let no_rows: Vec<&DeviceKernel> = Vec::new();
-        match compile_rows(&NORM_ALTUP_AUX, "sm_89", &no_rows) {
-            Err(CompileError::Refused(why)) => {
-                assert!(why.contains("norm/altup_aux"), "a refusal names the unit: {why}");
-            }
-            other => panic!("an empty row list must be refused, got {:?}", other.err()),
-        }
-    }
-
-    /// A virtual architecture is refused for the same reason and in the same
-    #[test]
-    fn a_virtual_architecture_is_refused() {
-        let rows: Vec<&DeviceKernel> = NORM_ALTUP_AUX.rows.iter().collect();
-        match compile_rows(&NORM_ALTUP_AUX, "compute_89", &rows) {
-            Err(CompileError::Refused(why)) => {
-                assert!(why.contains("compute_89"), "a refusal names the architecture: {why}");
-            }
-            other => panic!("`compute_89` must be refused, got {:?}", other.err()),
-        }
-        assert!(options("compute_90", &[]).is_err());
-        assert!(options("", &[]).is_err());
-    }
-
-    /// The options are the arithmetic contract, spelled out.
-    #[test]
-    fn the_options_are_the_contract() {
-        let options = options("sm_89", &[]).expect("a real architecture");
-        let spelled: Vec<&str> =
-            options.iter().map(|o| o.to_str().expect("options are ASCII")).collect();
-        assert_eq!(
-            spelled,
-            [
-                "--gpu-architecture=sm_89",
-                "-std=c++17",
-                "--fmad=false",
-                "--prec-div=true",
-                "--prec-sqrt=true",
-            ]
-        );
-    }
-
-    /// A unit's own options are appended, and the shared contract is intact
-    #[test]
-    fn a_units_own_options_come_after_the_shared_contract() {
-        let options = options("sm_89", &["--device-as-default-execution-space"])
-            .expect("a real architecture");
-        let spelled: Vec<&str> =
-            options.iter().map(|o| o.to_str().expect("options are ASCII")).collect();
-        assert_eq!(spelled[..5], [
-            "--gpu-architecture=sm_89",
-            "-std=c++17",
-            "--fmad=false",
-            "--prec-div=true",
-            "--prec-sqrt=true",
-        ]);
-        assert_eq!(spelled[5], "--device-as-default-execution-space");
-        assert_eq!(spelled.len(), 6);
-    }
-
-    /// The architecture-specific variants are architectures, not mistakes.
-    #[test]
-    fn architecture_specific_variants_are_accepted() {
-        for arch in ["sm_80", "sm_90a", "sm_100f", "sm_120"] {
-            let options = options(arch, &[]).unwrap_or_else(|e| panic!("{arch} is real: {e}"));
-            assert_eq!(options[0].to_str().expect("ASCII"), format!("--gpu-architecture={arch}"));
-        }
-    }
-
-    /// A floor this machine does not meet declines by name, and says both
-    #[test]
-    fn a_floor_above_the_loaded_nvrtc_declines_by_name() {
-        let have = version().expect("this crate cannot compile without NVRTC anyway");
-        let unreachable = Toolchain::new(have.major, have.minor + 1);
-
-        match admits("norm/altup_aux", unreachable) {
-            Err(CompileError::Toolchain { unit, needs, have: found }) => {
-                assert_eq!(unit, "norm/altup_aux", "a decline names the unit");
-                assert_eq!(needs, unreachable);
-                assert_eq!(found, have, "and reports what it found, not what it wanted");
-            }
-            other => panic!("a floor above the loaded NVRTC must decline, got {other:?}"),
-        }
-
-        assert!(admits("norm/altup_aux", have).is_ok(), "the loaded version meets its own floor");
-        assert!(admits("norm/altup_aux", Toolchain::ANY).is_ok());
-    }
-
-    /// A version gap is not a [`CompileError::Refused`], and the compile path
-    #[test]
-    fn a_version_gap_is_not_a_refusal() {
-        let have = version().expect("NVRTC is loaded");
-        let rows: Vec<&DeviceKernel> = NORM_ALTUP_AUX.rows.iter().collect();
-        let unreachable = Toolchain::new(have.major + 1, 0);
-
-        let why = declined(
-            compile_under(&NORM_ALTUP_AUX, "sm_89", &rows, NORM_ALTUP_AUX.header_set(), unreachable),
-            "a unit whose floor is not met is not compiled by an older compiler",
-        );
-        assert!(
-            matches!(why, CompileError::Toolchain { .. }),
-            "a version gap has its own variant: {why:?}"
-        );
-        assert!(!matches!(why, CompileError::Refused(_)), "and is not a bad-argument refusal");
-
-        let rendered = why.to_string();
-        assert!(rendered.contains("norm/altup_aux"), "{rendered}");
-        assert!(rendered.contains(&unreachable.to_string()), "which version it needed: {rendered}");
-        assert!(rendered.contains(&have.to_string()), "and which it found: {rendered}");
-
-        let refused = declined(
-            compile_under(
-                &NORM_ALTUP_AUX,
-                "compute_89",
-                &rows,
-                NORM_ALTUP_AUX.header_set(),
-                Toolchain::ANY,
-            ),
-            "a virtual architecture is refused",
-        );
-        assert!(matches!(refused, CompileError::Refused(_)), "{refused:?}");
-
-        let none: Vec<&DeviceKernel> = Vec::new();
-        let first = declined(
-            compile_under(&NORM_ALTUP_AUX, "sm_89", &none, NORM_ALTUP_AUX.header_set(), unreachable),
-            "both are wrong",
-        );
-        assert!(matches!(first, CompileError::Toolchain { .. }), "{first:?}");
-    }
-
-    /// The error out of a compile that must not have produced a cubin.
-    fn declined(result: Result<super::Compiled, CompileError>, why: &str) -> CompileError {
-        match result {
-            Err(error) => error,
-            Ok(compiled) => panic!("{why}, and instead it produced {} bytes", compiled.cubin.len()),
-        }
-    }
-
-    /// The version this process loaded is a real one, and asking twice gives
-    #[test]
-    fn the_loaded_nvrtc_reports_a_version() {
-        let have = version().expect("NVRTC is loaded");
-        assert_eq!(have, version().expect("and stays loaded"));
-        assert!(have.major >= 11, "NVRTC has reported a major version since 7.0: {have}");
-        assert!(!have.is_any(), "`any` is the absence of a floor, never a version");
-        println!("nvrtcVersion says {have}");
-    }
-
-    /// The Tile IR guard, against images shaped like the two NVRTC produces.
-    #[test]
-    fn tile_ir_is_refused_and_sass_is_not() {
-        let tile_ir = b"\x7fELF...\x00.note.nv.tkinfo\x00.nv.info\x00".to_vec();
-        let err = unassembled_tile_ir("moe/moe_grouped_gemm_tile", &tile_ir)
-            .expect_err("an image with tkinfo and no .text must be refused");
-        let said = format!("{err:?}");
-        assert!(
-            said.contains("Tile IR") && said.contains("tileiras"),
-            "the refusal has to name what happened and what to install: {said}"
-        );
-
-        let sass = b"\x7fELF...\x00.text._ZN3pie6kernel1kEv\x00.nv.info\x00".to_vec();
-        assert!(
-            unassembled_tile_ir("norm/rmsnorm", &sass).is_ok(),
-            "an ordinary cubin must pass untouched"
-        );
-
-        let assembled = b"\x7fELF\x00.note.nv.tkinfo\x00.text._ZN1kEv\x00".to_vec();
-        assert!(
-            unassembled_tile_ir("moe/moe_grouped_gemm_tile", &assembled).is_ok(),
-            "tkinfo WITH .text is an assembled tile cubin and this box runs those"
-        );
-    }
-}
-
 #[cfg(test)]
 mod tile_header_trap {
     use super::tile_header_mismatch;
@@ -734,10 +661,7 @@ mod tile_assembly {
         let e = refusal(
             assemble_tile_ir(b"", "sm_89", Path::new("/nonexistent/tileiras")).unwrap_err(),
         );
-        assert!(
-            e.contains("nvidia-cuda-tileiras"),
-            "the refusal must name the wheel: {e}"
-        );
+        assert!(e.contains("nvidia-cuda-tileiras"), "the refusal must name the wheel: {e}");
         assert!(
             e.contains("nothing cross-checks the four"),
             "and must say why the version is not obvious: {e}"

@@ -5819,31 +5819,6 @@ pub mod cuda {
         .expect("the reorder produces its value")
     }
 
-    /// `kernels::moe::scatter_add_weighted_bf16`: fold the routed rows back
-    /// onto the residual stream, each scaled by its router weight.
-    ///
-    /// `out[dst_idx[i]] += src[i] · row_weights[i]`. `whole` because
-    /// `dst_idx` is route-global: a window over output ROWS is not a window
-    /// over routes.
-    pub fn scatter_add_weighted(
-        out: &Val,
-        src: &Val,
-        dst_idx: &Val,
-        row_weights: &Val,
-        hidden: u32,
-    ) -> Val {
-        record(
-            &out.t,
-            out.layer,
-            "moe::scatter_add_weighted_bf16",
-            vec![],
-            None,
-            vec![out.id, src.id, dst_idx.id, row_weights.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the combine produces its value")
-    }
-
     // ── MLA: latent attention ──────────────────────────────────────
     //
     // deepseek_v4, glm5 and kimi_k3 all attend through a LATENT KV: the
@@ -6897,11 +6872,6 @@ pub mod cuda {
     /// here is what lets the body emit ONE op where the semantic text
     /// emits a WeightedSum and a ResidualAdd — the fusion is a kernel
     /// fact, so it belongs in the CUDA reading, not in the trace shape.
-    ///
-    /// The per-expert `kernels::moe::scatter_add_weighted_bf16` loop is the
-    /// OTHER combine, and it is not stated here: it runs once per expert
-    /// with a row count the host learned from a device readback, which
-    /// is a launch count no declaration fixes.
     pub fn weighted_sum(weights: &Val, x: &Val, hidden: u32, residual: Option<&Val>) -> Val {
         let mut inputs = vec![x.id, weights.id];
         if let Some(r) = residual {

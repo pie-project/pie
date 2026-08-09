@@ -132,10 +132,7 @@ impl std::fmt::Debug for StageHooks<'_> {
 /// zero-default there would silently disable every hook.
 #[must_use]
 pub fn default_hooks<'a>() -> StageHooks<'a> {
-    StageHooks {
-        hook_rows_k: u32::MAX,
-        ..StageHooks::default()
-    }
+    StageHooks { hook_rows_k: u32::MAX, ..StageHooks::default() }
 }
 
 impl<'a> StageHooks<'a> {

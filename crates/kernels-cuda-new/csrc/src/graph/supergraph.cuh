@@ -116,16 +116,18 @@
 // `<<<1, 1>>>` and none should for two rows (`new-horizon.md` §10.5), so both
 // rows are `LaunchRule::Unstated` and the driver builds the `Launch`.
 //
-// # The handle crosses as `u64`, and that is `Ty::Usize` exactly
+// # The handle crosses as `usize`, and that is `Ty::Usize` exactly
 //
 // `cudaGraphConditionalHandle` is `unsigned long long` (`driver_types.h`),
 // which on LP64 is a DIFFERENT type from `size_t` with the same width -- so
-// the parameter below is the prelude's `u64` (`decltype(sizeof(0))`, i.e.
-// `size_t`), the row says `Ty::Usize`, and the one conversion happens at the
-// one call, cast explicitly. Spelling the parameter `unsigned long long` and
-// the row `Ty::Usize` would compile here and fail
-// `abi::emit_device_typecheck`'s function-pointer initialisation, which is
-// the check that exists to catch exactly this.
+// the parameter below is the prelude's `usize` (`decltype(sizeof(0))`), the
+// row says `Ty::Usize`, and the one conversion happens at the one call, cast
+// explicitly. Spelling the parameter `unsigned long long` and the row
+// `Ty::Usize` would compile here and fail the device typecheck's
+// function-pointer initialisation, which is the check that exists to catch
+// exactly this -- and did: the parameter said `u64`, which was a synonym for
+// `usize` until `pie_device.cuh` stopped deriving the 64-bit pair from the
+// pointer-width pair, and the assertion caught the day it stopped.
 //
 //===----------------------------------------------------------------------===//
 #pragma once
@@ -155,12 +157,12 @@ namespace pie_cuda_driver::kernels::graph::device {
 
 // The scalar layer is the PRELUDE's, named here so the kernels below read as
 // they did when they were `std::uint8_t` and `unsigned long long`.
-using ::pie_cuda_driver::kernels::device::u64;
+using ::pie_cuda_driver::kernels::device::usize;
 using ::pie_cuda_driver::kernels::device::u8;
 
 // Arms `handle` from `preds[slot]` as a BOOLEAN: the conditional node
 // downstream takes its IF branch when the byte is non-zero.
-__global__ void supergraph_set_cond(u64 handle, const u8* __restrict__ preds, int slot) {
+__global__ void supergraph_set_cond(usize handle, const u8* __restrict__ preds, int slot) {
     cudaGraphSetConditional(static_cast<unsigned long long>(handle), preds[slot]);
 }
 
@@ -175,7 +177,7 @@ __global__ void supergraph_set_cond(u64 handle, const u8* __restrict__ preds, in
 // this kernel deliberately does NOT clamp: a fire whose predicate says "arm
 // 4" of a three-arm switch has a lowering/driver disagreement, and running
 // arm 0 instead would answer with the wrong program rather than with nothing.
-__global__ void supergraph_set_switch(u64 handle, const u8* __restrict__ preds, int slot) {
+__global__ void supergraph_set_switch(usize handle, const u8* __restrict__ preds, int slot) {
     cudaGraphSetConditional(static_cast<unsigned long long>(handle),
                             static_cast<unsigned int>(preds[slot]));
 }

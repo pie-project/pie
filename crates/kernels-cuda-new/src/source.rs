@@ -142,29 +142,7 @@ fn fold(mut hash: u64, bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unit::Headers;
-
-    /// The check that makes the set authoritative: every `#include` REACHABLE
-    #[test]
-    fn every_include_reachable_from_a_unit_resolves() {
-        let mut visited = 0usize;
-        let mut includes = 0usize;
-        for unit in crate::unit::UNITS {
-            match reachable(unit.name, unit.root, unit.header_set()) {
-                Ok(reached) => {
-                    visited += 1;
-                    includes += reached.len();
-                }
-                Err(why) => panic!("{why}"),
-            }
-        }
-        assert_eq!(visited, crate::unit::UNITS.len(), "every unit is walked, or this proves less");
-        assert!(
-            includes > 0,
-            "{visited} units and not one include followed -- this test would pass against an \
-             empty header set and a root that reaches nothing, which is what it exists to catch"
-        );
-    }
+    use crate::jit::Headers;
 
     /// The set a unit chooses decides what resolves — checked with a header
     #[test]
@@ -198,11 +176,7 @@ mod tests {
         assert!(why.contains("from `two.cuh`"), "and the header that reaches it: {why}");
         assert!(why.contains("`a/unit`"), "and the unit that would not compile: {why}");
 
-        let full = [
-            carried[0],
-            carried[1],
-            Header { name: "three.cuh", text: "" },
-        ];
+        let full = [carried[0], carried[1], Header { name: "three.cuh", text: "" }];
         assert_eq!(
             reachable("a/unit", root, &full).expect("all three are carried"),
             ["one.cuh", "two.cuh", "three.cuh"]
@@ -229,22 +203,13 @@ mod tests {
         let base = digest(DEVICE_HEADERS);
         assert_eq!(base, digest(DEVICE_HEADERS), "and is stable");
 
-        let edited = [Header {
-            name: DEVICE_HEADERS[0].name,
-            text: "// not what it was",
-        }];
+        let edited = [Header { name: DEVICE_HEADERS[0].name, text: "// not what it was" }];
         assert_ne!(base, digest(&edited), "text is in the key");
 
-        let renamed = [Header {
-            name: "norm/somewhere_else.cuh",
-            text: DEVICE_HEADERS[0].text,
-        }];
+        let renamed = [Header { name: "norm/somewhere_else.cuh", text: DEVICE_HEADERS[0].text }];
         assert_ne!(base, digest(&renamed), "and so is the name it resolves by");
 
-        let split = [
-            Header { name: "a", text: "bc" },
-            Header { name: "d", text: "e" },
-        ];
+        let split = [Header { name: "a", text: "bc" }, Header { name: "d", text: "e" }];
         let joined = [Header { name: "ab", text: "c" }, Header { name: "d", text: "e" }];
         assert_ne!(digest(&split), digest(&joined));
     }

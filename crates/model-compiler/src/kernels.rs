@@ -1,7 +1,7 @@
 //! ② KERNEL SIGNATURES — the compiler's end of the tables.
 //!
 //! The rows moved out. A kernel's contract belongs beside the kernel, so the
-//! CUDA table is [`kernels_cuda::KERNELS`] and the Metal one is
+//! CUDA table is [`kernels_cuda_new::sigs`] and the Metal one is
 //! [`kernels_metal::KERNELS`], each in the crate that also holds the `.cu` /
 //! `.metal` it describes — one source file and one table row, same directory,
 //! same diff hunk. The words a row is written in are the `kernels` crate's,
@@ -22,7 +22,7 @@ use crate::trace::{ForwardPlan, OpKind};
 // surface. `Cap` and `Prepare` are named by model texts and by the tests
 // below; `KernelSig` is what `trace` and `emit_cuda` hold a reference to.
 pub use kernels::{Cap, KernelSig, Prepare};
-pub use kernels_cuda_new::table::KERNELS;
+pub use kernels_cuda_new::sigs;
 pub use kernels_metal::KERNELS as KERNELS_METAL;
 
 /// Which backend's kernels a lowered trace states.
@@ -51,7 +51,7 @@ impl Backend {
 
     pub fn table(self) -> &'static [KernelSig] {
         match self {
-            Backend::Cuda => KERNELS,
+            Backend::Cuda => sigs(),
             Backend::Metal => KERNELS_METAL,
         }
     }
@@ -90,11 +90,7 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
         let inside_peel = peeled > 0;
         peeled = peeled.saturating_sub(1);
         match &op.kind {
-            OpKind::Peel {
-                prefix_ops,
-                tail_ops,
-                ..
-            } => {
+            OpKind::Peel { prefix_ops, tail_ops, .. } => {
                 peeled = peeled.max(*prefix_ops as usize + *tail_ops as usize);
             }
             OpKind::Launch { kernel, .. } => match backend.and_then(|b| sig_in(b, kernel)) {
@@ -127,9 +123,7 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
 /// Reads the BACKEND's table, which is why it takes the plan: the family
 /// name says which backend, exactly as `check_plan` reads it.
 pub fn in_place_pairs(plan: &ForwardPlan, kernel: &str) -> &'static [(u32, u32)] {
-    Backend::of_family(&plan.family)
-        .and_then(|b| sig_in(b, kernel))
-        .map_or(&[][..], |s| s.in_place)
+    Backend::of_family(&plan.family).and_then(|b| sig_in(b, kernel)).map_or(&[][..], |s| s.in_place)
 }
 
 /// Which outputs a SEMANTIC op writes over which inputs.

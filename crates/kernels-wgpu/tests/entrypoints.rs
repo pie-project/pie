@@ -716,9 +716,15 @@ const FIELDS: [&str; 12] = [
 ///
 /// Each for its own reason, and each asserted still to BE a field — an
 /// exclusion that outlives its subject hides nothing and should go.
-const UNCOMPARED: [(&str, &str); 4] = [
+const UNCOMPARED: [(&str, &str); 5] = [
     ("name", "the key this map is built on"),
     ("symbol", "the key this map is built on"),
+    (
+        "args",
+        "DERIVED from a routine's `fn` signature, so no table states it in \
+         source and a scrape of these files would find nothing to compare; \
+         empty in all three of these tables, and only CUDA's fills it",
+    ),
     (
         "file",
         "the one thing the three tables are SUPPOSED to disagree about: \

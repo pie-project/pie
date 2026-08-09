@@ -29,15 +29,6 @@ pub enum Error {
         /// Which way it did not work out.
         why: crate::runtime::Ungeometric,
     },
-    /// The values did not match the row.
-    Args(crate::runtime::ArgError),
-    /// The row's arm could not be chosen or could not be filled.
-    Specialise {
-        /// The row whose specialisation did not work out — the base symbol
-        symbol: &'static str,
-        /// What did not line up.
-        why: String,
-    },
     /// The driver refused.
     Driver {
         /// The call that failed, spelled as CUDA spells it.
@@ -63,10 +54,6 @@ impl std::fmt::Display for Error {
             Error::Geometry { symbol, why } => {
                 write!(f, "`{symbol}` states a launch these dims cannot satisfy: {why:?}")
             }
-            Error::Args(why) => write!(f, "{why}"),
-            Error::Specialise { symbol, why } => {
-                write!(f, "`{symbol}` states a specialisation this fire could not take: {why}")
-            }
             Error::Driver { what, code, why } => write!(f, "{what} failed with {code} ({why})"),
         }
     }
@@ -75,14 +62,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Args(why) => Some(why),
             _ => None,
         }
-    }
-}
-
-impl From<crate::runtime::ArgError> for Error {
-    fn from(why: crate::runtime::ArgError) -> Self {
-        Error::Args(why)
     }
 }

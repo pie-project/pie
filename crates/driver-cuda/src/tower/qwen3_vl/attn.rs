@@ -163,8 +163,7 @@ fn ensure(slot: &mut Option<Res>) -> Result<&mut Res> {
             klpl: None,
         });
     }
-    slot.as_mut()
-        .ok_or_else(|| Error::invalid(WHO, "the attention resources were not raised"))
+    slot.as_mut().ok_or_else(|| Error::invalid(WHO, "the attention resources were not raised"))
 }
 
 /// Upload a `u32` run into a held buffer, replacing it when it is too small.
@@ -186,9 +185,8 @@ fn upload(
         *held = None;
         *held = Some(alloc.alloc(bytes.len().max(1))?);
     }
-    let buffer = held
-        .as_mut()
-        .ok_or_else(|| Error::invalid(WHO, "an index buffer went missing"))?;
+    let buffer =
+        held.as_mut().ok_or_else(|| Error::invalid(WHO, "an index buffer went missing"))?;
     buffer.copy_from_host(bytes, stream)
 }
 
@@ -236,7 +234,7 @@ pub(super) fn attend(
         total = total
             .checked_add(len)
             .ok_or_else(|| Error::invalid(WHO, "the batched patch count overflowed an int"))?;
-        let pages = len.div_ceil(PAGE_SIZE);
+        let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
         qo[i + 1] = qo[i] + len.unsigned_abs();
         kvpi[i + 1] = kvpi[i] + pages.unsigned_abs();
         klpl[i] = (len - (pages - 1) * PAGE_SIZE).unsigned_abs();
@@ -318,16 +316,10 @@ pub(super) fn attend(
         st.sig = Some(sig);
     }
 
-    let (Some(qo_d), Some(kvpi_d), Some(kvidx_d), Some(klpl_d)) = (
-        st.qo.as_ref(),
-        st.kvpi.as_ref(),
-        st.kvidx.as_ref(),
-        st.klpl.as_ref(),
-    ) else {
-        return Err(Error::invalid(
-            WHO,
-            "the plan is current but its index buffers are not held",
-        ));
+    let (Some(qo_d), Some(kvpi_d), Some(kvidx_d), Some(klpl_d)) =
+        (st.qo.as_ref(), st.kvpi.as_ref(), st.kvidx.as_ref(), st.klpl.as_ref())
+    else {
+        return Err(Error::invalid(WHO, "the plan is current but its index buffers are not held"));
     };
     #[allow(clippy::cast_precision_loss)]
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();

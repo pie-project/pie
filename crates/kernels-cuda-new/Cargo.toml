@@ -99,36 +99,13 @@ tracing = "0.1"
 # pulls in beside it.
 kernels = { path = "../kernels" }
 
-# The probes need a CUDA runtime, and `cargo test` builds examples -- so
-# without this a feature-free `cargo test` fails on `use cudarc`, which is the
-# one build this crate most wants to keep working. `required-features` is how
-# a target says "skip me" rather than "fail"; the alternative, `#[cfg]` inside
-# each example, leaves a file whose every item is compiled out and whose `main`
-# still has to exist.
-#
-# Autodiscovery stays ON, so a new `examples/*.rs` is picked up as before. A
-# new probe that touches `cudarc` must be declared here too, or it breaks the
-# feature-free build the same way -- which is why every entry below names the
-# same feature and why they are listed together.
-[[example]]
-name = "header_probe"
-required-features = ["_cuda"]
 
-[[example]]
-name = "stdlib_probe"
-required-features = ["_cuda"]
 
-[[example]]
-name = "cg_probe"
-required-features = ["_cuda"]
 
 [[example]]
 name = "mma_probe"
 required-features = ["_cuda"]
 
-[[example]]
-name = "flashinfer_probe"
-required-features = ["_cuda"]
 
 [[example]]
 name = "fp8_pipeline_probe"
@@ -138,47 +115,12 @@ required-features = ["_cuda"]
 name = "halftype_parity"
 required-features = ["_cuda"]
 
-# Reads the tables and nothing else, so it runs on a machine with no CUDA --
-# which is when someone is most likely to ask how far the migration got.
-[[example]]
-name = "migration_status"
 
-[[example]]
-name = "unit_probe_attn_heavy"
-required-features = ["_cuda"]
 
-[[example]]
-name = "unit_probe_attn_small"
-required-features = ["_cuda"]
 
-[[example]]
-name = "unit_probe_mlp"
-required-features = ["_cuda"]
 
-[[example]]
-name = "unit_probe_norm"
-required-features = ["_cuda"]
 
-[[example]]
-name = "unit_probe_quant"
-required-features = ["_cuda"]
 
-[[example]]
-name = "unit_probe_rope_layout"
-required-features = ["_cuda"]
 
-[[example]]
-name = "unit_probe_ssm"
-required-features = ["_cuda"]
 
-[[example]]
-name = "argform_probe"
-required-features = ["_cuda"]
 
-# Measures whether three rows classified "no device text in this tree" would
-# vendor into `csrc/vendor/flashinfer/` and compile under NVRTC. It stages
-# upstream text in memory from the tree CPM already fetched -- it writes
-# nothing and migrates nothing.
-[[example]]
-name = "vendor_probe"
-required-features = ["_cuda"]

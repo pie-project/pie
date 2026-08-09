@@ -36,7 +36,7 @@
 //!
 //! A `__global__` that takes a struct **by value** — XQA's
 //! `KVCacheList<true>` at `xqa/mha.cuh:2804`, FA2's `__grid_constant__`
-//! params — crosses as [`ArgValue::Bytes`](crate::runtime::ArgValue::Bytes),
+//! params — crosses as [`ArgValue::Bytes`](crate::jit::ArgValue::Bytes),
 //! which is a borrowed `(ptr, len)`. That is the reason this trait's one
 //! method takes `&self` rather than `self`:
 //!
@@ -54,19 +54,32 @@
 //!
 //! **What a by-value aggregate is checked by**, since no `Ty` can name it:
 //!
-//! 1. [`typecheck_tu`] compares the whole `__global__` parameter list
-//!    against [`Abi::CPP`], so an aggregate declared where the kernel takes
-//!    a pointer — or the wrong aggregate — is a C++ compile error.
-//! 2. [`by_value!`](crate::by_value) asserts the Rust mirror's `size_of`,
+//! 1. [`by_value!`](crate::by_value) asserts the Rust mirror's `size_of`,
 //!    `align_of` and every `offset_of` against numbers **measured out of
 //!    NVRTC's PTX**, in `const` context, so a drifted mirror is a Rust
 //!    compile error.
-//! 3. [`typecheck_tu`] emits the same numbers as C++ `static_assert`s, so a
-//!    drifted *header* is a C++ compile error.
+//! 2. [`typecheck_tu`] emits the same numbers as C++ `static_assert`s over
+//!    the header's own declaration, so a drifted *header* is a C++ compile
+//!    error. `tests/typecheck_tu.rs` compiles one per root that declares an
+//!    aggregate.
 //!
-//! (2) and (3) are the same measurement asserted from both sides. That is
-//! the whole defence, and it is stronger than the tag it replaces: `Ty`
-//! could never have said anything about a field offset.
+//! The two are the same measurement asserted from both sides, and that is
+//! stronger than the tag it replaces: `Ty` could never have said anything
+//! about a field offset.
+//!
+//! **What is NOT checked, and why not yet.** A third check belongs here —
+//! comparing a `__global__`'s whole parameter list against the [`Abi::CPP`]
+//! of the routine that launches it, so that an aggregate passed where the
+//! kernel takes a pointer is a compile error rather than a garbage read.
+//! Every piece of it exists: [`Abi::CPP`] per type, and
+//! [`Routine::spelling`](kernels::routine::Routine::spelling) per routine,
+//! derived from the signature. What is missing is the PAIRING. A routine
+//! names its instantiation inside its body rather than in data, so nothing
+//! can ask a routine which template-id it launches; and even paired, the
+//! `&[..]` list a body hands `Ctx::launch` is not its own parameter list,
+//! because bodies compute derived arguments. Making this reachable wants
+//! `Ctx::launch` generic over a tuple of [`Abi`] types, so the spellings
+//! derive at the launch site where the pairing already exists.
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -104,8 +117,51 @@ pub trait Abi: Copy {
     /// `&self` and not `self`: a by-value aggregate answers with a pointer
     /// INTO the receiver, so the receiver must be the caller's binding and
     /// not a moved copy in this frame. See the module header.
-    #[cfg(feature = "_cuda")]
-    fn arg(&self) -> crate::runtime::ArgValue;
+    fn arg(&self) -> crate::jit::ArgValue;
+
+    /// The same crossing, the other way: recover this type from a value bound
+    /// at position `at`.
+    ///
+    /// This is what `call()` goes through. It is on the same impl as
+    /// [`Abi::arg`] so the two directions cannot disagree about which
+    /// `ArgValue` variant this type is.
+    ///
+    /// # Errors
+    ///
+    /// [`kernels::Refusal::Kind`] if the value is of another kind.
+    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal>;
+}
+
+/// The refusal every [`Abi::unpack`] gives for a value of the wrong kind.
+const fn wrong_kind(at: usize, want: Ty) -> kernels::Refusal {
+    kernels::Refusal::Kind { at, want }
+}
+
+/// [`Abi::unpack`] for a by-value aggregate: the bytes, read back as `T`.
+///
+/// The length is compared against the mirror's own `size_of` rather than
+/// trusted, because a short read here would be a launch with a struct half
+/// filled from whatever follows it.
+///
+/// # Errors
+///
+/// [`kernels::Refusal::Kind`] if the value is not bytes, or is the wrong
+/// number of them.
+pub fn unpack_aggregate<T: Copy>(
+    value: &crate::jit::ArgValue,
+    at: usize,
+    want: Ty,
+) -> Result<T, kernels::Refusal> {
+    match value {
+        crate::jit::ArgValue::Bytes { ptr, len } if *len == core::mem::size_of::<T>() => {
+            // SAFETY: `ArgValue::Bytes` states `len` initialised bytes at
+            // `ptr` for this call's duration, and `len` is `T`'s own size.
+            // Read unaligned because the caller's buffer need not be aligned
+            // for `T`.
+            Ok(unsafe { ptr.cast::<T>().read_unaligned() })
+        }
+        _ => Err(wrong_kind(at, want)),
+    }
 }
 
 /// `bf16` — brain float, the device text's own spelling.
@@ -170,11 +226,17 @@ macro_rules! scalar_abi {
         impl Abi for $rust {
             const CPP: &'static str = $cpp;
             const TY: Ty = Ty::$ty;
-            #[cfg(feature = "_cuda")]
-            fn arg(&self) -> crate::runtime::ArgValue {
-                crate::runtime::ArgValue::$arg(*self)
+            fn arg(&self) -> crate::jit::ArgValue {
+                crate::jit::ArgValue::$arg(*self)
+            }
+            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
+                match value {
+                    crate::jit::ArgValue::$arg(v) => Ok(*v),
+                    _ => Err(wrong_kind(at, Ty::$ty)),
+                }
             }
         }
+        $crate::arg_via_abi!($rust);
     };
 }
 
@@ -217,11 +279,18 @@ pub struct fp8_kind(pub u32);
 impl Abi for fp8_kind {
     const CPP: &'static str = "::__nv_fp8_interpretation_t";
     const TY: Ty = Ty::Fp8Kind;
-    #[cfg(feature = "_cuda")]
-    fn arg(&self) -> crate::runtime::ArgValue {
-        crate::runtime::ArgValue::U32(self.0)
+    fn arg(&self) -> crate::jit::ArgValue {
+        crate::jit::ArgValue::U32(self.0)
+    }
+    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
+        match value {
+            crate::jit::ArgValue::U32(v) => Ok(Self(*v)),
+            _ => Err(wrong_kind(at, Ty::Fp8Kind)),
+        }
     }
 }
+
+crate::arg_via_abi!(fp8_kind);
 
 // No scalar `u8`, and not an oversight: `Ty` has no general byte tag — the
 // row world only ever crossed a scalar byte as a semantic enum (`KvScheme`,
@@ -239,17 +308,27 @@ macro_rules! ptr_abi {
         impl Abi for *const $pointee {
             const CPP: &'static str = $const_cpp;
             const TY: Ty = Ty::$const_ty;
-            #[cfg(feature = "_cuda")]
-            fn arg(&self) -> crate::runtime::ArgValue {
-                crate::runtime::ArgValue::Ptr(*self as *mut c_void)
+            fn arg(&self) -> crate::jit::ArgValue {
+                crate::jit::ArgValue::Ptr(*self as *mut c_void)
+            }
+            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
+                match value {
+                    crate::jit::ArgValue::Ptr(p) => Ok(p.cast::<$pointee>().cast_const()),
+                    _ => Err(wrong_kind(at, Ty::$const_ty)),
+                }
             }
         }
         impl Abi for *mut $pointee {
             const CPP: &'static str = $mut_cpp;
             const TY: Ty = Ty::$mut_ty;
-            #[cfg(feature = "_cuda")]
-            fn arg(&self) -> crate::runtime::ArgValue {
-                crate::runtime::ArgValue::Ptr(self.cast::<c_void>())
+            fn arg(&self) -> crate::jit::ArgValue {
+                crate::jit::ArgValue::Ptr(self.cast::<c_void>())
+            }
+            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
+                match value {
+                    crate::jit::ArgValue::Ptr(p) => Ok(p.cast::<$pointee>()),
+                    _ => Err(wrong_kind(at, Ty::$mut_ty)),
+                }
             }
         }
         /// A pointer the launcher accepts a null for.
@@ -257,11 +336,16 @@ macro_rules! ptr_abi {
             const CPP: &'static str = $mut_cpp;
             const TY: Ty = Ty::$mut_ty;
             const NULLABLE: bool = true;
-            #[cfg(feature = "_cuda")]
-            fn arg(&self) -> crate::runtime::ArgValue {
-                crate::runtime::ArgValue::Ptr(
+            fn arg(&self) -> crate::jit::ArgValue {
+                crate::jit::ArgValue::Ptr(
                     self.map_or(core::ptr::null_mut(), |p| p.as_ptr().cast::<c_void>()),
                 )
+            }
+            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
+                match value {
+                    crate::jit::ArgValue::Ptr(p) => Ok(NonNull::new(p.cast::<$pointee>())),
+                    _ => Err(wrong_kind(at, Ty::$mut_ty)),
+                }
             }
         }
         /// A `const` pointer the launcher accepts a null for.
@@ -269,13 +353,26 @@ macro_rules! ptr_abi {
             const CPP: &'static str = $const_cpp;
             const TY: Ty = Ty::$const_ty;
             const NULLABLE: bool = true;
-            #[cfg(feature = "_cuda")]
-            fn arg(&self) -> crate::runtime::ArgValue {
-                crate::runtime::ArgValue::Ptr(
+            fn arg(&self) -> crate::jit::ArgValue {
+                crate::jit::ArgValue::Ptr(
                     self.0.map_or(core::ptr::null_mut(), |p| p.as_ptr().cast::<c_void>()),
                 )
             }
+            fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
+                match value {
+                    crate::jit::ArgValue::Ptr(p) => {
+                        Ok(MaybeConst(NonNull::new(p.cast::<$pointee>())))
+                    }
+                    _ => Err(wrong_kind(at, Ty::$const_ty)),
+                }
+            }
         }
+        $crate::arg_via_abi!(
+            *const $pointee,
+            *mut $pointee,
+            Option<NonNull<$pointee>>,
+            MaybeConst<$pointee>,
+        );
     };
 }
 
@@ -463,11 +560,18 @@ pub struct Stream(pub *mut c_void);
 impl Abi for Stream {
     const CPP: &'static str = "cudaStream_t";
     const TY: Ty = Ty::Stream;
-    #[cfg(feature = "_cuda")]
-    fn arg(&self) -> crate::runtime::ArgValue {
-        crate::runtime::ArgValue::Ptr(self.0)
+    fn arg(&self) -> crate::jit::ArgValue {
+        crate::jit::ArgValue::Ptr(self.0)
+    }
+    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
+        match value {
+            crate::jit::ArgValue::Ptr(p) => Ok(Self(*p)),
+            _ => Err(wrong_kind(at, Ty::Stream)),
+        }
     }
 }
+
+crate::arg_via_abi!(Stream);
 
 /// A device address held as an opaque word.
 ///
@@ -521,7 +625,7 @@ pub trait ByValue: Abi {
 /// # What this generates
 ///
 /// 1. An [`Abi`] impl whose [`arg`](Abi::arg) is
-///    [`ArgValue::Bytes`](crate::runtime::ArgValue::Bytes) over the
+///    [`ArgValue::Bytes`](crate::jit::ArgValue::Bytes) over the
 ///    receiver. That makes the aggregate an ORDINARY `Abi` type: a
 ///    [`unit!`](crate::unit) declaration names it exactly the way it names
 ///    `f32`, and nothing in `unit!`, `contract!` or `bind!` knows the
@@ -590,17 +694,23 @@ macro_rules! by_value {
         impl $crate::x::Abi for $rust {
             const CPP: &'static str = $cpp;
             const TY: ::kernels::Ty = ::kernels::Ty::$tag;
-            #[cfg(feature = "_cuda")]
-            fn arg(&self) -> $crate::runtime::ArgValue {
+            fn arg(&self) -> $crate::jit::ArgValue {
                 // The borrow is of the caller's binding, which outlives the
-                // `fire` call; `Args::bind` copies out of it before it
-                // returns. See `abi`'s header for why this is `&self`.
-                $crate::runtime::ArgValue::Bytes {
+                // `fire` call; the launch copies out of it before it returns.
+                // See `abi`'s header for why this is `&self`.
+                $crate::jit::ArgValue::Bytes {
                     ptr: ::core::ptr::from_ref::<$rust>(self).cast::<u8>(),
                     len: ::core::mem::size_of::<$rust>(),
                 }
             }
+            fn unpack(
+                value: &$crate::jit::ArgValue,
+                at: usize,
+            ) -> ::core::result::Result<Self, ::kernels::Refusal> {
+                $crate::x::abi::unpack_aggregate::<$rust>(value, at, ::kernels::Ty::$tag)
+            }
         }
+        $crate::arg_via_abi!($rust);
 
         impl $crate::x::ByValue for $rust {
             const LAYOUT: $crate::x::Layout = $crate::x::Layout {
@@ -687,14 +797,24 @@ macro_rules! by_value {
         impl $crate::x::Abi for $rust {
             const CPP: &'static str = $cpp;
             const TY: ::kernels::Ty = ::kernels::Ty::MlaPlanCache;
-            #[cfg(feature = "_cuda")]
-            fn arg(&self) -> $crate::runtime::ArgValue {
-                $crate::runtime::ArgValue::Bytes {
+            fn arg(&self) -> $crate::jit::ArgValue {
+                $crate::jit::ArgValue::Bytes {
                     ptr: ::core::ptr::from_ref::<$rust>(self).cast::<u8>(),
                     len: ::core::mem::size_of::<$rust>(),
                 }
             }
+            fn unpack(
+                value: &$crate::jit::ArgValue,
+                at: usize,
+            ) -> ::core::result::Result<Self, ::kernels::Refusal> {
+                $crate::x::abi::unpack_aggregate::<$rust>(
+                    value,
+                    at,
+                    ::kernels::Ty::MlaPlanCache,
+                )
+            }
         }
+        $crate::arg_via_abi!($rust);
 
         impl $crate::x::ByValue for $rust {
             const LAYOUT: $crate::x::Layout = $crate::x::Layout {
@@ -767,130 +887,15 @@ impl<'a> Bytes<'a> {
     ///
     /// `cpp` is read by the typecheck translation unit, which is where an
     /// aggregate's layout agreement is actually checked.
-    #[cfg(feature = "_cuda")]
     #[must_use]
-    pub fn arg(self) -> crate::runtime::ArgValue {
-        crate::runtime::ArgValue::Bytes { ptr: self.bytes.as_ptr(), len: self.bytes.len() }
+    pub fn arg(self) -> crate::jit::ArgValue {
+        crate::jit::ArgValue::Bytes { ptr: self.bytes.as_ptr(), len: self.bytes.len() }
     }
 }
 
-/// The typecheck translation unit for one unit's rows.
-///
-/// # Why this exists next to `abi::emit_device_typecheck`
-///
-/// The old emitter spells a buffer operand with `device_cpp_ty(ty, storage)`,
-/// where `storage` is the HEAD OF THE ROW'S `elem` — the template argument.
-/// That works while `elem` is a type and fails when it is a value: it
-/// returns `Err` for `device::i32(128)`, for `device::true_type::value`, for
-/// a bare `128`, `true` or `false`. Seven of `rope`'s fourteen device rows
-/// are value-instantiated, so seven of fourteen could not be typechecked at
-/// all.
-///
-/// Here each parameter spells ITSELF, through [`Abi::CPP`], and the template
-/// argument is only pasted between the brackets. A non-type template
-/// argument stops being a problem because it was never a source of parameter
-/// types in the first place — the old emitter's coupling was the bug.
-///
-/// The output is the same shape the old one produces and is compiled by the
-/// same pass: one `static_assert` per row over a pointer-to-function
-/// comparison, which is the strictest check C++ offers and fails on a
-/// reordered pair of `int`s, a dropped `const`, or a `bf16` where the
-/// `__global__` takes an `f16`.
-///
-/// `params` is `unit!`'s `PARAMS`, parallel to `unit.rows`.
-///
-/// `layouts` is the unit's by-value aggregates — every
-/// [`ByValue::LAYOUT`] named by any row's parameter list. Each becomes
-/// `static_assert`s on `sizeof`, `alignof` and every field's `offsetof`,
-/// which is the SAME measurement `by_value!` asserts on the Rust side. That
-/// is deliberate: the Rust assertions catch a drifted mirror, these catch a
-/// drifted header, and only both together catch a rename that moved a field
-/// in the header while someone updated the mirror to match the wrong
-/// numbers. A unit with no by-value parameter passes `&[]`.
-///
-/// # Panics
-///
-/// When `params` and `unit.rows` are different lengths, which is drift
-/// between two things one macro writes and therefore cannot happen without
-/// someone having edited generated output by hand.
-#[must_use]
-pub fn typecheck_tu(
-    unit: &crate::unit::Unit,
-    params: &[&[&str]],
-    layouts: &[Layout],
-    include: &str,
-) -> String {
-    assert_eq!(
-        unit.rows.len(),
-        params.len(),
-        "{}: {} rows and {} parameter lists",
-        unit.name,
-        unit.rows.len(),
-        params.len()
-    );
-    let mut out = String::new();
-    out.push_str("// GENERATED by kernels-cuda-new::x::abi::typecheck_tu — do not edit.\n");
-    out.push_str("//\n");
-    out.push_str("// One assertion per declared instantiation. Each compares the type of\n");
-    out.push_str("// the real `__global__` against a function pointer built from the\n");
-    out.push_str("// declaration's parameter types, so a reordered pair, a dropped\n");
-    out.push_str("// `const` or a bf16/f16 swap is a compile error naming the symbol.\n");
-    out.push_str("#include <cstddef>\n#include <type_traits>\n#include \"");
-    out.push_str(include);
-    out.push_str("\"\n\nnamespace {\n");
-    for layout in layouts {
-        out.push_str("\n// ");
-        out.push_str(layout.cpp);
-        out.push_str(" — by value. Measured by ");
-        out.push_str(layout.probe);
-        out.push_str(";\n// the same numbers are asserted on the Rust mirror by `by_value!`.\n");
-        // `offsetof` and not the pointer-difference form: this TU is compiled
-        // by the host compiler, where `offsetof` is the constant expression
-        // and `(char*)&((T*)0)->f - (char*)(T*)0` is not. Under NVRTC it is
-        // the other way round — `offsetof` is unavailable there and the
-        // difference folds — which is why the probe uses the other spelling.
-        push_static_assert(
-            &mut out,
-            &format!("sizeof({}) == {}", layout.cpp, layout.size),
-            &format!("{}: sizeof moved; re-run {}", layout.cpp, layout.probe),
-        );
-        push_static_assert(
-            &mut out,
-            &format!("alignof({}) == {}", layout.cpp, layout.align),
-            &format!("{}: alignof moved; re-run {}", layout.cpp, layout.probe),
-        );
-        for (field, at) in layout.fields {
-            push_static_assert(
-                &mut out,
-                &format!("offsetof({}, {field}) == {at}", layout.cpp),
-                &format!("{}::{field} moved; re-run {}", layout.cpp, layout.probe),
-            );
-        }
-    }
-    for (row, params) in unit.rows.iter().zip(params) {
-        let tag = mangle(row.sig.symbol);
-        out.push_str("\n// ");
-        out.push_str(row.sig.symbol);
-        out.push_str("\nusing fn_");
-        out.push_str(&tag);
-        out.push_str(" = void (*)(");
-        for (i, p) in params.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(p);
-        }
-        out.push_str(");\nstatic_assert(::std::is_same_v<fn_");
-        out.push_str(&tag);
-        out.push_str(", decltype(&");
-        out.push_str(&row.instantiation());
-        out.push_str(")>,\n    \"");
-        out.push_str(row.sig.symbol);
-        out.push_str(": the declaration and the __global__ disagree\");\n");
-    }
-    out.push_str("\n}  // namespace\n");
-    out
-}
+/// The `__global__` [`typecheck_tu`] defines, so a compile of the unit has
+/// something to be asked for by name.
+pub const TYPECHECK_ENTRY: &str = "::pie_cuda_driver::kernels::typecheck::probe";
 
 /// One `static_assert`, wrapped the way the rest of the TU wraps them.
 fn push_static_assert(out: &mut String, cond: &str, message: &str) {
@@ -901,7 +906,64 @@ fn push_static_assert(out: &mut String, cond: &str, message: &str) {
     out.push_str("\");\n");
 }
 
-/// A symbol as a C++ identifier.
-fn mangle(symbol: &str) -> String {
-    symbol.replace([':', '<', '>', ',', ' ', '(', ')', '#'], "_")
+/// `root` with every one of `layouts` asserted against the header's own
+/// declaration, as a translation unit NVRTC can be handed.
+///
+/// The numbers in a [`Layout`] were measured once, out of PTX, by the script
+/// its `probe` field names. `by_value!` asserts them against the RUST mirror
+/// in `const` context; this asserts the same numbers against the C++ the
+/// mirror is a mirror OF. Neither alone is enough — the mirror and the header
+/// can drift apart only in a direction the other one is looking.
+///
+/// The only thing the appended text DEFINES is [`TYPECHECK_ENTRY`], an empty
+/// `__global__`. A `static_assert` produces no code, so without it the TU
+/// would have nothing to lower and no name to ask for — and every compile in
+/// this crate is asked for by name. The answer wanted is whether the unit
+/// compiles at all; the entry point exists to make that question askable.
+///
+/// `__INTADDR__` and not `offsetof`, and that is not a style choice: NVRTC's
+/// front end is EDG, and `csrc/shim/README.md`'s "The measurement that
+/// outlives the row" records six spellings tried against it, of which this is
+/// the only one that compiles. `offsetof` and `__builtin_offsetof` both give
+/// *"type name is not allowed"*; all three pointer-difference forms give
+/// *"must have a constant value"*. That section says the measurement is kept
+/// because "the next carried header that restates an upstream struct will need
+/// it" — this is that reader.
+///
+/// It also means the unit needs no `#include` the root has not already made,
+/// which matters: `cstddef` is carried without `offsetof`, its last asking
+/// site having been deleted with `moe_glue.cuh`.
+#[must_use]
+pub fn typecheck_tu(root: &str, layouts: &[Layout]) -> String {
+    let mut out = String::with_capacity(root.len() + layouts.len() * 512);
+    out.push_str(root);
+    out.push_str(
+        "\n\n// ── the typecheck unit's entry point ──\n\
+         namespace pie_cuda_driver { namespace kernels { namespace typecheck {\n\
+         __global__ void probe() {}\n\
+         }}}\n\
+         \n// ── the measured layouts, asserted ──\n",
+    );
+    for layout in layouts {
+        let cpp = layout.cpp;
+        out.push_str(&format!("\n// {cpp}\n// measured by {}\n", layout.probe));
+        push_static_assert(
+            &mut out,
+            &format!("sizeof({cpp}) == {}", layout.size),
+            &format!("sizeof disagrees with the measurement in {}", layout.probe),
+        );
+        push_static_assert(
+            &mut out,
+            &format!("alignof({cpp}) == {}", layout.align),
+            &format!("alignof disagrees with the measurement in {}", layout.probe),
+        );
+        for (field, at) in layout.fields {
+            push_static_assert(
+                &mut out,
+                &format!("__INTADDR__(&((({cpp}*)0)->{field})) == {at}"),
+                &format!("{field}'s offset disagrees with the measurement in {}", layout.probe),
+            );
+        }
+    }
+    out
 }

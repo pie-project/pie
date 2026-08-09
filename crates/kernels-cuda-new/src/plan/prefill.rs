@@ -167,9 +167,10 @@ pub fn split_qo_kv_indptr(
         let max_seq_len = req.total_num_rows.wrapping_sub(req.batch_size).wrapping_add(1);
         let max_qo_len = u64::from(max_seq_len) * u64::from(gqa_group_size);
         cta_tile_q = fa2_determine_cta_tile_q(max_qo_len as i64, req.head_dim_vo, cc_major);
-        total_num_tiles_q = ceil_div_u32(req.total_num_rows.wrapping_mul(gqa_group_size), cta_tile_q)
-            .wrapping_add(req.batch_size)
-            .wrapping_sub(1);
+        total_num_tiles_q =
+            ceil_div_u32(req.total_num_rows.wrapping_mul(gqa_group_size), cta_tile_q)
+                .wrapping_add(req.batch_size)
+                .wrapping_sub(1);
     } else {
         if batch_size == 0 {
             return Err(Error::EmptyBatch);
@@ -329,8 +330,7 @@ fn plan_impl(
         int_alloc.alloc(4, 1, "batch_prefill_kv_chunk_size_ptr")? as i64;
 
     if info.enable_cuda_graph {
-        info.total_num_rows_offset =
-            int_alloc.alloc(4, 16, "batch_prefill_total_num_rows")? as i64;
+        info.total_num_rows_offset = int_alloc.alloc(4, 16, "batch_prefill_total_num_rows")? as i64;
         if staging.materialises() {
             staging.put_u32(
                 info.total_num_rows_offset as usize,
@@ -356,7 +356,11 @@ fn plan_impl(
             &split.kv_tile_indices,
             "batch_prefill_kv_tile_indices",
         )?;
-        staging.put_i32s(info.o_indptr_offset as usize, &split.o_indptr, "batch_prefill_o_indptr")?;
+        staging.put_i32s(
+            info.o_indptr_offset as usize,
+            &split.o_indptr,
+            "batch_prefill_o_indptr",
+        )?;
         staging.put_i32(
             info.kv_chunk_size_ptr_offset as usize,
             split.kv_chunk_size as i32,

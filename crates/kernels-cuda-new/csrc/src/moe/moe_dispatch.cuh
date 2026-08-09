@@ -55,7 +55,7 @@
 // firing a vectorised form on an odd hidden size puts every second row on a
 // 2-byte boundary and faults. The launcher keeps the choice.
 //
-// # Six rows, and the eighteen kernels that have none
+// # Six rows, and the seventeen kernels that have none
 //
 // `scalar_weighted_add` states `LaunchRule::Elementwise` — `ceil(n / 256)`
 // blocks of 256 over a flat rectangle, which is the launcher exactly.
@@ -83,14 +83,11 @@
 // which is larger. A row there would launch `routes` blocks over an
 // `aligned_rows`-deep permutation and drop the tail.
 //
-// The other eighteen are migrated as TEXT and unmigrated as ROWS, in five
+// The other seventeen are migrated as TEXT and unmigrated as ROWS, in five
 // groups:
 //
-//   * **A grid over routes or padded blocks.** `scatter_add_weighted` (one
-//     block per route, and unlike `add_moe_route_bias` its output rows are
-//     TOKENS — it scatters through `dst_idx`, so the grid and the rectangle
-//     count different things), `build_moe_ptrs_decode_batched`
-//     (`ceil(routes / 256)`),
+//   * **A grid over routes or padded blocks.**
+//     `build_moe_ptrs_decode_batched` (`ceil(routes / 256)`),
 //     `build_moe_ptrs_aligned` (one thread per padded block),
 //     `moe_decode_gemv_*` and `moe_decode_wmma_*` (a 2D grid of output tiles
 //     × routes). `Dims` carries the fire's rectangle; the route count is
@@ -173,38 +170,10 @@ namespace wmma = ::nvcuda::wmma;
 /// not fully unroll. 16 is twice Qwen3.6's 8.
 constexpr int kMaxTopK = 16;
 
-/// `out[dst_idx[n]] += w[n] · src[n]`, one block per routed row.
-///
-/// Read-modify-write per row, which is safe only because the per-expert
-/// calls are SEQUENTIAL — there are no concurrent writers to a given output
-/// row across expert iterations. That is also why the block width is the
-/// constant `kDispatchBlock` and not `blockDim.x`: the stride is the
-/// constant, so a launch with a different block width would leave a slice of
-/// each row uncomputed while the guard-free loop double-added the rest.
-template <class T>
-__global__ void scatter_add_weighted(
-    T* __restrict__ out,
-    const T* __restrict__ src,
-    const i32* __restrict__ dst_idx,
-    const float* __restrict__ row_weights,
-    int hidden)
-{
-    const int n = blockIdx.x;
-    const int row = dst_idx[n];
-    const float w = row_weights[n];
-    const T* in = src + static_cast<long long>(n) * hidden;
-    T*       o  = out + static_cast<long long>(row) * hidden;
-    for (int h = threadIdx.x; h < hidden; h += kDispatchBlock) {
-        const float prev = Elem<T>::to_f32(o[h]);
-        const float add  = Elem<T>::to_f32(in[h]) * w;
-        o[h] = Elem<T>::from_f32(prev + add);
-    }
-}
-
 /// `out[i] += weight · src[i]`, flat.
 ///
 /// The decode fast path: with one token every per-expert contribution lands
-/// on the same destination row, so the indexed scatter above degenerates to
+/// on the same destination row, so an indexed scatter would degenerate to
 /// an fma over a row — which saves an expert-index D2H copy and the gather.
 template <class T>
 __global__ void scalar_weighted_add(
@@ -1146,8 +1115,8 @@ __global__ void reorder_moe_aligned_output(
 
 /// Add each route's expert bias onto the route's row, in place.
 ///
-/// One block per route, striding by `blockDim.x` — so unlike
-/// `scatter_add_weighted` this one is width-agnostic, and its grid IS
+/// One block per route, striding by `blockDim.x` — so this one is
+/// width-agnostic, and its grid IS
 /// `LaunchRule::Rms`: the value it writes is the route-major staging, one
 /// row per route, so the rectangle's rows and the launcher's routes are the
 /// same number. The statement is still `whole`, because `topk_idx` is

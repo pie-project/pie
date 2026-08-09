@@ -64,13 +64,11 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 use cudarc::cublas::sys::{
-    cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmEx, cublasGetStream,
+    cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmEx, cublasGetStream_v2,
     cublasOperation_t, cublasStatus_t, cudaDataType,
 };
 use cudarc::cublaslt::sys as lt;
 
-use super::device::ArgValue;
-use kernels_cuda_new::Dims;
 
 // ─────────────────────────────────────────────────────────────────────────
 // The vocabulary the router switches on — `kernels-cuda`'s `DType` and
@@ -160,9 +158,7 @@ pub struct WeightView {
 /// shim's `catch` turned that into an abort. A panic here reaches the same
 /// place by the same route.
 fn unsupported(api: &str, act_dtype: i32, w_dtype: i32, y_dtype: i32) -> ! {
-    panic!(
-        "ops::{api}: unsupported dtype combo (act={act_dtype}, w={w_dtype}, y={y_dtype})"
-    );
+    panic!("ops::{api}: unsupported dtype combo (act={act_dtype}, w={w_dtype}, y={y_dtype})");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -247,10 +243,7 @@ fn stream_is_capturing(stream: *mut c_void) -> bool {
 fn stream_synchronize(stream: *mut c_void) {
     use cudarc::runtime::sys::{cudaError, cudaStreamSynchronize};
     let code = unsafe { cudaStreamSynchronize(stream.cast()) };
-    assert!(
-        code == cudaError::cudaSuccess,
-        "cudaStreamSynchronize failed with {code:?}"
-    );
+    assert!(code == cudaError::cudaSuccess, "cudaStreamSynchronize failed with {code:?}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -279,12 +272,7 @@ struct GrowScratch {
 
 impl GrowScratch {
     const fn new(name: &'static str) -> Self {
-        Self {
-            ptr: std::ptr::null_mut(),
-            bytes: 0,
-            sealed: false,
-            name,
-        }
+        Self { ptr: std::ptr::null_mut(), bytes: 0, sealed: false, name }
     }
 
     fn reserve(&mut self, want: usize) {
@@ -408,9 +396,7 @@ impl LtCtx {
             let mut dev: i32 = 0;
             if unsafe { cudaGetDevice(&mut dev) } == cudaError::cudaSuccess {
                 let mut prop: cudaDeviceProp = unsafe { std::mem::zeroed() };
-                if unsafe { cudarc::runtime::sys::cudaGetDeviceProperties_v2(&mut prop, dev) }
-                    == cudaError::cudaSuccess
-                {
+                if unsafe { get_device_properties(&mut prop, dev) } == cudaError::cudaSuccess {
                     self.compute_capability_major = prop.major;
                     // sm_89 (Ada) is the floor for FP8 tensor cores. Hopper
                     // is 9.0 and Blackwell 10.0, both `major > 8`.
@@ -419,6 +405,32 @@ impl LtCtx {
                 }
             }
         }
+    }
+}
+
+/// `cudaGetDeviceProperties`, under whichever name this runtime exports it.
+///
+/// CUDA 12 renamed the entry point to `_v2` when `cudaDeviceProp` grew; CUDA
+/// 13 dropped the suffix again and kept the wider struct. `cudarc` follows the
+/// headers, so the SAME call is two different symbols depending on which
+/// `cuda-1x` feature is on.
+///
+/// # Safety
+///
+/// `prop` must be a live, writable `cudaDeviceProp`.
+unsafe fn get_device_properties(
+    prop: *mut cudarc::runtime::sys::cudaDeviceProp,
+    device: i32,
+) -> cudarc::runtime::sys::cudaError {
+    #[cfg(feature = "cuda-12")]
+    // SAFETY: the caller's obligation, forwarded.
+    unsafe {
+        cudarc::runtime::sys::cudaGetDeviceProperties_v2(prop, device)
+    }
+    #[cfg(feature = "cuda-13")]
+    // SAFETY: as above.
+    unsafe {
+        cudarc::runtime::sys::cudaGetDeviceProperties(prop, device)
     }
 }
 
@@ -490,20 +502,15 @@ impl DequantWeightCache {
         // 16 GiB)` — a quarter of what is left, capped.
         let mut free_bytes: usize = 0;
         let mut total_bytes: usize = 0;
-        let budget = if unsafe {
-            cudarc::runtime::sys::cudaMemGetInfo(&mut free_bytes, &mut total_bytes)
-        } == cudarc::runtime::sys::cudaError::cudaSuccess
-        {
-            (free_bytes / 4).min(16usize << 30)
-        } else {
-            0
-        };
-        Self {
-            entries: HashMap::new(),
-            used: 0,
-            budget,
-            fill_stream: None,
-        }
+        let budget =
+            if unsafe { cudarc::runtime::sys::cudaMemGetInfo(&mut free_bytes, &mut total_bytes) }
+                == cudarc::runtime::sys::cudaError::cudaSuccess
+            {
+                (free_bytes / 4).min(16usize << 30)
+            } else {
+                0
+            };
+        Self { entries: HashMap::new(), used: 0, budget, fill_stream: None }
     }
 
     /// Returns the entry's device pointer and whether it still needs
@@ -584,11 +591,8 @@ pub fn validate_quant_weight_view(api: &str, w: &WeightView, n: i32, k: i32) {
 
     let is_nibble_packed = w.dtype == dtype::INT4_PACKED || w.dtype == dtype::MXFP4_PACKED;
     let nk = (n as usize) * (k as usize);
-    let expected_weight_bytes = if is_nibble_packed {
-        (nk + 1) / 2
-    } else {
-        nk * dtype_bytes(w.dtype)
-    };
+    let expected_weight_bytes =
+        if is_nibble_packed { (nk + 1) / 2 } else { nk * dtype_bytes(w.dtype) };
     assert!(
         w.nbytes >= expected_weight_bytes,
         "{api}: quant weight buffer is smaller than GEMM shape requires; have {} bytes, \
@@ -823,10 +827,7 @@ unsafe fn dequant_then_bf16(
         }
         // The cache declined — re-expand into the growable scratch, on the
         // caller's stream, every call.
-        None => (
-            with_lt_ctx(|ctx| ctx.dequant.ensure(weight_elems * 2)),
-            stream,
-        ),
+        None => (with_lt_ctx(|ctx| ctx.dequant.ensure(weight_elems * 2)), stream),
     };
 
     if scale_kind == quant_kind::PER_GROUP && group_size > 0 {
@@ -835,26 +836,28 @@ unsafe fn dequant_then_bf16(
         // `rows` became the rule's grid and its `scale_cols` is derived
         // device-side as `ceil(cols / group_size)`.
         empty_or_panic("quant::dequant_fp8_e4m3_to_bf16_per_group", unsafe {
+            let ctx = kernels_cuda_new::jit::Ctx::on(fill_stream);
             kernels_cuda_new::x::quant::dequant_fp8_e4m3_to_bf16_per_group(
+                &ctx,
                 w_fp8.cast(),
                 bf16_w.cast(),
                 w_scale_fp32_dev.cast(),
                 n,
                 k,
                 group_size,
-                fill_stream,
             )
         });
     } else if scale_kind == quant_kind::PER_CHANNEL {
         // `(fp8_in, bf16_out, scale_inv_dev, cols)` — `rows` is the grid.
         empty_or_panic("quant::dequant_fp8_e4m3_to_bf16_per_channel", unsafe {
+            let ctx = kernels_cuda_new::jit::Ctx::on(fill_stream);
             kernels_cuda_new::x::quant::dequant_fp8_e4m3_to_bf16_per_channel(
+                &ctx,
                 w_fp8.cast(),
                 bf16_w.cast(),
                 w_scale_fp32_dev.cast(),
                 n,
                 k,
-                fill_stream,
             )
         });
     } else {
@@ -893,12 +896,13 @@ unsafe fn dequant_then_bf16(
         // path and the row's `ParamF32` operand was never reached. The host
         // program takes an `f32` parameter and the question does not arise.
         empty_or_panic("quant::dequant_fp8_e4m3_to_bf16", unsafe {
+            let ctx = kernels_cuda_new::jit::Ctx::on(fill_stream);
             kernels_cuda_new::x::quant::dequant_fp8_e4m3_to_bf16(
+                &ctx,
                 w_fp8.cast(),
                 bf16_w.cast(),
                 scale,
                 weight_elems,
-                fill_stream,
             )
         });
     }
@@ -932,13 +936,14 @@ unsafe fn int8_dequant_then_bf16(
     // `quant::dequant_int8_to_bf16_per_channel` — a JIT row already, fired
     // through `unit_of` like the FP8 three.
     empty_or_panic("quant::dequant_int8_to_bf16_per_channel", unsafe {
+        let ctx = kernels_cuda_new::jit::Ctx::on(stream);
         kernels_cuda_new::x::quant::dequant_int8_to_bf16_per_channel(
+            &ctx,
             w_int8.cast(),
             bf16_w.cast(),
             w_scale_inv.cast(),
             n,
             k,
-            stream,
         )
     });
     unsafe { gemm_bf16(handle, act, bf16_w, y, m, n, k, beta) };
@@ -1007,14 +1012,15 @@ unsafe fn blockwise_w8a8(
     // `fire/quant_int8.rs` states the rectangle beside the `<<<>>>` it came
     // from. This was `ffi::pie_k_quant_*` until `csrc/src/quant/` was deleted.
     empty_or_panic("quant::quantize_bf16_to_fp8_e4m3_per_token_group", unsafe {
+        let ctx = kernels_cuda_new::jit::Ctx::on(stream);
         kernels_cuda_new::x::quant::quantize_bf16_to_fp8_e4m3_per_token_group(
+            &ctx,
             act.cast(),
             act_fp8.cast(),
             act_scale.cast(),
             m,
             k,
             128,
-            stream,
         )
     });
 
@@ -1024,11 +1030,11 @@ unsafe fn blockwise_w8a8(
     );
     desc.set(
         lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-        &(lt::cublasOperation_t::CUBLAS_OP_T),
+        &(cublasOperation_t::CUBLAS_OP_T),
     );
     desc.set(
         lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-        &(lt::cublasOperation_t::CUBLAS_OP_N),
+        &(cublasOperation_t::CUBLAS_OP_N),
     );
     desc.set(
         lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
@@ -1048,8 +1054,10 @@ unsafe fn blockwise_w8a8(
         &act_scale_const,
     );
 
-    let a_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
-    let b_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, m as u64, k as i64);
+    let a_layout =
+        LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
+    let b_layout =
+        LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, m as u64, k as i64);
     let d_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_16BF, n as u64, m as u64, n as i64);
     let pref = LtMatmulPref::new(workspace_bytes);
 
@@ -1145,30 +1153,14 @@ unsafe fn fp8_e4m3_w_bf16_act(
 
     if scale_kind == quant_kind::PER_GROUP
         && unsafe {
-            blockwise_w8a8(
-                act,
-                w_fp8,
-                w_scale_fp32_dev,
-                y,
-                m,
-                n,
-                k,
-                beta,
-                stream,
-                group_size,
-            )
+            blockwise_w8a8(act, w_fp8, w_scale_fp32_dev, y, m, n, k, beta, stream, group_size)
         }
     {
         return;
     }
 
     let (native, handle_lt, workspace, workspace_bytes) = with_lt_ctx(|ctx| {
-        (
-            ctx.fp8_native_supported,
-            ctx.handle,
-            ctx.workspace,
-            ctx.workspace_bytes,
-        )
+        (ctx.fp8_native_supported, ctx.handle, ctx.workspace, ctx.workspace_bytes)
     });
 
     if !native || scale_kind == quant_kind::PER_CHANNEL || scale_kind == quant_kind::PER_GROUP {
@@ -1197,20 +1189,17 @@ unsafe fn fp8_e4m3_w_bf16_act(
     );
     desc.set(
         lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-        &(lt::cublasOperation_t::CUBLAS_OP_T),
+        &(cublasOperation_t::CUBLAS_OP_T),
     );
     desc.set(
         lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-        &(lt::cublasOperation_t::CUBLAS_OP_N),
+        &(cublasOperation_t::CUBLAS_OP_N),
     );
     // FAST_ACCUM: fp32 accumulation with a reduced-precision inner loop. The
     // archive pinned it on and every FP8 parity check in this tree is
     // written against that arithmetic.
     let fast_accum: i8 = 1;
-    desc.set(
-        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_FAST_ACCUM,
-        &fast_accum,
-    );
+    desc.set(lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum);
     // cuBLASLt multiplies A by `*scale` BEFORE the matmul. mistral3 stores
     // `weight_scale_inv` such that `bf16 = fp8 * scale`, which matches this
     // contract exactly — the name says "inv" and the arithmetic does not.
@@ -1219,7 +1208,8 @@ unsafe fn fp8_e4m3_w_bf16_act(
         &w_scale_fp32_dev,
     );
 
-    let a_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
+    let a_layout =
+        LtMatrixLayout::new(lt::cudaDataType::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
     let b_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_16BF, k as u64, m as u64, k as i64);
     let d_layout = LtMatrixLayout::new(lt::cudaDataType::CUDA_R_16BF, n as u64, m as u64, n as i64);
     let pref = LtMatmulPref::new(workspace_bytes);
@@ -1371,13 +1361,14 @@ unsafe fn int8_w_bf16_act(
     // `quantize_bf16_to_int8_per_channel` and this calls that row directly,
     // which is what `table/driver_internal.rs` prescribed for it.
     empty_or_panic("quant::quantize_bf16_to_int8_per_channel", unsafe {
+        let ctx = kernels_cuda_new::jit::Ctx::on(stream);
         kernels_cuda_new::x::quant::quantize_bf16_to_int8_per_channel(
+            &ctx,
             act_bf16.cast(),
             act_int8.cast(),
             act_scale.cast(),
             m,
             k,
-            stream,
         )
     });
 
@@ -1446,55 +1437,41 @@ unsafe fn int8_w_bf16_act(
     // straight into `y_bf16`.
     if beta == 0.0 {
         empty_or_panic("quant::dequant_int32_w8a8_to_bf16", unsafe {
+            let ctx = kernels_cuda_new::jit::Ctx::on(stream);
             kernels_cuda_new::x::quant::dequant_int32_w8a8_to_bf16(
+                &ctx,
                 acc_int32.cast(),
                 act_scale.cast(),
                 w_scale_inv.cast(),
                 y_bf16.cast(),
                 m,
                 n,
-                stream,
             )
         });
     } else {
         let mn = (m as usize) * (n as usize);
         let dq_dst = with_lt_ctx(|ctx| ctx.dequant.ensure(mn * 2));
         empty_or_panic("quant::dequant_int32_w8a8_to_bf16", unsafe {
+            let ctx = kernels_cuda_new::jit::Ctx::on(stream);
             kernels_cuda_new::x::quant::dequant_int32_w8a8_to_bf16(
+                &ctx,
                 acc_int32.cast(),
                 act_scale.cast(),
                 w_scale_inv.cast(),
                 dq_dst.cast(),
                 m,
                 n,
-                stream,
             )
         });
-        // `norm::residual_add_bf16`, `LaunchRule::Elementwise`: `(y, x, n)`.
-        // Fired through the JIT rather than through the shim entry for
-        // `bind::service::gemm_act_x_wt_bias_bf16`'s reason — a `pie_k_*`
-        // call is a consumer of the C++ launcher, and this was one of the two
-        // C++ call sites holding that row. Both are gone and the row is in
-        // `device::JIT_DISPATCHED` now, so the entry point this paragraph
-        // used to name does not exist at all; naming it here would ALSO trip
-        // `driver-cuda/build.rs`'s hand-arm scan, which is a plain text
-        // search over this crate and does not know a comment from a call.
-        unsafe {
-            super::jit::fire(
-                "norm::residual_add_bf16",
-                Dims {
-                    rows: 1,
-                    width: u32::try_from(mn).unwrap_or(u32::MAX),
-                    ..Dims::default()
-                },
-                &[
-                    ArgValue::Ptr(y_bf16),
-                    ArgValue::Ptr(dq_dst),
-                    ArgValue::Usize(mn),
-                ],
-                stream,
-            );
-        }
+        // `y += x`, through the same fn-world entry the dequant above uses.
+        // The dynamic path resolved a `LaunchRule` from the row's sig, and a
+        // crossed contract states none, so it refused `Geometry { Unstated }`
+        // -- which `bind::jit::fire` reports only for `Unknown` and otherwise
+        // swallows, making this a launch that silently did not happen.
+        empty_or_panic("norm::residual_add_bf16", unsafe {
+            let ctx = kernels_cuda_new::jit::Ctx::on(stream);
+            kernels_cuda_new::x::norm::residual_add_bf16(&ctx, y_bf16.cast(), dq_dst.cast(), mn)
+        });
     }
 }
 
@@ -1640,13 +1617,14 @@ pub unsafe fn act_x_w(
         // `quant::dequant_mxfp4_to_bf16`, `LaunchRule::RouteRows`:
         // `(packed, block_scale, out, in_dim)` — `out_dim` is the grid.
         empty_or_panic("quant::dequant_mxfp4_to_bf16", unsafe {
+            let ctx = kernels_cuda_new::jit::Ctx::on(stream);
             kernels_cuda_new::x::quant::dequant_mxfp4_to_bf16(
+                &ctx,
                 w.data.cast(),
                 w.scale_data.cast(),
                 bf16_w.cast(),
                 n,
                 k,
-                stream,
             )
         });
         unsafe { gemm_bf16(handle, act, bf16_w, y, m, n, k, beta) };
@@ -1680,8 +1658,8 @@ pub unsafe fn act_x_w(
 /// from. So `n` and `k` are ordinary `i32` parameters now, passed in the
 /// kernel's own order, and a swap is a type error at the two places where the
 /// types differ rather than a transposed grid at run time.
-fn empty_or_panic(symbol: &str, fired: kernels_cuda_new::x::Fired) {
-    if let kernels_cuda_new::x::Fired::Declined(why) = fired
+fn empty_or_panic(symbol: &str, fired: Result<(), kernels_cuda_new::x::Refusal>) {
+    if let Err(why) = fired
         && !matches!(why, kernels_cuda_new::x::Refusal::Empty { .. })
     {
         panic!("{symbol} declined: {why:?}");
@@ -1695,8 +1673,8 @@ fn empty_or_panic(symbol: &str, fired: kernels_cuda_new::x::Fired) {
 /// would be a race with no error, which is why the handle is the authority
 /// rather than a passed-in stream.
 fn stream_of(handle: *mut c_void) -> *mut c_void {
-    let mut stream: cudarc::driver::sys::CUstream = std::ptr::null_mut();
-    let status = unsafe { cublasGetStream(handle.cast::<cublasContext>(), &mut stream) };
+    let mut stream: cudarc::cublas::sys::cudaStream_t = std::ptr::null_mut();
+    let status = unsafe { cublasGetStream_v2(handle.cast::<cublasContext>(), &raw mut stream) };
     check(status, "cublasGetStream");
     stream.cast()
 }

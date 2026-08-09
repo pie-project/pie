@@ -69,8 +69,8 @@
 
 use core::ffi::c_void;
 
+use kernels_cuda_new::x::Refusal;
 use kernels_cuda_new::x::abi::bf16;
-use kernels_cuda_new::x::{Fired, Refusal};
 
 use crate::fire::moe_ptrs::Arrays;
 
@@ -111,7 +111,7 @@ pub unsafe fn grouped_gemm_bf16(
     n: i32,
     k: i32,
     stream: *mut c_void,
-) -> Fired {
+) -> Result<(), Refusal> {
     // `moe_grouped_gemm.cu:37`, and it is the host program's own first test:
     // an empty padded batch has nothing to launch OVER, which is a different
     // fact from a rectangle no implementation can compute. Made here as well
@@ -119,7 +119,7 @@ pub unsafe fn grouped_gemm_bf16(
     // `batched_act_x_wt_bf16` returns silently on `batch_count <= 0`, and a
     // silent return is not an answer this caller can report.
     if max_blocks <= 0 {
-        return Fired::Declined(Refusal::Empty { what: "the padded block count" });
+        return Err(Refusal::Empty { what: "the padded block count" });
     }
 
     if kernels_cuda_new::x::moe::supported(m, n, k).is_ok() {
@@ -127,29 +127,31 @@ pub unsafe fn grouped_gemm_bf16(
         // predicate and would decline on its own; it is asked here first
         // because the answer selects the implementation rather than reporting
         // one.
-        return unsafe {
-            kernels_cuda_new::x::moe::moe_grouped_gemm_bf16(
-                a.cast::<bf16>(),
-                bank.cast::<bf16>(),
-                c.cast::<bf16>(),
-                expert_ids.cast::<i32>(),
-                max_blocks,
-                m,
-                n,
-                k,
-                stream,
-            )
+        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
+        return match kernels_cuda_new::x::moe::moe_grouped_gemm_bf16(
+            &ctx,
+            a.cast::<bf16>(),
+            bank.cast::<bf16>(),
+            c.cast::<bf16>(),
+            expert_ids.cast::<i32>(),
+            max_blocks,
+            m,
+            n,
+            k,
+        ) {
+            Ok(()) => Ok(()),
+            Err(why) => Err(why),
         };
     }
 
     let Some(arrays) = arrays else {
-        return Fired::Declined(Refusal::Absent {
+        return Err(Refusal::Absent {
             what: "the six pointer arrays, which `moe::build_moe_ptrs_aligned_bf16` fills \
                    as step 3 of the aligned leg",
         });
     };
     let Some(half) = arrays.select(bank) else {
-        return Fired::Declined(Refusal::Absent {
+        return Err(Refusal::Absent {
             what: "this GEMM's bank among the two the pointer build carved for",
         });
     };
@@ -174,5 +176,5 @@ pub unsafe fn grouped_gemm_bf16(
             handle, a_ptrs, b_ptrs, c_ptrs, m, n, k, max_blocks, 0.0,
         );
     }
-    Fired::Launched
+    Ok(())
 }

@@ -42,7 +42,7 @@
 //! — which is the same shape as Half A's stated reason for this very move,
 //! corrected in the code below.
 
-use kernels_cuda_new::runtime::{ArgValue, Launch};
+use kernels_cuda_new::ArgValue;
 use kernels_cuda_new::x::{KvDType, KvLayer, KvScheme};
 
 use crate::bind::abi::{KvCacheLayerView, KvCacheScheme};
@@ -159,7 +159,6 @@ impl TryFrom<&KvCacheLayerView> for KvLayer {
     }
 }
 
-
 // ===========================================================================
 // THE BEAM-REPAIR CELL MOVE, `kv_paged.cu:352-378` — PORTED, AND ITS C++ IS GONE
 // ===========================================================================
@@ -247,10 +246,7 @@ pub unsafe fn copy_kv_cells_bf16(
     // `kv_paged.cu:360-363`, and in that order: the scheme is checked before
     // the extent, so a caller that passes a quantised cache is wrong whether
     // or not it also passes zero cells.
-    assert!(
-        layer.is_native_bf16(),
-        "attn::copy_kv_cells_bf16 requires native bf16 KV cache"
-    );
+    assert!(layer.is_native_bf16(), "attn::copy_kv_cells_bf16 requires native bf16 KV cache");
     // `kv_paged.cu:364`.
     if n <= 0 {
         return CopyKvCells::Declined(CopyDecline::NoCells);
@@ -259,16 +255,17 @@ pub unsafe fn copy_kv_cells_bf16(
     // `kv_paged.cu:366` — `if (layer.hnd_layout)`. One `Term::Is` over one
     // operand, which is what `SPECIALISATIONS`' `COPY_KV_CELLS` states, so
     // the argument list below is built once.
-    let symbol = if layer.hnd_layout {
-        "attn::copy_kv_cells_bf16#hnd"
+    let instantiation = if layer.hnd_layout {
+        kernels_cuda_new::x::attn::kv_paged::inst::COPY_KV_CELLS_HND
     } else {
-        "attn::copy_kv_cells_bf16#nhd"
+        kernels_cuda_new::x::attn::kv_paged::inst::COPY_KV_CELLS_NHD
     };
 
     // `kv_paged.cu:367` / `:373`: `<<<N, BLOCK, 0, stream>>>`, with
     // `constexpr int BLOCK = 256` at `:365` — the same 256 this module
     // already states and the same `LaunchRule::PerRow` fixes.
-    let launch = Launch { grid: [n.unsigned_abs(), 1, 1], block: [BLOCK, 1, 1], smem: 0 };
+    let launch =
+        kernels_cuda_new::jit::Launch::grid([n.unsigned_abs(), 1, 1], [BLOCK, 1, 1]).smem(0);
 
     // The operand order is the `__global__`'s, not the launcher's: the
     // launcher took the view whole and carried a stream, and the row takes
@@ -286,7 +283,13 @@ pub unsafe fn copy_kv_cells_bf16(
         ArgValue::I32(layer.head_dim),
     ];
 
-    super::hand::fire(symbol, launch, &values, stream);
+    super::hand::fire(
+        &kernels_cuda_new::x::attn::kv_paged::ROOT,
+        instantiation,
+        launch,
+        &values,
+        stream,
+    );
     CopyKvCells::Launched
 }
 
@@ -295,7 +298,6 @@ pub unsafe fn copy_kv_cells_bf16(
 // file. `x::attn::kv_paged::{write_kv_to_pages, write_kv_to_pages_bf16,
 // write_kv_explicit_bf16, max_touched_pages}`.
 // ===========================================================================
-
 
 // ===========================================================================
 // THE TWO PAGE-VIEW BUILDERS, `kv_paged.cu:309` AND `:324`
@@ -385,7 +387,7 @@ pub unsafe fn build_window_page_view(
     if keep_pages <= 0 {
         return PageView::Declined(PageViewDecline::NoKeptPages);
     }
-    let launch = Launch { grid: [1, 1, 1], block: [256, 1, 1], smem: 0 };
+    let launch = kernels_cuda_new::jit::Launch::grid([1, 1, 1], [256, 1, 1]).smem(0);
     let values = [
         ArgValue::Ptr(src_indices.cast_mut().cast()),
         ArgValue::Ptr(src_indptr.cast_mut().cast()),
@@ -394,7 +396,13 @@ pub unsafe fn build_window_page_view(
         ArgValue::Ptr(dst_indices.cast()),
         ArgValue::I32(r),
     ];
-    super::hand::fire("attn::build_window_page_view", launch, &values, stream);
+    super::hand::fire(
+        &kernels_cuda_new::x::attn::kv_paged::ROOT,
+        kernels_cuda_new::x::attn::kv_paged::inst::BUILD_WINDOW_PAGE_VIEW,
+        launch,
+        &values,
+        stream,
+    );
     PageView::Launched
 }
 
@@ -445,7 +453,7 @@ pub unsafe fn build_full_split_view(
     if page_size <= 0 {
         return PageView::Declined(PageViewDecline::NoPageSize);
     }
-    let launch = Launch { grid: [1, 1, 1], block: [32, 1, 1], smem: 0 };
+    let launch = kernels_cuda_new::jit::Launch::grid([1, 1, 1], [32, 1, 1]).smem(0);
     // The operand order is the `__global__`'s, which puts `src_indices` LAST
     // — after three outputs — and not beside `src_indptr` where a reader
     // expects it. Transcribed rather than tidied: the row states the same
@@ -460,7 +468,13 @@ pub unsafe fn build_full_split_view(
         ArgValue::Ptr(dst_last.cast()),
         ArgValue::Ptr(src_indices.cast_mut().cast()),
     ];
-    super::hand::fire("attn::build_full_split_view", launch, &values, stream);
+    super::hand::fire(
+        &kernels_cuda_new::x::attn::kv_paged::ROOT,
+        kernels_cuda_new::x::attn::kv_paged::inst::BUILD_FULL_SPLIT_VIEW,
+        launch,
+        &values,
+        stream,
+    );
     PageView::Launched
 }
 

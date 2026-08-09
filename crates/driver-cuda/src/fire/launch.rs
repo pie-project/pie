@@ -95,11 +95,7 @@ fn attention_landing(
     use model_compiler::lower::Arg;
     match dplan.spec(fi).outs.first() {
         Some(Arg::Arena { at, .. }) => Some(*at),
-        _ => match lowered
-            .launches
-            .get(fi + 1)
-            .map(|n| &lowered.args[n.args.start as usize])
-        {
+        _ => match lowered.launches.get(fi + 1).map(|n| &lowered.args[n.args.start as usize]) {
             Some(Arg::Arena { at, .. }) => Some(*at),
             _ => None,
         },
@@ -173,11 +169,7 @@ pub fn fire_class_of(
     requests: usize,
 ) -> Result<model_compiler::trace::FireClass, i32> {
     use model_compiler::trace::FireClass;
-    Ok(if rows == requests {
-        FireClass::Decode
-    } else {
-        FireClass::Prefill
-    })
+    Ok(if rows == requests { FireClass::Decode } else { FireClass::Prefill })
 }
 
 /// Replay this fire's bucket if it is captured, and capture it if not.
@@ -285,23 +277,14 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     // attachment, mask kind, correction arm, depth, LoRA rank", and every
     // one of those is a branch rather than a different prepared state.
     for marks in [
-        model_compiler::lower::Row {
-            samples: true,
-            ..Default::default()
-        },
-        model_compiler::lower::Row {
-            samples: true,
-            write_desc: true,
-            ..Default::default()
-        },
+        model_compiler::lower::Row { samples: true, ..Default::default() },
+        model_compiler::lower::Row { samples: true, write_desc: true, ..Default::default() },
     ] {
         let warm_rows = vec![marks; rows];
         let Ok(warm) = model_compiler::lower::lower_with(
             plan,
             &warm_rows,
-            model_compiler::lower::Fire {
-                captures_across_splits: false,
-            },
+            model_compiler::lower::Fire { captures_across_splits: false },
             model_compiler::lower::GuardMode::Resolve,
         ) else {
             return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
@@ -426,9 +409,7 @@ fn build_lowering(
     use crate::bind::DispatchPlan;
     use model_compiler::lower::{Fire, GuardMode, lower_with};
 
-    let plan = row
-        .trace(class, deployed)
-        .map_err(|e| i32::from(crate::Error::from(e)))?;
+    let plan = row.trace(class, deployed).map_err(|e| i32::from(crate::Error::from(e)))?;
     // `captures_across_splits` FOLLOWS THE GUARD MODE, and it did not.
     //
     // `lower.rs` states the consequence of getting this wrong, at the
@@ -448,15 +429,7 @@ fn build_lowering(
     // key said "the split does not matter" and the lowering froze it.
     let lower_as = |g: GuardMode| {
         let captures_across_splits = g == GuardMode::Union;
-        lower_with(
-            &plan,
-            fire_rows,
-            Fire {
-                captures_across_splits,
-            },
-            g,
-        )
-        .map_err(|e| {
+        lower_with(&plan, fire_rows, Fire { captures_across_splits }, g).map_err(|e| {
             eprintln!("[driver-cuda] launch: uncovered: {e:?}");
             PIE_STATUS_UNSUPPORTED
         })
@@ -465,11 +438,7 @@ fn build_lowering(
     if !union {
         sg_trace(|| "union off at the gate".into());
     }
-    let lowered = lower_as(if union {
-        GuardMode::Union
-    } else {
-        GuardMode::Resolve
-    })?;
+    let lowered = lower_as(if union { GuardMode::Union } else { GuardMode::Resolve })?;
 
     // NOTHING DECLINES THE UNION ANY MORE, and the two clauses that used
     // to are worth naming because their removal is the point of §5 (1)
@@ -539,11 +508,7 @@ fn build_lowering(
             format!(
                 "refused at load: {} unfireable symbol(s): {}",
                 unfireable.len(),
-                unfireable
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                unfireable.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
             )
         });
         return Err(PIE_STATUS_UNSUPPORTED);
@@ -554,12 +519,7 @@ fn build_lowering(
     let (rows_left, total) = dplan.sweep_progress();
     sg_trace(|| format!("routes: {rows_left}/{total} still row-world"));
     sg_trace(|| format!("built: launches={} union={union}", lowered.launches.len()));
-    Ok(LoweredFire {
-        plan,
-        lowered,
-        dplan,
-        union,
-    })
+    Ok(LoweredFire { plan, lowered, dplan, union })
 }
 
 /// One step's fire — the former single-step body.
@@ -790,15 +750,7 @@ fn admit(
         );
         return Err(PIE_STATUS_UNSUPPORTED);
     }
-    Ok((
-        Admitted {
-            class,
-            rows,
-            requests,
-            fire_rows,
-        },
-        row,
-    ))
+    Ok((Admitted { class, rows, requests, fire_rows }, row))
 }
 
 /// Run the instance's registered program over the fire's logits.
@@ -863,9 +815,7 @@ fn run_program(
     //
     // Falling back to the first stage keeps a package that states no
     // kinds working, which is what every fixture in the tree is.
-    let stage = compiled
-        .stage_of_kind(crate::program::runtime::stage_kind::EPILOGUE)
-        .unwrap_or(0);
+    let stage = compiled.stage_of_kind(crate::program::runtime::stage_kind::EPILOGUE).unwrap_or(0);
     let Some(plan) = compiled.plans.get(stage).cloned() else {
         return Ok(false);
     };
@@ -990,10 +940,7 @@ fn logits_row_of(span_end: usize, rows: usize, sampled_rows: &[u32]) -> usize {
     if sampled_rows.len() == rows {
         return row;
     }
-    sampled_rows
-        .iter()
-        .position(|&s| s as usize == row)
-        .unwrap_or(row)
+    sampled_rows.iter().position(|&s| s as usize == row).unwrap_or(row)
 }
 
 fn deliver_logits(
@@ -1180,11 +1127,7 @@ fn ready_device_state(state: &mut Shell) -> Result<(), i32> {
     if state.fire_alloc.is_none() {
         state.fire_alloc = Some(crate::device::Allocator::new());
     }
-    while state
-        .in_flight
-        .front()
-        .is_some_and(|f| f.done.is_complete().unwrap_or(true))
-    {
+    while state.in_flight.front().is_some_and(|f| f.done.is_complete().unwrap_or(true)) {
         let done = state.in_flight.pop_front().expect("just checked");
         retire(done);
     }
@@ -1256,13 +1199,7 @@ fn gdn_context(
     requests: usize,
     alloc: &crate::device::Allocator,
     stream: &crate::device::OwnedStream,
-) -> Result<
-    (
-        Option<crate::bind::GdnCtx>,
-        Option<crate::device::DeviceBuffer>,
-    ),
-    i32,
-> {
+) -> Result<(Option<crate::bind::GdnCtx>, Option<crate::device::DeviceBuffer>), i32> {
     use crate::bind::GdnCtx;
 
     let mut gdn_ctx: Option<GdnCtx> = None;
@@ -1276,9 +1213,8 @@ fn gdn_context(
             // `(conv, recurrent)` pair per linear layer and derive every
             // stride here; `RecurrentStateCache` pools them and answers
             // both, which is what its 1,467 tested lines were ported for.
-            let is_linear: Vec<bool> = (0..dep.layers)
-                .map(|l| shape.linear_layers.contains(&l))
-                .collect();
+            let is_linear: Vec<bool> =
+                (0..dep.layers).map(|l| shape.linear_layers.contains(&l)).collect();
             let cache =
                 crate::pools::recurrent_state_cache::RecurrentStateCache::allocate_bf16_recurrent(
                     &is_linear,
@@ -1289,15 +1225,10 @@ fn gdn_context(
                     u32::try_from(shape.v_d).unwrap_or(0),
                     i32::try_from(GDN_SLOTS).unwrap_or(0),
                 );
-            let mut conv = alloc.alloc(
-                usize::try_from(cache.layout().conv_total_bytes())
-                    .unwrap_or(0)
-                    .max(1),
-            )?;
+            let mut conv = alloc
+                .alloc(usize::try_from(cache.layout().conv_total_bytes()).unwrap_or(0).max(1))?;
             let mut recurrent = alloc.alloc(
-                usize::try_from(cache.layout().recurrent_total_bytes())
-                    .unwrap_or(0)
-                    .max(1),
+                usize::try_from(cache.layout().recurrent_total_bytes()).unwrap_or(0).max(1),
             )?;
             conv.memset(0, stream.as_ref())?;
             recurrent.memset(0, stream.as_ref())?;
@@ -1353,10 +1284,7 @@ fn gdn_context(
             if rs_flags.get(r).copied().unwrap_or(0) & driver_api::local::PIE_RS_FLAG_RESET == 0 {
                 continue;
             }
-            let Ok(ops) = gdn_state
-                .cache
-                .reset_slot(i32::try_from(slot).unwrap_or(-1))
-            else {
+            let Ok(ops) = gdn_state.cache.reset_slot(i32::try_from(slot).unwrap_or(-1)) else {
                 eprintln!("[driver-cuda] launch: rs_slot_ids names a slot the cache lacks");
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
@@ -1385,11 +1313,7 @@ fn gdn_context(
             })
             .collect();
         // Every slot the fire names has to exist, buffer slots included.
-        let need_buffer = rs_buffer_slot_ids
-            .iter()
-            .copied()
-            .max()
-            .map_or(0, |m| m + 1);
+        let need_buffer = rs_buffer_slot_ids.iter().copied().max().map_or(0, |m| m + 1);
         gdn_state.ensure_slots(need_buffer.max(need_slots), epoch, &alloc, &stream)?;
         // THE FOLD, recorded on the fire's stream so it lands after the
         // pass that filled the buffer. Copying the accepted prefix's LAST
@@ -1457,9 +1381,7 @@ fn gdn_context(
             // Still one base per MODEL layer, so nothing downstream moved:
             // the pooling changed where a base comes FROM, not what a
             // launch is handed.
-            conv_state: (0..gdn_state.is_linear.len())
-                .map(|l| gdn_state.conv_base(l))
-                .collect(),
+            conv_state: (0..gdn_state.is_linear.len()).map(|l| gdn_state.conv_base(l)).collect(),
             conv_stride_elems: gdn_state.conv_stride_elems,
             recurrent_state: (0..gdn_state.is_linear.len())
                 .map(|l| gdn_state.recurrent_base(l))
@@ -1580,11 +1502,7 @@ fn kv_pools_for(
         crate::serve::state::install_kv(
             kv,
             epoch,
-            KvState {
-                cache,
-                _held: held,
-                num_pages: need_pages,
-            },
+            KvState { cache, _held: held, num_pages: need_pages },
         );
     }
     Ok((*kv).as_ref().expect("just ensured").views())
@@ -1807,14 +1725,7 @@ fn raise_attn_plans(
     use crate::bind::{DecodePlan, PrefillPlan};
     use crate::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 
-    let PlanGeometry {
-        kv_indptr,
-        kv_lens,
-        qo_indptr,
-        kv_heads,
-        head_dim,
-        page_size,
-    } = geom;
+    let PlanGeometry { kv_indptr, kv_lens, qo_indptr, kv_heads, head_dim, page_size } = geom;
     let mut sops = LiveStagingOps;
     if scratch_slot.is_none() {
         let ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
@@ -1846,10 +1757,8 @@ fn raise_attn_plans(
     // fire class: the hybrid's `prefill_decode` fact routes a
     // single-request decode through the PREFILL flashinfer path
     // (`TokensLE(1)` resolves at lower time).
-    let states_decode_dispatch = lowered
-        .kernels
-        .iter()
-        .any(|k| k == "attn::dispatch_attention_flashinfer_decode");
+    let states_decode_dispatch =
+        lowered.kernels.iter().any(|k| k == "attn::dispatch_attention_flashinfer_decode");
     ws.begin_plan_update(&mut sops)?;
     // EVERY PLAN THE GEOMETRY PERMITS, not just the one this fire's text
     // states. Under `GuardMode::Union` both arms of an attention guard are
@@ -1942,11 +1851,7 @@ fn raise_attn_plans(
         decode_plan_full: decode_plan_full_ptr,
         prefill_plan: prefill_plan.as_ptr(),
         workspace: ws.view(),
-        prefill_workspace: if planless_prefill {
-            ws.view()
-        } else {
-            prefill_ws.view()
-        },
+        prefill_workspace: if planless_prefill { ws.view() } else { prefill_ws.view() },
         states_decode_dispatch,
     })
 }
@@ -1990,13 +1895,7 @@ fn publish_seam_pins(
     // parse of the knob reaches here rather than a second read of it.
     attn_score_window: u32,
 ) -> Result<SeamPins, i32> {
-    let PlanGeometry {
-        kv_indptr,
-        kv_lens,
-        qo_indptr,
-        page_size,
-        ..
-    } = geom;
+    let PlanGeometry { kv_indptr, kv_lens, qo_indptr, page_size, .. } = geom;
     for (&v, &w) in named_widths {
         // fp32-wide: the GDN seam pins are f32; llama-like's are bf16 and
         // simply leave half the pin unread.
@@ -2019,11 +1918,7 @@ fn publish_seam_pins(
     // resident memory and plan-raise time; it is NOT runtime waste,
     // because the arm a fire does not take is skipped by the conditional
     // rather than executed. `.wiki/driver/graph.md` §5 ①.
-    let score_window = if states_decode_dispatch {
-        1
-    } else {
-        attn_score_window
-    };
+    let score_window = if states_decode_dispatch { 1 } else { attn_score_window };
     let sink = crate::fire::attn_score::plan_score_sink(
         kv_indptr,
         kv_lens,
@@ -2035,19 +1930,13 @@ fn publish_seam_pins(
         // A sink too large to publish (the prefill window grows with the
         // context) keeps the old answer: null, and the capturing arm
         // declines exactly as it did.
-        None => (
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            core::ptr::null(),
-        ),
+        None => (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null()),
         Some(p) => {
             let base = fire_arrays.score(alloc, &p, stream.as_ref())?;
             (
                 base,
                 unsafe { base.cast::<u8>().add(p.folded_offset) }.cast::<std::ffi::c_void>(),
-                unsafe { base.cast::<u8>().add(p.indptr_offset) }
-                    .cast::<i32>()
-                    .cast_const(),
+                unsafe { base.cast::<u8>().add(p.indptr_offset) }.cast::<i32>().cast_const(),
             )
         }
     };
@@ -2096,9 +1985,7 @@ fn publish_seam_pins(
             let base = fire_arrays.mask(alloc, &p, stream.as_ref())?;
             (
                 base.cast::<u8>().cast_const(),
-                unsafe { base.cast::<u8>().add(p.indptr_offset) }
-                    .cast::<i32>()
-                    .cast_const(),
+                unsafe { base.cast::<u8>().add(p.indptr_offset) }.cast::<i32>().cast_const(),
             )
         }
     };
@@ -2118,14 +2005,7 @@ fn publish_seam_pins(
         core::ptr::null_mut()
     };
 
-    Ok(SeamPins {
-        d_scores,
-        d_folded,
-        d_score_indptr,
-        d_mask,
-        d_mask_indptr,
-        d_attn_out,
-    })
+    Ok(SeamPins { d_scores, d_folded, d_score_indptr, d_mask, d_mask_indptr, d_attn_out })
 }
 
 /// Which SSA value holds the attention QUERY, and where its output lands.
@@ -2184,10 +2064,8 @@ fn lora_pins(
         Arg::Named { value, .. } => Some(*value),
         Arg::Arena { .. } | Arg::Weight(_) => None,
     };
-    let mut args = lowered.launches[at]
-        .args
-        .clone()
-        .filter_map(|ai| named(&lowered.args[ai as usize]));
+    let mut args =
+        lowered.launches[at].args.clone().filter_map(|ai| named(&lowered.args[ai as usize]));
     let q = args.next()?;
     let v = args.next()?;
     let x = dplan.spec(at).aux.first().and_then(named)?;
@@ -2212,21 +2090,16 @@ fn attention_pins(
     } else {
         "attn::dispatch_attention_flashinfer_prefill_bf16"
     };
-    let Some(fi) = lowered
-        .launches
-        .iter()
-        .position(|x| lowered.kernels[x.kernel as usize] == dispatch_name)
+    let Some(fi) =
+        lowered.launches.iter().position(|x| lowered.kernels[x.kernel as usize] == dispatch_name)
     else {
         eprintln!("[driver-cuda] launch: the lowering states no {dispatch_name}");
         return Err(PIE_STATUS_UNSUPPORTED);
     };
-    let q_pin = lowered.launches[fi]
-        .args
-        .clone()
-        .find_map(|ai| match &lowered.args[ai as usize] {
-            Arg::Named { value, .. } => Some(*value),
-            _ => None,
-        });
+    let q_pin = lowered.launches[fi].args.clone().find_map(|ai| match &lowered.args[ai as usize] {
+        Arg::Named { value, .. } => Some(*value),
+        _ => None,
+    });
     // The dispatch's OUTPUT, read off its own op join.
     //
     // This used to be `launches[fi + 1]`'s first operand — "the launch
@@ -2332,9 +2205,7 @@ fn run_sampling_programs(
             Arg::Arena { .. } | Arg::Weight(_) => None,
         })
     });
-    let logits_base = readout
-        .and_then(|v| named_bufs.get(&v))
-        .map_or(0, |b| b.as_ptr() as u64);
+    let logits_base = readout.and_then(|v| named_bufs.get(&v)).map_or(0, |b| b.as_ptr() as u64);
     // EVERY REQUEST, each over its OWN row.
     //
     // This used to fire only `instance_ids.first()`, and then let a
@@ -2519,17 +2390,12 @@ fn lora_phase(
         core::ptr::null_mut()
     } else {
         scratch
-            .attn_out(
-                alloc,
-                rows * model.deployment.shape.intermediate.max(1) as usize * 2,
-            )
+            .attn_out(alloc, rows * model.deployment.shape.intermediate.max(1) as usize * 2)
             .unwrap_or(core::ptr::null_mut())
     };
     let named_bufs = &scratch.named;
-    let lora_state = (!lora_lanes.is_empty())
-        .then(|| lora_pins(lowered, dplan))
-        .flatten()
-        .and_then(|pins| {
+    let lora_state =
+        (!lora_lanes.is_empty()).then(|| lora_pins(lowered, dplan)).flatten().and_then(|pins| {
             let ptr = |v: model_compiler::trace::ValueId| {
                 named_bufs.get(&v).map(crate::device::DeviceBuffer::as_ptr)
             };
@@ -2755,10 +2621,7 @@ fn fire_experts_per_token(lowered: &model_compiler::lower::Lowered) -> i32 {
             .iter()
             .find_map(|&(s, i)| (s == sym.as_str()).then_some(i))
             .or_else(|| {
-                ROUTED_QMV_STEMS
-                    .iter()
-                    .any(|s| sym.starts_with(s))
-                    .then_some(ROUTED_QMV_FANOUT_AT)
+                ROUTED_QMV_STEMS.iter().any(|s| sym.starts_with(s)).then_some(ROUTED_QMV_FANOUT_AT)
             });
         let Some(at) = at else { continue };
         // The run this launch's `params` names, then the slot inside it. A
@@ -2797,12 +2660,7 @@ fn tail_csrs(kv_indptr: &[u32], qo_indptr: &[u32], split: usize) -> TailCsrs {
             .iter()
             .map(|p| p.saturating_sub(page0))
             .collect(),
-        qo: qo_indptr
-            .get(split..)
-            .unwrap_or(&[])
-            .iter()
-            .map(|p| p.saturating_sub(tok0))
-            .collect(),
+        qo: qo_indptr.get(split..).unwrap_or(&[]).iter().map(|p| p.saturating_sub(tok0)).collect(),
     }
 }
 
@@ -2867,11 +2725,8 @@ fn peel_tail_ctx(
     if two_kind {
         return Err(PIE_STATUS_UNSUPPORTED);
     }
-    let TailCsrs {
-        base,
-        indptr: tail_indptr,
-        qo: tail_qo,
-    } = tail_csrs(kv_indptr, qo_indptr, split);
+    let TailCsrs { base, indptr: tail_indptr, qo: tail_qo } =
+        tail_csrs(kv_indptr, qo_indptr, split);
 
     let d_indptr = scratch.upload_u32(alloc, slot::TAIL_INDPTR, &tail_indptr, stream)?;
     let d_lens = scratch.upload_u32(alloc, slot::TAIL_LENS, &kv_lens[split..], stream)?;
@@ -2980,15 +2835,7 @@ pub(crate) fn step_impl(
     use model_compiler::trace::ValueId;
 
     let t_head = std::time::Instant::now();
-    let (
-        Admitted {
-            class,
-            rows,
-            requests,
-            fire_rows,
-        },
-        row,
-    ) = admit(state, step)?;
+    let (Admitted { class, rows, requests, fire_rows }, row) = admit(state, step)?;
     // THE MUTATION FIRST, AND THEN THE BORROWS. `ready_device_state` takes
     // `&mut Shell`, so every shared borrow this function goes on to hold —
     // `model`, the lowering, the stream, the allocator — has to be taken
@@ -3048,12 +2895,8 @@ pub(crate) fn step_impl(
         )?;
         state.lowerings.insert(key, built);
     }
-    let LoweredFire {
-        plan,
-        lowered,
-        dplan,
-        union,
-    } = state.lowerings.get(&key).expect("just built");
+    let LoweredFire { plan, lowered, dplan, union } =
+        state.lowerings.get(&key).expect("just built");
     let union = *union;
     sg_trace(|| format!("  lowering {:?}", t_low.elapsed()));
     let mut phase = std::time::Instant::now();
@@ -3131,52 +2974,43 @@ pub(crate) fn step_impl(
 
     let arena_bytes = lowered.arena_bytes.max(64);
     let arena_ptr = state.fire_arrays.arena(&alloc, arena_bytes)?;
-    let exec_frame = Frame {
-        arena: arena_ptr,
-        arena_bytes,
-    };
+    let exec_frame = Frame { arena: arena_ptr, arena_bytes };
 
     let mut named_widths: std::collections::BTreeMap<ValueId, u32> =
         std::collections::BTreeMap::new();
     for a in &lowered.args {
-        if let Arg::Named { value, width } = a {
+        if let Arg::Named { value, width, .. } = a {
             named_widths.insert(*value, *width);
         }
     }
     for i in 0..lowered.launches.len() {
         for a in &dplan.spec(i).outs {
-            if let Arg::Named { value, width } = a {
+            if let Arg::Named { value, width, .. } = a {
                 named_widths.insert(*value, *width);
             }
         }
     }
-    let SeamPins {
-        d_scores,
-        d_folded,
-        d_score_indptr,
-        d_mask,
-        d_mask_indptr,
-        d_attn_out,
-    } = publish_seam_pins(
-        &mut state.fire_arrays,
-        alloc,
-        stream,
-        dep,
-        model,
-        step,
-        &named_widths,
-        PlanGeometry {
-            kv_indptr,
-            kv_lens,
-            qo_indptr,
-            kv_heads: kv_heads_i,
-            head_dim: head_dim_i,
-            page_size,
-        },
-        rows,
-        states_decode_dispatch,
-        state.boot.attn_score_window,
-    )?;
+    let SeamPins { d_scores, d_folded, d_score_indptr, d_mask, d_mask_indptr, d_attn_out } =
+        publish_seam_pins(
+            &mut state.fire_arrays,
+            alloc,
+            stream,
+            dep,
+            model,
+            step,
+            &named_widths,
+            PlanGeometry {
+                kv_indptr,
+                kv_lens,
+                qo_indptr,
+                kv_heads: kv_heads_i,
+                head_dim: head_dim_i,
+                page_size,
+            },
+            rows,
+            states_decode_dispatch,
+            state.boot.attn_score_window,
+        )?;
 
     lap("attn-plan");
     // ── The hybrid's GDN context: driver-owned slabs, instance slots. ──
@@ -3191,9 +3025,7 @@ pub(crate) fn step_impl(
     )?;
 
     // POOLED, because a capture bakes `lse_out_d`. See `Scratch::lse`.
-    let lse = state
-        .fire_arrays
-        .lse(alloc, rows * model.deployment.shape.q_heads as usize * 4)?;
+    let lse = state.fire_arrays.lse(alloc, rows * model.deployment.shape.q_heads as usize * 4)?;
 
     // The guard-owned attention values, discovered from the lowering as
     // the smokes discovered them.
@@ -3267,16 +3099,8 @@ pub(crate) fn step_impl(
         kv_page_indptr_d: d_kv_indptr.cast(),
         kv_last_page_lens_d: d_kv_lens.cast(),
         qo_indptr_d: d_qo.cast(),
-        qo_indptr_h: if planless {
-            qo_indptr.as_ptr()
-        } else {
-            core::ptr::null()
-        },
-        kv_page_indptr_h: if planless {
-            kv_indptr.as_ptr()
-        } else {
-            core::ptr::null()
-        },
+        qo_indptr_h: if planless { qo_indptr.as_ptr() } else { core::ptr::null() },
+        kv_page_indptr_h: if planless { kv_indptr.as_ptr() } else { core::ptr::null() },
         num_requests: requests as i32,
         num_pages_in_batch: kv_indices.len() as i32,
         first_token: 0,
@@ -3326,10 +3150,8 @@ pub(crate) fn step_impl(
     // `Shell::cublas`: creating and destroying one per fire cost 3.2 ms.
     let mut cublas_ops = crate::device::cublas::LiveCublas;
     if state.cublas.is_none() {
-        state.cublas = Some(crate::device::cublas::CublasHandle::create(
-            &mut cublas_ops,
-            raw_stream,
-        )?);
+        state.cublas =
+            Some(crate::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)?);
     }
     let cublas = state.cublas.as_mut().expect("just ensured");
     cublas.set_stream(&mut cublas_ops, raw_stream)?;
@@ -3411,11 +3233,7 @@ pub(crate) fn step_impl(
         // it per layer, and the stacks that do not are read out of
         // `rope_theta_by_layer` on the next line. Zero for a
         // deployment with no attention layers at all.
-        rope_theta: model
-            .deployment
-            .attention
-            .first()
-            .map_or(0.0, |a| a.rope_theta),
+        rope_theta: model.deployment.attention.first().map_or(0.0, |a| a.rope_theta),
         rope_theta_by_layer: theta_by_layer,
         rotary_by_layer,
         head_dim: i32::try_from(model.deployment.shape.head_dim).unwrap_or(0),
@@ -3463,10 +3281,9 @@ pub(crate) fn step_impl(
             _ => [0.0; 4],
         },
         yarn_original_max: match model.deployment.rope_scaling {
-            Some(model::deployment::RopeScaling::Yarn {
-                original_max_position,
-                ..
-            }) => i32::try_from(original_max_position).unwrap_or(0),
+            Some(model::deployment::RopeScaling::Yarn { original_max_position, .. }) => {
+                i32::try_from(original_max_position).unwrap_or(0)
+            }
             _ => 0,
         },
         // gpt-oss's CLAMPED GLU, read off the statement rather than left
@@ -3505,9 +3322,7 @@ pub(crate) fn step_impl(
         // captures, because under `GuardMode::Union` every arm lowers
         // and the predicate decides at replay. The arm has to be
         // issuable with nothing to correct.
-        lora: lora_state
-            .as_ref()
-            .map(|(s, scratch)| (std::ptr::from_ref(s), *scratch)),
+        lora: lora_state.as_ref().map(|(s, scratch)| (std::ptr::from_ref(s), *scratch)),
         // The fire's peel window, published so a `_devwin` statement in a
         // tail region can early-out per lane. The prefix is the rows that
         // do NOT carry the axis's mark, so the tail begins where the
@@ -3515,8 +3330,8 @@ pub(crate) fn step_impl(
         // the word says the whole fire.
         peel_window: peel_window_ptr,
         rows_total: i32::try_from(rows).unwrap_or(0),
-            moe_ptrs: std::cell::Cell::new(None),
-};
+        moe_ptrs: std::cell::Cell::new(None),
+    };
 
     lap("bind");
     // THE TAIL'S OWN STATE, when the lowering peeled. `peel_start` is
@@ -3564,10 +3379,7 @@ pub(crate) fn step_impl(
         None
     };
     let named_bufs = &state.fire_arrays.named;
-    let mut resolver = LiveResolver {
-        model,
-        named: named_bufs,
-    };
+    let mut resolver = LiveResolver { model, named: named_bufs };
     // ── Which prepared state each rectangle gets. ──
     let regions = match tail_ctx.as_ref() {
         Some(tail) => AttnRegions::split(&attn, tail),
@@ -3579,10 +3391,7 @@ pub(crate) fn step_impl(
     // frees, or the frees are not deferred.
     if state.preds.is_none() {
         state.preds = crate::device::PredicateWord::new(
-            state
-                .fire_alloc
-                .as_ref()
-                .expect("the fire allocator exists"),
+            state.fire_alloc.as_ref().expect("the fire allocator exists"),
         )
         .ok();
     }
@@ -3614,15 +3423,7 @@ pub(crate) fn step_impl(
             class,
         )
     } else {
-        run(
-            &lowered,
-            &dplan,
-            exec_frame,
-            &mut resolver,
-            &ctx,
-            regions,
-            gdn_ctx.as_ref(),
-        )
+        run(&lowered, &dplan, exec_frame, &mut resolver, &ctx, regions, gdn_ctx.as_ref())
     };
     lap("run");
     // A step that owes nothing SYNCHRONIZES, because the next step in the
@@ -3630,11 +3431,8 @@ pub(crate) fn step_impl(
     // completion does not: its debt rides a stream-ordered callback and
     // this call returns with the work still queued, which is the whole
     // point.
-    let sync = if owes.is_some() && state.runahead {
-        Ok(())
-    } else {
-        stream.as_ref().synchronize()
-    };
+    let sync =
+        if owes.is_some() && state.runahead { Ok(()) } else { stream.as_ref().synchronize() };
     lap("sync");
     match (result, sync) {
         (Ok(_), Ok(())) => {}
@@ -3682,10 +3480,7 @@ pub(crate) fn step_impl(
     // fire frees — and reusing the earlier binding here would extend a
     // shared borrow across it. Re-deriving is one line and says where the
     // mutable window ended.
-    let alloc = state
-        .fire_alloc
-        .as_ref()
-        .expect("the fire allocator exists");
+    let alloc = state.fire_alloc.as_ref().expect("the fire allocator exists");
     let unsampled = run_sampling_programs(
         SamplingSites {
             instances: &state.instances,
@@ -3801,13 +3596,7 @@ mod peel_tests {
     use model_compiler::trace::PeelWindow;
 
     fn rows(hooked: &[bool]) -> Vec<Row> {
-        hooked
-            .iter()
-            .map(|&h| Row {
-                hooked: h,
-                ..Row::default()
-            })
-            .collect()
+        hooked.iter().map(|&h| Row { hooked: h, ..Row::default() }).collect()
     }
 
     /// The three cases the two kernel forms have to agree on.
@@ -3834,19 +3623,12 @@ mod peel_tests {
 
         // A CONTIGUOUS MARKED SUFFIX: prefix [0,2), tail [2,4).
         assert_eq!(
-            peel_word(
-                &rows(&[false, false, true, true]),
-                Some(PeelWindow::HookFreePrefix),
-                4
-            ),
+            peel_word(&rows(&[false, false, true, true]), Some(PeelWindow::HookFreePrefix), 4),
             (2, 2)
         );
 
         // EVERY ROW MARKED: no prefix, the tail is the fire.
-        assert_eq!(
-            peel_word(&rows(&[true; 4]), Some(PeelWindow::HookFreePrefix), 4),
-            (0, 4)
-        );
+        assert_eq!(peel_word(&rows(&[true; 4]), Some(PeelWindow::HookFreePrefix), 4), (0, 4));
     }
 
     /// The axis picks the predicate, and the two axes are different marks.
@@ -3871,11 +3653,7 @@ mod peel_tests {
         let got = tail_csrs(&kv_indptr, &qo_indptr, 2);
         assert_eq!(
             got,
-            TailCsrs {
-                base: 3,
-                indptr: vec![0, 3, 4],
-                qo: vec![0, 1, 2]
-            },
+            TailCsrs { base: 3, indptr: vec![0, 3, 4], qo: vec![0, 1, 2] },
             "requests 2..4 hold 3 then 1 pages, and their pages begin at \
              index 3 — the value `kv_indptr[2]` holds"
         );
@@ -3906,13 +3684,6 @@ mod peel_tests {
     #[test]
     fn a_split_past_the_end_is_empty_not_a_panic() {
         let got = tail_csrs(&[0, 2], &[0, 1], 9);
-        assert_eq!(
-            got,
-            TailCsrs {
-                base: 0,
-                indptr: Vec::new(),
-                qo: Vec::new()
-            }
-        );
+        assert_eq!(got, TailCsrs { base: 0, indptr: Vec::new(), qo: Vec::new() });
     }
 }

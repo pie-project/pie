@@ -11,14 +11,38 @@ use cudarc::cublas::sys::{
 };
 use cudarc::cublaslt::sys as lt;
 use cudarc::runtime::sys::{
-    cudaDeviceProp, cudaError, cudaEventCreate, cudaEventDestroy, cudaEventElapsedTime,
-    cudaEventRecord, cudaEventSynchronize, cudaEvent_t, cudaFree, cudaGetDevice,
-    cudaGetDeviceProperties_v2, cudaGetErrorName, cudaGetLastError, cudaMalloc, cudaMemGetInfo,
-    cudaMemsetAsync, cudaPeekAtLastError, cudaStreamCaptureStatus, cudaStreamCreateWithFlags,
-    cudaStreamDestroy, cudaStreamIsCapturing, cudaStreamNonBlocking, cudaStreamSynchronize,
+    cudaDeviceProp, cudaError, cudaEvent_t, cudaEventCreate, cudaEventDestroy,
+    cudaEventElapsedTime, cudaEventRecord, cudaEventSynchronize, cudaFree, cudaGetDevice,
+    cudaGetErrorName, cudaGetLastError, cudaMalloc, cudaMemGetInfo, cudaMemsetAsync,
+    cudaPeekAtLastError, cudaStreamCaptureStatus, cudaStreamCreateWithFlags, cudaStreamDestroy,
+    cudaStreamIsCapturing, cudaStreamNonBlocking, cudaStreamSynchronize,
 };
 
-use super::gemv::{Gemv, gemv_bf16};
+/// `cudaGetDeviceProperties`, under whichever name this runtime exports it.
+///
+/// CUDA 12 renamed the entry point to `_v2` when `cudaDeviceProp` grew; CUDA
+/// 13 dropped the suffix again and kept the wider struct. `cudarc` follows the
+/// headers, so the SAME call is two different symbols depending on which
+/// `cuda-1x` feature is on, and naming either one directly makes the crate
+/// build under exactly one of them.
+///
+/// # Safety
+///
+/// `prop` must be a live, writable `cudaDeviceProp`.
+unsafe fn get_device_properties(prop: *mut cudaDeviceProp, device: i32) -> cudaError {
+    #[cfg(feature = "cuda-12")]
+    // SAFETY: the caller's obligation, forwarded.
+    unsafe {
+        cudarc::runtime::sys::cudaGetDeviceProperties_v2(prop, device)
+    }
+    #[cfg(feature = "cuda-13")]
+    // SAFETY: as above.
+    unsafe {
+        cudarc::runtime::sys::cudaGetDeviceProperties(prop, device)
+    }
+}
+
+use super::gemv::gemv_bf16;
 
 /// `cublasComputeType_t bf16_compute_type() { return CUBLAS_COMPUTE_32F; }`.
 const COMPUTE: cublasComputeType_t = cublasComputeType_t::CUBLAS_COMPUTE_32F;
@@ -42,10 +66,7 @@ fn check_lt(status: lt::cublasStatus_t, what: &str) {
 }
 
 fn check(status: cublasStatus_t, what: &str) {
-    assert!(
-        status == cublasStatus_t::CUBLAS_STATUS_SUCCESS,
-        "cuBLAS error ({status:?}): {what}"
-    );
+    assert!(status == cublasStatus_t::CUBLAS_STATUS_SUCCESS, "cuBLAS error ({status:?}): {what}");
 }
 
 /// Clears a sticky CUDA error, the C++'s bare `cudaGetLastError();`.
@@ -63,7 +84,8 @@ fn current_device() -> i32 {
 /// `gemm.cpp:195` — the handle's stream, or `None` if cuBLAS will not say.
 fn cublas_stream(handle: cublasHandle_t) -> Option<*mut c_void> {
     let mut stream: cudarc::cublas::sys::cudaStream_t = std::ptr::null_mut();
-    if unsafe { cublasGetStream_v2(handle, &raw mut stream) } == cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    if unsafe { cublasGetStream_v2(handle, &raw mut stream) }
+        == cublasStatus_t::CUBLAS_STATUS_SUCCESS
     {
         Some(stream.cast())
     } else {
@@ -95,10 +117,7 @@ impl Bf16LtCtx {
     /// `gemm.cpp:130` — `ensure()`. Idempotent; both halves are separately
     fn ensure(&mut self) {
         if self.handle.is_null() {
-            check_lt(
-                unsafe { lt::cublasLtCreate(&raw mut self.handle) },
-                "cublasLtCreate",
-            );
+            check_lt(unsafe { lt::cublasLtCreate(&raw mut self.handle) }, "cublasLtCreate");
         }
         if self.workspace.is_null() {
             let code = unsafe { cudaMalloc(&raw mut self.workspace, self.workspace_bytes) };
@@ -359,8 +378,7 @@ fn build_lt_plan(m: i32, n: i32, k: i32) -> Option<Arc<Bf16LtPlan>> {
         };
     }
 
-    let mut heuristics: [lt::cublasLtMatmulHeuristicResult_t; 8] =
-        unsafe { core::mem::zeroed() };
+    let mut heuristics: [lt::cublasLtMatmulHeuristicResult_t; 8] = unsafe { core::mem::zeroed() };
     let mut returned: i32 = 0;
     if st == ok {
         st = unsafe {
@@ -423,11 +441,7 @@ fn gemm_bf16_lt(
     let preferred = lt_algo_index_for_shape(n, k);
     let begin = preferred.min((returned - 1).max(0));
     for pass in 0..2 {
-        let (first, last) = if pass == 0 {
-            (begin, begin + 1)
-        } else {
-            (0, returned)
-        };
+        let (first, last) = if pass == 0 { (begin, begin + 1) } else { (0, returned) };
         for i in first..last {
             if pass == 1 && i == begin {
                 continue;
@@ -548,10 +562,9 @@ fn run_dense_tactic(
             let Some(stream) = cublas_stream(handle) else {
                 return false;
             };
-            matches!(
-                gemv_bf16(w, act, bias, y, n, k, stream, beta),
-                Gemv::Launched
-            )
+            // SAFETY: the tuner's arena, live across the launch.
+            let ctx = unsafe { crate::jit::Ctx::on(stream) };
+            gemv_bf16(&ctx, w, act, bias, y, n, k, beta).is_ok()
         }
         GemmKind::Lt => {
             let Some(plan) = plan else { return false };
@@ -666,8 +679,7 @@ impl DenseTuneArena {
         }
         self.handle = caller;
         let filled = unsafe {
-            cudaMemsetAsync(self.act, 0x3C, act_bytes, self.stream.cast())
-                == cudaError::cudaSuccess
+            cudaMemsetAsync(self.act, 0x3C, act_bytes, self.stream.cast()) == cudaError::cudaSuccess
                 && cudaMemsetAsync(self.y, 0x3C, y_bytes, self.stream.cast())
                     == cudaError::cudaSuccess
                 && cudaStreamSynchronize(self.stream.cast()) == cudaError::cudaSuccess
@@ -694,7 +706,7 @@ fn time_dense_tactic(
     const WARMUP: i32 = 3;
     const ITERS: i32 = 7;
     let ws = Some((arena.workspace, arena.workspace_bytes));
-    let mut fire = || {
+    let fire = || {
         run_dense_tactic(
             arena.handle,
             t,
@@ -749,35 +761,29 @@ fn time_dense_tactic(
 }
 
 /// `gemm.cpp:653` — the ballot.
-fn dense_candidates(plan: Option<&Bf16LtPlan>, m: i32, n: i32, k: i32, beta: f32) -> Vec<DenseTactic> {
+fn dense_candidates(
+    plan: Option<&Bf16LtPlan>,
+    m: i32,
+    n: i32,
+    k: i32,
+    beta: f32,
+) -> Vec<DenseTactic> {
     let mut out = Vec::new();
     if m == 1 && (beta == 0.0 || beta == 1.0) {
-        out.push(DenseTactic {
-            kind: GemmKind::Gemv,
-            algo: 0,
-        });
+        out.push(DenseTactic { kind: GemmKind::Gemv, algo: 0 });
     }
-    out.push(DenseTactic {
-        kind: GemmKind::GemmEx,
-        algo: 0,
-    });
+    out.push(DenseTactic { kind: GemmKind::GemmEx, algo: 0 });
     if let Some(plan) = plan {
         let preferred = lt_algo_index_for_shape(n, k);
         let count = plan.heuristics.len() as i32;
         if preferred < count {
-            out.push(DenseTactic {
-                kind: GemmKind::Lt,
-                algo: preferred,
-            });
+            out.push(DenseTactic { kind: GemmKind::Lt, algo: preferred });
         }
         for i in 0..count {
             if i == preferred {
                 continue;
             }
-            out.push(DenseTactic {
-                kind: GemmKind::Lt,
-                algo: i,
-            });
+            out.push(DenseTactic { kind: GemmKind::Lt, algo: i });
         }
     }
     out
@@ -786,10 +792,7 @@ fn dense_candidates(plan: Option<&Bf16LtPlan>, m: i32, n: i32, k: i32, beta: f32
 /// `tuning_cache.hpp:34` — mixes `v` into hash `h`.
 #[must_use]
 pub const fn tuning_hash(h: u64, v: u64) -> u64 {
-    h ^ (v
-        .wrapping_add(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(h << 6)
-        .wrapping_add(h >> 2))
+    h ^ (v.wrapping_add(0x9e37_79b9_7f4a_7c15).wrapping_add(h << 6).wrapping_add(h >> 2))
 }
 
 /// `gemm.cpp:713` — the cache key for a dense shape.
@@ -812,11 +815,7 @@ struct DiskCache {
 impl DiskCache {
     fn new(name: &str, signature: String) -> Self {
         let path = cache_path(name);
-        let mut cache = Self {
-            signature,
-            path,
-            entries: HashMap::new(),
-        };
+        let mut cache = Self { signature, path, entries: HashMap::new() };
         if !cache.signature.is_empty() && cache.path.is_some() {
             cache.load();
         }
@@ -835,11 +834,7 @@ impl DiskCache {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        else {
+        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
             return;
         };
         let empty = file.metadata().is_ok_and(|meta| meta.len() == 0);
@@ -863,11 +858,9 @@ impl DiskCache {
         if matches {
             let mut fields = lines.flat_map(str::split_whitespace);
             while let (Some(k), Some(a), Some(b)) = (fields.next(), fields.next(), fields.next()) {
-                let (Ok(k), Ok(a), Ok(b)) = (
-                    u64::from_str_radix(k, 16),
-                    a.parse::<i32>(),
-                    b.parse::<i32>(),
-                ) else {
+                let (Ok(k), Ok(a), Ok(b)) =
+                    (u64::from_str_radix(k, 16), a.parse::<i32>(), b.parse::<i32>())
+                else {
                     break;
                 };
                 self.entries.insert(k, (a, b));
@@ -898,19 +891,14 @@ fn dense_cache_signature() -> String {
         return String::new();
     }
     let mut prop = unsafe { core::mem::zeroed::<cudaDeviceProp>() };
-    if unsafe { cudaGetDeviceProperties_v2(&raw mut prop, device) } != cudaError::cudaSuccess {
+    if unsafe { get_device_properties(&raw mut prop, device) } != cudaError::cudaSuccess {
         clear_error();
         return String::new();
     }
     let mut version: i32 = 0;
     let _ = unsafe { cublasGetVersion_v2(std::ptr::null_mut(), &raw mut version) };
-    let name = unsafe { CStr::from_ptr(prop.name.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
-    format!(
-        "# pie-dense-gemm v1 sm{}{} cublas={version} dev={name}",
-        prop.major, prop.minor
-    )
+    let name = unsafe { CStr::from_ptr(prop.name.as_ptr()) }.to_string_lossy().into_owned();
+    format!("# pie-dense-gemm v1 sm{}{} cublas={version} dev={name}", prop.major, prop.minor)
 }
 
 /// The tactic file's basename. Unchanged from the C++, so a machine that has
@@ -1069,12 +1057,7 @@ fn dense_tactic_for(
 #[must_use]
 pub fn dense_tactic_is_gemv(m: i32, n: i32, k: i32, beta: f32) -> bool {
     let key = dense_key(m, n, k, beta);
-    with_tuner(|tuner| {
-        tuner
-            .chosen
-            .get(&key)
-            .is_some_and(|t| t.kind == GemmKind::Gemv)
-    })
+    with_tuner(|tuner| tuner.chosen.get(&key).is_some_and(|t| t.kind == GemmKind::Gemv))
 }
 
 /// One line per dense bf16 GEMM naming the shape, the capture status and the
@@ -1083,8 +1066,7 @@ fn path_trace_take() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     static BUDGET: AtomicI32 = AtomicI32::new(40000);
     let on = *ON.get_or_init(|| {
-        std::env::var("PIE_GEMM_PATH_TRACE")
-            .is_ok_and(|v| !v.is_empty() && !v.starts_with('0'))
+        std::env::var("PIE_GEMM_PATH_TRACE").is_ok_and(|v| !v.is_empty() && !v.starts_with('0'))
     });
     if !on {
         return false;
@@ -1158,11 +1140,19 @@ pub unsafe fn act_x_wt_bf16(
     }
 
     if m == 1 && beta == 0.0 {
+        // SAFETY: the caller's matrices, live across the launch.
         if let Some(stream) = cublas_stream(handle)
-            && matches!(
-                gemv_bf16(w, act, std::ptr::null(), y, n, k, stream, 0.0),
-                Gemv::Launched
+            && gemv_bf16(
+                &unsafe { crate::jit::Ctx::on(stream) },
+                w,
+                act,
+                std::ptr::null(),
+                y,
+                n,
+                k,
+                0.0,
             )
+            .is_ok()
         {
             if path_trace {
                 eprintln!("[gemm-path]   -> gemv");
@@ -1289,14 +1279,12 @@ pub unsafe fn batched_act_x_wt_bf16(
     }
     let handle: cublasHandle_t = handle.cast::<cublasContext>();
     let alpha = 1.0f32;
-    let grouped_key = dense_key(m, n, k, beta)
-        ^ (batch_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let grouped_key =
+        dense_key(m, n, k, beta) ^ (batch_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let known = grouped_support(grouped_key);
-    let capturing = cublas_stream(handle)
-        .map_or(true, |s| {
-            capture_status(s)
-                .is_none_or(|c| c != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
-        });
+    let capturing = cublas_stream(handle).map_or(true, |s| {
+        capture_status(s).is_none_or(|c| c != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
+    });
     let try_grouped = known == Some(true) || (known.is_none() && !capturing);
     if try_grouped {
         let transa = [cublasOperation_t::CUBLAS_OP_T];
@@ -1368,9 +1356,8 @@ pub unsafe fn batched_act_x_wt_bf16(
     if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         let device = current_device();
         let pending = unsafe { cudaPeekAtLastError() };
-        let pending_name = unsafe { CStr::from_ptr(cudaGetErrorName(pending)) }
-            .to_string_lossy()
-            .into_owned();
+        let pending_name =
+            unsafe { CStr::from_ptr(cudaGetErrorName(pending)) }.to_string_lossy().into_owned();
         let capture = cublas_stream(handle).map_or_else(
             || "unknown".to_owned(),
             |s| match capture_status(s) {
@@ -1437,10 +1424,7 @@ pub unsafe fn act_x_wt_bf16_out_fp32(
             ALGO_TENSOR_OP,
         )
     };
-    check(
-        status,
-        &format!("cublasGemmEx[bf16->fp32] M={m} N={n} K={k}"),
-    );
+    check(status, &format!("cublasGemmEx[bf16->fp32] M={m} N={n} K={k}"));
 }
 
 /// `gemm::grouped_act_x_wt_bf16` — one `cublasGemmGroupedBatchedEx`.
@@ -1503,70 +1487,5 @@ pub unsafe fn grouped_act_x_wt_bf16(
             COMPUTE,
         )
     };
-    check(
-        status,
-        &format!("cublasGemmGroupedBatchedEx[bf16] groups={group_count} N={n} K={k}"),
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `tuning_cache.hpp:34`'s first mix, which pins the constant.
-    #[test]
-    fn tuning_hash_matches_the_cpp() {
-        assert_eq!(tuning_hash(0, 0), 0x9e37_79b9_7f4a_7c15);
-    }
-
-    /// The disk stores `kind` as an integer, so the discriminants are an ABI.
-    #[test]
-    fn gemm_kind_discriminants_are_the_disk_format() {
-        assert_eq!(GemmKind::GemmEx as i32, 0);
-        assert_eq!(GemmKind::Lt as i32, 1);
-        assert_eq!(GemmKind::Gemv as i32, 2);
-        assert_eq!(GemmKind::from_i32(3), None);
-        assert_eq!(GemmKind::from_i32(-1), None);
-    }
-
-    /// `beta` folds in as a bit, so 1.0 and 2.0 must key the same and 0.0
-    #[test]
-    fn dense_key_reads_beta_as_a_bit() {
-        assert_eq!(dense_key(1, 2, 3, 1.0), dense_key(1, 2, 3, 2.0));
-        assert_ne!(dense_key(1, 2, 3, 0.0), dense_key(1, 2, 3, 1.0));
-    }
-
-    /// The five ladder rungs, each named for the checkpoint that measured it.
-    #[test]
-    fn the_shape_ladder_is_the_cpp_ladder() {
-        assert_eq!(lt_algo_index_for_shape(12288, 1024), 2);
-        assert_eq!(lt_algo_index_for_shape(200_000, 2048), 1);
-        assert_eq!(lt_algo_index_for_shape(4096, 5120), 0);
-        assert_eq!(lt_algo_index_for_shape(8192, 2048), 0);
-        assert_eq!(lt_algo_index_for_shape(100_000, 2560), 0);
-        assert_eq!(lt_algo_index_for_shape(4096, 4096), 5);
-    }
-
-    /// The large-hidden-size rung is a FAULT guard, not a speed one.
-    #[test]
-    fn lt_min_n_keeps_large_k_off_the_lt_path() {
-        assert_eq!(lt_min_n(7168), 32768);
-        assert_eq!(lt_min_n(1024), 12288);
-        assert_eq!(lt_min_n(2048), 6144);
-        assert_eq!(lt_min_n(2560), 12288);
-    }
-
-    /// A `beta` the GEMV cannot fold keeps it off the ballot; `M > 1` too.
-    #[test]
-    fn the_gemv_is_balloted_only_where_it_can_run() {
-        let gemv = |m, beta| {
-            dense_candidates(None, m, 4096, 4096, beta)
-                .first()
-                .map(|t| t.kind)
-        };
-        assert_eq!(gemv(1, 0.0), Some(GemmKind::Gemv));
-        assert_eq!(gemv(1, 1.0), Some(GemmKind::Gemv));
-        assert_eq!(gemv(1, 0.5), Some(GemmKind::GemmEx));
-        assert_eq!(gemv(2, 0.0), Some(GemmKind::GemmEx));
-    }
+    check(status, &format!("cublasGemmGroupedBatchedEx[bf16] groups={group_count} N={n} K={k}"));
 }

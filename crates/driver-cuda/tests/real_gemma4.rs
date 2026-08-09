@@ -75,15 +75,12 @@ impl Checkpoint {
         let home = std::env::var_os("HOME")?;
         let snaps =
             PathBuf::from(home).join(format!(".cache/huggingface/hub/{cache_dir}/snapshots"));
-        let snap = std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(Result::ok)
-            .find_map(|e| {
-                let d = e.path();
-                (d.join("model.safetensors").is_file()
-                    || d.join("model.safetensors.index.json").is_file())
-                .then_some(d)
-            })?;
+        let snap = std::fs::read_dir(&snaps).ok()?.filter_map(Result::ok).find_map(|e| {
+            let d = e.path();
+            (d.join("model.safetensors").is_file()
+                || d.join("model.safetensors.index.json").is_file())
+            .then_some(d)
+        })?;
         let files: Vec<PathBuf> = if snap.join("model.safetensors").is_file() {
             vec![snap.join("model.safetensors")]
         } else {
@@ -132,10 +129,7 @@ impl Checkpoint {
     }
 
     fn bytes(&self, name: &str) -> &[u8] {
-        let (f, b, e) = *self
-            .index
-            .get(name)
-            .unwrap_or_else(|| panic!("checkpoint lacks {name}"));
+        let (f, b, e) = *self.index.get(name).unwrap_or_else(|| panic!("checkpoint lacks {name}"));
         &self.raws[f][b..e]
     }
 }
@@ -148,10 +142,7 @@ impl Checkpoint {
 /// way).
 fn bind(ckpt: &Checkpoint, facts: &Gemma4Facts, sink: &mut dyn FnMut(String, Vec<u8>)) {
     let p = "model.language_model";
-    sink(
-        "embed".into(),
-        ckpt.bytes(&format!("{p}.embed_tokens.weight")).to_vec(),
-    );
+    sink("embed".into(), ckpt.bytes(&format!("{p}.embed_tokens.weight")).to_vec());
     // The PLE table is `[vocab, 35 * ple_dim]` row-major; a TRUNCATED
     // depth (the bisection aid) states a narrower row, so the table's
     // rows re-pack to the stated stride — without this every truncated
@@ -170,35 +161,21 @@ fn bind(ckpt: &Checkpoint, facts: &Gemma4Facts, sink: &mut dyn FnMut(String, Vec
     }
     sink(
         "ple_model_proj".into(),
-        ckpt.bytes(&format!("{p}.per_layer_model_projection.weight"))
-            .to_vec(),
+        ckpt.bytes(&format!("{p}.per_layer_model_projection.weight")).to_vec(),
     );
     sink(
         "ple_model_norm".into(),
-        ckpt.bytes(&format!("{p}.per_layer_projection_norm.weight"))
-            .to_vec(),
+        ckpt.bytes(&format!("{p}.per_layer_projection_norm.weight")).to_vec(),
     );
-    sink(
-        "final_norm".into(),
-        ckpt.bytes(&format!("{p}.norm.weight")).to_vec(),
-    );
+    sink("final_norm".into(), ckpt.bytes(&format!("{p}.norm.weight")).to_vec());
     for n in 0..facts.layers {
         let lp = format!("{p}.layers.{n}");
         let mut w =
             |trace: &str, hf: String| sink(format!("layer.{n}.{trace}"), ckpt.bytes(&hf).to_vec());
         w("attn_norm", format!("{lp}.input_layernorm.weight"));
-        w(
-            "post_attn_norm",
-            format!("{lp}.post_attention_layernorm.weight"),
-        );
-        w(
-            "pre_ffw_norm",
-            format!("{lp}.pre_feedforward_layernorm.weight"),
-        );
-        w(
-            "post_ffw_norm",
-            format!("{lp}.post_feedforward_layernorm.weight"),
-        );
+        w("post_attn_norm", format!("{lp}.post_attention_layernorm.weight"));
+        w("pre_ffw_norm", format!("{lp}.pre_feedforward_layernorm.weight"));
+        w("post_ffw_norm", format!("{lp}.post_feedforward_layernorm.weight"));
         w("q_norm", format!("{lp}.self_attn.q_norm.weight"));
         w("o_proj", format!("{lp}.self_attn.o_proj.weight"));
         w("down", format!("{lp}.mlp.down_proj.weight"));
@@ -209,9 +186,7 @@ fn bind(ckpt: &Checkpoint, facts: &Gemma4Facts, sink: &mut dyn FnMut(String, Vec
             w("q_proj", format!("{lp}.self_attn.q_proj.weight"));
         } else {
             w("k_norm", format!("{lp}.self_attn.k_norm.weight"));
-            let mut qkv = ckpt
-                .bytes(&format!("{lp}.self_attn.q_proj.weight"))
-                .to_vec();
+            let mut qkv = ckpt.bytes(&format!("{lp}.self_attn.q_proj.weight")).to_vec();
             qkv.extend_from_slice(ckpt.bytes(&format!("{lp}.self_attn.k_proj.weight")));
             qkv.extend_from_slice(ckpt.bytes(&format!("{lp}.self_attn.v_proj.weight")));
             sink(format!("layer.{n}.qkv"), qkv);
@@ -290,29 +265,12 @@ fn gemma4_matches_transformers_on_real_weights() {
     let plan = gemma4_cuda(&facts, &cuda, FireClass::Prefill);
     // A prefill: one request, TOKENS rows -- every row multi-token, which
     // is what `GuardPred::WindowOne` reads (graph.md §4.1).
-    let rows: Vec<Row> = vec![
-        Row {
-            samples: true,
-            multi_token: true,
-            ..Row::default()
-        };
-        TOKENS
-    ];
-    let l = lower(
-        &plan,
-        &rows,
-        Fire {
-            captures_across_splits: false,
-        },
-    )
-    .expect("lowers");
+    let rows: Vec<Row> = vec![Row { samples: true, multi_token: true, ..Row::default() }; TOKENS];
+    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame {
-        arena: arena.as_ptr(),
-        arena_bytes: l.arena_bytes,
-    };
+    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
 
     let up = |data: &[u8]| {
         let mut b = alloc.alloc(data.len()).expect("upload");
@@ -329,13 +287,13 @@ fn gemma4_matches_transformers_on_real_weights() {
     // ── The seam-value pool. ──
     let mut named_widths: BTreeMap<ValueId, u32> = BTreeMap::new();
     for a in &l.args {
-        if let Arg::Named { value, width } = a {
+        if let Arg::Named { value, width, .. } = a {
             named_widths.insert(*value, *width);
         }
     }
     for i in 0..l.launches.len() {
         for a in &dplan.spec(i).outs {
-            if let Arg::Named { value, width } = a {
+            if let Arg::Named { value, width, .. } = a {
                 named_widths.insert(*value, *width);
             }
         }
@@ -416,14 +374,9 @@ fn gemma4_matches_transformers_on_real_weights() {
     let csr_lens = up(&u32s(&last_lens_h));
     let qo_indptr = up(&u32s(&qo_indptr_h));
     let row_valid = up(&[1u8; TOKENS]);
-    let ids = up(&prompt
-        .iter()
-        .flat_map(|t| t.to_le_bytes())
-        .collect::<Vec<u8>>());
+    let ids = up(&prompt.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
     let positions = up(&(0i32..7).flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
-    let lse = alloc
-        .alloc(TOKENS * facts.q_heads as usize * 4)
-        .expect("lse");
+    let lse = alloc.alloc(TOKENS * facts.q_heads as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
     let mut ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2).expect("ws");
@@ -504,13 +457,7 @@ fn gemma4_matches_transformers_on_real_weights() {
         // `rotary_of(l)` for the Q-ONLY partial ropes, whose dsl
         // statement carries no width: 128 on the full layers.
         rotary_by_layer: (0..facts.layers)
-            .map(|i| {
-                if facts.is_full_attn(i) {
-                    facts.global_rotary_dim
-                } else {
-                    0
-                }
-            })
+            .map(|i| if facts.is_full_attn(i) { facts.global_rotary_dim } else { 0 })
             .collect(),
         head_dim: facts.head_dim as i32,
         num_q_heads: facts.q_heads as i32,
@@ -540,8 +487,8 @@ fn gemma4_matches_transformers_on_real_weights() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-            moe_ptrs: std::cell::Cell::new(None),
-};
+        moe_ptrs: std::cell::Cell::new(None),
+    };
 
     let mut logits_value: Option<ValueId> = None;
     for i in 0..l.launches.len() {
@@ -552,10 +499,7 @@ fn gemma4_matches_transformers_on_real_weights() {
         }
     }
 
-    let mut resolver = Live {
-        weights: &weights,
-        named: &named_bufs,
-    };
+    let mut resolver = Live { weights: &weights, named: &named_bufs };
     let ran = if std::env::var("GEMMA4_AB_TRACE").is_ok() {
         // Launch-by-launch walk with a sync and a last-row norm of the
         // first output after each — the bisection's microscope.
@@ -564,16 +508,8 @@ fn gemma4_matches_transformers_on_real_weights() {
             let kernel = l.kernels[launch.kernel as usize].clone();
             let bound = bind(&l, launch, frame, &mut resolver)
                 .unwrap_or_else(|e| panic!("launch {i} {kernel}: bind {e:?}"));
-            dispatch(
-                &bound,
-                dplan.spec(i),
-                frame,
-                &mut resolver,
-                &ctx,
-                Some(&attn),
-                None,
-            )
-            .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
+            dispatch(&bound, dplan.spec(i), frame, &mut resolver, &ctx, Some(&attn), None)
+                .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
             stream
                 .as_ref()
                 .synchronize()
@@ -589,9 +525,7 @@ fn gemma4_matches_transformers_on_real_weights() {
                     other => panic!("the relay rides the arena, got {other:?}"),
                 };
                 let mut whole = vec![0u8; l.arena_bytes];
-                arena
-                    .copy_to_host(&mut whole, stream.as_ref())
-                    .expect("d2h");
+                arena.copy_to_host(&mut whole, stream.as_ref()).expect("d2h");
                 stream.as_ref().synchronize().expect("sync");
                 let d = facts.ple_dim as usize;
                 let lcount = facts.layers as usize;
@@ -604,14 +538,8 @@ fn gemma4_matches_transformers_on_real_weights() {
                     let r = TOKENS - 1;
                     let src_off = src_at + ((r * lcount + layer) * d) * 2;
                     let dst_off = dst_at + ((layer * TOKENS + r) * d) * 2;
-                    let sn: f32 = (0..d)
-                        .map(|c| bf(src_off + c * 2).powi(2))
-                        .sum::<f32>()
-                        .sqrt();
-                    let dn: f32 = (0..d)
-                        .map(|c| bf(dst_off + c * 2).powi(2))
-                        .sum::<f32>()
-                        .sqrt();
+                    let sn: f32 = (0..d).map(|c| bf(src_off + c * 2).powi(2)).sum::<f32>().sqrt();
+                    let dn: f32 = (0..d).map(|c| bf(dst_off + c * 2).powi(2)).sum::<f32>().sqrt();
                     eprintln!(
                         "  relay L{layer} r{r}: src n={sn:.3} [{:.3},{:.3}] dst n={dn:.3} [{:.3},{:.3}]",
                         bf(src_off),
@@ -631,13 +559,11 @@ fn gemma4_matches_transformers_on_real_weights() {
                         let w = width as usize;
                         let rows = (launch.rows.end - launch.rows.start) as usize;
                         let mut whole = vec![0u8; l.arena_bytes];
-                        arena
-                            .copy_to_host(&mut whole, stream.as_ref())
-                            .expect("d2h");
+                        arena.copy_to_host(&mut whole, stream.as_ref()).expect("d2h");
                         stream.as_ref().synchronize().expect("sync");
                         (whole[at..at + rows * w * 2].to_vec(), w)
                     }
-                    Arg::Named { value, width } => {
+                    Arg::Named { value, width, .. } => {
                         // The pins are allocated 4 bytes per element
                         // (fp32-capable); the bf16 rows live in the
                         // FIRST half — truncate so the row math below
@@ -671,16 +597,8 @@ fn gemma4_matches_transformers_on_real_weights() {
         }
         l.launches.len()
     } else {
-        run(
-            &l,
-            &dplan,
-            frame,
-            &mut resolver,
-            &ctx,
-            AttnRegions::whole(Some(&attn)),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("the gemma-4 A/B walk refused: {e:?}"))
+        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None)
+            .unwrap_or_else(|e| panic!("the gemma-4 A/B walk refused: {e:?}"))
     };
     assert_eq!(ran, l.launches.len());
     stream.as_ref().synchronize().expect("the fire retires");
@@ -713,10 +631,7 @@ fn gemma4_matches_transformers_on_real_weights() {
             f32::from_bits(u32::from(bits) << 16)
         };
         let head: Vec<f32> = (0..8).map(|c| h(TOKENS - 1, c)).collect();
-        let norm: f32 = (0..hidden)
-            .map(|c| h(TOKENS - 1, c).powi(2))
-            .sum::<f32>()
-            .sqrt();
+        let norm: f32 = (0..hidden).map(|c| h(TOKENS - 1, c).powi(2)).sum::<f32>().sqrt();
         eprintln!(
             "ours residual before final norm (launch {}): last row head {head:?} norm={norm:.4}",
             y_at.0
@@ -730,13 +645,11 @@ fn gemma4_matches_transformers_on_real_weights() {
             .iter()
             .find(|x| l.kernels[x.kernel as usize] == "layout::transpose_bf16_nld_to_lnd")
             .expect("the relay ran");
-        let (src_at, dst_at) = match (
-            &l.args[t.args.start as usize],
-            &l.args[t.args.start as usize + 1],
-        ) {
-            (Arg::Arena { at: s, .. }, Arg::Arena { at: d, .. }) => (*s, *d),
-            other => panic!("the relay rides the arena, got {other:?}"),
-        };
+        let (src_at, dst_at) =
+            match (&l.args[t.args.start as usize], &l.args[t.args.start as usize + 1]) {
+                (Arg::Arena { at: s, .. }, Arg::Arena { at: d, .. }) => (*s, *d),
+                other => panic!("the relay rides the arena, got {other:?}"),
+            };
         let d = facts.ple_dim as usize;
         let lcount = facts.layers as usize;
         let bf = |off: usize| {
@@ -746,14 +659,8 @@ fn gemma4_matches_transformers_on_real_weights() {
             let r = TOKENS - 1;
             let src_off = src_at + ((r * lcount + layer) * d) * 2;
             let dst_off = dst_at + ((layer * TOKENS + r) * d) * 2;
-            let sn: f32 = (0..d)
-                .map(|c| bf(src_off + c * 2).powi(2))
-                .sum::<f32>()
-                .sqrt();
-            let dn: f32 = (0..d)
-                .map(|c| bf(dst_off + c * 2).powi(2))
-                .sum::<f32>()
-                .sqrt();
+            let sn: f32 = (0..d).map(|c| bf(src_off + c * 2).powi(2)).sum::<f32>().sqrt();
+            let dn: f32 = (0..d).map(|c| bf(dst_off + c * 2).powi(2)).sum::<f32>().sqrt();
             eprintln!(
                 "relay layer {layer} row {r}: src norm={sn:.3} head=[{:.3},{:.3}] dst norm={dn:.3} head=[{:.3},{:.3}]",
                 bf(src_off),
@@ -776,9 +683,7 @@ fn gemma4_matches_transformers_on_real_weights() {
     let lv = logits_value.expect("the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits
-        .copy_to_host(&mut back, stream.as_ref())
-        .expect("d2h logits");
+    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let last = TOKENS - 1;
     let logit = |t: usize| {
@@ -822,17 +727,11 @@ fn gemma4_matches_transformers_on_real_weights() {
     );
     let our_top8: Vec<usize> = all[..8].iter().map(|(t, _)| *t).collect();
     for t in &ids5 {
-        assert!(
-            our_top8.contains(t),
-            "HF top-5 token {t} missing from our top-8 {our_top8:?}"
-        );
+        assert!(our_top8.contains(t), "HF top-5 token {t} missing from our top-8 {our_top8:?}");
     }
     for (t, hf) in ids5.iter().zip(&vals5) {
         let ours = logit(*t);
-        assert!(
-            (ours - hf).abs() < 0.75,
-            "top-5 token {t}: ours {ours} vs HF {hf}"
-        );
+        assert!((ours - hf).abs() < 0.75, "top-5 token {t}: ours {ours} vs HF {hf}");
     }
     let probes: Vec<usize> = reference["probe_ids"]
         .as_array()
@@ -854,10 +753,7 @@ fn gemma4_matches_transformers_on_real_weights() {
         .collect();
     for (t, hf) in probes.iter().zip(&probe_vals) {
         let ours = logit(*t);
-        assert!(
-            (ours - hf).abs() < 0.6,
-            "probe token {t}: ours {ours} vs HF {hf}"
-        );
+        assert!((ours - hf).abs() < 0.6, "probe token {t}: ours {ours} vs HF {hf}");
     }
 
     ws.release(&mut sops);

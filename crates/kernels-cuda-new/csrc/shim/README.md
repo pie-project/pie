@@ -6,7 +6,13 @@ NVRTC before CUDA 13.3 ships **no device headers at all**. A `#include
 <cuda_fp16.h>` under it does not find a smaller `cuda_fp16.h`; it finds
 nothing, and the compile stops. The device text this crate carries — ours and
 FlashInfer's alike — is written against those names, so the names have to be
-answered. These fourteen files are the answer.
+answered. These **twenty-one** files are the answer.
+
+Fourteen of them arrived together, when this directory was made out of two
+others; that is the next section. The other seven arrived one at a time and
+are in **Every addition and retirement, in order** below. This page is the
+register for the directory: a file sitting here without an entry is the
+defect, not the file.
 
 ## The name is the contract
 
@@ -51,6 +57,34 @@ with no diagnostic at all. A host header whose names reach device code is
 **carried**, under the exact spelling the directive uses — the rule that is
 the difference between 33 guards in the vendored tree and roughly seventy.
 
+## Every addition and retirement, in order
+
+Fourteen is where this directory started and twenty-one is where it stands.
+The seven between are below. **Six of them were added without an entry here**,
+which is the failure this page exists to prevent: a shim with no register is
+fourteen files and a habit. They are written up after the fact, from each
+file's own banner and from the commit that added it, and one of them
+(`cuda_runtime_api.h`) already had its section further down and keeps it.
+
+| added | file | what it answers | the site that asked |
+| --- | --- | --- | --- |
+| `8f7ac3601` | `cassert` | nothing — NVRTC's preamble already supplies `assert`; only the *name* was missing | `xqa/barriers.cuh:19`. `xqa/utils.h:5` was the second asker and its include is now inside a `// PIE: REMOVED` marker |
+| `c13deb22d` | `cstddef` | `std::size_t`, qualified because we are the ones who spelled it that way | `attn/attention_score_capture.cuh:27` |
+| `d69beb982` | `cstring` | `std::memcpy`, as a byte loop | `attn/attention_mla_naive.cuh:63`, used at `:294-295` to pack two `__nv_bfloat16` for `mma.sync` without aliasing |
+| `d69beb982` | `math_constants.h` | one `#define`: `CUDART_INF_F` | `attn/attention_mla_naive.cuh:67`, the online-softmax running maximum's identity |
+| `d69beb982` | `cuda_pipeline.h` | the three `cp.async` primitives, one inline PTX instruction each | `attn/attention_mla_naive.cuh:66`, `mla_mma_paged_kernel`'s KV staging |
+| `854a508df` | `cuda_runtime_api.h` | the whole file, forwarding to `cuda_runtime.h` | `cute/util/debug.hpp:38` — see **Added for CUTLASS** below, which is its entry |
+| `c6c3ceab1` | `limits` | `std::numeric_limits<float>::infinity()` and nothing else | FlashInfer's MoE glue activation adaptors |
+
+All seven landed on 2026-08-14, within one working day of each other, which is
+why no single commit felt like a change to this directory. Each file's own
+banner carries the measurement; this table carries only that it happened.
+
+**Retirements** are the two sections at the end: seven `cutlass/`, `cute/` and
+`cutlass_extensions/` files added and deleted the same day, and `cstddef`'s
+`offsetof` — the file stays, the member does not. Nothing else has ever been
+removed from here.
+
 ## `-iquote`, never `-I`, and this one is silent to get wrong
 
 Under NVRTC there is one resolver and the carried set answers both `"…"` and
@@ -82,15 +116,34 @@ its includer:
 The inward direction fails loudly if a site forgets a flag — there is no other
 `pie_device.cuh` anywhere. **The outward direction does not fail at all**; it
 finds the toolkit's header and builds the wrong type. That asymmetry is the
-whole reason both directories are named at all four sites:
+whole reason both directories were named at all four sites:
 
 1. `kernels-cuda/csrc/CMakeLists.txt` — `target_compile_options(pie_kernels_cuda …)`
 2. `driver-cuda/build.rs` — the `pie_vision_towers` `cc::Build`
 3. `driver-cuda/build.rs` — the `pie_attn_flashinfer` `cc::Build`
 4. `kernels-cuda-new/tests/device_typecheck_types.rs` — `compile()`
 
+**All four are gone, and this whole section is now history rather than a
+rule.** Site 1 went with the archive crate at `85c6c674b`; sites 2 and 3 went
+when `driver-cuda/build.rs` lost every `cc::Build` — what is left of that
+script is the link closure behind the `abi` feature and nothing else; site 4's
+test file was deleted at `1a08b179a`. `grep -rn iquote crates/` now finds only
+prose: five `.cuh` header comments describing a build that no longer runs,
+`carried.rs`'s module doc, this page and `MODIFICATIONS`. No build script, no
+CMakeLists, no test passes the flag, because there is no offline compile of
+this crate's device text left to pass it to. So no shim can shadow a real
+header today — not because the discipline held, but because the configuration
+it protected is gone.
+
+It is kept in full because the hazard is a property of `-I` and not of any
+particular build script, and the next offline compile of this text — a
+`cc::Build`, a CMake target, a probe that shells out to nvcc — reintroduces it
+on the first line. §21.10's measurement is the thing to reread before writing
+that flag, not after.
+
 One edge stays inside this directory and needs no flag: `cuda_bf16.h` includes
-`"cuda_fp16.h"` and both are here, so it resolves beside the includer.
+`"cuda_fp16.h"` and both are here, so it resolves beside the includer. That
+one still holds, because it is about the carried set and not about nvcc.
 
 ## Under the carried set there is no order, and that is the stronger property
 
@@ -143,11 +196,14 @@ consulted.** Under the carried set there is no toolkit and no order, so the
 shim always answers — which means the JIT is the configuration the right-hand
 column measures, and a probe must be arranged to match it.
 
-Nothing catches this later either:
-`tests/layers.rs::every_include_reachable_from_a_unit_resolves` walks
-**quoted** includes only, and every CUTLASS and CuTe include is angle-
-bracketed. Such an omission passes the gate and fails at first fire on a GPU
-box, naming the include rather than the omission. So: an `-I` probe measures
+Nothing catches this later either. The check that walks the carried set is
+`src/source.rs::every_device_include_resolves` — it was
+`tests/layers.rs::every_include_reachable_from_a_unit_resolves` until
+`1a08b179a` deleted that file, and the property is unchanged because both run
+on `source::quoted_includes`, which walks **quoted** includes only. Every
+CUTLASS and CuTe include is angle-bracketed. Such an omission passes the gate
+and fails at first fire on a GPU box, naming the include rather than the
+omission. So: an `-I` probe measures
 whether the *text* compiles, never whether the *set* is complete. The set is
 complete when `carried.rs`'s walk covers the closure — the directory IS the
 set — and a probe cannot stand in for that.
@@ -186,10 +242,16 @@ closed here: CCCL's `extended_data_types.h:50` forward-declares
 `cuda_fp16.h:236` makes `__half` an *alias* to the one canonical device type.
 An alias and a struct forward-declaration of one name cannot coexist, and in
 production the shim **is** `<cuda_fp16.h>`. Options and the reason none was
-taken unilaterally are recorded at
+taken unilaterally were recorded at
 `driver-cuda::fire::flashinfer_moe::params::CCCL_FP16_CONFLICTS_WITH_SHIM_ALIAS`
 — it touches the canonical-type identity `fa2` and `xqa` are built on, so it
-is a decision rather than an addition.
+is a decision rather than an addition. **That symbol no longer exists**:
+`efaad26b4` retired the fused CUTLASS leg and deleted the module holding it,
+66 files. The argument survives in `new-horizon.md` §68, which is where it was
+written out in full and where it is recorded as *deferred, not open*. The gap
+itself is unchanged — `cuda_fp16.h:236` is still an alias, CCCL still
+forward-declares a struct — and it goes live again the moment anything here
+carries CCCL.
 
 `std::void_t` was on CUTLASS's list too
 (`epilogue/thread/linear_combination_bias_elementwise.h:77`) and was **already

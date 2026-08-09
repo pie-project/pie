@@ -150,8 +150,19 @@ namespace cooperative_groups {
 // NVIDIA's two device symbols for a grid barrier, declared rather than
 // defined: `cicc` lowers the call and the driver resolves it at module load.
 // See `grid_group::sync()` for the measurement and for what is not measured.
+//
+// Under `--relocatable-device-code=true` NVRTC's own builtin header declares
+// both, as `__cudart_builtin__` over `enum cudaCGScope` -- declaring them
+// again here is an incompatible redeclaration and the compile fails. RDC is
+// also the only mode in which they can be RESOLVED, by a `cuLink` against
+// `libcudadevrt.a`, so the two cases are one switch.
+#if defined(__CUDACC_RDC__)
+#define PIE_CG_SCOPE_GRID (::cudaCGScopeGrid)
+#else
 extern "C" __device__ unsigned long long cudaCGGetIntrinsicHandle(unsigned int scope);
 extern "C" __device__ unsigned int cudaCGSynchronize(unsigned long long handle, unsigned int flags);
+#define PIE_CG_SCOPE_GRID (1u)
+#endif
 
 /// The thread block as a group object, which is the only shape of it the
 /// closure ever asks for.
@@ -245,7 +256,7 @@ public:
     /// header spent forty lines refusing: it would compile, run, and let
     /// stage two read stage one's partial outputs.
     __device__ __forceinline__ void sync() const {
-        cudaCGSynchronize(cudaCGGetIntrinsicHandle(/* cudaCGScopeGrid */ 1u), 0u);
+        cudaCGSynchronize(cudaCGGetIntrinsicHandle(PIE_CG_SCOPE_GRID), 0u);
     }
 
     /// This thread's index within the grid, block-major.

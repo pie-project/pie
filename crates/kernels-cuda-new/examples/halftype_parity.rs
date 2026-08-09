@@ -217,98 +217,302 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
     fn rows() -> Vec<Row> {
         vec![
             // -- fp16 conversions ---------------------------------------
-            Row { name: "__float2half", sym: "k_f2h", group: "fp16", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = ub(__float2half(f32(in[i])));" },
-            Row { name: "__float2half_rn", sym: "k_f2h_rn", group: "fp16", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = ub(__float2half_rn(f32(in[i])));" },
-            Row { name: "__half2float", sym: "k_h2f", group: "fp16", feed: Feed::Bits16,
-                  ins: 1, outs: 1, body: "out[i] = ub(__half2float(h1(in[i])));" },
-            Row { name: "__float2half2_rn", sym: "k_f2h2", group: "fp16", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = ub(__float2half2_rn(f32(in[i])));" },
-            Row { name: "__floats2half2_rn", sym: "k_ff2h2", group: "fp16", feed: Feed::Floats,
-                  ins: 2, outs: 1,
-                  body: "out[i] = ub(__floats2half2_rn(f32(in[2*i]), f32(in[2*i+1])));" },
-            Row { name: "__float22half2_rn", sym: "k_f22h2", group: "fp16", feed: Feed::Floats,
-                  ins: 2, outs: 1,
-                  body: "out[i] = ub(__float22half2_rn(make_float2(f32(in[2*i]), f32(in[2*i+1]))));" },
-            Row { name: "__half22float2", sym: "k_h22f2", group: "fp16", feed: Feed::Bits16,
-                  ins: 2, outs: 2,
-                  body: "float2 r = __half22float2(h2(in[2*i], in[2*i+1]));\n\
-                         out[2*i] = ub(r.x); out[2*i+1] = ub(r.y);" },
-            Row { name: "__halves2half2", sym: "k_hh2h2", group: "fp16", feed: Feed::Bits16,
-                  ins: 2, outs: 1,
-                  body: "out[i] = ub(__halves2half2(h1(in[2*i]), h1(in[2*i+1])));" },
-            Row { name: "make_half2", sym: "k_mkh2", group: "fp16", feed: Feed::Bits16,
-                  ins: 2, outs: 1,
-                  body: "out[i] = ub(make_half2(h1(in[2*i]), h1(in[2*i+1])));" },
-            Row { name: "__half_as_ushort", sym: "k_h_as_u", group: "fp16", feed: Feed::Bits16,
-                  ins: 1, outs: 1, body: "out[i] = (unsigned)__half_as_ushort(h1(in[i]));" },
-            Row { name: "__ushort_as_half", sym: "k_u_as_h", group: "fp16", feed: Feed::Bits16,
-                  ins: 1, outs: 1,
-                  body: "out[i] = ub(__ushort_as_half((unsigned short)in[i]));" },
+            Row {
+                name: "__float2half",
+                sym: "k_f2h",
+                group: "fp16",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__float2half(f32(in[i])));",
+            },
+            Row {
+                name: "__float2half_rn",
+                sym: "k_f2h_rn",
+                group: "fp16",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__float2half_rn(f32(in[i])));",
+            },
+            Row {
+                name: "__half2float",
+                sym: "k_h2f",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__half2float(h1(in[i])));",
+            },
+            Row {
+                name: "__float2half2_rn",
+                sym: "k_f2h2",
+                group: "fp16",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__float2half2_rn(f32(in[i])));",
+            },
+            Row {
+                name: "__floats2half2_rn",
+                sym: "k_ff2h2",
+                group: "fp16",
+                feed: Feed::Floats,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(__floats2half2_rn(f32(in[2*i]), f32(in[2*i+1])));",
+            },
+            Row {
+                name: "__float22half2_rn",
+                sym: "k_f22h2",
+                group: "fp16",
+                feed: Feed::Floats,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(__float22half2_rn(make_float2(f32(in[2*i]), f32(in[2*i+1]))));",
+            },
+            Row {
+                name: "__half22float2",
+                sym: "k_h22f2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 2,
+                body: "float2 r = __half22float2(h2(in[2*i], in[2*i+1]));\n\
+                         out[2*i] = ub(r.x); out[2*i+1] = ub(r.y);",
+            },
+            Row {
+                name: "__halves2half2",
+                sym: "k_hh2h2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(__halves2half2(h1(in[2*i]), h1(in[2*i+1])));",
+            },
+            Row {
+                name: "make_half2",
+                sym: "k_mkh2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(make_half2(h1(in[2*i]), h1(in[2*i+1])));",
+            },
+            Row {
+                name: "__half_as_ushort",
+                sym: "k_h_as_u",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = (unsigned)__half_as_ushort(h1(in[i]));",
+            },
+            Row {
+                name: "__ushort_as_half",
+                sym: "k_u_as_h",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__ushort_as_half((unsigned short)in[i]));",
+            },
             // -- fp16 arithmetic ----------------------------------------
-            Row { name: "__hmul", sym: "k_hmul", group: "fp16", feed: Feed::Bits16,
-                  ins: 2, outs: 1, body: "out[i] = ub(__hmul(h1(in[2*i]), h1(in[2*i+1])));" },
-            Row { name: "__hsub", sym: "k_hsub", group: "fp16", feed: Feed::Bits16,
-                  ins: 2, outs: 1, body: "out[i] = ub(__hsub(h1(in[2*i]), h1(in[2*i+1])));" },
-            Row { name: "__hmax", sym: "k_hmax", group: "fp16", feed: Feed::Bits16,
-                  ins: 2, outs: 1, body: "out[i] = ub(__hmax(h1(in[2*i]), h1(in[2*i+1])));" },
-            Row { name: "operator*(half, half)", sym: "k_op_mul_h", group: "fp16",
-                  feed: Feed::Bits16, ins: 2, outs: 1,
-                  body: "out[i] = ub(h1(in[2*i]) * h1(in[2*i+1]));" },
-            Row { name: "operator-(half, half)", sym: "k_op_sub_h", group: "fp16",
-                  feed: Feed::Bits16, ins: 2, outs: 1,
-                  body: "out[i] = ub(h1(in[2*i]) - h1(in[2*i+1]));" },
-            Row { name: "__hmul2", sym: "k_hmul2", group: "fp16", feed: Feed::Bits16,
-                  ins: 4, outs: 1,
-                  body: "out[i] = ub(__hmul2(h2(in[4*i], in[4*i+1]), h2(in[4*i+2], in[4*i+3])));" },
-            Row { name: "__hsub2", sym: "k_hsub2", group: "fp16", feed: Feed::Bits16,
-                  ins: 4, outs: 1,
-                  body: "out[i] = ub(__hsub2(h2(in[4*i], in[4*i+1]), h2(in[4*i+2], in[4*i+3])));" },
-            Row { name: "__hmax2", sym: "k_hmax2", group: "fp16", feed: Feed::Bits16,
-                  ins: 4, outs: 1,
-                  body: "out[i] = ub(__hmax2(h2(in[4*i], in[4*i+1]), h2(in[4*i+2], in[4*i+3])));" },
-            Row { name: "__hfma2", sym: "k_hfma2", group: "fp16", feed: Feed::Bits16,
-                  ins: 6, outs: 1,
-                  body: "out[i] = ub(__hfma2(h2(in[6*i], in[6*i+1]), h2(in[6*i+2], in[6*i+3]), \
-                         h2(in[6*i+4], in[6*i+5])));" },
-            Row { name: "operator*(half2, half2)", sym: "k_op_mul_h2", group: "fp16",
-                  feed: Feed::Bits16, ins: 4, outs: 1,
-                  body: "out[i] = ub(h2(in[4*i], in[4*i+1]) * h2(in[4*i+2], in[4*i+3]));" },
-            Row { name: "operator-(half2, half2)", sym: "k_op_sub_h2", group: "fp16",
-                  feed: Feed::Bits16, ins: 4, outs: 1,
-                  body: "out[i] = ub(h2(in[4*i], in[4*i+1]) - h2(in[4*i+2], in[4*i+3]));" },
-            Row { name: "__shfl_xor_sync(half2)", sym: "k_shfl_h2", group: "fp16",
-                  feed: Feed::Bits16, ins: 2, outs: 2,
-                  body: "__half2 v = h2(in[2*i], in[2*i+1]);\n\
+            Row {
+                name: "__hmul",
+                sym: "k_hmul",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(__hmul(h1(in[2*i]), h1(in[2*i+1])));",
+            },
+            Row {
+                name: "__hsub",
+                sym: "k_hsub",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(__hsub(h1(in[2*i]), h1(in[2*i+1])));",
+            },
+            Row {
+                name: "__hmax",
+                sym: "k_hmax",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(__hmax(h1(in[2*i]), h1(in[2*i+1])));",
+            },
+            Row {
+                name: "operator*(half, half)",
+                sym: "k_op_mul_h",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(h1(in[2*i]) * h1(in[2*i+1]));",
+            },
+            Row {
+                name: "operator-(half, half)",
+                sym: "k_op_sub_h",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(h1(in[2*i]) - h1(in[2*i+1]));",
+            },
+            Row {
+                name: "__hmul2",
+                sym: "k_hmul2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 4,
+                outs: 1,
+                body: "out[i] = ub(__hmul2(h2(in[4*i], in[4*i+1]), h2(in[4*i+2], in[4*i+3])));",
+            },
+            Row {
+                name: "__hsub2",
+                sym: "k_hsub2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 4,
+                outs: 1,
+                body: "out[i] = ub(__hsub2(h2(in[4*i], in[4*i+1]), h2(in[4*i+2], in[4*i+3])));",
+            },
+            Row {
+                name: "__hmax2",
+                sym: "k_hmax2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 4,
+                outs: 1,
+                body: "out[i] = ub(__hmax2(h2(in[4*i], in[4*i+1]), h2(in[4*i+2], in[4*i+3])));",
+            },
+            Row {
+                name: "__hfma2",
+                sym: "k_hfma2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 6,
+                outs: 1,
+                body: "out[i] = ub(__hfma2(h2(in[6*i], in[6*i+1]), h2(in[6*i+2], in[6*i+3]), \
+                         h2(in[6*i+4], in[6*i+5])));",
+            },
+            Row {
+                name: "operator*(half2, half2)",
+                sym: "k_op_mul_h2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 4,
+                outs: 1,
+                body: "out[i] = ub(h2(in[4*i], in[4*i+1]) * h2(in[4*i+2], in[4*i+3]));",
+            },
+            Row {
+                name: "operator-(half2, half2)",
+                sym: "k_op_sub_h2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 4,
+                outs: 1,
+                body: "out[i] = ub(h2(in[4*i], in[4*i+1]) - h2(in[4*i+2], in[4*i+3]));",
+            },
+            Row {
+                name: "__shfl_xor_sync(half2)",
+                sym: "k_shfl_h2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 2,
+                body: "__half2 v = h2(in[2*i], in[2*i+1]);\n\
                          out[2*i] = ub(__shfl_xor_sync(0xffffffffu, v, 1));\n\
-                         out[2*i+1] = ub(__shfl_xor_sync(0xffffffffu, v, 2));" },
+                         out[2*i+1] = ub(__shfl_xor_sync(0xffffffffu, v, 2));",
+            },
             // -- bf16 ---------------------------------------------------
-            Row { name: "__float2bfloat16", sym: "k_f2b", group: "bf16", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = ub(__float2bfloat16(f32(in[i])));" },
-            Row { name: "__float2bfloat16_rn", sym: "k_f2b_rn", group: "bf16", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = ub(__float2bfloat16_rn(f32(in[i])));" },
-            Row { name: "__bfloat162float", sym: "k_b2f", group: "bf16", feed: Feed::Bits16,
-                  ins: 1, outs: 1, body: "out[i] = ub(__bfloat162float(b1(in[i])));" },
-            Row { name: "__float2bfloat162_rn", sym: "k_f2b2", group: "bf16", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = ub(__float2bfloat162_rn(f32(in[i])));" },
-            Row { name: "__floats2bfloat162_rn", sym: "k_ff2b2", group: "bf16", feed: Feed::Floats,
-                  ins: 2, outs: 1,
-                  body: "out[i] = ub(__floats2bfloat162_rn(f32(in[2*i]), f32(in[2*i+1])));" },
-            Row { name: "__float22bfloat162_rn", sym: "k_f22b2", group: "bf16", feed: Feed::Floats,
-                  ins: 2, outs: 1,
-                  body: "out[i] = ub(__float22bfloat162_rn(make_float2(f32(in[2*i]), \
-                         f32(in[2*i+1]))));" },
-            Row { name: "__bfloat1622float2", sym: "k_b22f2", group: "bf16", feed: Feed::Bits16,
-                  ins: 2, outs: 2,
-                  body: "float2 r = __bfloat1622float2(b2(in[2*i], in[2*i+1]));\n\
-                         out[2*i] = ub(r.x); out[2*i+1] = ub(r.y);" },
-            Row { name: "make_bfloat162", sym: "k_mkb2", group: "bf16", feed: Feed::Bits16,
-                  ins: 2, outs: 1,
-                  body: "out[i] = ub(make_bfloat162(b1(in[2*i]), b1(in[2*i+1])));" },
-            Row { name: "__hmul2(bf16)", sym: "k_hmul2_b", group: "bf16", feed: Feed::Bits16,
-                  ins: 4, outs: 1,
-                  body: "out[i] = ub(__hmul2(b2(in[4*i], in[4*i+1]), b2(in[4*i+2], in[4*i+3])));" },
+            Row {
+                name: "__float2bfloat16",
+                sym: "k_f2b",
+                group: "bf16",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__float2bfloat16(f32(in[i])));",
+            },
+            Row {
+                name: "__float2bfloat16_rn",
+                sym: "k_f2b_rn",
+                group: "bf16",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__float2bfloat16_rn(f32(in[i])));",
+            },
+            Row {
+                name: "__bfloat162float",
+                sym: "k_b2f",
+                group: "bf16",
+                feed: Feed::Bits16,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__bfloat162float(b1(in[i])));",
+            },
+            Row {
+                name: "__float2bfloat162_rn",
+                sym: "k_f2b2",
+                group: "bf16",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = ub(__float2bfloat162_rn(f32(in[i])));",
+            },
+            Row {
+                name: "__floats2bfloat162_rn",
+                sym: "k_ff2b2",
+                group: "bf16",
+                feed: Feed::Floats,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(__floats2bfloat162_rn(f32(in[2*i]), f32(in[2*i+1])));",
+            },
+            Row {
+                name: "__float22bfloat162_rn",
+                sym: "k_f22b2",
+                group: "bf16",
+                feed: Feed::Floats,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(__float22bfloat162_rn(make_float2(f32(in[2*i]), \
+                         f32(in[2*i+1]))));",
+            },
+            Row {
+                name: "__bfloat1622float2",
+                sym: "k_b22f2",
+                group: "bf16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 2,
+                body: "float2 r = __bfloat1622float2(b2(in[2*i], in[2*i+1]));\n\
+                         out[2*i] = ub(r.x); out[2*i+1] = ub(r.y);",
+            },
+            Row {
+                name: "make_bfloat162",
+                sym: "k_mkb2",
+                group: "bf16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "out[i] = ub(make_bfloat162(b1(in[2*i]), b1(in[2*i+1])));",
+            },
+            Row {
+                name: "__hmul2(bf16)",
+                sym: "k_hmul2_b",
+                group: "bf16",
+                feed: Feed::Bits16,
+                ins: 4,
+                outs: 1,
+                body: "out[i] = ub(__hmul2(b2(in[4*i], in[4*i+1]), b2(in[4*i+2], in[4*i+3])));",
+            },
             // -- the storage structs ------------------------------------
             //
             // Not arithmetic -- a layout and two casts -- and gated here
@@ -319,46 +523,115 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
             // COPY-initialisation on purpose, because that is the form
             // `tests/prelude_parity.rs` uses and the form an `explicit`
             // conversion operator would silently refuse.
-            Row { name: "static_cast<__half_raw>(h).x", sym: "k_h2raw", group: "fp16",
-                  feed: Feed::Bits16, ins: 1, outs: 1,
-                  body: "out[i] = (unsigned)static_cast<__half_raw>(h1(in[i])).x;" },
-            Row { name: "__half = __half_raw", sym: "k_raw2h", group: "fp16",
-                  feed: Feed::Bits16, ins: 1, outs: 1,
-                  body: "__half_raw r; r.x = (unsigned short)in[i];\n\
-                         __half v = r; out[i] = ub(v);" },
-            Row { name: "static_cast<__half2_raw>(h2)", sym: "k_h22raw", group: "fp16",
-                  feed: Feed::Bits16, ins: 2, outs: 2,
-                  body: "__half2_raw r = static_cast<__half2_raw>(h2(in[2*i], in[2*i+1]));\n\
-                         out[2*i] = (unsigned)r.x; out[2*i+1] = (unsigned)r.y;" },
-            Row { name: "__half2 = __half2_raw", sym: "k_raw2h2", group: "fp16",
-                  feed: Feed::Bits16, ins: 2, outs: 1,
-                  body: "__half2_raw r; r.x = (unsigned short)in[2*i];\n\
+            Row {
+                name: "static_cast<__half_raw>(h).x",
+                sym: "k_h2raw",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = (unsigned)static_cast<__half_raw>(h1(in[i])).x;",
+            },
+            Row {
+                name: "__half = __half_raw",
+                sym: "k_raw2h",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 1,
+                outs: 1,
+                body: "__half_raw r; r.x = (unsigned short)in[i];\n\
+                         __half v = r; out[i] = ub(v);",
+            },
+            Row {
+                name: "static_cast<__half2_raw>(h2)",
+                sym: "k_h22raw",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 2,
+                body: "__half2_raw r = static_cast<__half2_raw>(h2(in[2*i], in[2*i+1]));\n\
+                         out[2*i] = (unsigned)r.x; out[2*i+1] = (unsigned)r.y;",
+            },
+            Row {
+                name: "__half2 = __half2_raw",
+                sym: "k_raw2h2",
+                group: "fp16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "__half2_raw r; r.x = (unsigned short)in[2*i];\n\
                          r.y = (unsigned short)in[2*i+1];\n\
-                         __half2 v = r; out[i] = ub(v);" },
-            Row { name: "static_cast<__nv_bfloat16_raw>(b).x", sym: "k_b2raw", group: "bf16",
-                  feed: Feed::Bits16, ins: 1, outs: 1,
-                  body: "out[i] = (unsigned)static_cast<__nv_bfloat16_raw>(b1(in[i])).x;" },
-            Row { name: "__nv_bfloat16 = __nv_bfloat16_raw", sym: "k_raw2b", group: "bf16",
-                  feed: Feed::Bits16, ins: 1, outs: 1,
-                  body: "__nv_bfloat16_raw r; r.x = (unsigned short)in[i];\n\
-                         __nv_bfloat16 v = r; out[i] = ub(v);" },
-            Row { name: "static_cast<__nv_bfloat162_raw>(b2)", sym: "k_b22raw", group: "bf16",
-                  feed: Feed::Bits16, ins: 2, outs: 2,
-                  body: "__nv_bfloat162_raw r = static_cast<__nv_bfloat162_raw>(\
+                         __half2 v = r; out[i] = ub(v);",
+            },
+            Row {
+                name: "static_cast<__nv_bfloat16_raw>(b).x",
+                sym: "k_b2raw",
+                group: "bf16",
+                feed: Feed::Bits16,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = (unsigned)static_cast<__nv_bfloat16_raw>(b1(in[i])).x;",
+            },
+            Row {
+                name: "__nv_bfloat16 = __nv_bfloat16_raw",
+                sym: "k_raw2b",
+                group: "bf16",
+                feed: Feed::Bits16,
+                ins: 1,
+                outs: 1,
+                body: "__nv_bfloat16_raw r; r.x = (unsigned short)in[i];\n\
+                         __nv_bfloat16 v = r; out[i] = ub(v);",
+            },
+            Row {
+                name: "static_cast<__nv_bfloat162_raw>(b2)",
+                sym: "k_b22raw",
+                group: "bf16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 2,
+                body: "__nv_bfloat162_raw r = static_cast<__nv_bfloat162_raw>(\
                          b2(in[2*i], in[2*i+1]));\n\
-                         out[2*i] = (unsigned)r.x; out[2*i+1] = (unsigned)r.y;" },
-            Row { name: "__nv_bfloat162 = __nv_bfloat162_raw", sym: "k_raw2b2", group: "bf16",
-                  feed: Feed::Bits16, ins: 2, outs: 1,
-                  body: "__nv_bfloat162_raw r; r.x = (unsigned short)in[2*i];\n\
+                         out[2*i] = (unsigned)r.x; out[2*i+1] = (unsigned)r.y;",
+            },
+            Row {
+                name: "__nv_bfloat162 = __nv_bfloat162_raw",
+                sym: "k_raw2b2",
+                group: "bf16",
+                feed: Feed::Bits16,
+                ins: 2,
+                outs: 1,
+                body: "__nv_bfloat162_raw r; r.x = (unsigned short)in[2*i];\n\
                          r.y = (unsigned short)in[2*i+1];\n\
-                         __nv_bfloat162 v = r; out[i] = ub(v);" },
+                         __nv_bfloat162 v = r; out[i] = ub(v);",
+            },
             // -- not ours, and the row is the proof ---------------------
-            Row { name: "__float2int_rd", sym: "k_f2i_rd", group: "builtin", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = (unsigned)__float2int_rd(f32(in[i]));" },
-            Row { name: "__float2int_rn", sym: "k_f2i_rn", group: "builtin", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = (unsigned)__float2int_rn(f32(in[i]));" },
-            Row { name: "__float2int_rz", sym: "k_f2i_rz", group: "builtin", feed: Feed::Floats,
-                  ins: 1, outs: 1, body: "out[i] = (unsigned)__float2int_rz(f32(in[i]));" },
+            Row {
+                name: "__float2int_rd",
+                sym: "k_f2i_rd",
+                group: "builtin",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = (unsigned)__float2int_rd(f32(in[i]));",
+            },
+            Row {
+                name: "__float2int_rn",
+                sym: "k_f2i_rn",
+                group: "builtin",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = (unsigned)__float2int_rn(f32(in[i]));",
+            },
+            Row {
+                name: "__float2int_rz",
+                sym: "k_f2i_rz",
+                group: "builtin",
+                feed: Feed::Floats,
+                ins: 1,
+                outs: 1,
+                body: "out[i] = (unsigned)__float2int_rz(f32(in[i]));",
+            },
         ]
     }
 
@@ -378,7 +651,7 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
     }
 
     pub fn run() -> i32 {
-        let Some(arch) = kernels_cuda_new::runtime::cache::arch() else {
+        let Some(arch) = kernels_cuda_new::jit::cache::arch() else {
             println!("no CUDA device is current; this probe needs one to compare on");
             return 1;
         };
@@ -444,19 +717,23 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
                 return 1;
             }
         };
-        let portable = match compile_with_nvrtc(&text, arch, &headers, &["-DPIE_HALFTYPE_FORCE_PORTABLE"])
-        {
-            Ok(built) => {
-                println!("  portable      NVRTC, every fallback forced   {:8.1} ms", built.millis);
-                Some(built)
-            }
-            Err(why) => {
-                println!("  portable      NVRTC REFUSED:\n{why}");
-                None
-            }
-        };
+        let portable =
+            match compile_with_nvrtc(&text, arch, &headers, &["-DPIE_HALFTYPE_FORCE_PORTABLE"]) {
+                Ok(built) => {
+                    println!(
+                        "  portable      NVRTC, every fallback forced   {:8.1} ms",
+                        built.millis
+                    );
+                    Some(built)
+                }
+                Err(why) => {
+                    println!("  portable      NVRTC REFUSED:\n{why}");
+                    None
+                }
+            };
 
-        let (Ok(reference), Ok(native)) = (Module::load(&reference.image), Module::load(&native.image))
+        let (Ok(reference), Ok(native)) =
+            (Module::load(&reference.image), Module::load(&native.image))
         else {
             println!("\nloading a cubin failed");
             return 1;
@@ -465,11 +742,7 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
 
         let floats = f32_corpus();
         let bits16 = bits16_corpus();
-        println!(
-            "\ncorpora: {} fp32 patterns, {} 16-bit patterns\n",
-            floats.len(),
-            bits16.len()
-        );
+        println!("\ncorpora: {} fp32 patterns, {} 16-bit patterns\n", floats.len(), bits16.len());
 
         let d_floats = match Device::upload(&floats) {
             Ok(d) => d,
@@ -489,7 +762,10 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
         let mut failures = 0usize;
         let mut checked = 0usize;
 
-        println!("{:<26} {:>5} {:>10}  {:>6}  {}", "function", "group", "inputs", "result", "first difference");
+        println!(
+            "{:<26} {:>5} {:>10}  {:>6}  {}",
+            "function", "group", "inputs", "result", "first difference"
+        );
         println!("{}", "-".repeat(112));
         for row in &rows {
             let (corpus, device) = match row.feed {
@@ -499,10 +775,9 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
             let n = corpus.len() / row.ins;
             checked += n;
             match compare_row(row, &reference, &native, device, n, corpus) {
-                Ok(None) => println!(
-                    "{:<26} {:>5} {:>10}  {:>6}  {}",
-                    row.name, row.group, n, "PASS", "--"
-                ),
+                Ok(None) => {
+                    println!("{:<26} {:>5} {:>10}  {:>6}  {}", row.name, row.group, n, "PASS", "--")
+                }
                 Ok(Some(diff)) => {
                     failures += 1;
                     println!(
@@ -533,7 +808,10 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
                  which no device in this building runs, measured against the same reference:\n",
                 rows.len()
             );
-            println!("{:<26} {:>5} {:>10}  {:>6}  {}", "function", "group", "inputs", "result", "first difference");
+            println!(
+                "{:<26} {:>5} {:>10}  {:>6}  {}",
+                "function", "group", "inputs", "result", "first difference"
+            );
             println!("{}", "-".repeat(112));
             for row in &rows {
                 let (corpus, device) = match row.feed {
@@ -555,7 +833,10 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
                     }
                     Err(why) => {
                         portable_failures += 1;
-                        println!("{:<26} {:>5} {:>10}  {:>6}  {why}", row.name, row.group, n, "ERROR");
+                        println!(
+                            "{:<26} {:>5} {:>10}  {:>6}  {why}",
+                            row.name, row.group, n, "ERROR"
+                        );
                     }
                 }
             }
@@ -678,7 +959,7 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
         let mut caught = Vec::new();
         let mut missed = Vec::new();
         for row in rows.iter().filter(|r| r.sym == "k_ff2h2" || r.sym == "k_f22h2") {
-        let n = corpus.len() / row.ins;
+            let n = corpus.len() / row.ins;
             match compare_row(row, reference, &mutant, input, n, corpus) {
                 Ok(Some(_)) => caught.push(row.name),
                 _ => missed.push(row.name),
@@ -718,9 +999,8 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
             "{head}__device__ float widen_h(__half h) {{ return (float)h; }}\n\
              __device__ float widen_b(__nv_bfloat16 b) {{ return (float)b; }}\n"
         );
-        let implicit = format!(
-            "{head}__device__ float widen_h(__half h) {{ float f = h; return f; }}\n"
-        );
+        let implicit =
+            format!("{head}__device__ float widen_h(__half h) {{ float f = h; return f; }}\n");
         let call = format!(
             "{head}__device__ float widen_h(__half h) {{ return __half2float(h); }}\n\
              __device__ float widen_b(__nv_bfloat16 b) {{ return __bfloat162float(b); }}\n"
@@ -882,7 +1162,9 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
         // both formats' fields, because the same corpus feeds both.
         let mut reps: Vec<u32> = Vec::new();
         for sign in [0u32, 1] {
-            for exponent in [0u32, 1, 2, 64, 100, 124, 125, 126, 127, 128, 129, 130, 140, 190, 254, 255] {
+            for exponent in
+                [0u32, 1, 2, 64, 100, 124, 125, 126, 127, 128, 129, 130, 140, 190, 254, 255]
+            {
                 for mantissa in [0u32, 1, 0x40, 0x7f] {
                     reps.push((sign << 15) | (exponent << 7) | mantissa);
                 }
@@ -1077,7 +1359,11 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
         let started = Instant::now();
         // SAFETY: the program is live and the options outlive the call.
         let code = unsafe {
-            nv::nvrtcCompileProgram(program, i32::try_from(options.len()).unwrap(), options.as_ptr())
+            nv::nvrtcCompileProgram(
+                program,
+                i32::try_from(options.len()).unwrap(),
+                options.as_ptr(),
+            )
         };
         let millis = started.elapsed().as_secs_f64() * 1e3;
         let log = program_log(program);
@@ -1164,7 +1450,13 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
         /// handles result `i` in BOTH cubins -- the warp row shuffles between
         /// lanes, so the mapping from lane to input has to be identical or
         /// the two paths would be answering different questions.
-        fn run(&self, sym: &str, input: &Device, n: usize, outs: usize) -> Result<Vec<u32>, String> {
+        fn run(
+            &self,
+            sym: &str,
+            input: &Device,
+            n: usize,
+            outs: usize,
+        ) -> Result<Vec<u32>, String> {
             let name = CString::new(sym).map_err(|_| "a NUL in a kernel name")?;
             let mut function: dr::CUfunction = std::ptr::null_mut();
             // SAFETY: `module` came from a successful load and `name` is
@@ -1329,7 +1621,11 @@ __device__ __forceinline__ __nv_bfloat162 b2(unsigned a, unsigned b) {
         let mut name = [0u8; 128];
         // SAFETY: the buffer is 128 bytes and that is what is claimed.
         let code = unsafe {
-            dr::cuDeviceGetName(name.as_mut_ptr().cast(), i32::try_from(name.len()).unwrap(), device)
+            dr::cuDeviceGetName(
+                name.as_mut_ptr().cast(),
+                i32::try_from(name.len()).unwrap(),
+                device,
+            )
         };
         if code != dr::CUresult::CUDA_SUCCESS {
             return "unknown".to_string();

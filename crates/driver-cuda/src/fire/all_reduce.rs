@@ -163,12 +163,15 @@ use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::fmt;
 use std::sync::Arc;
 
-use cudarc::driver::sys::{CUdeviceptr, CUpointer_attribute, cuMemsetD16_v2, cuPointerGetAttribute};
+use cudarc::driver::sys::{
+    CUdeviceptr, CUpointer_attribute, cuMemsetD16_v2, cuPointerGetAttribute,
+};
 use cudarc::runtime::sys::{
-    cudaDeviceCanAccessPeer, cudaDeviceEnablePeerAccess, cudaDeviceSynchronize, cudaError, cudaFree,
-    cudaGetDevice, cudaGetLastError, cudaIpcCloseMemHandle, cudaIpcGetMemHandle, cudaIpcMemHandle_t,
-    cudaIpcMemLazyEnablePeerAccess, cudaIpcOpenMemHandle, cudaMalloc, cudaMemcpy, cudaMemcpyKind,
-    cudaMemset, cudaStreamCaptureStatus, cudaStreamIsCapturing, cudaStream_t,
+    cudaDeviceCanAccessPeer, cudaDeviceEnablePeerAccess, cudaDeviceSynchronize, cudaError,
+    cudaFree, cudaGetDevice, cudaGetLastError, cudaIpcCloseMemHandle, cudaIpcGetMemHandle,
+    cudaIpcMemHandle_t, cudaIpcMemLazyEnablePeerAccess, cudaIpcOpenMemHandle, cudaMalloc,
+    cudaMemcpy, cudaMemcpyKind, cudaMemset, cudaStream_t, cudaStreamCaptureStatus,
+    cudaStreamIsCapturing,
 };
 
 use crate::error::{Error, check_cu, check_rt, ignore_in_drop};
@@ -508,9 +511,7 @@ pub fn resolve(
         return Err(Decline::WorldSizeUnsupported { nranks });
     }
     if !INSTANTIATED.contains(&pattern) {
-        return Err(Decline::PatternNotInstantiated {
-            code: pattern.code(),
-        });
+        return Err(Decline::PatternNotInstantiated { code: pattern.code() });
     }
     Ok(Instantiation {
         nranks,
@@ -673,15 +674,10 @@ impl fmt::Display for Decline {
                  have it"
             ),
             Self::CaptureUnknown => write!(f, "`cudaStreamIsCapturing` failed on this stream"),
-            Self::Unregistered => write!(
-                f,
-                "the input's base allocation was never passed to `register_buffer`"
-            ),
-            Self::AboveCrossover {
-                bytes,
-                crossover,
-                world_size,
-            } => write!(
+            Self::Unregistered => {
+                write!(f, "the input's base allocation was never passed to `register_buffer`")
+            }
+            Self::AboveCrossover { bytes, crossover, world_size } => write!(
                 f,
                 "{bytes} bytes is at or above the {crossover}-byte crossover for world size \
                  {world_size}; NCCL wins on bandwidth here"
@@ -691,18 +687,15 @@ impl fmt::Display for Decline {
                 "no fusion workspace was built (world size 2 with a positive `fusion_max_tokens` \
                  and `fusion_hidden` is what builds one)"
             ),
-            Self::FusionTokens { tokens, max_tokens } => write!(
-                f,
-                "{tokens} tokens against a workspace sized for {max_tokens}"
-            ),
-            Self::FusionHidden { hidden, want } => write!(
-                f,
-                "hidden {hidden} against a workspace sized for exactly {want}"
-            ),
-            Self::FusionWorldSize { world_size } => write!(
-                f,
-                "the fused landing is world size 2 only; this group is {world_size}"
-            ),
+            Self::FusionTokens { tokens, max_tokens } => {
+                write!(f, "{tokens} tokens against a workspace sized for {max_tokens}")
+            }
+            Self::FusionHidden { hidden, want } => {
+                write!(f, "hidden {hidden} against a workspace sized for exactly {want}")
+            }
+            Self::FusionWorldSize { world_size } => {
+                write!(f, "the fused landing is world size 2 only; this group is {world_size}")
+            }
             Self::FusionHiddenNotOctet { hidden } => {
                 write!(f, "hidden {hidden} is not a multiple of 8")
             }
@@ -716,11 +709,7 @@ impl fmt::Display for Decline {
                 "the fused all-reduce does not support TP world size {nranks} (flashinfer supports \
                  2, 4, 8, 16)"
             ),
-            Self::NoDeviceText {
-                what,
-                header,
-                name_expression,
-            } => write!(
+            Self::NoDeviceText { what, header, name_expression } => write!(
                 f,
                 "{what} has no device text in this tree: `{header}` is CPM-fetched, not vendored, \
                  and `crates/kernels-cuda-new/csrc/src/attn/flashinfer/` has no `comm/`. The point \
@@ -1192,10 +1181,7 @@ impl CustomAllReduce {
         // SAFETY: a live out-parameter.
         check_rt(unsafe { cudaGetDevice(&mut dev) }, "cudaGetDevice")?;
         if cfg.group_devices.is_empty() {
-            return Err(Error::invalid(
-                "custom_all_reduce",
-                "group device ordinals are required",
-            ));
+            return Err(Error::invalid("custom_all_reduce", "group device ordinals are required"));
         }
         if cfg.group_devices.len() != self.world_size as usize {
             return Err(Error::invalid(
@@ -1219,15 +1205,9 @@ impl CustomAllReduce {
         // wrapper stays valid for fully-connected larger groups.
         let signal_bytes = SIGNAL_BYTES + self.max_bytes;
         // SAFETY: a live out-parameter and a positive size.
-        check_rt(
-            unsafe { cudaMalloc(&mut self.signal_self, signal_bytes) },
-            "cudaMalloc(signal)",
-        )?;
+        check_rt(unsafe { cudaMalloc(&mut self.signal_self, signal_bytes) }, "cudaMalloc(signal)")?;
         // SAFETY: `signal_self` now addresses `signal_bytes` writable bytes.
-        check_rt(
-            unsafe { cudaMemset(self.signal_self, 0, signal_bytes) },
-            "cudaMemset(signal)",
-        )?;
+        check_rt(unsafe { cudaMemset(self.signal_self, 0, signal_bytes) }, "cudaMemset(signal)")?;
 
         // `:263-297`, the signal exchange.
         self.signal_peers = self.exchange_pointers(self.signal_self)?;
@@ -1252,11 +1232,7 @@ impl CustomAllReduce {
             "[custom_all_reduce] initialised (world={}, rank={}, mode={}, fully_connected={})",
             self.world_size,
             self.rank,
-            if self.same_process {
-                "same-process"
-            } else {
-                "ipc"
-            },
+            if self.same_process { "same-process" } else { "ipc" },
             if self.fully_connected { "yes" } else { "no" }
         );
         Ok(())
@@ -1285,10 +1261,7 @@ impl CustomAllReduce {
 
         let mut self_handle = cudaIpcMemHandle_t { reserved: [0; 64] };
         // SAFETY: `local` is a base allocation of this process.
-        check_rt(
-            unsafe { cudaIpcGetMemHandle(&mut self_handle, local) },
-            "cudaIpcGetMemHandle",
-        )?;
+        check_rt(unsafe { cudaIpcGetMemHandle(&mut self_handle, local) }, "cudaIpcGetMemHandle")?;
         let gathered = self.allgather(&from_handle(&self_handle));
 
         let mut out = Vec::with_capacity(world);
@@ -1357,20 +1330,14 @@ impl CustomAllReduce {
         let lamport_bytes = align_up(lamport_comm_bytes * 3, FUSION_ALIGN);
 
         let mut buffers = [std::ptr::null_mut::<c_void>(); 3];
-        for (slot, bytes) in buffers
-            .iter_mut()
-            .zip([buffer_bytes, flag_bytes, lamport_bytes])
-        {
+        for (slot, bytes) in buffers.iter_mut().zip([buffer_bytes, flag_bytes, lamport_bytes]) {
             // SAFETY: a live out-parameter and a positive size.
             check_rt(unsafe { cudaMalloc(slot, bytes) }, "cudaMalloc(fusion)")?;
         }
 
         let mut flag_dev: *mut c_void = std::ptr::null_mut();
         // SAFETY: a live out-parameter.
-        check_rt(
-            unsafe { cudaMalloc(&mut flag_dev, 5 * 4) },
-            "cudaMalloc(fusion flags)",
-        )?;
+        check_rt(unsafe { cudaMalloc(&mut flag_dev, 5 * 4) }, "cudaMalloc(fusion flags)")?;
 
         // Everything allocated: park it on `self` so `Drop` owns it from
         // here, before anything else can fail.
@@ -1434,10 +1401,7 @@ impl CustomAllReduce {
         // SAFETY: a live out-parameter and a positive size.
         check_rt(
             unsafe {
-                cudaMalloc(
-                    &mut workspace_dev,
-                    workspace.len() * std::mem::size_of::<*mut c_void>(),
-                )
+                cudaMalloc(&mut workspace_dev, workspace.len() * std::mem::size_of::<*mut c_void>())
             },
             "cudaMalloc(fusion workspace)",
         )?;
@@ -1510,7 +1474,11 @@ impl CustomAllReduce {
     ///
     /// An unresolvable base pointer, a failing IPC exchange, or an exhausted
     /// `RankData` slab.
-    pub fn register_buffer(&mut self, buf: *mut c_void, _buf_bytes: usize) -> crate::error::Result<()> {
+    pub fn register_buffer(
+        &mut self,
+        buf: *mut c_void,
+        _buf_bytes: usize,
+    ) -> crate::error::Result<()> {
         let self_base = base_ptr(buf)?;
         if self.buffers.contains_key(&(self_base as usize)) {
             return Ok(());
@@ -1551,7 +1519,8 @@ impl CustomAllReduce {
                 flat[i * 8 + r] = *ptr;
             }
         }
-        let first = (self.rank_data as usize + self.rank_data_next * RANK_DATA_BYTES) as *mut c_void;
+        let first =
+            (self.rank_data as usize + self.rank_data_next * RANK_DATA_BYTES) as *mut c_void;
         // SAFETY: the capacity check above proves `n` slots fit, and `flat`
         // is exactly `n * RANK_DATA_BYTES` bytes of initialised host memory.
         check_rt(
@@ -1696,16 +1665,11 @@ impl CustomAllReduce {
         }
         // `:469-471`. The 16-byte multiple is the kernel's vector width.
         if bytes == 0 || bytes > self.max_bytes || bytes % 16 != 0 {
-            return Err(Decline::Bytes {
-                bytes,
-                max_bytes: self.max_bytes,
-            });
+            return Err(Decline::Bytes { bytes, max_bytes: self.max_bytes });
         }
         // `:473`.
         if self.world_size > 2 && !self.fully_connected {
-            return Err(Decline::NotFullyConnected {
-                world_size: self.world_size,
-            });
+            return Err(Decline::NotFullyConnected { world_size: self.world_size });
         }
         // `:475-479`. During capture the pointer query is meaningless --
         // the address will be replayed, not dereferenced now -- so the
@@ -1745,11 +1709,7 @@ impl CustomAllReduce {
         if bytes < crossover {
             Ok(())
         } else {
-            Err(Decline::AboveCrossover {
-                bytes,
-                crossover,
-                world_size: self.world_size,
-            })
+            Err(Decline::AboveCrossover { bytes, crossover, world_size: self.world_size })
         }
     }
 
@@ -1773,25 +1733,17 @@ impl CustomAllReduce {
         };
         // `:491`.
         if tokens <= 0 || tokens > fusion.max_tokens {
-            return Err(Decline::FusionTokens {
-                tokens,
-                max_tokens: fusion.max_tokens,
-            });
+            return Err(Decline::FusionTokens { tokens, max_tokens: fusion.max_tokens });
         }
         // `:492`.
         if hidden != fusion.hidden {
-            return Err(Decline::FusionHidden {
-                hidden,
-                want: fusion.hidden,
-            });
+            return Err(Decline::FusionHidden { hidden, want: fusion.hidden });
         }
         // `:493`. The fusion plane is built for TP=2 only (`:308`), so this
         // is unreachable from a constructed `Fusion` -- kept because the C++
         // kept it and because it is the invariant, not a consequence.
         if self.world_size != 2 {
-            return Err(Decline::FusionWorldSize {
-                world_size: self.world_size,
-            });
+            return Err(Decline::FusionWorldSize { world_size: self.world_size });
         }
         // `:494`. The kernel's vector width in bf16 elements.
         if hidden % 8 != 0 {
@@ -2103,14 +2055,8 @@ mod tests {
 
     #[test]
     fn the_one_reached_point_resolves() {
-        let got = resolve(
-            REACHED.nranks,
-            REACHED.pattern,
-            REACHED.fp32_acc,
-            true,
-            false,
-        )
-        .expect("the one point pie reaches must resolve");
+        let got = resolve(REACHED.nranks, REACHED.pattern, REACHED.fp32_acc, true, false)
+            .expect("the one point pie reaches must resolve");
         assert_eq!(got, REACHED);
     }
 

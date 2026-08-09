@@ -66,10 +66,10 @@
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::ArgValue;
+use kernels_cuda_new::x::{ssm, vision};
 use model::shared::tower_names::AUDIO_SLOTS_PER_LAYER;
 
-use super::{Scratch, fire, fire_stated, p, pm, rect};
+use super::{Scratch, call};
 use crate::device::{StreamRef, read_raw_span};
 use crate::{Error, Result};
 
@@ -81,20 +81,6 @@ use crate::{Error, Result};
 /// decision. `super::gemma4_vision` collapsed thirty-two this way; this file
 /// was written at one.
 const WHO: &str = "gemma4_audio";
-
-/// The tile every `G2` grid pairs with, transcribed from the launcher this
-/// walk replaces:
-///
-/// ```text
-/// dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
-/// ```
-///
-/// `LaunchRule::Tile16` IS that pair, so every `G2`-launched kernel here fires
-/// through [`super::fire`] with a rectangle and no block of its own. This
-/// constant is for the three that do not have a rule — their `grid.z` is a
-/// channel count — and `kernels-cuda-new/tests/launch_rules.rs` reads the
-/// quote above as the citation the deleted `.cu` used to carry.
-const B2: [u32; 3] = [16, 16, 1];
 
 /// A clipped linear's five slots: `[w, imin, imax, omin, omax]`.
 ///
@@ -120,13 +106,7 @@ pub struct Clip {
 impl Clip {
     /// Five consecutive slots — `gemma4_towers_c.cpp`'s `clip_of`.
     fn of(t: &[*const c_void]) -> Self {
-        Self {
-            w: t[0],
-            imin: t[1],
-            imax: t[2],
-            omin: t[3],
-            omax: t[4],
-        }
+        Self { w: t[0], imin: t[1], imax: t[2], omin: t[3], omax: t[4] }
     }
 }
 
@@ -146,12 +126,7 @@ pub struct Ffn {
 impl Ffn {
     /// Twelve consecutive slots — `gemma4_towers_c.cpp`'s `ffn_of`.
     fn of(t: &[*const c_void]) -> Self {
-        Self {
-            pre_ln: t[0],
-            post_ln: t[1],
-            fc1: Clip::of(&t[2..]),
-            fc2: Clip::of(&t[7..]),
-        }
+        Self { pre_ln: t[0], post_ln: t[1], fc1: Clip::of(&t[2..]), fc2: Clip::of(&t[7..]) }
     }
 }
 
@@ -453,25 +428,18 @@ impl Walk {
     }
 }
 
-/// A non-negative extent as the `u32` a `Dims` field is.
-fn extent(what: &str, value: i32) -> Result<u32> {
-    u32::try_from(value).map_err(|_| Error::invalid(WHO, format!("{WHO}: {what}: {value}")))
-}
 
 /// A row-major element count as the `usize` an `Elementwise` row wants.
 fn elems(what: &str, rows: i32, width: i32) -> Result<usize> {
     let r = usize::try_from(rows).map_err(|_| Error::invalid(WHO, format!("{what}: rows")))?;
     let c = usize::try_from(width).map_err(|_| Error::invalid(WHO, format!("{what}: width")))?;
-    r.checked_mul(c)
-        .ok_or_else(|| Error::invalid(WHO, format!("{what}: element count overflowed")))
+    r.checked_mul(c).ok_or_else(|| Error::invalid(WHO, format!("{what}: element count overflowed")))
 }
 
 /// `vd::k_rms<bfd><<<N, 256, 0, S>>>(x, w, o, N, W, EPS)`.
 ///
-/// `LaunchRule::PerRow` is `grid[rows,1,1] block[256,1,1]`, which is the
-/// launcher's `<<<N, 256>>>` exactly. `w` is nullable and the embedder's call
-/// passes null — a parameterless RMSNorm is what `Gemma4MultimodalEmbedder`
-/// is, not a missing weight.
+/// `weight` is nullable and the embedder's call passes null — a parameterless
+/// RMSNorm is what `Gemma4MultimodalEmbedder` is, not a missing weight.
 fn rms(
     x: *const c_void,
     weight: *const c_void,
@@ -481,27 +449,12 @@ fn rms(
     eps: f32,
     stream: StreamRef<'_>,
 ) -> Result<()> {
-    fire(
-        "vision::k_rms_bf16",
-        rect(extent("rms rows", rows)?, extent("rms width", width)?),
-        &[
-            p(x),
-            p(weight),
-            pm(o),
-            ArgValue::I32(rows),
-            ArgValue::I32(width),
-            ArgValue::F32(eps),
-        ],
-        stream,
-    )
+    call("vision::k_rms_bf16", stream, |ctx| {
+        vision::k_rms_bf16(ctx, x, weight, o, rows, width, eps)
+    })
 }
 
 /// `vd::k_matmul<bfd><<<G2(Out, N), B2, 0, S>>>(x, w, y, N, Kin, Out)`.
-///
-/// `G2(X, Y)` is `dim3((X+15)/16, (Y+15)/16)` and `LaunchRule::Tile16` is
-/// `grid[ceil(width/16), ceil(rows/16), 1] block[16,16,1]` — so the
-/// rectangle is `rows = N`, `width = Out`, and the `k` extent is an operand
-/// rather than a grid axis.
 fn matmul(
     x: *const c_void,
     w: *const c_void,
@@ -511,27 +464,10 @@ fn matmul(
     out: i32,
     stream: StreamRef<'_>,
 ) -> Result<()> {
-    fire(
-        "vision::k_matmul_bf16",
-        rect(extent("matmul rows", n)?, extent("matmul width", out)?),
-        &[
-            p(x),
-            p(w),
-            pm(y),
-            ArgValue::I32(n),
-            ArgValue::I32(kin),
-            ArgValue::I32(out),
-        ],
-        stream,
-    )
+    call("vision::k_matmul_bf16", stream, |ctx| vision::k_matmul_bf16(ctx, x, w, y, n, kin, out))
 }
 
 /// `vd::k_clamp<bfd><<<(n+255)/256, 256, 0, S>>>(x, o, lo, hi, n)`.
-///
-/// `LaunchRule::Elementwise` computes `n = rows * width` and then
-/// `grid[ceil(n/256),1,1] block[256,1,1]`, which is the launcher's arithmetic
-/// with the multiply moved inside the rule. Passing the count as the
-/// rectangle's `rows` keeps the two identical.
 fn clamp(
     x: *const c_void,
     o: *mut c_void,
@@ -540,14 +476,7 @@ fn clamp(
     n: usize,
     stream: StreamRef<'_>,
 ) -> Result<()> {
-    let rows = u32::try_from(n)
-        .map_err(|_| Error::invalid(WHO, "clamp element count overflowed a grid extent"))?;
-    fire(
-        "vision::k_clamp_bf16",
-        rect(rows, 1),
-        &[p(x), pm(o), p(lo), p(hi), ArgValue::Usize(n)],
-        stream,
-    )
+    call("vision::k_clamp_bf16", stream, |ctx| vision::k_clamp_bf16(ctx, x, o, lo, hi, n))
 }
 
 /// The clipped linear — `gemma4_audio.cu:163-166`'s `clin` lambda.
@@ -569,14 +498,7 @@ fn clin(
 ) -> Result<()> {
     clamp(x, xc, c.imin, c.imax, elems("clin in", n, kin)?, stream)?;
     matmul(xc.cast_const(), c.w, out, n, kin, o, stream)?;
-    clamp(
-        out.cast_const(),
-        out,
-        c.omin,
-        c.omax,
-        elems("clin out", n, o)?,
-        stream,
-    )
+    clamp(out.cast_const(), out, c.omin, c.omax, elems("clin out", n, o)?, stream)
 }
 
 /// The arena the walk writes through — `DeviceScratch`'s twelve `MAL` calls
@@ -666,15 +588,9 @@ pub fn run(
     }
     let f32d = scratch.upload_bytes(&features[..mel * 4], stream)?;
     let feat = scratch.bf16(mel)?;
-    fire(
-        "vision::k_f32_to_bf16_bf16",
-        rect(
-            u32::try_from(mel).map_err(|_| Error::invalid(WHO, "mel plane overflowed a grid"))?,
-            1,
-        ),
-        &[pm(f32d), pm(feat), ArgValue::Usize(mel)],
-        stream,
-    )?;
+    call("vision::k_f32_to_bf16_bf16", stream, |ctx| {
+        vision::k_f32_to_bf16_bf16(ctx, f32d.cast_const(), feat, mel)
+    })?;
     // `:182` synchronised here. It does not need to: the upload, the cast and
     // every launch below are ordered on one stream, and the host reads
     // nothing until `encode` copies the rows back. The C++ arena freed with
@@ -730,20 +646,10 @@ pub fn run(
         .checked_mul(c1ch)
         .ok_or_else(|| Error::invalid(WHO, "flattened SSCP width overflowed"))?;
     let flat = scratch.bf16(elems("sscp flat", n, flat_w)?)?;
-    // `dim3 g((FLAT+15)/16,(N+15)/16); k_sscp_flatten<bfd><<<g,B2,0,S>>>` —
-    // `Tile16` over `rows = N`, `width = FLAT`.
-    fire(
-        "vision::k_sscp_flatten_bf16",
-        rect(extent("flatten rows", n)?, extent("flatten width", flat_w)?),
-        &[
-            p(c1.cast_const()),
-            pm(flat),
-            ArgValue::I32(c1ch),
-            ArgValue::I32(t2),
-            ArgValue::I32(f2),
-        ],
-        stream,
-    )?;
+    // `dim3 g((FLAT+15)/16,(N+15)/16); k_sscp_flatten<bfd><<<g,B2,0,S>>>`.
+    call("vision::k_sscp_flatten_bf16", stream, |ctx| {
+        vision::k_sscp_flatten_bf16(ctx, c1.cast_const(), flat, c1ch, t2, f2)
+    })?;
 
     // ── 2) Conformer layers ─────────────────────────────────────────────
     // `:202` and `:212-214`. Every buffer the loop needs is allocated once,
@@ -769,15 +675,11 @@ pub fn run(
     matmul(flat.cast_const(), w.sscp_input_proj, a.h, n, flat_w, hd, stream)?;
 
     // `:220` — `dim3 g((Hd+15)/16,(P+15)/16); k_rel_pos_enc<bfd><<<g,B2,0,S>>>`.
-    // `Tile16` over `rows = P`, `width = Hd`. Shared across layers;
-    // `relative_k_proj` differs per layer, so `relk` is recomputed inside the
-    // loop and `pe` is not.
-    fire(
-        "vision::k_rel_pos_enc_bf16",
-        rect(extent("pos enc rows", g.pp)?, extent("pos enc width", hd)?),
-        &[pm(a.pe), ArgValue::I32(g.pp), ArgValue::I32(hd)],
-        stream,
-    )?;
+    // Shared across layers; `relative_k_proj` differs per layer, so `relk` is
+    // recomputed inside the loop and `pe` is not.
+    call("vision::k_rel_pos_enc_bf16", stream, |ctx| {
+        vision::k_rel_pos_enc_bf16(ctx, a.pe, g.pp, hd)
+    })?;
 
     for layer in &w.layers {
         ffn(&g, &a, &layer.ff1, w.residual_weight, eps, stream)?;
@@ -787,53 +689,40 @@ pub fn run(
         clin(a.hn.cast_const(), a.q, a.xc, &layer.q, n, hd, hd, stream)?;
         clin(a.hn.cast_const(), a.k, a.xc, &layer.k, n, hd, hd, stream)?;
         clin(a.hn.cast_const(), a.v, a.xc, &layer.v, n, hd, hd, stream)?;
-        // `k_qkv_scale<bfd><<<G2(Hd,N),B2,0,S>>>` — `Tile16`, `rows = N`,
-        // `width = Hd`. Scales `q` and `k` IN PLACE, which is why both are
-        // `BufMut` on the row.
-        fire(
-            "vision::k_qkv_scale_bf16",
-            rect(extent("qkv rows", n)?, extent("qkv width", hd)?),
-            &[
-                pm(a.q),
-                pm(a.k),
-                p(layer.per_dim_scale),
-                ArgValue::I32(n),
-                ArgValue::I32(nh),
-                ArgValue::I32(g.head_dim),
-                ArgValue::F32(g.q_scale),
-                ArgValue::F32(g.k_scale),
-            ],
-            stream,
-        )?;
+        // `k_qkv_scale<bfd><<<G2(Hd,N),B2,0,S>>>`. Scales `q` and `k` IN
+        // PLACE, which is why both are `*mut`.
+        call("vision::k_qkv_scale_bf16", stream, |ctx| {
+            vision::k_qkv_scale_bf16(
+                ctx,
+                a.q,
+                a.k,
+                layer.per_dim_scale,
+                n,
+                nh,
+                g.head_dim,
+                g.q_scale,
+                g.k_scale,
+            )
+        })?;
         // `:242` — `relative_k_proj(pe) → relk [P, H*hd]`. NOT a clipped
         // linear: a plain matmul, `G2(Hd, P)`.
         matmul(a.pe.cast_const(), layer.relative_k, a.relk, g.pp, hd, hd, stream)?;
         // `:243` — `dim3 g((N+127)/128,NH); k_local_attn<bfd><<<g,128,0,S>>>`.
-        // A TILE count on `grid.x`, which no rule states; the row is
-        // `Unstated` and this is the grid.
-        fire_stated(
-            "vision::k_local_attn_bf16",
-            [
-                extent("local attn tiles", n)?.div_ceil(128),
-                extent("local attn heads", nh)?,
-                1,
-            ],
-            [128, 1, 1],
-            0,
-            &[
-                p(a.q.cast_const()),
-                p(a.k.cast_const()),
-                p(a.v.cast_const()),
-                p(a.relk.cast_const()),
-                pm(a.attn),
-                ArgValue::I32(n),
-                ArgValue::I32(nh),
-                ArgValue::I32(g.head_dim),
-                ArgValue::I32(g.pp),
-                ArgValue::F32(w.logit_cap),
-            ],
-            stream,
-        )?;
+        call("vision::k_local_attn_bf16", stream, |ctx| {
+            vision::k_local_attn_bf16(
+                ctx,
+                a.q.cast_const(),
+                a.k.cast_const(),
+                a.v.cast_const(),
+                a.relk.cast_const(),
+                a.attn,
+                n,
+                nh,
+                g.head_dim,
+                g.pp,
+                w.logit_cap,
+            )
+        })?;
         clin(a.attn.cast_const(), a.tmp, a.xc, &layer.post, n, hd, hd, stream)?;
         rms(a.tmp.cast_const(), layer.norm_post_attn, a.tmp, n, hd, eps, stream)?;
         add(a.h, a.tmp.cast_const(), elems("attn residual", n, hd)?, stream)?;
@@ -841,19 +730,11 @@ pub fn run(
         // ── light depthwise-conv module, `:248-271` ─────────────────────
         rms(a.h.cast_const(), layer.lconv_pre_ln, a.hn, n, hd, eps, stream)?;
         clin(a.hn.cast_const(), a.start, a.xc, &layer.lconv_start, n, hd, 2 * hd, stream)?;
-        // `k_glu<bfd><<<G2(Hd,N),B2,0,S>>>` — `Tile16`, `rows = N`,
-        // `width = Hd`: the OUTPUT width, half of `start`'s.
-        fire(
-            "vision::k_glu_bf16",
-            rect(extent("glu rows", n)?, extent("glu width", hd)?),
-            &[
-                p(a.start.cast_const()),
-                pm(a.glu),
-                ArgValue::I32(n),
-                ArgValue::I32(hd),
-            ],
-            stream,
-        )?;
+        // `k_glu<bfd><<<G2(Hd,N),B2,0,S>>>` — `hd` is the OUTPUT width, half
+        // of `start`'s.
+        call("vision::k_glu_bf16", stream, |ctx| {
+            vision::k_glu_bf16(ctx, a.start.cast_const(), a.glu, n, hd)
+        })?;
         // `:264-266`, transcribed whole:
         //
         // ```text
@@ -869,23 +750,19 @@ pub fn run(
         // refused by `Walk::new`.
         let k = w.conv_kernel;
         if n > 0 && hd > 0 && k > 0 {
-            fire_stated(
-                "ssm::causal_conv1d_prefill_noact_bf16",
-                [extent("conv channels", hd)?, 1, 1],
-                [64, 1, 1],
-                0,
-                &[
-                    p(a.glu.cast_const()),
-                    p(layer.depthwise_conv),
-                    p(core::ptr::null()),
-                    pm(a.conv),
-                    pm(core::ptr::null_mut()),
-                    ArgValue::I32(n),
-                    ArgValue::I32(hd),
-                    ArgValue::I32(k),
-                ],
-                stream,
-            )?;
+            call("ssm::causal_conv1d_prefill_noact_bf16", stream, |ctx| {
+                ssm::causal_conv1d_prefill_noact_bf16(
+                    ctx,
+                    a.glu.cast_const().cast(),
+                    layer.depthwise_conv.cast(),
+                    kernels_cuda_new::x::abi::MaybeConst::none(),
+                    a.conv.cast(),
+                    core::ptr::null_mut(),
+                    n,
+                    hd,
+                    k,
+                )
+            })?;
         }
         // `:267` — the `clamp(±finfo_max)` HF applies here is a no-op in bf16
         // range and the C++ skipped it. Skipped here too, for the same
@@ -901,22 +778,19 @@ pub fn run(
 
     // ── 3) output_proj (1024 → 1536, +bias), `:282-283` ──────────────────
     let enc = scratch.bf16(elems("encoder out", n, opd)?)?;
-    // `k_matmul_bias<bfd><<<G2(OPD,N),B2,0,S>>>` — `Tile16`, `rows = N`,
-    // `width = OPD`.
-    fire(
-        "vision::k_matmul_bias_bf16",
-        rect(extent("out proj rows", n)?, extent("out proj width", opd)?),
-        &[
-            p(a.h.cast_const()),
-            p(w.output_proj_w),
-            p(w.output_proj_b),
-            pm(enc),
-            ArgValue::I32(n),
-            ArgValue::I32(hd),
-            ArgValue::I32(opd),
-        ],
-        stream,
-    )?;
+    // `k_matmul_bias<bfd><<<G2(OPD,N),B2,0,S>>>`.
+    call("vision::k_matmul_bias_bf16", stream, |ctx| {
+        vision::k_matmul_bias_bf16(
+            ctx,
+            a.h.cast_const(),
+            w.output_proj_w,
+            w.output_proj_b,
+            enc,
+            n,
+            hd,
+            opd,
+        )
+    })?;
 
     // ── 4) the shared embedder, `:287-289` ───────────────────────────────
     // A PARAMETERLESS RMSNorm — the weight is null and that is what
@@ -972,62 +846,23 @@ struct SscpStage {
 /// records that as one of the three stages it verified against HF.
 ///
 /// Three of the four grids are `dim3((F+15)/16, (T+15)/16, C)` — a channel
-/// count on `grid.z`, which no `LaunchRule` states. The rows are `Unstated`
-/// and the grid is here, computed once and passed to all three.
+/// count on `grid.z`, which is why no `LaunchRule` ever stated them. The grid
+/// is the routine's now, computed once from the same three extents.
 fn sscp(s: SscpStage, stream: StreamRef<'_>) -> Result<()> {
-    // `dim3 g((F_out+15)/16, (T_out+15)/16, C_out)`, shared by the conv and
-    // both transposes.
-    let grid = [
-        extent("sscp freq", s.f_out)?.div_ceil(16),
-        extent("sscp time", s.t_out)?.div_ceil(16),
-        extent("sscp channels", s.out_ch)?,
-    ];
-    fire_stated(
-        "vision::k_conv2d_s2_bf16",
-        grid,
-        B2,
-        0,
-        &[
-            p(s.src),
-            p(s.conv_w),
-            pm(s.chw),
-            ArgValue::I32(s.in_ch),
-            ArgValue::I32(s.t_in),
-            ArgValue::I32(s.f_in),
-            ArgValue::I32(s.out_ch),
-            ArgValue::I32(s.t_out),
-            ArgValue::I32(s.f_out),
-        ],
-        stream,
-    )?;
-    let transpose = [
-        ArgValue::I32(s.out_ch),
-        ArgValue::I32(s.t_out),
-        ArgValue::I32(s.f_out),
-    ];
-    fire_stated(
-        "vision::k_chlast_bf16",
-        grid,
-        B2,
-        0,
-        &[
-            p(s.chw.cast_const()),
-            pm(s.chlast),
-            transpose[0],
-            transpose[1],
-            transpose[2],
-        ],
-        stream,
-    )?;
-    // `LaunchRule::PerRowNarrow` is `grid[rows,1,1] block[128,1,1]`, and the
-    // rows are the `T*F` spatial positions with the channel axis as the
-    // width. In place: it reads and writes `chlast`.
+    call("vision::k_conv2d_s2_bf16", stream, |ctx| {
+        vision::k_conv2d_s2_bf16(
+            ctx, s.src, s.conv_w, s.chw, s.in_ch, s.t_in, s.f_in, s.out_ch, s.t_out, s.f_out,
+        )
+    })?;
+    call("vision::k_chlast_bf16", stream, |ctx| {
+        vision::k_chlast_bf16(ctx, s.chw.cast_const(), s.chlast, s.out_ch, s.t_out, s.f_out)
+    })?;
+    // The rows are the `T*F` spatial positions with the channel axis as the
+    // width, and the norm reads and writes `chlast` in place.
     //
-    // The two launchers this one call replaces, verbatim — `launch_rules.rs`
-    // reads them as the citation `per_row_narrow`'s transcription was written
-    // from, and they are the reason this function takes its extents as a
-    // struct: the only difference between them is which of `(T1,F1,C0)` and
-    // `(T2,F2,C1)` is substituted.
+    // The two launchers this one call replaces, verbatim — they are the reason
+    // this function takes its extents as a struct: the only difference between
+    // them is which of `(T1,F1,C0)` and `(T2,F2,C1)` is substituted.
     //
     // ```text
     // vd::k_layernorm_relu<bfd><<<T1*F1,128,0,S>>>(D(c0cl),D(w.sscp0_norm),D(c0cl),T1*F1,C0,EPS);
@@ -1037,60 +872,31 @@ fn sscp(s: SscpStage, stream: StreamRef<'_>) -> Result<()> {
         .t_out
         .checked_mul(s.f_out)
         .ok_or_else(|| Error::invalid(WHO, "SSCP row count overflowed"))?;
-    fire(
-        "vision::k_layernorm_relu_bf16",
-        rect(extent("ln rows", rows)?, extent("ln width", s.out_ch)?),
-        &[
-            p(s.chlast.cast_const()),
-            p(s.norm_w),
-            pm(s.chlast),
-            ArgValue::I32(rows),
-            ArgValue::I32(s.out_ch),
-            ArgValue::F32(s.eps),
-        ],
-        stream,
-    )?;
-    fire_stated(
-        "vision::k_chfirst_bf16",
-        grid,
-        B2,
-        0,
-        &[
-            p(s.chlast.cast_const()),
-            pm(s.chw),
-            transpose[0],
-            transpose[1],
-            transpose[2],
-        ],
-        stream,
-    )
+    call("vision::k_layernorm_relu_bf16", stream, |ctx| {
+        vision::k_layernorm_relu_bf16(
+            ctx,
+            s.chlast.cast_const(),
+            s.norm_w,
+            s.chlast,
+            rows,
+            s.out_ch,
+            s.eps,
+        )
+    })?;
+    call("vision::k_chfirst_bf16", stream, |ctx| {
+        vision::k_chfirst_bf16(ctx, s.chlast.cast_const(), s.chw, s.out_ch, s.t_out, s.f_out)
+    })
 }
 
-/// `vd::k_add<bfd><<<(n+255)/256, 256, 0, S>>>(a, b, n)` — `a += b`.
-///
-/// `LaunchRule::Elementwise`, and the row's `in_place` cell already states
-/// that operand 0 is both the read and the write.
+/// `vd::k_add<bfd><<<(n+255)/256, 256, 0, S>>>(a, b, n)` — `a += b`, with
+/// operand 0 both the read and the write.
 fn add(y: *mut c_void, x: *const c_void, n: usize, stream: StreamRef<'_>) -> Result<()> {
-    let rows = u32::try_from(n)
-        .map_err(|_| Error::invalid(WHO, "residual element count overflowed a grid extent"))?;
-    fire(
-        "vision::k_add_bf16",
-        rect(rows, 1),
-        &[pm(y), p(x), ArgValue::Usize(n)],
-        stream,
-    )
+    call("vision::k_add_bf16", stream, |ctx| vision::k_add_bf16(ctx, y, x, n))
 }
 
 /// `vd::k_silu<bfd><<<(n+255)/256, 256, 0, S>>>(x, x, n)`, in place.
 fn silu(x: *mut c_void, n: usize, stream: StreamRef<'_>) -> Result<()> {
-    let rows = u32::try_from(n)
-        .map_err(|_| Error::invalid(WHO, "silu element count overflowed a grid extent"))?;
-    fire(
-        "vision::k_silu_bf16",
-        rect(rows, 1),
-        &[p(x.cast_const()), pm(x), ArgValue::Usize(n)],
-        stream,
-    )
+    call("vision::k_silu_bf16", stream, |ctx| vision::k_silu_bf16(ctx, x.cast_const(), x, n))
 }
 
 /// The macaron half-FFN — `gemma4_audio.cu:223-231`'s `ffn` lambda.
@@ -1117,19 +923,9 @@ fn ffn(
     // `k_axpy<bfd><<<(N*Hd+255)/256, 256, 0, S>>>(h, ffout, RW, N*Hd)` —
     // `h += RW * ffout`, the macaron half-step's residual weight.
     let count = elems("ffn residual", n, hd)?;
-    let rows = u32::try_from(count)
-        .map_err(|_| Error::invalid(WHO, "axpy element count overflowed a grid extent"))?;
-    fire(
-        "vision::k_axpy_bf16",
-        rect(rows, 1),
-        &[
-            pm(a.h),
-            p(a.ffout.cast_const()),
-            ArgValue::F32(residual_weight),
-            ArgValue::Usize(count),
-        ],
-        stream,
-    )
+    call("vision::k_axpy_bf16", stream, |ctx| {
+        vision::k_axpy_bf16(ctx, a.h, a.ffout.cast_const(), residual_weight, count)
+    })
 }
 
 /// Frames after subsampling — `gemma4_audio.hpp`'s
@@ -1211,15 +1007,7 @@ pub fn encode(
                 .checked_mul(usize::try_from(w.text_hidden).unwrap_or(0))
                 .ok_or_else(|| Error::invalid(WHO, "projected row buffer overflowed"))?,
         )?;
-        run(
-            w,
-            &features[blo..bhi],
-            frames_i,
-            n_mel,
-            rows,
-            projected,
-            stream,
-        )?;
+        run(w, &features[blo..bhi], frames_i, n_mel, rows, projected, stream)?;
         // `:342-346` — the rows come back to the host between clips, because
         // the encode ABI's output is a host buffer.
         let begin = rows_written * row_bytes;

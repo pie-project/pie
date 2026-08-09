@@ -488,7 +488,7 @@ mod probe {
     // -----------------------------------------------------------------
 
     pub fn run() -> i32 {
-        let Some(arch) = kernels_cuda_new::runtime::cache::arch() else {
+        let Some(arch) = kernels_cuda_new::jit::cache::arch() else {
             println!("no CUDA device is current; this probe needs one to compare on");
             return 1;
         };
@@ -553,12 +553,10 @@ mod probe {
         // -------------------------------------------------------------
         // pipeline
         // -------------------------------------------------------------
-        let pipe_reference = format!(
-            "#include <cooperative_groups.h>\n#include <cuda/pipeline>\n\n{BODY_PIPE}"
-        );
-        let pipe_under_test = format!(
-            "#include <cooperative_groups.h>\n#include <cuda/pipeline>\n\n{BODY_PIPE}"
-        );
+        let pipe_reference =
+            format!("#include <cooperative_groups.h>\n#include <cuda/pipeline>\n\n{BODY_PIPE}");
+        let pipe_under_test =
+            format!("#include <cooperative_groups.h>\n#include <cuda/pipeline>\n\n{BODY_PIPE}");
         let pipe_pair = build_pair(
             "cuda/pipeline",
             &nvcc,
@@ -572,13 +570,12 @@ mod probe {
         // -------------------------------------------------------------
         // cmath and the controls: NVRTC only
         // -------------------------------------------------------------
-        let cmath_built = compile_with_nvrtc(
-            &format!("#include <cuda/cmath>\n\n{BODY_CMATH}"),
-            arch,
-            &[cmath],
-        );
+        let cmath_built =
+            compile_with_nvrtc(&format!("#include <cuda/cmath>\n\n{BODY_CMATH}"), arch, &[cmath]);
         match &cmath_built {
-            Ok(built) => println!("  under test  NVRTC  cuda/cmath           {:8.1} ms", built.millis),
+            Ok(built) => {
+                println!("  under test  NVRTC  cuda/cmath           {:8.1} ms", built.millis)
+            }
             Err(why) => {
                 println!("  under test  NVRTC  cuda/cmath  REFUSED:\n{why}");
                 compile_failures += 1;
@@ -596,7 +593,9 @@ mod probe {
         }
 
         if compile_failures > 0 {
-            println!("\n{compile_failures} translation unit(s) refused to compile; nothing was measured.");
+            println!(
+                "\n{compile_failures} translation unit(s) refused to compile; nothing was measured."
+            );
             return 1;
         }
 
@@ -633,7 +632,10 @@ mod probe {
         // -------------------------------------------------------------
         // the report
         // -------------------------------------------------------------
-        println!("\n{:<40} {:>12}  {:>6}  first differing input / detail", "check", "inputs", "result");
+        println!(
+            "\n{:<40} {:>12}  {:>6}  first differing input / detail",
+            "check", "inputs", "result"
+        );
         println!("{}", "-".repeat(118));
         let mut failures = 0usize;
         for row in &rows {
@@ -795,7 +797,11 @@ mod probe {
         // that should declare them are not this file's to edit.
         let source = format!(
             "#include <cuda_fp16.h>\n             #include <cuda_bf16.h>\n             typedef __half nv_half;\n             typedef __nv_bfloat16 nv_bfloat16;\n             {}\n             __global__ void closure_touch(int* o) {{ o[0] = 1; }}\n",
-            ROOTS.iter().map(|r| format!("#include <flashinfer/{r}>")).collect::<Vec<_>>().join("\n")
+            ROOTS
+                .iter()
+                .map(|r| format!("#include <flashinfer/{r}>"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
 
         // `-default-device` is not decoration and not this probe cheating.
@@ -962,7 +968,9 @@ mod probe {
         // be reporting a rumour.
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         for _ in 0..(1usize << 20) {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let mixed = (state >> 32) as u32 ^ (state as u32).rotate_left(13);
             values.push(f32::from_bits(mixed));
         }
@@ -1093,7 +1101,13 @@ mod probe {
         let mut args = vec![input.ptr];
         args.extend(outs.iter().map(|d| d.ptr));
         let count = i32::try_from(n).unwrap();
-        module.launch("fp8_from16", 256, u32::try_from(n.div_ceil(256)).unwrap(), &args, &[count])?;
+        module.launch(
+            "fp8_from16",
+            256,
+            u32::try_from(n.div_ceil(256)).unwrap(),
+            &args,
+            &[count],
+        )?;
         Ok((outs[0].download(n)?, outs[1].download(n)?, outs[2].download(n)?, outs[3].download(n)?))
     }
 
@@ -1165,7 +1179,9 @@ mod probe {
         ];
         let mut state = 0x243f_6a88_85a3_08d3u64;
         for _ in 0..65_536 {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             dividends.push((state >> 32) as u32);
         }
         let count = dividends.len();
@@ -1270,10 +1286,8 @@ mod probe {
                 &[i32::try_from(TILES).unwrap()],
             )?;
             let bytes = output.download(n * 4)?;
-            let got: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+            let got: Vec<f32> =
+                bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
             if got != host {
                 bad_runs += 1;
                 if detail.is_empty() {
@@ -1424,7 +1438,10 @@ mod probe {
         println!("  csrc/shim/cuda_fp8.h                   {:>10} B", thousands(CUDA_FP8.len()));
         println!("  csrc/shim/cuda_fp4.h                   {:>10} B", thousands(CUDA_FP4.len()));
         println!("  csrc/shim/cuda/cmath                   {:>10} B", thousands(CUDA_CMATH.len()));
-        println!("  csrc/shim/cuda/pipeline                {:>10} B", thousands(CUDA_PIPELINE.len()));
+        println!(
+            "  csrc/shim/cuda/pipeline                {:>10} B",
+            thousands(CUDA_PIPELINE.len())
+        );
         println!("  {:<38} {:>10} B", "", "----------");
         println!("  these four                             {:>10} B", thousands(four));
         println!(
@@ -1442,14 +1459,8 @@ mod probe {
             thousands(CCCL_BYTES),
             thousands(CCCL_FILES)
         );
-        println!(
-            "  NVIDIA cuda_fp8.h + .hpp               {:>10} B",
-            thousands(NVIDIA_FP8_BYTES)
-        );
-        println!(
-            "  NVIDIA cuda_fp4.h + .hpp               {:>10} B",
-            thousands(NVIDIA_FP4_BYTES)
-        );
+        println!("  NVIDIA cuda_fp8.h + .hpp               {:>10} B", thousands(NVIDIA_FP8_BYTES));
+        println!("  NVIDIA cuda_fp4.h + .hpp               {:>10} B", thousands(NVIDIA_FP4_BYTES));
         let vendor = CCCL_BYTES + NVIDIA_FP8_BYTES + NVIDIA_FP4_BYTES;
         println!("  {:<38} {:>10} B", "", "----------");
         println!("  what carrying them would have cost     {:>10} B", thousands(vendor));
@@ -1576,7 +1587,11 @@ mod probe {
         let started = Instant::now();
         // SAFETY: the program is live and the options outlive the call.
         let code = unsafe {
-            nv::nvrtcCompileProgram(program, i32::try_from(options.len()).unwrap(), options.as_ptr())
+            nv::nvrtcCompileProgram(
+                program,
+                i32::try_from(options.len()).unwrap(),
+                options.as_ptr(),
+            )
         };
         let millis = started.elapsed().as_secs_f64() * 1e3;
         let log = program_log(program);
@@ -1898,7 +1913,11 @@ mod probe {
         let mut name = [0u8; 128];
         // SAFETY: the buffer is 128 bytes and that is what is claimed.
         let code = unsafe {
-            dr::cuDeviceGetName(name.as_mut_ptr().cast(), i32::try_from(name.len()).unwrap(), device)
+            dr::cuDeviceGetName(
+                name.as_mut_ptr().cast(),
+                i32::try_from(name.len()).unwrap(),
+                device,
+            )
         };
         if code != dr::CUresult::CUDA_SUCCESS {
             return "unknown".to_string();

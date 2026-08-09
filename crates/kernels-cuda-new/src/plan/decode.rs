@@ -72,8 +72,7 @@ pub fn partition_min_pages_per_batch(
         let mid = (low + high) / 2;
         let mut new_batch_size = 0u32;
         for &elem in num_pages {
-            new_batch_size =
-                new_batch_size.wrapping_add(ceil_div_i32_in_u32(elem, mid) as u32);
+            new_batch_size = new_batch_size.wrapping_add(ceil_div_i32_in_u32(elem, mid) as u32);
         }
         if new_batch_size.wrapping_mul(gdy) > max_grid_size {
             low = mid + 1;
@@ -83,8 +82,7 @@ pub fn partition_min_pages_per_batch(
     }
     let mut new_batch_size = 0u32;
     for &elem in num_pages {
-        new_batch_size =
-            new_batch_size.wrapping_add(ceil_div_i32_in_u32(elem.max(1), low) as u32);
+        new_batch_size = new_batch_size.wrapping_add(ceil_div_i32_in_u32(elem.max(1), low) as u32);
     }
     (low, new_batch_size)
 }
@@ -109,12 +107,8 @@ pub fn estimate(req: &Request<'_>, max_grid_size: u32) -> Result<WorkEstimate, E
     }
 
     let num_pages: Vec<i32> = (0..req.batch_size as usize).map(|i| req.pages(i)).collect();
-    let (max_num_pages_per_batch, new_batch_size) = partition_min_pages_per_batch(
-        max_grid_size,
-        gdy,
-        &num_pages,
-        (128 / req.page_size).max(1),
-    );
+    let (max_num_pages_per_batch, new_batch_size) =
+        partition_min_pages_per_batch(max_grid_size, gdy, &num_pages, (128 / req.page_size).max(1));
     let split_kv = !(new_batch_size == req.batch_size && !req.enable_cuda_graph);
     Ok(WorkEstimate {
         split_kv,
@@ -196,8 +190,7 @@ fn plan_impl(
     info.kv_tile_indices_offset =
         int_alloc.alloc(padded * 4, 16, "batch_decode_kv_tile_indices")? as i64;
     info.o_indptr_offset = int_alloc.alloc((padded + 1) * 4, 16, "batch_decode_o_indptr")? as i64;
-    info.kv_chunk_size_ptr_offset =
-        int_alloc.alloc(4, 1, "batch_decode_kv_chunk_size_ptr")? as i64;
+    info.kv_chunk_size_ptr_offset = int_alloc.alloc(4, 1, "batch_decode_kv_chunk_size_ptr")? as i64;
 
     if staging.materialises() {
         staging.put_i32s(

@@ -468,14 +468,19 @@ using u32 = unsigned int;
 // `sizeof`.
 using usize = decltype(sizeof(0));
 using isize = decltype(static_cast<char*>(nullptr) - static_cast<char*>(nullptr));
-// The 64-bit pair is DERIVED from the pointer-width pair rather than spelled.
-// `long` on LP64 and `long long` on LLP64 are both 64 bits and mangle
-// differently, and `ptrdiff_t`/`size_t` already resolve to whichever one this
-// target uses -- which is the same one `<cstdint>` picks for `int64_t`.
-// `__INT64_TYPE__` would say it directly and NVRTC does not define it; it
-// defines `__SIZE_TYPE__`, so that is what gets asked.
-using i64 = isize;
-using u64 = usize;
+// The 64-bit pair is SPELLED, not derived from the pointer-width pair.
+//
+// It used to be `using i64 = isize`, on the argument that `ptrdiff_t` resolves
+// to "whichever one this target uses -- which is the same one `<cstdint>`
+// picks for `int64_t`". That is false here and the device typecheck measured
+// it: `csrc/shim/cstdint` picks `long long`, `ptrdiff_t` on this LP64 target
+// is `long`, and the two are distinct types that mangle differently. A row
+// declaring `*const i64` was refused against a `__global__` taking
+// `const i64*` because the assertion spells the row's side `::std::int64_t*`.
+// Same width, same ABI, different type -- which is exactly the class of
+// mismatch this file exists to make impossible.
+using i64 = long long;
+using u64 = unsigned long long;
 
 static_assert(sizeof(i8) == 1 && sizeof(i16) == 2 && sizeof(i32) == 4 && sizeof(i64) == 8);
 static_assert(sizeof(u8) == 1 && sizeof(u16) == 2 && sizeof(u32) == 4 && sizeof(u64) == 8);

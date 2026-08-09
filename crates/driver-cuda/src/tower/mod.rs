@@ -16,8 +16,8 @@
 //! the language it was written in. This module is the other half: **every
 //! line that runs on the CPU is Rust, and the only C++ left is device text
 //! NVRTC compiles at run time.** A `<<<grid, block, smem, stream>>>` becomes a
-//! [`fire`] of the row that already states that geometry; the arena becomes a
-//! [`Scratch`]; the per-image loop becomes a `for`.
+//! [`call`] of the routine that already states that geometry; the arena
+//! becomes a [`Scratch`]; the per-image loop becomes a `for`.
 //!
 //! [`qwen3_vl`] arrived by the same measurement taken a second time:
 //! `driver-cuda/csrc/vision/qwen3_vl_tower.cu` held **zero `__global__` and
@@ -29,34 +29,38 @@
 //!
 //! # The geometry is not invented here
 //!
-//! Every fire below names a row whose launch rule was written against the C++
-//! launcher it replaces, and each call site carries the `<<<>>>` expression it
-//! reproduces in a comment. Where a rule and a launcher disagree, that is a
-//! finding and not a rule to add — §10.5 forbids growing the vocabulary for
-//! one kernel. There is exactly one such divergence in this module and it is
-//! stated at its call site (`gemma4_vision::rms`).
+//! Every tower kernel's grid now lives beside the instantiation it launches,
+//! in `kernels_cuda_new::x::vision`, where it was transcribed from the C++
+//! launcher it replaces. What is left at a call site is the walk's own
+//! vocabulary — which buffer, which extent, which weight — and the `<<<>>>`
+//! citation is on the routine.
+//!
+//! The one numerics divergence this port carries is NOT a tower kernel and so
+//! is not covered by that: it is stated at its call site
+//! (`gemma4_vision::rms`).
 //!
 //! # A failure is a refusal
 //!
 //! The C++ walk ended every CUDA call in `VCK(...)`, which threw
 //! `std::runtime_error` — and an exception crossing the C ABI is undefined
 //! behaviour that in practice reaches SIGABRT with no message. Every function
-//! here returns [`crate::Result`] instead, and [`fire`] turns a refused launch
-//! into an error naming the symbol rather than into a launch of something
+//! here returns [`crate::Result`] instead, and [`call`] turns a refused launch
+//! into an error naming the routine rather than into a launch of something
 //! else. Nothing here substitutes a kernel, retries at another geometry, or
-//! treats a `Geometry` refusal as a no-op.
+//! treats an empty extent as a no-op.
 //!
 //! `crate::bind::jit::fire` is deliberately NOT the entry used: it returns
 //! `()` because a routed row has nowhere else to go, and swallowing a
-//! `Geometry` or `Args` refusal is exactly wrong for a walk whose next launch
-//! reads the buffer this one was supposed to write.
+//! geometry or an argument refusal is exactly wrong for a walk whose next
+//! launch reads the buffer this one was supposed to write.
 
 #![allow(clippy::print_stderr)]
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::runtime::{Args, Launch, cache};
-use kernels_cuda_new::{ArgValue, Dims, Stream, unit};
+use kernels_cuda_new::ArgValue;
+use kernels_cuda_new::jit::Ctx;
+use kernels_cuda_new::x::Refusal;
 
 use crate::device::{Allocator, DeviceBuffer, StreamRef};
 use crate::{Error, Result};
@@ -65,85 +69,36 @@ pub mod gemma4_audio;
 pub mod gemma4_vision;
 pub mod qwen3_vl;
 
-/// Fire the row `symbol` names, refusing loudly.
+/// Run one routine on this walk's stream, refusing loudly.
 ///
-/// `dims` is the fire's rectangle — the rule turns it into the grid and block
-/// the C++ launcher spelled by hand. `values` are the row's operands in the
-/// row's order, checked against the row by the JIT crate rather than trusted.
+/// A routine picks its own instantiation and computes its own grid, so what a
+/// call site states is the walk's half — the pointers, the extents — and the
+/// name to put in front of a refusal. The name is not derivable: a
+/// [`Refusal`] is a `Copy` value with no symbol in it, which is deliberate
+/// (the same broken kernel is fired once per layer per token, so the detail
+/// goes to the log once and the value stays cheap).
+///
+/// The closure is what keeps the [`Ctx`] scoped. `Ctx::on` is unsafe because
+/// the stream must outlive every launch made through it; taking the body here
+/// means the context cannot escape the borrow that carries that.
 ///
 /// # Errors
 ///
-/// Any refusal from [`kernels_cuda_new::fire`], with the symbol as the call:
-/// no unit hosts it, its unit will not compile, the rule has no launch for
-/// these dims, the values do not match the row, or the driver refused the
-/// launch. Each is a stop, never a fallback.
-pub(crate) fn fire(
-    symbol: &'static str,
-    dims: Dims,
-    values: &[ArgValue],
+/// Whatever the routine refuses — an empty extent, an extent too large for a
+/// grid, or a compile, load or launch the device declined. Each is a stop,
+/// never a fallback.
+pub(crate) fn call(
+    what: &'static str,
     stream: StreamRef<'_>,
+    body: impl FnOnce(&Ctx) -> std::result::Result<(), Refusal>,
 ) -> Result<()> {
     // SAFETY: `stream` is a live `cudaStream_t` for as long as the borrow
     // lasts, which is the assertion `StreamRef` exists to carry; the pointer
     // operands address `Scratch` allocations and published weights, both live
     // until the caller synchronises. The same obligation the C++ walk made
     // implicitly at every `<<<>>>`.
-    let outcome = unsafe {
-        kernels_cuda_new::fire(
-            symbol,
-            dims,
-            values,
-            Stream::from_runtime(stream.as_raw().cast()),
-        )
-    };
-    outcome.map_err(|why| Error::invalid(symbol, why.to_string()))
-}
-
-/// Fire the row `symbol` names at a grid THIS CALLER states.
-///
-/// [`fire`] hands a rectangle to the row's `LaunchRule` and lets the rule
-/// compute the launch. Some launchers have no rule, and the honest reason is
-/// written on their rows: three of gemma-4 audio's SSCP kernels put a channel
-/// count on `grid.z`, which `Dims` has no field for, and `k_local_attn` puts
-/// a TILE count on `grid.x` where every ported rule puts a count of things.
-/// §10.5 forbids growing the vocabulary for one kernel, and the answer under
-/// the owner's principle is not a new rule — it is that **the host computes
-/// the grid, and the host is Rust**.
-///
-/// So this takes `grid`, `block` and `smem` from the caller, which quotes the
-/// `dim3` it transcribed. `fire/attn_score.rs` has fired
-/// `attn::attn_score_fold_heads` exactly this way since before the towers
-/// moved; this is that path with the panics turned into refusals.
-///
-/// # Errors
-///
-/// No unit hosts `symbol`; the unit will not compile; the values do not match
-/// the row; the driver refused the launch. A stop, never a fallback.
-pub(crate) fn fire_stated(
-    symbol: &'static str,
-    grid: [u32; 3],
-    block: [u32; 3],
-    smem: u32,
-    values: &[ArgValue],
-    stream: StreamRef<'_>,
-) -> Result<()> {
-    let Some((index, unit)) = unit::unit_of(symbol) else {
-        return Err(Error::invalid(symbol, "no JIT unit hosts this symbol"));
-    };
-    let Some(sig) = unit.row(symbol).map(|row| row.sig) else {
-        return Err(Error::invalid(symbol, "the unit does not hold this row"));
-    };
-    let module = cache::module(index, unit)
-        .map_err(|why| Error::invalid(symbol, format!("unit `{}`: {why}", unit.name)))?;
-    let mut args =
-        Args::bind(sig, values).map_err(|why| Error::invalid(symbol, why.to_string()))?;
-    let launch = Launch { grid, block, smem };
-    // SAFETY: as [`fire`] — the stream outlives the borrow and every pointer
-    // operand addresses live device memory until the caller synchronises.
-    let stream = unsafe { Stream::from_runtime(stream.as_raw().cast()) };
-    module
-        .fire(sig, launch, &mut args, stream)
-        .map_err(|why| Error::invalid(symbol, why.to_string()))
+    let ctx = unsafe { Ctx::on(stream.as_raw().cast()) };
+    body(&ctx).map_err(|why| Error::invalid(what, format!("{why:?}")))
 }
 
 /// The tower's scratch arena — `gemma4_vision.cu`'s `DeviceScratch`.
@@ -166,10 +121,7 @@ pub(crate) struct Scratch {
 impl Scratch {
     /// An empty arena.
     pub(crate) fn new() -> Self {
-        Self {
-            alloc: Allocator::new(),
-            live: Vec::new(),
-        }
+        Self { alloc: Allocator::new(), live: Vec::new() }
     }
 
     /// `count` elements of `width` bytes, uninitialised.
@@ -268,32 +220,4 @@ impl Scratch {
     }
 }
 
-/// A pointer operand, `const` or not — every `Buf`, `BufMut`, `F32s`,
-/// `F32sMut` and `I32s` cell of a row.
-///
-/// One helper rather than a `.cast_mut()` at forty argument positions, for
-/// `gemma4_vision.cu`'s own reason for writing `D()`: a cast spelled out
-/// thirty times is thirty places to get the constness wrong, and the compiler
-/// cannot tell a wrong one from a right one.
-pub(crate) fn p(pointer: *const c_void) -> ArgValue {
-    ArgValue::Ptr(pointer.cast_mut())
-}
 
-/// A pointer operand from a scratch allocation, which is already `*mut`.
-pub(crate) fn pm(pointer: *mut c_void) -> ArgValue {
-    ArgValue::Ptr(pointer)
-}
-
-/// A rectangle of `rows` by `width` and nothing else — the `Dims` every
-/// `Elementwise`, `Tile16`, `PerRow` and `Rms` fire in this module wants.
-///
-/// The other seven fields stay zero because no rule in this module reads
-/// them; the two that do (`AxialRope`'s `kv_heads` and `head_dim`) are spelled
-/// at their own call site, where the head count is visible.
-pub(crate) fn rect(rows: u32, width: u32) -> Dims {
-    Dims {
-        rows,
-        width,
-        ..Dims::default()
-    }
-}

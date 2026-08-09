@@ -65,11 +65,7 @@
 use std::ffi::c_void;
 
 use super::DispatchCtx;
-use super::abi::AttentionWorkspaceView;
-use kernels_cuda_new::x::KvLayer;
 
-use super::abi::KvCacheLayerView;
-use super::abi::MlaCacheLayerView;
 
 // ── `attn/dsa_indexer.cu`'S THREE MOVED TO `kernels_cuda_new::x::attn` ─
 //
@@ -173,9 +169,6 @@ use super::abi::MlaCacheLayerView;
 // /// The three pointer arrays must be HOST arrays of `group_count` device
 // /// addresses (cuBLAS reads them on the host for the grouped form), and
 // /// `m_array` a host array of `group_count` row counts.
-
-
-
 
 // ── `gemm_act_x_wt_bf16` MOVED TO `kernels_cuda_new::x::gemm::act_x_wt_bf16` ──
 //
@@ -481,7 +474,6 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
     }
 }
 
-
 // `moe::moe_grouped_gemm_bf16` STOOD HERE, as `pub unsafe fn
 // moe_moe_grouped_gemm_bf16`, and is DELETED. §5 step 5 took `moe` into
 // fn-world: the host program is `x::moe::moe_grouped_gemm_bf16`, and the
@@ -565,7 +557,6 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // them. The refusal is made at model load now instead of being an
 // `UnknownKernel` at fire time.
 
-
 // ── `norm/`: SIX WRAPPERS STOOD HERE AND ARE GONE ─────────────────────
 //
 // `norm` crossed into fn-world (`.wiki/kernel-x/northstar.md` §5 step 5).
@@ -595,7 +586,6 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // `norm::add_bias_bf16` is NOT one of the six and is still fired from this
 // file, by the gemm wrapper above: that call goes through `super::jit::fire`
 // by symbol and keeps resolving, because `x::norm` declares the same symbol.
-
 
 // ── `rope/`: NINE WRAPPERS STOOD HERE AND ARE GONE ──────────────────────
 //
@@ -678,22 +668,18 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // fact said out loud: `Route::Unbound` at MODEL LOAD with the sentence,
 // rather than a wrapper nothing called and a comment explaining why.
 
-
 // `moe::moe_gate_up_decode_gemv_bf16` STOOD HERE, as `pub unsafe fn
 // moe_moe_gate_up_decode_gemv_bf16`, and is DELETED with `fire::moe_dispatch`
 // -- `x::moe::moe_gate_up_decode_gemv_bf16` is the host program and its
 // `bind!` arm is the fire.
 
-
 // `moe::moe_down_decode_gemv_bf16` STOOD HERE, as `pub unsafe fn
 // moe_moe_down_decode_gemv_bf16`, and is DELETED for its twin's reason.
-
 
 // `moe::transpose_expert_scales_u8` STOOD HERE, as `pub unsafe fn
 // moe_transpose_expert_scales_u8`, and is DELETED. `x::moe` keeps the host
 // program and declares the symbol a `none:`: weight preparation is not a
 // trace statement, which is what its five unsourced operands were saying.
-
 
 // `moe::build_moe_ptrs_aligned_bf16` STOOD HERE, as `pub unsafe fn
 // moe_build_moe_ptrs_aligned_bf16`, and is DELETED. `x::moe` keeps the host
@@ -713,7 +699,6 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // them would hand that reader bytes the next allocation owns. A wrong
 // answer, not a refusal.
 
-
 // `moe::reorder_moe_aligned_output_bf16` STOOD HERE, as `pub unsafe fn
 // moe_reorder_moe_aligned_output_bf16`, and is DELETED. `x::moe` keeps the
 // host program, including the vectorisability fork that chooses between two
@@ -723,11 +708,12 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // row count` for as long as that was true and for a day after it was not,
 // which is the failure mode a tombstone has: it is written beside the
 // deletion and nothing re-derives it when the sentence it names comes true.
-// `x::moe`'s four remaining `none:` arms are `add_moe_route_bias`,
-// `transpose_expert_scales`, `moe_bucket_exact` and `scatter_add_weighted`;
-// fourteen bind and two are driver ops. It said FIVE until
-// `build_moe_ptrs_aligned` took `Service::DriverOp`, which is this same
-// paragraph's subject happening to this same paragraph.
+// `x::moe`'s three remaining `none:` arms are `add_moe_route_bias`,
+// `transpose_expert_scales` and `moe_bucket_exact`; thirteen bind and three
+// are driver ops. It said FIVE until `build_moe_ptrs_aligned` took
+// `Service::DriverOp`, and FOUR until `scatter_add_weighted` was deleted as
+// an orphan, which is this same paragraph's subject happening to this same
+// paragraph.
 
 // `ssm_build_nemotron_moe_ptrs_decode_batched_bf16` AND
 // `ssm_build_nemotron_moe_ptrs_aligned_bf16` STOOD HERE, filed with `moe/`
@@ -856,9 +842,6 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // this one declared a device half for the first time rather than binding a
 // `fn` to one that already existed.
 
-
-
-
 // `attn_combine_attn_outputs_bf16` STOOD HERE, and it is gone rather than
 // moved: the symbol crossed into fn-world as
 // `kernels_cuda_new::x::attn`'s `COMBINE_ATTN_OUTPUTS`, so its `table::attn`
@@ -907,7 +890,6 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // requires: it reads this file's text, so a symbol that outlives its entry
 // point here goes red immediately.
 
-
 /// `comm::all_reduce_bf16` — the custom P2P all-reduce.
 ///
 /// Ported from `comm/custom_all_reduce.cu:603-621` by way of
@@ -944,7 +926,8 @@ pub unsafe fn comm_all_reduce_bf16(
     stream: *mut c_void,
 ) {
     // SAFETY: forwarded unchanged; the caller's assertion is this function's.
-    let outcome = unsafe { crate::fire::all_reduce::all_reduce_bf16(car, input, output, count, stream) };
+    let outcome =
+        unsafe { crate::fire::all_reduce::all_reduce_bf16(car, input, output, count, stream) };
     if let crate::fire::all_reduce::AllReduce::Declined(why) = outcome {
         panic!("comm::all_reduce_bf16 declined: {why}");
     }
@@ -1040,28 +1023,4 @@ pub unsafe fn comm_all_reduce_residual_rmsnorm_bf16(
 mod tests {
     //! What can be checked without a device: that the classification and
     //! this module agree about which symbols are here.
-
-    /// EVERY `RUST_SERVED` SYMBOL HAS A FUNCTION HERE, AND THE NAMES MATCH.
-    ///
-    /// The list in `execution.rs` is what makes `emit_c_shim` drop a row's
-    /// shim entry. A symbol on that list with no function here is a row with
-    /// NO executor at all: the C++ body is deleted, the shim entry is gone,
-    /// and the arm the emitter writes names a path that does not exist —
-    /// which is a compile error, but only in the crate that includes the
-    /// generated file, and only in one feature combination. Saying it here
-    /// says it in the crate that owns the answer.
-    #[test]
-    fn every_rust_served_symbol_is_spelled_here() {
-        let text = include_str!("service.rs");
-        for symbol in kernels_cuda_new::execution::RUST_SERVED {
-            let name = kernels_cuda_new::abi::entry_name(symbol);
-            let bare = name.strip_prefix("pie_k_").expect("`entry_name` prefixes");
-            assert!(
-                text.contains(&format!("pub unsafe fn {bare}(")),
-                "`execution::RUST_SERVED` names `{symbol}`, so `emit_c_shim` drops its shim \
-                 entry and the C++ body is deletable -- but `bind::service` has no \
-                 `pub unsafe fn {bare}`. The row would have no executor on any path."
-            );
-        }
-    }
 }

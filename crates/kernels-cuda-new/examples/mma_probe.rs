@@ -182,7 +182,7 @@ mod probe {
     /// Runs every check. `true` only when all four agree exactly AND the
     /// transposed-store control was caught.
     pub fn run() -> bool {
-        let arch = match kernels_cuda_new::runtime::cache::arch() {
+        let arch = match kernels_cuda_new::jit::cache::arch() {
             Some(arch) => arch,
             None => {
                 // A skip, not a failure -- `tests/fire.rs` draws the same line
@@ -280,7 +280,8 @@ mod probe {
         let cases = cases();
         let total = cases.len();
         for case in &cases {
-            let (Ok(want), Ok(got)) = (reference.run(&case.a, &case.b), under_test.run(&case.a, &case.b))
+            let (Ok(want), Ok(got)) =
+                (reference.run(&case.a, &case.b), under_test.run(&case.a, &case.b))
             else {
                 println!("{:<44} {:>6}  a launch failed", case.what, "ERROR");
                 failures += 1;
@@ -727,7 +728,11 @@ mod probe {
         let started = Instant::now();
         // SAFETY: the program is live and the options outlive the call.
         let code = unsafe {
-            nv::nvrtcCompileProgram(program, i32::try_from(options.len()).unwrap(), options.as_ptr())
+            nv::nvrtcCompileProgram(
+                program,
+                i32::try_from(options.len()).unwrap(),
+                options.as_ptr(),
+            )
         };
         let millis = started.elapsed().as_secs_f64() * 1e3;
         let log = program_log(program);
@@ -988,7 +993,11 @@ mod probe {
         let mut name = [0u8; 128];
         // SAFETY: the buffer is 128 bytes and that is what is claimed.
         let code = unsafe {
-            dr::cuDeviceGetName(name.as_mut_ptr().cast(), i32::try_from(name.len()).unwrap(), device)
+            dr::cuDeviceGetName(
+                name.as_mut_ptr().cast(),
+                i32::try_from(name.len()).unwrap(),
+                device,
+            )
         };
         if code != dr::CUresult::CUDA_SUCCESS {
             return "unknown".to_string();

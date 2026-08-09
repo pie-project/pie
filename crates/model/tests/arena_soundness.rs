@@ -1049,7 +1049,13 @@ fn what_the_epilogue_hands_each_of_its_rectangles() {
                 .iter()
                 .map(|a| match a {
                     Arg::Arena { at, width, .. } => format!("arena@{at}/w{width}"),
-                    Arg::Named { value, width } => format!("named(v{value})/w{width}"),
+                    // `bytes` printed here and elided for `Arena`, because
+                    // this is the variant with no extent to check: the
+                    // element width is the only thing that says how big the
+                    // rectangle a backend binds whole actually is.
+                    Arg::Named { value, width, bytes } => {
+                        format!("named(v{value})/w{width}x{bytes}B")
+                    }
                     Arg::Weight(w) => format!("weight({w})"),
                 })
                 .collect();

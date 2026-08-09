@@ -1578,7 +1578,8 @@ kernels = "/tmp/spv"
         assert_eq!(facts.page_size, driver_vulkan::facts::PAGE_SIZE);
         assert!(
             driver.export_kv_handle().is_none(),
-            "this driver's pages are not exportable, and a handle here would              invite another process to map them"
+            "this driver's pages are not exportable, and a handle here would \
+             invite another process to map them"
         );
 
         // The two refusals. Both are unconditional, and both are a refusal

@@ -58,25 +58,23 @@
 //!
 //! `hand::fire` panics on every failure, and it is right to: a caller that
 //! reached it has already decided it will launch, and no ahead-of-time
-//! launcher is left to fall back to. Here the two halves of that argument
-//! come apart, so this module splits them:
+//! launcher is left to fall back to. Here that is wrong in one direction —
+//! **a launch this stream cannot take must stay recoverable.** That is the one
+//! failure the C++ reported by returning `cudaGetLastError()` as an int, and
+//! [`open_cond`] has always turned a non-zero into an [`Error`] and let the
+//! capture be abandoned. `fire/launch.rs` says it outright: *"a refused
+//! capture is not a refused fire"*, and the supergraph is an optimisation.
 //!
-//! * **Resolution and compilation panic**, with the symbol named —
-//!   `fire/gemv.rs`'s rule. A missing unit, a missing row, a unit that will
-//!   not compile, an operand list that disagrees with its signature: each is
-//!   drift between this driver and its kernel table.
-//! * **The launch itself is refused, not fatal.** That is the one failure the
-//!   C++ reported by returning `cudaGetLastError()` as an int, and
-//!   [`open_cond`] has always turned a non-zero into an [`Error`] and let the
-//!   capture be abandoned. `fire/launch.rs` says it outright — *"a refused
-//!   capture is not a refused fire"* — and the supergraph is an optimisation,
-//!   so a launch this stream cannot take must stay recoverable.
-//!
-//! The split matters in one direction only. If a broken table were reported
-//! as a refused launch, every capture would abandon and every fire would run
-//! eagerly, silently and forever, with no diagnostic anywhere — the exact
-//! failure `hand`'s header calls *"the one diagnosis that sends a reader to
-//! the wrong file"*.
+//! This module used to SPLIT that from table drift, panicking when a unit was
+//! missing or would not compile and refusing only the launch. **The split is
+//! gone with the unit**: [`kernels_cuda_new::x::graph`] is two `fn`s the
+//! compiler resolves, so there is no table left to drift from, and what
+//! remains — the compile, the load and the launch — comes back as one
+//! `Refusal`. The worry the split answered was that a broken table would be
+//! reported as a refused launch and every capture would abandon *"with no
+//! diagnostic anywhere"*; `jit::Ctx::launch` logs the compiler's or the
+//! driver's own words at `error!` once per instantiation, which is the
+//! diagnostic that argument was asking for.
 //!
 //! The C++'s comment explaining the `int` return — *"the C++ original throws
 //! out of `CUDA_CHECK`, which is not a shape that crosses `extern \"C\"`"* —
@@ -87,7 +85,8 @@
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::runtime::{ArgValue, Args, Launch, Stream, cache};
+use kernels_cuda_new::jit::Ctx;
+use kernels_cuda_new::x::{Refusal, graph};
 
 use crate::error::{Error, Result};
 
@@ -97,21 +96,6 @@ const SET_COND: &str = "graph::supergraph_set_cond";
 /// `graph/supergraph.cuh`'s SWITCH-arming kernel.
 const SET_SWITCH: &str = "graph::supergraph_set_switch";
 
-/// `csrc/supergraph.cu:61` and `:74` — `<<<1, 1, 0, stream>>>`, both
-/// launchers, cited rather than derived.
-///
-/// One thread, because the kernel is one store to one handle. No
-/// [`kernels::LaunchRule`] states this and none should: a rule reads a
-/// [`kernels_cuda_new::Dims`], and there is no extent here to read. The row
-/// says [`kernels::LaunchRule::Unstated`] and the geometry is the driver's,
-/// which is what `fire/attn_score.rs` and `fire/split_packed.rs` each did with
-/// a geometry no rule states.
-const ARM: Launch = Launch {
-    grid: [1, 1, 1],
-    block: [1, 1, 1],
-    smem: 0,
-};
-
 /// Arms `handle` from `preds[slot]` on `stream`, which must be capturing —
 /// the launch becomes the conditional node's upstream dependency.
 ///
@@ -120,15 +104,11 @@ const ARM: Launch = Launch {
 ///
 /// # Errors
 ///
-/// If the launch is refused — the stream is not capturing, or CUDA declines
-/// it. The caller abandons the capture and the fire runs eagerly.
-///
-/// # Panics
-///
-/// If this driver and its kernel table disagree, or the `graph/supergraph`
-/// unit will not compile or load. See the module header for the split.
+/// If the launch is refused — the stream is not capturing, CUDA declines it,
+/// or the root will not compile or load. The caller abandons the capture and
+/// the fire runs eagerly.
 pub fn set_cond(handle: u64, preds: *const u8, slot: u32, stream: *mut c_void) -> Result<()> {
-    arm(SET_COND, handle, preds, slot, stream)
+    arm(SET_COND, graph::supergraph_set_cond, handle, preds, slot, stream)
 }
 
 /// Arms `handle` from `preds[slot]` as a body INDEX rather than a boolean.
@@ -149,63 +129,44 @@ pub fn set_cond(handle: u64, preds: *const u8, slot: u32, stream: *mut c_void) -
 /// # Errors
 ///
 /// [`set_cond`]'s.
-///
-/// # Panics
-///
-/// [`set_cond`]'s.
 pub fn set_switch(handle: u64, preds: *const u8, slot: u32, stream: *mut c_void) -> Result<()> {
-    arm(SET_SWITCH, handle, preds, slot, stream)
+    arm(SET_SWITCH, graph::supergraph_set_switch, handle, preds, slot, stream)
 }
 
-/// The body both launchers share: resolve the row, bind three operands,
-/// launch one thread.
+/// The body both launchers share: the two conversions the driver's vocabulary
+/// needs, then the routine.
 ///
-/// Not [`crate::fire::hand::fire`], and the difference is the last line — that
-/// function panics on the launch, this one refuses. The four steps above it
-/// are the same and in the same order, which is the contract `hand`'s header
-/// states.
+/// `routine` is the `fn` itself and not a symbol, which is what the descent
+/// bought: the resolution `symbol` used to drive is the compiler's now, and
+/// `name` survives only so a refusal says which of the two was refused.
 ///
-/// The operand list is `(handle, preds, slot)` and the stream is not one of
-/// them; it is the launch's, as it was the `<<<>>>`'s.
+/// The stream is not one of the routine's arguments; it is the launch's, as it
+/// was the `<<<>>>`'s.
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // both pointers are the caller's, never read here
 fn arm(
-    symbol: &'static str,
+    name: &'static str,
+    routine: fn(&Ctx, usize, *const c_void, i32) -> std::result::Result<(), Refusal>,
     handle: u64,
     preds: *const u8,
     slot: u32,
     stream: *mut c_void,
 ) -> Result<()> {
-    let Some((index, unit)) = kernels_cuda_new::unit::unit_of(symbol) else {
-        panic!("{symbol} is in no JIT unit — this driver and its kernel table disagree");
-    };
-    let Some(sig) = unit.row(symbol).map(|row| row.sig) else {
-        panic!("{symbol} named unit `{}` and is not one of its rows", unit.name);
-    };
-    let module = match cache::module(index, unit) {
-        Ok(module) => module,
-        Err(why) => panic!("{symbol}: unit `{}` would not compile or load: {why}", unit.name),
-    };
     // A slot index that does not fit an `int` is a lowering that named a slot
     // no predicate word has — refused rather than folded to 0, for the reason
     // `set_switch` gives about arm 4 of a three-arm switch. The `extern "C"`
     // seam this replaces wrote `i32::try_from(pred_slot).unwrap_or(0)`.
     let Ok(slot) = i32::try_from(slot) else {
-        return Err(Error::invalid(symbol, "pred slot does not fit an int"));
+        return Err(Error::invalid(name, "pred slot does not fit an int"));
     };
-    let values = [
-        ArgValue::Usize(handle as usize),
-        ArgValue::Ptr(preds.cast::<c_void>().cast_mut()),
-        ArgValue::I32(slot),
-    ];
-    let mut args = match Args::bind(sig, &values) {
-        Ok(args) => args,
-        Err(why) => panic!("{symbol}: {why}"),
-    };
-    // SAFETY: the caller holds the capturing stream live across the launch —
-    // the same assertion `SupergraphBuilder` made when it handed the raw
-    // stream to a C++ launcher that put it in a `<<<>>>`.
-    let stream = unsafe { Stream::from_runtime(stream) };
-    module
-        .fire(sig, ARM, &mut args, stream)
-        .map_err(|why| Error::invalid(symbol, format!("the arming launch failed: {why}")))
+    // `cudaGraphConditionalHandle` is `unsigned long long` and the device
+    // parameter is the prelude's `usize`; the two are the same width and a
+    // different type, so the cast is written once, here.
+    let handle = handle as usize;
+    // SAFETY: the caller holds the capturing stream live across the launch,
+    // and `preds` addresses the device-resident predicate word — the same
+    // assertion `SupergraphBuilder` made when it handed the raw stream to a
+    // C++ launcher that put it in a `<<<>>>`.
+    let ctx = unsafe { Ctx::on(stream) };
+    routine(&ctx, handle, preds.cast::<c_void>(), slot)
+        .map_err(|why| Error::invalid(name, format!("the arming launch failed: {why:?}")))
 }

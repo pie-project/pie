@@ -138,10 +138,7 @@ mod tests {
         };
         assert_eq!(round_robin(4, 12), vec![0, 2, 3, 1, 0, 3, 1, 2, 0, 1, 2, 3]);
         assert_eq!(round_robin(3, 9), vec![0, 1, 2, 0, 1, 2, 0, 1, 2]);
-        assert_eq!(
-            round_robin(8, 16),
-            vec![0, 2, 6, 7, 5, 1, 4, 3, 0, 6, 4, 3, 2, 7, 1, 5]
-        );
+        assert_eq!(round_robin(8, 16), vec![0, 2, 6, 7, 5, 1, 4, 3, 0, 6, 4, 3, 2, 7, 1, 5]);
     }
 
     /// Unequal costs, so the sift path is exercised rather than the tie path.

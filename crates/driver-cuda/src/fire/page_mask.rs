@@ -464,20 +464,14 @@ impl FirePageMask {
         let Some(sink) = self.sink.as_mut() else {
             return;
         };
-        ops.memset_async(
-            sink.keep,
-            1,
-            sink.num_requests as usize * sink.stride as usize,
-        );
+        ops.memset_async(sink.keep, 1, sink.num_requests as usize * sink.stride as usize);
         sink.written_layer = None;
     }
 
     /// Whether the sink was written *for this layer*.
     #[must_use]
     pub fn written_for(&self, layer: u32) -> bool {
-        self.sink
-            .as_ref()
-            .is_some_and(|s| s.written_layer == Some(layer))
+        self.sink.as_ref().is_some_and(|s| s.written_layer == Some(layer))
     }
 
     /// Gather the fire's page table down to the kept pages.
@@ -598,11 +592,7 @@ mod tests {
 
     impl Slab {
         fn new() -> Self {
-            Self {
-                bytes: vec![0u8; 8 << 20],
-                next: 0,
-                allocs: 0,
-            }
+            Self { bytes: vec![0u8; 8 << 20], next: 0, allocs: 0 }
         }
     }
 
@@ -695,18 +685,9 @@ mod tests {
 
     #[test]
     fn a_malformed_csr_is_rejected_rather_than_producing_a_short_stride() {
-        assert_eq!(
-            MaskSlotLayout::plan(geometry(&[0, 9, 4, 12])),
-            Err(MaskError::MalformedCsr)
-        );
-        assert_eq!(
-            MaskSlotLayout::plan(geometry(&[0, 5, 99, 12])),
-            Err(MaskError::MalformedCsr)
-        );
-        assert_eq!(
-            MaskSlotLayout::plan(geometry(&[0, 0, 0])),
-            Err(MaskError::NoPages)
-        );
+        assert_eq!(MaskSlotLayout::plan(geometry(&[0, 9, 4, 12])), Err(MaskError::MalformedCsr));
+        assert_eq!(MaskSlotLayout::plan(geometry(&[0, 5, 99, 12])), Err(MaskError::MalformedCsr));
+        assert_eq!(MaskSlotLayout::plan(geometry(&[0, 0, 0])), Err(MaskError::NoPages));
         assert_eq!(FireGeometry::new(&[0]).unwrap_err(), MaskError::NoGeometry);
     }
 
@@ -720,9 +701,7 @@ mod tests {
             vec![0, 8, 16, 24, 32],
             vec![0, 3, 3, 40, 41, 97],
             vec![0, 0, 7],
-            vec![
-                0, 2, 5, 5, 9, 14, 20, 27, 35, 44, 54, 65, 77, 90, 104, 119, 135,
-            ],
+            vec![0, 2, 5, 5, 9, 14, 20, 27, 35, 44, 54, 65, 77, 90, 104, 119, 135],
         ] {
             let mut mem = Slab::new();
             let mut arena = SidebandArena::new();
@@ -760,10 +739,7 @@ mod tests {
         sink.written_layer = Some(7);
         assert!(mask.written_for(7));
         mask.begin_layer(&mut ops);
-        assert!(
-            !mask.written_for(7),
-            "a new layer must not inherit the previous layer's mask"
-        );
+        assert!(!mask.written_for(7), "a new layer must not inherit the previous layer's mask");
         mask.release(&mut arena);
         arena.destroy(&mut mem);
     }
@@ -783,25 +759,12 @@ mod tests {
             assert_eq!(mask.written_for(layer), layer == 1);
         }
 
-        mask.compact(
-            &mut ops,
-            core::ptr::null(),
-            core::ptr::null(),
-            core::ptr::null(),
-            2,
-        )
-        .unwrap();
+        mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 2).unwrap();
         assert_eq!(ops.compactions, 1);
         assert_eq!(ops.last_stride, 8);
 
         assert_eq!(
-            mask.compact(
-                &mut ops,
-                core::ptr::null(),
-                core::ptr::null(),
-                core::ptr::null(),
-                3
-            ),
+            mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 3),
             Err(MaskError::RequestCountMismatch),
             "a request-count disagreement must refuse, not launch"
         );
@@ -820,14 +783,8 @@ mod tests {
         assert!(!mask.active());
         assert!(mask.sink().is_none());
         mask.begin_layer(&mut ops);
-        mask.compact(
-            &mut ops,
-            core::ptr::null(),
-            core::ptr::null(),
-            core::ptr::null(),
-            99,
-        )
-        .unwrap();
+        mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 99)
+            .unwrap();
         assert!(mask.page_indices().is_null());
         assert!(!mask.written_for(0));
         assert_eq!(ops.memsets.len(), 0);
@@ -881,10 +838,7 @@ mod tests {
             mask.release(&mut arena);
             assert!(!mask.still_holds_slot());
         }
-        assert_eq!(
-            mem.allocs, allocs_after_warm,
-            "the steady state must allocate nothing"
-        );
+        assert_eq!(mem.allocs, allocs_after_warm, "the steady state must allocate nothing");
         arena.destroy(&mut mem);
     }
 
@@ -1137,16 +1091,8 @@ pub mod element_mask {
         /// one path.
         #[test]
         fn each_query_row_brings_its_own_mask() {
-            let p = from_words(
-                &[0, 2],
-                &[0, 1],
-                &[3],
-                16,
-                &[0, 2],
-                &[0, 1, 2],
-                &[0b001, 0b011],
-            )
-            .expect("decoded");
+            let p = from_words(&[0, 2], &[0, 1], &[3], 16, &[0, 2], &[0, 1, 2], &[0b001, 0b011])
+                .expect("decoded");
             assert_eq!(p.mask, vec![1, 0, 0, 1, 1, 0]);
             let causal = plan_causal(&[0, 2], &[0, 1], &[3], 16).expect("causal");
             assert_eq!(p.indptr, causal.indptr, "same geometry, same CSR");

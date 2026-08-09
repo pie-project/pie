@@ -266,7 +266,7 @@ fn the_table_covers_the_dsl_surface() {
         .collect();
     stated.sort_unstable();
     stated.dedup();
-    let mut declared: Vec<&str> = KERNELS.iter().map(|k| k.symbol).collect();
+    let mut declared: Vec<&str> = sigs().iter().map(|k| k.symbol).collect();
     declared.sort_unstable();
 
     let unbacked: Vec<&str> = stated
@@ -429,8 +429,9 @@ fn the_depth_axis_derives_from_the_layer_tag() {
 /// No symbol is declared twice, and no dsl-side name is either.
 #[test]
 fn table_is_unambiguous() {
-    for (i, k) in KERNELS.iter().enumerate() {
-        for other in &KERNELS[i + 1..] {
+    let rows = sigs();
+    for (i, k) in rows.iter().enumerate() {
+        for other in &rows[i + 1..] {
             assert_ne!(k.symbol, other.symbol, "symbol declared twice");
             assert_ne!(k.name, other.name, "name declared twice");
         }

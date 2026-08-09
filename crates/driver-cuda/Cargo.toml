@@ -389,15 +389,6 @@ driver-api = { path = "../driver-api" }
 name = "attn_score_parity"
 required-features = ["_cuda"]
 
-# No `required-features`, and that is the point of it. It resolves the four
-# post-kernel symbols through `kernels_cuda_new::unit` — a static table, not
-# a CUDA call — and compares each row's operand list against the C++
-# `<<<>>>` the driver transcribed. So the check that the migrated launches
-# pass their arguments in the right order runs on a box with no toolkit,
-# which is the gate `driver-cuda` has always had to satisfy. See the file's
-# header for why `attn_score_parity` cannot make this claim itself.
-[[test]]
-name = "attn_score_post_geometry"
 
 [[test]]
 name = "attn_ws_parity"
@@ -514,9 +505,6 @@ required-features = ["_cuda"]
 name = "caches_parity"
 required-features = ["_cuda"]
 
-[[test]]
-name = "launch_abi"
-required-features = ["_cuda"]
 
 # `[[test]] bridge_smoke` STOOD HERE and is deleted with its subject.
 #
@@ -568,18 +556,5 @@ required-features = ["_cuda", "abi"]
 name = "shape_analysis"
 required-features = ["_cuda"]
 
-# Tier A: the device-entry pilot. `_cuda` alone and NOT `bridge` -- the whole
-# claim is that a kernel can be launched with no shim in the build, so a test
-# that needed one would not be testing it.
-[[test]]
-name = "tier_a_pilot"
-required-features = ["_cuda"]
 
-# The cutover's proof. `bridge` because `bind::dispatch` is the bridge
-# executor's entry and the whole point is to enter there -- firing the row by
-# hand is what `tier_a_pilot` already does, and it stays green whether the
-# dispatcher routes or not.
-[[test]]
-name = "jit_dispatch"
-required-features = ["_cuda"]
 

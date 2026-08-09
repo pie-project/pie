@@ -79,7 +79,7 @@ pub const DECODE_GQA_GROUPS: &[u32] = &[1, 2, 3, 4, 8];
 
 use crate::fire::launch::launch_impl;
 use load::{adopt_and_compile, load_impl};
-use state::{ChannelState, InstanceEntry, ProgramEntry, Shell as ShellState, channel_dtype};
+use state::{ChannelState, InstanceEntry, ProgramEntry, channel_dtype};
 
 /// Run a driver entry point, turning a panic into a status rather than into
 /// the caller's problem.

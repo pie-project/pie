@@ -8,7 +8,7 @@
 //! `device::attn_score_fold_heads`, ours and already rowed. This module is the
 //! planning half of that program; [`crate::fire::kv_paged`] holds the dequant
 //! switch its dispatches open with, and the launches themselves resolve
-//! against [`kernels_cuda_new::families::fa2`]'s 56 units.
+//! against [`kernels_cuda_new::x::fa2`]'s 56 roots.
 //!
 //! # What is here and what is deliberately not
 //!
@@ -63,7 +63,7 @@
 //!   belongs.
 //! * **`head_dim_supports_cascade_merge`'s `{64, 128, 256, 512}`** (`:376`,
 //!   `:985`) is **upstream's** set, and it agrees with
-//!   [`kernels_cuda_new::families::fa2::HEAD_DIMS`] by shared origin rather
+//!   [`kernels_cuda_new::x::fa2::HEAD_DIMS`] by shared origin rather
 //!   than by construction. Two facts that happen to match; whoever changes one
 //!   says which.
 //! * **The arch coverage this deletion RECOVERS, and it is worth naming**
@@ -91,19 +91,17 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use kernels_cuda_new::fa2::{Device as FaDevice, KvWidth};
-use kernels_cuda_new::families::fa2::DecodeArm;
-use kernels_cuda_new::plan::{self, Device, Workspace};
+use kernels_cuda_new::fa2::Device as FaDevice;
 use kernels_cuda_new::plan::info::{
     DecodePlanInfo, MlaPlanInfo, PrefillPlanInfo, PrefillPlanSm90Info,
 };
-use kernels_cuda_new::runtime::Launch;
+use kernels_cuda_new::plan::{self, Device, Workspace};
+use kernels_cuda_new::x::fa2 as lattice;
 
 use crate::device::StreamRef;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::flashinfer_fa2_dispatch::{DecodeDispatch, PrefillDispatch};
-use super::hand;
 
 /// Whether a plan was built, and by which planner.
 ///
@@ -137,7 +135,10 @@ pub enum Decline {
     /// plan short-circuits past the dispatch entirely, so an unsupported
     /// head_dim would otherwise be reported as a valid plan and only fail
     /// later inside the kernel launch."* The check keeps that position.
-    HeadDim { head_dim: u32 },
+    HeadDim {
+        /// The head dim asked for.
+        head_dim: u32,
+    },
     /// The lattice holds no unit for this (head dim, `CTA_TILE_Q`) pair.
     ///
     /// # The one pair this can actually name today
@@ -153,7 +154,7 @@ pub enum Decline {
     /// and at head dim 256 (`NUM_MMA_D_VO` 16) with `CTA_TILE_Q` 128
     /// (`NUM_MMA_Q` 2) the left side is `2 * (128 + 8 * NUM_MMA_KV)`, which is
     /// at least 256 **for every `NUM_MMA_KV` including zero**. There is no
-    /// valid instantiation, so `families::fa2` names no unit for it.
+    /// valid instantiation, so `x::fa2` names no root for it.
     ///
     /// # And the archive did not hit it — the guard is one line of arithmetic
     ///
@@ -173,7 +174,12 @@ pub enum Decline {
     /// The refusal stays anyway, because `cta_tile_q` is a *parameter* here
     /// and a caller may compute it some other way. It is cheaper than a
     /// launch that fails inside NVRTC with a static assertion.
-    HeadDimTile { head_dim: u32, cta_tile_q: u32 },
+    HeadDimTile {
+        /// The head dim asked for.
+        head_dim: u32,
+        /// The `CTA_TILE_Q` asked for.
+        cta_tile_q: u32,
+    },
     /// The batch is empty. `num_requests <= 0`.
     NoRequests,
     /// [`kernels_cuda_new::plan`] refused, and which planner did.
@@ -197,7 +203,12 @@ pub enum Decline {
     /// through [`kernels_cuda_new::plan`]'s allocator, so this is the one
     /// overflow this module can name precisely — and it does, where
     /// [`Decline::Planner`] cannot.
-    WorkspaceTooSmall { needed: usize, have: usize },
+    WorkspaceTooSmall {
+        /// Bytes the plan needs.
+        needed: usize,
+        /// Bytes the caller supplied.
+        have: usize,
+    },
     /// A score-capturing prefill plan was asked for with a sliding window.
     ///
     /// `attention_flashinfer.cu:299-311`, transcribed whole because the
@@ -206,14 +217,20 @@ pub enum Decline {
     /// capture has already written out. The captured tensor would hold scores
     /// for positions the kernel then discards — not a scaled answer but a
     /// different one, and silently. The C++ threw; this refuses.
-    ScoreCaptureWindow { window_left: i32 },
+    ScoreCaptureWindow {
+        /// The window the caller asked for.
+        window_left: i32,
+    },
 }
 
 impl core::fmt::Display for Decline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::HeadDim { head_dim } => {
-                write!(f, "flashinfer fa2: unsupported head_dim {head_dim}; the lattice holds {{64, 128, 256, 512}}")
+                write!(
+                    f,
+                    "flashinfer fa2: unsupported head_dim {head_dim}; the lattice holds {{64, 128, 256, 512}}"
+                )
             }
             Self::HeadDimTile { head_dim, cta_tile_q } => write!(
                 f,
@@ -243,7 +260,7 @@ impl core::fmt::Display for Decline {
 /// The head dims the FA2 lattice is instantiated over.
 ///
 /// `kernels.def`'s list, and upstream's `head_dim_supports_cascade_merge` set.
-/// Stated here as well as in [`kernels_cuda_new::families::fa2::HEAD_DIMS`]
+/// Stated here as well as in [`kernels_cuda_new::x::fa2::HEAD_DIMS`]
 /// because this is the *gate* and that is the *lattice*: they must agree, and
 /// [`the_gate_and_the_lattice_agree`] is what makes them.
 ///
@@ -425,10 +442,7 @@ impl DecodePlanCache {
     /// `plan::Device` exists.
     #[must_use]
     pub fn can_use_static_nonsplit(num_requests: i32, cc_major: i32) -> bool {
-        !force_split_kv_small_enabled()
-            && cc_major >= 8
-            && num_requests > 0
-            && num_requests <= 512
+        !force_split_kv_small_enabled() && cc_major >= 8 && num_requests > 0 && num_requests <= 512
     }
 
     /// `refresh_static_nonsplit_decode_vectors`, `:117-133`.
@@ -557,7 +571,7 @@ impl PrefillPlanCache {
 /// locals, and it is here so that the three caches are one shape.
 ///
 /// **The MLA kernels are not in the FA2 lattice** and are not probed;
-/// `families::fa2` holds paged decode and paged prefill only. This struct
+/// `x::fa2` holds paged decode and paged prefill only. This struct
 /// plans; nothing in this crate yet launches from it.
 #[derive(Clone, Debug, Default)]
 pub struct MlaPlanCache {
@@ -660,22 +674,10 @@ pub fn fa_device() -> FaDevice {
 /// `cudaOccupancyMaxActiveBlocksPerMultiprocessor` **on the decode kernel**
 /// (`decode.cuh:715-718`) and multiplies by the SM count. That is a per-cubin
 /// fact, so under the JIT it is
-/// [`kernels_cuda_new::runtime::module::KernelModule::max_active_blocks_per_sm`]
-/// over the `CUfunction` the unit produced — which means the unit is compiled
-/// at PLAN time, before the fire.
-///
-/// `block_threads` is [`kernels_cuda_new::fa2::DecodeGeometry::num_threads`]
-/// and **not** the product of the block dims: at GQA group 3 those differ
-/// (128 against 120) and `decode.cuh:715` passes the former. Getting that
-/// wrong is a plausible-looking occupancy for a block shape nothing launches.
-///
-/// # The arm is `Full` and the other four would answer the same
-///
-/// The decode arm selects a variant *functor* — a soft cap, a window
-/// predicate — and changes neither `num_threads` nor the shared-memory
-/// request, which are the only two things the occupancy query reads. Probing
-/// one arm therefore answers for all five, and probing `Full` rather than the
-/// arm the fire will take avoids compiling a unit the fire may not want.
+/// [`kernels_cuda_new::x::fa2::decode_blocks_per_sm`] over the `CUfunction`
+/// the root produced — which means the point is compiled at PLAN time, before
+/// the fire. Which arm is probed, and why `num_threads` rather than the
+/// product of the block dims, are that function's own doc.
 ///
 /// # When the query cannot be made this answers `num_sm`
 ///
@@ -692,27 +694,9 @@ pub fn decode_max_grid_size(head_dim: i32, num_q_heads: i32, num_kv_heads: i32) 
         return floor;
     }
     let group = if num_kv_heads > 0 { (num_q_heads / num_kv_heads).max(1) } else { 1 };
-    let head_dim = head_dim as u32;
-    let group = group as u32;
-    let Ok(geometry) =
-        kernels_cuda_new::fa2::DecodeGeometry::derive(head_dim, group, KvWidth::BF16, fa)
-    else {
-        return floor;
-    };
-    let Some(symbol) =
-        kernels_cuda_new::families::fa2::decode_symbol(head_dim, group, DecodeArm::Full)
-    else {
-        return floor;
-    };
-    let Some((index, unit)) = kernels_cuda_new::unit::unit_of(symbol) else {
-        return floor;
-    };
-    let Ok(module) = kernels_cuda_new::runtime::cache::module(index, unit) else {
-        return floor;
-    };
-    match module.max_active_blocks_per_sm(symbol, geometry.num_threads, geometry.smem_bytes) {
-        Ok(per_sm) => per_sm.max(1).saturating_mul(floor),
-        Err(_) => floor,
+    match lattice::decode_blocks_per_sm(head_dim as u32, group as u32, fa) {
+        Some(per_sm) => per_sm.max(1).saturating_mul(floor),
+        None => floor,
     }
 }
 
@@ -774,10 +758,7 @@ pub fn plan_static_nonsplit_decode(
     // int buffer and this one starts at `int_base_bytes`.
     let needed = cursor.saturating_add(cache.int_base_bytes);
     if needed > workspace.int_bytes {
-        return Planned::Declined(Decline::WorkspaceTooSmall {
-            needed,
-            have: workspace.int_bytes,
-        });
+        return Planned::Declined(Decline::WorkspaceTooSmall { needed, have: workspace.int_bytes });
     }
 
     // `:178-190`. The C++ wrote into the page-locked mirror at
@@ -818,8 +799,9 @@ pub fn plan_static_nonsplit_decode(
     cache.page_size = page_size;
     cache.num_pages_in_batch =
         kv_page_indptr_h.get(num_requests as usize).copied().unwrap_or(0) as i32;
-    // `:207` — `current_device_supports_pdl()`, which `fire/xqa.rs:957` states
-    // as `major >= 9`. RECORDED AND NOT APPLIED: programmatic dependent launch
+    // `:207` — `current_device_supports_pdl()`, which
+    // `kernels_cuda_new::x::xqa::xqa_decode_bf16` states as `major >= 9` and
+    // does not apply either. RECORDED AND NOT APPLIED: programmatic dependent launch
     // is a `cudaLaunchKernelEx` attribute and this lattice fires through
     // `cuLaunchKernel`, as every other JIT row in this driver does. The field
     // is kept so that the day a launch attribute path exists, the plan already
@@ -900,9 +882,7 @@ pub fn plan_decode(
     // `:240-245`. A windowed layer wants the real planner; see the roofline
     // measurement in this module's header for what the static plan costs it.
     let windowed_split = window_split_kv_enabled() && window_left >= 0;
-    if !windowed_split
-        && DecodePlanCache::can_use_static_nonsplit(num_requests, device.cc_major)
-    {
+    if !windowed_split && DecodePlanCache::can_use_static_nonsplit(num_requests, device.cc_major) {
         return plan_static_nonsplit_decode(
             cache,
             kv_page_indptr_h,
@@ -923,9 +903,9 @@ pub fn plan_decode(
     // cache's own buffer rather than allocated per step, which is what the
     // C++'s `indptr_h_buf` was for.
     cache.indptr_h_buf.clear();
-    cache.indptr_h_buf.extend(
-        kv_page_indptr_h.iter().take(num_requests as usize + 1).map(|&v| v as i32),
-    );
+    cache
+        .indptr_h_buf
+        .extend(kv_page_indptr_h.iter().take(num_requests as usize + 1).map(|&v| v as i32));
 
     let gqa_group_size = if num_kv_heads > 0 { num_q_heads / num_kv_heads } else { 0 };
     let req = plan::decode::Request {
@@ -1015,9 +995,7 @@ pub fn plan_prefill(
     };
 
     cache.qo_h_buf.clear();
-    cache
-        .qo_h_buf
-        .extend(qo_indptr_h.iter().take(num_requests as usize + 1).map(|&v| v as i32));
+    cache.qo_h_buf.extend(qo_indptr_h.iter().take(num_requests as usize + 1).map(|&v| v as i32));
     cache.kv_h_buf.clear();
     cache
         .kv_h_buf
@@ -1058,16 +1036,16 @@ pub fn plan_prefill(
         // regression on short prompts and small batches, which are exactly
         // the shapes the prefill scheduler splits.
         //
-        // It is fixed. `kernels_cuda_new::families::cascade` carries
+        // It is fixed. `kernels_cuda_new::x::cascade` carries
         // `PersistentVariableLengthMergeStatesKernel` at all four head dims,
         // compiled by NVRTC out of the VENDORED `cascade.cuh`, and
         // `fire/merge_states.rs` is the Rust host program that fires it.
         // Every dispatch that returns
         // `flashinfer_fa2_dispatch::Fired::Split` now folds before it
         // returns, so the predicate is upstream's again and its input is the
-        // lattice's own head-dim set — which
-        // `families::cascade::tests::the_lattice_covers_flashinfer_fa2s_head_dims`
-        // pins against `families::fa2::HEAD_DIMS`.
+        // lattice's own head-dim set. `x::cascade::HEAD_DIMS` and
+        // `x::fa2::HEAD_DIMS` are the same four values in two places, and
+        // whoever changes one says which.
         disable_split_kv: !head_dim_instantiated(head_dim.max(0) as u32),
         num_colocated_ctas: 0,
     };
@@ -1246,22 +1224,26 @@ pub struct PlanUpload<'a> {
 ///
 /// `P` is the params type — [`kernels_cuda_new::fa2::params::DecodeParams`] or
 /// [`kernels_cuda_new::fa2::params::DecodeScoreParams`] — so the capturing and
-/// non-capturing fires are one function.
+/// non-capturing fires are one function. The bound is
+/// [`kernels_cuda_new::x::fa2::DecodeBlock`], which the two mirrors implement
+/// and nothing else does: the decode entry points are instantiated over those
+/// two blocks only.
 ///
-/// # A missing symbol is a panic and not an error
+/// # A refused fire is an `Err` and not a panic
 ///
-/// [`hand::fire_params`] panics if the lattice named a symbol the loaded
-/// module does not export. That is drift between this driver and its kernel
-/// table, and the module header of [`hand`] says why it may not be answered
-/// with a `Result`. The `Result` here is the H2D's alone.
+/// It was a panic while a symbol-resolving `hand::fire_params` stood here,
+/// because a symbol the table named and the module did not export is table
+/// drift and not a declined request. That function is deleted — FA2's 460
+/// rows were its only caller and a routine names its own instantiation — and
+/// the routine answers a `kernels::Refusal`
+/// instead — the lattice holds no such point, the geometry refused, the
+/// compile refused — and each of those is a statement this function's caller
+/// can report. The six services still turn it into a panic; the ViT returns
+/// it.
 ///
 /// # Errors
 ///
-/// The descriptor upload faulted.
-///
-/// # Panics
-///
-/// The JIT and the table disagree — see above.
+/// The descriptor upload faulted, or the routine refused.
 ///
 /// # Safety
 ///
@@ -1269,7 +1251,7 @@ pub struct PlanUpload<'a> {
 /// the kernel reads or writes, `upload.int_buffer` must be the workspace the
 /// params' offsets were computed against, and `stream` must outlive the
 /// launch.
-pub unsafe fn fire_decode<P>(
+pub unsafe fn fire_decode<P: lattice::DecodeBlock>(
     dispatch: &mut DecodeDispatch<P>,
     upload: PlanUpload<'_>,
     stream: *mut c_void,
@@ -1284,26 +1266,23 @@ pub unsafe fn fire_decode<P>(
             StreamRef::from_raw(stream.cast()),
         )?;
     }
-    let launch = Launch { grid: dispatch.grid, block: dispatch.block, smem: dispatch.smem };
-    // SAFETY: as above.
-    unsafe { hand::fire_params(dispatch.symbol, launch, &mut dispatch.params, stream) };
-    Ok(())
+    // SAFETY: as above -- the caller vouches for every address in the block
+    // and holds the stream live across the launch.
+    let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
+    lattice::decode(&ctx, dispatch.at, &dispatch.params)
+        .map_err(|why| Error::invalid("flashinfer fa2 decode", why.to_string()))
 }
 
 /// Upload the plan, then fire one prefill dispatch. See [`fire_decode`].
 ///
 /// # Errors
 ///
-/// The descriptor upload faulted.
-///
-/// # Panics
-///
-/// The JIT and the table disagree.
+/// The descriptor upload faulted, or the routine refused.
 ///
 /// # Safety
 ///
 /// As [`fire_decode`].
-pub unsafe fn fire_prefill<P>(
+pub unsafe fn fire_prefill<P: lattice::PrefillBlock>(
     dispatch: &mut PrefillDispatch<P>,
     upload: PlanUpload<'_>,
     stream: *mut c_void,
@@ -1317,10 +1296,10 @@ pub unsafe fn fire_prefill<P>(
             StreamRef::from_raw(stream.cast()),
         )?;
     }
-    let launch = Launch { grid: dispatch.grid, block: dispatch.block, smem: dispatch.smem };
     // SAFETY: as above.
-    unsafe { hand::fire_params(dispatch.symbol, launch, &mut dispatch.params, stream) };
-    Ok(())
+    let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
+    lattice::prefill(&ctx, dispatch.at, &dispatch.params)
+        .map_err(|why| Error::invalid("flashinfer fa2 prefill", why.to_string()))
 }
 
 #[cfg(test)]
@@ -1335,7 +1314,7 @@ mod tests {
     /// with the symbol named but no unit to compile it.
     #[test]
     fn the_gate_and_the_lattice_agree() {
-        assert_eq!(HEAD_DIMS.as_slice(), kernels_cuda_new::families::fa2::HEAD_DIMS);
+        assert_eq!(HEAD_DIMS.as_slice(), kernels_cuda_new::x::fa2::HEAD_DIMS);
         for hd in HEAD_DIMS {
             assert!(head_dim_instantiated(hd));
         }
@@ -1404,9 +1383,8 @@ mod tests {
         assert!(!info.split_kv);
         assert_eq!(info.padded_batch_size, 4);
 
-        let at = |off: usize| {
-            i32::from_ne_bytes(cache.int_upload[off..off + 4].try_into().unwrap())
-        };
+        let at =
+            |off: usize| i32::from_ne_bytes(cache.int_upload[off..off + 4].try_into().unwrap());
         assert_eq!([at(0), at(4), at(8), at(12)], [0, 1, 2, 3], "request_indices[r] = r");
         assert_eq!([at(16), at(20), at(24), at(28)], [0; 4], "kv_tile_indices = 0");
         assert_eq!([at(32), at(36), at(40), at(44), at(48)], [0, 1, 2, 3, 4], "o_indptr");

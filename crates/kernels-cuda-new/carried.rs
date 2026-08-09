@@ -8,9 +8,9 @@
 //! Three is a list. The set now holds every kernel header this crate
 //! compiles, the shims that replace NVIDIA's device headers, the two that
 //! close the CCCL door, and an internalised FlashInfer and XQA closure of
-//! forty-four files — and the moment a list of sixty entries has to be edited
-//! by hand to add a file, the rule stops being enforced by the build and
-//! starts being enforced by whoever remembers it.
+//! thirty-eight files — and the moment a list of well over a hundred entries
+//! has to be edited by hand to add a file, the rule stops being enforced by
+//! the build and starts being enforced by whoever remembers it.
 //!
 //! The failure mode is specific and unpleasant: a `.cuh` added to `csrc/` and
 //! not added to the array is not a compile error anywhere. It is an NVRTC
@@ -90,7 +90,11 @@
 //! optional and is not tidiness: `csrc/src/pie_fp8.cuh` and `pie_half2.cuh`
 //! reach the shims by QUOTED include and used to find them beside the
 //! includer, and a quoted name that misses falls through to the real toolkit
-//! header without a word. Four sites pass the pair.
+//! header without a word. Four sites passed the pair; all four are gone, and
+//! there is no offline compile of this device text left in the workspace to
+//! pass it. `csrc/shim/README.md` records which four and why the paragraph is
+//! kept — the hazard belongs to `-I`, not to any one build script, and the
+//! next `cc::Build` over this text reintroduces it on its first line.
 //!
 //! # It was three walks until the `.cuh` files moved here
 //!

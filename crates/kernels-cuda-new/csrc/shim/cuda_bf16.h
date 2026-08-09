@@ -517,5 +517,27 @@ __device__ __forceinline__ __nv_bfloat162 __hmul2(__nv_bfloat162 a, __nv_bfloat1
 // still emits `mov.b32 {0, h}` below sm_90; the shift is the same bits, and
 // one statement of it -- the prelude's -- is better than two.
 
+// `a * b` and `__hadd2_rn(a, b)` over a packed pair.
+//
+// XQA's `smemFp16ArraySum` and its X-row rescale write both spellings against
+// `InputElem2`, which is `__nv_bfloat162` under `-DDTYPE=device::bf16`. The
+// multiply is `__hmul2`, already here in its three arch bodies. The add goes
+// through fp32 and back, which is not an approximation: a bf16 sum is
+// correctly rounded exactly when it is computed wide and rounded once, and
+// `__float22bfloat162_rn` is that one rounding -- the same answer
+// `add.rn.bf16x2` gives, without needing sm_90 to say it.
+__device__ __forceinline__ __nv_bfloat162 operator*(__nv_bfloat162 a, __nv_bfloat162 b) {
+    return __hmul2(a, b);
+}
+
+__device__ __forceinline__ __nv_bfloat162 __hadd2_rn(__nv_bfloat162 a, __nv_bfloat162 b) {
+    const float2 x = __bfloat1622float2(a);
+    const float2 y = __bfloat1622float2(b);
+    float2 sum;
+    sum.x = x.x + y.x;
+    sum.y = x.y + y.y;
+    return __float22bfloat162_rn(sum);
+}
+
 #undef PIE_BF16_HAS_SM90
 #undef PIE_BF16_HAS_SM80

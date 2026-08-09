@@ -175,12 +175,7 @@ impl BucketKey {
         _fire: model_compiler::trace::FireClass,
         model: u64,
     ) -> Self {
-        Self {
-            requests,
-            tokens,
-            model,
-            lora_shape: 0,
-        }
+        Self { requests, tokens, model, lora_shape: 0 }
     }
 
     /// The same key for a fire that staged adapters.
@@ -365,15 +360,7 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(
-            key,
-            Entry {
-                exec,
-                epoch,
-                digest: 0,
-                nodes: Vec::new(),
-            },
-        );
+        self.execs.insert(key, Entry { exec, epoch, digest: 0, nodes: Vec::new() });
         Ok(())
     }
 
@@ -399,15 +386,7 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(
-            key,
-            Entry {
-                exec,
-                epoch,
-                digest,
-                nodes,
-            },
-        );
+        self.execs.insert(key, Entry { exec, epoch, digest, nodes });
         Ok(())
     }
 
@@ -651,10 +630,7 @@ mod tests {
     fn a_miss_is_not_an_error() {
         let mut c = Recordings::new();
         assert!(c.is_empty());
-        assert!(
-            c.get(BucketKey::new(1, 1, FireClass::Decode, 0), PlanEpoch::at(0))
-                .is_none()
-        );
+        assert!(c.get(BucketKey::new(1, 1, FireClass::Decode, 0), PlanEpoch::at(0)).is_none());
         assert_eq!(c.stats(), (0, 1, 0));
     }
 }
