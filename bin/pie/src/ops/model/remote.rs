@@ -498,7 +498,7 @@ async fn fetch_range(inner: Arc<Inner>, request: RangeRequest) -> Result<RangeRe
         let url = file.signed_url.lock().await.clone();
         let response = inner
             .client
-            .get(url)
+            .get(url.clone())
             .header(
                 RANGE,
                 format!("bytes={}-{}", request.range.start, request.range.end - 1),
@@ -524,7 +524,7 @@ async fn fetch_range(inner: Arc<Inner>, request: RangeRequest) -> Result<RangeRe
                 bail!("{}: signed URL remained {status} after refresh", file.path);
             }
             inner.counters.retries_auth.fetch_add(1, Ordering::Relaxed);
-            refresh_url(&inner, &file).await?;
+            refresh_url(&inner, &file, &url).await?;
             continue;
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -630,8 +630,14 @@ async fn fetch_range(inner: Arc<Inner>, request: RangeRequest) -> Result<RangeRe
     unreachable!("bounded retry loop returns or errors")
 }
 
-async fn refresh_url(inner: &Inner, file: &RemoteFile) -> Result<()> {
+async fn refresh_url(inner: &Inner, file: &RemoteFile, rejected_url: &Url) -> Result<()> {
     let _refresh = file.refresh.lock().await;
+    // Several in-flight ranges can discover the same expired URL together.
+    // The first waiter refreshes it; later waiters reuse that result instead
+    // of serially resolving the same shard once per failed request.
+    if *file.signed_url.lock().await != *rejected_url {
+        return Ok(());
+    }
     let (url, size) = resolve_signed_url(
         &inner.resolver,
         &inner.endpoint,
