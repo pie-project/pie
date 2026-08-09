@@ -181,7 +181,7 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
 mod tests {
     use super::super::{DivClass, Granularity, Lowering, SITE_EXPERT_WEIGHTS};
     use super::*;
-    use model::families::llama_like::forward::facts::{LlamaLikeFacts};
+    use model::shared::llama_like::forward::facts::{LlamaLikeFacts};
 use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts};
     use model_compiler::{StateStore};
 
@@ -212,7 +212,7 @@ use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35Mo
             LlamaLikeFacts::mistral_7b_v03(),
             LlamaLikeFacts::olmo2_1b(),
         ] {
-            let plan = model::families::llama_like::forward::llama_like(&facts);
+            let plan = model::shared::llama_like::forward::llama_like(&facts);
             assert!(
                 derive_sites(&plan).is_empty(),
                 "no model-structural sites in a dense trace ({})",

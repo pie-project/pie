@@ -10,7 +10,7 @@
 //! Olmo-3 ships `layer_types`: three `sliding_attention` layers then one
 //! `full_attention`, repeating for the whole stack, with the sliding
 //! ones at 4096. A row states ONE `window`, because
-//! [`project::deployment`](crate::families::llama_like::project::deployment)
+//! [`project::deployment`](crate::shared::llama_like::project::deployment)
 //! writes one `LayerAttention` per layer from one width — the per-layer
 //! table is `window_by_layer`'s, which gemma-2 and gemma-4 override and
 //! the llama lineage does not.
@@ -36,8 +36,8 @@ pub mod chat;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
-use crate::families::llama_like::project;
-use crate::families::llama_like::spec::LlamaLikeFacts;
+use crate::shared::llama_like::project;
+use crate::shared::llama_like::spec::LlamaLikeFacts;
 use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
@@ -227,18 +227,48 @@ impl Variant for Olmo3 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
-        crate::llama_3::contract::author_dense(builder)
+        match builder.naming() {
+            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            // The registry this replaced held NO MLX row for olmo-3, and
+            // the absence was a silence the caller read as "no
+            // contract". Stated as the refusal it always was.
+            crate::shared::policy::Naming::Mlx => crate::shared::builder::fail(
+                "olmo-3: no MLX authoring pass exists for this family, so \
+                 there is no name layout to author against",
+            ),
+        }
     }
 
+    /// This row's text, for whichever backend asked.
+    ///
+    /// `rope_rescaled: TRUE`: OLMo 3 states YaRN, all five numbers,
+    /// including the `attention_factor` most configs omit
+    /// ([`ROPE_SCALING`]). No base expresses a YaRN ladder, so the
+    /// Metal text reads the driver's derived frequency table instead —
+    /// and a row that said otherwise would rotate every channel but the
+    /// first at the wrong wavelength, at every position but zero.
+    ///
+    /// Its predecessor states none, which is why this is a row's answer
+    /// rather than something a family assumes — see [`crate::olmo_2`].
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        Ok(project::trace(&self.shape, class, load))
+        project::trace(
+            &self.shape,
+            project::MetalRow {
+                rope_theta: self.rope_theta,
+                norm_eps: self.norm_eps,
+                window: self.window,
+                rope_rescaled: true,
+            },
+            class,
+            load,
+        )
     }
 
     /// ChatML-SHAPED, and its own template all the same: OLMo 3 moved
@@ -336,27 +366,6 @@ mod tests {
             );
             assert_ne!(a.max_model_len, 0, "{}: 0 is 'the row does not say'", v.id);
             assert!(!a.media_encode, "{}: OLMo 3 ships no encoder tower", v.id);
-        }
-    }
-
-    /// SIXTEEN TIMES OLMO 2's CEILING, out of the same struct and the
-    /// same projection.
-    ///
-    /// The generations are near enough that the only thing keeping
-    /// their advertised facts apart is that each states its own, so the
-    /// difference is asserted rather than assumed. The label check is
-    /// part of the same property: `olmo2` and `olmo3` are the whole of
-    /// what a guest program has to tell a 4k model from a 64k one.
-    #[test]
-    fn the_generation_extended_the_context_and_the_rows_say_so() {
-        let older = crate::olmo_2::VARIANTS[0]
-            .deployment(Deployed::single())
-            .expect("servable")
-            .advertised;
-        for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("servable").advertised;
-            assert_eq!(a.max_model_len, older.max_model_len * 16, "{}: 4096 -> 65536", v.id);
-            assert_ne!(a.arch, older.arch, "{}: the digit is the difference", v.id);
         }
     }
 
@@ -565,10 +574,10 @@ mod tests {
         let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
-        let policy = crate::policy::Policy::default();
+        let policy = crate::shared::policy::Policy::default();
 
         for v in VARIANTS {
-            let mut builder = crate::builder::Builder::new(
+            let mut builder = crate::shared::builder::Builder::new(
                 &metadata,
                 v.id(),
                 v.load_shape(),

@@ -25,8 +25,8 @@ use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps}
 use driver_cuda::bind::{
     AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, MapResolver, PrefillPlan, run,
 };
-use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
-use model::families::llama_like::forward::llama_like_cuda;
+use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{Arg, Fire, Row, lower};
 use model_compiler::trace::{FireClass, ValueId};
 

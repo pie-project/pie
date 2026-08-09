@@ -12,8 +12,22 @@ using namespace metal;
 
 struct SoftcapParams {
   float cap;  // 30.0
-  uint  n;    // vocab
+  uint  unused;  // was the vocab; see below
 };
+
+// THE GRID IS THE EXTENT, so this bound is gone.
+//
+// This read `if (gid >= p.n) return;` with `p.n` stated as the vocabulary -- ONE
+// ROW -- while `LaunchRule::Elementwise` dispatches `width * rows`. Every row
+// after the first returned immediately and kept whatever the arena held,
+// which is a previous statement's output at that offset and therefore
+// different in fires of different shapes.
+//
+// The same defect `mlp/gated.metal` records at length: a per-row number
+// cannot bound a whole-tensor dispatch, the text cannot state the whole
+// count because `Tokens` is not known until a fire lowers, and the driver
+// already spends the knowledge it does have on the grid. The field stays so
+// the params struct keeps its size and layout.
 
 template <typename T>
 [[kernel]] void logit_softcap(
@@ -21,7 +35,6 @@ template <typename T>
     device T* out               [[buffer(1)]],
     constant SoftcapParams& p   [[buffer(2)]],
     uint gid                    [[thread_position_in_grid]]) {
-  if (gid >= p.n) return;
   const float x = static_cast<float>(logits[gid]);
   out[gid] = static_cast<T>(p.cap * precise::tanh(x / p.cap));
 }

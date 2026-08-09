@@ -1,6 +1,6 @@
 //! Kimi K2's SHAPE: the numbers a checkpoint of this generation has.
 //!
-//! Ungated, for the reason `families/llama_like/spec.rs` states: a
+//! Ungated, for the reason `shared/llama_like/spec.rs` states: a
 //! catalog row is written in these words, and a row must exist under
 //! every aspect — `chat` asks which template speaks for it, `contract`
 //! asks how to author it, `forward` asks what to trace. One struct,

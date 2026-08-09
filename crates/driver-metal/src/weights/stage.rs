@@ -26,11 +26,12 @@
 //! * elastic sizing of KV/scratch (`alloc_zeroed`'s initial-commit
 //!   parameter) — regions allocate at full size for now.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use model_loader::error::Error as LoaderError;
-use model_loader::executor::host::execute_plan_into_arena;
+use model_loader::executor::host::execute_plan_into_backing;
 use model_loader::plan::LoadPlan;
 use model_loader::plan::spans::{Span, publish_spans};
 
@@ -112,7 +113,7 @@ pub fn stage_plan_weights(
     context: &Context,
     plan: &LoadPlan,
     snapshot_dir: &Path,
-) -> Result<(Allocation, HashMap<String, Handle>)> {
+) -> Result<(Vec<Allocation>, HashMap<String, Handle>)> {
     // Where every tensor lands, known from the PLAN before a byte is read --
     // which is what lets the region be allocated first and written into.
     //
@@ -153,43 +154,237 @@ pub fn stage_plan_weights(
         .values()
         .map(|bytes| bytes.div_ceil(256) * 256)
         .sum();
-    let region = Allocation::new(context, (arena_len + outside_budget).max(1), "weights region")?;
+    let total = (arena_len + outside_budget).max(1);
+
+    // CHUNKED at 4 GiB, because a recorded command cannot bind past it.
+    // `setKernelBuffer:offset:atIndex:` truncates its offset to 32 bits on
+    // this hardware (`device_icb.rs` asks the device), so a weight staged
+    // more than 4 GiB into one buffer is bound to the wrong bytes when a
+    // fire is replayed -- every launch succeeds and the logits are NaN.
+    //
+    // One region was the right shape for the reason the header gives: a
+    // residency entry per tensor, and addresses that move. Five regions for
+    // a 17 GB checkpoint keep both properties and cost four more residency
+    // entries.
+    //
+    // Cuts land on tensor boundaries, so no tensor straddles two buffers --
+    // a tensor is bound as one operand and must be wholly inside the buffer
+    // it is bound from. The writes the executor makes may still straddle,
+    // and `Chunked` splits them.
+    let cuts = cut_at_tensor_boundaries(&published, arena_len, total);
+    let mut chunks = Vec::with_capacity(cuts.len());
+    for (i, span) in cuts.windows(2).enumerate() {
+        let _ = i;
+        chunks.push(Allocation::new(context, span[1] - span[0], "weights region")?);
+    }
 
     let mut sink = Outside {
         in_arena: &published.in_arena,
         tensors: Vec::new(),
     };
     {
-        // SAFETY: the region was just allocated and no GPU work references it,
-        // so the executor is the only writer. `arena_len` is the region's own
-        // sizing term, so the slice is inside it.
-        let arena = unsafe {
-            std::slice::from_raw_parts_mut(
-                region.contents().cast::<u8>().as_ptr(),
-                usize::try_from(arena_len).unwrap_or(usize::MAX),
-            )
+                let mut backing = Chunked {
+            chunks: &chunks,
+            cuts: &cuts,
+            len: usize::try_from(arena_len).unwrap_or(usize::MAX),
         };
-        execute_plan_into_arena(plan, snapshot_dir, arena, &mut sink, &mut |_| {}).map_err(
-            |err| Error::Create {
+        execute_plan_into_backing(plan, snapshot_dir, &mut backing, &mut sink, &mut |_| {})
+            .map_err(|err| Error::Create {
                 what: "staged weights",
                 message: err.to_string(),
-            },
-        )?;
+            })?;
     }
 
+    let slice_at = |offset: u64, bytes: u64| -> Result<Handle> {
+        let i = chunk_of(&cuts, offset);
+        chunks[i].slice(offset - cuts[i], bytes)
+    };
     let mut weights = HashMap::new();
     for (name, span) in &published.in_arena {
-        weights.insert(name.clone(), region.slice(span.offset, span.bytes)?);
+        weights.insert(name.clone(), slice_at(span.offset, span.bytes)?);
     }
     sink.tensors.sort_by(|a, b| a.0.cmp(&b.0));
     let mut at = arena_len;
     for (name, bytes) in &sink.tensors {
-        // SAFETY: as above; `outside_budget` reserved this span.
-        unsafe { region.write(at, bytes)? };
-        weights.insert(name.clone(), region.slice(at, bytes.len() as u64)?);
+        let i = chunk_of(&cuts, at);
+        // SAFETY: no GPU work references the chunks yet, and `outside_budget`
+        // reserved this span -- which `cut_at_tensor_boundaries` kept whole.
+        unsafe { chunks[i].write(at - cuts[i], bytes)? };
+        weights.insert(name.clone(), slice_at(at, bytes.len() as u64)?);
         at += (bytes.len() as u64).div_ceil(256) * 256;
     }
-    Ok((region, weights))
+    Ok((chunks, weights))
+}
+
+/// The most a recorded command can carry as a buffer offset, plus one.
+///
+/// `device/recording.rs` refuses a bind past this and says why; staging in
+/// chunks no larger than it is how a checkpoint stays recordable.
+const FOUR_GIB: u64 = 1 << 32;
+
+/// Where to cut `total` bytes into chunks of at most [`FOUR_GIB`], such that
+/// no tensor crosses a cut.
+///
+/// Returns the boundaries, `[0, .., total]`, so chunk `i` is
+/// `cuts[i]..cuts[i + 1]` and holds every tensor starting in that range.
+///
+/// A tensor larger than [`FOUR_GIB`] would force a cut inside itself, and
+/// none exists: the largest in any checkpoint here is a 262 144 x 5 376
+/// 4-bit embedding table, 0.7 GB. If one ever does, its chunk is simply
+/// larger than the ceiling and `record` refuses that fire — which is the
+/// same correct-and-slower answer as before, for one model instead of all.
+fn cut_at_tensor_boundaries(
+    published: &model_loader::plan::spans::Published,
+    arena_len: u64,
+    total: u64,
+) -> Vec<u64> {
+    // Every tensor as (start, end), in address order. The arena's spans come
+    // out of a `BTreeMap` keyed by name, so they are sorted by name and have
+    // to be re-sorted; the stragglers are appended in the order the writer
+    // above lays them down.
+    let mut spans: Vec<(u64, u64)> = published
+        .in_arena
+        .values()
+        .map(|s| (s.offset, s.offset + s.bytes))
+        .collect();
+    let mut at = arena_len;
+    let mut outside: Vec<(&String, &u64)> = published.outside.iter().collect();
+    outside.sort_by(|a, b| a.0.cmp(b.0));
+    for (_, bytes) in outside {
+        spans.push((at, at + bytes));
+        at += bytes.div_ceil(256) * 256;
+    }
+    spans.sort_unstable();
+
+    let mut cuts = vec![0u64];
+    for &(start, end) in &spans {
+        let open = *cuts.last().unwrap_or(&0);
+        // Cut BEFORE this tensor, not after the last one: a gap between two
+        // tensors belongs to whichever side keeps the chunk under the
+        // ceiling, and putting it in front of the tensor that would overflow
+        // is what keeps the cut on a boundary.
+        if end > open + FOUR_GIB && start > open {
+            cuts.push(start);
+        }
+    }
+    cuts.push(total);
+    cuts.dedup();
+    cuts
+}
+
+/// Which chunk holds `offset`.
+fn chunk_of(cuts: &[u64], offset: u64) -> usize {
+    cuts.partition_point(|&c| c <= offset).saturating_sub(1)
+}
+
+/// The staged weights as one address space, over the chunks they live in.
+///
+/// The executor writes by arena offset and knows nothing about buffers; this
+/// turns each offset into a chunk and an offset inside it, splitting any
+/// access that crosses a cut. Reads that stay inside one chunk are lent, not
+/// copied — the trait's `Cow` is for exactly this.
+struct Chunked<'a> {
+    chunks: &'a [Allocation],
+    cuts: &'a [u64],
+    len: usize,
+}
+
+impl Chunked<'_> {
+    /// Call `f(chunk, offset_in_chunk, len)` for each piece of `offset..offset + len`.
+    fn pieces(&self, offset: u64, len: u64, mut f: impl FnMut(usize, u64, u64)) {
+        let (mut at, end) = (offset, offset + len);
+        while at < end {
+            let i = chunk_of(self.cuts, at);
+            let stop = end.min(self.cuts[i + 1]);
+            f(i, at - self.cuts[i], stop - at);
+            at = stop;
+        }
+    }
+}
+
+impl model_loader::executor::arena::ArenaBacking for Chunked<'_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn read(&self, offset: usize, len: usize) -> std::result::Result<Cow<'_, [u8]>, LoaderError> {
+        let (offset, len) = (offset as u64, len as u64);
+        self.bounds(offset, len)?;
+        let i = chunk_of(self.cuts, offset);
+        if offset + len <= self.cuts[i + 1] {
+            // SAFETY: inside the chunk, and the executor is the only writer.
+            return Ok(Cow::Borrowed(unsafe {
+                std::slice::from_raw_parts(
+                    self.chunks[i]
+                        .contents()
+                        .cast::<u8>()
+                        .as_ptr()
+                        .add((offset - self.cuts[i]) as usize),
+                    len as usize,
+                )
+            }));
+        }
+        let mut out = Vec::with_capacity(len as usize);
+        self.pieces(offset, len, |i, at, n| {
+            // SAFETY: as above.
+            out.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(
+                    self.chunks[i].contents().cast::<u8>().as_ptr().add(at as usize),
+                    n as usize,
+                )
+            });
+        });
+        Ok(Cow::Owned(out))
+    }
+
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> std::result::Result<(), LoaderError> {
+        let offset = offset as u64;
+        self.bounds(offset, bytes.len() as u64)?;
+        let mut taken = 0usize;
+        let mut failed = None;
+        self.pieces(offset, bytes.len() as u64, |i, at, n| {
+            let n = n as usize;
+            // SAFETY: `pieces` keeps every span inside its chunk, and no GPU
+            // work references these buffers until staging returns.
+            if let Err(err) = unsafe { self.chunks[i].write(at, &bytes[taken..taken + n]) } {
+                failed = Some(err);
+            }
+            taken += n;
+        });
+        match failed {
+            None => Ok(()),
+            Some(err) => Err(LoaderError::Internal(err.to_string())),
+        }
+    }
+
+    fn fill(&mut self, offset: usize, len: usize, byte: u8) -> std::result::Result<(), LoaderError> {
+        let (offset, len) = (offset as u64, len as u64);
+        self.bounds(offset, len)?;
+        self.pieces(offset, len, |i, at, n| {
+            // SAFETY: as `write`.
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.chunks[i].contents().cast::<u8>().as_ptr().add(at as usize),
+                    n as usize,
+                )
+            };
+            dst.fill(byte);
+        });
+        Ok(())
+    }
+}
+
+impl Chunked<'_> {
+    /// The range is inside the arena.
+    fn bounds(&self, offset: u64, len: u64) -> std::result::Result<(), LoaderError> {
+        if offset + len > *self.cuts.last().unwrap_or(&0) {
+            return Err(LoaderError::Overflow(format!(
+                "{len} bytes at {offset} leaves a {}-byte arena",
+                self.len
+            )));
+        }
+        Ok(())
+    }
 }
 
 
@@ -197,7 +392,7 @@ pub fn stage_plan_weights(
 
 #[cfg(test)]
 mod tests {
-    use super::fits_on_this_gpu;
+    use super::{FOUR_GIB, chunk_of, cut_at_tensor_boundaries, fits_on_this_gpu};
     use crate::device::memory::Memory;
 
     /// The guard the port dropped, restored and held to a number.
@@ -229,5 +424,60 @@ mod tests {
         // A machine that will not answer is not a machine with no memory.
         fits_on_this_gpu(&Memory::default(), u64::MAX)
             .expect("an unreadable ceiling must not refuse a load");
+    }
+
+    /// A tensor is bound as ONE operand, so it must be wholly inside the
+    /// buffer it is bound from.
+    ///
+    /// This is the property the 4 GiB cut exists to keep, and it is the one
+    /// that a size-based cut would break: chopping every 4 GiB lands inside
+    /// whichever tensor spans the boundary, and that tensor is then bound
+    /// from a buffer that holds half of it. Nothing would report it — the
+    /// launch succeeds and reads the pages after the buffer.
+    #[test]
+    fn a_cut_never_lands_inside_a_tensor() {
+        // Six 0.7 GB tensors and one 3 GB straggler, which is where a naive
+        // cut at exactly 4 GiB would fall.
+        let big = 700 * (1 << 20);
+        let mut spans = std::collections::BTreeMap::new();
+        let mut at = 0u64;
+        for i in 0..6 {
+            spans.insert(format!("t{i}"), model_loader::plan::spans::Span {
+                offset: at,
+                bytes: big,
+            });
+            at += big;
+        }
+        let huge = 3 * (1u64 << 30);
+        spans.insert("straddler".to_string(), model_loader::plan::spans::Span {
+            offset: at,
+            bytes: huge,
+        });
+        at += huge;
+
+        let published = model_loader::plan::spans::Published {
+            in_arena: spans.clone(),
+            outside: std::collections::BTreeMap::new(),
+        };
+        let cuts = cut_at_tensor_boundaries(&published, at, at);
+
+        assert!(cuts.len() > 2, "7.1 GiB of weights does not fit one chunk: {cuts:?}");
+        for span in spans.values() {
+            let start = chunk_of(&cuts, span.offset);
+            let last = chunk_of(&cuts, span.offset + span.bytes - 1);
+            assert_eq!(
+                start, last,
+                "a tensor at {} for {} bytes crosses a cut in {cuts:?}",
+                span.offset, span.bytes
+            );
+        }
+        for pair in cuts.windows(2) {
+            assert!(
+                pair[1] - pair[0] <= FOUR_GIB,
+                "chunk {}..{} is past what a recorded command can bind",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

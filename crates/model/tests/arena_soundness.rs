@@ -164,9 +164,9 @@ fn families() -> Vec<(&'static str, FireClass, ForwardPlan)> {
         out.push((
             "llama_like",
             f,
-            families::llama_like::forward::llama_like_cuda(
-                &families::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b(),
-                &families::llama_like::forward::facts::LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            shared::llama_like::forward::llama_like_cuda(
+                &shared::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b(),
+                &shared::llama_like::forward::facts::LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
                 f,
             ),
         ));

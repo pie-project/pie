@@ -39,7 +39,7 @@ pub(crate) fn create_impl(
         return std::ptr::null_mut();
     }
     // The boot TOML rides in `config_bytes`. Three keys are read today:
-    // `[model] id`, `[model] descriptor` and `[driver] runahead`.
+    // `[model] id`, `[model] config` and `[driver] runahead`.
     let boot = (!desc.config_bytes.ptr.is_null())
         .then(|| unsafe {
             std::slice::from_raw_parts(desc.config_bytes.ptr, desc.config_bytes.len)
@@ -47,9 +47,9 @@ pub(crate) fn create_impl(
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .and_then(|text| text.parse::<toml::Table>().ok())
         .unwrap_or_default();
-    let boot_descriptor = boot
+    let boot_config = boot
         .get("model")
-        .and_then(|m| m.get("descriptor")?.as_str())
+        .and_then(|m| m.get("config")?.as_str())
         .map(std::path::PathBuf::from);
     // WHAT THE PROCESS BOUNDARY CARRIES.
     //
@@ -168,7 +168,7 @@ pub(crate) fn create_impl(
     }
     let boxed = Box::new(Shell {
         caps: CAPS_JSON.as_bytes().to_vec(),
-        boot_descriptor,
+        boot_config,
         boot_model_id,
         runahead,
         boot: cfg.clone(),
@@ -284,11 +284,11 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     let config_json = match read_meta(&meta, model::encoding::CONFIG_OBJECT) {
         Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| i32::from(crate::Error::from(e)))?,
         Ok(None) => {
-            let Some(path) = &state.boot_descriptor else {
+            let Some(path) = &state.boot_config else {
                 return Err(crate::Error::unsupported(
                     "load_model",
-                    "no embedded model/config and no [model] descriptor in \
-                     the boot config",
+                    "no embedded model/config and no [model] config in \
+                     the boot TOML",
                 )
                 .into());
             };
@@ -375,6 +375,10 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     // table keyed differently.
     model.deployment = row
         .deployment(model::catalog::Deployed {
+            // This driver, named. See the note at the trace call in
+            // `fire/launch.rs`: the row serves both backends, so which
+            // one is asking is the caller's to state.
+            backend: model::catalog::Backend::Cuda,
             tp_size: state.tp_size,
             layer_scalars: &model.gemma_layer_scalars,
         })
@@ -416,6 +420,40 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     } {
         return Err(crate::error::Error::Unsupported { what: what.to_string() }.into());
     }
+
+    // THE GQA RATIO, refused at LOAD rather than discovered at launch.
+    //
+    // The same argument as the `KvStyle` match above, for the same
+    // reason, at the same door: FlashInfer's decode instantiates a fixed
+    // set of group sizes and reports anything else by THROWING, and a
+    // throw crossing the C ABI is undefined behaviour. The shim prints
+    // and dies, because a launcher signature has nowhere to put a
+    // failure. This return does.
+    //
+    // It is asked HERE rather than in `model` because it is not a fact
+    // about the checkpoint — it is a fact about what this build
+    // instantiated. `model` states the shape and names the set
+    // (`DECODE_GQA_GROUPS`); the driver is what decides that the set
+    // applies to it.
+    model
+        .deployment
+        .servable_by(model::shared::llama_like::project::DECODE_GQA_GROUPS)
+        .map_err(|why| -> i32 {
+            // The refusal's OWN sentence, plus the numbers. `servable_by`
+            // distinguishes a fractional ratio from an uninstantiated
+            // one, and collapsing them here would report a malformed
+            // shape as a missing kernel.
+            crate::error::Error::Unsupported {
+                what: format!(
+                    "{why}: {} q heads over {} kv heads; this build \
+                     instantiates {:?}",
+                    model.deployment.shape.q_heads,
+                    model.deployment.shape.kv_heads,
+                    model::shared::llama_like::project::DECODE_GQA_GROUPS,
+                ),
+            }
+            .into()
+        })?;
 
     // A NEW RESIDENCY, so every cache keyed on the old one is dropped.
     //
@@ -708,7 +746,7 @@ fn synthetic_fire(
 ///
 /// The driver's whole part in naming, and it is deliberately small: which
 /// trace name means which published tensor is FAMILY knowledge and lives in
-/// `model::weight_names`, beside the DSL that invents the trace names and the
+/// `model::shared::weight_names`, beside the DSL that invents the trace names and the
 /// contract author that invents the published ones. What is left here is the
 /// two things only a driver can answer.
 ///
@@ -731,7 +769,7 @@ fn wire_trace_names(model: &mut LoadedModel) {
     let set: std::collections::BTreeSet<&str> =
         published.iter().map(String::as_str).collect();
     let has = |n: &str| set.contains(n);
-    let wiring = model::weight_names::wire(row.load_shape(), &has);
+    let wiring = model::shared::weight_names::wire(row.load_shape(), &has);
 
     for (trace, name) in wiring.aliases {
         model.aliases.insert(trace, name);

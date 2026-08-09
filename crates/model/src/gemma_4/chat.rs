@@ -8,7 +8,7 @@
 //!
 //!   <bos><|turn>system\n{system}<turn|>\n<|turn>user\n{user}<turn|>\n<|turn>model\n
 
-use crate::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use tokenizer::Tokenizer;
 use std::sync::Arc;

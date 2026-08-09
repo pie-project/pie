@@ -241,8 +241,8 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
     use driver_cuda::bind::{
         DispatchCtx, DispatchPlan, DispatchRefusal, Frame, Resolver, bind, dispatch,
     };
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
-    use model::families::llama_like::forward::llama_like_cuda;
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+    use model::shared::llama_like::forward::llama_like_cuda;
     use model_compiler::lower::{Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 
@@ -691,8 +691,8 @@ fn zero_weight_decode(leg: Leg) {
     use driver_cuda::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run, run_captured,
     };
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
-    use model::families::llama_like::forward::llama_like_cuda;
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+    use model::shared::llama_like::forward::llama_like_cuda;
     use model_compiler::lower::{Arg, Fire, GuardMode, Row, lower_with};
     use model_compiler::trace::{FireClass, ValueId};
 
@@ -1384,8 +1384,8 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
     use driver_cuda::bind::{
         AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run,
     };
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
-    use model::families::llama_like::forward::llama_like_cuda;
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+    use model::shared::llama_like::forward::llama_like_cuda;
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 

@@ -28,6 +28,22 @@
 //! has no forward text for its architecture or no kernel for the shape it
 //! projects. That is a real gap and it deserves a gate.
 //!
+//! # The first half of that gap is a row's answer now
+//!
+//! "No forward text for its architecture" used to be a fact about
+//! `driver-metal`: `model/text.rs` held eleven architecture STRINGS and a
+//! `serves()` that tested membership. It is a fact about the ROW now —
+//! `catalog::Variant::trace` takes a `Deployed` whose `backend` says which
+//! driver is asking, and a row with no Metal text refuses there. So the three
+//! text gates below ask the catalog rather than a list, which is why none of
+//! them names a model except the two the device gates open.
+//!
+//! The old list's own defect is the argument for the change and it is worth
+//! keeping: `LLAMA_LIKE` named `gemma4`, so `serve/load.rs` claimed every
+//! gemma-4 at its pre-staging gate and a second refusal ninety lines later
+//! rejected it on the sandwich norm — after the 17 GB the first gate exists
+//! to avoid. It also omitted `gemma3`, which the same text models.
+//!
 //! # Why this one derives its answer instead of listing it
 //!
 //! `driver-cuda`'s equivalent keeps a `NOT_YET_SERVABLE` const and reconciles
@@ -48,8 +64,10 @@
 use std::collections::BTreeSet;
 
 use driver_metal::batch::{AffineFormat, geometry_from_deployment};
-use model::catalog::{self, Deployed};
+use model::catalog::{self, Deployed, MetalBinding};
 use model::deployment::{Deployment, KvStyle, RopeScaling};
+use model_compiler::kernels::Backend;
+use model_compiler::trace::FireClass;
 
 /// The affine point every row is measured at.
 ///
@@ -60,6 +78,14 @@ use model::deployment::{Deployment, KvStyle, RopeScaling};
 /// "can this build launch that shape" is the question an operator is actually
 /// asking.
 const AT: AffineFormat = AffineFormat::G64_B4;
+
+/// The same point, as the binding a row is asked for a text with.
+///
+/// Deliberately `model::binding::ANY_ENCODING` rather than a second literal:
+/// the driver's pre-staging refusal is answered with that value, and a test
+/// that measured coverage at a DIFFERENT binding would be measuring a
+/// question the driver never asks. The tests below that vary it say so.
+const AT_METAL: MetalBinding = driver_metal::model::binding::ANY_ENCODING;
 
 /// Every catalog row, projected once, keeping the ones that deploy.
 ///
@@ -251,19 +277,41 @@ fn extraordinary(d: &Deployment) -> Option<String> {
 /// reads, and the coverage they represent evaporates without a red build.
 /// This is the assertion that turns that into a failure, and it is the same
 /// argument `driver-cuda`'s `the_three_live_families_are_servable` makes.
+///
+/// The text assertion is new and it is the sharper half. `serves` used to be
+/// a membership test against `model/text.rs`'s eleven architecture strings,
+/// so it could only say that a NAME was listed; it is the row's own answer
+/// now, and `Backend::of_family` reads which backend that answer was written
+/// for. A row that answered a Metal load with `llama_like.cuda.decode` would
+/// pass every gate in this driver and fault at its first dispatch, on a
+/// symbol no Metal shader exports.
 #[test]
 fn the_two_checkpoints_the_device_gates_open_still_project_a_geometry() {
     for want in ["llama-3.2-1b", "qwen3-0.6b"] {
-        let row = catalog::find(want)
-            .unwrap_or_else(|| panic!("`{want}` must stay in the catalog: the device gates open it"));
+        let row = catalog::find(want).unwrap_or_else(|| {
+            panic!("`{want}` must stay in the catalog: the device gates open it")
+        });
         let d = row
             .deployment(Deployed::single())
             .unwrap_or_else(|e| panic!("`{want}` must stay deployable: {e}"));
-        assert!(
-            driver_metal::model::text::serves(d.advertised.arch),
-            "`{want}` advertises `{}`, which no Metal text serves — the \
-             device gates would skip it",
-            d.advertised.arch
+        driver_metal::model::binding::serves(row).unwrap_or_else(|e| {
+            panic!(
+                "`{want}` advertises `{}` and this build has no Metal text for \
+                 it ({e}) — `load_model` would refuse it before staging and \
+                 the device gates would skip it",
+                d.advertised.arch
+            )
+        });
+        let plan = driver_metal::model::binding::text(row, FireClass::Decode, &AT_METAL)
+            .unwrap_or_else(|e| panic!("`{want}` refused a decode text: {e}"));
+        assert_eq!(
+            Backend::of_family(&plan.family),
+            Some(Backend::Metal),
+            "`{want}` answered a METAL load with `{}`. Every symbol in it \
+             would be looked up in the Metal table at fire time, and the \
+             lookup is the only thing standing between a CUDA text and a \
+             dispatch",
+            plan.family
         );
         let g = geometry_from_deployment(&d, row.load_shape(), AT)
             .unwrap_or_else(|e| panic!("`{want}` must stay launchable: {}", e.0));
@@ -274,75 +322,111 @@ fn the_two_checkpoints_the_device_gates_open_still_project_a_geometry() {
     }
 }
 
-/// The text's allow-list names architectures, and three of them are dead.
+/// The pre-staging question is the same question at every fire class.
 ///
-/// # This is a finding, pinned so it stays one
+/// `serve/load.rs` asks the row ONCE, before it stages, and it asks at
+/// `FireClass::Decode` — but what it is really asking is whether the
+/// checkpoint can be served at all, and a served checkpoint prefills before
+/// it decodes. A row with a decode text and no prefill text would pass that
+/// gate, stage its weights, admit its first request and refuse the fire.
 ///
-/// `model/text.rs`'s `LLAMA_LIKE` is a hand-typed list of architecture
-/// strings. Three entries — `llama3`, `llama4` and `qwen3_moe` — are names NO
-/// catalog row advertises, and they are dead in a specific and instructive
-/// way: the llama generation advertises `llama` for all five of its rows, and
-/// the Qwen-3 mixtures advertise `qwen3` exactly like its dense rows, because
-/// a MIXTURE IS A FACT OF THE ROW AND NOT A SEPARATE ARCHITECTURE. Those
-/// entries are the fossil of a table that keyed on `config.json`'s
-/// `model_type`, where `qwen3_moe` and `qwen3` genuinely were two keys.
-///
-/// They are listed rather than deleted because deleting them is a behaviour
-/// change to `serves()` for an operator who spelled one in a boot file, and
-/// that is a separate commit from this one. What this test buys is that the
-/// list cannot GROW a fourth by accident, and that if one of the three starts
-/// being advertised the line comes out.
+/// That is not a hypothetical shape of bug: `Variant::trace`'s own doc
+/// records `unbuilt_kv_store()` existing because "a family could hold a facts
+/// row, load happily and die at its first fire", and the whole point of
+/// moving the refusal to the row was to make the door the place that answers.
+/// A door that answers for one class only is half a door.
 #[test]
-fn the_texts_allow_list_is_advertised_by_the_catalog_or_stated_dead() {
-    /// Entries of `LLAMA_LIKE` that no catalog row advertises, and why.
-    const NO_ROW_ADVERTISES: &[&str] = &[
-        // The llama generation advertises `llama` for 3.1, 3.2 and 3.3
-        // alike; a point release is not an architecture.
-        "llama3",
-        "llama4",
-        // A mixture is a fact of the row — `moe_intermediate` and
-        // `n_experts` — not a second architecture beside the dense one.
-        "qwen3_moe",
-    ];
-
-    let advertised: BTreeSet<String> =
-        deployable().iter().map(|(_, d)| canonical(d.advertised.arch)).collect();
-    let dead: BTreeSet<String> = NO_ROW_ADVERTISES.iter().map(|a| canonical(a)).collect();
-
-    let mut orphans = Vec::new();
-    let mut revived = Vec::new();
-    for entry in driver_metal::model::text::known() {
-        let c = canonical(entry);
-        match (advertised.contains(&c), dead.contains(&c)) {
-            (true, true) => revived.push(entry),
-            (false, false) => orphans.push(entry),
-            _ => {}
+fn the_pre_staging_question_is_answered_the_same_at_every_fire_class() {
+    let mut disagree = Vec::new();
+    for (row, _) in deployable() {
+        let door = driver_metal::model::binding::serves(row).is_ok();
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            let here = driver_metal::model::binding::text(row, class, &AT_METAL).is_ok();
+            if here != door {
+                disagree.push(format!("{}: {class:?} says {here}, the door says {door}", row.id()));
+            }
         }
     }
-
     assert!(
-        orphans.is_empty(),
-        "`model/text.rs`'s LLAMA_LIKE names {orphans:?}, which no catalog row \
-         advertises. An entry no row can reach is a name that only ever \
-         matches an operator's typo — and it reads as coverage. Either a row \
-         should advertise it, or it belongs in NO_ROW_ADVERTISES here with \
-         the argument for why."
-    );
-    assert!(
-        revived.is_empty(),
-        "{revived:?} are stated dead here and ARE advertised by a row now; \
-         delete their lines from NO_ROW_ADVERTISES"
+        disagree.is_empty(),
+        "these rows answer the Metal question differently at different fire \
+         classes. `serve/load.rs` asks once, before it stages 17 GB, and a \
+         row that agrees at the door and refuses at the fire has spent all of \
+         it to say so:\n  {}",
+        disagree.join("\n  ")
     );
 }
 
-/// The same reduction `model/text.rs` applies, restated for the test.
+/// The text this driver runs is the text the ROW states — every row.
 ///
-/// Deliberately a COPY and not a call: `canonical` is private to `text.rs`
-/// and making it public so a test can borrow it would put a spelling rule on
-/// the crate's API surface, which `layering.rs` is the gate against. Six
-/// lines duplicated is cheaper than a public function nobody outside a test
-/// calls — and if the two ever disagree, the `orphans` assertion above fires,
-/// which is the copy checking itself.
-fn canonical(arch: &str) -> String {
-    arch.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect()
+/// `model::binding::text` is four lines and this test is why it may not grow
+/// a fifth. What it replaced was `text::plan_for(arch, class, &facts,
+/// &metal)`: a match on an architecture STRING, over facts the driver had
+/// rebuilt from nine tensor probes, which is two opportunities per fire to
+/// describe a different model than the one that was identified. The claim now
+/// is that the driver contributes NOTHING to the text but the binding — no
+/// fallback, no adjustment, no second answer for a row it thinks it knows
+/// better.
+///
+/// The one thing it does contribute is a refusal, and this pins its shape:
+/// when the row's answer is a Metal text the driver hands that value back
+/// UNCHANGED, and when it is not the driver refuses rather than editing it.
+/// Those are the only two outcomes. A driver that could rewrite a text would
+/// be back to describing models.
+///
+/// Asked of every deployable row rather than of a fixture, because the defect
+/// this replaces was never in the common case. `LLAMA_LIKE` served `llama`
+/// correctly for a year; what it got wrong was `gemma4`, which it listed and
+/// the load path refused, and `gemma3`, which it omitted and the same text
+/// models.
+#[test]
+fn the_text_this_driver_runs_is_the_text_the_row_states() {
+    let bindings = [AT_METAL, MetalBinding { quant_group: 128, quant_bits: 8, ..AT_METAL }];
+    let mut rows = 0usize;
+    let mut passed_through = 0usize;
+    for (row, _) in deployable() {
+        rows += 1;
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            for b in &bindings {
+                let theirs = row.trace(class, Deployed::metal(b));
+                match driver_metal::model::binding::text(row, class, b) {
+                    Ok(mine) => {
+                        assert_eq!(
+                            Ok(&mine),
+                            theirs.as_ref(),
+                            "`{}` gets a different {class:?} text through this \
+                             driver than it states for itself at g{}/b{}",
+                            row.id(),
+                            b.quant_group,
+                            b.quant_bits
+                        );
+                        assert_eq!(
+                            Backend::of_family(&mine.family),
+                            Some(Backend::Metal),
+                            "`{}` was served `{}`, which is not a Metal text",
+                            row.id(),
+                            mine.family
+                        );
+                        passed_through += 1;
+                    }
+                    // The two refusable shapes, and no third: the row said no,
+                    // or the row answered for another backend. Anything else
+                    // would be this driver having an opinion about a model.
+                    Err(_) => {
+                        let stated_metal = theirs
+                            .as_ref()
+                            .is_ok_and(|p| Backend::of_family(&p.family) == Some(Backend::Metal));
+                        assert!(
+                            !stated_metal,
+                            "`{}` states a Metal {class:?} text and this driver \
+                             refused it anyway",
+                            row.id()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(rows > 10, "only {rows} rows deployed; this gate is not reading the catalog");
+    assert!(passed_through > 0, "no row's text reached a fire; the door is shut for everything");
 }

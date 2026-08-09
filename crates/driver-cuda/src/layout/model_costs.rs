@@ -289,6 +289,9 @@ mod tests {
         d.attention = (0..28)
             .map(|l| LayerAttention {
                 head_dim: 128,
+                // The stack-wide count, repeated: this row's layers agree,
+                // which is what having no per-layer count used to say.
+                kv_heads: 8,
                 window: -1,
                 kv_source: l,
                 sm_scale: 1.0 / (128.0_f32).sqrt(),

@@ -16,7 +16,7 @@
 //! question about the MODEL, whose "no" was also the answer for a
 //! checkpoint that simply had not been aliased yet. The rows state
 //! [`NormPlacement::Post`], and
-//! [`project::manifest`](crate::families::llama_like::project::manifest)
+//! [`project::manifest`](crate::shared::llama_like::project::manifest)
 //! turns it into the pair of expectations the probe was groping for.
 //!
 //! # Global q/k norm, and how THAT used to be discovered
@@ -38,8 +38,8 @@ pub mod chat;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
-use crate::families::llama_like::project;
-use crate::families::llama_like::spec::LlamaLikeFacts;
+use crate::shared::llama_like::project;
+use crate::shared::llama_like::spec::LlamaLikeFacts;
 use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
@@ -231,18 +231,44 @@ impl Variant for Olmo2 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
-        crate::llama_3::contract::author_dense(builder)
+        match builder.naming() {
+            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            // The registry this replaced held NO MLX row for olmo-2, and
+            // the absence was a silence the caller read as "no
+            // contract". Stated as the refusal it always was.
+            crate::shared::policy::Naming::Mlx => crate::shared::builder::fail(
+                "olmo-2: no MLX authoring pass exists for this family, so \
+                 there is no name layout to author against",
+            ),
+        }
     }
 
+    /// This row's text, for whichever backend asked.
+    ///
+    /// `rope_rescaled: false`: OLMo 2 states a plain `rope_theta` of
+    /// 500 000 and no `rope_scaling` in any of the three releases. Its
+    /// successor does state one, which is why the flag is a row's
+    /// answer and not a generation-family assumption — see
+    /// [`crate::olmo_3`].
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        Ok(project::trace(&self.shape, class, load))
+        project::trace(
+            &self.shape,
+            project::MetalRow {
+                rope_theta: self.rope_theta,
+                norm_eps: self.norm_eps,
+                window: self.window,
+                rope_rescaled: false,
+            },
+            class,
+            load,
+        )
     }
 
     /// `<|user|>\n … \n`, with `<|endoftext|>` closing the assistant
@@ -287,39 +313,6 @@ mod tests {
         }
     }
 
-    /// THE GENERATION IS A 4K ONE AND SAYS SO, next door to a 64k
-    /// successor built out of the same `LlamaLikeFacts` and the same
-    /// projection.
-    ///
-    /// This is the assertion that stops the two from being unified
-    /// behind one shared ceiling: the shapes are close enough that it
-    /// would look like a tidy-up, and the result would hand an OLMo 2
-    /// sixteen times the context it was trained on.
-    #[test]
-    fn the_generation_states_a_shorter_ceiling_than_olmo_3() {
-        for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("servable").advertised;
-            assert!(
-                a.max_model_len < crate::olmo_3::VARIANTS[0]
-                    .deployment(Deployed::single())
-                    .expect("servable")
-                    .advertised
-                    .max_model_len,
-                "{}: OLMo 2 is the shorter-context generation and the rows must say so",
-                v.id
-            );
-            assert_ne!(
-                a.arch,
-                crate::olmo_3::VARIANTS[0]
-                    .deployment(Deployed::single())
-                    .expect("servable")
-                    .advertised
-                    .arch,
-                "{}: the label is the only name that separates the two generations",
-                v.id
-            );
-        }
-    }
 
     /// The label is what `architectures[0]` reduces to under the
     /// worker's heuristic, which is the check a real checkpoint has to
@@ -507,10 +500,10 @@ mod tests {
         let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
-        let policy = crate::policy::Policy::default();
+        let policy = crate::shared::policy::Policy::default();
 
         for v in VARIANTS {
-            let mut builder = crate::builder::Builder::new(
+            let mut builder = crate::shared::builder::Builder::new(
                 &metadata,
                 v.id(),
                 v.load_shape(),

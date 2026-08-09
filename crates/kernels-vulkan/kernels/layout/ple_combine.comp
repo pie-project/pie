@@ -1,0 +1,24 @@
+// Gemma PLE combine: `(proj + token) * inv_sqrt2`.
+//
+// The count field remains in `PleCombineParams` for ABI parity with Metal, but
+// it is not a bounds check: the driver already expressed the true extent in the
+// grid, including multi-row prefill tensors.
+
+#version 450
+
+#include "common/bf16.glsl"
+#include "norm/rms_params.glsl"
+
+layout(local_size_x = 256) in;
+
+PIE_BUFFER_RO(0, Proj, proj);
+PIE_BUFFER_RO(1, Token, token);
+PIE_BUFFER_RW(2, Out, out_);
+layout(std430, binding = 3) readonly buffer Params { PleCombineParams p; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    out_[gid] = PIE_STORE((PIE_LOAD(proj[gid]) + PIE_LOAD(token[gid])) * p.inv_sqrt2);
+}
+
+// pie:instantiate ple_combine_bfloat16

@@ -11,8 +11,8 @@ use model_loader::contract::{Expr, TensorType};
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding, QuantScheme, QuantSpec};
 
-use crate::builder::{Builder, is_raw};
-use crate::moe::hf_moe_expert_stacks;
+use crate::shared::builder::{Builder, is_raw};
+use crate::shared::moe::hf_moe_expert_stacks;
 
 /// glm_moe_dsa. `embed_tokens` is sharded on axis 0 under TP to save
 /// per-rank memory; the FP4 path touches routed and shared experts only,

@@ -21,8 +21,8 @@
 
 use std::path::PathBuf;
 
-use model::families::llama_like::forward::llama_like;
-use model::families::llama_like::forward::llama_like_cuda;
+use model::shared::llama_like::forward::llama_like;
+use model::shared::llama_like::forward::llama_like_cuda;
 use model::qwen_3_5::forward::qwen3_5_full_attn_block;
 use model::qwen_3_5::forward::qwen3_5_gdn_block;
 use model::qwen_3_5::forward::qwen3_5_hybrid;
@@ -31,7 +31,7 @@ use model::gpt_oss::forward::gpt_oss_cuda;
 use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
 use model::qwen_3_5::forward::qwen3_5_moe_mlp_block;
 use model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda;
-use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
 use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts};

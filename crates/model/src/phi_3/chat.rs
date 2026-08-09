@@ -10,7 +10,7 @@
 //! Each role marker and `<|end|>` are single special tokens
 //! (e.g. id 32010 / 32007 on Phi-3-mini-4k-instruct).
 
-use crate::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use tokenizer::Tokenizer;
 use std::sync::Arc;

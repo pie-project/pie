@@ -564,10 +564,21 @@ mod tests {
     #[test]
     fn the_offsets_array_holds_one_more_entry_than_there_are_tokens() {
         let vocab: Vec<String> = ["a", "bb", "ccc"].iter().map(|s| s.to_string()).collect();
-        let canonical = Tokenizer::from_vocab(&vocab).to_canonical().unwrap();
+        let tokenizer = Tokenizer::from_vocab(&vocab);
+        let tokens = tokenizer.vocab_size() as usize;
+        let canonical = tokenizer.to_canonical().unwrap();
         let offsets = read_u32s(&canonical.vocab_offsets, "offsets").unwrap();
-        assert_eq!(offsets, [0, 1, 3, 6]);
-        assert_eq!(canonical.vocab_bytes, b"abbccc");
+        assert_eq!(offsets.len(), tokens + 1, "one more entry than there are tokens");
+        // The stated vocabulary keeps the ids it stated; `from_vocab`
+        // appends its byte tail after them, so the first four offsets and
+        // the first six bytes are still exactly these.
+        assert_eq!(&offsets[..4], &[0, 1, 3, 6]);
+        assert_eq!(&canonical.vocab_bytes[..6], b"abbccc");
+        assert_eq!(
+            usize::try_from(*offsets.last().unwrap()).unwrap(),
+            canonical.vocab_bytes.len(),
+            "the last offset is the end of the bytes",
+        );
     }
 
     #[test]

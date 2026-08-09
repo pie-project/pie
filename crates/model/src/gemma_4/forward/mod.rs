@@ -281,7 +281,6 @@ pub fn gemma4_cuda(
                 FireClass::Prefill => {
                     dsl::cuda::attention_flashinfer_prefill_planless(&attn_in, &kv, window_left)
                 }
-                other => unreachable!("gemma4 refuses {other:?} at trace start"),
             }
             .expect("the class states its attention");
             // Post-attention observation. Whether the scores are actually

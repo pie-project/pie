@@ -45,8 +45,7 @@ use std::path::PathBuf;
 use driver_metal::device::Context;
 use driver_metal::weights::load::load;
 use driver_metal::lowering::resolve::{Names, Store};
-use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-use model::families::llama_like::forward::llama_like_metal;
+use model::catalog::{MetalBinding, Variant};
 use model_compiler::lower::{Arg, Fire, Row, lower};
 use model_compiler::trace::FireClass;
 
@@ -101,20 +100,23 @@ fn affine(encoding: &model::encoding::Encoding) -> driver_metal::batch::AffineFo
 
 /// Every weight name the Metal text states, over both fire classes.
 ///
-/// The facts come from the CHECKPOINT, through the same chain the seam uses:
-/// tensors -> `catalog` row -> `Deployment` -> `DecodeGeometry` ->
-/// `text::facts_from`. An
-/// earlier draft named `qwen3_0_6b()` here and reported 308 missing names
+/// The text comes from the CHECKPOINT, through the same chain the seam uses:
+/// tensors -> `catalog` row -> `row.trace(class, Deployed::metal(binding))`.
+/// An earlier draft named `qwen3_0_6b()` here and reported 308 missing names
 /// against a llama-3.2 snapshot -- every one of them a `qkv` or a `q_norm`,
 /// which is to say the fixture's bindings and not the checkpoint's. A gate
 /// that states its own facts is not testing the checkpoint.
-fn names_the_text_states(
-    facts: &LlamaLikeFacts,
-    metal: &LlamaLikeMetalFacts,
-) -> BTreeSet<String> {
+///
+/// It used to take `(LlamaLikeFacts, LlamaLikeMetalFacts)` that the DRIVER
+/// had rebuilt from nine tensor probes, which made this gate's chain one link
+/// longer than the seam's and the extra link the one most likely to be wrong.
+/// The row states the facts and the binding states the encoding, which is the
+/// whole of what the seam hands over.
+fn names_the_text_states(row: &dyn Variant, binding: &MetalBinding) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for (class, rows) in [(FireClass::Decode, 1usize), (FireClass::Prefill, 16)] {
-        let plan = llama_like_metal(facts, metal, class);
+        let plan = driver_metal::model::binding::text(row, class, binding)
+            .unwrap_or_else(|e| panic!("`{}` states no metal {class:?} text: {e}", row.id()));
         let low = lower(
             &plan,
             &vec![
@@ -142,7 +144,23 @@ fn names_the_text_states(
     out
 }
 
+/// THE `architecture_of` READER IS GONE, and its absence is the point.
+///
+/// It read `model_type` out of `config.json` so that two tests in this file
+/// could ask "which architecture is this?" — and its own doc recorded the
+/// defect that made it necessary: *"Same file, same question, two answers;
+/// the one that asks first is right."* The reason there were two answers is
+/// that the seam did not read `model_type` at all. It reduced
+/// `architectures[0]`, so this file and the driver held different strings
+/// for one checkpoint, and the pairs that differ (`qwen3_moe` against
+/// `qwen3moe`, `gpt_oss` against `gptoss`) are exactly the ones the seam
+/// refused while this gate called them healthy.
+///
+/// Both askers now read `deployment.advertised.arch` off the matched row.
+/// One row states one architecture, so the question has one answer and
+/// there is no reader left to disagree with.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn the_checkpoint_answers_the_names_the_text_states() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -153,6 +171,40 @@ fn the_checkpoint_answers_the_names_the_text_states() {
         return;
     };
     let (row, encoding) = served(&snapshot);
+
+    // Does this driver CLAIM this checkpoint? Asking second is how this gate
+    // spent its life reporting a failure that was not one: pointed at a
+    // Qwen3.6 snapshot it built a `llama_like` text anyway and reported 576
+    // unanswered names -- `layer.0.q_proj` for a layer whose checkpoint
+    // publishes `linear_attn.in_proj_qkv`, because Qwen3.6 interleaves linear
+    // attention and its architecture is not in the served list at all.
+    //
+    // That is the driver being RIGHT. A gate that demands names bind for an
+    // architecture nobody claimed measures the wrong half: the claim comes
+    // first, and there are two sound outcomes, not one.
+    //
+    // The claim is now the ROW's, which is what makes the two outcomes
+    // distinguishable at all: `architecture_of` re-read `config.json` and
+    // could disagree with what the seam built, so a mismatch showed up as
+    // missing names rather than as a refusal.
+    let arch = match row.deployment(model::catalog::Deployed::single()) {
+        Ok(d) => d.advertised.arch,
+        Err(why) => {
+            eprintln!("SKIP: the matched row `{}` does not deploy: {why}", row.id());
+            return;
+        }
+    };
+    if let Err(why) = driver_metal::model::binding::serves(row) {
+        // No assertion here, deliberately: the refusal `binding::text` gives
+        // at the fire IS this one, so checking it after branching on it
+        // asserts `!x` given `x`. The value is the branch. What used to
+        // happen instead was a page of 576 "missing" names, every one of them
+        // missing for the single reason that nothing here claims to serve
+        // this checkpoint.
+        eprintln!("SKIP: no metal text for row `{}` (`{arch}`): {why}", row.id());
+        return;
+    }
+
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     assert!(
         !loaded.tensors.is_empty(),
@@ -171,13 +223,24 @@ fn the_checkpoint_answers_the_names_the_text_states() {
         affine(&encoding),
     )
     .expect("a decodable geometry");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&geometry, |t| loaded.tensors.contains_key(t));
+    // WHAT THE LOAD OBSERVED, and nothing else. This was
+    // `text::facts_from(&geometry, |t| loaded.tensors.contains_key(t))` --
+    // twenty-nine model facts rebuilt here from the tensors, in a gate whose
+    // subject is whether the text's names find the checkpoint. Deriving the
+    // text's facts from the same tensor set the names are then looked up in
+    // is a gate that cannot fail for the reason it exists to catch.
+    //
+    // `loaded.mxfp4` is the one question left, and it is the seam's own: a
+    // bank the load left in the publisher's format states an mxfp4 symbol
+    // rather than an affine one.
+    let binding = driver_metal::model::binding::observed(geometry.quant, |t| {
+        loaded.mxfp4.contains(t)
+    });
 
     let named = HashMap::new();
     let mut store = Store::new(Names::mlx(), &loaded.tensors, &named);
     let mut missing: BTreeSet<String> = BTreeSet::new();
-    for name in names_the_text_states(&facts, &metal) {
+    for name in names_the_text_states(row, &binding) {
         use driver_metal::lowering::executor::Resolver as _;
         if store.weight(&name).is_none() {
             missing.insert(name);
@@ -204,6 +267,7 @@ fn the_checkpoint_answers_the_names_the_text_states() {
 /// Not an assertion — a report, so a run against a new checkpoint says what it
 /// holds without anyone editing a test to find out.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn what_this_checkpoint_published() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -214,7 +278,20 @@ fn what_this_checkpoint_published() {
         return;
     };
     let (row, encoding) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    // A report cannot fail on a refusal -- the refusal is the thing to
+    // report. `weights::stage` asks `fits_on_this_gpu` before staging, and on
+    // this machine the 31B gemma reaches it only in the THIRD test of the
+    // file, because the two before it are still holding their arenas: the
+    // ceiling `Memory::probe` answers is the kernel's free pages, not a
+    // constant. Panicking here turned the driver refusing correctly into a
+    // red suite, which is the opposite of what a diagnostic is for.
+    let loaded = match load(&context, &snapshot, row, &encoding) {
+        Ok(loaded) => loaded,
+        Err(why) => {
+            eprintln!("this device would not hold this checkpoint: {why:?}");
+            return;
+        }
+    };
     let names = loaded.names();
     eprintln!("{} tensors published; layer 0 and the globals:", names.len());
     for name in &names {
@@ -243,6 +320,7 @@ fn what_this_checkpoint_published() {
 /// already contains. `catalog::identify` reads it off the tensors, so the
 /// variable is gone and with it the run that named the wrong one.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn every_name_the_text_states_is_a_tensor_the_load_plan_publishes() {
     let dirs = snapshots_to_check();
     if dirs.is_empty() {
@@ -323,8 +401,8 @@ fn check_one_snapshot(dir: &std::path::Path) {
     // them healthy over five checkpoints. One row states one architecture,
     // so there is nothing left to disagree.
     let arch = deployment.advertised.arch;
-    if !driver_metal::model::text::serves(arch) {
-        eprintln!("    SKIP: no metal text serves `{arch}` (row `{}`)", row.id());
+    if let Err(why) = driver_metal::model::binding::serves(row) {
+        eprintln!("    SKIP: no metal text for row `{}` (`{arch}`): {why}", row.id());
         return;
     }
 
@@ -374,17 +452,13 @@ fn check_one_snapshot(dir: &std::path::Path) {
         })
         .map(|t| t.name.as_str())
         .collect();
-    let (facts, metal) = driver_metal::model::text::facts_from_with(
-        &geometry,
-        |t| published.contains(t),
-        |t| mxfp4.contains(t),
-    );
+    let binding = driver_metal::model::binding::observed(geometry.quant, |t| mxfp4.contains(t));
 
     let tensors = HashMap::new();
     let named = HashMap::new();
     let store = Store::new(names, &tensors, &named);
     let mut missing: BTreeSet<String> = BTreeSet::new();
-    for traced in names_the_text_states(&facts, &metal) {
+    for traced in names_the_text_states(row, &binding) {
         // EVERY spelling, not the first: this store has no staged tensors to
         // choose with, and a role that has several candidates resolves at run
         // time against the ones the checkpoint published. Asking only the
@@ -417,10 +491,10 @@ fn check_one_snapshot(dir: &std::path::Path) {
             .join("\n  ")
     );
 
-    check_projection_widths(dir.as_path(), &plan, &facts, &metal, &store);
+    check_projection_widths(dir.as_path(), &plan, &deployment, &store);
 }
 
-/// Every attention projection is as wide as the facts say it is.
+/// Every attention projection is as wide as the ROW says it is.
 ///
 /// # Why names are not enough
 ///
@@ -436,13 +510,22 @@ fn check_one_snapshot(dir: &std::path::Path) {
 /// 4x512. A driver holding one head shape read half of each full layer's Q
 /// and ran a quarter past the end of its K.
 ///
+/// # The widths come off the deployment's own per-layer table
+///
+/// This took `LlamaLikeMetalFacts` and asked `head_dim_at(l, ..)` -- a
+/// driver-held pair of "the sliding shape" and "the global shape" plus a
+/// period to choose between them, rebuilt here from tensor probes. The row
+/// states a `LayerAttention` PER LAYER, which is the same fact without the
+/// reconstruction: gemma-4's two shapes are two entries in that table, and a
+/// stack with one shape repeats it. Reading the table is what the gemma-4
+/// story above argues for in the first place.
+///
 /// The first dimension is the OUTPUT width for every layout here, quantized
 /// or not -- the packing is on the input axis.
 fn check_projection_widths(
     dir: &std::path::Path,
     plan: &model_loader::plan::LoadPlan,
-    facts: &LlamaLikeFacts,
-    metal: &LlamaLikeMetalFacts,
+    deployment: &model::deployment::Deployment,
     store: &Store,
 ) {
     let shapes: HashMap<&str, &[i64]> = plan
@@ -459,18 +542,17 @@ fn check_projection_widths(
     };
 
     let mut wrong = Vec::new();
-    for l in 0..facts.layers {
-        let head_dim = metal.head_dim_at(l, facts.head_dim);
-        let kv_heads = metal.kv_heads_at(l, facts.kv_heads);
+    for (l, layer) in deployment.attention.iter().enumerate() {
+        let head_dim = layer.head_dim;
         for (role, heads) in [
-            (format!("layer.{l}.q_proj"), facts.q_heads),
-            (format!("layer.{l}.k_proj"), kv_heads),
+            (format!("layer.{l}.q_proj"), deployment.shape.q_heads),
+            (format!("layer.{l}.k_proj"), deployment.shape.kv_heads),
         ] {
             let Some(got) = width_of(&role) else { continue };
             let want = i64::from(heads * head_dim);
             if got != want {
                 wrong.push(format!(
-                    "{role}: the checkpoint publishes {got} and the text reads \
+                    "{role}: the checkpoint publishes {got} and the row states \
                      {want} ({heads} heads x {head_dim})"
                 ));
             }
@@ -478,7 +560,7 @@ fn check_projection_widths(
     }
     assert!(
         wrong.is_empty(),
-        "{}: {} projection(s) are not the width the text reads them at. This \
+        "{}: {} projection(s) are not the width the row states. This \
          is the failure a NAME gate cannot see -- every tensor is present and \
          correctly spelled, and the driver reads the wrong number of bytes out \
          of it:\n  {}",

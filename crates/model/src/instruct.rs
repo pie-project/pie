@@ -15,7 +15,7 @@ pub struct ToolGrammar {
 // The shared decoders, re-exported so `instruct::decoders` stays a valid
 // path: it is what every generation's template imports, and the templates
 // became crates without their imports needing to know.
-pub use crate::decoders;
+pub use crate::shared::decoders;
 
 /// Events emitted by the chat decoder.
 #[derive(Debug, Clone)]

@@ -240,8 +240,8 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
     use driver_metal::bind::encode::{Params, Pipelines, commands, encode};
     use driver_metal::lowering::executor::{Frame, Slice};
     use driver_metal::lowering::dispatch::{table, table_width};
-    use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-    use model::families::llama_like::forward::llama_like_metal;
+    use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+    use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, Row, lower};
     use model_compiler::trace::FireClass;
 
@@ -476,4 +476,138 @@ impl driver_metal::lowering::executor::Resolver for Everything {
     fn pool(&mut self, _: driver_metal::lowering::executor::FireTable) -> Option<u32> {
         Some(128)
     }
+}
+
+/// **Does a recorded command's buffer offset survive past 4 GiB?**
+///
+/// The third question, and it was asked because a real checkpoint answered
+/// it the hard way. `a_replayed_fire_over_real_weights_agrees_with_the_encoded_one`
+/// (`device_real_weights.rs`) is bit-exact on Llama-3.2-1B, whose weights are
+/// 0.68 GB, and produces **262 144 NaNs out of 262 144 logits** on both
+/// gemma-4 checkpoints, whose weights are 14 GB and 17 GB. The arenas differ
+/// at byte 0 — the recording is wrong from its first command, which rules out
+/// anything cumulative and leaves the one thing those two models do not share:
+/// a weight that lives more than 4 GiB into its buffer.
+///
+/// `Regions::resolve` hands back `(&MTLBuffer, u64)` and `record` passes the
+/// `u64` straight to `setKernelBuffer:offset:atIndex:`, whose parameter is an
+/// `NSUInteger` — 64 bits. Nothing in this tree truncates it, and nothing in
+/// the headers says the device does either. So the question is entirely about
+/// what the hardware does with it, and only the hardware can answer it.
+///
+/// The probe is the same shape as the one above with one thing changed: the
+/// addend lives at 4 GiB + 64 in a 5 GiB buffer, and byte 0 of that buffer
+/// holds a different value. A truncated offset reads byte 0 and the assertion
+/// below names it.
+#[test]
+#[ignore = "allocates 5 GiB"]
+fn a_recorded_commands_buffer_offset_is_truncated_to_thirty_two_bits() {
+    const FOUR_GIB: u64 = 1 << 32;
+    const AT: u64 = FOUR_GIB + 64;
+
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let pipeline = compiler
+        .compile(&context, SHADER, "bump")
+        .expect("the probe shader compiles");
+
+    let Ok(big) = Allocation::new(&context, 5u64 << 30, "icb probe 5 GiB") else {
+        eprintln!("SKIP: no 5 GiB buffer");
+        return;
+    };
+    let out = Allocation::new(&context, 16 * 4, "icb probe out").expect("a region");
+    // SAFETY: freshly allocated, nothing encoded against them.
+    unsafe {
+        out.zero(0, out.len()).expect("zeroes");
+        // 111 at byte 0 is the DECOY: it is what a 32-bit truncation of `AT`
+        // very nearly reads, and a distinct value says which happened.
+        big.write(0, &111u32.to_le_bytes()).expect("writes");
+        big.write(64, &111u32.to_le_bytes()).expect("writes");
+        big.write(AT, &7u32.to_le_bytes()).expect("writes");
+    }
+
+    // CONTROL: the ordinary encode path, which binds a raw GPU address and so
+    // has no offset to truncate. This is the path a fire takes today, and it
+    // proves the buffer really does hold 7 at `AT`.
+    {
+        let table = driver_metal::device::ArgumentTable::new(&context, 2).expect("a table");
+        table.bind_address(0, out.gpu_address()).expect("binds");
+        table.bind_address(1, big.gpu_address() + AT).expect("binds");
+        let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
+        stepper
+            .run(|encoder| {
+                encoder.set_pipeline(&pipeline);
+                encoder.set_argument_table(&table);
+                encoder.dispatch([16, 1, 1], [16, 1, 1])
+            })
+            .expect("the control fires");
+        assert_eq!(
+            read(&out),
+            vec![7u32; 16],
+            "the ENCODE path reads 4 GiB into a buffer, so the probe is sound"
+        );
+        // SAFETY: retired.
+        unsafe { out.zero(0, out.len()).expect("re-zero for the ICB run") };
+    }
+
+    let descriptor = MTLIndirectCommandBufferDescriptor::new();
+    descriptor.setCommandTypes(MTLIndirectCommandType(
+        MTLIndirectCommandType::ConcurrentDispatch.0
+            | MTLIndirectCommandType::ConcurrentDispatchThreads.0,
+    ));
+    descriptor.setInheritBuffers(false);
+    descriptor.setInheritPipelineState(false);
+    descriptor.setMaxKernelBufferBindCount(2);
+
+    // SAFETY: the descriptor is fully initialised above.
+    let icb = unsafe {
+        context
+            .device()
+            .newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
+                &descriptor,
+                1,
+                MTLResourceOptions::StorageModeShared,
+            )
+    }
+    .expect("the device makes an indirect command buffer for compute");
+    context.residency().addAllocation(ProtocolObject::from_ref(&*icb));
+    context.residency().addAllocation(ProtocolObject::from_ref(big.buffer()));
+    context.residency().commit();
+    context.residency().requestResidency();
+
+    // SAFETY: index 0 is below the max command count declared above.
+    let command = unsafe { icb.indirectComputeCommandAtIndex(0) };
+    command.setComputePipelineState(&pipeline);
+    // SAFETY: both buffers outlive the execution below, and the indices are
+    // below `maxKernelBufferBindCount`.
+    unsafe {
+        command.setKernelBuffer_offset_atIndex(out.buffer(), 0, 0);
+        command.setKernelBuffer_offset_atIndex(big.buffer(), AT as usize, 1);
+    }
+    command.concurrentDispatchThreads_threadsPerThreadgroup(
+        MTLSize { width: 16, height: 1, depth: 1 },
+        MTLSize { width: 16, height: 1, depth: 1 },
+    );
+
+    execute(&context, &icb, 1);
+
+    let got = read(&out);
+    assert_eq!(
+        got,
+        vec![111u32; 16],
+        "the recorded command read byte {} -- the low 32 bits of {AT}",
+        AT & 0xffff_ffff
+    );
+    assert_ne!(
+        got,
+        vec![7u32; 16],
+        "THE DEVICE HAS BEEN FIXED. A recorded command now binds {AT} bytes \
+         into its buffer and reads what is there, which is what the encode \
+         path above already does. Delete the four-gibibyte refusal in \
+         `device/recording.rs` and this test with it: every fire over a \
+         checkpoint larger than 4 GiB can be recorded again."
+    );
 }

@@ -276,14 +276,19 @@ impl Variant for GptOss {
     ///
     /// The MLX author (`contract::author_gpt_oss_mlx`) is a different
     /// BACKEND's reading of the same checkpoint, not a different model,
-    /// so it is not a row: `crate::policy` is where a build picks a
-    /// loader.
+    /// so it is not a row: `crate::shared::policy` is where a build picks a
+    /// loader -- which is why this ASKS. Stating the HF author alone
+    /// read as though the sentence above had been implemented, and
+    /// handed Metal a contract in the checkpoint's own names.
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
-        contract::author_gpt_oss(builder)
+        match builder.naming() {
+            crate::shared::policy::Naming::Hf => contract::author_gpt_oss(builder),
+            crate::shared::policy::Naming::Mlx => contract::author_gpt_oss_mlx(builder),
+        }
     }
 
     #[cfg(feature = "forward")]
@@ -292,6 +297,17 @@ impl Variant for GptOss {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+        // METAL, refused by name. `llama_like_metal` is the only Metal
+        // text in this build and it is not this model's — see
+        // [`project::NO_METAL`] for what it states instead and why
+        // reaching for it would trace a different model under this
+        // row's id. The refusal is stated HERE, at the row, rather than
+        // consulted from a list of architecture strings a driver keeps:
+        // a list is a fourth place for the answer to live and a fourth
+        // place for it to be wrong.
+        if let crate::catalog::Backend::Metal(_) = load.backend {
+            return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
+        }
         Ok(project::trace(&self.shape, class, load))
     }
 
@@ -501,7 +517,7 @@ mod tests {
     /// extents and names no expert weight, and because the id vocabulary
     /// forbids an encoding word outright (`catalog::tests::
     /// no_id_names_an_encoding`). Where the packing is decided is
-    /// `crate::policy`.
+    /// `crate::shared::policy`.
     #[test]
     fn no_row_records_the_expert_encoding() {
         for v in VARIANTS {
@@ -556,7 +572,7 @@ mod tests {
     #[test]
     fn the_llama_like_fixture_measures_the_same_checkpoint() {
         let f = &row("gpt-oss-20b").shape;
-        let l = crate::families::llama_like::spec::LlamaLikeFacts::gpt_oss_20b();
+        let l = crate::shared::llama_like::spec::LlamaLikeFacts::gpt_oss_20b();
         assert_eq!(l.hidden, f.hidden);
         assert_eq!(l.layers, f.layers);
         assert_eq!(l.q_heads, f.q_heads);
@@ -613,15 +629,82 @@ mod tests {
     /// `instruct::create`'s string match — and it is a DIFFERENT
     /// template from every other row's, which is what the `_ =>` arm
     /// could not have told anyone.
+    ///
+    /// The fixture names harmony's three stop strings, because `seal()`
+    /// resolves them THROUGH THE TOKENIZER and a vocabulary that does not
+    /// contain them makes the answer empty for a reason that has nothing
+    /// to do with the row. `t0..t63` alone tested that a missing token is
+    /// missing.
     #[cfg(feature = "chat")]
     #[test]
     fn every_row_speaks_harmony() {
-        let vocab: Vec<String> = (0..64).map(|i| format!("t{i}")).collect();
+        let mut vocab: Vec<String> = ["<|endoftext|>", "<|return|>", "<|call|>"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        vocab.extend((0..64).map(|i| format!("t{i}")));
         let tokenizer = Arc::new(tokenizer::Tokenizer::from_vocab(&vocab));
         for v in VARIANTS {
             let chat = v.chat(tokenizer.clone());
             assert!(!chat.user("Hi").is_empty(), "{}", v.id);
             assert!(!chat.seal().is_empty(), "{}", v.id);
         }
+    }
+
+    /// A METAL load is refused BY NAME rather than traced as a llama.
+    ///
+    /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
+    /// table answered "does this build serve you" from an architecture
+    /// STRING reduced by `canonical()`, in a driver, before any text was
+    /// traced — so it could say yes to a row whose text does not exist
+    /// (it listed `gemma4`) and no to one whose text does (it omitted
+    /// `gemma3`). The row answers now, and what it answers with is a
+    /// sentence naming what is missing.
+    ///
+    /// The comparison is against [`project::NO_METAL`] itself and not a
+    /// paraphrase, so the sentence a caller is shown is the sentence
+    /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
+    #[cfg(feature = "forward")]
+    #[test]
+    fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
+        use crate::catalog::{Backend, Deployed, MetalBinding};
+        use crate::deployment::Refusal;
+        use model_compiler::trace::FireClass;
+
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+        };
+        assert!(!VARIANTS.is_empty());
+        for v in VARIANTS {
+            for class in [FireClass::Prefill, FireClass::Decode] {
+                let err = v
+                    .trace(class, Deployed::metal(&bind))
+                    .expect_err("this build has no Metal text for this generation");
+                assert_eq!(
+                    err,
+                    Refusal::Unsupported(project::NO_METAL),
+                    "`{}` refused a Metal load with a sentence that is not the \
+                     one the row states",
+                    v.id
+                );
+            }
+        }
+        // And the refusal is about the BACKEND and nothing else: the
+        // same rows keep answering a CUDA load exactly as they did.
+        for v in VARIANTS {
+            assert!(
+                v.trace(FireClass::Decode, Deployed::single()).is_ok(),
+                "`{}` stopped serving CUDA",
+                v.id
+            );
+        }
+        // A `Backend::Cuda` is what `Deployed::single()` states, so the
+        // arm above is reached by every existing caller unchanged.
+        assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }

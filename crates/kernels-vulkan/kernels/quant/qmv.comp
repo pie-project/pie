@@ -1,0 +1,179 @@
+#version 450
+
+// Affine GEMV projections, ported from `quant/qmv.metal`.
+//
+// The port keeps MLX's little-endian affine packing, the four-rows-per-simdgroup
+// launch shape, and the bounds-checked K tail whose absence broke Gemma-4-31B at
+// K=5376. Vulkan does not promise a 32-wide subgroup, so the final reduction is
+// through shared memory over the 32 local-x lanes rather than subgroup width.
+
+#include "common/bf16.glsl"
+#include "common/affine.glsl"
+
+#ifndef PIE_VEC
+#define PIE_VEC 1
+#endif
+
+layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+PIE_BUFFER_RO(1, Scales, scales);
+PIE_BUFFER_RO(2, Biases, biases);
+PIE_BUFFER_RO(3, X, x);
+PIE_BUFFER_RW(4, Y, y);
+// Declared only by the variants whose ROW has a sixth buffer operand, and at 5
+// rather than 7. Both halves of that are load-bearing.
+//
+// `kernels_vulkan::bindings()` numbers buffer-kinded operands densely from zero
+// in the row's operand order, so `affine_qmv_fast_residual`'s residual is
+// binding 5 -- while `affine_qmv_fast` has five operands and no sixth binding
+// at all, which is why this cannot simply be declared unconditionally.
+//
+// This read binding 7 for every variant until an audit compiled each one and
+// compared its `OpDecorate Binding` set against the table (see
+// `scripts/vulkan-kernel-audit.py --bindings`). 7 is the Metal buffer index:
+// Metal numbers scalars in the same run as buffers, Vulkan sends them to a push
+// block, and the two numbers differ by however many scalars precede the
+// operand. They must never be copied across.
+#if defined(PIE_RESIDUAL) || defined(PIE_BIAS)
+PIE_BUFFER_RO(5, Extra, extra);
+#endif
+
+// The block is variant-shaped, and it has to be. A push block is not like a
+// descriptor set, where declaring more than you read is free: the block a
+// module declares must fit inside the pipeline layout's push range
+// (`VUID-VkComputePipelineCreateInfo-layout-10069`), and that range is built
+// from what the ROW states. `affine_qmv_fast` states two scalars, so a
+// module that declares seven -- as this one did until a validation layer
+// said so -- is asking the shell for twenty bytes no row will ever push.
+//
+// `row_stride` and `m` therefore appear only for the strided variant that
+// reads them. Three more fields (`x_slot_stride`, `x_row_stride`,
+// `slots_per_row`) were declared here and read by nothing at all; they were
+// the routed row's shape, copied in and never removed.
+layout(push_constant) uniform Push {
+    int in_vec_size;
+    int out_vec_size;
+#if defined(PIE_WIDE_STRIDED)
+    int row_stride;
+    int m;
+#endif
+} pc;
+
+shared float partials[8 * 32];
+
+uint weight_words_per_row() { return uint(pc.in_vec_size) * uint(PIE_BITS) / 32u; }
+uint groups_per_row() { return uint(pc.in_vec_size) / uint(PIE_GROUP); }
+
+float affine_value(uint row, uint k) {
+    uint word = w[row * weight_words_per_row() + k / uint(PIE_CODES_PER_WORD)];
+    float code = pie_affine_code(word, k % uint(PIE_CODES_PER_WORD));
+    uint g = k / uint(PIE_GROUP);
+    return code * PIE_LOAD(scales[row * groups_per_row() + g])
+         + PIE_LOAD(biases[row * groups_per_row() + g]);
+}
+
+float x_at(uint vec, uint k) {
+#if defined(PIE_WIDE_STRIDED)
+    return PIE_LOAD(x[vec * uint(pc.row_stride) + k]);
+#else
+    return PIE_LOAD(x[vec * uint(pc.in_vec_size) + k]);
+#endif
+}
+
+float dot_lane(uint row, uint vec, uint lid, uint values_per_thread) {
+    uint block_size = values_per_thread * 32u;
+    float acc = 0.0;
+    for (uint k0 = lid * values_per_thread; k0 < uint(pc.in_vec_size); k0 += block_size) {
+        for (uint i = 0u; i < 16u; i++) {
+            if (i < values_per_thread && k0 + i < uint(pc.in_vec_size)) {
+                acc += x_at(vec, k0 + i) * affine_value(row, k0 + i);
+            }
+        }
+    }
+    return acc;
+}
+
+void reduce_store(bool tail) {
+    uint lid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint out0 = gl_WorkGroupID.y * 8u + ly * 4u;
+    uint vec = gl_WorkGroupID.x;
+    uint values_per_thread = uint(PIE_CODES_PER_WORD) * 2u;
+
+    for (uint r = 0u; r < 4u; r++) {
+        uint row = out0 + r;
+        float v = row < uint(pc.out_vec_size) ? dot_lane(row, vec, lid, values_per_thread) : 0.0;
+        partials[(ly * 4u + r) * 32u + lid] = v;
+    }
+    barrier();
+
+    if (lid == 0u) {
+        for (uint r = 0u; r < 4u; r++) {
+            uint row = out0 + r;
+            if (row < uint(pc.out_vec_size)) {
+                float sum = 0.0;
+                for (uint i = 0u; i < 32u; i++) sum += partials[(ly * 4u + r) * 32u + i];
+#if defined(PIE_BIAS)
+                if (tail) sum += PIE_LOAD(extra[row]);
+#endif
+#if defined(PIE_RESIDUAL)
+                uint at = vec * uint(pc.out_vec_size) + row;
+                uint16_t q = PIE_STORE(sum);
+                y[at] = PIE_STORE(PIE_LOAD(q) + PIE_LOAD(extra[at]));
+#else
+                y[vec * uint(pc.out_vec_size) + row] = PIE_STORE(sum);
+#endif
+            }
+        }
+    }
+}
+
+#if defined(PIE_WIDE_STRIDED)
+void wide_strided() {
+    uint row_slot = gl_LocalInvocationID.y * 4u + (gl_LocalInvocationID.x & 3u);
+    if (gl_LocalInvocationID.x >= 4u) return;
+    uint row = gl_WorkGroupID.y * 8u + row_slot;
+    uint vec0 = gl_WorkGroupID.x * uint(PIE_VEC);
+    if (row >= uint(pc.out_vec_size)) return;
+    for (uint v = 0u; v < uint(PIE_VEC); v++) {
+        uint vec = vec0 + v;
+        if (vec < uint(pc.m)) {
+            float acc = 0.0;
+            for (uint k = 0u; k < uint(pc.in_vec_size); k++) {
+                acc += x_at(vec, k) * affine_value(row, k);
+            }
+            y[vec * uint(pc.row_stride) + row] = PIE_STORE(acc);
+        }
+    }
+}
+#endif
+
+void main() {
+#if defined(PIE_WIDE_STRIDED)
+    wide_strided();
+#elif defined(PIE_TAIL)
+    reduce_store(true);
+#else
+    reduce_store(false);
+#endif
+}
+
+// pie:instantiate affine_qmv_fast_bfloat16_gs_128_b_4 PIE_GROUP=128 PIE_BITS=4
+// pie:instantiate affine_qmv_fast_bfloat16_gs_128_b_8 PIE_GROUP=128 PIE_BITS=8
+// pie:instantiate affine_qmv_fast_bfloat16_gs_32_b_4 PIE_GROUP=32 PIE_BITS=4
+// pie:instantiate affine_qmv_fast_bfloat16_gs_32_b_8 PIE_GROUP=32 PIE_BITS=8
+// pie:instantiate affine_qmv_fast_bfloat16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4
+// pie:instantiate affine_qmv_fast_bfloat16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8
+// pie:instantiate affine_qmv_fast_residual_bfloat16_gs_128_b_4 PIE_GROUP=128 PIE_BITS=4 PIE_RESIDUAL=1
+// pie:instantiate affine_qmv_fast_residual_bfloat16_gs_128_b_8 PIE_GROUP=128 PIE_BITS=8 PIE_RESIDUAL=1
+// pie:instantiate affine_qmv_fast_residual_bfloat16_gs_32_b_4 PIE_GROUP=32 PIE_BITS=4 PIE_RESIDUAL=1
+// pie:instantiate affine_qmv_fast_residual_bfloat16_gs_32_b_8 PIE_GROUP=32 PIE_BITS=8 PIE_RESIDUAL=1
+// pie:instantiate affine_qmv_fast_residual_bfloat16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_RESIDUAL=1
+// pie:instantiate affine_qmv_fast_residual_bfloat16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_RESIDUAL=1
+// pie:instantiate affine_qmv_tail_bfloat16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_TAIL=1
+// pie:instantiate affine_qmv_tail_bfloat16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_TAIL=1
+// pie:instantiate affine_qmv_tail_bias_bfloat16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_BIAS=1 PIE_TAIL=1
+// pie:instantiate affine_qmv_tail_bias_bfloat16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_BIAS=1 PIE_TAIL=1
+// pie:instantiate affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8 PIE_GROUP=64 PIE_BITS=4 PIE_WIDE_STRIDED=1 PIE_VEC=4 PIE_K_LANES=8
+// pie:instantiate affine_qmv_wide_strided_bfloat16_gs_64_b_8_v_4_kl_8 PIE_GROUP=64 PIE_BITS=8 PIE_WIDE_STRIDED=1 PIE_VEC=4 PIE_K_LANES=8

@@ -122,10 +122,14 @@ fn crate_src() -> PathBuf {
 /// per-backend facts stayed, and a family may have either or both.
 fn families() -> BTreeMap<String, PathBuf> {
     let mut out = BTreeMap::new();
-    let mut roots = vec![crate_src(), crate_src().join("families")];
-    roots.retain(|r| r.is_dir());
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+    // Both halves: a generation directory at the root, and a shared
+    // family under `shared/`. The second was `src/families/`, and a
+    // scan that skips a missing root in silence would have gone on
+    // passing over half a crate after the rename — so neither is
+    // optional and neither is skipped.
+    for root in [crate_src(), crate_src().join("shared")] {
+        let entries = std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("{} is readable: {e}", root.display()));
         for e in entries.flatten() {
             let dir = e.path();
             if dir.join("spec.rs").is_file() || dir.join("forward/facts.rs").is_file() {
@@ -134,6 +138,18 @@ fn families() -> BTreeMap<String, PathBuf> {
             }
         }
     }
+    // Named rather than counted. A count would not have caught the
+    // rename this comment is about: exactly one family lives under
+    // `shared/`, so losing that root drops the total by one and any
+    // threshold loose enough to survive a new generation is loose enough
+    // to miss it. `llama_like` is the family a dozen generations bind,
+    // which makes it the half worth being sure of.
+    assert!(
+        out.contains_key("llama_like"),
+        "the shared half of the crate contributed nothing; found {:?}",
+        out.keys().collect::<Vec<_>>()
+    );
+    assert!(out.len() >= 10, "found only {} families", out.len());
     out
 }
 

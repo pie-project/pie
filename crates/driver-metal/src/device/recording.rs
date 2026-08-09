@@ -121,6 +121,9 @@ impl std::fmt::Debug for Recording {
     }
 }
 
+/// The most a recorded command can carry as a buffer offset, plus one.
+const FOUR_GIB: u64 = 1 << 32;
+
 /// Record `dispatches` into an indirect command buffer.
 ///
 /// `regions` must resolve every operand address to the allocation holding it:
@@ -145,7 +148,24 @@ pub fn record(
     regions: &Regions,
     commands: &[Command<'_>],
 ) -> Result<Recording> {
-    let widest = commands.iter().map(|c| c.binds.len()).max().unwrap_or(1);
+    // The INDEX SPACE, not the count. `maxKernelBufferBindCount` bounds the
+    // largest `[[buffer(n)]]` a recorded command may address, and a bind past
+    // it is not an error -- Metal drops it and the kernel reads address zero.
+    //
+    // This took the widest `binds.len()`, which is the same number only when
+    // every command binds slots 0..n with no gaps. A plan whose kernels leave
+    // a hole -- an optional operand a deployment does not have, a scalar block
+    // at a fixed high slot -- has a command that binds three buffers at slots
+    // 0, 1 and 5, and `3` bounds it out of its own table.
+    //
+    // Measured: llama-3.2-1B replays bit-identically and gemma-4-31b and
+    // gemma-4-26b came back ALL NaN -- 262144 of 262144 logits, from a
+    // recording that reported success, because a dropped bind is silent.
+    let widest = commands
+        .iter()
+        .flat_map(|c| c.binds.iter().map(|b| b.slot + 1))
+        .max()
+        .unwrap_or(1);
     let descriptor = MTLIndirectCommandBufferDescriptor::new();
     // BOTH spellings: the type has to match the call the command makes, and
     // declaring one while calling the other is a command that silently does
@@ -207,6 +227,36 @@ pub fn record(
                             command.symbol, bind.address, bind.slot
                         ),
                     })?;
+            // FOUR GIBIBYTES, and the device is why.
+            // `setKernelBuffer:offset:atIndex:` takes an `NSUInteger` and
+            // truncates it to 32 bits on this hardware --
+            // `device_icb.rs::a_recorded_commands_buffer_offset_is_truncated_to_thirty_two_bits`
+            // binds 4 GiB + 64 into a 5 GiB buffer and reads back byte 64.
+            // The encode path binds raw GPU addresses and has no offset to
+            // lose, so it is unaffected; only a recording is.
+            //
+            // It cost a whole debugging round to find, because what it does
+            // is bind a weight to the wrong bytes of the right buffer: the
+            // fire runs, every launch succeeds, and 262 144 of 262 144 logits
+            // come back NaN. Refusing here turns that into an encoded fire --
+            // slower, and right.
+            //
+            // A checkpoint reaches this the moment it is larger than 4 GiB,
+            // which is every model this engine is for. Lifting it means
+            // staging weights in chunks no larger than 4 GiB rather than the
+            // one region `weights/stage.rs` allocates today.
+            if offset >= FOUR_GIB {
+                return Err(Error::Unrecordable {
+                    what: "fire",
+                    message: format!(
+                        "`{}` binds slot {} at {offset} bytes into its buffer, and a \
+                         recorded command truncates that to {}",
+                        command.symbol,
+                        bind.slot,
+                        offset & 0xffff_ffff,
+                    ),
+                });
+            }
             // SAFETY: the buffer outlives the recording (the registry retains
             // it) and the slot is below `maxKernelBufferBindCount`.
             unsafe {

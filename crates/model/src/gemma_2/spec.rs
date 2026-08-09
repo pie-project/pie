@@ -1,6 +1,6 @@
 //! Gemma 2's SHAPE: the numbers a gemma-2 checkpoint has.
 //!
-//! Ungated, for the reason `families/llama_like/spec.rs` states: a
+//! Ungated, for the reason `shared/llama_like/spec.rs` states: a
 //! catalog row is written in these words, and a row is the crate's
 //! identity under EVERY aspect — `chat` asks which template speaks for
 //! it, `contract` asks who authors its load, `forward` asks what to

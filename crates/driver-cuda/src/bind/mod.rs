@@ -18,6 +18,14 @@
 /// what a bound launch is bound TO.
 pub mod abi;
 
+/// Tier A: a device entry point loaded from a cubin, its arguments
+/// marshalled from the row, and `cuLaunchKernel`. No host launcher.
+pub mod device;
+
+/// Tier A: the arithmetic a stated [`kernels::LaunchRule`] names — what
+/// the C++ launchers computed inside `<<<>>>`.
+pub mod launch;
+
 use std::ffi::c_void;
 
 use model_compiler::lower::{Arg, Buffers, Launch, Lowered};

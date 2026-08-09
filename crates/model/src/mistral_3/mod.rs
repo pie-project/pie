@@ -1,7 +1,7 @@
 //! The Mistral lineage.
 //!
 //! Two rows and a chat template. The authoring pass is
-//! `crate::llama_3::contract::author_dense` — Mistral's block is the
+//! `crate::shared::llama_like::contract::author_dense` — Mistral's block is the
 //! llama block, and saying so by CALLING the pass is what the old
 //! `HF_ROWS` said by repeating a function pointer in a column.
 //!
@@ -30,8 +30,8 @@ pub mod chat;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
-use crate::families::llama_like::project;
-use crate::families::llama_like::spec::LlamaLikeFacts;
+use crate::shared::llama_like::project;
+use crate::shared::llama_like::spec::LlamaLikeFacts;
 use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
@@ -201,18 +201,46 @@ impl Variant for Mistral3 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
-        crate::llama_3::contract::author_dense(builder)
+        match builder.naming() {
+            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            // The registry this replaced held an MLX row for `mistral`,
+            // and a row that states only the HF author hands Metal the
+            // checkpoint's own names and its own dtype. See
+            // `llama_3::mod`'s `author`.
+            crate::shared::policy::Naming::Mlx => crate::shared::llama_like::contract::author_llama_mlx(builder),
+        }
     }
 
+    /// This row's text, for whichever backend asked.
+    ///
+    /// The WINDOW is the field to read twice here. Mistral-7B-v0.3
+    /// states `sliding_window: 4096` and the v0.1/v0.2 rows state none,
+    /// so this is the family's one generation where the same three
+    /// scalars carry a real per-row difference — and a window dropped
+    /// is a model attending its whole prefix, fluent about a context it
+    /// was never trained to see.
+    ///
+    /// `rope_rescaled: false`: no Mistral config in this table states
+    /// `rope_scaling`; the base alone describes the ladder.
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        Ok(project::trace(&self.shape, class, load))
+        project::trace(
+            &self.shape,
+            project::MetalRow {
+                rope_theta: self.rope_theta,
+                norm_eps: self.norm_eps,
+                window: self.window,
+                rope_rescaled: false,
+            },
+            class,
+            load,
+        )
     }
 
     /// `[INST] … [/INST]`, whose assistant turn opens with NOTHING — the
@@ -435,10 +463,10 @@ mod tests {
         let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
-        let policy = crate::policy::Policy::default();
+        let policy = crate::shared::policy::Policy::default();
 
         for v in VARIANTS {
-            let mut builder = crate::builder::Builder::new(
+            let mut builder = crate::shared::builder::Builder::new(
                 &metadata,
                 v.id(),
                 v.load_shape(),

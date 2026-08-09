@@ -9,7 +9,7 @@
 //! pointing at a template that lived in kimi-k2's directory. Three keys,
 //! three tables, and one of them reaching into a sibling for its answer.
 //!
-//! The template is shared and stays shared — `families::kimi` is where
+//! The template is shared and stays shared — `shared::kimi` is where
 //! it went, so this row names a FAMILY rather than a sibling generation.
 //!
 //! Read `VARIANTS` and then `impl Variant`. What this generation adds
@@ -233,15 +233,15 @@ impl Variant for KimiK3 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::policy::Naming::Hf => contract::author_kimi_k3(builder),
+            crate::shared::policy::Naming::Hf => contract::author_kimi_k3(builder),
             // `MLX_ROWS` never held this generation, and the absence was
             // an `Ok(None)` the caller read as "no contract" — a silence
             // shaped exactly like a generation nobody had written yet.
             // Stated as the refusal it always was.
-            crate::policy::Naming::Mlx => crate::builder::fail(
+            crate::shared::policy::Naming::Mlx => crate::shared::builder::fail(
                 "kimi-k3: no MLX authoring pass exists for this generation, so \
                  there is no name layout to author against",
             ),
@@ -250,28 +250,43 @@ impl Variant for KimiK3 {
 
     /// # Errors
     ///
-    /// [`crate::deployment::Refusal::Unsupported`], and today always:
-    /// this row states the gated MLA output the generation ships, and
-    /// the text cannot declare it. See [`project::trace`] — that refusal
-    /// is where the assertion inside the text stops being a panic.
+    /// Whatever [`Self::deployment`] refuses — asked first, because the
+    /// door's question and the fire's are one question — and then
+    /// [`crate::deployment::Refusal::Unsupported`] from
+    /// [`project::trace`] when this row states the gated MLA output the
+    /// generation ships and the text cannot declare it. That second
+    /// refusal is where the assertion inside the text stops being a
+    /// panic; the first is why a row with nowhere to put its KV never
+    /// gets a fire to begin with.
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        let _ = load;
+        // METAL, refused by name. `llama_like_metal` is the only Metal
+        // text in this build and it is not this model's — see
+        // [`project::NO_METAL`] for what it states instead and why
+        // reaching for it would trace a different model under this
+        // row's id. The refusal is stated HERE, at the row, rather than
+        // consulted from a list of architecture strings a driver keeps:
+        // a list is a fourth place for the answer to live and a fourth
+        // place for it to be wrong.
+        if let crate::catalog::Backend::Metal(_) = load.backend {
+            return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
+        }
+        self.deployment(load)?;
         project::trace(&self.shape, class)
     }
 
     /// Kimi's own `<|im_middle|>` protocol, shared with kimi-k2 and
-    /// stated from `families/` rather than reached for across a sibling
+    /// stated from `shared/` rather than reached for across a sibling
     /// directory. The arm that used to state it keyed on `"kimi_k2" |
     /// "kimi_k25" | "kimi_k3"` — three strings for one answer, in a
     /// table that could disagree with the other two.
     #[cfg(feature = "chat")]
     fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(crate::families::kimi::KimiInstruct::new(tokenizer))
+        Arc::new(crate::shared::kimi::KimiInstruct::new(tokenizer))
     }
 }
 
@@ -407,7 +422,7 @@ mod tests {
 
     /// The chat answer is the FAMILY's, not a sibling's. Naming
     /// `crate::kimi_k2::chat` here would be the reach the templates were
-    /// moved to `families/` to remove — and it is kimi's own
+    /// moved to `shared/` to remove — and it is kimi's own
     /// `<|im_middle|>` protocol, which READS like ChatML and is not: the
     /// `_ =>` arm this replaces handed every unknown architecture
     /// `<|im_start|>`, and a K3 served that way emits a turn its
@@ -437,7 +452,7 @@ mod tests {
     #[test]
     fn an_mlx_naming_is_refused_out_loud_and_an_hf_naming_is_authored() {
         use crate::encoding::Encoding as StoredEncoding;
-        use crate::policy::{Naming, Policy};
+        use crate::shared::policy::{Naming, Policy};
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
@@ -448,13 +463,13 @@ mod tests {
 
         let mlx = Policy { naming: Naming::Mlx, ..Policy::default() };
         let mut builder =
-            crate::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &mlx);
+            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &mlx);
         assert_eq!(builder.naming(), Naming::Mlx);
         assert!(v.author(&mut builder).is_err(), "no MLX layout exists to author against");
 
         let hf = Policy::default();
         let mut builder =
-            crate::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &hf);
+            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &hf);
         assert_eq!(builder.naming(), Naming::Hf);
         // An empty checkpoint has no expert stacks and no gate banks to
         // band, so the HF pass runs to its `publish_remaining` and
@@ -514,5 +529,74 @@ mod tests {
             "a label can name many rows and never fewer; the moment it names fewer, \
              something is dispatching on the label again",
         );
+    }
+
+    /// A METAL load is refused BY NAME rather than traced as a llama.
+    ///
+    /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
+    /// table answered "does this build serve you" from an architecture
+    /// STRING reduced by `canonical()`, in a driver, before any text was
+    /// traced — so it could say yes to a row whose text does not exist
+    /// (it listed `gemma4`) and no to one whose text does (it omitted
+    /// `gemma3`). The row answers now, and what it answers with is a
+    /// sentence naming what is missing.
+    ///
+    /// The comparison is against [`project::NO_METAL`] itself and not a
+    /// paraphrase, so the sentence a caller is shown is the sentence
+    /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
+    #[cfg(feature = "forward")]
+    #[test]
+    fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
+        use crate::catalog::{Backend, Deployed, MetalBinding};
+        use crate::deployment::Refusal;
+        use model_compiler::trace::FireClass;
+
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+        };
+        assert!(!VARIANTS.is_empty());
+        for v in VARIANTS {
+            for class in [FireClass::Prefill, FireClass::Decode] {
+                let err = v
+                    .trace(class, Deployed::metal(&bind))
+                    .expect_err("this build has no Metal text for this generation");
+                assert_eq!(
+                    err,
+                    Refusal::Unsupported(project::NO_METAL),
+                    "`{}` refused a Metal load with a sentence that is not the \
+                     one the row states",
+                    v.id
+                );
+            }
+        }
+        // And the refusal is about the BACKEND and nothing else: the
+        // same rows keep answering a CUDA load exactly as they did.
+        //
+        // kimi-k3's one row refuses CUDA too, on the SEPARATE ground
+        // `project::trace` states — its MLA output gate has no
+        // declaration in this build's text, because the semantic
+        // `SigmoidGateMul` wants equal shapes and MLA's absorb is
+        // rank-3. That the two sentences are different is the assertion
+        // with teeth: a backend gate placed to fire first for every load
+        // would swallow the more specific refusal and report the wrong
+        // missing thing.
+        for v in VARIANTS {
+            let cuda = v.trace(FireClass::Decode, Deployed::single());
+            let err = cuda.expect_err("the output gate is still unstated");
+            assert_ne!(
+                err,
+                Refusal::Unsupported(project::NO_METAL),
+                "`{}` answered a CUDA load with the METAL refusal",
+                v.id
+            );
+        }
+        // A `Backend::Cuda` is what `Deployed::single()` states, so the
+        // arm above is reached by every existing caller unchanged.
+        assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }

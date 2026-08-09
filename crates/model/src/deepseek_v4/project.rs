@@ -39,10 +39,7 @@ use super::spec::Dsv4Facts;
 /// was a substring search over a sentence written for a human.
 #[must_use]
 pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    match kv {
-        KvStyle::Paged => true,
-        KvStyle::Mla { .. } | KvStyle::Dsv4 { .. } => false,
-    }
+    kv.has_a_store_in_this_build()
 }
 
 /// This row's tensors.
@@ -215,6 +212,9 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
     let sm_scale = 1.0 / (a.head_dim as f32).sqrt();
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
+            // One shape for every layer, which is what this row was
+            // already saying by having no per-layer count.
+            kv_heads: a.heads,
             head_dim: a.head_dim,
             window,
             // Every layer owns its pages. A compressing layer owns a
@@ -256,6 +256,14 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
             // both layer kinds share, so both are stated and the planner
             // takes the wider.
             moe_intermediate: f.moe.moe_intermediate,
+            experts_per_token: f.moe.top_k,
+            shared_intermediate: 0,
+            // Not "no shared expert": `dsv4_shard_axis` names
+            // `shared_experts.{w1,w3,w2}`, so this generation plainly has
+            // them. `Dsv4MoeFacts` states no width, and `manifest`'s doc
+            // above already refuses to name the tensors for exactly that
+            // reason — a width invented here would be the same guess with
+            // a driver reading it.
             vocab: f.vocab,
         },
         attention,
@@ -279,6 +287,11 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
+        // Not a gemma: the gain is the multiplier, stored directly.
+        norm_unit_offset: false,
+        v_norm: false,
+        k_eq_v: false,
+        mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // DEFAULT, and the row writes over it. None of the three
         // answers in here is geometry: an arch label is a coarse family
@@ -300,6 +313,38 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         towers: Default::default(),
     }
 }
+
+/// Why this build has no Metal text for a deepseek-v4 row.
+///
+/// A `const` so the test that asserts the refusal NAMES the missing
+/// thing compares against the same string the caller is shown, rather
+/// than against a paraphrase that can drift away from it — the shape
+/// `csm::project::NO_TRACE` set for the same reason.
+///
+/// Its forward is `dsv4_cuda`: MLA with a compressed KV latent, a
+/// per-token compression boundary and a 256-expert router. The only
+/// Metal text in this build is `llama_like_metal`, which states none of
+/// those — and it could not be reached for this row in any case, since
+/// it takes a `LlamaLikeFacts` and this row's shape is `Dsv4Facts`.
+///
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine, and a pie whose Metal half had this text would serve the same
+/// row unchanged. What is missing is a TEXT in this build, which is a
+/// fact about the build.
+///
+/// Stating it is the whole of what replaces `driver-metal`'s
+/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
+/// reduced by a punctuation-stripping `canonical()`, consulted before
+/// any text was traced and free to disagree with what the tracer would
+/// actually do. It listed `gemma4`, which the load path refused on
+/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// that answers for itself cannot disagree with a list, because there
+/// is no list.
+pub const NO_METAL: &str = "deepseek-v4 has no Metal text in this build: its forward is `dsv4_cuda` — \
+     multi-head latent attention over a compressed KV, a per-token compression \
+     boundary and a 256-expert router — and the one Metal text here \
+     (`llama_like_metal`) states none of those and takes a different shape \
+     entirely; the CUDA backend serves this row";
 
 /// Trace this row's CUDA text for one fire class.
 ///

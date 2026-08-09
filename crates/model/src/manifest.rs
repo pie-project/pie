@@ -39,7 +39,7 @@
 //! extents and says nothing about [`Encoding`]. A packed int4 tensor
 //! whose stored shape is `[rows, cols/8]` still has `cols` logical
 //! columns, and [`Observed::of`] is what restores them. What the
-//! encoding then decides is policy — see [`crate::policy`] — which is
+//! encoding then decides is policy — see [`crate::shared::policy`] — which is
 //! where a quantization belongs: it changes how the weights are read,
 //! never which model they are.
 //!
@@ -195,7 +195,12 @@ impl Manifest {
                 (Presence::Required, None) => faults.push(Fault::Missing(name)),
                 (Presence::Absent, Some(_)) => faults.push(Fault::Unexpected(name)),
                 (Presence::Required | Presence::Optional, Some(seen))
-                    if !spec.extents.is_empty() && !extents_agree(&spec.extents, seen) =>
+                    if !spec.extents.is_empty()
+                        && !extents_agree(
+                            &spec.extents,
+                            seen,
+                            observed.has(&format!("{name}.scales")),
+                        ) =>
                 {
                     faults.push(Fault::Extent {
                         name,
@@ -215,7 +220,24 @@ impl Manifest {
 /// Trailing degenerate axes are ignored on both sides: a `[n]` gamma
 /// and an `[n, 1]` one are the same vector, and which of the two a
 /// converter wrote is not a fact about the model.
-fn extents_agree(want: &[u64], got: &[u64]) -> bool {
+///
+/// `packed` says the checkpoint publishes this tensor as PACKED WORDS
+/// rather than values, which is what a `.scales` companion beside it
+/// means. A manifest states the model, so its extents are the logical
+/// ones; a raw HuggingFace snapshot states the file, so an MLX 4-bit
+/// `q_proj` arrives as `[2048, 256]` where the model says `[2048,
+/// 2048]`. The last axis is the packed one — every leading axis is a
+/// row count and survives untouched — so only the last is allowed to
+/// come up short, and only by whole words.
+///
+/// The quotient is NOT checked against a bit width, because no bit
+/// width is knowable here. Deriving one would need the group size, and
+/// this crate already holds that 4 bits at group 64 and 8 bits at
+/// group 32 pack to shapes no extent distinguishes. What the packing
+/// costs the match is therefore ONE axis of one tensor, and what it
+/// leaves is every other axis exactly: a vocabulary, a hidden width
+/// and a head count still refuse a row that does not own them.
+fn extents_agree(want: &[u64], got: &[u64], packed: bool) -> bool {
     let squeeze = |d: &[u64]| -> Vec<u64> {
         let mut v: Vec<u64> = d.iter().copied().filter(|&x| x != 1).collect();
         if v.is_empty() && !d.is_empty() {
@@ -223,7 +245,21 @@ fn extents_agree(want: &[u64], got: &[u64]) -> bool {
         }
         v
     };
-    squeeze(want) == squeeze(got)
+    let (want, got) = (squeeze(want), squeeze(got));
+    if want == got {
+        return true;
+    }
+    if !packed || want.len() != got.len() || want.is_empty() {
+        return false;
+    }
+    let split = want.len() - 1;
+    if want[..split] != got[..split] {
+        return false;
+    }
+    let (w, g) = (want[split], got[split]);
+    // A whole number of values per word, and more than one of them --
+    // an unpacked tensor already returned above.
+    g != 0 && w > g && w.is_multiple_of(g) && (w / g).is_power_of_two()
 }
 
 /// How a checkpoint failed to be a variant.
@@ -869,9 +905,13 @@ mod tests {
     fn qk_norm_width_is_an_extent_rather_than_a_byte_count() {
         let per_head = Manifest::new(1).with(TensorSpec::required("layer.{}.q_norm", [128u64]));
         let global = Manifest::new(1).with(TensorSpec::required("layer.{}.q_norm", [2048u64]));
-        let olmo = seen(&[("model.layers.0.q_norm.weight", &[2048])]);
-        assert!(per_head.check(&olmo).is_err());
-        assert!(global.check(&olmo).is_ok());
+        // One gain for the whole layer, which is the wide spelling. Named
+        // for the SHAPE rather than for the generation that publishes it:
+        // this module is vocabulary, and a fixture named after a family is
+        // how a family's fact starts living outside its own directory.
+        let one_per_layer = seen(&[("model.layers.0.q_norm.weight", &[2048])]);
+        assert!(per_head.check(&one_per_layer).is_err());
+        assert!(global.check(&one_per_layer).is_ok());
     }
 
     /// A mismatch reports every disagreement, because "which variant is

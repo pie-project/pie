@@ -17,8 +17,8 @@ use driver_metal::lowering::dispatch::{
     Dispatch, Geometry, Undispatchable, dims_of, pipelines_needed, plan_one,
 };
 use driver_metal::lowering::executor::{Frame, Resolver, Slice};
-use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-use model::families::llama_like::forward::llama_like_metal;
+use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Fire, Lowered, Row, lower};
 use model_compiler::trace::{FireClass, ValueId};
 

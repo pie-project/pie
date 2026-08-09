@@ -1,4 +1,4 @@
-//! A generation may name `families/` and the shared root. Never a sibling.
+//! A generation may name `shared/` and the shared root. Never a sibling.
 //!
 //! Twenty generations were twenty crates, and the reason given was always this
 //! rule: a crate boundary is the only thing Rust has that stops one generation
@@ -13,7 +13,7 @@
 //! record of the violation rather than a defence against it.
 //!
 //! So this test comes with the thing that makes the rule keepable:
-//! [`families`](model::families), a legitimate home for what more than one
+//! [`shared`](model::shared), a legitimate home for what more than one
 //! generation binds. ChatML lives there now. The rule and the escape hatch
 //! arrive together on purpose — a rule with nowhere to put the exception is a
 //! rule that gets an exception written into it.
@@ -36,13 +36,16 @@ fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// The generation modules: directory modules under `src/`, minus the four
-/// that are not generations — `families/` (cross-generation sharing), `ffi/`
-/// (the C boundary, one door for all of them), `config/` (the `pie.model/1`
-/// descriptor, an aspect every generation is parameterized by rather than one
-/// generation's property) and `bin/` (cargo's layout, not this crate's).
+/// The generation modules: directory modules under `src/`, minus the three
+/// that are not generations — `shared/` (the vocabulary a generation is
+/// allowed to name), `ffi/` (the C boundary, one door for all of them) and
+/// `bin/` (cargo's layout, not this crate's).
+///
+/// `config/` used to be a fourth. It held the `pie.model/1` descriptor, an
+/// aspect every generation was parameterized by rather than one generation's
+/// property, and it is deleted: the catalog answers what it resolved.
 fn generations() -> Vec<String> {
-    let not_a_generation = ["families", "ffi", "config", "bin"];
+    let not_a_generation = ["shared", "ffi", "bin"];
     let mut names: Vec<String> = std::fs::read_dir(src())
         .expect("src/ exists")
         .filter_map(Result::ok)
@@ -108,7 +111,7 @@ fn no_generation_names_a_sibling() {
         found.is_empty(),
         "a generation names a sibling:\n{}\n\n\
          What two generations share is not one generation's property. Move it \
-         to `families/` and let both name it there -- that is what the module \
+         to `shared/` and let both name it there -- that is what the module \
          is for, and it is why this rule is keepable at all.",
         found.join("\n")
     );

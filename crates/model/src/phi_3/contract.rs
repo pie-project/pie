@@ -14,7 +14,7 @@ use model_loader::checkpoint::RawTensor;
 use model_loader::contract::Expr;
 use model_loader::error::Error;
 
-use crate::builder::Builder;
+use crate::shared::builder::Builder;
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))

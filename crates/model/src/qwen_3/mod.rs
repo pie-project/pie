@@ -17,8 +17,8 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
-use crate::families::llama_like::project;
-use crate::families::llama_like::spec::LlamaLikeFacts;
+use crate::shared::llama_like::project;
+use crate::shared::llama_like::spec::LlamaLikeFacts;
 use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
@@ -370,18 +370,47 @@ impl Variant for Qwen3 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
-        crate::llama_3::contract::author_llama_like(builder)
+        match builder.naming() {
+            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_llama_like(builder),
+            // The registry this replaced held an MLX row for `qwen3` and `qwen3_moe`,
+            // and a row that states only the HF author hands Metal the
+            // checkpoint's own names and its own dtype. See
+            // `llama_3::mod`'s `author`.
+            crate::shared::policy::Naming::Mlx => crate::shared::llama_like::contract::author_llama_mlx(builder),
+        }
     }
 
+    /// This row's text, for whichever backend asked.
+    ///
+    /// The epsilon is the generation CONSTANT and not a row field, for
+    /// the reason [`NORM_EPS`] gives: every published Qwen-3 config
+    /// states `1e-6`, and a row that could hold a different one would
+    /// be a row that can disagree with the generation for no reason a
+    /// checkpoint gave it.
+    ///
+    /// `rope_rescaled: false`: Qwen 3 publishes no `rope_scaling` in
+    /// any release this table holds, dense or mixture. Its long-context
+    /// story is YaRN applied at serve time, which is not a fact the
+    /// weights carry.
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        Ok(project::trace(&self.shape, class, load))
+        project::trace(
+            &self.shape,
+            project::MetalRow {
+                rope_theta: self.rope_theta,
+                norm_eps: NORM_EPS,
+                window: self.window,
+                rope_rescaled: false,
+            },
+            class,
+            load,
+        )
     }
 
     /// ChatML, and stated rather than fallen through to.
@@ -391,9 +420,9 @@ impl Variant for Qwen3 {
     /// is gone; this row says ChatML because Qwen 3 is ChatML.
     #[cfg(feature = "chat")]
     fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(crate::families::chatml::QwenInstruct::new(
+        Arc::new(crate::shared::chatml::QwenInstruct::new(
             tokenizer,
-            crate::families::chatml::QWEN_CHATML,
+            crate::shared::chatml::QWEN_CHATML,
         ))
     }
 }
@@ -422,7 +451,8 @@ mod tests {
         assert_ne!(moe.shape.moe_intermediate, 0);
         // And the manifest agrees, because it is a projection of the
         // same field: a mixture ships a router, a dense block does not.
-        let names: Vec<&str> = moe.manifest().tensors.iter().map(|t| t.name.as_str()).collect();
+        let binding = moe.manifest();
+        let names: Vec<&str> = binding.tensors.iter().map(|t| t.name.as_str()).collect();
         assert!(names.iter().any(|n| n.contains("mlp.gate")), "{names:?}");
     }
 

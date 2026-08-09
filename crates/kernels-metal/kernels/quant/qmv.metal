@@ -83,17 +83,25 @@ inline U qdot(
 }
 
 // `packs_per_thread` is what sets the K stride: block_size = 32 * pack_factor *
-// packs_per_thread, and the reduction loop assumes K is a whole number of blocks.
-// At 4 bits that is 512 for the two-pack default and 256 for one pack, which is
-// why gemma4's `per_layer_projection` (K=256) needs the narrow instantiation --
-// the fast one reads 512 elements of a 256-element row.
+// packs_per_thread. At 4 bits that is 512 for the two-pack default and 256 for
+// one pack.
 //
-// Two is also the measured best for the models that use this path, which is not
-// the same answer the bounds-checked tail gives (see `qmv_gptoss_impl`, where
-// dense wants two and routed wants one). Decode GB/s at four:
-// gemma-4-31b 287.7 -> 283.4, Qwen3.6-27B 273.8 -> 267.5. Wider reads here buy
-// nothing because K is already a whole number of 512s by construction, so the
-// only thing the extra pack changes is how much state a lane carries.
+// The reduction loop no longer ASSUMES K is a whole number of blocks -- it
+// guards the tail, and the note in the loop is where that story is. This
+// comment used to end "K is already a whole number of 512s by construction",
+// one sentence after observing that gemma4's `per_layer_projection` (K=256)
+// needs the narrow instantiation because "the fast one reads 512 elements of a
+// 256-element row". The same fact, written twice, once as a defect worked
+// around by picking a different instantiation and once as an invariant that
+// holds. It was the second that was believed, and gemma-4-31b's K=5376 --
+// which no instantiation divides -- fell through both.
+//
+// Two is still the measured best for the models that use this path, which is
+// not the same answer the bounds-checked tail gives (see `qmv_gptoss_impl`,
+// where dense wants two and routed wants one). Decode GB/s at four:
+// gemma-4-31b 287.7 -> 283.4, Qwen3.6-27B 273.8 -> 267.5. Wider reads buy
+// nothing here; the only thing the extra pack changes is how much state a lane
+// carries.
 template <typename T, int group_size, int bits, int packs_per_thread_ = 2>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
@@ -147,21 +155,50 @@ METAL_FUNC void qmv_fast_impl(
   y += tid.x * out_vec_size + out_row;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
-      U s = sl[0];
-      U b = bl[0];
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    // THE TAIL, and its absence was a wrong answer rather than a fault.
+    //
+    // The comment above this template used to state that "K is already a
+    // whole number of 512s by construction". It is a whole number of
+    // `group_size`s by construction -- that is what quantization means --
+    // and nothing makes it a whole number of the REDUCTION BLOCK, which is
+    // `values_per_thread * 32` and has no relation to the group. Every
+    // deployment this driver had run happened to satisfy it (llama-3.2's
+    // 2048, qwen3's 4096, gpt-oss's 2880 through its own kernel), so the
+    // claim read as a fact for as long as no checkpoint falsified it.
+    //
+    // gemma-4-31b's hidden is 5376, which is 512 * 10.5. The last iteration
+    // then read 256 elements past the end of the activation row, past the
+    // end of each weight row, and -- for the LAST output row of the matrix
+    // -- past the end of the tensor itself, into whichever tensor the loader
+    // staged next. A scale read out of another tensor's packed bytes is an
+    // arbitrary bf16, so `layer.0.up_proj` wrote 2.4e28 into its last column
+    // while `layer.0.gate_proj`, same shape and same input, wrote 18. The
+    // failure looked like one broken binding and was the whole family of
+    // projections whose K is 5376: q, k, v, gate and up. o_proj (K=8192) and
+    // down (K=21504) divide and were right.
+    //
+    // A lane is wholly in or wholly out, never split: `values_per_thread` is
+    // 16 at four bits and 8 at eight, and `in_vec_size` is a multiple of
+    // `group_size` (64 or 32), so the remainder is a whole number of lanes.
+    // That makes the guard one compare against a value every lane already
+    // holds -- no partial load, no masked dot -- and it is uniform across a
+    // simdgroup for every block but the last.
+    if (k + int(simd_lid) * values_per_thread < in_vec_size) {
+      U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T* sl = scales + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      }
     }
     ws += block_size * bytes_per_pack / pack_factor;
     scales += block_size / group_size;
     biases += block_size / group_size;
     x += block_size;
   }
-
   // Bounded, because a simdgroup produces four outputs whether or not the
   // matrix has four left. Every projection here used to be a whole number of
   // eight and the host rounded the grid DOWN, which cost nothing until a
@@ -240,15 +277,21 @@ METAL_FUNC void qmv_fast_residual_impl(
   y += tid.x * out_vec_size + out_row;
   residual += tid.x * out_vec_size + out_row;
 
+  // The same K tail as `qmv_fast_impl`, and the same reason -- see the note
+  // there. This variant fuses the residual add into the write-back and is
+  // otherwise the same reduction, so a guard in one and not the other would
+  // make `o_proj` right and `o_proj + residual` wrong on the same checkpoint.
   for (int k = 0; k < in_vec_size; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
-      U s = sl[0];
-      U b = bl[0];
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    if (k + int(simd_lid) * values_per_thread < in_vec_size) {
+      U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T* sl = scales + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      }
     }
     ws += block_size * bytes_per_pack / pack_factor;
     scales += block_size / group_size;

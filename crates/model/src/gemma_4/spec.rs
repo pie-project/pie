@@ -63,6 +63,20 @@ pub struct Gemma4Facts {
     /// [`Self::head_dim`] on E4B (512 vs 256), which is why the two
     /// kinds cannot share one width the way qwen3_5's do.
     pub global_head_dim: u32,
+    /// `num_global_key_value_heads` — the FULL layers' kv-head count.
+    ///
+    /// The second half of the head shape, and the half that had no
+    /// field. `global_head_dim` alone says a full layer's heads are
+    /// wider; it does not say there are fewer of them, and there are:
+    /// the 31b runs 16 sliding against 4 global, the 26b 8 against 2.
+    /// A pool sizing a full layer's page at the sliding count reads
+    /// three quarters past the end of its K — not a crash, a fluent
+    /// model reading another layer's memory.
+    ///
+    /// HF defaults this key to `num_key_value_heads` when the config
+    /// omits it, which is what the E-series rows state: one shape's
+    /// count at two widths.
+    pub global_kv_heads: u32,
     /// Partial-rotary width on the FULL layers, resolved the driver's
     /// way (`max(2, 2 * int(0.5 * factor * head_dim))`): 0.25 × 512
     /// gives 128. Sliding layers rotate fully.
@@ -138,6 +152,17 @@ impl Gemma4Facts {
         }
     }
 
+    /// This layer's kv-head COUNT, which varies with the same predicate
+    /// and by a different factor. See [`Self::global_kv_heads`].
+    #[must_use]
+    pub fn kv_heads_of(&self, l: u32) -> u32 {
+        if self.is_full_attn(l) {
+            self.global_kv_heads
+        } else {
+            self.kv_heads
+        }
+    }
+
     /// `google/gemma-4-E4B-it`, read from the checkpoint's own
     /// `config.json` (`text_config`) — every value a field of that file
     /// or the driver's stated derivation from one.
@@ -151,6 +176,9 @@ impl Gemma4Facts {
             kv_heads: 2,
             head_dim: 256,
             global_head_dim: 512,
+            // `num_global_key_value_heads` is absent from this
+            // row's config, and HF reads that as the sliding count.
+            global_kv_heads: 2,
             // partial_rotary_factor 0.25 on `global_head_dim` 512.
             global_rotary_dim: 128,
             intermediate: 10_240,
@@ -184,6 +212,9 @@ impl Gemma4Facts {
             kv_heads: 1,
             head_dim: 256,
             global_head_dim: 512,
+            // `num_global_key_value_heads` is absent from this
+            // row's config, and HF reads that as the sliding count.
+            global_kv_heads: 1,
             // 0.25 * 512 through `max(2, 2 * int(0.5 * f * d))`.
             global_rotary_dim: 128,
             intermediate: 6144,
@@ -192,6 +223,47 @@ impl Gemma4Facts {
             kv_shared_layers: 20,
             ple_dim: 256,
             double_wide_shared: true,
+            logit_softcap: 30.0,
+        }
+    }
+
+    /// `google/gemma-4-31B-it`, from its own `config.json`
+    /// (`text_config`) — the DENSE 31B, and the only gemma-4 in the
+    /// corpus this repo has real weights and an MLX reference for.
+    ///
+    /// It was missing from this table, which is a quieter failure than
+    /// a wrong number: a checkpoint that matches no row is refused as
+    /// "no model this build serves", and the model every gemma fix in
+    /// the driver had been verified against stopped being servable
+    /// without anything saying so.
+    ///
+    /// The two head shapes are its own and are the reason
+    /// [`Self::global_kv_heads`] exists: 16x256 on a sliding layer,
+    /// 4x512 on a full one, so BOTH numbers change and neither implies
+    /// the other. `num_kv_shared_layers` is 0 and
+    /// `hidden_size_per_layer_input` is 0, so there is no sharing and
+    /// no PLE — the E-series' two defining structures are both absent
+    /// here.
+    #[must_use]
+    pub const fn gemma_4_31b() -> Self {
+        Self {
+            hidden: 5376,
+            layers: 60,
+            full_attn_interval: 6,
+            q_heads: 32,
+            kv_heads: 16,
+            head_dim: 256,
+            global_head_dim: 512,
+            global_kv_heads: 4,
+            // partial_rotary_factor 0.25 on `global_head_dim` 512, from
+            // this row's `rope_parameters.full_attention`.
+            global_rotary_dim: 128,
+            intermediate: 21_504,
+            vocab: 262_144,
+            tied_embeddings: true,
+            kv_shared_layers: 0,
+            ple_dim: 0,
+            double_wide_shared: false,
             logit_softcap: 30.0,
         }
     }
@@ -218,6 +290,7 @@ impl Gemma4Facts {
             kv_heads: 8,
             head_dim: 256,
             global_head_dim: 512,
+            global_kv_heads: 2,
             global_rotary_dim: 128,
             intermediate: 2112,
             vocab: 262_144,

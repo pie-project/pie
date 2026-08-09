@@ -59,7 +59,49 @@ pub static KERNELS: &[KernelSig] = &[
     // 9 in quantized_qmm_t.metal
     kernel!(mxfp4_qmm_t_routed_bias "mxfp4_qmm_t_routed_bias", axes = &[BF16, TILE_M, TILE_N]),
     // 1 in quantized_qmv.metal
-    kernel!(mxfp4_qmv_routed_bias "mxfp4_qmv_routed_bias", axes = &[BF16, GROUP_32, BITS_4]),
+    //
+    // This row named no operands, which made it the one unstated row in the
+    // table that is provably REACHABLE. `model-compiler`'s routed-QMV site
+    // picks the symbol with a `match` on the weight repr --
+    // `WeightRepr::Mxfp4Marlin => "mxfp4_qmv_routed_bias"` against
+    // `affine_qmv_routed{_bias}` for everything else -- and then makes ONE
+    // `with_params` call for both arms. So a driver does try to bind this, and
+    // an operand list it cannot read is a failure at launch rather than dead
+    // code.
+    //
+    // Found from the Vulkan side, by intersecting the operand-less rows with
+    // every symbol literal in `model-compiler`: of the 57, exactly this one
+    // survived. `kernels-vulkan` states it identically.
+    //
+    // The list below is not invented to fill the hole. `qmv.metal` generates
+    // this symbol from `instantiate_gptoss_qmv` with `fn = qmv_routed_bias` --
+    // the SAME macro and the SAME template function as `qmv_routed_bias`
+    // directly above, differing only in the codec and the group/bits point,
+    // neither of which appears in the signature. The twelve parameters are
+    // therefore identical operand for operand, and this is that row's list
+    // copied across rather than reconstructed.
+    //
+    // `biases` stays in the ABI and stays unread: the MXFP4 codec has no
+    // separate bias plane, so the kernel takes the pointer and ignores it. A
+    // row is positional, so dropping the slot would shift everything after it.
+    kernel!(mxfp4_qmv_routed_bias "mxfp4_qmv_routed_bias",
+    file = Some("quant/qmv.metal"),
+    launch = kernels::LaunchRule::RoutedQmv,
+    operands = kernels::operands![
+        w: Buf <- kernels::Source::Weight(0),
+        scales: Buf <- kernels::Source::Weight(1),
+        biases: Buf <- kernels::Source::Weight(2),
+        x: Buf <- kernels::Source::In(0),
+        y: BufMut <- kernels::Source::Out(0),
+        in_vec_size: I32 <- kernels::Source::Param(0),
+        out_vec_size: I32 <- kernels::Source::Param(1),
+        bias: Buf <- kernels::Source::Weight(3),
+        expert_ids: Buf <- kernels::Source::In(1),
+        x_slot_stride: I32 <- kernels::Source::Param(2),
+        x_row_stride: I32 <- kernels::Source::Param(3),
+        slots_per_row: I32 <- kernels::Source::Param(4),
+    ],
+    axes = &[BF16, GROUP_32, BITS_4]),
     // 54 in quantized_qmm_t.metal
     kernel!(qmm_t_routed "affine_qmm_t_routed", axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
     // 9 in quantized_qmm_t.metal

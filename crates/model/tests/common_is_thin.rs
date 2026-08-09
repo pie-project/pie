@@ -38,18 +38,12 @@ use std::path::PathBuf;
 /// under `model/src/` is covered the moment it exists. `common` itself is
 /// excluded, obviously, and so are the aspect modules that are not families.
 fn family_names() -> Vec<String> {
-    // A generation is a DIRECTORY module under `src/`; the shared root is the
-    // loose `.rs` files beside them. Four directories are not generations:
-    // `families/` is cross-generation sharing, `ffi/` is the C boundary (one
-    // door for all of them), `config/` is the descriptor aspect, and `bin/`
-    // is cargo's, not this crate's layout at all.
-    //
-    // `config/` in particular MUST be here: the word "config" occurs all over
-    // the shared root in code (`crate::config::VERSION` in `facts.rs`), so
-    // leaving it in would make the guard below fire on the very reference
-    // that is correct.
+    // A generation is a DIRECTORY module under `src/`. Three directories are
+    // not generations: `shared/` is the vocabulary a generation may name,
+    // `ffi/` is the C boundary (one door for all of them), and `bin/` is
+    // cargo's layout, not this crate's.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let not_a_generation = ["families", "ffi", "config", "bin"];
+    let not_a_generation = ["shared", "ffi", "bin"];
     let mut names: Vec<String> = std::fs::read_dir(&root)
         .expect("src/ exists")
         .filter_map(Result::ok)
@@ -81,16 +75,26 @@ fn family_names() -> Vec<String> {
     names
 }
 
-/// The shared root: every `.rs` beside the generation directories that holds
-/// vocabulary rather than dispatch.
+/// The shared perimeter: every `.rs` that a generation may reach for, and
+/// that must therefore hold vocabulary rather than knowledge.
 ///
-/// `SHARED` and `NOT_SHARED` must between them name every root file. That
+/// Two directories now, and both are listed with their path from `src/` so
+/// they cannot be confused: the crate ROOT (the catalog and its answers) and
+/// `shared/` (the vocabulary a generation is allowed to name). Before those
+/// were one, the loose files at the root WERE the shared root; the split
+/// moved the sharing into `shared/` and left the root as the table's own
+/// surface, so this guard has to walk both to mean what it meant.
+///
+/// `SHARED` and `NOT_SHARED` must between them name every file in both. That
 /// exhaustiveness IS the guard now that no crate boundary draws the line: a
-/// new root module cannot be quietly shared, because an unclassified one fails
+/// new module cannot be quietly shared, because an unclassified one fails
 /// here before any family check runs.
 const SHARED: &[&str] = &[
-    "builder.rs", "decoders.rs", "facts.rs", "instruct.rs", "metadata.rs",
-    "mlx.rs", "moe.rs", "policy.rs", "probe.rs",
+    // ── The crate root: the table's own surface ──
+    "encoding.rs",
+    "instruct.rs",
+    "manifest.rs",
+    "metadata.rs",
     // `deployment.rs` belongs here and the fact that it PASSES is the
     // whole claim: it is what a driver receives, and a driver that
     // could read a family name off it could branch on one. The guard
@@ -108,8 +112,15 @@ const SHARED: &[&str] = &[
     // `&dyn Variant` now, so it holds no family names at all — which is
     // why it moved from the exceptions below to the perimeter here.
     "contract.rs",
+    // ── `shared/`: the general vocabulary half ──
+    "shared/builder.rs",
+    "shared/decoders.rs",
+    "shared/mlx.rs",
+    "shared/moe.rs",
+    "shared/policy.rs",
+    "shared/probe.rs",
 ];
-/// Root files that name families ON PURPOSE, with the reason each does.
+/// Files that name families ON PURPOSE, with the reason each does.
 const NOT_SHARED: &[(&str, &str)] = &[
     ("lib.rs", "the crate doc, which names the generations it declares"),
     (
@@ -122,24 +133,46 @@ const NOT_SHARED: &[(&str, &str)] = &[
     ),
     ("multimodal.rs", "family-aware by design -- it dispatches on a VisionArch"),
     (
-        "ffi.rs",
-        "a DOOR, not vocabulary: one `extern \"C\"` entry per family is what \
-         the C surface of a per-family declaration looks like",
-    ),
-    (
-        "weight_names.rs",
-        "a MAP between two of this crate's own vocabularies: the trace names \
-         the DSL invents and the published names a contract author invents. \
-         Each family's walk recognises itself by a tensor only it ships, so \
-         naming families is what the module IS",
-    ),
-    (
         "emissions.rs",
         "a DEPLOYMENT LIST: which families' static forms are committed, from \
          which fact sets -- shared between the emit-cuda bin and the \
          regeneration check so neither holds a copy, and per-family by its \
          nature",
     ),
+    (
+        "shared/weight_names.rs",
+        "a MAP between two of this crate's own vocabularies: the trace names \
+         the DSL invents and the published names a contract author invents. \
+         Each family's walk recognises itself by a tensor only it ships, so \
+         naming families is what the module IS",
+    ),
+    (
+        "shared/mod.rs",
+        "the directory's own doc and its `pub mod` list, which necessarily \
+         names the shared IMPLEMENTATIONS below — a module list is not a \
+         switch on a family, and the rule it states is the one this file \
+         enforces",
+    ),
+    // The shared IMPLEMENTATIONS. Each is one specific answer that several
+    // generations happen to have in common, and each is named for the
+    // generation that wrote it down first — which is a fact about who wrote
+    // it, not a dispatch on who binds it. They are exempt for the same reason
+    // a generation directory is: naming the family is what the file is about.
+    // The rule they are held to instead is the sibling-isolation one, which
+    // is what makes `shared/` the legitimate home rather than a sibling edge.
+    (
+        "shared/chatml.rs",
+        "ChatML, which qwen3 wrote first and five generations parameterize",
+    ),
+    (
+        "shared/gemma_chat.rs",
+        "gemma's `<start_of_turn>` template, bound by gemma-3 and gemma-3n",
+    ),
+    (
+        "shared/deepseek.rs",
+        "deepseek's shared pieces, bound by more than one deepseek generation",
+    ),
+    ("shared/kimi.rs", "kimi's shared pieces, bound by kimi-k2 and kimi-k3"),
 ];
 
 /// `instruct.rs` is half vocabulary and half registry, in that order, split by
@@ -147,15 +180,27 @@ const NOT_SHARED: &[(&str, &str)] = &[
 const INSTRUCT_REGISTRY_MARKER: &str = "── The registry ──";
 
 fn common_sources() -> Vec<(String, String)> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let on_disk: Vec<String> = std::fs::read_dir(&dir)
-        .expect("src/ exists")
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-        .collect();
-    assert!(!on_disk.is_empty(), "found no sources at the root of src/");
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Both halves of the perimeter, labelled by their path from `src/`. The
+    // family DIRECTORIES under `shared/` are deliberately not walked: a
+    // `shared/llama_like/` names its family in every file, and it is held to
+    // the sibling-isolation rule instead.
+    let mut on_disk: Vec<String> = Vec::new();
+    for (prefix, dir) in [("", src.clone()), ("shared/", src.join("shared"))] {
+        for entry in std::fs::read_dir(&dir).expect("a perimeter directory") {
+            let path = entry.expect("readable entry").path();
+            if path.extension().is_some_and(|x| x == "rs") {
+                let name = path.file_name().unwrap().to_string_lossy();
+                on_disk.push(format!("{prefix}{name}"));
+            }
+        }
+    }
+    assert!(
+        on_disk.len() > 10,
+        "found {} sources across the root and `shared/`; the layout moved and \
+         this guard is now looking in the wrong place",
+        on_disk.len()
+    );
 
     let mut unclassified: Vec<&String> = on_disk
         .iter()
@@ -166,17 +211,29 @@ fn common_sources() -> Vec<(String, String)> {
     unclassified.sort();
     assert!(
         unclassified.is_empty(),
-        "root module(s) classified as neither shared vocabulary nor dispatch: {unclassified:?}.\n\
+        "module(s) classified as neither shared vocabulary nor dispatch: {unclassified:?}.\n\
          Add it to SHARED (and it must then name no family) or to NOT_SHARED with the reason \
          it is allowed to. Silence here would mean a new shared module nothing guards.",
     );
 
+    // And the other direction: a classification naming a file that no longer
+    // exists is a rule pointing at nothing, which reads as green forever.
+    let mut vanished: Vec<&str> = SHARED
+        .iter()
+        .chain(NOT_SHARED.iter().map(|(n, _)| n))
+        .copied()
+        .filter(|n| !on_disk.iter().any(|f| f == n))
+        .collect();
+    vanished.sort_unstable();
+    assert!(
+        vanished.is_empty(),
+        "classified module(s) that are not on disk: {vanished:?}. A rule about \
+         a file that moved is a rule that guards nothing.",
+    );
+
     let mut out = Vec::new();
     for name in SHARED {
-        if !on_disk.iter().any(|f| f == name) {
-            continue;
-        }
-        let text = std::fs::read_to_string(dir.join(name)).expect("read a shared source");
+        let text = std::fs::read_to_string(src.join(name)).expect("read a shared source");
         let text = match text.find(INSTRUCT_REGISTRY_MARKER) {
             Some(at) if *name == "instruct.rs" => text[..at].to_string(),
             _ => text,
@@ -240,15 +297,22 @@ fn common_writes_down_no_family_name() {
 #[test]
 fn the_family_list_matches_real_code() {
     let families = family_names();
-    let llama = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/llama_3/contract.rs");
-    let text = std::fs::read_to_string(&llama).expect("read Llama 3's contract");
+    // A GENERATION's own module, which is the thing the list is meant to
+    // recognise. It used to be `llama_3/contract.rs`, which moved to
+    // `shared/llama_like/contract.rs` when the three authoring passes ten
+    // generations bind stopped pretending to be llama-3's — and a shared
+    // file is the wrong oracle for this, because the whole claim above is
+    // that shared files hold no family names. `llama_3/mod.rs` is llama-3's
+    // and stays llama-3's: it is where its rows are written down.
+    let llama = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/llama_3/mod.rs");
+    let text = std::fs::read_to_string(&llama).expect("read Llama 3's own module");
     let hits = families
         .iter()
         .filter(|f| text.to_ascii_lowercase().contains(f.as_str()))
         .count();
     assert!(
         hits >= 2,
-        "the family-name list matched {hits} names in llama's own contract; \
+        "the family-name list matched {hits} names in llama's own module; \
          it is not looking for the right strings"
     );
 }

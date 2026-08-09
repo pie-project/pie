@@ -5,7 +5,7 @@
 //! trailing newline; the caller should prepend it to the first user turn.
 //! No thinking or tool-use support.
 
-use crate::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use tokenizer::Tokenizer;
 use std::sync::Arc;

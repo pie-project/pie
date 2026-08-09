@@ -22,8 +22,8 @@ use model_loader::contract::{Expr, TensorType};
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding, TensorId};
 
-use crate::builder::{Builder, is_raw, mxfp4_encoding};
-use crate::probe::hf_shard_axis;
+use crate::shared::builder::{Builder, is_raw, mxfp4_encoding};
+use crate::shared::probe::hf_shard_axis;
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))

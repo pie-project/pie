@@ -21,8 +21,8 @@
 
 use std::collections::BTreeSet;
 
-use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
-use model::families::llama_like::forward::llama_like_cuda;
+use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{CondRegion, Fire, GuardMode, Launch, Lowered, Row, lower_with};
 use driver_cuda::fire::recordings::predicate_of;
 use model_compiler::trace::FireClass;

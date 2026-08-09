@@ -48,10 +48,10 @@ fn texts() -> Vec<Text> {
         Text {
             name: "llama_like",
             plan: |class| {
-                use model::families::llama_like::forward::facts::{
+                use model::shared::llama_like::forward::facts::{
                     LlamaLikeFacts, LlamaLikeMetalFacts,
                 };
-                model::families::llama_like::forward::llama_like_metal(
+                model::shared::llama_like::forward::llama_like_metal(
                     &LlamaLikeFacts::qwen3_0_6b(),
                     &LlamaLikeMetalFacts::synthetic(),
                     class,
@@ -74,10 +74,10 @@ fn texts() -> Vec<Text> {
         Text {
             name: "llama_like (qwen3-moe)",
             plan: |class| {
-                use model::families::llama_like::forward::facts::{
+                use model::shared::llama_like::forward::facts::{
                     LlamaLikeFacts, LlamaLikeMetalFacts,
                 };
-                model::families::llama_like::forward::llama_like_metal(
+                model::shared::llama_like::forward::llama_like_metal(
                     &LlamaLikeFacts::qwen3_30b_a3b(),
                     &LlamaLikeMetalFacts::synthetic(),
                     class,
@@ -98,10 +98,10 @@ fn texts() -> Vec<Text> {
         Text {
             name: "llama_like (gpt-oss)",
             plan: |class| {
-                use model::families::llama_like::forward::facts::{
+                use model::shared::llama_like::forward::facts::{
                     LlamaLikeFacts, LlamaLikeMetalFacts,
                 };
-                model::families::llama_like::forward::llama_like_metal(
+                model::shared::llama_like::forward::llama_like_metal(
                     &LlamaLikeFacts::gpt_oss_20b(),
                     &LlamaLikeMetalFacts::gpt_oss_20b(),
                     class,
@@ -124,10 +124,10 @@ fn texts() -> Vec<Text> {
         Text {
             name: "llama_like (gemma facts)",
             plan: |class| {
-                use model::families::llama_like::forward::facts::{
+                use model::shared::llama_like::forward::facts::{
                     LlamaLikeFacts, LlamaLikeMetalFacts,
                 };
-                model::families::llama_like::forward::llama_like_metal(
+                model::shared::llama_like::forward::llama_like_metal(
                     &LlamaLikeFacts::qwen3_0_6b(),
                     &LlamaLikeMetalFacts::gemma_like(),
                     class,

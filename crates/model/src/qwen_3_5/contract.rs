@@ -12,9 +12,9 @@ use model_loader::contract::Expr;
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding, QuantScheme};
 
-use crate::builder::{Builder, is_raw};
-use crate::mlx;
-use crate::moe::hf_moe_expert_stacks;
+use crate::shared::builder::{Builder, is_raw};
+use crate::shared::mlx;
+use crate::shared::moe::hf_moe_expert_stacks;
 
 /// qwen3_5, qwen3_5_text: a dense hybrid decoder under the usual names.
 pub fn author_qwen3_5(b: &mut Builder<'_>) -> Result<(), Error> {

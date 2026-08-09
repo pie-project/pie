@@ -12,12 +12,19 @@
 //! # Why they could go
 //!
 //! Every one was gated on `PIE_METAL_SMOKE_CHECKPOINT` pointing at a
-//! **qwen3.5-family** snapshot -- an architecture no Metal text serves
-//! (`model::text::serves("qwen3_5")` is false, and its config interleaves
-//! linear attention this crate does not model). So they skipped in CI, they
+//! **qwen3.5-family** snapshot -- a generation whose config interleaves
+//! linear attention this crate does not model. So they skipped in CI, they
 //! skipped on any machine without that variable, and the path they drove is
 //! not the path a deployment takes: `MetalDriver::launch` runs the generic
 //! executor and only the generic executor.
+//!
+//! The refusal itself moved while this file sat here. It used to be a string
+//! table (`model::text::serves("qwen3_5")` was false) and is a ROW's answer
+//! now, asked through `model::binding::serves` -- which means the refusal is
+//! the catalog's to state and not this driver's. Worth knowing before reading
+//! the paragraph above as a promise: the row is what refuses, so if a
+//! qwen3.5 row grows a Metal text these gates become reachable without a line
+//! changing here.
 //!
 //! # What runs instead, unconditionally, on every `cargo test`
 //!

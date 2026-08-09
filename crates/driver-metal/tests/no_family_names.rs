@@ -77,10 +77,11 @@ const PREFIXES: &[&str] = &["go_", "ll_", "g4_", "q35_"];
 
 /// Whether a line names a family, spelled out or abbreviated.
 fn names_a_family(line: &str) -> bool {
-    // The same reduction `model/text.rs` applies to an architecture string,
-    // for the same reason: a publisher's capitalisation and punctuation are
-    // not the identity. Matching raw text saw `gemma_facts` and missed
-    // `GemmaFacts`, which is where family names actually appear in Rust.
+    // The same reduction the deleted `model/text.rs` applied to an
+    // architecture string, for the same reason: a publisher's capitalisation
+    // and punctuation are not the identity. Matching raw text saw
+    // `gemma_facts` and missed `GemmaFacts`, which is where family names
+    // actually appear in Rust.
     let flat: String =
         line.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect();
     if FAMILIES.iter().any(|f| {
@@ -106,18 +107,34 @@ const FAMILIES: &[&str] =
 /// this test exists to catch.
 fn budget() -> BTreeMap<&'static str, usize> {
     [
-        // ── The one that is still a question ─────────────────────────
+        // ── The one that is gone ─────────────────────────────────────
         //
-        // The list of architectures a Metal text is written for, plus the
-        // `LlamaLikeFacts` synthesis that feeds it. It is a LOOKUP and not a
-        // dispatch — `metal.md`'s test for the whole crate is *does removing
-        // it change which kernels fire*, and it does not — but it is still a
-        // list of family names in a driver, and it stays budgeted until a
-        // catalog row can be asked for a METAL trace the way it can be asked
-        // for a CUDA one. `Variant::trace` has no backend parameter today,
-        // which is the whole reason this file cannot go to zero.
-        ("model/text.rs", 27),
-        // ── The five that are not ────────────────────────────────────
+        // `model/text.rs` was budgeted 27, for "the list of architectures a
+        // Metal text is written for, plus the `LlamaLikeFacts` synthesis that
+        // feeds it", and its entry said in as many words what would retire
+        // it: *"it stays budgeted until a catalog row can be asked for a
+        // METAL trace the way it can be asked for a CUDA one. `Variant::trace`
+        // has no backend parameter today, which is the whole reason this file
+        // cannot go to zero."*
+        //
+        // It has one now — `catalog::Deployed::backend` — and the file is
+        // DELETED rather than reduced. The eleven architecture strings, the
+        // `canonical()` that folded spellings onto them and the
+        // `facts_from_with()` that rebuilt twenty-nine model facts from nine
+        // tensor probes all went with it, because the row states every one of
+        // them. What replaced it is `model/binding.rs`, which is not in this
+        // table at all: it spells no family name in code, because the six
+        // things it holds are an affine point, an expert bank's format and
+        // three kernel capabilities, and not one of those is a model.
+        //
+        // `serve/state.rs` was budgeted 2, for two `use` paths into
+        // `model::shared::llama_like` — the crate's cross-generation
+        // sharing module — which the shell needed because it held that
+        // family's facts struct. It holds a `&dyn catalog::Variant` and a
+        // `catalog::MetalBinding` now, neither of which is a family's type,
+        // so both imports went and the entry with them.
+        //
+        // ── The six that are not ─────────────────────────────────────
         //
         // A refusal naming the model whose shape caused it: gemma-4 pages
         // two KV geometries, and an operator reading "this pool's layers
@@ -132,19 +149,27 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // and a test fixture's `model_type` string", which the count no
         // longer sees. Their entries are gone rather than zeroed: a file
         // whose only mentions were its own coverage was never in debt.
-        // Two `use` paths into `model::families::llama_like`, which is
-        // `crates/model`'s own cross-generation sharing module. Reading a
-        // shared module that happens to be named after the generation that
-        // first needed it is not branching on a family — but it is also
-        // not nothing, and §5 has the rename as an open item.
-        ("serve/state.rs", 2),
+        // `serve/state.rs` left the same way — see the note above.
+        //
         // `batch/geometry.rs` held `DecodeGeometry::gemma`, a bool named for
         // the family whose norm convention it selected, and then held the
-        // ladder that filled it. Both are gone and the file has NO entry
-        // here, which is the measurement worth reading: it is fifteen hundred
-        // lines about a checkpoint's shape and it spends zero of this budget,
-        // because every family fact in it is either a refusal's prose or a
-        // comment recording what a real checkpoint measured.
+        // ladder that filled it. Both are gone, and what is left is three
+        // lines that are not a dispatch at all: a `RopeScaling::Llama3` match
+        // arm — an enum variant `model::deployment` states, so reading it is
+        // reading the ROW rather than deciding what the model is — and two
+        // lines of the refusal that fires when a checkpoint asks for a YaRN
+        // ladder this driver does not derive. That refusal names llama-3's
+        // `rope_type` because an operator who reads "this driver derives only
+        // llama-3's piecewise table" knows what to do next, and one that
+        // reads "unsupported rope scaling" does not.
+        //
+        // Budgeted at what those three are rather than left unlisted. The
+        // comment here used to claim the file spent ZERO — written when
+        // `PREFIXES` did not exist and the count could not see a match arm —
+        // and an unlisted file that scores is a red build with no argument
+        // attached to it, which is the failure mode this table's `unlisted`
+        // assertion exists to force into the open.
+        ("batch/geometry.rs", 3),
         // The kernel ABI's family-prefixed kind names. Absent from this
         // table until `PREFIXES` was added, because every one of its
         // mentions is an abbreviation: it names no family in full. 62 of
@@ -161,18 +186,19 @@ fn budget() -> BTreeMap<&'static str, usize> {
 /// Lines of DISPATCH that name a family: comments and tests excluded.
 ///
 /// Comments are provenance -- "ports gemma_4/forward" -- not dispatch. Tests
-/// are the opposite of the thing being counted: `assert!(serves("qwen3"))` is
-/// not a driver learning what a model is, it is the guard on the code that
-/// must know. Counting them made writing a test cost budget, which taxes
-/// exactly the work #7 needs; `model/text.rs` was 48 with 37 of them inside
-/// `#[cfg(test)]`, so three quarters of its debt was its own coverage.
+/// are the opposite of the thing being counted: `assert!(serves(row))` is not
+/// a driver learning what a model is, it is the guard on the code that must
+/// know. Counting them made writing a test cost budget, which taxes exactly
+/// the work #7 needs; the deleted `model/text.rs` was 48 with 37 of them
+/// inside `#[cfg(test)]`, so three quarters of its debt was its own coverage.
 fn count(path: &std::path::Path) -> usize {
     let Ok(text) = std::fs::read_to_string(path) else {
         return 0;
     };
     // `#[cfg(test)]` opens a module; it closes when its braces balance.
     // Tracking depth rather than assuming the file ends there matters:
-    // `model/text.rs` has two test modules with real code between them.
+    // `model/text.rs` had two test modules with real code between them, and
+    // `batch/geometry.rs` still does.
     let mut depth = 0i32;
     let mut armed = false;
     let mut n = 0;

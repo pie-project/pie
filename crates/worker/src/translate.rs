@@ -96,7 +96,7 @@ fn build_model(
     let snapshot_dir = PathBuf::from(&group0_caps.snapshot_dir);
     // The metadata was lifted once when the model was resolved; this only
     // decides which of the two shapes the runtime is being handed. Only the
-    // tokenizer half varies -- the descriptor is there either way.
+    // tokenizer half varies -- the config is there either way.
     let tokenizer_path = if metadata.tokenizer.is_some() {
         snapshot_dir.clone()
     } else {
@@ -172,7 +172,7 @@ mod tests {
     fn fixture_metadata() -> model::ModelMetadata {
         model::ModelMetadata {
             tokenizer: None,
-            descriptor: br#"{"version":"pie.model/1","vocab_size":32,"num_hidden_layers":2}"#
+            config: br#"{"version":"pie.model/1","vocab_size":32,"num_hidden_layers":2}"#
                 .to_vec(),
         }
     }

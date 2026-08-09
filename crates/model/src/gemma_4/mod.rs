@@ -204,6 +204,24 @@ pub const VARIANTS: &[Gemma4] = &[
         max_model_len: 131_072,
         towers: E_SERIES_TOWERS,
     },
+    // google/gemma-4-31B and google/gemma-4-31B-it — the DENSE 31B, and
+    // the row this table did not have. `attention_k_eq_v` is true here
+    // and does NOT refuse: this build reads V out of the K projection,
+    // and the 31b reproduces MLX's logits exactly doing it. What the
+    // 26b still lacks is the routed bank, which is now the only thing
+    // `untraced` names.
+    Gemma4 {
+        id: "gemma-4-31b",
+        shape: Gemma4Facts::gemma_4_31b(),
+        mixture: None,
+        sliding_window: 1024,
+        k_eq_v: true,
+        max_model_len: 262_144,
+        // VISION ONLY, and the same tower the 26b ships — 27 layers of
+        // 1152 with a 3-wide pooling kernel, read from this row's own
+        // `vision_config`. `audio_config` is `null`.
+        towers: Towers { audio: None, vision: Some(A4B_VISION) },
+    },
     // google/gemma-4-26B-A4B-it — the row that LOADS and does not SERVE.
     // Its contract authors, its manifest identifies it, and its
     // deployment refuses: `attention_k_eq_v` and a 128-expert routed
@@ -239,15 +257,22 @@ impl Gemma4 {
     ///
     /// ONE predicate for two questions, because a row that cannot be
     /// deployed cannot be traced either and two spellings of that would
-    /// be two chances to disagree. It is the same test the old
-    /// derivation made — `gemma4_attention_k_eq_v || gemma4_enable_moe`
-    /// — moved from a parse of `config.json` to a read of the row.
+    /// be two chances to disagree.
+    ///
+    /// It USED to be the old derivation's whole test —
+    /// `gemma4_attention_k_eq_v || gemma4_enable_moe` — and the first
+    /// half stopped being true. This build does have attention text
+    /// that reads V out of the K projection; gemma-4-31b runs it and
+    /// reproduces MLX's logits exactly. A refusal kept past the day its
+    /// reason expired reads exactly like one that was never wrong, and
+    /// it deleted the only gemma-4 in the corpus with real weights to
+    /// check against. The routed bank is still unwritten, and that is
+    /// what this now says.
     fn untraced(&self) -> Option<Refusal> {
-        if self.k_eq_v || self.mixture.is_some() {
+        if self.mixture.is_some() {
             return Some(Refusal::Unsupported(
-                "gemma-4 26B-A4B: this build has no attention text that reads V out of the K \
-                 projection (`attention_k_eq_v`) and no routed-expert text for a gemma-4 \
-                 block (`gemma4_enable_moe`, 128 experts top-8); the E-series rows serve",
+                "gemma-4 26B-A4B: this build has no routed-expert text for a gemma-4 block \
+                 (`gemma4_enable_moe`, 128 experts top-8); the dense rows serve",
             ));
         }
         None
@@ -300,6 +325,7 @@ impl Variant for Gemma4 {
             self.mixture,
             self.sliding_window,
             NORM_EPS,
+            self.k_eq_v,
             load,
         );
         deployment.towers = self.towers.clone();
@@ -328,11 +354,11 @@ impl Variant for Gemma4 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::policy::Naming::Hf => self::contract::author_gemma4(builder),
-            crate::policy::Naming::Mlx => self::contract::author_gemma4_mlx(builder),
+            crate::shared::policy::Naming::Hf => self::contract::author_gemma4(builder),
+            crate::shared::policy::Naming::Mlx => self::contract::author_gemma4_mlx(builder),
         }
     }
 
@@ -347,9 +373,33 @@ impl Variant for Gemma4 {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
-        let _ = load;
         if let Some(refusal) = self.untraced() {
             return Err(refusal);
+        }
+        // METAL, through `llama_like_metal` with THIS row projected into
+        // the facts it reads. It used to be refused by name here, and
+        // [`project::metal_facts`] records why that refusal was wrong
+        // about the text it named: `llama_like_metal` carries every
+        // gemma-4 field, its own comments are measurements taken on
+        // gemma-4-31b, and what was actually missing was the projection.
+        if let crate::catalog::Backend::Metal(bind) = load.backend {
+            if load.tp_size > 1 {
+                return Err(Refusal::Unsupported(
+                    crate::shared::llama_like::project::NO_METAL_SHARD,
+                ));
+            }
+            let shape = project::metal_shape(&self.shape, self.mixture);
+            let facts = project::metal_facts(
+                &self.shape,
+                self.mixture,
+                self.sliding_window,
+                NORM_EPS,
+                self.k_eq_v,
+                bind,
+            );
+            return Ok(crate::shared::llama_like::forward::llama_like_metal(
+                &shape, &facts, class,
+            ));
         }
         Ok(project::trace(&self.shape, self.sliding_window, class))
     }
@@ -371,7 +421,7 @@ impl Variant for Gemma4 {
 mod tests {
     use super::{
         ARCH, Deployed, Gemma4, Gemma4Facts, Gemma4Mixture, NORM_EPS, Towers, VARIANTS, Variant,
-        rows,
+        project, rows,
     };
     use crate::deployment::{AttnOutput, PrefillStyle, Refusal};
 
@@ -397,8 +447,8 @@ mod tests {
     fn the_rows_are_the_variants() {
         assert_eq!(rows().len(), VARIANTS.len());
         let ids: Vec<&str> = rows().iter().map(|r| r.id()).collect();
-        assert_eq!(ids, vec!["gemma-4-e2b", "gemma-4-e4b", "gemma-4-26b-a4b"]);
-        assert_eq!(rows().len(), 3);
+        assert_eq!(ids, vec!["gemma-4-e2b", "gemma-4-e4b", "gemma-4-31b", "gemma-4-26b-a4b"]);
+        assert_eq!(rows().len(), 4);
     }
 
     /// Ids are unique, non-empty and spelled the way a boundary carries
@@ -536,7 +586,7 @@ mod tests {
             .iter()
             .filter_map(|v| v.deployment(Deployed::single()).ok().map(|d| (v.id, d)))
             .collect();
-        assert_eq!(deployed.len(), 2, "the A4B refuses, so two rows advertise");
+        assert_eq!(deployed.len(), 3, "the A4B refuses, so three rows advertise");
         let labels: std::collections::BTreeSet<&str> =
             deployed.iter().map(|(_, d)| d.advertised.arch).collect();
         assert_eq!(labels.len(), 1, "one family, one label");
@@ -642,29 +692,40 @@ mod tests {
         // derivation for this model type".
         assert!(text.contains("gemma-4"), "the refusal must name the model: {text}");
         assert!(text.contains("routed-expert"), "the refusal must name what is missing: {text}");
-        assert!(text.contains("attention_k_eq_v"), "and the key it is about: {text}");
-        assert!(text.contains("gemma4_enable_moe"), "and the other one: {text}");
+        assert!(text.contains("gemma4_enable_moe"), "and the config key it is about: {text}");
+        // `attention_k_eq_v` USED to be named here as a second missing
+        // leg. It is not missing, and a refusal listing a reason that
+        // has been implemented sends a reader to fix what already works.
         assert!(
-            text.contains("E-series rows serve"),
+            !text.contains("attention_k_eq_v"),
+            "the k/v mode is served now, so the refusal must not still blame it: {text}"
+        );
+        assert!(
+            text.contains("dense rows serve"),
             "a refusal that says what DOES work is the difference between a dead end and a \
              next step: {text}"
         );
     }
 
-    /// The two dense rows deploy, so the refusal above is about the A4B
-    /// and not about the generation.
+    /// The three dense rows deploy, so the refusal above is about the
+    /// A4B and not about the generation.
     #[test]
     fn the_dense_rows_serve() {
-        for id in ["gemma-4-e2b", "gemma-4-e4b"] {
+        for id in ["gemma-4-e2b", "gemma-4-e4b", "gemma-4-31b"] {
             let d = row(id).deployment(Deployed::single());
             assert!(d.is_ok(), "{id} refused, and its legs are all traced");
         }
     }
 
     /// One predicate answers both questions, so a row cannot deploy and
-    /// then fail to trace. The A4B's k/v mode alone would refuse even
-    /// without the routed bank, and the test states that by asking a row
-    /// that has one and not the other.
+    /// then fail to trace.
+    ///
+    /// The k/v mode used to be half of that predicate, and this test
+    /// asserted a hypothetical row carrying it alone would refuse. It
+    /// SERVES: gemma-4-31b is exactly that row — dense, `k_eq_v` — and
+    /// it reproduces MLX's logits on real weights. The hypothetical is
+    /// kept, inverted, because the pairing is the thing worth holding:
+    /// whatever `untraced` answers, `deployment` must agree.
     #[test]
     fn a_row_that_cannot_deploy_cannot_trace_either() {
         assert!(row("gemma-4-26b-a4b").untraced().is_some());
@@ -680,9 +741,122 @@ mod tests {
             towers: Towers::default(),
         };
         assert!(
-            k_eq_v_only.untraced().is_some(),
-            "V read from K is a different attention, not a different width"
+            k_eq_v_only.untraced().is_none(),
+            "V read from K is a different attention and this build has it"
         );
-        assert!(k_eq_v_only.deployment(Deployed::single()).is_err());
+        assert!(k_eq_v_only.deployment(Deployed::single()).is_ok());
+
+        // The pairing, on the row that DOES refuse.
+        let a4b = row("gemma-4-26b-a4b");
+        assert!(a4b.untraced().is_some());
+        assert!(a4b.deployment(Deployed::single()).is_err());
+    }
+
+    /// A METAL load traces the llama-like Metal text, at THIS row's
+    /// widths.
+    ///
+    /// This test asserted the opposite — that every variant refused with
+    /// a `project::NO_METAL` constant — and the refusal it pinned said
+    /// `llama_like_metal` "states the widths without the fused-projection
+    /// split or the shared-cache attention built on them". It states all
+    /// of them, and gemma-4-31b passed all twelve of `driver-metal`'s
+    /// real-weight gates through that text at 5d7e05526. What was missing
+    /// was the PROJECTION, which `driver-metal/src/model/text.rs` used to
+    /// do from tensor probes and which [`project::metal_facts`] does from
+    /// the row.
+    ///
+    /// So the guard changed shape rather than went away. Its point was
+    /// that a row must not be traced AS a llama — the `LLAMA_LIKE` table
+    /// answered from an architecture string and could say yes to a row
+    /// whose text does not exist — and what stops that is not a refusal
+    /// but the widths: a gemma-4 traced as a generic llama would carry
+    /// ONE attention shape, and this asserts the two.
+    #[cfg(feature = "forward")]
+    #[test]
+    fn a_metal_load_traces_this_rows_two_attention_shapes_and_not_a_llamas() {
+        use crate::catalog::{Backend, Deployed, MetalBinding};
+        use model_compiler::trace::FireClass;
+
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+        };
+        assert!(!VARIANTS.is_empty());
+        let mut two_shaped = 0usize;
+        for v in VARIANTS {
+            if v.untraced().is_some() {
+                continue;
+            }
+            for class in [FireClass::Prefill, FireClass::Decode] {
+                let plan = v
+                    .trace(class, Deployed::metal(&bind))
+                    .expect("this row projects into the llama-like Metal text");
+                assert!(
+                    plan.family.starts_with("llama_like.metal."),
+                    "`{}` traced `{}`",
+                    v.id,
+                    plan.family
+                );
+                assert_ne!(plan.ops.len(), 0);
+            }
+
+            // The two shapes, which is what "not as a llama" means. A
+            // generic llama states ONE `head_dim` and ONE `kv_heads`;
+            // this row's full layers are twice as wide per head and
+            // carry a quarter the KV heads, and the facts say so.
+            let facts = project::metal_facts(
+                &v.shape,
+                v.mixture,
+                v.sliding_window,
+                NORM_EPS,
+                v.k_eq_v,
+                &bind,
+            );
+            if v.shape.global_head_dim > 0 {
+                two_shaped += 1;
+                assert_eq!(facts.global_head_dim, v.shape.global_head_dim);
+                assert_eq!(facts.global_kv_heads, v.shape.global_kv_heads);
+                let full = (0..v.shape.layers).find(|l| v.shape.is_full_attn(*l));
+                let slide = (0..v.shape.layers).find(|l| !v.shape.is_full_attn(*l));
+                if let (Some(full), Some(slide)) = (full, slide) {
+                    assert_ne!(
+                        facts.head_dim_at(full, v.shape.head_dim),
+                        facts.head_dim_at(slide, v.shape.head_dim),
+                        "`{}` reads one width at both layer kinds",
+                        v.id
+                    );
+                }
+            }
+            // Two rotary bases, and `rope_theta_at` picks off the same
+            // window list the widths do.
+            assert_eq!(facts.rope_theta, project::ROPE_THETA_GLOBAL);
+            assert_eq!(facts.rope_theta_sliding, project::ROPE_THETA_LOCAL);
+            // The three weightless facts no checkpoint could contradict.
+            assert!(facts.v_norm, "`{}` dropped the V norm", v.id);
+            assert_eq!(facts.activation, crate::shared::llama_like::forward::facts::Activation::Geglu);
+            assert!(facts.embed_scale > 0.0, "gemma scales its embeddings");
+        }
+        assert!(two_shaped > 0, "no variant exercised the two-shape path");
+
+        // A SHARDED Metal load is still refused: `LlamaLikeMetalFacts`
+        // has no shard vocabulary, so the text would state the whole
+        // model's widths against one rank's slice.
+        let sharded = Deployed { backend: Backend::Metal(&bind), tp_size: 4, layer_scalars: &[] };
+        let served = VARIANTS.iter().find(|v| v.untraced().is_none()).expect("one row traces");
+        assert!(served.trace(FireClass::Decode, sharded).is_err());
+
+        // And CUDA is unchanged.
+        for v in VARIANTS {
+            if v.untraced().is_some() {
+                continue;
+            }
+            let cuda = v.trace(FireClass::Decode, Deployed::single()).expect("CUDA still traces");
+            assert!(cuda.family.starts_with("gemma4"), "{}", cuda.family);
+        }
+        assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }

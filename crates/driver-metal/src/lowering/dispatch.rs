@@ -268,13 +268,41 @@ pub fn dims_of(
             .flatten()
             .filter(|n| *n > 0)
     });
+    // The head width the KERNEL will use, when the row states one. Read the
+    // same way, because it is the same question: a number the fire cannot
+    // answer for every layer.
+    let stated_head = sig.head_param.and_then(|i| {
+        let at = launch.params.start as usize + i as usize;
+        (at < launch.params.end as usize)
+            .then(|| lowered.params.get(at).copied())
+            .flatten()
+            .filter(|n| *n > 0)
+    });
+    // The head COUNT the KERNEL will use, when the row states one. The third
+    // reading of the same statement, and it is here because a head SHAPE is
+    // two numbers: gemma-4's full-attention layers carry four 512-wide KV
+    // heads where its sliding layers carry sixteen 256-wide ones, and a grid
+    // that takes the width from the statement and the count from the fire is
+    // still describing neither layer.
+    let stated_heads = sig.heads_param.and_then(|i| {
+        let at = launch.params.start as usize + i as usize;
+        (at < launch.params.end as usize)
+            .then(|| lowered.params.get(at).copied())
+            .flatten()
+            .filter(|n| *n > 0)
+    });
+    let width = sizing_width(lowered, launch);
     Dims {
         rows: launch.rows.end - launch.rows.start,
-        width: sizing_width(lowered, launch),
+        width,
         in_width: input_width(lowered, launch),
         q_heads: geometry.q_heads,
-        kv_heads: geometry.kv_heads,
-        head_dim: geometry.head_dim,
+        kv_heads: stated_heads.unwrap_or(geometry.kv_heads),
+        head_dim: stated_head.unwrap_or(geometry.head_dim),
+        // The SAME stated number, read by whichever rule asked for it: a
+        // rope's rotated channels, a norm's reduction axis. A row names one
+        // scalar as its extent and its rule knows which dimension that is.
+        axis: stated.unwrap_or(width),
         rotary_dims: stated.unwrap_or(geometry.rotary_dims),
         n_experts: geometry.n_experts,
         experts_per_token: geometry.experts_per_token,

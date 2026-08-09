@@ -252,9 +252,18 @@ impl Variant for Gemma3n {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
-        crate::llama_3::contract::author_dense(builder)
+        match builder.naming() {
+            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            // The registry this replaced held NO MLX row for gemma-3n, and
+            // the absence was a silence the caller read as "no
+            // contract". Stated as the refusal it always was.
+            crate::shared::policy::Naming::Mlx => crate::shared::builder::fail(
+                "gemma-3n: no MLX authoring pass exists for this generation, \
+                 so there is no name layout to author against",
+            ),
+        }
     }
 
     #[cfg(feature = "forward")]
@@ -263,21 +272,32 @@ impl Variant for Gemma3n {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+        // METAL, refused by name. `llama_like_metal` is the only Metal
+        // text in this build and it is not this model's — see
+        // [`project::NO_METAL`] for what it states instead and why
+        // reaching for it would trace a different model under this
+        // row's id. The refusal is stated HERE, at the row, rather than
+        // consulted from a list of architecture strings a driver keeps:
+        // a list is a fourth place for the answer to live and a fourth
+        // place for it to be wrong.
+        if let crate::catalog::Backend::Metal(_) = load.backend {
+            return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
+        }
         Ok(project::trace(&self.shape, class, load))
     }
 
     /// Gemma's `<start_of_turn>` template.
     ///
-    /// Reached through `families/` rather than through `gemma_3::chat`,
+    /// Reached through `shared/` rather than through `gemma_3::chat`,
     /// because a generation module may not name a sibling — see
     /// `tests/sibling_isolation.rs`, whose own message prescribes
-    /// `families/` for exactly this. The template is one template; what
+    /// `shared/` for exactly this. The template is one template; what
     /// two generations must not share is a MODULE.
     #[cfg(feature = "chat")]
     fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(crate::families::gemma_chat::Gemma3Instruct::for_variant(
+        Arc::new(crate::shared::gemma_chat::Gemma3Instruct::for_variant(
             tokenizer,
-            crate::families::gemma_chat::Gemma3Variant::Gemma3nText,
+            crate::shared::gemma_chat::Gemma3Variant::Gemma3nText,
         ))
     }
 }
@@ -471,5 +491,62 @@ mod tests {
             assert!(chat.seal().contains(&2), "{} does not seal with <eos>", v.id);
             assert!(chat.cue().starts_with(&[0]), "{} cues with <start_of_turn>", v.id);
         }
+    }
+
+    /// A METAL load is refused BY NAME rather than traced as a llama.
+    ///
+    /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
+    /// table answered "does this build serve you" from an architecture
+    /// STRING reduced by `canonical()`, in a driver, before any text was
+    /// traced — so it could say yes to a row whose text does not exist
+    /// (it listed `gemma4`) and no to one whose text does (it omitted
+    /// `gemma3`). The row answers now, and what it answers with is a
+    /// sentence naming what is missing.
+    ///
+    /// The comparison is against [`project::NO_METAL`] itself and not a
+    /// paraphrase, so the sentence a caller is shown is the sentence
+    /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
+    #[cfg(feature = "forward")]
+    #[test]
+    fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
+        use crate::catalog::{Backend, Deployed, MetalBinding};
+        use crate::deployment::Refusal;
+        use model_compiler::trace::FireClass;
+
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+        };
+        assert!(!VARIANTS.is_empty());
+        for v in VARIANTS {
+            for class in [FireClass::Prefill, FireClass::Decode] {
+                let err = v
+                    .trace(class, Deployed::metal(&bind))
+                    .expect_err("this build has no Metal text for this generation");
+                assert_eq!(
+                    err,
+                    Refusal::Unsupported(project::NO_METAL),
+                    "`{}` refused a Metal load with a sentence that is not the \
+                     one the row states",
+                    v.id
+                );
+            }
+        }
+        // And the refusal is about the BACKEND and nothing else: the
+        // same rows keep answering a CUDA load exactly as they did.
+        for v in VARIANTS {
+            assert!(
+                v.trace(FireClass::Decode, Deployed::single()).is_ok(),
+                "`{}` stopped serving CUDA",
+                v.id
+            );
+        }
+        // A `Backend::Cuda` is what `Deployed::single()` states, so the
+        // arm above is reached by every existing caller unchanged.
+        assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }

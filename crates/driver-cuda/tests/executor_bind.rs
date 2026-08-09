@@ -20,8 +20,8 @@ use std::collections::BTreeSet;
 use std::ffi::c_void;
 
 use driver_cuda::bind::{BindRefusal, Frame, Resolver, bind};
-use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
-use model::families::llama_like::forward::llama_like_cuda;
+use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use model::shared::llama_like::forward::llama_like_cuda;
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
 use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
 use model_compiler::lower::{Fire, Lowered, Row, lower};

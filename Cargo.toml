@@ -106,6 +106,13 @@ members = [
     "crates/kernels",
     "crates/kernels-cuda",
     "crates/kernels-metal",
+    # The Vulkan tree. Its table is `kernels-metal`'s coverage, row for row, so
+    # the two are comparable rather than merely parallel; what differs is the
+    # launch ABI (buffers to descriptor bindings, scalars to one push-constant
+    # block), which is the API's shape and not any kernel's. `native` is what
+    # costs `glslc` -- Vulkan has no runtime shader compiler, so GLSL -> SPIR-V
+    # is a BUILD-time hop where Metal's is a run-time one.
+    "crates/kernels-vulkan",
 
     # -- tensor-*: the guest-program toolchain ------------------------------
     # authoring eDSL -> PTIR -> planning -> CUDA/Metal codegen, plus the
@@ -160,6 +167,7 @@ default-members = [
     "crates/kernels",
     "crates/kernels-cuda",
     "crates/kernels-metal",
+    "crates/kernels-vulkan",
     "crates/tensor-ir",
     "crates/tensor-dsl",
     "crates/tensor-compiler",

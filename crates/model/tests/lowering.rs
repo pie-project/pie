@@ -8,8 +8,8 @@
 use model_compiler::lower::*;
 use model_compiler::trace::{ForwardPlan, OpKind, PeelWindow, ValueId};
 use std::ops::Range;
-use model::families::llama_like::forward::facts::LlamaLikeCudaFacts;
-use model::families::llama_like::forward::facts::LlamaLikeFacts;
+use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
+use model::shared::llama_like::forward::facts::LlamaLikeFacts;
 use model_compiler::trace::FireClass;
 
 /// A fire whose rows are all plain AND all sampled — the ordinary
@@ -37,7 +37,7 @@ fn gathered(n: usize) -> Vec<Row> {
 }
 
 fn decode_plan() -> ForwardPlan {
-    model::families::llama_like::forward::llama_like_cuda(
+    model::shared::llama_like::forward::llama_like_cuda(
         &LlamaLikeFacts::qwen3_0_6b(),
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Decode,
@@ -60,7 +60,7 @@ fn live_plans() -> Vec<(String, ForwardPlan)> {
         for class in [FireClass::Decode, FireClass::Prefill] {
             out.push((
                 format!("{name}.{class:?}"),
-                model::families::llama_like::forward::llama_like_cuda(&facts, &cuda, class),
+                model::shared::llama_like::forward::llama_like_cuda(&facts, &cuda, class),
             ));
         }
     }
@@ -635,7 +635,7 @@ fn a_whole_kernel_refuses_a_row_window() {
         decode_fused_post: false,
         ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
     };
-    let plan = model::families::llama_like::forward::llama_like_cuda(&facts, &cuda, FireClass::Decode);
+    let plan = model::shared::llama_like::forward::llama_like_cuda(&facts, &cuda, FireClass::Decode);
     assert!(
         plan.ops.iter().any(|op| matches!(
             &op.kind,

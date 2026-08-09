@@ -1,0 +1,168 @@
+// Routed quantized GEMM for sorted MoE rows.
+// Ported from the routed Metal qmm_t instantiations. This GLSL body keeps the
+// expert choice per row tile and the expert-major weight layout; it uses a
+// scalar tiled implementation rather than sharing dense quant/qmm_t.comp, so
+// the routed family can stand alone while the dense port is authored in parallel.
+
+#version 450
+
+#include "common/bf16.glsl"
+#include "common/affine.glsl"
+#include "common/mxfp4.glsl"
+
+#ifndef PIE_BM
+#error "routed qmm is compiled with PIE_BM"
+#endif
+#ifndef PIE_BN
+#error "routed qmm is compiled with PIE_BN"
+#endif
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+#if defined(PIE_MXFP4)
+layout(std430, binding = 1) readonly buffer Exponents { uint8_t exponents[]; };
+PIE_BUFFER_RO(2, X, x);
+PIE_BUFFER_RW(3, Y, y);
+PIE_BUFFER_RO(4, Bias, bias);
+layout(std430, binding = 5) readonly buffer TileExpert { int tile_expert[]; };
+#else
+PIE_BUFFER_RO(1, Scales, scales);
+PIE_BUFFER_RO(2, Biases, biases);
+PIE_BUFFER_RO(3, X, x);
+PIE_BUFFER_RW(4, Y, y);
+layout(std430, binding = 5) readonly buffer TileExpert { int tile_expert[]; };
+#endif
+
+layout(push_constant) uniform Push { int K; int N; } pc;
+
+uint byte_at(uint byte_index) {
+    uint word = w[byte_index >> 2u];
+    return (word >> ((byte_index & 3u) * 8u)) & 0xffu;
+}
+
+float weight_at(uint e, uint n, uint k) {
+#if defined(PIE_MXFP4)
+    uint b = byte_at(e * uint(pc.N) * uint(pc.K / 2) + n * uint(pc.K / 2) + (k >> 1u));
+    float code = (k & 1u) == 0u ? mxfp4_lo(b) : mxfp4_hi(b);
+    uint s = e * uint(pc.N) * uint(pc.K / PIE_MXFP4_BLOCK)
+           + n * uint(pc.K / PIE_MXFP4_BLOCK) + k / uint(PIE_MXFP4_BLOCK);
+    return code * mxfp4_block_scale(uint(exponents[s]));
+#else
+    uint wi = e * uint(pc.N) * uint(pc.K * PIE_BITS / 32)
+            + n * uint(pc.K * PIE_BITS / 32) + k / uint(PIE_CODES_PER_WORD);
+    uint g = k / uint(PIE_GROUP);
+    uint sg = e * uint(pc.N) * uint(pc.K / PIE_GROUP) + n * uint(pc.K / PIE_GROUP) + g;
+    return pie_affine_code(w[wi], k & uint(PIE_CODES_PER_WORD - 1)) * PIE_LOAD(scales[sg]) + PIE_LOAD(biases[sg]);
+#endif
+}
+
+void main() {
+    uint tile_m = gl_WorkGroupID.y;
+    int expert = tile_expert[tile_m];
+    if (expert < 0) return;
+    uint e = uint(expert);
+    uint col0 = gl_WorkGroupID.x * uint(PIE_BN);
+    uint row0 = tile_m * uint(PIE_BM);
+
+    for (uint rr = gl_LocalInvocationID.y; rr < uint(PIE_BM); rr += gl_WorkGroupSize.y) {
+        for (uint cc = gl_LocalInvocationID.x; cc < uint(PIE_BN); cc += gl_WorkGroupSize.x) {
+            uint n = col0 + cc;
+            if (n >= uint(pc.N)) continue;
+            float acc = 0.0;
+            for (uint k = 0u; k < uint(pc.K); k++) acc += PIE_LOAD(x[(row0 + rr) * uint(pc.K) + k]) * weight_at(e, n, k);
+#if defined(PIE_MXFP4)
+            acc += PIE_LOAD(bias[e * uint(pc.N) + n]);
+#endif
+            y[(row0 + rr) * uint(pc.N) + n] = PIE_STORE(acc);
+        }
+    }
+}
+
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_16 PIE_GROUP=128 PIE_BITS=4 PIE_BM=16 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_32 PIE_GROUP=128 PIE_BITS=4 PIE_BM=16 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_64 PIE_GROUP=128 PIE_BITS=4 PIE_BM=16 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_16 PIE_GROUP=128 PIE_BITS=4 PIE_BM=32 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_32 PIE_GROUP=128 PIE_BITS=4 PIE_BM=32 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_64 PIE_GROUP=128 PIE_BITS=4 PIE_BM=32 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_16 PIE_GROUP=128 PIE_BITS=4 PIE_BM=64 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_32 PIE_GROUP=128 PIE_BITS=4 PIE_BM=64 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_64 PIE_GROUP=128 PIE_BITS=4 PIE_BM=64 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_16 PIE_GROUP=128 PIE_BITS=8 PIE_BM=16 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_32 PIE_GROUP=128 PIE_BITS=8 PIE_BM=16 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_64 PIE_GROUP=128 PIE_BITS=8 PIE_BM=16 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_16 PIE_GROUP=128 PIE_BITS=8 PIE_BM=32 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_32 PIE_GROUP=128 PIE_BITS=8 PIE_BM=32 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_64 PIE_GROUP=128 PIE_BITS=8 PIE_BM=32 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_16 PIE_GROUP=128 PIE_BITS=8 PIE_BM=64 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_32 PIE_GROUP=128 PIE_BITS=8 PIE_BM=64 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_64 PIE_GROUP=128 PIE_BITS=8 PIE_BM=64 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_16 PIE_GROUP=32 PIE_BITS=4 PIE_BM=16 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_32 PIE_GROUP=32 PIE_BITS=4 PIE_BM=16 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_64 PIE_GROUP=32 PIE_BITS=4 PIE_BM=16 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_16 PIE_GROUP=32 PIE_BITS=4 PIE_BM=32 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_32 PIE_GROUP=32 PIE_BITS=4 PIE_BM=32 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_64 PIE_GROUP=32 PIE_BITS=4 PIE_BM=32 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_16 PIE_GROUP=32 PIE_BITS=4 PIE_BM=64 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_32 PIE_GROUP=32 PIE_BITS=4 PIE_BM=64 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_64 PIE_GROUP=32 PIE_BITS=4 PIE_BM=64 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_16 PIE_GROUP=32 PIE_BITS=8 PIE_BM=16 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_32 PIE_GROUP=32 PIE_BITS=8 PIE_BM=16 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_64 PIE_GROUP=32 PIE_BITS=8 PIE_BM=16 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_16 PIE_GROUP=32 PIE_BITS=8 PIE_BM=32 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_32 PIE_GROUP=32 PIE_BITS=8 PIE_BM=32 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_64 PIE_GROUP=32 PIE_BITS=8 PIE_BM=32 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_16 PIE_GROUP=32 PIE_BITS=8 PIE_BM=64 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_32 PIE_GROUP=32 PIE_BITS=8 PIE_BM=64 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_64 PIE_GROUP=32 PIE_BITS=8 PIE_BM=64 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_16 PIE_GROUP=64 PIE_BITS=4 PIE_BM=16 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=16 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_64 PIE_GROUP=64 PIE_BITS=4 PIE_BM=16 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_16 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_64 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_16 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_64 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_16 PIE_GROUP=64 PIE_BITS=8 PIE_BM=16 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_32 PIE_GROUP=64 PIE_BITS=8 PIE_BM=16 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_64 PIE_GROUP=64 PIE_BITS=8 PIE_BM=16 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_16 PIE_GROUP=64 PIE_BITS=8 PIE_BM=32 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_32 PIE_GROUP=64 PIE_BITS=8 PIE_BM=32 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_64 PIE_GROUP=64 PIE_BITS=8 PIE_BM=32 PIE_BN=64
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_16 PIE_GROUP=64 PIE_BITS=8 PIE_BM=64 PIE_BN=16
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_32 PIE_GROUP=64 PIE_BITS=8 PIE_BM=64 PIE_BN=32
+// pie:instantiate affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_64 PIE_GROUP=64 PIE_BITS=8 PIE_BM=64 PIE_BN=64
+// `PIE_FP16` below is INERT: no body in this file reads it, so these nine
+// modules are byte-identical to their non-`fp16` siblings and the name is a
+// promise the code does not keep. It is not a live defect, because
+// `affine_qmm_t_routed_fp16`'s row states no operands and so cannot be bound
+// by any driver -- but it is a trap laid for whoever states it. In the dense
+// sibling `quant/qmm_t.comp` the `_fp16_precast` variants are NOT cosmetic:
+// they bind a separate pre-cast fp16 activation buffer. A driver that selects
+// this name because it has pre-cast its activations would hand fp16 bytes to a
+// shader reading bf16 and get silent garbage.
+//
+// So: implement the pre-cast path here BEFORE the row is stated, or drop the
+// nine names -- which cannot be done unilaterally, since `kernels-metal` has
+// the same nine and the two tables are checked against each other.
+// `scripts/vulkan-kernel-audit.py --defines` holds the line meanwhile: this
+// one is allow-listed with its reason and any NEW inert define fails.
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_16 PIE_GROUP=64 PIE_BITS=4 PIE_BM=16 PIE_BN=16 PIE_FP16=1
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=16 PIE_BN=32 PIE_FP16=1
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_64 PIE_GROUP=64 PIE_BITS=4 PIE_BM=16 PIE_BN=64 PIE_FP16=1
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_16 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=16 PIE_FP16=1
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=32 PIE_FP16=1
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_64 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BN=64 PIE_FP16=1
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_16 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=16 PIE_FP16=1
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=32 PIE_FP16=1
+// pie:instantiate affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_64 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=64 PIE_FP16=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_16 PIE_GROUP=32 PIE_BITS=4 PIE_BM=16 PIE_BN=16 PIE_MXFP4=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_32 PIE_GROUP=32 PIE_BITS=4 PIE_BM=16 PIE_BN=32 PIE_MXFP4=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_64 PIE_GROUP=32 PIE_BITS=4 PIE_BM=16 PIE_BN=64 PIE_MXFP4=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_16 PIE_GROUP=32 PIE_BITS=4 PIE_BM=32 PIE_BN=16 PIE_MXFP4=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_32 PIE_GROUP=32 PIE_BITS=4 PIE_BM=32 PIE_BN=32 PIE_MXFP4=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_64 PIE_GROUP=32 PIE_BITS=4 PIE_BM=32 PIE_BN=64 PIE_MXFP4=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_16 PIE_GROUP=32 PIE_BITS=4 PIE_BM=64 PIE_BN=16 PIE_MXFP4=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_32 PIE_GROUP=32 PIE_BITS=4 PIE_BM=64 PIE_BN=32 PIE_MXFP4=1
+// pie:instantiate mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_64 PIE_GROUP=32 PIE_BITS=4 PIE_BM=64 PIE_BN=64 PIE_MXFP4=1

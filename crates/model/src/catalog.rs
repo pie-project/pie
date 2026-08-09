@@ -60,7 +60,7 @@
 //! splitting the row four ways would quadruple the table to record
 //! something that is not about the model. A row is the LOGICAL model,
 //! its manifest compares logical extents, and the observed encoding
-//! flows on into [`crate::policy`] — which is where a decision about how
+//! flows on into [`crate::shared::policy`] — which is where a decision about how
 //! to read weights belongs.
 //!
 //! **Packaging.** Which safetensors shard a tensor landed in gets
@@ -159,9 +159,67 @@ impl LoadShape {
     }
 }
 
+/// What a Metal load observed that no row can state.
+///
+/// Every field here is about the BYTES this checkpoint shipped or about
+/// the kernels this driver built — never about the model. Its
+/// counterpart on the CUDA side is `LlamaLikeCudaFacts`, which is the
+/// same eight-ish questions asked of a different backend, and the reason
+/// both are short is that the model half of each text's input is the
+/// row's and gets projected rather than observed.
+///
+/// The two encoding fields are the load-time half of the module doc's
+/// rule that an encoding is a policy and not an identity: the same row
+/// serves bf16 and int4, and which one arrived is exactly the kind of
+/// thing a table of models must not try to hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetalBinding {
+    /// The affine quantisation group width the staged tensors carry.
+    ///
+    /// Asked of the load rather than inferred from a tensor's shape,
+    /// because g64/b8 and g128/b4 pack to identical extents.
+    pub quant_group: u32,
+    /// The affine quantisation bit width the staged tensors carry.
+    pub quant_bits: u32,
+    /// Whether the expert bank reached the device still in MXFP4.
+    ///
+    /// A fact about what the loader did — it transcodes to affine when
+    /// this driver has no native routed kernel — and so it can only be
+    /// known after staging, which is why it lives here and not in the
+    /// row.
+    pub moe_mxfp4: bool,
+    /// Whether this build folds the residual add into the decode GEMV.
+    pub fuse_residual_gemv: bool,
+    /// Whether this build's paged attention takes more than one row.
+    pub paged_multi_batch: bool,
+    /// Whether this build's quantised matmul takes more than one row.
+    pub qmm_multi_batch: bool,
+}
+
+/// Which driver is asking for the text.
+///
+/// A row states one model and every backend's reading of it, so the
+/// backend is a parameter of the question rather than a second table of
+/// answers. Before this existed, `driver-metal` kept an eleven-entry
+/// table of architecture STRINGS and rebuilt the model's own facts from
+/// nine tensor probes — the third dispatch key this catalog exists to
+/// delete.
+///
+/// `Metal` carries its binding because a Metal text needs both halves;
+/// `Cuda` carries none because that backend's binding is a projection of
+/// the row and the tp width alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Backend<'a> {
+    /// The CUDA driver, whose binding facts derive from the row.
+    #[default]
+    Cuda,
+    /// The Metal driver, with what its load observed.
+    Metal(&'a MetalBinding),
+}
+
 /// What the LOAD knows that a row cannot.
 ///
-/// Two values, and the shortness of this list is the point. Its
+/// Three values, and the shortness of this list is the point. Its
 /// predecessor was a `Checkpoint<'_>` whose first field was the whole
 /// parsed `config.json` — 228 of 244 field reads went there — which is
 /// how "what is this model" stayed a question the driver re-asked. A row
@@ -169,6 +227,12 @@ impl LoadShape {
 /// about this model.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Deployed<'a> {
+    /// Which driver is asking, and what its load observed.
+    ///
+    /// Defaults to [`Backend::Cuda`], which is not a preference but the
+    /// shape of the fleet: one backend derives its binding and the other
+    /// observes it, so only the observing one has to say so.
+    pub backend: Backend<'a>,
     /// The tensor-parallel group this rank's weights were sharded for.
     ///
     /// A fact about how the checkpoint was SPREAD, which no row can
@@ -182,11 +246,17 @@ pub struct Deployed<'a> {
     pub layer_scalars: &'a [f32],
 }
 
-impl Deployed<'_> {
+impl<'a> Deployed<'a> {
     /// One rank, no host scalars — what a single-GPU boot passes.
     #[must_use]
     pub fn single() -> Self {
-        Self { tp_size: 1, layer_scalars: &[] }
+        Self { backend: Backend::Cuda, tp_size: 1, layer_scalars: &[] }
+    }
+
+    /// One rank on Metal, with what that load observed.
+    #[must_use]
+    pub fn metal(binding: &'a MetalBinding) -> Self {
+        Self { backend: Backend::Metal(binding), tp_size: 1, layer_scalars: &[] }
     }
 }
 
@@ -254,15 +324,22 @@ pub trait Variant: Sync + Send + 'static {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error>;
 
     /// This variant's forward text, traced for one fire class.
     ///
+    /// Backend-agnostic: `load.backend` says which driver is asking, and
+    /// a row that has a text for one backend and not the other refuses
+    /// the other HERE rather than being absent from that driver's own
+    /// table of names. That absence is what `driver-metal` used to
+    /// spell, and spelling it twice is how `gemma4` came to be listed as
+    /// served by a driver that then refused it on a different ground.
+    ///
     /// # Errors
     ///
     /// [`Refusal::Unsupported`](crate::deployment::Refusal) when this
-    /// build has no text for the row.
+    /// build has no text for the row, or none for the backend asking.
     #[cfg(feature = "forward")]
     fn trace(
         &self,
@@ -477,9 +554,43 @@ pub enum Override {
     Id(String),
 }
 
+/// Rows that no checkpoint can tell apart, declared on purpose.
+///
+/// [`identify`] treats two matching rows as [`Unmatched::Ambiguous`], and
+/// that doc calls it "a defect in the TABLE, because two rows nothing can
+/// distinguish should have been one". That rule is right about accidents
+/// — a generation that copies a neighbour's `manifest()` and forgets to
+/// change a number must fail loudly — and wrong about one real case.
+///
+/// Llama-3.1-70B and Llama-3.3-70B are 3.1's geometry exactly, retrained.
+/// Every number a manifest can read is equal; what differs is the
+/// WEIGHTS, which no shape check reaches. They are not one row, because a
+/// guest naming `llama-3.3-70b` means a different model than one naming
+/// `llama-3.1-70b`. And they cannot be separated by inspecting harder.
+///
+/// So the ambiguity is stated here rather than argued with. Two things
+/// follow, and both matter: a checkpoint matching a declared set is still
+/// REFUSED rather than guessed at — [`Override::Id`] is how a caller
+/// says which twin it has, and it still holds the checkpoint to the
+/// manifest — and an ambiguity that is NOT in this table is still the
+/// defect the test says it is.
+pub const GEOMETRIC_TWINS: &[&[&str]] = &[&["llama-3.1-70b", "llama-3.3-70b"]];
+
+/// Whether these ids are a declared [`GEOMETRIC_TWINS`] set.
+///
+/// Order-insensitive and exact: a subset does not count, because a set
+/// that shrank means a row learned to distinguish itself and the
+/// declaration is now stale.
+#[must_use]
+pub fn are_declared_twins(ids: &[&str]) -> bool {
+    GEOMETRIC_TWINS.iter().any(|set| {
+        set.len() == ids.len() && set.iter().all(|id| ids.contains(id))
+    })
+}
+
 #[cfg(feature = "contract")]
 mod identify {
-    use super::{Override, Unmatched, Variant, catalog, find};
+    use super::{Override, Unmatched, Variant, catalog, find, nearest_ids};
     use crate::manifest::Observed;
     use model_loader::checkpoint::CheckpointMetadata;
 
@@ -488,9 +599,15 @@ mod identify {
     /// One pass over the table, and the answer is the row whose
     /// manifest the checkpoint satisfies. Exactly one must, and both
     /// other outcomes are reported rather than resolved: zero is a
-    /// checkpoint this build does not serve, and more than one is a
-    /// defect in the TABLE, because two rows nothing can distinguish
-    /// are one row.
+    /// checkpoint this build does not serve, and more than one is
+    /// USUALLY a defect in the TABLE, because two rows nothing can
+    /// distinguish are one row.
+    ///
+    /// Usually, and not always: see [`GEOMETRIC_TWINS`] for the case
+    /// where two rows are one geometry under two release names, which no
+    /// amount of inspecting resolves. Either way this reports rather than
+    /// guesses — the caller says which one with [`Override::Id`], and the
+    /// checkpoint is still held to that row's manifest.
     ///
     /// # Errors
     ///
@@ -567,7 +684,7 @@ mod tests {
         /// rather than deleted because the template is the expensive
         /// part and a row is cheap: whoever adds `llama-2-7b` or
         /// `deepseek-r1` gets a tested template instead of writing one.
-        /// R1's has since been moved to `families::deepseek` and adopted
+        /// R1's has since been moved to `shared::deepseek` and adopted
         /// by `deepseek_v4`, which is the shape a line leaves this list
         /// by wanting: the words outlive the directory.
         ///
@@ -581,7 +698,7 @@ mod tests {
             // pointed at that.
             ("llama_2", "the [INST] template; no Llama 2 row is transcribed"),
             // R1's `<think>` turn, which now lives in
-            // `families::deepseek` — `deepseek_v4` adopted it, so the
+            // `shared::deepseek` — `deepseek_v4` adopted it, so the
             // template is reachable and this directory is not. What is
             // left here is a re-export and no row: R1's own geometry is
             // still untranscribed.
@@ -642,7 +759,7 @@ mod tests {
              NO_ROWS_YET why the generation has none yet."
         );
         let vanished: Vec<&&str> =
-            stated.keys().filter(|m| !rowless.contains(**m)).collect();
+            stated.keys().filter(|m| !rowless.contains(*m)).collect();
         assert!(
             vanished.is_empty(),
             "{vanished:?} are listed as having no rows but declare no module — \
@@ -652,7 +769,7 @@ mod tests {
 
     /// An id names a model, never an encoding of one — so it carries no
     /// quantization word. A row per encoding would quadruple the table
-    /// to record something [`crate::policy`] already decides.
+    /// to record something [`crate::shared::policy`] already decides.
     #[test]
     fn an_id_names_a_model_and_not_an_encoding_of_one() {
         for id in ids() {
@@ -945,7 +1062,8 @@ mod identify_tests {
         CheckpointMetadata { files: Vec::new(), tensors }
     }
 
-    /// NO TWO ROWS ARE INDISTINGUISHABLE BY TENSORS.
+    /// NO TWO ROWS ARE INDISTINGUISHABLE BY TENSORS, except where the
+    /// table says so out loud.
     ///
     /// The strongest statement this file can make, and the one the whole
     /// design rests on: hand `identify` the tensors a row implies and it
@@ -953,15 +1071,27 @@ mod identify_tests {
     /// generation that copies a neighbour's `manifest()` and forgets to
     /// change a number fails here, at the table, instead of on someone's
     /// checkpoint.
+    ///
+    /// The one exception is [`GEOMETRIC_TWINS`], and it is an exception
+    /// about the MODELS rather than about the check: Llama-3.3-70B is
+    /// 3.1-70B's geometry exactly, retrained, so no manifest can separate
+    /// them and the honest thing is to say so instead of asserting
+    /// something false. Ambiguity outside that table still fails, and an
+    /// entry that stops being ambiguous fails too — a stale declaration
+    /// is how an exception turns into a hole.
     #[test]
     fn every_row_is_identified_as_itself_and_not_as_a_sibling() {
         let mut collisions: Vec<String> = Vec::new();
+        let mut twinned: Vec<&str> = Vec::new();
         for row in catalog() {
             let metadata = checkpoint_of(*row);
             match identify(&metadata, &Override::None) {
                 Ok(found) if found.id() == row.id() => {}
                 Ok(found) => collisions
                     .push(format!("{} identified as {}", row.id(), found.id())),
+                Err(Unmatched::Ambiguous { ids }) if are_declared_twins(&ids) => {
+                    twinned.push(row.id());
+                }
                 Err(Unmatched::Ambiguous { ids }) => {
                     collisions.push(format!("{} is ambiguous with {ids:?}", row.id()));
                 }
@@ -972,9 +1102,41 @@ mod identify_tests {
             collisions.is_empty(),
             "identification is not one-to-one, so a checkpoint can load as a \
              model it is not — which is the one thing the manifest exists to \
-             make impossible:\n  {}",
+             make impossible. If a pair here is genuinely one geometry under \
+             two release names, declare it in `GEOMETRIC_TWINS`; otherwise a \
+             manifest is wrong:\n  {}",
             collisions.join("\n  ")
         );
+        for set in GEOMETRIC_TWINS {
+            for id in *set {
+                assert!(
+                    twinned.contains(id),
+                    "{id} is declared a geometric twin and identifies cleanly \
+                     anyway, so the declaration is stale — drop it, or the \
+                     next real collision hides behind it",
+                );
+            }
+        }
+    }
+
+    /// A declared twin is a CHOICE the caller makes, not a guess the
+    /// table makes for them.
+    ///
+    /// The exception above buys nothing if the twins are unloadable, so
+    /// this is the other half: [`Override::Id`] resolves the ambiguity,
+    /// and it does it without weakening the check — the checkpoint is
+    /// still held to the named row's manifest.
+    #[test]
+    fn a_declared_twin_still_loads_when_the_caller_names_it() {
+        for set in GEOMETRIC_TWINS {
+            for id in *set {
+                let row = find(id).unwrap_or_else(|| panic!("{id} is declared but not in the catalog"));
+                let metadata = checkpoint_of(row);
+                let found = identify(&metadata, &Override::Id((*id).to_string()))
+                    .unwrap_or_else(|e| panic!("{id} named explicitly and still refused: {e}"));
+                assert_eq!(found.id(), *id);
+            }
+        }
     }
 
     /// A checkpoint nothing describes is REFUSED, with the near misses.

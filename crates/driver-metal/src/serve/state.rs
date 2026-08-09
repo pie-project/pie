@@ -90,7 +90,7 @@ pub struct Shell {
     /// arena per load would let two pools each believe they had the whole
     /// budget.
     pub(crate) arena: crate::device::Arena,
-    /// `[model] descriptor` from the boot TOML, parsed by the caller.
+    /// `[model] config` from the boot TOML, parsed by the caller.
     ///
     /// The one key this seam reads out of the boot config, and the same one
     /// `driver-cuda`'s shell reads. The PARSE stays with the caller: a boot
@@ -105,7 +105,7 @@ pub struct Shell {
     /// for when the artifact does not carry one embedded, and ONE FIELD IS
     /// READ OUT OF IT: the declared quantization. Everything else a driver
     /// used to read here is a catalog row's, matched from the tensors.
-    pub(crate) boot_descriptor: Option<PathBuf>,
+    pub(crate) boot_config: Option<PathBuf>,
     /// `[model] id` from the boot TOML, when the operator named one.
     ///
     /// An OVERRIDE and not a selector. `catalog::identify` matches a
@@ -135,23 +135,38 @@ pub struct Shell {
     /// two readers of one document with nobody holding them together. There
     /// is one projection and every consumer reads it.
     pub(crate) deployment: Option<model::deployment::Deployment>,
-    /// The Metal text's facts, synthesized at load from [`Self::deployment`].
+    /// The identified ROW, and what this load observed that no row can state.
     ///
-    /// Still synthesized here rather than taken from the row, and the reason
-    /// is worth stating precisely because it looks like a leftover.
-    /// `catalog::Variant::trace` traces the row's CUDA text — there is no
-    /// backend parameter on it — and the Metal text is a different function
-    /// over the same family facts (`llama_like_metal`). Until a row can be
-    /// asked for a Metal trace, this driver builds the family facts from the
-    /// projected `Deployment` plus the three questions only the STAGED
-    /// TENSORS can answer: qk-norm, fused QKV, attention bias.
+    /// The field this replaced held `(LlamaLikeFacts, LlamaLikeMetalFacts)` —
+    /// twenty-nine model facts this driver had rebuilt for itself out of the
+    /// projected deployment plus nine `has_tensor` probes — and its doc
+    /// explained that it was synthesized here because "`catalog::Variant::trace`
+    /// traces the row's CUDA text; there is no backend parameter on it".
+    /// There is one now. `catalog::Deployed::backend` names which driver is
+    /// asking, so the Metal text is the row's own answer and the facts are
+    /// the row's own facts, stated once in `crates/model` for both backends
+    /// instead of derived twice.
+    ///
+    /// What survives is the pair: the row, and the [`MetalBinding`] holding
+    /// the six things a row genuinely cannot know — the affine group and bit
+    /// width the bytes arrived in (`mlx-community` publishes one model at
+    /// g64/b4 and at g128/b8, and the two pack to identical extents), whether
+    /// the expert bank reached the device still in MXFP4, and the three
+    /// kernel capabilities of `crates/kernels-metal` as compiled into this
+    /// binary. [`crate::model::binding`] builds it and is the only thing that
+    /// may.
+    ///
+    /// Both halves are `Copy`, so a fire takes them by copy where the old
+    /// pair needed a `clone()` of two heap-allocated fact structs per launch.
     ///
     /// Held rather than re-derived per fire, for the same reason as the
-    /// deployment above.
-    pub(crate) text_facts: Option<(
-        model::families::llama_like::forward::facts::LlamaLikeFacts,
-        model::families::llama_like::forward::facts::LlamaLikeMetalFacts,
-    )>,
+    /// deployment above — and here the reason is sharper. A launch that
+    /// re-identified would ask the tensors a second time, and the tensors are
+    /// gone: staging consumed them. The row is the load's answer, carried.
+    ///
+    /// [`MetalBinding`]: model::catalog::MetalBinding
+    pub(crate) text_row:
+        Option<(&'static dyn model::catalog::Variant, model::catalog::MetalBinding)>,
     /// The runtime shader compiler, and the pipelines a fire's symbols have
     /// compiled to. Held across fires: a model's symbol set is bounded by its
     /// text, so a driver that recompiled per fire would spend more time in the
@@ -174,7 +189,7 @@ unsafe impl Sync for Shell {}
 impl Shell {
     /// Open the default Metal 4 device.
     ///
-    /// `boot_descriptor` is `[model] descriptor` and `boot_model_id` is
+    /// `boot_config` is `[model] config` and `boot_model_id` is
     /// `[model] id`, both from the caller's boot config and both already
     /// parsed — see the fields' docs for why the parse is not in here.
     ///
@@ -182,7 +197,7 @@ impl Shell {
     ///
     /// No Metal 4 device, or a device whose queue could not be created. Both
     /// are boot conditions, not runtime ones.
-    pub fn open(boot_descriptor: Option<PathBuf>, boot_model_id: Option<String>) -> Result<Self> {
+    pub fn open(boot_config: Option<PathBuf>, boot_model_id: Option<String>) -> Result<Self> {
         // `Arc` over a type that is neither `Send` nor `Sync`, deliberately.
         //
         // `Stepper::shared` exists because a stepper that BORROWS the context
@@ -215,11 +230,11 @@ impl Shell {
             // not exist.
             id: "",
             pool: None,
-            boot_descriptor,
+            boot_config,
             boot_model_id,
             inv_freq: Vec::new(),
             deployment: None,
-            text_facts: None,
+            text_row: None,
             has_linear_attn: false,
             compiler,
             pipelines: crate::bind::encode::Pipelines::new(shader_tree()),

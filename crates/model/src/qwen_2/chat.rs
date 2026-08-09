@@ -9,7 +9,7 @@
 // `QwenInstruct` is vendor-shared chat: Qwen3 owns it, and Qwen2, Qwen3.5,
 // GLM-5 and Nemotron-H bind it. The generation that implements a thing keeps
 // it; the others name it.
-use crate::families::chatml::{ChatMLConfig, QwenInstruct};
+use crate::shared::chatml::{ChatMLConfig, QwenInstruct};
 use tokenizer::Tokenizer;
 use std::sync::Arc;
 

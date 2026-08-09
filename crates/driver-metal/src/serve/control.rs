@@ -97,11 +97,12 @@ impl Shell {
         Err(Error::Unserved {
             what: "copy_state",
             message: "recurrent state is unreachable on this backend. It belongs to the \
-                      qwen3_5 family and its neighbours, which `model::text` refuses at \
-                      load, so no model this backend serves has any state to copy. \
-                      `serve::transfer::plan_state_copy` and `layout::LinearStateSlots` \
-                      are planned and stored ahead of that family being served, not \
-                      behind it."
+                      qwen3_5 family and its neighbours, whose rows this build has no \
+                      Metal text for — `load_model` asks each row before it stages, and \
+                      refuses there — so no model this backend serves has any state to \
+                      copy. `serve::transfer::plan_state_copy` and \
+                      `layout::LinearStateSlots` are planned and stored ahead of that \
+                      family being served, not behind it."
                 .to_string(),
         })
     }

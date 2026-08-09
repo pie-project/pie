@@ -30,6 +30,8 @@ pub static KERNELS: &[KernelSig] = &[
         // sliding one. The kernel never reads param 3 -- its operand list
         // stops at 2 -- but `Rule::Rope`'s grid is half of it.
         grid_param = Some(3),
+        // The heads are counted by the SAME width the kernel is told.
+        head_param = Some(2),
         axes = &[BF16]),
     // 1 in rope.metal
     // The rotation a deployment that RESCALES its ladder takes. Same body as
@@ -51,6 +53,8 @@ pub static KERNELS: &[KernelSig] = &[
         ],
         // See `neox_decode`: the extent is the statement's.
         grid_param = Some(3),
+        // The heads are counted by the SAME width the kernel is told.
+        head_param = Some(1),
         axes = &[BF16]),
     // 1 in rope.metal
     // The batched form of the rescaled ladder, and the row a PREFILL on
@@ -76,6 +80,8 @@ pub static KERNELS: &[KernelSig] = &[
         ],
         // See `neox_decode`: the extent is the statement's.
         grid_param = Some(3),
+        // The heads are counted by the SAME width the kernel is told.
+        head_param = Some(1),
         axes = &[BF16]),
     // 1 in rope.metal
     // The batched form, and the same shape: one tensor, per-token positions.
@@ -92,6 +98,8 @@ pub static KERNELS: &[KernelSig] = &[
         // sliding one. The kernel never reads param 3 -- its operand list
         // stops at 2 -- but `Rule::Rope`'s grid is half of it.
         grid_param = Some(3),
+        // The heads are counted by the SAME width the kernel is told.
+        head_param = Some(2),
         axes = &[BF16]),
     // 1 in rope.metal
     // gemma's rotation: the same neox body over a PROPORTIONAL slice of each
@@ -111,6 +119,8 @@ pub static KERNELS: &[KernelSig] = &[
         // sliding one. The kernel never reads param 3 -- its operand list
         // stops at 2 -- but `Rule::Rope`'s grid is half of it.
         grid_param = Some(3),
+        // The heads are counted by the SAME width the kernel is told.
+        head_param = Some(2),
         axes = &[BF16]),
     // 1 in rope.metal
     kernel!(neox_prop_mb "neox_prop_mb", axes = &[BF16]),

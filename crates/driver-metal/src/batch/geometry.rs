@@ -208,6 +208,40 @@ pub struct DecodeGeometry {
     /// (`num_kv_shared_layers`), or zero for a stack where every layer writes
     /// its own. Zero for gemma-4-31b.
     pub kv_shared_layers: u32,
+    /// Whether the norm gains are stored as an OFFSET FROM ONE, so the fold
+    /// is `(1 + w)` rather than `w`.
+    ///
+    /// gemma-1, -2 and -3 store the offset; **gemma-4 stores the multiplier**
+    /// and MLX reads it with a plain `nn.RMSNorm` where the earlier three use
+    /// their own `1.0 + self.weight`. `crates/model/src/gemma_4`'s text says
+    /// the same thing for CUDA and has since it was written: "PLAIN, despite
+    /// the family name."
+    ///
+    /// A FACT OF ITS OWN because it was read off the norm PLACEMENT, and
+    /// `text.rs` said in as many words that this was an observation rather
+    /// than a law -- "a stack that published one without the other would
+    /// break here, loudly." gemma-4 is that stack, and it did not break
+    /// loudly: `(1 + w)/w` is 1.002 where `w` is 444 and 1.38 where `w` is
+    /// 2.6, so the norm's LARGEST value agreed with MLX to three digits
+    /// while its ordinary ones were off by a third.
+    pub norm_unit_offset: bool,
+    /// Whether V is RMS-normed per head before it is written to the pool.
+    ///
+    /// gemma-4 does; nothing else here does, **including gemma-3**, which
+    /// carries the per-head `q_norm`/`k_norm` and no V norm at all. So this is
+    /// not implied by the QK norm and cannot be read off it.
+    ///
+    /// A FACT RATHER THAN A PROBE for a reason no other norm here has: MLX's
+    /// `v_norm` is `RMSNormNoScale`, a module with no parameter, so the
+    /// checkpoint contains nothing to ask about. `has_tensor` answers no,
+    /// correctly, for a model that does it and a model that does not.
+    ///
+    /// Kept separate from [`Self::norm_unit_offset`] though both are read off
+    /// the same gemma-4 marker: one says how a gain is stored and the other
+    /// says whether a tensor is normed, and folding two statements into one
+    /// flag because they agree today is how the fold got read off the
+    /// sandwich.
+    pub v_norm: bool,
     /// Whether the MLP's gate is GELU rather than SiLU.
     ///
     /// Read from the config's stated activation, not from which publisher
@@ -328,6 +362,8 @@ impl Default for DecodeGeometry {
             rope_theta_sliding: 0.0,
             per_layer_emb_dim: 0,
             kv_shared_layers: 0,
+            norm_unit_offset: true,
+            v_norm: false,
             gelu_gate: false,
             swiglu_limit: 0.0,
             swiglu_alpha: 0.0,
@@ -769,10 +805,10 @@ pub fn geometry_from_deployment(
         )));
     }
 
-    // ── the mixture this driver cannot route ──
+    // ── the mixture, and the bounds its router has ──
     //
     // Ordered so the two ROUTER bounds stay reachable: a row that exceeds
-    // them is refused by the bound it exceeds and not by the top-k gap
+    // them is refused by the bound it exceeds and not by the shape check
     // below, because the bound is the more specific diagnosis and because a
     // limit that is never reported is a limit nobody can act on.
     let routed = load.n_experts > 0 || d.shape.moe_intermediate > 0;
@@ -791,22 +827,40 @@ pub fn geometry_from_deployment(
                 load.n_experts, d.shape.moe_intermediate
             )));
         }
-        return refuse(
-            "this row is a routed mixture and a `Deployment` states no top-k. \
-             `LoadShape` counts the experts and `Geometry` gives one expert's \
-             width, but how many of them a token visits — the number this \
-             driver checks against ROUTER_MAX_TOP_K and launches the router \
-             with — is stated by no value a driver receives. Refused rather \
-             than guessed: a mixture fired at the wrong top-k routes each \
-             token to almost the right experts and returns fluent nonsense, \
-             which is the same failure the router's own affine point had",
-        );
-    }
-    if d.shape.intermediate == 0 {
+        // The top-k used to be refused here, and the refusal named the
+        // field it was missing: "`LoadShape` counts the experts and
+        // `Geometry` gives one expert's width, but how many of them a
+        // token visits is stated by no value a driver receives." Every
+        // routed row's own facts knew it -- gpt-oss's `top_k`, gemma-4's
+        // `experts_per_token`, the `MoeFacts` five families share -- and
+        // none of it reached a driver. `Geometry::experts_per_token` is
+        // that statement; this reads it rather than guessing.
+        if d.shape.experts_per_token == 0 {
+            return Err(GeometryRefused(format!(
+                "this row states {} experts and a top-k of zero; a router \
+                 selecting nothing produces no MLP at all",
+                load.n_experts
+            )));
+        }
+        if d.shape.experts_per_token > ROUTER_MAX_TOP_K {
+            return Err(GeometryRefused(format!(
+                "top-k {} exceeds the {ROUTER_MAX_TOP_K} lanes the router \
+                 ranks in one pass",
+                d.shape.experts_per_token
+            )));
+        }
+        if d.shape.experts_per_token > load.n_experts {
+            return Err(GeometryRefused(format!(
+                "this row routes each token to {} of {} experts, which is \
+                 more experts than it has",
+                d.shape.experts_per_token, load.n_experts
+            )));
+        }
+    } else if d.shape.intermediate == 0 {
         return refuse("a dense FFN needs an intermediate width");
     }
 
-    // ── the second attention shape this driver cannot page ──
+    // ── the second attention shape ──
     //
     // Measured on `mlx-community/gemma-4-31b-it-4bit`'s own tensors, layer 0
     // (sliding) against layer 5 (full):
@@ -817,18 +871,36 @@ pub fn geometry_from_deployment(
     // | `q_proj` | `[8192, ...]` = 32x256 | `[16384, ...]` = 32x512 |
     // | `k_proj` | `[4096, ...]` = 16x256 | `[2048, ...]` = 4x512 |
     //
-    // BOTH halves are needed and `Deployment` states one. `LayerAttention`
-    // carries a per-layer `head_dim`, so the 512 is reachable; there is no
-    // per-layer kv-head count anywhere, so the 4-against-16 is not. The pool
-    // sizes a page from `(kv_heads, head_dim)` per layer, and taking the
-    // sliding layers' sixteen for a full layer reads a quarter past the end
-    // of its K — not a crash, a fluent model reading another layer's memory.
-    if let Some((a, b)) = d.decode_head_dims() {
+    // BOTH halves are needed and `Deployment` used to state one. This was a
+    // REFUSAL of the whole gemma-4 generation, and it named its own missing
+    // piece: `LayerAttention` carried a per-layer `head_dim`, so the 512 was
+    // reachable, and there was no per-layer kv-head count anywhere, so the
+    // 4-against-16 was not. A pool sizes a page from `(kv_heads, head_dim)`
+    // per layer, and taking the sliding layers' sixteen for a full layer
+    // reads three quarters past the end of its K — not a crash, a fluent
+    // model reading another layer's memory. `LayerAttention::kv_heads` is
+    // that count, so the shape is now READ rather than declined.
+    //
+    // Zero in both fields means "one shape everywhere", which is what
+    // `head_dim_at`/`kv_heads_at` already read them as, so every row whose
+    // layers agree passes through unchanged.
+    let (global_head_dim, global_kv_heads, full_partial_rotary) =
+        match d.full_attention_shape() {
+            Some((hd, kv, rot)) if hd > 0 => (
+                hd,
+                kv,
+                // A FRACTION here and an extent there, because the grid
+                // launches half of it. `Rule::Rope`'s own derivation is
+                // `max(2, 2 * int(0.5 * f * d))`, so handing back the ratio
+                // the row spelled as an extent round-trips exactly.
+                rot as f32 / hd as f32,
+            ),
+            _ => (0, 0, 0.0),
+        };
+    if global_kv_heads > 0 && n_q_heads % global_kv_heads != 0 {
         return Err(GeometryRefused(format!(
-            "this row's layers state two head dims ({a} and {b}) and \
-             `LayerAttention` states no per-layer kv-head count to go with \
-             them; the second shape's K would be paged at the first shape's \
-             width"
+            "the full-attention layers state {global_kv_heads} kv heads, which does not \
+             divide {n_q_heads} q heads; GQA has no grouping for that"
         )));
     }
 
@@ -927,6 +999,14 @@ pub fn geometry_from_deployment(
         sliding_window,
         full_attn_interval,
         final_logit_softcap: d.logit_softcap,
+        // STATED by the row, not defaulted. `DecodeGeometry::default`
+        // carries `true` — the answer for gemma-1, -2 and -3 — so letting
+        // this fall through the struct-update below would have served
+        // gemma-4 with a `(1 + w)` fold its checkpoint never asked for.
+        norm_unit_offset: d.norm_unit_offset,
+        // STATED for the same reason and unaskable of the tensors:
+        // a weightless norm leaves nothing in the checkpoint.
+        v_norm: d.v_norm,
         per_layer_emb_dim: u32::try_from(d.ple_dim.max(0)).unwrap_or(0),
         kv_shared_layers: load.kv_shared_layers,
         intermediate: d.shape.intermediate,
@@ -940,22 +1020,43 @@ pub fn geometry_from_deployment(
         // consumes, so neither a row nor this driver can state it
         // inconsistently with the head counts.
         gdn_v_total: gdn_v_heads * gdn_v_dim,
-        // The four shapes above are refused, so these stay at the zeros that
-        // mean "not that": `is_moe` reads `n_experts > 0 && experts_per_token
-        // > 0`, and both being zero is the only reading of a dense stack this
-        // file can honestly produce.
-        n_experts: 0,
-        experts_per_token: 0,
-        moe_intermediate: 0,
-        shared_intermediate: 0,
-        // The two head shapes and the second kv-head count are refused above,
-        // so a geometry that gets here has ONE of each and
-        // `head_dim_at`/`kv_heads_at` read the zeros as "one shape
-        // everywhere".
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_partial_rotary: 0.0,
-        attention_k_eq_v: false,
+        // READ, now that the row states the top-k. These were zeroed with
+        // a comment saying the mixture "is refused above" — true while it
+        // was, and the whole reason a fallthrough default is dangerous:
+        // `is_moe()` reads both counts, so a zero here does not fail, it
+        // silently serves a mixture as a dense stack.
+        n_experts: load.n_experts,
+        experts_per_token: d.shape.experts_per_token,
+        moe_intermediate: d.shape.moe_intermediate,
+        // A shared expert is a whole FFN every token runs beside the bank,
+        // so a wrong width here is not a slowdown — it is an addend that
+        // is either missing or misread. The row states it; nothing about
+        // it is derivable, which is why the two proxies a driver could
+        // have reached for (`moe_intermediate`, or zero) are both wrong
+        // for some shipped row.
+        shared_intermediate: d.shape.shared_intermediate,
+        // READ from the per-layer table above, and zero when it is uniform.
+        global_head_dim,
+        global_kv_heads,
+        full_partial_rotary,
+        // STATED, like `v_norm`: the flag's name says V equals K, and what
+        // the checkpoint does is ship no `v_proj` at all.
+        attention_k_eq_v: d.k_eq_v,
+        // The MLP gate, which a `Deployment` did not state and this file
+        // therefore left at its default — SiLU, for EVERY checkpoint that
+        // reached it. `serve::load` caught the gemma case by asking the
+        // tensors and refused; the rest were served a few percent wrong at
+        // the origin. `Deployment::mlp_gate` is the statement that refusal
+        // asked for.
+        gelu_gate: matches!(d.mlp_gate, model::deployment::MlpGate::GeluTanh),
+        swiglu_limit: match d.mlp_gate {
+            model::deployment::MlpGate::SiluClamped { limit, .. } => limit,
+            _ => 0.0,
+        },
+        swiglu_alpha: match d.mlp_gate {
+            model::deployment::MlpGate::SiluClamped { alpha, .. } => alpha,
+            _ => 0.0,
+        },
         ..DecodeGeometry::default()
     })
 }
@@ -981,6 +1082,8 @@ mod tests {
         Deployment {
             layers,
             norm_eps: 1e-5,
+            k_eq_v: false,
+            mlp_gate: model::deployment::MlpGate::Silu,
             shape: Geometry {
                 hidden: 2048,
                 q_heads: 32,
@@ -989,11 +1092,14 @@ mod tests {
                 head_dim_kernel: 64,
                 intermediate: 8192,
                 moe_intermediate: 0,
+                experts_per_token: 0,
+                shared_intermediate: 0,
                 vocab: 128_256,
             },
             attention: (0..layers)
                 .map(|l| LayerAttention {
                     head_dim: 64,
+                    kv_heads: 8,
                     window: -1,
                     kv_source: l,
                     sm_scale: 0.125,
@@ -1008,6 +1114,8 @@ mod tests {
             logit_softcap: 0.0,
             ple_dim: 0,
             norm: NormPlacement::Pre,
+            norm_unit_offset: false,
+            v_norm: false,
             scales: std::collections::BTreeMap::new(),
             advertised: Advertised::default(),
             rope_scaling: None,
@@ -1345,29 +1453,58 @@ mod tests {
     fn a_mixture_is_both_numbers_or_neither_at_the_deployment_too() {
         let mut load = shape(4);
         load.n_experts = 128;
-        let why = why(&dense(4), load);
-        assert!(why.contains("both numbers or neither"), "{why}");
+        let half_load = why(&dense(4), load);
+        assert!(half_load.contains("both numbers or neither"), "{half_load}");
 
         let mut d = dense(4);
         d.shape.moe_intermediate = 768;
-        let why = why(&d, shape(4));
-        assert!(why.contains("both numbers or neither"), "{why}");
+        let half_row = why(&d, shape(4));
+        assert!(half_row.contains("both numbers or neither"), "{half_row}");
     }
 
-    /// The gap this migration opened, stated as a refusal so it cannot be
-    /// discovered by a checkpoint that boots and answers wrongly.
+    /// The top-k is READ, and the three ways it can be wrong are refused.
+    ///
+    /// This test used to assert the gap itself — "a `Deployment` states no
+    /// top-k" — which was true of the migration and never true of the
+    /// models: gpt-oss's facts called it `top_k`, gemma-4's mixture called
+    /// it `experts_per_token`, and five families shared a `MoeFacts` that
+    /// had it. None of it reached a driver. `Geometry::experts_per_token`
+    /// is that statement, so the refusal became a derivation and what is
+    /// left to refuse is a top-k that cannot be served.
     #[test]
-    fn a_routed_mixture_is_refused_because_no_value_states_the_top_k() {
+    fn a_routed_mixture_reads_its_top_k_and_refuses_the_ones_it_cannot_route() {
+        let routed = |top_k: u32| {
+            let mut d = dense(4);
+            d.shape.moe_intermediate = 768;
+            d.shape.experts_per_token = top_k;
+            let mut load = shape(4);
+            load.n_experts = 128;
+            (d, load)
+        };
+
+        let (d, load) = routed(8);
+        let g = geometry_from_deployment(&d, load, AffineFormat::G64_B4)
+            .expect("a routed row this driver can serve");
+        assert!(g.is_moe(), "both counts reach the geometry");
+        assert_eq!(g.experts_per_token, 8);
+        assert_eq!(g.n_experts, 128);
+        assert_eq!(g.moe_intermediate, 768);
+
+        let (d, load) = routed(0);
+        assert!(why(&d, load).contains("router selecting nothing"));
+
+        let (d, load) = routed(ROUTER_MAX_TOP_K + 1);
+        let over = why(&d, load);
+        assert!(over.contains("ROUTER_MAX_TOP_K") || over.contains(&ROUTER_MAX_TOP_K.to_string()));
+
+        // More experts visited than exist is its own diagnosis, because
+        // "16 of 8" is a stated contradiction and not a bound.
         let mut d = dense(4);
         d.shape.moe_intermediate = 768;
+        d.shape.experts_per_token = 12;
         let mut load = shape(4);
-        load.n_experts = 128;
-        let why = why(&d, load);
-        assert!(why.contains("states no top-k"), "{why}");
-        assert!(
-            why.contains("ROUTER_MAX_TOP_K"),
-            "the refusal names the bound that would have been checked: {why}"
-        );
+        load.n_experts = 8;
+        assert!(why(&d, load).contains("more experts than it has"));
     }
 
     #[test]
@@ -1377,19 +1514,85 @@ mod tests {
         assert!(why(&d, shape(4)).contains("dense FFN needs an intermediate width"));
     }
 
-    /// gemma-4's two attention shapes, refused on the half `Deployment`
-    /// cannot state.
+    /// gemma-4's two attention shapes, READ off the per-layer table.
+    ///
+    /// This used to be a refusal, and the refusal named the half
+    /// `Deployment` could not state: a per-layer kv-head count. It has
+    /// one now, so the case it declined is the case it projects, and
+    /// both halves of the second shape have to arrive — a `head_dim`
+    /// that crossed while the count did not would page a full layer's K
+    /// at the sliding width and read past the end of it.
     #[test]
-    fn two_head_dims_in_one_stack_are_refused_for_want_of_the_second_kv_count() {
+    fn two_head_dims_in_one_stack_are_read_and_not_refused() {
         let mut d = dense(12);
+        // The stack-wide `Geometry` carries the SLIDING shape, which is
+        // what gemma-4's own row states; the per-layer table carries the
+        // full layers' departure from it.
+        d.shape.head_dim = 256;
+        d.shape.head_dim_kernel = 256;
         for l in 0..12usize {
             let full = (l + 1).is_multiple_of(6);
             d.attention[l].window = if full { -1 } else { 1024 };
             d.attention[l].head_dim = if full { 512 } else { 256 };
+            d.attention[l].kv_heads = if full { 2 } else { 8 };
+            d.attention[l].rotary_dim = if full { 128 } else { 256 };
+        }
+        let g = geometry_from_deployment(&d, shape(12), AffineFormat::G64_B4)
+            .expect("both halves of the second shape are stated");
+        assert_eq!((g.head_dim, g.n_kv_heads), (256, 8), "the sliding shape is the base");
+        assert_eq!(
+            (g.global_head_dim, g.global_kv_heads),
+            (512, 2),
+            "and the full layers' shape is the second one"
+        );
+        assert!(
+            (g.full_partial_rotary - 0.25).abs() < 1e-6,
+            "128 of 512 is the fraction the grid launches half of: {}",
+            g.full_partial_rotary
+        );
+        // And the pool reads them as a per-layer PAGE, which is the
+        // reader this whole pair exists for.
+        let pool = crate::layout::kv::Shape {
+            layers: g.n_layers,
+            kv_heads: g.n_kv_heads,
+            head_dim: g.head_dim,
+            page_size: 16,
+            pages: 4,
+            element_bytes: 2,
+            global_head_dim: g.global_head_dim,
+            global_kv_heads: g.global_kv_heads,
+            full_attn_every: g.full_attn_every,
+        };
+        assert_eq!(pool.heads_at(0), (8, 256));
+        assert_eq!(pool.heads_at(5), (2, 512));
+        assert!(!pool.is_uniform(), "two page sizes is exactly what this is");
+    }
+
+    /// A stack whose layers agree reads zeros, which is what
+    /// `head_dim_at`/`kv_heads_at` take as "one shape everywhere".
+    #[test]
+    fn a_uniform_stack_states_no_second_shape() {
+        let g = geometry_from_deployment(&dense(8), shape(8), AffineFormat::G64_B4)
+            .expect("a uniform stack projects");
+        assert_eq!((g.global_head_dim, g.global_kv_heads), (0, 0));
+        assert_eq!((g.head_dim, g.n_kv_heads), (64, 8));
+    }
+
+    /// The second shape's count still has to group.
+    #[test]
+    fn a_full_layer_kv_count_that_does_not_divide_the_q_heads_is_refused() {
+        let mut d = dense(12);
+        d.shape.head_dim = 256;
+        d.shape.head_dim_kernel = 256;
+        for l in 0..12usize {
+            let full = (l + 1).is_multiple_of(6);
+            d.attention[l].window = if full { -1 } else { 1024 };
+            d.attention[l].head_dim = if full { 512 } else { 256 };
+            d.attention[l].kv_heads = if full { 7 } else { 8 };
         }
         let why = why(&d, shape(12));
-        assert!(why.contains("two head dims (256 and 512)"), "{why}");
-        assert!(why.contains("kv-head count"), "{why}");
+        assert!(why.contains("7 kv heads"), "{why}");
+        assert!(why.contains("does not divide 32"), "{why}");
     }
 
     /// An affine point off the instantiation grid entirely, refused at the
@@ -1590,5 +1793,36 @@ mod tests {
         let geometry = DecodeGeometry::default();
         assert_eq!(geometry.gdn_conv_stride_bytes(), 6144 * 4 * 4);
         assert_eq!(geometry.gdn_recurrent_stride_bytes(), 16 * 128 * 128 * 4);
+    }
+
+    /// The `(1 + w)` fold comes from the ROW, and the default is the
+    /// opposite of what a row can say.
+    ///
+    /// `DecodeGeometry::default()` carries `true`, so a projection that
+    /// let this field fall through `..default()` would answer "folds" for
+    /// every stack — including the one stack that does not. This test
+    /// fails if the field is ever dropped from the construction, which is
+    /// exactly the mistake the struct-update syntax makes easy.
+    #[test]
+    fn the_norm_fold_is_the_rows_answer_and_not_the_defaults() {
+        assert!(
+            DecodeGeometry::default().norm_unit_offset,
+            "the default must stay `true` for this test to be able to fail"
+        );
+
+        let mut plain = dense(4);
+        plain.norm_unit_offset = false;
+        let g = geometry_from_deployment(&plain, shape(4), AffineFormat::G64_B4)
+            .expect("a dense stack is servable");
+        assert!(
+            !g.norm_unit_offset,
+            "a row that stores the multiplier directly must not be folded"
+        );
+
+        let mut folded = dense(4);
+        folded.norm_unit_offset = true;
+        let g = geometry_from_deployment(&folded, shape(4), AffineFormat::G64_B4)
+            .expect("a dense stack is servable");
+        assert!(g.norm_unit_offset, "a row that stores an offset must fold");
     }
 }

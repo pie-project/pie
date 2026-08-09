@@ -23,7 +23,7 @@ pub mod project;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
-use crate::families::llama_like::spec::LlamaLikeFacts;
+use crate::shared::llama_like::spec::LlamaLikeFacts;
 use crate::manifest::Manifest;
 
 use self::project::Schedule;
@@ -256,9 +256,18 @@ impl Variant for Gemma3 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
-        crate::llama_3::contract::author_dense(builder)
+        match builder.naming() {
+            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            // The registry this replaced held NO MLX row for gemma-3, and
+            // the absence was a silence the caller read as "no
+            // contract". Stated as the refusal it always was.
+            crate::shared::policy::Naming::Mlx => crate::shared::builder::fail(
+                "gemma-3: no MLX authoring pass exists for this generation, \
+                 so there is no name layout to author against",
+            ),
+        }
     }
 
     #[cfg(feature = "forward")]
@@ -267,10 +276,10 @@ impl Variant for Gemma3 {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        Ok(project::trace(&self.shape, class, load))
+        project::trace(&self.shape, &self.schedule, NORM_EPS, class, load)
     }
 
-    /// Gemma's `<start_of_turn>` template, which lives in `families/`
+    /// Gemma's `<start_of_turn>` template, which lives in `shared/`
     /// because gemma-3n binds it too.
     #[cfg(feature = "chat")]
     fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
@@ -483,7 +492,7 @@ mod tests {
         }
     }
 
-    /// The template is gemma's, from `families/` — where it lives
+    /// The template is gemma's, from `shared/` — where it lives
     /// because gemma-3n binds the same one, and a generation may not
     /// reach into a sibling for it.
     #[cfg(feature = "chat")]

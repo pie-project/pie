@@ -85,9 +85,12 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
     // The checkpoint's own head dim, unpadded: 256 and 128 are both
     // instantiated, so the rounding is the identity here and the
     // question is asked rather than assumed.
-    let head_dim = crate::families::llama_like::project::round_up_attn_head_dim(f.attn.head_dim);
+    let head_dim = crate::shared::llama_like::project::round_up_attn_head_dim(f.attn.head_dim);
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
+            // One shape for every layer, which is what this row was
+            // already saying by having no per-layer count.
+            kv_heads: f.attn.kv_heads,
             head_dim,
             // The alternation, per layer. This is the vector that used
             // to be a shape field.
@@ -112,6 +115,8 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
             intermediate: f.intermediate,
             // Dense throughout; gemma's mixture is gemma-4.
             moe_intermediate: 0,
+            experts_per_token: 0,
+            shared_intermediate: 0,
             vocab: f.vocab,
         },
         attention,
@@ -131,6 +136,14 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
         // normed one. The post-norms sit on the block's OUTPUT, which is
         // a fact of the traced text and not of the driver's staging.
         norm: NormPlacement::Pre,
+        // gemma-2 pairs the sandwich with the offset, which is what made
+        // reading this off the placement look sound for three generations.
+        norm_unit_offset: true,
+        // gemma-3 carries the per-head q/k norm and NO V norm: the two
+        // are separate facts, and this row is where that is said.
+        v_norm: false,
+        k_eq_v: false,
+        mlp_gate: crate::deployment::MlpGate::GeluTanh,
         // No named constants: the `sqrt(hidden)` embedding scale is
         // stated inside the trace, not looked up by name.
         scales: std::collections::BTreeMap::new(),
@@ -142,6 +155,38 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
         towers: Default::default(),
     }
 }
+
+/// Why this build has no Metal text for a gemma-2 row.
+///
+/// A `const` so the test that asserts the refusal NAMES the missing
+/// thing compares against the same string the caller is shown, rather
+/// than against a paraphrase that can drift away from it — the shape
+/// `csm::project::NO_TRACE` set for the same reason.
+///
+/// Its forward is `gemma2_cuda`, which states gemma-2's caps —
+/// the attention logit cap and the final logit cap — and
+/// `llama_like_metal`, the one Metal text here, has a `logit_softcap`
+/// field it reads for the final one but no attention cap at all. A
+/// gemma-2 traced without its attention cap runs, and its softmax
+/// saturates differently in every layer.
+///
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine, and a pie whose Metal half had this text would serve the same
+/// row unchanged. What is missing is a TEXT in this build, which is a
+/// fact about the build.
+///
+/// Stating it is the whole of what replaces `driver-metal`'s
+/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
+/// reduced by a punctuation-stripping `canonical()`, consulted before
+/// any text was traced and free to disagree with what the tracer would
+/// actually do. It listed `gemma4`, which the load path refused on
+/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// that answers for itself cannot disagree with a list, because there
+/// is no list.
+pub const NO_METAL: &str = "gemma-2 has no Metal text in this build: its forward is `gemma2_cuda`, whose \
+     attention logit cap has no counterpart in the one Metal text here \
+     (`llama_like_metal`), and whose shape is `Gemma2Facts` rather than the \
+     `LlamaLikeFacts` that text takes; the CUDA backend serves this row";
 
 /// Trace this row's CUDA text for one fire class.
 ///
@@ -216,7 +261,7 @@ mod tests {
     #[test]
     fn the_alternating_window_reaches_every_layer() {
         let f = f();
-        let d = deployment(&f, 10_000.0);
+        let d = deployment(&f, 10_000.0, 1e-6);
         let windows: Vec<i32> = d.attention.iter().map(|a| a.window).collect();
         assert_eq!(windows, f.window_by_layer());
         assert_eq!(windows.len(), 42);
@@ -231,12 +276,12 @@ mod tests {
     /// the corpus to say.
     #[test]
     fn a_null_final_softcap_is_no_cap_and_not_a_panic() {
-        let capped = deployment(&f(), 10_000.0);
+        let capped = deployment(&f(), 10_000.0, 1e-6);
         assert_eq!(capped.logit_softcap, 30.0);
 
         let mut uncapped = f();
         uncapped.final_logit_softcap = false;
-        assert_eq!(deployment(&uncapped, 10_000.0).logit_softcap, 0.0);
+        assert_eq!(deployment(&uncapped, 10_000.0, 1e-6).logit_softcap, 0.0);
     }
 
     /// The launch geometry is the row's own numbers, so a fire and a
@@ -244,7 +289,7 @@ mod tests {
     #[test]
     fn the_launch_geometry_is_the_rows_own_numbers() {
         let f = f();
-        let d = deployment(&f, 10_000.0);
+        let d = deployment(&f, 10_000.0, 1e-6);
         assert_eq!(d.shape.hidden, 3584);
         assert_eq!(d.shape.q_heads, 16);
         assert_eq!(d.shape.kv_heads, 8);
@@ -262,7 +307,7 @@ mod tests {
     /// a claim about every family that had not been written yet.
     #[test]
     fn the_defaults_the_old_vtable_supplied_are_stated() {
-        let d = deployment(&f(), 10_000.0);
+        let d = deployment(&f(), 10_000.0, 1e-6);
         assert_eq!(d.kv, KvStyle::Paged);
         assert!(d.recurrent.is_none());
         assert_eq!(d.prefill, PrefillStyle::Planned);
@@ -287,7 +332,7 @@ mod tests {
         f.attn.head_dim = 128;
         f.attn.heads = 32;
         f.attn.kv_heads = 16;
-        let d = deployment(&f, 10_000.0);
+        let d = deployment(&f, 10_000.0, 1e-6);
         assert_eq!(d.shape.head_dim, 128);
         assert!((d.attention[0].sm_scale - 1.0 / 128f32.sqrt()).abs() < 1e-6);
     }

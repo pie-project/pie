@@ -19,9 +19,9 @@ use super::mock_device::{Behavior, MockBackend, launch_observer};
 /// PTIR program at bind.
 ///
 /// Read from the fixture `config.json` here, and written into the fixture
-/// descriptor below, so the two sides of that equality come from one number.
+/// config below, so the two sides of that equality come from one number.
 /// The engine itself no longer reads a `config.json`: it takes `vocab_size`
-/// from the `pie.model/1` descriptor the worker hands it, which for a real
+/// from the checkpoint config the worker hands it, which for a real
 /// boot is normalized from exactly this file.
 fn fixture_vocab_size() -> u32 {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures");
@@ -212,13 +212,13 @@ impl MockEnv {
                 kv_page_size: 16,
                 tokenizer_path,
                 // A fixture snapshot: the tokenizer is a file on disk, and the
-                // descriptor is what the worker would have normalized from the
+                // config is what the worker would have lifted from the
                 // fixture's `config.json`. Only the two fields `register`
                 // reads are stated -- the rest of the schema is the
                 // normalizer's business, and this harness never runs it.
                 metadata: ::model::ModelMetadata {
                     tokenizer: None,
-                    descriptor: format!(
+                    config: format!(
                         r#"{{"version":"pie.model/1","vocab_size":{},"num_hidden_layers":2}}"#,
                         fixture_vocab_size(),
                     )

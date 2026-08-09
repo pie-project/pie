@@ -13,8 +13,8 @@
 
 use model_compiler::kernels::*;
 use model_compiler::trace::ForwardPlan;
-use model::families::llama_like::forward::facts::LlamaLikeCudaFacts;
-use model::families::llama_like::forward::facts::LlamaLikeFacts;
+use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
+use model::shared::llama_like::forward::facts::LlamaLikeFacts;
 use model::qwen_3_5::forward::facts::Qwen35CudaFacts;
 use model::qwen_3_5::forward::facts::Qwen35HybridFacts;
 use model_compiler::trace::FireClass;
@@ -298,7 +298,7 @@ fn the_table_covers_the_dsl_surface() {
 #[test]
 fn the_depth_axis_derives_from_the_layer_tag() {
     let facts = LlamaLikeFacts::qwen3_0_6b();
-    let plan = model::families::llama_like::forward::llama_like_cuda(
+    let plan = model::shared::llama_like::forward::llama_like_cuda(
         &facts,
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Decode,
@@ -337,7 +337,7 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // between the two halves of the axis: stopping after layer `k`
     // costs a prefill nothing, and narrowing rows under it would
     // cost it a plan it has no way to build.
-    let prefill = model::families::llama_like::forward::llama_like_cuda(
+    let prefill = model::shared::llama_like::forward::llama_like_cuda(
         &facts,
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Prefill,
@@ -382,7 +382,7 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // not have. So the trace states the axis and the DRIVER refuses
     // the shapes that narrow (`PaddedHeadNarrowing`), which is the
     // same division of labour the Prefill class settled.
-    let padded = model::families::llama_like::forward::llama_like_cuda(
+    let padded = model::shared::llama_like::forward::llama_like_cuda(
         &facts,
         &LlamaLikeCudaFacts {
             head_dim_padded: true,
@@ -400,7 +400,7 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // The XQA decode deployment is the one that still withholds it:
     // its prepare is fire-wide and R-shaped, so even the free half
     // has nothing to stand on.
-    let xqa = model::families::llama_like::forward::llama_like_cuda(
+    let xqa = model::shared::llama_like::forward::llama_like_cuda(
         &facts,
         &LlamaLikeCudaFacts {
             xqa_decode: true,
@@ -430,12 +430,12 @@ fn table_is_unambiguous() {
 fn live_traces_satisfy_the_table() {
     let mut plans = Vec::new();
     for class in [FireClass::Decode, FireClass::Prefill] {
-        plans.push(model::families::llama_like::forward::llama_like_cuda(
+        plans.push(model::shared::llama_like::forward::llama_like_cuda(
             &LlamaLikeFacts::qwen3_0_6b(),
             &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
             class,
         ));
-        plans.push(model::families::llama_like::forward::llama_like_cuda(
+        plans.push(model::shared::llama_like::forward::llama_like_cuda(
             &LlamaLikeFacts::mistral_7b_v03(),
             &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
             class,

@@ -1,0 +1,167 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common/bf16.glsl"
+#include "attn/sdpa_online.glsl"
+
+// Paged attention read side. The port keeps the Metal page-table arithmetic:
+// request -> CSR page list -> physical page + in-page offset, then NHD element
+// addressing. The scalar body below is intentionally subgroup-width agnostic;
+// the `_p32` and `_sg8` names are ABI points, not assumptions about Vulkan's
+// hardware subgroup size.
+
+#ifndef PIE_HEAD_DIM
+#error "sdpa_paged requires -DPIE_HEAD_DIM"
+#endif
+
+#if defined(PIE_TILED)
+layout(local_size_x = 32, local_size_y = 32) in;
+#else
+layout(local_size_x = PIE_HEAD_DIM) in;
+#endif
+
+PIE_BUFFER_RO(0, Queries, queries);
+PIE_BUFFER_RO(1, KPages, k_pages);
+PIE_BUFFER_RO(2, VPages, v_pages);
+PIE_BUFFER_RW(3, Out, out_);
+layout(std430, binding = 4) readonly buffer PositionIds { int position_ids[]; };
+layout(std430, binding = 5) readonly buffer ReqOfToken { int req_of_token[]; };
+layout(std430, binding = 6) readonly buffer KvPageIndices { uint kv_page_indices[]; };
+layout(std430, binding = 7) readonly buffer KvPageIndptr { uint kv_page_indptr[]; };
+layout(std430, binding = 8) readonly buffer AttentionMask { uint8_t attention_mask[]; };
+layout(std430, binding = 9) readonly buffer AttentionMaskEnabled { uint8_t attention_mask_enabled[]; };
+PIE_BUFFER_RO(10, Sinks, sinks);
+
+#if defined(PIE_TILED)
+layout(push_constant) uniform Push {
+    int gqa_factor;
+    int page_size;
+    int n_kv_heads;
+    float scale;
+    uint attention_mask_stride;
+    int window;
+    int n_rows;
+#if defined(PIE_STRIDED)
+    int q_row_pitch;
+    int o_row_pitch;
+#endif
+} pc;
+#else
+layout(push_constant) uniform Push {
+    int gqa_factor;
+    int page_size;
+    int n_kv_heads;
+    float scale;
+    uint attention_mask_stride;
+    int window;
+} pc;
+#endif
+
+uint page_slot(int req, int kp) {
+#if defined(PIE_PAGE_SIZE) && PIE_PAGE_SIZE == 32
+    uint page_ix = uint(kp) >> 5;
+    uint page_off = uint(kp) & 31u;
+    uint phys = kv_page_indices[kv_page_indptr[req] + page_ix];
+    return phys * 32u + page_off;
+#else
+    uint page_ix = uint(kp / pc.page_size);
+    uint page_off = uint(kp % pc.page_size);
+    uint phys = kv_page_indices[kv_page_indptr[req] + page_ix];
+    return phys * uint(pc.page_size) + page_off;
+#endif
+}
+
+bool keeps(uint row, int kp, int q_pos, int start) {
+    if (kp > q_pos || kp < start) return false;
+    if (attention_mask_enabled[row] != uint8_t(0)) {
+        if (uint(kp) >= pc.attention_mask_stride) return false;
+        if (attention_mask[row * pc.attention_mask_stride + uint(kp)] == uint8_t(0)) return false;
+    }
+    return true;
+}
+
+uint q_base_for(uint row, uint q_head, uint n_q_heads) {
+#if defined(PIE_TILED) && defined(PIE_STRIDED)
+    return (pc.q_row_pitch > 0 ? row * uint(pc.q_row_pitch) : row * n_q_heads * uint(PIE_HEAD_DIM)) + q_head * uint(PIE_HEAD_DIM);
+#else
+    return (row * n_q_heads + q_head) * uint(PIE_HEAD_DIM);
+#endif
+}
+
+uint o_base_for(uint row, uint q_head, uint n_q_heads) {
+#if defined(PIE_TILED) && defined(PIE_STRIDED)
+    return (pc.o_row_pitch > 0 ? row * uint(pc.o_row_pitch) : row * n_q_heads * uint(PIE_HEAD_DIM)) + q_head * uint(PIE_HEAD_DIM);
+#else
+    return (row * n_q_heads + q_head) * uint(PIE_HEAD_DIM);
+#endif
+}
+
+float dot_page(uint q_base, int req, int kv_head, int kp) {
+    uint slot = page_slot(req, kp);
+    uint k_base = (slot * uint(pc.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
+    float acc = 0.0;
+    for (uint d = 0u; d < uint(PIE_HEAD_DIM); d++) {
+        acc += pc.scale * PIE_LOAD(queries[q_base + d]) * PIE_LOAD(k_pages[k_base + d]);
+    }
+    return acc;
+}
+
+void compute_one(uint row, uint q_head, uint d_out, uint n_q_heads) {
+    int req = req_of_token[row];
+    int q_pos = position_ids[row];
+#if defined(PIE_FAST_FULL)
+    int start = 0;
+#else
+    int start = (pc.window > 0 && q_pos >= pc.window) ? (q_pos - pc.window + 1) : 0;
+#endif
+    uint q_base = q_base_for(row, q_head, n_q_heads);
+    uint o_base = o_base_for(row, q_head, n_q_heads);
+    int kv_head = int(q_head) / pc.gqa_factor;
+
+    float max_score = PIE_SDPA_NEG_INF;
+    float sum_exp = 0.0;
+    float out_acc = 0.0;
+    for (int kp = start; kp <= q_pos; kp++) {
+        if (!keeps(row, kp, q_pos, start)) continue;
+        float score = dot_page(q_base, req, kv_head, kp);
+        float hist, prob;
+        sdpa_online_update(score, max_score, sum_exp, hist, prob);
+        uint slot = page_slot(req, kp);
+        uint v_at = (slot * uint(pc.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM) + d_out;
+        out_acc = out_acc * hist + prob * PIE_LOAD(v_pages[v_at]);
+    }
+#if defined(PIE_WITH_SINK)
+    float orescale = sdpa_merge_sink(PIE_LOAD(sinks[q_head]), max_score, sum_exp);
+    out_acc *= orescale;
+#endif
+    out_[o_base + d_out] = PIE_STORE(sum_exp == 0.0 ? out_acc : out_acc / sum_exp);
+}
+
+void main() {
+#if defined(PIE_TILED)
+    uint q_head = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.y * 32u + gl_LocalInvocationID.y;
+    if (row >= uint(pc.n_rows)) return;
+    for (uint d = gl_LocalInvocationID.x; d < uint(PIE_HEAD_DIM); d += 32u) {
+        compute_one(row, q_head, d, gl_NumWorkGroups.x);
+    }
+#else
+    compute_one(gl_WorkGroupID.y, gl_WorkGroupID.x, gl_LocalInvocationID.x, gl_NumWorkGroups.x);
+#endif
+}
+
+// pie:instantiate sdpa_paged_decode_bfloat16_d_64 PIE_HEAD_DIM=64
+// pie:instantiate sdpa_paged_decode_bfloat16_d_128 PIE_HEAD_DIM=128
+// pie:instantiate sdpa_paged_decode_bfloat16_d_256 PIE_HEAD_DIM=256
+// pie:instantiate sdpa_paged_decode_bfloat16_d_512 PIE_HEAD_DIM=512
+// pie:instantiate sdpa_paged_decode_bfloat16_d_64_p32 PIE_HEAD_DIM=64 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1
+// pie:instantiate sdpa_paged_decode_bfloat16_d_128_p32 PIE_HEAD_DIM=128 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1
+// pie:instantiate sdpa_paged_decode_bfloat16_d_64_p32_sg8 PIE_HEAD_DIM=64 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1 PIE_SHORT_GROUP=8
+// pie:instantiate sdpa_paged_decode_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_WITH_SINK=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_WITH_SINK=1
+// pie:instantiate sdpa_paged_tiled_strided_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_STRIDED=1

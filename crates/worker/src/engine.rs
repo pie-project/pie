@@ -364,7 +364,7 @@ struct LoadedModelDrivers {
     kv_handle: Option<driver_api::KvHandle>,
     drivers: ModelDrivers,
     /// The model's compiled metadata, read once while resolving it. Present
-    /// for either input form: an artifact carries the descriptor, a snapshot's
+    /// for either input form: an artifact carries the config, a snapshot's
     /// `config.json` is normalized into one.
     metadata: model::ModelMetadata,
 }
@@ -428,7 +428,7 @@ fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {
 fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
     // A `.zt` artifact already has an identity, and it is a better one than
     // anything derivable here: the manifest digest covers every tensor, the
-    // compiled tokenizer and the model descriptor together, and for a sharded
+    // compiled tokenizer and the checkpoint config together, and for a sharded
     // artifact it reaches the shards through their entries in the shard table.
     // It also survives the file being moved, which the path-derived answer
     // below does not.
@@ -576,7 +576,7 @@ fn load_model_drivers(
         let lifted = resolved_model
             .metadata()
             .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
-        let descriptor = lifted.descriptor.clone();
+        let config = lifted.config.clone();
         metadata = Some(lifted);
         let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_drivers: Vec<GroupDriver> = Vec::with_capacity(topology.len());
@@ -588,7 +588,7 @@ fn load_model_drivers(
                 flavor,
                 &embedded_base_opts,
                 &snapshot_dir,
-                &descriptor,
+                &config,
                 tp_degree,
                 component,
             )?);
@@ -1009,7 +1009,7 @@ fn create_driver_group(
     flavor: Flavor,
     base_opts: &DriverOptions,
     snapshot_dir: &Path,
-    descriptor: &[u8],
+    config: &[u8],
     tp_degree: usize,
     component: driver_api::ModelComponent,
 ) -> Result<GroupDriver> {
@@ -1021,7 +1021,7 @@ fn create_driver_group(
             return crate::embedded_driver::create_driver_backend_group(
                 &rank_opts,
                 snapshot_dir,
-                descriptor,
+                config,
                 group_idx,
                 &tp_launches,
                 component,
@@ -1050,7 +1050,7 @@ fn create_driver_group(
     crate::embedded_driver::create_driver_backend(
         &opts,
         snapshot_dir,
-        descriptor,
+        config,
         group_idx,
         None,
         component,

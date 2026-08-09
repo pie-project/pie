@@ -1,0 +1,134 @@
+// Fused GDN core for decode.
+//
+// Ported from Metal's `gdn_core.metal`: the conv/silu prologue, q/k L2 norms,
+// gated recurrent update, and ping-pong conv-state writeback are unchanged. The
+// Vulkan port deliberately reduces through shared memory over the 32 x-lanes so
+// correctness does not depend on the implementation's subgroup width.
+
+#version 450
+
+#include "common/bf16.glsl"
+#include "ssm/gdn_params.glsl"
+
+layout(local_size_x = 32, local_size_y = 4) in;
+
+PIE_BUFFER_RO(0, Mixed, mixed);
+layout(std430, binding = 1) readonly buffer ConvState { float conv_state[]; };
+layout(std430, binding = 2) buffer RState { float rstate[]; };
+PIE_BUFFER_RW(3, CoreOut, core_out);
+PIE_BUFFER_RO(4, ConvW, conv_w);
+PIE_BUFFER_RO(5, ConvB, conv_b);
+layout(std430, binding = 6) readonly buffer ALog { float A_log[]; };
+PIE_BUFFER_RO(7, DtBias, dt_bias);
+PIE_BUFFER_RO(8, AGate, a_gate);
+PIE_BUFFER_RO(9, BGate, b_gate);
+layout(std430, binding = 10) buffer NewConvState { float new_conv_state[]; };
+layout(std430, binding = 11) readonly buffer Params { GdnCoreParams p; };
+#if defined(PIE_SLOTTED)
+layout(std430, binding = 12) readonly buffer SlotIds { uint slot_ids[]; };
+#endif
+
+shared float sh_reduce[4 * 32];
+
+float silu(float x) { return x / (1.0 + exp(-x)); }
+
+float row_sum32(float v) {
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint at = ly * 32u + lx;
+    sh_reduce[at] = v;
+    barrier();
+    for (uint stride = 16u; stride > 0u; stride >>= 1) {
+        if (lx < stride) sh_reduce[at] += sh_reduce[at + stride];
+        barrier();
+    }
+    float outv = sh_reduce[ly * 32u];
+    barrier();
+    return outv;
+}
+
+float convsilu(int slot, int b_idx, int c) {
+    float acc = PIE_LOAD(conv_b[c]);
+    for (int j = 0; j < p.Kc - 1; ++j)
+        acc += conv_state[(slot * p.Kc + (j + 1)) * p.conv_dim + c] * PIE_LOAD(conv_w[c * p.Kc + j]);
+    acc += PIE_LOAD(mixed[b_idx * p.conv_dim + c]) * PIE_LOAD(conv_w[c * p.Kc + (p.Kc - 1)]);
+    return silu(acc);
+}
+
+void write_conv(int slot, int b_idx, int c) {
+    for (int j = 0; j < p.Kc - 1; ++j)
+        new_conv_state[(slot * p.Kc + j) * p.conv_dim + c] =
+            conv_state[(slot * p.Kc + (j + 1)) * p.conv_dim + c];
+    new_conv_state[(slot * p.Kc + (p.Kc - 1)) * p.conv_dim + c] =
+        PIE_LOAD(mixed[b_idx * p.conv_dim + c]);
+}
+
+void main() {
+    int n = int(gl_WorkGroupID.z);
+    int b_idx = n / p.Hv;
+    int hv_idx = n % p.Hv;
+    int rep = p.Hv / p.Hk;
+    int hk_idx = hv_idx / rep;
+    bool hk_first = (hv_idx % rep) == 0;
+    int dk_idx = int(gl_LocalInvocationID.x);
+    int dv_idx = int(gl_GlobalInvocationID.y);
+    int n_per_t = p.Dk / 32;
+#if defined(PIE_SLOTTED)
+    int slot = int(slot_ids[b_idx]);
+#else
+    int slot = b_idx;
+#endif
+
+    float qraw[8];
+    float kraw[8];
+    float qsq = 0.0;
+    float ksq = 0.0;
+    for (int i = 0; i < n_per_t; ++i) {
+        int d = n_per_t * dk_idx + i;
+        qraw[i] = convsilu(slot, b_idx, p.q_off + hk_idx * p.Dk + d);
+        kraw[i] = convsilu(slot, b_idx, p.k_off + hk_idx * p.Dk + d);
+        qsq += qraw[i] * qraw[i];
+        ksq += kraw[i] * kraw[i];
+    }
+    float qinv = p.inv_sqrt_dk / sqrt(row_sum32(qsq) + p.eps);
+    float kinv = 1.0 / sqrt(row_sum32(ksq) + p.eps);
+
+    float vval = convsilu(slot, b_idx, p.v_off + hv_idx * p.Dv + dv_idx);
+    float ad = PIE_LOAD(a_gate[b_idx * p.Hv + hv_idx]) + PIE_LOAD(dt_bias[hv_idx]);
+    float sp = max(ad, 0.0) + log(1.0 + exp(-abs(ad)));
+    float decay = exp(-exp(A_log[hv_idx]) * sp);
+    float beta = 1.0 / (1.0 + exp(-PIE_LOAD(b_gate[b_idx * p.Hv + hv_idx])));
+
+    uint state_base = uint(((slot * p.Hv + hv_idx) * p.Dv + dv_idx) * p.Dk);
+    float st[8];
+    float kv = 0.0;
+    for (int i = 0; i < n_per_t; ++i) {
+        int d = n_per_t * dk_idx + i;
+        st[i] = rstate[state_base + uint(d)] * decay;
+        kv += st[i] * (kraw[i] * kinv);
+    }
+    kv = row_sum32(kv);
+    float delta = (vval - kv) * beta;
+    float outv = 0.0;
+    for (int i = 0; i < n_per_t; ++i) {
+        int d = n_per_t * dk_idx + i;
+        float kk = kraw[i] * kinv;
+        st[i] += kk * delta;
+        outv += st[i] * (qraw[i] * qinv);
+        rstate[state_base + uint(d)] = st[i];
+    }
+    outv = row_sum32(outv);
+    if (dk_idx == 0) core_out[(b_idx * p.Hv + hv_idx) * p.Dv + dv_idx] = PIE_STORE(outv);
+
+    if (dv_idx == 0 && hk_first) {
+        for (int i = 0; i < n_per_t; ++i) {
+            int d = n_per_t * dk_idx + i;
+            write_conv(slot, b_idx, p.q_off + hk_idx * p.Dk + d);
+            write_conv(slot, b_idx, p.k_off + hk_idx * p.Dk + d);
+        }
+    }
+    write_conv(slot, b_idx, p.v_off + hv_idx * p.Dv + dv_idx);
+}
+
+// pie:instantiate gdn_core_bfloat16
+// pie:instantiate gdn_core_slotted_bfloat16 PIE_SLOTTED=1

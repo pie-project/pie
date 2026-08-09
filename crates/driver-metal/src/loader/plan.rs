@@ -17,7 +17,7 @@
 //! fallback every claimed transform must have.
 //!
 //! The loading policy went the same way. [`compile_load_plan`] here used to
-//! state all seven [`model::policy::Policy`] fields, and
+//! state all seven [`model::shared::policy::Policy`] fields, and
 //! `driver-cuda`'s copy stated the same seven, differing in exactly two —
 //! its own comment said the block was carried "bit for bit". Two copies of a
 //! policy is not a spelling problem: a field added to `Policy` gets a
@@ -32,7 +32,7 @@ use std::path::Path;
 use model::boot::Binding;
 use model::catalog::Variant;
 use model::encoding::Encoding;
-use model::policy::Mxfp4MoePolicy;
+use model::shared::policy::Mxfp4MoePolicy;
 use model_loader::checkpoint::read::parse_checkpoint_metadata;
 use model_loader::plan::{LoadPlan, StorageTarget};
 use model_loader::types::BackendKind;
@@ -168,11 +168,11 @@ mod tests {
     fn this_driver_asks_for_mlx_names_and_unfused_projections() {
         assert_eq!(
             Binding::MLX_IN_PLACE.naming,
-            model_loader::types::Naming::Mlx
+            model::shared::policy::Naming::Mlx
         );
         assert_eq!(
             Binding::MLX_IN_PLACE.projections,
-            model::policy::Projections::InPlace
+            model::shared::policy::Projections::InPlace
         );
     }
 

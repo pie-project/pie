@@ -40,8 +40,8 @@ use driver_metal::bind::encode::Pipelines;
 use driver_metal::lowering::executor::{Resolver, Slice};
 use driver_metal::lowering::frame::{Step, lower_step};
 use driver_metal::fire::run::run;
-use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-use model::families::llama_like::forward::llama_like_metal;
+use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::trace::{FireClass, ValueId};
 
 fn kernels_dir() -> PathBuf {

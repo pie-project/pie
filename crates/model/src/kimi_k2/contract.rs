@@ -10,7 +10,7 @@ use model_loader::contract::Expr;
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding};
 
-use crate::builder::{Builder, int4b8_encoding, is_raw};
+use crate::shared::builder::{Builder, int4b8_encoding, is_raw};
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))

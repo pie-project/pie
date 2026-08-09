@@ -68,8 +68,25 @@ instantiate_silu_mul_strided(bfloat16, bfloat)
 
 instantiate_silu_mul(bfloat16, bfloat)
 
+// THE GRID IS THE EXTENT, so this carries no count.
+//
+// `n` used to be here and used to be read as `if (gid >= p.n) return;`. It
+// was stated by the text as the INTERMEDIATE WIDTH -- one row -- and the
+// dispatch covers `width * rows`, so every row after the first returned
+// immediately. A prefill's second token came back as zeros; a decode is one
+// row and never noticed.
+//
+// A per-row number cannot bound a whole-tensor dispatch, and the text cannot
+// state the whole: its shape says `[Tokens, intermediate]` and `Tokens` is
+// not known until a fire lowers. The driver is what knows, and it already
+// spends that knowledge on the grid -- `Rule::Elementwise` sizes on the
+// output operand, so the dispatch is exactly the element count and a second
+// bound is a second answer to a question already answered.
+//
+// `silu_mul` above takes no params for exactly this reason and has always
+// been right. This is now the same shape.
 struct GegluParams {
-  uint n;  // element count (intermediate width)
+  uint unused;
 };
 
 inline float gelu_tanh(float x) {
@@ -85,7 +102,7 @@ template <typename T>
     device T* out             [[buffer(2)]],
     constant GegluParams& p   [[buffer(3)]],
     uint gid                  [[thread_position_in_grid]]) {
-  if (gid >= p.n) return;
+  (void)p;
   const float g = gelu_tanh(static_cast<float>(gate[gid]));
   out[gid] = static_cast<T>(g * static_cast<float>(up[gid]));
 }
@@ -144,7 +161,7 @@ template <typename T>
 instantiate_geglu_strided(bfloat16, bfloat)
 
 struct GptOssSwiGluParams {
-  uint n;        // experts_per_token * intermediate
+  uint unused;   // was a per-row element count -- see `GegluParams`
   float limit;   // 7.0
   float alpha;   // 1.702
 };
@@ -164,7 +181,6 @@ template <typename T>
     device T* out                   [[buffer(2)]],
     constant GptOssSwiGluParams& p  [[buffer(3)]],
     uint gid [[thread_position_in_grid]]) {
-  if (gid >= p.n) return;
   float g = float(gate[gid]);
   float u = float(up[gid]);
   g = min(g, p.limit);

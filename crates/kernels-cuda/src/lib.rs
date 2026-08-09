@@ -28,6 +28,7 @@ pub mod layout;
 pub mod mlp;
 pub mod moe;
 pub mod norm;
+pub mod norm_device;
 pub mod quant;
 pub mod rope;
 pub mod sample;
@@ -104,7 +105,8 @@ const EMPTY: KernelSig = KernelSig {
     whole: false, needs: Prepare::None,
     lacks: &[], sink: None, in_place: &[], depth_prefix_plan: false,
     operands: &[],
-    returns: "", axes: &[], grid_param: None, lowered_as: None,
+    returns: "", axes: &[], grid_param: None,
+    head_param: None, heads_param: None, lowered_as: None,
 };
 
 const fn copy_sig(k: &KernelSig) -> KernelSig {
@@ -114,6 +116,8 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         lacks: k.lacks, sink: k.sink, in_place: k.in_place,
         depth_prefix_plan: k.depth_prefix_plan,
         operands: k.operands, returns: k.returns, axes: k.axes,
-        grid_param: k.grid_param, lowered_as: k.lowered_as,
+        grid_param: k.grid_param,
+        head_param: k.head_param, heads_param: k.heads_param,
+        lowered_as: k.lowered_as,
     }
 }

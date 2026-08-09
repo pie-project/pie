@@ -12,7 +12,7 @@
 //! Read `VARIANTS` and then `impl Variant`. What this generation adds
 //! over its shape is what a shape cannot state: which pass authors it
 //! and which template speaks for it — and the second of those is shared
-//! with kimi-k3, so it lives in `families/` and this directory
+//! with kimi-k3, so it lives in `shared/` and this directory
 //! re-exports it.
 
 #[cfg(feature = "chat")]
@@ -211,23 +211,39 @@ impl Variant for KimiK2 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         contract::author_kimi(builder)
     }
 
     /// # Errors
     ///
-    /// Never, today: the text traces for both fire classes. The `Result`
-    /// is the trait's, and it is what lets [`Self::deployment`] refuse
-    /// before anything reaches here.
+    /// Whatever [`Self::deployment`] refuses, because it is asked first
+    /// and the two questions are one question: "does this build serve
+    /// this row". The text itself traces for both fire classes.
+    ///
+    /// It has to be asked here rather than assumed. This doc used to say
+    /// the refusal happened "before anything reaches here" — but nothing
+    /// sequenced the two calls, so a build with no MLA latent store
+    /// refused at the door and handed out a fire anyway.
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        let _ = load;
+        // METAL, refused by name. `llama_like_metal` is the only Metal
+        // text in this build and it is not this model's — see
+        // [`project::NO_METAL`] for what it states instead and why
+        // reaching for it would trace a different model under this
+        // row's id. The refusal is stated HERE, at the row, rather than
+        // consulted from a list of architecture strings a driver keeps:
+        // a list is a fourth place for the answer to live and a fourth
+        // place for it to be wrong.
+        if let crate::catalog::Backend::Metal(_) = load.backend {
+            return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
+        }
+        self.deployment(load)?;
         Ok(project::trace(&self.shape, self.rope_yarn, class))
     }
 
@@ -237,7 +253,7 @@ impl Variant for KimiK2 {
     /// answer, in a table that could disagree with the other two.
     #[cfg(feature = "chat")]
     fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(crate::families::kimi::KimiInstruct::new(tokenizer))
+        Arc::new(crate::shared::kimi::KimiInstruct::new(tokenizer))
     }
 }
 
@@ -384,13 +400,21 @@ mod tests {
     /// The trace is still owed and still given: a build that cannot
     /// serve the row can still compile its text, which is what keeps the
     /// goldens honest.
+    ///
+    /// Asked of [`project::trace`] and not of [`Variant::trace`], and the
+    /// distinction is the same one `plan` draws against `deployment`: the
+    /// projection is TOTAL, a fact about the row, while the trait method
+    /// is capability-gated and must refuse exactly when the door does.
+    /// Asking the gated one here is what let this test and
+    /// `catalog::tests::a_row_that_cannot_deploy_cannot_trace_either`
+    /// state opposite things about the same call.
     #[cfg(feature = "forward")]
     #[test]
     fn every_row_traces_both_fire_classes() {
         use model_compiler::trace::FireClass;
         for v in VARIANTS {
             for class in [FireClass::Prefill, FireClass::Decode] {
-                let plan = v.trace(class, Deployed::single()).expect("kimi's text traces");
+                let plan = project::trace(&v.shape, v.rope_yarn, class);
                 assert!(plan.family.starts_with("kimi.cuda."), "{}", plan.family);
                 assert!(!plan.ops.is_empty());
             }
@@ -399,7 +423,7 @@ mod tests {
 
     /// The chat answer is a CALL and not a table row, and it reaches the
     /// same words `kimi_k3` reaches — which is why they live in
-    /// `families/` and not in this directory.
+    /// `shared/` and not in this directory.
     #[cfg(feature = "chat")]
     #[test]
     fn every_row_answers_the_chat_question() {
@@ -438,10 +462,10 @@ mod tests {
         let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
-        let policy = crate::policy::Policy::default();
+        let policy = crate::shared::policy::Policy::default();
 
         for v in VARIANTS {
-            let mut builder = crate::builder::Builder::new(
+            let mut builder = crate::shared::builder::Builder::new(
                 &metadata,
                 v.id(),
                 v.load_shape(),
@@ -451,5 +475,73 @@ mod tests {
             );
             v.author(&mut builder).unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
         }
+    }
+
+    /// A METAL load is refused BY NAME rather than traced as a llama.
+    ///
+    /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
+    /// table answered "does this build serve you" from an architecture
+    /// STRING reduced by `canonical()`, in a driver, before any text was
+    /// traced — so it could say yes to a row whose text does not exist
+    /// (it listed `gemma4`) and no to one whose text does (it omitted
+    /// `gemma3`). The row answers now, and what it answers with is a
+    /// sentence naming what is missing.
+    ///
+    /// The comparison is against [`project::NO_METAL`] itself and not a
+    /// paraphrase, so the sentence a caller is shown is the sentence
+    /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
+    #[cfg(feature = "forward")]
+    #[test]
+    fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
+        use crate::catalog::{Backend, Deployed, MetalBinding};
+        use crate::deployment::Refusal;
+        use model_compiler::trace::FireClass;
+
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+        };
+        assert!(!VARIANTS.is_empty());
+        for v in VARIANTS {
+            for class in [FireClass::Prefill, FireClass::Decode] {
+                let err = v
+                    .trace(class, Deployed::metal(&bind))
+                    .expect_err("this build has no Metal text for this generation");
+                assert_eq!(
+                    err,
+                    Refusal::Unsupported(project::NO_METAL),
+                    "`{}` refused a Metal load with a sentence that is not the \
+                     one the row states",
+                    v.id
+                );
+            }
+        }
+        // And the refusal is about the BACKEND and nothing else.
+        //
+        // Stated as "not the Metal sentence" rather than `is_ok()`,
+        // because this family's CUDA answer is not `Ok` either: MLA has
+        // no store in ANY build, `deployment` has always said so, and
+        // `trace` now asks it first instead of firing a text for a row
+        // the door already turned away. Asserting `is_ok()` here would
+        // make this test a second, quieter claim that the MLA store is
+        // built -- which is the coupling `Deployed::metal` exists to
+        // avoid. What "unchanged" means is that no CUDA caller ever sees
+        // a sentence about Metal.
+        for v in VARIANTS {
+            let cuda = v.trace(FireClass::Decode, Deployed::single());
+            assert_ne!(
+                cuda.as_ref().err(),
+                Some(&Refusal::Unsupported(project::NO_METAL)),
+                "`{}` answered a CUDA load with a sentence about Metal",
+                v.id
+            );
+        }
+        // A `Backend::Cuda` is what `Deployed::single()` states, so the
+        // arm above is reached by every existing caller unchanged.
+        assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }

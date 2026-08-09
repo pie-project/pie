@@ -136,11 +136,14 @@ pub fn deployment(
     rope_theta_local: f32,
     norm_eps: f32,
 ) -> Deployment {
-    let head_dim = crate::families::llama_like::project::round_up_attn_head_dim(f.attn.head_dim);
+    let head_dim = crate::shared::llama_like::project::round_up_attn_head_dim(f.attn.head_dim);
     let attention = (0..f.layers())
         .map(|l| {
             let window = model_compiler::facts::window_left_at(f.window_left, l);
             LayerAttention {
+                // One shape for every layer, which is what this row
+                // was already saying by having no per-layer count.
+                kv_heads: f.attn.kv_heads,
                 head_dim,
                 window,
                 // Every layer writes and reads its OWN pages. The config
@@ -180,6 +183,8 @@ pub fn deployment(
             // of ONE feed-forward, it does not route to experts — so
             // there is no second width for a planner to size against.
             moe_intermediate: 0,
+            experts_per_token: 0,
+            shared_intermediate: 0,
             vocab: f.vocab,
         },
         attention,
@@ -194,6 +199,14 @@ pub fn deployment(
         // the trait's default of zero.
         ple_dim: i32::try_from(f.ple_width).unwrap_or(0),
         norm: NormPlacement::Pre,
+        // A gemma-3 derivative, and it kept the fold: this generation's
+        // forward fires `NormVariant::Gemma`.
+        norm_unit_offset: true,
+        // gemma-3 carries the per-head q/k norm and NO V norm: the two
+        // are separate facts, and this row is where that is said.
+        v_norm: false,
+        k_eq_v: false,
+        mlp_gate: crate::deployment::MlpGate::GeluTanh,
         // No named host scalars: gemma-3n's `sqrt(hidden)` embedding
         // scale and its AltUp coefficient clip are stated inside the
         // traced text, not looked up by name at fire time. Gemma-4 is
@@ -207,6 +220,39 @@ pub fn deployment(
         towers: Default::default(),
     }
 }
+
+/// Why this build has no Metal text for a gemma-3n row.
+///
+/// A `const` so the test that asserts the refusal NAMES the missing
+/// thing compares against the same string the caller is shown, rather
+/// than against a paraphrase that can drift away from it — the shape
+/// `csm::project::NO_TRACE` set for the same reason.
+///
+/// Its forward is `gemma3n_cuda`: AltUp's four-way hidden
+/// bundle, the Laurel residual, per-layer embeddings and the shared-KV
+/// tail. `llama_like_metal` carries a `per_layer_emb_dim` and a
+/// `kv_shared_layers` — which is exactly the trap, because carrying two
+/// of the four would trace a model that is recognisably gemma-3n and is
+/// not this one.
+///
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine, and a pie whose Metal half had this text would serve the same
+/// row unchanged. What is missing is a TEXT in this build, which is a
+/// fact about the build.
+///
+/// Stating it is the whole of what replaces `driver-metal`'s
+/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
+/// reduced by a punctuation-stripping `canonical()`, consulted before
+/// any text was traced and free to disagree with what the tracer would
+/// actually do. It listed `gemma4`, which the load path refused on
+/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// that answers for itself cannot disagree with a list, because there
+/// is no list.
+pub const NO_METAL: &str = "gemma-3n has no Metal text in this build: its forward is `gemma3n_cuda` — \
+     AltUp's four-way hidden bundle, the Laurel residual, per-layer embeddings \
+     and the shared-KV tail — and the one Metal text here (`llama_like_metal`) \
+     states two of those four and takes a different shape; a text that is \
+     recognisably gemma-3n and is not this one is the failure to avoid";
 
 /// Trace this row's CUDA text for one fire class.
 ///
@@ -305,7 +351,7 @@ mod tests {
     /// generation that is named after having one.
     #[test]
     fn the_per_layer_embedding_width_reaches_the_deployment() {
-        let d = deployment(&e2b(), 1_000_000.0, 10_000.0);
+        let d = deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6);
         assert_eq!(d.ple_dim, 256);
         assert_eq!(d.ple_dim, i32::try_from(e2b().ple_width).unwrap());
         assert!(d.ple_dim > 0, "the default this row replaces was 0");
@@ -315,7 +361,7 @@ mod tests {
     /// states 30.0 and the deployment carried 0.0.
     #[test]
     fn the_final_softcap_reaches_the_deployment() {
-        assert_eq!(deployment(&e2b(), 1_000_000.0, 10_000.0).logit_softcap, 30.0);
+        assert_eq!(deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6).logit_softcap, 30.0);
     }
 
     /// The window schedule the shape holds is the schedule every layer
@@ -323,7 +369,7 @@ mod tests {
     #[test]
     fn the_window_schedule_reaches_every_layer() {
         let f = e2b();
-        let d = deployment(&f, 1_000_000.0, 10_000.0);
+        let d = deployment(&f, 1_000_000.0, 10_000.0, 1e-6);
         let windows: Vec<i32> = d.attention.iter().map(|a| a.window).collect();
         assert_eq!(windows, f.window_left.to_vec());
         assert_eq!(windows.len(), 30);
@@ -336,7 +382,7 @@ mod tests {
     /// default table broadcast 1e6 to all thirty.
     #[test]
     fn the_rope_base_follows_the_window() {
-        let d = deployment(&e2b(), 1_000_000.0, 10_000.0);
+        let d = deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6);
         for a in &d.attention {
             if a.window < 0 {
                 assert_eq!(a.rope_theta, 1_000_000.0);
@@ -354,7 +400,7 @@ mod tests {
     /// shared ones.
     #[test]
     fn every_layer_owns_its_pages() {
-        let d = deployment(&e2b(), 1_000_000.0, 10_000.0);
+        let d = deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6);
         for (l, a) in d.attention.iter().enumerate() {
             assert_eq!(a.kv_source, l as u32);
         }
@@ -363,7 +409,7 @@ mod tests {
     /// The launch geometry is the row's own numbers.
     #[test]
     fn the_launch_geometry_is_the_rows_own_numbers() {
-        let d = deployment(&e2b(), 1_000_000.0, 10_000.0);
+        let d = deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6);
         assert_eq!(d.shape.hidden, 2048);
         assert_eq!(d.shape.q_heads, 8);
         assert_eq!(d.shape.kv_heads, 2);
@@ -381,7 +427,7 @@ mod tests {
     /// wrong.
     #[test]
     fn the_defaults_the_old_vtable_supplied_are_stated() {
-        let d = deployment(&e2b(), 1_000_000.0, 10_000.0);
+        let d = deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6);
         assert_eq!(d.kv, KvStyle::Paged);
         assert!(d.recurrent.is_none());
         assert_eq!(d.prefill, PrefillStyle::Planned);
@@ -409,7 +455,7 @@ mod tests {
         assert_eq!(ext("embed_tokens_per_layer"), vec![262_400, 35 * 256]);
         assert_eq!(m.layers, 35);
 
-        let d = deployment(&f, 1_000_000.0, 10_000.0);
+        let d = deployment(&f, 1_000_000.0, 10_000.0, 1e-6);
         assert_eq!(d.layers, 35);
         assert_eq!(d.shape.intermediate, 16384);
         assert_eq!(d.attention[34].window, -1, "the last layer is a full one");

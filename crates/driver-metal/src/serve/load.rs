@@ -66,9 +66,9 @@ impl Shell {
                 message: format!("the embedded {} is not utf8: {e}", model::encoding::CONFIG_OBJECT),
             })?,
             Ok(None) => {
-                let path = self.boot_descriptor.as_ref().ok_or_else(|| Error::Unserved {
+                let path = self.boot_config.as_ref().ok_or_else(|| Error::Unserved {
                     what: "load_model",
-                    message: "no embedded model/config and no `[model] descriptor` in the \
+                    message: "no embedded model/config and no `[model] config` in the \
                               boot config. One field is read out of it — the declared \
                               quantization — and no metal kernel can be named without it"
                         .to_string(),
@@ -137,15 +137,48 @@ impl Shell {
         // and the shell keeps the projection itself.
         let arch = deployment.advertised.arch;
         let max_model_len = deployment.advertised.max_model_len;
-        if !crate::model::text::serves(arch) {
+        // Whether this build has a Metal text for the row, asked BEFORE a
+        // byte is staged — and asked of the ROW.
+        //
+        // THE PLACEMENT IS PRESERVED DELIBERATELY. The old order's own
+        // message admitted what it costs to get this wrong: "the checkpoint
+        // loaded, but nothing states its forward pass." On the 31B gemma that
+        // sentence is 17 GB of staging spent to reach a refusal identification
+        // had already settled. Same rule as `weights::stage::fits_on_this_gpu`,
+        // whose doc states it: asked before a byte is read is the only moment
+        // it can be asked usefully. The two refusals sit on the same side of
+        // the load, and this one must stay on this side of it.
+        //
+        // WHAT CHANGED IS WHO ANSWERS. This was `text::serves(arch)` — a
+        // membership test against an eleven-entry table of architecture
+        // strings, which is the third dispatch key for an identity
+        // `catalog::identify` had already settled from the tensors. Two keys
+        // for one identity gave two answers: the table listed `"gemma4"`, so
+        // this gate CLAIMED every gemma-4 and a second refusal ninety lines
+        // below then rejected it on the sandwich norm — after the staging
+        // this gate exists to avoid. The row answers now, so there is one
+        // list and it is the one that traces.
+        //
+        // **The refusal must not depend on the binding facts**, and it does
+        // not: `binding::serves` asks with `binding::ANY_ENCODING`, because a
+        // row that refuses Metal refuses it for EVERY encoding. Whether a
+        // text was written is a fact about this build's source, and no group
+        // size, bit width or expert-bank format can move it — which is what
+        // lets the question be asked here, where `moe_mxfp4` is not yet
+        // knowable because the tensors are not yet on the device.
+        // `binding::a_row_is_served_the_same_way_at_every_encoding` holds the
+        // whole catalog to that, so this placement stops being sound the
+        // moment it fails rather than silently.
+        if let Err(refusal) = crate::model::binding::serves(row) {
             return Err(Error::Unserved {
                 what: "load_model",
                 message: format!(
-                    "no Metal text for `{arch}` (row `{}`); this backend serves {:?}. The \
-                     row exists and its author is written — what is missing is the forward \
-                     pass, which is `tests/catalog_coverage.rs`'s list.",
-                    row.id(),
-                    crate::model::text::known()
+                    "no Metal text for row `{}` (`{arch}`): {refusal}. The row exists \
+                     and its author is written — what is missing is the forward pass, \
+                     which `tests/catalog_coverage.rs` enumerates. Refused before \
+                     staging: the answer is the row's, so reading the checkpoint could \
+                     not have changed it.",
+                    row.id()
                 ),
             });
         }
@@ -185,21 +218,25 @@ impl Shell {
         let geometry = crate::batch::geometry_from_deployment(&deployment, row.load_shape(), quant)
             .map_err(Error::from)?;
 
-        // TWO STATEMENTS FROM ONE CHECKPOINT THAT CANNOT BOTH BE TRUE.
+        // TWO STATEMENTS FROM ONE CHECKPOINT THAT CANNOT BOTH BE TRUE — and
+        // the reason there is no refusal here any more.
         //
         // A stack that norms both ways round each sub-layer — a sandwich norm
-        // — states its MLP gate as a GELU. `DecodeGeometry::gelu_gate` says
-        // SiLU, and it says SiLU for every checkpoint that reaches this line,
-        // because a `Deployment` STATES NO ACTIVATION AT ALL: the row's own
-        // forward text names it, and a driver receives the shape rather than
-        // the text. So the tensors are asked instead, and the answer they
-        // give here contradicts the only answer this driver can project.
+        // — states its MLP gate as a GELU. This used to be unconditional for
+        // gemma, because a `Deployment` STATED NO ACTIVATION AT ALL and this
+        // driver could only project a SiLU; the refusal named what would lift
+        // it, and `Deployment::mlp_gate` is that. So the guard now compares
+        // two independent answers instead of one answer and a default: what
+        // the ROW says its gate is, against what the TENSORS imply.
         //
-        // Serving it anyway is a 2%-at-the-origin error that diverges from
-        // there, produces finite plausible tokens and never faults — which is
-        // exactly how every gemma checkpoint ran as a llama for as long as
-        // the gate was inferred from a family flag. Refused, and the refusal
-        // names what would lift it.
+        // Kept, and not deleted with the hole it described. Serving a gemma
+        // on a SiLU is a 2%-at-the-origin error that diverges from there,
+        // produces finite plausible tokens and never faults — measured on
+        // gemma-4-31b, whose three mid-rank probes read 0.95, 0.93 and 0.93
+        // of MLX's logits and whose argmax and top five were RIGHT
+        // throughout. A defect that survives every cheap check is one worth
+        // keeping a second reader for, and a row added later with its gate
+        // left at the default is exactly how it would come back.
         if loaded
             .tensors
             .contains_key("layers.0.pre_feedforward_layernorm.weight")
@@ -208,29 +245,43 @@ impl Shell {
             return Err(Error::Unserved {
                 what: "load_model",
                 message: format!(
-                    "`{}` ships a sandwich norm, whose MLP gate is a GELU, and this \
-                     driver can only project a SiLU gate: `model::deployment::Deployment` \
-                     states no activation, so the row's own text is the only thing that \
-                     knows. Lifting this needs either an activation on `Deployment` or a \
-                     `Variant::trace` that can be asked for a Metal text",
+                    "`{}` ships a sandwich norm, whose MLP gate is a GELU, and its \
+                     catalog row states a SiLU. `Deployment::mlp_gate` is what this \
+                     driver projects from, so the row is where to fix it: a gemma \
+                     served on a SiLU answers plausibly and wrongly",
                     row.id()
                 ),
             });
         }
 
-        // The Metal text's facts, from the geometry the row projected and the
-        // tensors the checkpoint actually shipped. The three binding facts —
-        // qk-norm, fused QKV, attention bias — ask the TENSORS, because a row
-        // states an architecture and a tensor states a binding.
+        // THE ROW, and what this load OBSERVED that the row cannot state.
         //
-        // Two probes: which tensors the checkpoint shipped, and which of them
-        // the load left in MXFP4. The second is what a MIXTURE needs -- a
-        // checkpoint need not quantize uniformly, and reading an expert bank
-        // with the dense format is NaNs rather than a near miss.
-        self.text_facts = Some(crate::model::text::facts_from_with(
-            &geometry,
-            |name| loaded.tensors.contains_key(name),
-            |name| loaded.mxfp4.contains(name),
+        // What stood here called `text::facts_from_with`, which rebuilt
+        // twenty-nine `LlamaLikeFacts` out of the projected geometry and NINE
+        // `has_tensor` probes: qk-norm, fused QKV, attention bias, the
+        // router, the shared expert, the sandwich norm, the attention sink,
+        // the per-layer scalar, and the norm variant. Every one of those is
+        // stated by the row, was stated by the row while this code ran, and
+        // was re-derived here anyway from whether a name happened to be in a
+        // safetensors index. That is how the norm variant came to read
+        // `(1 + w)` for gemma-4 — a stack whose gains are a plain
+        // multiplier — because it shipped the norm the probe asked about.
+        //
+        // What is left is six values, and not one of them is about the model:
+        // the affine point the BYTES arrived in, whether the expert bank
+        // reached the device still in MXFP4, and three capabilities of the
+        // kernels this binary was BUILT with. `binding::observed` takes the
+        // affine format and one tensor question, and that narrow signature is
+        // the guarantee rather than a convenience — it cannot see the
+        // geometry, so it cannot smuggle a model fact back in.
+        //
+        // The remaining probe is `Loaded::mxfp4`: which names the load plan
+        // left in the checkpoint's own format. It decides an ENCODING, not a
+        // fact — a checkpoint need not quantize uniformly, and reading an
+        // expert bank with the dense format is NaNs rather than a near miss.
+        self.text_row = Some((
+            row,
+            crate::model::binding::observed(geometry.quant, |name| loaded.mxfp4.contains(name)),
         ));
         self.inv_freq = crate::model::rope::frequencies(
             geometry.head_dim,
@@ -252,7 +303,9 @@ impl Shell {
         self.recordings.clear();
         self.regions = crate::device::Regions::new();
         self.deployment = Some(deployment);
-        self.regions.add(&loaded.region);
+        for region in &loaded.regions {
+            self.regions.add(region);
+        }
         self.model = Some(loaded);
         let shape = crate::layout::kv::Shape {
             layers: geometry.n_layers,
@@ -265,7 +318,7 @@ impl Shell {
             // states a second one. Zero everywhere but gemma-4, and the pool
             // reads the zeros as "one shape for the whole stack".
             //
-            // `full_attn_every` is the same rule `model::text` derives
+            // `full_attn_every` is the same rule the row's text derives
             // `window_left` from, so the pool and the text agree about which
             // layers are full without a second list to keep in step.
             global_head_dim: geometry.global_head_dim,
@@ -355,8 +408,9 @@ impl Shell {
             // `arch_name` is a FAMILY label a guest program matches on —
             // `engine`'s `model.arch_name()` is a host function inferlets
             // call — and deliberately coarser than the id beside it. It is
-            // not a dispatch key: nothing in this crate branches on it except
-            // `model::text`, which LOOKS UP a text rather than choosing one.
+            // not a dispatch key: nothing in this crate branches on it at
+            // all any more, now that the text is the row's answer rather
+            // than a table lookup on this string.
             arch_name: arch.to_string(),
             // WHICH ROW, which is the answer an operator and a boundary both
             // want and which this driver could not give at all: it published

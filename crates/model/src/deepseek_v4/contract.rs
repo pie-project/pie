@@ -11,8 +11,8 @@ use model_loader::contract::{Expr, GroupContract, Scales, TensorContract, Tensor
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding, QuantGranularity, ScaleForm, TensorId, Visibility};
 
-use crate::builder::{Builder, is_raw, mxfp4_encoding};
-use crate::policy::{Mxfp4MoePolicy, Mxfp4MoeRequest};
+use crate::shared::builder::{Builder, is_raw, mxfp4_encoding};
+use crate::shared::policy::{Mxfp4MoePolicy, Mxfp4MoeRequest};
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))

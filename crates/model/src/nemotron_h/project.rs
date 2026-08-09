@@ -23,7 +23,6 @@
 //! where the traced text reads it, and `forward` stops before the routed
 //! block when there are no experts.
 
-use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
     PrefillStyle, RecurrentShape, Towers,
@@ -180,6 +179,9 @@ pub fn deployment(
     let head_dim = head_dim_kernel.max(a.head_dim);
     let attention = (0..f.layers())
         .map(|l| LayerAttention {
+            // One shape for every layer, which is what this row was
+            // already saying by having no per-layer count.
+            kv_heads: a.kv_heads,
             head_dim,
             // `sliding_window` is null in all three published configs:
             // the four attention layers of a 52-layer stack see the
@@ -210,6 +212,8 @@ pub fn deployment(
             // planner told only one of them under-sizes the other.
             intermediate: if f.is_mixture() { 0 } else { f.moe.moe_intermediate },
             moe_intermediate: if f.is_mixture() { f.moe.moe_intermediate } else { 0 },
+            experts_per_token: if f.is_mixture() { f.moe.top_k } else { 0 },
+            shared_intermediate: if f.is_mixture() { f.moe.shared_intermediate } else { 0 },
             vocab: f.vocab,
         },
         attention,
@@ -222,6 +226,11 @@ pub fn deployment(
         logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
+        // Not a gemma: the gain is the multiplier, stored directly.
+        norm_unit_offset: false,
+        v_norm: false,
+        k_eq_v: false,
+        mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // Filled by the ROW: a family label and a published ceiling are
         // facts about a checkpoint, and a projection sees geometry.
@@ -267,6 +276,37 @@ fn mamba_shape(f: &NemotronHFacts) -> RecurrentShape {
         conv_k: m.conv_kernel as i32,
     }
 }
+
+/// Why this build has no Metal text for a nemotron-h row.
+///
+/// A `const` so the test that asserts the refusal NAMES the missing
+/// thing compares against the same string the caller is shown, rather
+/// than against a paraphrase that can drift away from it — the shape
+/// `csm::project::NO_TRACE` set for the same reason.
+///
+/// Its forward is `nemotron_h_cuda`, a HYBRID stack: Mamba-2
+/// state-space layers interleaved with attention. `llama_like_metal`
+/// states attention layers only, so tracing it would drop every
+/// recurrent layer in the model.
+///
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine, and a pie whose Metal half had this text would serve the same
+/// row unchanged. What is missing is a TEXT in this build, which is a
+/// fact about the build.
+///
+/// Stating it is the whole of what replaces `driver-metal`'s
+/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
+/// reduced by a punctuation-stripping `canonical()`, consulted before
+/// any text was traced and free to disagree with what the tracer would
+/// actually do. It listed `gemma4`, which the load path refused on
+/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// that answers for itself cannot disagree with a list, because there
+/// is no list.
+pub const NO_METAL: &str = "nemotron-h has no Metal text in this build: its forward is `nemotron_h_cuda`, \
+     a hybrid of Mamba-2 state-space layers and attention layers, and the one \
+     Metal text here (`llama_like_metal`) states attention only — it has no \
+     recurrent layer kind and takes a different shape; the CUDA backend serves \
+     this row";
 
 /// Trace this row's CUDA text for one fire class.
 #[cfg(feature = "forward")]

@@ -1,0 +1,26 @@
+// Compact the rows a fire will actually sample.
+//
+// Ported from Metal's row gather with the same packed params buffer. The extra
+// `count` operand in the Rust row is packed into that buffer, so there is no
+// push constant here.
+
+#version 450
+
+#include "common/bf16.glsl"
+#include "layout/row_gather_params.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+PIE_BUFFER_RO(0, In, input_);
+PIE_BUFFER_RW(1, Out, out_);
+layout(std430, binding = 2) readonly buffer Rows { uint rows[]; };
+layout(std430, binding = 3) readonly buffer Params { RowGatherParams p; };
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint i = gl_GlobalInvocationID.y;
+    if (c >= p.width || i >= p.count) return;
+    out_[i * p.width + c] = input_[rows[i] * p.width + c];
+}
+
+// pie:instantiate row_gather_bfloat16

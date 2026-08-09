@@ -40,7 +40,7 @@
 use std::sync::Arc;
 use tokenizer::Tokenizer;
 
-use crate::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 
 /// The speaker a user's turn is attributed to.

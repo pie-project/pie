@@ -4,7 +4,7 @@
 //! them. The DSL invents TRACE names (`layer.3.qkv`) as it records a
 //! forward pass; a load contract invents PUBLISHED names
 //! (`model.layers.3.self_attn.qkv_proj.fused.weight`) as it authors the
-//! staging; and [`model::weight_names::wire`] is the one bridge between
+//! staging; and [`model::shared::weight_names::wire`] is the one bridge between
 //! them. A trace name `wire()` cannot answer reaches the driver's
 //! resolver, which returns `None` — and `Resolver::weight`'s own doc says
 //! what that is:
@@ -114,7 +114,7 @@ fn answerable(scheme: Scheme) -> BTreeSet<String> {
     // 136-field config this used to build.
     let shape = LoadShape::dense(4, 128, false);
     let published = scheme.published();
-    let w = model::weight_names::wire(shape, &published);
+    let w = model::shared::weight_names::wire(shape, &published);
     w.aliases
         .iter()
         .map(|(t, _)| normalise(t))
@@ -178,7 +178,7 @@ fn stems(plan: &ForwardPlan) -> BTreeSet<String> {
 /// family that has a golden and no row here is a family whose seam nobody
 /// is checking, and the two lists diverging is itself the bug.
 fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
     use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
@@ -187,7 +187,7 @@ fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
         (
             "llama_like",
             Scheme::LlamaLike,
-            model::families::llama_like::forward::llama_like_cuda(
+            model::shared::llama_like::forward::llama_like_cuda(
                 &LlamaLikeFacts::qwen3_0_6b(),
                 &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
                 FireClass::Decode,

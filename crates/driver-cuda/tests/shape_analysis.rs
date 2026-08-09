@@ -68,11 +68,11 @@ fn op_shape(plan: &model_compiler::trace::ForwardPlan, l: &Lowered) -> Vec<Strin
 
 /// Every family this tree declares a CUDA decode for, by name.
 fn families() -> Vec<(&'static str, Lowered)> {
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     vec![
         (
             "llama_like",
-            lower_plan(&model::families::llama_like::forward::llama_like_cuda(
+            lower_plan(&model::shared::llama_like::forward::llama_like_cuda(
                 &LlamaLikeFacts::qwen3_0_6b(),
                 &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
                 FireClass::Decode,
@@ -177,7 +177,7 @@ fn facts_select_programs_not_only_numbers() {
     // So a fact does not fill in a number. It selects a program. C cannot
     // be a fact schema over one described shape, in any family, and the
     // optimistic branch of C1 is closed.
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 
     let cuda = LlamaLikeCudaFacts::qwen3_0_6b_l40s();
     let deployments: Vec<(&str, LlamaLikeFacts)> = vec![
@@ -192,7 +192,7 @@ fn facts_select_programs_not_only_numbers() {
     let mut by_op: BTreeMap<Vec<String>, Vec<&str>> = BTreeMap::new();
     let mut lowered = Vec::new();
     for (name, facts) in deployments {
-        let plan = model::families::llama_like::forward::llama_like_cuda(
+        let plan = model::shared::llama_like::forward::llama_like_cuda(
             &facts,
             &cuda,
             FireClass::Decode,

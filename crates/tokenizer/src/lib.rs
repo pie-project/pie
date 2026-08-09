@@ -228,15 +228,30 @@ impl Tokenizer {
 
     /// Build a minimal tokenizer from raw token strings.
     ///
-    /// Each string becomes a token with ID = its index. No BPE merges, no
-    /// normalization, no special tokens. Uses the raw char fixture pipeline.
+    /// Each string becomes a token with ID = its index, and the 256
+    /// single-byte tokens are APPENDED after them so that ids the caller
+    /// stated keep the values it stated. Merges are then derived by
+    /// [`bpe::BpeTable::from_decoder_map`] as usual. No normalization, no
+    /// special tokens; the raw char fixture pipeline.
+    ///
+    /// The byte tail is what makes this a usable instrument rather than a
+    /// trap. BPE builds a token out of BASE SYMBOLS, and a fixture
+    /// vocabulary of whole words has none — so `encode` matched a string
+    /// that was exactly one entry and returned an EMPTY vector for
+    /// anything else. `"Hi"` and `"Bye"` each encoded; `"HiBye"` encoded
+    /// to nothing, silently, and four chat-template tests were reading
+    /// that silence as a template dropping its content.
     pub fn from_vocab(vocab: &[String]) -> Self {
         use std::collections::HashMap;
-        let map: HashMap<u32, Vec<u8>> = vocab
+        let mut map: HashMap<u32, Vec<u8>> = vocab
             .iter()
             .enumerate()
             .map(|(i, s)| (i as u32, s.as_bytes().to_vec()))
             .collect();
+        let stated = u32::try_from(vocab.len()).expect("fixture vocabularies are small");
+        for byte in 0u16..256 {
+            map.insert(stated + u32::from(byte), vec![byte as u8]);
+        }
         let bpe = bpe::BpeTable::from_decoder_map(map)
             .expect("enumerated vocabulary must have contiguous IDs");
         Self::new(bpe, Pipeline::RawChar, vec![])

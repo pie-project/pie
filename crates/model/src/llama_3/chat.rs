@@ -3,7 +3,7 @@
 //! Uses <|start_header_id|>role<|end_header_id|> delimiters.
 //! Tool responses use the `ipython` role.
 
-use crate::decoders::{GenericChatDecoder, ThinkingDecoder};
+use crate::shared::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };

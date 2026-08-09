@@ -115,21 +115,54 @@ impl Shell {
             })?;
         }
 
-        let (facts, metal) = self.text_facts.clone().ok_or_else(|| Error::Unserved {
+        // THE ROW that was identified at load, and what that load OBSERVED.
+        //
+        // Both `Copy`, where this used to `clone()` two fact structs per
+        // frame — and the clone was the smaller cost. What it cloned was
+        // twenty-nine model facts this driver had rebuilt for itself from
+        // nine tensor probes, so every fire ran a text selected from the
+        // driver's reading of a checkpoint rather than from the row that
+        // checkpoint had already been matched to.
+        let (row, binding) = self.text_row.ok_or_else(|| Error::Unserved {
             what: "launch",
-            message: "no text facts. `load_model` synthesizes them from the row's \
-                      projected deployment and the staged tensors."
+            message: "no row. `load_model` identifies one from the tensors and \
+                      records what its weights arrived as; a fire before a load \
+                      has nothing to trace."
                 .to_string(),
         })?;
-        // The ARCH the row states, not one derived from a config here. It is
-        // a lookup and not a dispatch — `model::text` answers which text was
-        // written for it — and the string comes from the same projection the
-        // facts above came from, so a text and a shape cannot be selected
-        // from two different readings of one checkpoint.
-        let arch = self
-            .deployment
-            .as_ref()
-            .map_or("", |d| d.advertised.arch);
+        // The fire's geometry, off the SAME projection the pool was sized
+        // from — read once here rather than per step, because a deployment
+        // does not change between the steps of a frame.
+        //
+        // `head_dim_alloc()` and not `head_dim`: phi-3's heads are 96 wide
+        // and run on the 128-wide kernel, so a dispatch that states the
+        // checkpoint's width addresses two thirds of the buffer the pool
+        // allocated. This is the value `DecodeGeometry::head_dim` carried and
+        // the value the deleted facts passed on, taken from the row's own
+        // rounding rule rather than from a re-derivation of it.
+        //
+        // The two mixture counts are zero because they can only be zero:
+        // `geometry_from_deployment` REFUSES a routed mixture outright — a
+        // `Deployment` states no top-k, and a mixture fired at the wrong one
+        // routes each token to almost the right experts and returns fluent
+        // nonsense — so a load that reached this line is a dense stack. Zeros
+        // are what `is_moe` reads as "not that", stated rather than inherited.
+        let geometry = {
+            let d = self.deployment.as_ref().ok_or_else(|| Error::Unserved {
+                what: "launch",
+                message: "no deployment. The row projects one at load and every \
+                          consumer reads that projection."
+                    .to_string(),
+            })?;
+            crate::lowering::dispatch::Geometry {
+                q_heads: d.shape.q_heads,
+                kv_heads: d.shape.kv_heads,
+                head_dim: d.shape.head_dim_alloc(),
+                rotary_dims: d.shape.head_dim_alloc(),
+                n_experts: 0,
+                experts_per_token: 0,
+            }
+        };
         let named = std::collections::HashMap::new();
 
         // ONE timeline for the whole frame, so a step is QUEUED while the
@@ -162,29 +195,32 @@ impl Shell {
                 sampling_indices: &step.plan.sampling_indices,
             };
             let class = crate::lowering::frame::fire_class(&s);
-            let plan = crate::model::text::plan_for(arch, class, &facts, &metal).map_err(
-                |why| Error::Unserved {
-                    what: "launch",
-                    message: format!("no text for this fire: {why:?}"),
-                },
-            )?;
+            // THE ROW'S OWN TEXT for this fire class, and the driver's only
+            // door to one.
+            //
+            // What this replaced took an architecture STRING and two fact
+            // structs — `plan_for(arch, class, &facts, &metal)` — and matched
+            // the string against an eleven-entry table to pick a text. That
+            // table was a third dispatch key for an identity `catalog::identify`
+            // had already settled from the tensors, and it disagreed with the
+            // load path about gemma-4 in the two directions a second list
+            // always eventually disagrees.
+            //
+            // The refusal is carried rather than summarized, the way
+            // `driver-cuda/src/fire/launch.rs` carries it: `Error: From<Refusal>`
+            // maps `Unsupported` and `Malformed` onto this driver's own
+            // `Unserved`, so what reaches the operator is the row's sentence.
+            // In practice a refusal here is unreachable — `load_model` asked
+            // the same row the same question before it staged a byte — and it
+            // is propagated anyway, because "unreachable" is a claim about
+            // today's `serves` and this is the place that would find out it
+            // had stopped being true.
+            let plan = crate::model::binding::text(row, class, &binding).map_err(Error::from)?;
             let lowered =
                 crate::lowering::frame::lower_step(&plan, &s).map_err(|why| Error::Program {
                     message: format!("step did not lower: {why:?}"),
                 })?;
 
-            let geometry = crate::lowering::dispatch::Geometry {
-                q_heads: facts.q_heads,
-                kv_heads: facts.kv_heads,
-                head_dim: facts.head_dim,
-                rotary_dims: facts.head_dim,
-                // The DEPLOYMENT's, not zero. `Rule::RouterLane`/`RouteRows`/
-                // `RoutedQmv` read these off the dims the same way `Qmv` reads
-                // `width`, so a mixture handed zeros launches a router over no
-                // experts -- which is a fire that runs and routes nothing.
-                n_experts: facts.n_experts,
-                experts_per_token: facts.experts_per_token,
-            };
             // Every CSR invariant, checked BEFORE the pool is touched.
             //
             // The derivation below used `unwrap_or(0)` three times, and the

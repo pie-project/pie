@@ -271,6 +271,9 @@ impl PlanEpoch {
 struct Entry {
     exec: GraphExec,
     epoch: PlanEpoch,
+    /// What the graph BAKED, when it was recorded. See
+    /// [`capture_digest`].
+    digest: u64,
     nodes: Vec<Option<cudarc::runtime::sys::cudaGraphNode_t>>,
 }
 
@@ -293,6 +296,9 @@ pub struct Recordings {
     hits: u64,
     misses: u64,
     stale: u64,
+    /// Replays refused because the fire's addresses are not the ones the
+    /// graph recorded. See [`capture_digest`].
+    mismatched: u64,
 }
 
 impl Recordings {
@@ -346,7 +352,7 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(key, Entry { exec, epoch, nodes: Vec::new() });
+        self.execs.insert(key, Entry { exec, epoch, digest: 0, nodes: Vec::new() });
         Ok(())
     }
 
@@ -366,12 +372,13 @@ impl Recordings {
         exec: GraphExec,
         epoch: PlanEpoch,
         nodes: Vec<Option<cudarc::runtime::sys::cudaGraphNode_t>>,
+        digest: u64,
         eligibility: Option<Ineligible>,
     ) -> core::result::Result<(), Ineligible> {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(key, Entry { exec, epoch, nodes });
+        self.execs.insert(key, Entry { exec, epoch, digest, nodes });
         Ok(())
     }
 
@@ -419,8 +426,26 @@ impl Recordings {
         &mut self,
         key: BucketKey,
         epoch: PlanEpoch,
+        digest: u64,
         stream: StreamRef<'_>,
     ) -> Result<bool> {
+        // THE PROPERTY, not the mechanisms. `PlanEpoch`, `BucketKey` and
+        // `union_eligibility` each answer "is this exec still valid for
+        // this fire?" from one angle, and each has been wrong once — not
+        // because the idea was wrong but because one path did not go
+        // through it. The digest asks the question those three exist to
+        // answer, and does not care which of them should have noticed.
+        //
+        // A MISMATCH IS A MISS, not a panic. It means the fire is handing
+        // the graph addresses it did not record, which is the same
+        // situation a stale epoch describes and takes the same answer: a
+        // recapture. Counted apart so it is visible rather than merely
+        // survived.
+        if self.execs.get(&key).is_some_and(|e| e.digest != digest) {
+            self.mismatched += 1;
+            self.execs.remove(&key);
+            return Ok(false);
+        }
         let Some(exec) = self.get(key, epoch) else { return Ok(false) };
         exec.launch(stream)?;
         Ok(true)
@@ -448,12 +473,65 @@ impl Recordings {
     pub const fn stats(&self) -> (u64, u64, u64) {
         (self.hits, self.misses, self.stale)
     }
+
+    /// Replays refused because the fire's addresses disagreed with the
+    /// graph's. See [`capture_digest`].
+    ///
+    /// Its own reader rather than a fourth tuple slot, because the
+    /// number means something different from the other three: a miss and
+    /// a stale entry are the cache working, and this one is a mechanism
+    /// that should have noticed and did not. A nonzero value on a steady
+    /// workload is a bug report.
+    #[must_use]
+    pub const fn mismatched(&self) -> u64 {
+        self.mismatched
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use model_compiler::trace::FireClass;
+
+    /// THE DIGEST IS A FUNCTION OF WHAT A GRAPH BAKES, and its two
+    /// properties are opposite failures.
+    ///
+    /// STABLE: two identical fires must agree, or every replay becomes a
+    /// recapture — the answers stay right and the capture stops paying
+    /// for itself, which is the quietest way for a performance mechanism
+    /// to die.
+    ///
+    /// SENSITIVE: a fire handing different addresses must disagree, which
+    /// is the whole point. `Recordings::replay` turns a disagreement into
+    /// a miss and an eviction, taking the same answer a stale epoch does.
+    ///
+    /// Driven through `Entry` rather than through a device, for the
+    /// reason the epoch test states: nothing can be inserted without one.
+    #[test]
+    fn the_digest_is_stable_and_sensitive() {
+        // Two runs of the same walk over the same values.
+        let one = fake_digest(0x1000, 4, 0);
+        assert_eq!(one, fake_digest(0x1000, 4, 0), "same fire, same number");
+
+        // A moved buffer, a different request count, a different adapter
+        // set. Each is a thing a graph bakes.
+        assert_ne!(one, fake_digest(0x2000, 4, 0), "a moved buffer");
+        assert_ne!(one, fake_digest(0x1000, 5, 0), "a different row count");
+        assert_ne!(one, fake_digest(0x1000, 4, 9), "a different adapter set");
+    }
+
+    /// The same FNV walk `capture_digest` runs, over the three axes a
+    /// test can vary without a device. Kept beside it so the mixer they
+    /// share cannot drift.
+    fn fake_digest(ptr: u64, rows: u64, lora: u64) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in [ptr, rows, lora] {
+            h ^= b;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
     #[test]
     fn variant_bits_are_not_in_the_key() {
         // With ONE stated exception, argued at the field: the lora group
@@ -543,4 +621,122 @@ mod tests {
         assert!(c.get(BucketKey::new(1, 1, FireClass::Decode, 0), PlanEpoch::at(0)).is_none());
         assert_eq!(c.stats(), (0, 1, 0));
     }
+}
+
+/// EVERYTHING A CAPTURED GRAPH BAKES, in one number.
+///
+/// The mechanisms that keep a replay honest — `PlanEpoch`, `BucketKey`,
+/// `union_eligibility` — each answer "is this exec still valid for this
+/// fire?" from a different angle, and each of the three has been wrong
+/// once. Every time, the mechanism existed and one path did not go
+/// through it: `with_lora` had no caller, `union_eligibility` was handed
+/// a literal `None`, the lora arena reallocated outside `Scratch::grow`.
+///
+/// **A sixth mechanism would be a sixth thing to remember.** This checks
+/// the PROPERTY the five exist to guarantee instead: a graph records
+/// addresses and extents, so a replay is only correct if the addresses
+/// and extents it is handed are the ones it recorded. Recompute, compare,
+/// refuse.
+///
+/// Not a `Hash` derive, for `digest_rows`' reason stated one level up: a
+/// derive makes every future field silently part of the answer, and the
+/// point is that adding a field to `AttnCtx` is exactly the moment
+/// someone must decide whether a capture bakes it. Naming them here
+/// makes that a deliberate line rather than an omission.
+///
+/// Cheap: ~70 multiplies once per fire, against a graph launch.
+#[cfg(feature = "bridge")]
+#[must_use]
+pub fn capture_digest(
+    ctx: &crate::bind::DispatchCtx,
+    regions: crate::bind::AttnRegions<'_>,
+    gdn: Option<&crate::bind::GdnCtx>,
+) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u64| {
+        h ^= b;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+
+    // ── ADDRESSES ONLY, and that is the whole definition ──
+    //
+    // A captured graph bakes POINTERS. The VALUES at them — the row
+    // count, the page count, the head dims — are re-uploaded every fire
+    // into those same buffers, which is what the pooling exists for. So
+    // hashing an extent is not stricter, it is WRONG: `num_pages_in_batch`
+    // changes on every step of a decode chain while the graph stays
+    // perfectly valid, and including it turned 72 replays into 0.
+    //
+    // Getting this boundary wrong is silent in both directions — too
+    // loose replays a stale graph, too strict recaptures forever and the
+    // answers stay right. `a_fifty_step_greedy_chain` is what measures
+    // the second one.
+    eat(ctx.stream.cast::<u8>() as u64);
+    eat(ctx.cublas.cast::<u8>() as u64);
+    eat(ctx.token_ids.cast::<u8>() as u64);
+    eat(ctx.positions.cast::<u8>() as u64);
+    eat(ctx.peel_window.cast::<u8>() as u64);
+    eat(ctx.sampling_indices.cast::<u8>() as u64);
+    // The LORA state, which is the one the bucket key had to learn about:
+    // a capture bakes the lane pointers and the launch count.
+    match ctx.lora {
+        Some((s, scratch)) => {
+            eat(s.cast::<u8>() as u64);
+            eat(scratch.cast::<u8>() as u64);
+            // SAFETY: the state outlives the call; see `capture_or_replay`.
+            eat(unsafe { (*s).capture_fingerprint });
+        }
+        None => eat(u64::MAX),
+    }
+
+    // ── Every attention region, because a peel launches two ──
+    for a in [regions.fire, regions.tail] {
+        let Some(a) = a else {
+            eat(u64::MAX);
+            continue;
+        };
+        eat(a.decode_plan.cast_const().cast::<u8>() as u64);
+        eat(a.decode_plan_full.cast_const().cast::<u8>() as u64);
+        eat(a.prefill_plan.cast_const().cast::<u8>() as u64);
+        eat(a.kv_page_indices_d.cast::<u8>() as u64);
+        eat(a.kv_page_indptr_d.cast::<u8>() as u64);
+        eat(a.kv_last_page_lens_d.cast::<u8>() as u64);
+        eat(a.qo_indptr_d.cast::<u8>() as u64);
+        eat(a.w_page_d.cast::<u8>() as u64);
+        eat(a.w_off_d.cast::<u8>() as u64);
+        eat(a.row_valid_d.cast::<u8>() as u64);
+        eat(a.q_out.cast_const().cast::<u8>() as u64);
+        eat(a.o_out.cast_const().cast::<u8>() as u64);
+        eat(a.score_out.cast_const().cast::<u8>() as u64);
+        eat(a.folded_out.cast_const().cast::<u8>() as u64);
+        eat(a.score_indptr_d.cast::<u8>() as u64);
+        eat(a.mask_d.cast::<u8>() as u64);
+        eat(a.mask_indptr_d.cast::<u8>() as u64);
+        eat(a.lse_out_d.cast_const().cast::<u8>() as u64);
+        eat(a.layers.len() as u64);
+        for l in &a.layers {
+            eat(l.k_pages.cast_const().cast::<u8>() as u64);
+            eat(l.v_pages.cast_const().cast::<u8>() as u64);
+        }
+    }
+
+    // ── The recurrent slabs ──
+    match gdn {
+        Some(g) => {
+            eat(g.slot_ids_d.cast::<u8>() as u64);
+            // The SLAB BASES, which a capture bakes exactly as it bakes a
+            // pool's: `ensure_slots` growing one is what bumps the epoch,
+            // and this is the same fact read from the other end.
+            eat(g.conv_state.len() as u64);
+            for b in &g.conv_state {
+                eat(*b);
+            }
+            eat(g.recurrent_state.len() as u64);
+            for b in &g.recurrent_state {
+                eat(*b);
+            }
+        }
+        None => eat(u64::MAX),
+    }
+    h
 }

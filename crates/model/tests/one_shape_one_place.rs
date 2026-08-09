@@ -51,11 +51,19 @@ const ALLOWED_TWINS: &[(&str, &str, &str)] = &[];
 /// `spec.rs` and `forward/facts.rs`, unioned. A family may have either or
 /// both: the split is a migration in progress, and a scan that knows
 /// about one half sees half the shapes.
+///
+/// Two roots, because a shape can be declared in either half of the
+/// crate: a generation directory at the root, or a shared family under
+/// `shared/`. The second used to be `src/families/` and `read_dir`
+/// returns `Err` for a path that is not there — which this loop skips in
+/// silence, so a rename would have quietly halved what the guard sees
+/// rather than failing it. Hence the assertion below.
 fn declaring_files() -> Vec<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut out = Vec::new();
-    for root in [src.clone(), src.join("families")] {
-        let Ok(rd) = std::fs::read_dir(&root) else { continue };
+    for root in [src.clone(), src.join("shared")] {
+        let rd = std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("{} is readable: {e}", root.display()));
         for e in rd.flatten() {
             let dir = e.path();
             for f in [dir.join("spec.rs"), dir.join("forward/facts.rs")] {
@@ -65,6 +73,15 @@ fn declaring_files() -> Vec<PathBuf> {
             }
         }
     }
+    // Named rather than counted, because a count cannot see this. One
+    // family lives under `shared/`, so losing that root moves the total
+    // by one — and any threshold loose enough to survive a new
+    // generation is loose enough to miss it.
+    assert!(
+        out.iter().any(|p| p.components().any(|c| c.as_os_str() == "llama_like")),
+        "the shared half of the crate contributed no shapes; found {out:?}"
+    );
+    assert!(out.len() >= 10, "found only {} declaring files", out.len());
     out
 }
 

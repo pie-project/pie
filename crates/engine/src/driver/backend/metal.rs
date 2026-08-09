@@ -40,9 +40,9 @@
 //! pages are sparse, which is what makes that possible.
 //!
 //! `copy_state` is the one that refuses. A state copy moves recurrent state,
-//! and no architecture `model::text` serves has any — the families that do
-//! (`qwen3_5` and its neighbours) are refused at load, so it is unreachable
-//! rather than unfinished.
+//! and no row this driver serves has any — the rows that do (`qwen3_5` and
+//! its neighbours) refuse a Metal load at the row itself, so it is
+//! unreachable rather than unfinished.
 //!
 //! It refuses by name rather than being absent. A backend that cannot be
 //! selected teaches nothing; one that is selected and says exactly which verb
@@ -79,7 +79,7 @@ impl MetalDriver {
     /// No Metal 4 device, or a device whose queue could not be created. Both
     /// are boot conditions, not runtime ones.
     pub fn create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
-        // `[model] descriptor` and `[model] id`, read HERE because a boot
+        // `[model] config` and `[model] id`, read HERE because a boot
         // TOML is the engine's format. A driver that parsed it would be the
         // second thing entitled to an opinion about the file's shape, and the
         // two would drift.
@@ -91,16 +91,16 @@ impl MetalDriver {
         let boot = std::str::from_utf8(config_bytes)
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok());
-        let boot_descriptor = boot.as_ref().and_then(|v| {
+        let boot_config = boot.as_ref().and_then(|v| {
             v.get("model")?
-                .get("descriptor")?
+                .get("config")?
                 .as_str()
                 .map(std::path::PathBuf::from)
         });
         let boot_model_id = boot
             .as_ref()
             .and_then(|v| Some(v.get("model")?.get("id")?.as_str()?.to_string()));
-        let shell = driver_metal::serve::Shell::open(boot_descriptor, boot_model_id)
+        let shell = driver_metal::serve::Shell::open(boot_config, boot_model_id)
             .map_err(|e| anyhow!("metal shell: {e}"))?;
         let facts = shell.device_facts().clone();
         Ok((

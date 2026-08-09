@@ -812,8 +812,7 @@ mod tests {
             vec![3], // <eos> is stop token
         );
 
-        let mut bm = vec![0u32; bitmask_size(4)];
-        m.fill_next_token_bitmask(&mut bm);
+        let mut bm = m.fill_next_token_mask();
 
         assert!(bitmask::get_bit(&bm, 0)); // "a"
         assert!(bitmask::get_bit(&bm, 1)); // "ab"
@@ -822,7 +821,7 @@ mod tests {
 
         // After "a", grammar can terminate
         m.accept_token(0);
-        m.fill_next_token_bitmask(&mut bm);
+        bm = m.fill_next_token_mask();
 
         assert!(!bitmask::get_bit(&bm, 0)); // "a" - no more input expected
         assert!(!bitmask::get_bit(&bm, 1)); // "ab" - no

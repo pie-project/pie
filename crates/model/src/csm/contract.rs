@@ -8,7 +8,7 @@ use model_loader::contract::Expr;
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding};
 
-use crate::builder::{Builder, is_raw};
+use crate::shared::builder::{Builder, is_raw};
 
 /// CSM: a dense backbone plus a depth decoder and the Mimi codec, all bf16.
 pub fn author_csm(b: &mut Builder<'_>) -> Result<(), Error> {

@@ -65,10 +65,27 @@ pub fn qmv(n: u32) -> Launch {
 /// silently drops the last partial group of four — and capped at the 1024
 /// threads Metal allows a threadgroup to be.
 #[must_use]
-pub fn rms(row_size: u32, n_rows: u32) -> Launch {
-    let t = row_size.div_ceil(4).min(1024);
+pub fn rms(row_size: u32, axis: u32, n_rows: u32) -> Launch {
+    // THE AXIS, not the tensor's width, and the two are only the same for a
+    // norm that spans its row. `rms.metal` gives threadgroup `gid` the span
+    // `gid * axis_size`, so the grid needs one threadgroup per AXIS and the
+    // threads in it size on the axis too.
+    //
+    // A hidden-state norm has `axis == row_size` and reduces to what this
+    // said before. A QK-norm does not: gemma-4 normalizes each head of a
+    // 8192-wide Q over 256 channels, so it needs 32 threadgroups per token
+    // and used to get one. **It normalized head 0 and left the other 31 as
+    // the projection wrote them**, in every fire including a decode, and
+    // nothing reported it -- the tensor is fully written, just not fully
+    // normalized. It surfaced as a prefill whose second token was all zeros,
+    // because there the missing threadgroups are whole tokens.
+    //
+    // Llama-3.2-1B has no QK-norm, which is why the gate that catches
+    // everything else was green over this the whole time.
+    let axis = axis.clamp(1, row_size.max(1));
+    let t = axis.div_ceil(4).min(1024);
     Launch {
-        grid: [t * n_rows, 1, 1],
+        grid: [t * (row_size / axis) * n_rows, 1, 1],
         tg: [t, 1, 1],
     }
 }
@@ -243,11 +260,7 @@ pub fn qmm_bm(n: u32) -> u32 {
 /// `rms_single_row` over `n_rows × n` stacked rows.
 #[must_use]
 pub fn rms_mb(row_size: u32, n_rows: u32, n: u32) -> Launch {
-    let t = row_size.div_ceil(4).min(1024);
-    Launch {
-        grid: [t * n_rows * n, 1, 1],
-        tg: [t, 1, 1],
-    }
+    rms(row_size * n_rows, row_size, n)
 }
 
 /// Flat elementwise over `width × n`.

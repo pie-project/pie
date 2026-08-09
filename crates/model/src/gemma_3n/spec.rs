@@ -1,6 +1,6 @@
 //! gemma3n's SHAPE: the numbers a gemma-3n checkpoint has.
 //!
-//! Ungated, for `families/llama_like/spec.rs`'s reason: a catalog row is
+//! Ungated, for `shared/llama_like/spec.rs`'s reason: a catalog row is
 //! written in these words and a row must exist under every aspect, so
 //! the struct cannot exist only when the tracer is compiled in.
 //!

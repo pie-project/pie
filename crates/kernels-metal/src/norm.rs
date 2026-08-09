@@ -79,6 +79,8 @@ pub static KERNELS: &[KernelSig] = &[
     // `<- Source::In(0)` says this buffer takes the statement's first operand,
     // wherever the statement chose to put it.
     kernel!(rms_single_row "rms_single_row", file = Some("norm/rms.metal"), launch = kernels::LaunchRule::Rms,
+        // `RmsParams.axis_size`, which is what the kernel strides by.
+        grid_param = Some(1),
         operands = kernels::operands![
             x: Buf <- kernels::Source::In(0),
             w: Buf <- kernels::Source::Weight(0),
@@ -96,6 +98,14 @@ pub static KERNELS: &[KernelSig] = &[
     // from `rms_single_row`.
     kernel!(vnorm_single_row "vnorm_single_row", file = Some("norm/vector.metal"),
         launch = kernels::LaunchRule::Rms,
+        // `VNormParams.axis_size`, for the reason `rms_single_row` states it:
+        // this kernel gives threadgroup `gid` the span `gid * axis_size`, so
+        // the grid needs one threadgroup per AXIS. A value norm's axis is the
+        // HEAD and its row is every head, so without this the fire's width
+        // would be taken for the axis and the whole row reduced as one --
+        // which is not a smaller normalization, it is a different number in
+        // every channel.
+        grid_param = Some(1),
         operands = kernels::operands![
             x: Buf <- kernels::Source::In(0),
             out: BufMut <- kernels::Source::Out(0),

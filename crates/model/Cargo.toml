@@ -66,6 +66,20 @@ required-features = ["forward"]
 name = "catalog_differential"
 required-features = ["forward"]
 
+# A property ABOUT two generations, which neither of them owns. It used to
+# live inside both as two halves that named each other across a sibling
+# edge; `forward` because an advertised ceiling is a row's deployment.
+[[test]]
+name = "neighbouring_generations"
+required-features = ["forward"]
+
+# The guard that replaces `driver-metal`'s deleted `LLAMA_LIKE` string
+# table: every row either traces a Metal text or refuses Metal in words.
+# `forward` because a text is the thing being asked for.
+[[test]]
+name = "catalog_backends"
+required-features = ["forward"]
+
 [[test]]
 name = "facts_are_read"
 required-features = ["forward"]

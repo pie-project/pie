@@ -2326,6 +2326,9 @@ pub mod metal {
         // are tables. The driver derives one at load and answers it as
         // `Source::RopeFrequencies`, so the statement's job is only to say
         // WHICH form this deployment takes.
+        // Deliberately unread, like `embed_gather`'s: both stems below name
+        // the M>1 form unconditionally.
+        let _ = multi_batch;
         let (kernel, params) = if table {
             // The batched form exists and is the same rotation over N rows.
             // This branch used to name the decode symbol whatever the fire
@@ -2335,11 +2338,20 @@ pub mod metal {
             // row computed row zero's index and rows one and up were never
             // rotated at all. Position zero makes rope the identity, so row
             // zero looked right and nothing said which row was wrong.
-            let stem = if multi_batch {
-                "neox_freqs_mb_bfloat16"
-            } else {
-                "neox_freqs_decode_bfloat16"
-            };
+            // ALWAYS the M>1 symbol. Choosing by class fixed the PREFILL
+            // and left the DECODE, because it read the class as though it
+            // answered "how many rows", and it does not: a decode of four
+            // requests is FOUR ROWS. `neox_freqs_decode` reads `position[0]`
+            // whatever grid it is handed, so a four-lane decode rotated lane
+            // zero and left three lanes unrotated -- and position zero makes
+            // rope the identity, so the one lane every single-request gate
+            // looks at agreed exactly.
+            //
+            // The mb form is the same rotation with the row read from the
+            // grid instead of assumed; its operands, its `LaunchRule::Rope`
+            // and its `head_param` are identical, so naming it at N=1 is not
+            // a widening.
+            let stem = "neox_freqs_mb_bfloat16";
             (
                 stem.to_string(),
                 // Scale, head width, and YaRN's `mscale` -- one for llama-3,
@@ -2354,7 +2366,9 @@ pub mod metal {
                 vec![scale.to_bits(), head_dim, 1.0f32.to_bits(), rotary_dim],
             )
         } else {
-            let stem = if multi_batch { "neox_mb_bfloat16" } else { "neox_decode_bfloat16" };
+            // ALWAYS the M>1 symbol, for the reason the table branch above
+            // states: the class does not answer how many rows a fire has.
+            let stem = "neox_mb_bfloat16";
             (
                 stem.to_string(),
                 // The rotation's scale, its log2 base and the head width. The
@@ -2468,6 +2482,7 @@ pub mod metal {
         kv_heads: u32,
         window: i32,
         sinks: Option<&str>,
+        scale: f32,
     ) -> Option<Val> {
         // The SINK variant is the same template at `sinks = true`, so it is
         // the same statement with one weight. A sink is a per-head learned
@@ -2484,11 +2499,22 @@ pub mod metal {
         // and the page size are the POOL's and come from the row; the mask
         // stride is zero because this text states no custom mask.
         //
-        // The scale is `1/sqrt(head_dim)` — the softmax temperature, and the
-        // one number here a reader is most likely to assume the kernel knows.
-        // It does not: it takes it, and a zero makes every logit zero and
-        // every attention uniform.
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // The softmax temperature, and the one number here a reader is most
+        // likely to assume the kernel knows. It does not: it takes it, and a
+        // zero makes every logit zero and every attention uniform.
+        //
+        // DERIVED ONLY AS A DEFAULT. `1/sqrt(head_dim)` is llama's rule, not
+        // attention's: gemma-3 states `query_pre_attn_scalar` and gemma-4
+        // states **1.0**, because its per-head `q_norm`/`k_norm` have already
+        // divided by the thing this would divide by again. A statement that
+        // derives it cannot serve a family that states it, and the derivation
+        // fails SILENTLY -- attention stays a probability distribution at any
+        // temperature, so the fire is finite, varied, and wrong.
+        let scale = if scale > 0.0 {
+            scale
+        } else {
+            1.0f32 / (head_dim as f32).sqrt()
+        };
         with_params(
             &q.t,
             Some(kv.l),
@@ -2554,11 +2580,19 @@ pub mod metal {
         point: &str,
         scale: f32,
     ) -> Val {
-        let stem = if multi_batch {
-            "embed_gather_scaled_mb_4bit"
-        } else {
-            "embed_gather_scaled_4bit"
-        };
+        // ALWAYS the M>1 symbol, exactly as `embed_gather` above -- and this
+        // is the twin that fix did not reach. `embed_gather_scaled_4bit`
+        // reads `id[0]` and writes `out[hidden]`, one row by construction,
+        // so a four-lane decode gathered lane zero and left three lanes
+        // holding a zeroed arena. Bisecting gemma-4-31b's decode put the
+        // stop at statement ZERO and every later statement inherited it --
+        // which is what made a geglu twenty statements downstream look like
+        // the defect.
+        //
+        // The scale is the only difference between these two and their
+        // unscaled twins, and it is the statement's either way.
+        let _ = multi_batch;
+        let stem = "embed_gather_scaled_mb_4bit";
         with_params(
             t,
             None,

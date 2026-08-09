@@ -1,8 +1,13 @@
 //! Llama 3 — the 3.1, 3.2 and 3.3 releases.
 //!
-//! One generation, one directory: the rows below, the two authoring
-//! passes in `contract` that most of the llama lineage calls, and the
-//! header-marked chat template in `chat`.
+//! One generation, one directory: the rows below and the header-marked
+//! chat template in `chat`.
+//!
+//! The authoring passes most of the llama lineage calls are NOT here.
+//! They were, because llama-3 wrote them down first, and ten generations
+//! reached across a sibling edge to call them. They live in
+//! [`crate::shared::llama_like::contract`] now — being written first is a
+//! fact about who wrote it, not a claim of ownership.
 //!
 //! # The three keys this generation was reached by
 //!
@@ -31,14 +36,11 @@
 
 #[cfg(feature = "chat")]
 pub mod chat;
-#[cfg(feature = "contract")]
-pub mod contract;
-
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
-use crate::families::llama_like::project;
-use crate::families::llama_like::spec::LlamaLikeFacts;
+use crate::shared::llama_like::project;
+use crate::shared::llama_like::spec::LlamaLikeFacts;
 use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
@@ -384,25 +386,60 @@ impl Variant for Llama3 {
 
     /// The lineage's own pass, called rather than tabulated.
     ///
-    /// `author_llama_like` lives next door in `contract` and is what
-    /// `HF_ROWS` named in a dozen rows' author column; the N:1 is
+    /// `author_llama_like` lives in [`crate::shared::llama_like::contract`]
+    /// and is what `HF_ROWS` named in a dozen rows' author column; the N:1 is
     /// unchanged, but it is a call now and cannot fall out of step with
     /// the shape stated three fields above it.
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
-        contract::author_llama_like(builder)
+        match builder.naming() {
+            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_llama_like(builder),
+            // A DIFFERENT BACKEND'S READING of the same checkpoint, and
+            // the reason this is a `match` rather than a call: the MLX
+            // author renames every tensor to the binder's own vocabulary
+            // and states the dtype its kernels read. Handing Metal the
+            // HF contract published the checkpoint's raw names AND left
+            // MLX's fp16 sidecars uncast, so a bf16 kernel read a scale
+            // of 6e-3 as 1e-20 and every logit came out zero.
+            crate::shared::policy::Naming::Mlx => crate::shared::llama_like::contract::author_llama_mlx(builder),
+        }
     }
 
+    /// This row's text, for whichever backend asked.
+    ///
+    /// `rope_rescaled: TRUE`, and it is the one row field here with
+    /// teeth: llama-3 rotates on a piecewise-rescaled ladder
+    /// ([`Self::deployment`] states the four numbers as
+    /// `RopeScaling::Llama3`), and NO `rope_theta` expresses it. The
+    /// Metal text therefore reads a frequency TABLE the driver derived
+    /// at load rather than deriving a ladder from the base, and this
+    /// flag is how it knows which.
+    ///
+    /// Nothing carried that for the length of this refactor:
+    /// `driver-metal` read the four numbers off the deleted
+    /// `pie.model/1` descriptor, and a factor of zero reads as "no
+    /// rescaling", so every llama-3 attended past its trained 8192 with
+    /// the wrong wavelengths — degrading rather than failing.
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        Ok(project::trace(&self.shape, class, load))
+        project::trace(
+            &self.shape,
+            project::MetalRow {
+                rope_theta: self.rope_theta,
+                norm_eps: self.norm_eps,
+                window: self.window,
+                rope_rescaled: true,
+            },
+            class,
+            load,
+        )
     }
 
     /// The header protocol, which is NOT ChatML.
@@ -775,10 +812,10 @@ mod tests {
         let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
-        let policy = crate::policy::Policy::default();
+        let policy = crate::shared::policy::Policy::default();
 
         for v in VARIANTS {
-            let mut builder = crate::builder::Builder::new(
+            let mut builder = crate::shared::builder::Builder::new(
                 &metadata,
                 v.id(),
                 v.load_shape(),

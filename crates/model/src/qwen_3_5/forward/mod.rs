@@ -1300,8 +1300,8 @@ mod tests {
     // A handful of tests here compare against the dense family -- "the hybrid's
     // KV marks match llama_like's" is a statement about both, so it is named
     // across the module boundary rather than duplicated.
-    use crate::families::llama_like::forward::facts::LlamaLikeFacts;
-    use crate::families::llama_like::forward::llama_like;
+    use crate::shared::llama_like::forward::facts::LlamaLikeFacts;
+    use crate::shared::llama_like::forward::llama_like;
     use model_compiler::trace::{DType, Dim, NormVariant, OpKind, StateRef, StateStore};
 
     /// The MoE block fragment's op sequence, mapped launch for launch to

@@ -1304,6 +1304,17 @@ mod tests {
 
     // ── Arch selection ────────────────────────────────────────────────────
 
+    /// A vision tower is selected by the WHOLE arch label, not by a
+    /// substring of it.
+    ///
+    /// The labels are a closed set — `gemma4` and `qwen3_5` are what
+    /// [`crate::deployment::Advertised::arch`] actually carries — and
+    /// matching on `contains` was a real defect: a generation named after
+    /// an older one picked up the older one's tower. This test used to
+    /// assert that defect, asking for `"Gemma4-27B"` and `"qwen3_5_moe"`
+    /// to resolve, so the decorated names are now the NEGATIVE cases.
+    /// See [`VisionArch::from_arch_name`], whose doc says the same thing
+    /// from the other side.
     #[test]
     fn arch_name_selection() {
         assert_eq!(
@@ -1311,18 +1322,21 @@ mod tests {
             Some(VisionArch::Gemma4)
         );
         assert_eq!(
-            VisionArch::from_arch_name("Gemma4-27B"),
+            VisionArch::from_arch_name("qwen3_5"),
+            Some(VisionArch::Qwen36)
+        );
+        // Case is not part of the label; decoration is.
+        assert_eq!(
+            VisionArch::from_arch_name("GEMMA4"),
             Some(VisionArch::Gemma4)
         );
-        assert_eq!(
-            VisionArch::from_arch_name("qwen3_6"),
-            Some(VisionArch::Qwen36)
-        );
-        assert_eq!(
-            VisionArch::from_arch_name("qwen3_5_moe"),
-            Some(VisionArch::Qwen36)
-        );
-        assert_eq!(VisionArch::from_arch_name("llama"), None);
+        for decorated in ["gemma4-27b", "qwen3_5_moe", "qwen3_6", "llama"] {
+            assert_eq!(
+                VisionArch::from_arch_name(decorated),
+                None,
+                "{decorated} is not one of the labels a row advertises",
+            );
+        }
     }
 
     // ── Qwen patchify (ported from the verified SDK function) ──────────────

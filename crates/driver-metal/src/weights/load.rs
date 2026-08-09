@@ -37,7 +37,12 @@ pub struct Loaded {
     /// `Loaded` lives. Dropping it while a fire is bound against those
     /// addresses takes the weights out of the residency set under a running
     /// GPU, which is why it is a field rather than a local.
-    pub region: Allocation,
+    ///
+    /// CHUNKED, and never one: a recorded command cannot bind past 4 GiB
+    /// (`device/recording.rs`), so `stage_weights` cuts the staged bytes on
+    /// tensor boundaries into buffers no larger than that. Every address in
+    /// `tensors` still points into exactly one of them.
+    pub regions: Vec<Allocation>,
     /// Checkpoint tensor name → its address and extent.
     pub tensors: HashMap<String, Slice>,
     /// Weights the plan leaves in MXFP4, by name.
@@ -113,7 +118,7 @@ pub fn load(
             message: err.to_string(),
         },
     )?;
-    let (region, staged) = stage_plan_weights(context, &plan, snapshot_dir)?;
+    let (regions, staged) = stage_plan_weights(context, &plan, snapshot_dir)?;
     let tensors = staged
         .into_iter()
         .map(|(name, handle)| {
@@ -125,7 +130,7 @@ pub fn load(
         .collect();
     let mxfp4 = plan.mxfp4_tensor_names();
     Ok(Loaded {
-        region,
+        regions,
         tensors,
         mxfp4,
     })

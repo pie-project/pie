@@ -21,7 +21,7 @@ use crate::deployment::{
     AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement, PrefillStyle,
     RecurrentShape,
 };
-use crate::families::llama_like::project::round_up_attn_head_dim;
+use crate::shared::llama_like::project::round_up_attn_head_dim;
 use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::{Qwen35HybridFacts, Qwen35MlpKind};
@@ -137,6 +137,9 @@ pub fn deployment(f: &Qwen35HybridFacts, rope_theta: f32, norm_eps: f32) -> Depl
     let head_dim = kernel.max(a.head_dim);
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
+            // One shape for every layer, which is what this row was
+            // already saying by having no per-layer count.
+            kv_heads: a.kv_heads,
             head_dim,
             window: -1,
             kv_source: l,
@@ -174,6 +177,14 @@ pub fn deployment(f: &Qwen35HybridFacts, rope_theta: f32, norm_eps: f32) -> Depl
                 Qwen35MlpKind::Dense { .. } => 0,
                 Qwen35MlpKind::Moe(moe) => moe.moe_intermediate,
             },
+            experts_per_token: match &f.mlp {
+                Qwen35MlpKind::Dense { .. } => 0,
+                Qwen35MlpKind::Moe(moe) => moe.top_k,
+            },
+            shared_intermediate: match &f.mlp {
+                Qwen35MlpKind::Dense { .. } => 0,
+                Qwen35MlpKind::Moe(moe) => moe.shared_expert_intermediate,
+            },
             vocab: f.vocab,
         },
         attention,
@@ -186,6 +197,11 @@ pub fn deployment(f: &Qwen35HybridFacts, rope_theta: f32, norm_eps: f32) -> Depl
         logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
+        // Not a gemma: the gain is the multiplier, stored directly.
+        norm_unit_offset: false,
+        v_norm: false,
+        k_eq_v: false,
+        mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // Filled by the ROW, not by the shape: a family label and a
         // published context ceiling are facts about a checkpoint, and a
@@ -267,6 +283,37 @@ pub fn cuda_facts(f: &Qwen35HybridFacts, load: Deployed<'_>) -> super::forward::
         window_left: Vec::new(),
     }
 }
+
+/// Why this build has no Metal text for a qwen-3.5 row.
+///
+/// A `const` so the test that asserts the refusal NAMES the missing
+/// thing compares against the same string the caller is shown, rather
+/// than against a paraphrase that can drift away from it — the shape
+/// `csm::project::NO_TRACE` set for the same reason.
+///
+/// Its forward is `qwen3_5_hybrid_cuda`, which interleaves
+/// gated DeltaNet layers with attention and states two SERVICE classes
+/// beside the two shaped ones. `llama_like_metal` has neither the
+/// recurrent layer kind nor the service classes.
+///
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine, and a pie whose Metal half had this text would serve the same
+/// row unchanged. What is missing is a TEXT in this build, which is a
+/// fact about the build.
+///
+/// Stating it is the whole of what replaces `driver-metal`'s
+/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
+/// reduced by a punctuation-stripping `canonical()`, consulted before
+/// any text was traced and free to disagree with what the tracer would
+/// actually do. It listed `gemma4`, which the load path refused on
+/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// that answers for itself cannot disagree with a list, because there
+/// is no list.
+pub const NO_METAL: &str = "qwen-3.5 has no Metal text in this build: its forward is \
+     `qwen3_5_hybrid_cuda`, which interleaves gated DeltaNet layers with \
+     attention and states two service classes beside the two shaped ones, and \
+     the one Metal text here (`llama_like_metal`) has neither and takes a \
+     different shape; the CUDA backend serves this row";
 
 /// Trace this row's CUDA text for one fire class.
 #[cfg(feature = "forward")]
@@ -516,7 +563,14 @@ mod tests {
         let moe_facts = cuda_facts(&mixture(), Deployed::single());
         assert!(moe_facts.moe_residual_fold, "tp == 1 folds into the residual");
         assert!(moe_facts.moe_shared_gate_dot, "35B-A3B binds a shared expert");
-        let sharded = cuda_facts(&mixture(), Deployed { tp_size: 4, layer_scalars: &[] });
+        let sharded = cuda_facts(
+            &mixture(),
+            Deployed {
+                backend: crate::catalog::Backend::Cuda,
+                tp_size: 4,
+                layer_scalars: &[],
+            },
+        );
         assert!(!sharded.moe_residual_fold, "tp > 1 writes scratch and allreduces");
     }
 

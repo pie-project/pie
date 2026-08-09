@@ -26,8 +26,7 @@
 pub mod facts;
 
 use self::facts::KimiK3Facts;
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::dsl::{self, matmul, MatW, NormW, WeightRepr};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct K3LayerW {

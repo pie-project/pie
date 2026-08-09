@@ -7,7 +7,7 @@
 //! - Tool outputs in <|im_start|>environment\ncontent<|im_end|>\n.
 //! - Generation prompt adds <|im_start|>assistant\n<think>
 
-use crate::decoders::{GenericChatDecoder, ThinkingDecoder};
+use crate::shared::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent};
 use tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;

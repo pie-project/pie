@@ -120,7 +120,7 @@ fn load_model_takes_one_descriptor_because_this_backend_holds_one_model() {
             .expect_err("/nonesuch holds no checkpoint")
     );
     assert!(
-        why.contains("[model] descriptor"),
+        why.contains("[model] config"),
         "model facts come from the descriptor the worker hands over, not from \
          a checkpoint this seam re-normalizes: {why}"
     );
@@ -305,7 +305,7 @@ fn a_frame_reaches_the_device_through_the_seam() {
     let path = dir.join("config.json");
     std::fs::write(&path, &raw).expect("it writes");
 
-    // TOML, which is what the boot config is — `[model] descriptor`.
+    // TOML, which is what the boot config is — `[model] config`.
     let config = format!("[model]\ndescriptor = \"{}\"\n", path.display());
     let Ok((mut backend, _)) = DriverBackend::metal_create(config.as_bytes()) else {
         eprintln!("SKIP: no Metal 4 device");

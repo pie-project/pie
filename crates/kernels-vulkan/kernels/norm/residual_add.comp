@@ -1,0 +1,31 @@
+// Residual add, flat and row-strided.
+//
+// This is the Metal `residual_add.metal` arithmetic moved without changing the
+// aliasing rule: `out` may alias `x`, and every element is read before its one
+// write. The strided variant moves Metal's scalar row pitch into push constants.
+
+#version 450
+
+#include "common/bf16.glsl"
+
+layout(local_size_x = 256) in;
+
+PIE_BUFFER_RO(0, X, x);
+PIE_BUFFER_RO(1, R, residual);
+PIE_BUFFER_RW(2, Out, out_);
+
+#if defined(PIE_STRIDED)
+layout(push_constant) uniform Push { int row_pitch; } pc;
+#endif
+
+void main() {
+#if defined(PIE_STRIDED)
+    uint i = uint(gl_GlobalInvocationID.y) * uint(pc.row_pitch) + gl_GlobalInvocationID.x;
+#else
+    uint i = gl_GlobalInvocationID.x;
+#endif
+    out_[i] = PIE_STORE(PIE_LOAD(x[i]) + PIE_LOAD(residual[i]));
+}
+
+// pie:instantiate residual_add_bfloat16
+// pie:instantiate residual_add_strided_bfloat16 PIE_STRIDED=1

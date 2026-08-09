@@ -43,6 +43,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// How a layer attends.
 ///
 /// PER LAYER, unconditionally — not "per layer for the families that
@@ -69,6 +71,51 @@ pub struct LayerAttention {
     pub rope_theta: f32,
     /// Rotary width, or `0` for full rotation at the head dim.
     pub rotary_dim: u32,
+    /// The kv-head COUNT for this layer.
+    ///
+    /// A head shape is two numbers. This struct stated the width and
+    /// left the count on the stack-wide `Geometry`, which is right for
+    /// every family whose layers agree — and gemma-4's do not. The
+    /// driver refused the whole generation over exactly this absence:
+    /// *"`LayerAttention` states no per-layer kv-head count to go with
+    /// them; the second shape's K would be paged at the first shape's
+    /// width"*. The rows that have one shape repeat it, which is the
+    /// same answer they were giving implicitly.
+    pub kv_heads: u32,
+}
+
+/// Which gate the MLP applies to its first projection.
+///
+/// A `Deployment` STATED NO ACTIVATION AT ALL, and a driver that
+/// receives a shape rather than a text has nowhere else to learn it. So
+/// every checkpoint reaching a backend was served with a SiLU gate,
+/// which for a gemma is a few percent at the origin that diverges from
+/// there: finite, plausible, never faulting, and wrong. `driver-metal`
+/// caught one class of it by asking the TENSORS — a stack shipping
+/// `pre_feedforward_layernorm` norms both ways round and therefore
+/// gates with a GELU — and refused, naming what would lift the refusal:
+/// *"either an activation on `Deployment` or a `Variant::trace` that
+/// can be asked for a Metal text"*. This is the first of those.
+///
+/// The clamp is on the variant rather than beside it, because a limit
+/// of zero and a limit of seven are not two settings of one gate: gpt-
+/// oss's is a different function, and a row holding `0.0` in a field
+/// nothing reads cannot be told from one that forgot to fill it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MlpGate {
+    /// `silu(gate) * up` — llama's, and most of the catalog's.
+    Silu,
+    /// `gelu_tanh(gate) * up` — every gemma, whose configs spell it
+    /// `hidden_activation: "gelu_pytorch_tanh"`.
+    GeluTanh,
+    /// gpt-oss's clamped SwiGLU: both halves are clipped and the gate
+    /// carries an alpha.
+    SiluClamped {
+        /// `swiglu_limit`, 7.0 on gpt-oss.
+        limit: f32,
+        /// The gate's alpha, 1.702 on gpt-oss.
+        alpha: f32,
+    },
 }
 
 /// What kind of KV this deployment needs.
@@ -95,6 +142,29 @@ pub enum KvStyle {
         /// One ratio per layer; `None` for an uncompressed layer.
         ratios: Vec<i32>,
     },
+}
+
+impl KvStyle {
+    /// Whether THIS BUILD provisions a store this style can live in.
+    ///
+    /// A capability question, not a shape one: the style is a fact about
+    /// the model and this answer is a fact about the binary, and keeping
+    /// them separable is why it is a method rather than a variant.
+    ///
+    /// It lives here because it was written three times — byte-identical
+    /// bodies in `glm_5`, `kimi_k2` and `kimi_k3`, one per MLA family —
+    /// and three copies of one question is how the copies drift. Worse,
+    /// only some callers asked: `deployment()` consulted it and `trace()`
+    /// did not, so glm-5 refused at the door and traced a fire anyway,
+    /// which is precisely the "loads successfully and dies at its first
+    /// fire" failure this enum's own doc says it exists to prevent.
+    #[must_use]
+    pub fn has_a_store_in_this_build(&self) -> bool {
+        match self {
+            Self::Paged => true,
+            Self::Mla { .. } | Self::Dsv4 { .. } => false,
+        }
+    }
 }
 
 /// A recurrent stack's slab geometry — what a driver must allocate and
@@ -199,6 +269,35 @@ pub struct Geometry {
     /// under-sizes a mixture whose experts are wider, which does not
     /// fail: it moves bytes out of the KV pool, quietly.
     pub moe_intermediate: u32,
+    /// How many experts one token visits, or `0` for a dense stack.
+    ///
+    /// Beside [`Self::moe_intermediate`] because a mixture is not
+    /// described by a width alone: the router ranks the experts and this
+    /// is how deep down that ranking a token goes. Every consumer of the
+    /// width needs it, and until it was stated here no consumer could
+    /// have it — [`crate::catalog::LoadShape`] counts the experts, this
+    /// struct gives one expert's width, and the top-k was known only to
+    /// the row's own facts, which no driver receives.
+    ///
+    /// A driver's alternative was to guess. driver-metal refused instead,
+    /// and its refusal named this field before it existed: "a mixture
+    /// fired at the wrong top-k routes each token to almost the right
+    /// experts and returns fluent nonsense". That is the same class as
+    /// serving a GEGLU stack on SiLU — finite, plausible, never faulting.
+    pub experts_per_token: u32,
+    /// The dense FFN a routed layer runs BESIDE the bank, gated by one
+    /// sigmoid scalar per token. Zero means the routing has none, and it
+    /// is `n_shared_experts * moe_intermediate` rather than one expert's
+    /// width — the rows already fold the count in.
+    ///
+    /// Here for the same reason as [`Self::experts_per_token`]: every
+    /// routed row states it (glm-5 1408, kimi-k2 2048, kimi-k3 1024,
+    /// qwen3.5 under the name `shared_expert_intermediate`) and none of
+    /// it reached a driver, so driver-metal's `shared_intermediate` had
+    /// to be derived — and the only proxies available were "equal to
+    /// `moe_intermediate`", which is false for kimi-k2, or "zero", which
+    /// silently drops a whole FFN from every token.
+    pub shared_intermediate: u32,
     /// The logit dimension.
     ///
     /// The MODEL's `vocab_size` and never the tokenizer's token count —
@@ -221,6 +320,8 @@ impl Geometry {
         head_dim_kernel: 0,
         intermediate: 0,
         moe_intermediate: 0,
+        experts_per_token: 0,
+        shared_intermediate: 0,
         vocab: 0,
     };
 
@@ -374,6 +475,50 @@ pub struct Deployment {
     /// Where the norm sits — read by anything that needs to name the
     /// projection input, which today is the adapter staging.
     pub norm: NormPlacement,
+    /// Whether the norm's gain is stored as an OFFSET FROM ONE, so that
+    /// firing it means `(1 + w) * x` rather than `w * x`.
+    ///
+    /// A fact of its own, and stated rather than derived, because the
+    /// only other place to read it from is the norm PLACEMENT — and that
+    /// reading is wrong for exactly one published stack. gemma-1, -2 and
+    /// -3 pair the sandwich with the offset, so "sandwiched" answered
+    /// "offset" correctly for years; gemma-4 publishes the sandwich and
+    /// stores a plain multiplier, and this repo's CUDA text has said so
+    /// since it was written — "PLAIN, despite the family name"
+    /// (`gemma_4/forward/mod.rs`).
+    ///
+    /// It did not fail loudly when it was inferred. `(1 + w)/w` is 1.002
+    /// where `w` is 444 and 1.38 where `w` is 2.6, so the norm's LARGEST
+    /// gains agreed to three digits while its ordinary ones were off by a
+    /// third — a whole generation served finite, plausible, wrong
+    /// numbers. That is the cost of deriving it, and the reason it is a
+    /// field.
+    ///
+    /// `false` for every non-gemma row: those checkpoints store the
+    /// multiplier directly. They are not merely *unaffected* — a driver
+    /// that reads this without first asking whether the stack is a gemma
+    /// gets the true answer for them too.
+    pub norm_unit_offset: bool,
+    /// Whether V is RMS-normed, per head, on its way to the KV pool.
+    ///
+    /// `true` for gemma-4 alone. Not implied by the per-head QK norm --
+    /// **gemma-3 carries `q_norm` and `k_norm` and has no V norm at all** --
+    /// so a driver cannot read it off the norms it can already see.
+    ///
+    /// A ROW'S ANSWER rather than a probe, for a reason no other norm here
+    /// has: the module ships NO PARAMETER. MLX calls it `RMSNormNoScale`, so
+    /// a checkpoint contains nothing to ask about, and `has_tensor` answers
+    /// no for a stack that does this and for a stack that does not.
+    pub v_norm: bool,
+    /// Whether V is read out of the K projection instead of its own.
+    ///
+    /// gemma-4's `attention_k_eq_v`. MEASURED rather than assumed from
+    /// the flag's name: those layers ship no `v_proj` at all, so a
+    /// driver that binds one gets `UnknownWeight` and a driver that
+    /// projects one gets a tensor the checkpoint never trained.
+    pub k_eq_v: bool,
+    /// Which gate this stack's MLP applies. See [`MlpGate`].
+    pub mlp_gate: MlpGate,
     /// Named scalar constants the forward refers to by name.
     pub scales: BTreeMap<String, f32>,
     /// What a driver ADVERTISES about this model, as distinct from what
@@ -558,6 +703,10 @@ impl Deployment {
             logit_softcap: 0.0,
             ple_dim: 0,
             norm: NormPlacement::Pre,
+            norm_unit_offset: false,
+            v_norm: false,
+            k_eq_v: false,
+            mlp_gate: MlpGate::Silu,
             scales: BTreeMap::new(),
             advertised: Advertised::default(),
             rope_scaling: None,
@@ -578,10 +727,77 @@ impl Deployment {
         Some((first, other))
     }
 
+    /// The FULL-attention layers' head shape, when it differs.
+    ///
+    /// `None` when every layer agrees, which is the ordinary case and
+    /// the answer that lets a driver read one shape everywhere.
+    /// `Some((head_dim, kv_heads, rotary_dim))` for a stack whose
+    /// windowed and unwindowed layers are shaped differently — gemma-4,
+    /// and so far only gemma-4.
+    ///
+    /// Keyed on the WINDOW rather than on "the shape that differs",
+    /// because the driver's `global_*` fields mean the full layers'
+    /// shape specifically: a page is sized per layer, and the layer
+    /// that reads the whole context is the one that has to be right.
+    #[must_use]
+    pub fn full_attention_shape(&self) -> Option<(u32, u32, u32)> {
+        let first = self.attention.first()?;
+        let full = self.attention.iter().find(|a| a.window < 0)?;
+        if full.head_dim == first.head_dim && full.kv_heads == first.kv_heads {
+            return None;
+        }
+        Some((full.head_dim, full.kv_heads, full.rotary_dim))
+    }
+
     /// Does any layer read another's KV pages?
     #[must_use]
     pub fn shares_kv(&self) -> bool {
         self.attention.iter().enumerate().any(|(l, a)| a.kv_source as usize != l)
+    }
+
+    /// CAN THIS BUILD SERVE THIS STACK — asked at load, not at launch.
+    ///
+    /// FlashInfer's decode instantiates a fixed set of GQA group sizes
+    /// and reports anything else by THROWING. A throw crossing the C
+    /// ABI is undefined behaviour: the generated shim prints the message
+    /// before it dies, and printing is all it can do, because a
+    /// launcher signature has nowhere to put a failure. A LOAD does —
+    /// it returns a status code — so the question has to be asked here.
+    ///
+    /// This was `refuse_unservable_gqa`, and it sat inside the llama
+    /// lineage's derivation as though it were a property of that
+    /// lineage. It is a property of the BUILD, so it takes the set as an
+    /// ARGUMENT: `model` states the shape, the driver states what it
+    /// instantiated, and neither one has to know the other's answer.
+    /// The live proof that it is not one lineage's business is
+    /// Qwen3.6-27B — 24 query heads over 4 kv heads is a group of six,
+    /// and it reaches the same dispatch from a different generation.
+    ///
+    /// The ratio itself is [`Geometry::gqa_group`] and is NOT restated
+    /// here. What this adds is the divisibility question, which that one
+    /// cannot answer: it truncates, so 14 over 4 reads as 3 — a group
+    /// every build instantiates, for a stack no build can run.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unsupported`] when the head counts do not divide, or
+    /// when the resulting group size is not in `groups`.
+    pub fn servable_by(&self, groups: &[u32]) -> Result<(), Refusal> {
+        let (q, kv) = (self.shape.q_heads, self.shape.kv_heads);
+        if kv == 0 || q % kv != 0 {
+            return Err(Refusal::Unsupported(
+                "the query heads do not divide the kv heads, so this stack \
+                 asks for a fractional GQA group no build instantiates",
+            ));
+        }
+        if groups.contains(&self.shape.gqa_group()) {
+            Ok(())
+        } else {
+            Err(Refusal::Unsupported(
+                "this build's decode does not instantiate the GQA group size \
+                 this stack asks for",
+            ))
+        }
     }
 
     /// The sliding window per layer, as the fire path binds it.
@@ -621,6 +837,7 @@ mod tests {
     fn layer(head_dim: u32) -> LayerAttention {
         LayerAttention {
             head_dim,
+            kv_heads: 1,
             window: -1,
             kv_source: 0,
             sm_scale: 1.0,
@@ -651,6 +868,10 @@ mod tests {
             logit_softcap: 0.0,
             ple_dim: 0,
             norm: NormPlacement::Pre,
+            norm_unit_offset: false,
+            v_norm: false,
+            k_eq_v: false,
+            mlp_gate: MlpGate::Silu,
             scales: BTreeMap::new(),
             advertised: Advertised::default(),
             rope_scaling: None,
@@ -697,6 +918,111 @@ mod tests {
         let mut d = stack(&[128]);
         d.kv = KvStyle::Mla { kv_lora_rank: 512, qk_rope_head_dim: 64 };
         assert!(matches!(d.kv, KvStyle::Mla { .. }));
+    }
+
+    /// The set is the CALLER's, which is what moved this out of the
+    /// llama lineage. A stack is servable or not against a build, and
+    /// the same stack answers differently to a differently-built pie.
+    #[test]
+    fn the_same_stack_is_servable_by_one_build_and_not_another() {
+        let mut d = stack(&[128]);
+        d.shape.q_heads = 24;
+        d.shape.kv_heads = 4;
+        assert_eq!(d.shape.gqa_group(), 6);
+        assert!(
+            d.servable_by(&[1, 2, 3, 4, 8]).is_err(),
+            "six is not in FlashInfer's instantiated set"
+        );
+        assert!(
+            d.servable_by(&[1, 2, 3, 4, 6, 8]).is_ok(),
+            "a build that instantiated six serves the identical stack"
+        );
+    }
+
+    /// Qwen3.6-27B, which the doc names as the live proof that this is
+    /// not one lineage's business: 24 over 4 reaches the same dispatch
+    /// from a different generation.
+    #[test]
+    fn the_hybrids_group_of_six_is_refused_at_the_door() {
+        let mut d = stack(&[128]);
+        d.shape.q_heads = 24;
+        d.shape.kv_heads = 4;
+        let why = d.servable_by(&[1, 2, 3, 4, 8]).expect_err("six is unservable");
+        assert!(
+            matches!(why, Refusal::Unsupported(_)),
+            "a build limit is Unsupported, not Malformed — the checkpoint is fine"
+        );
+    }
+
+    /// Qwen2.5-1.5B: twelve over two.
+    #[test]
+    fn the_other_live_example_is_refused_the_same_way() {
+        let mut d = stack(&[128]);
+        d.shape.q_heads = 12;
+        d.shape.kv_heads = 2;
+        assert_eq!(d.shape.gqa_group(), 6);
+        assert!(d.servable_by(&[1, 2, 3, 4, 8]).is_err());
+    }
+
+    #[test]
+    fn the_ordinary_ratios_are_served() {
+        for (q, kv, group) in [(16u32, 16u32, 1u32), (16, 8, 2), (32, 8, 4), (64, 8, 8)] {
+            let mut d = stack(&[128]);
+            d.shape.q_heads = q;
+            d.shape.kv_heads = kv;
+            assert_eq!(d.shape.gqa_group(), group, "{q} over {kv}");
+            assert!(d.servable_by(&[1, 2, 3, 4, 8]).is_ok(), "{q} over {kv}");
+        }
+    }
+
+    /// A ratio that does not divide is not a build question.
+    ///
+    /// No instantiation set contains a fractional group, so widening the
+    /// set cannot fix it — which is why `gqa_group` answers `None`
+    /// rather than truncating, and why the refusal says something
+    /// different.
+    #[test]
+    fn a_fractional_ratio_is_refused_by_every_build() {
+        let mut d = stack(&[128]);
+        d.shape.q_heads = 14;
+        d.shape.kv_heads = 4;
+        assert_eq!(
+            d.shape.gqa_group(),
+            3,
+            "the ratio TRUNCATES to a group every build instantiates, which \
+             is why divisibility is asked separately"
+        );
+        assert!(d.servable_by(&[1, 2, 3, 4, 8]).is_err());
+        assert!(
+            d.servable_by(&[1, 2, 3, 4, 6, 8, 14]).is_err(),
+            "widening the set cannot admit a ratio that does not divide"
+        );
+    }
+
+    /// Zero kv heads is refused rather than dividing by zero.
+    ///
+    /// `Geometry::gqa_group` answers 0 so that `EMPTY` stays askable,
+    /// and 0 is in no instantiation set — but the refusal comes from the
+    /// divisibility arm, so the sentence says the shape is wrong rather
+    /// than that a kernel is missing.
+    #[test]
+    fn a_stack_that_states_no_kv_heads_does_not_divide_by_zero() {
+        let mut d = stack(&[128]);
+        d.shape.q_heads = 8;
+        d.shape.kv_heads = 0;
+        assert_eq!(d.shape.gqa_group(), 0, "askable, not a panic");
+        assert!(d.servable_by(&[1, 2, 3, 4, 8]).is_err());
+        assert!(d.servable_by(&[0, 1, 2, 3, 4, 8]).is_err(), "not fixable by widening");
+    }
+
+    /// An empty set serves nothing, which is the honest answer for a
+    /// build that instantiated no decode at all.
+    #[test]
+    fn a_build_that_instantiated_nothing_serves_nothing() {
+        let mut d = stack(&[128]);
+        d.shape.q_heads = 8;
+        d.shape.kv_heads = 8;
+        assert!(d.servable_by(&[]).is_err());
     }
 }
 

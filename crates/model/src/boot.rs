@@ -40,7 +40,7 @@ use model_loader::plan::{self, LoadPlan, StorageTarget};
 
 use crate::catalog::{self, Override, Unmatched, Variant};
 use crate::encoding::Encoding;
-use crate::policy::{
+use crate::shared::policy::{
     Component, FamilyKnobs, Mxfp4MoePolicy, Mxfp4MoeRequest, Naming, Policy, Projections,
     RuntimeQuant,
 };

@@ -28,8 +28,8 @@ use model_loader::contract::ModelContract;
 use model_loader::error::Error;
 use model_loader::plan::StorageTarget;
 
-use crate::builder::Builder;
-use crate::policy::{Mxfp4MoePolicy, Policy};
+use crate::shared::builder::Builder;
+use crate::shared::policy::{Mxfp4MoePolicy, Policy};
 
 /// What a row's `author` dispatches to: a family's authoring pass.
 ///
@@ -108,9 +108,9 @@ mod tests {
     use super::*;
     use crate::catalog::Variant;
     use crate::encoding::Encoding as StoredEncoding;
-    use crate::policy::Mxfp4MoeRequest;
-    use model_loader::checkpoint::{FileId, RawTensor};
-    use model_loader::types::{DType, Encoding as TensorEncoding, TensorId};
+    use crate::shared::policy::Mxfp4MoeRequest;
+    use model_loader::checkpoint::RawTensor;
+    use model_loader::types::{DType, Encoding as TensorEncoding, FileId, TensorId};
 
     /// A real row, so these test the function and not a stub of it.
     ///
@@ -172,7 +172,7 @@ mod tests {
             &target(),
             &Policy::default(),
         )
-        .expect("a dense checkpoint the llama-like tail publishes");
+        .expect("a dense checkpoint the shared tail publishes");
 
         assert_eq!(
             contract.tensors.len(),

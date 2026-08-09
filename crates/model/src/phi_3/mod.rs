@@ -35,8 +35,8 @@ pub mod contract;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
-use crate::families::llama_like::project;
-use crate::families::llama_like::spec::LlamaLikeFacts;
+use crate::shared::llama_like::project;
+use crate::shared::llama_like::spec::LlamaLikeFacts;
 use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
@@ -210,18 +210,36 @@ impl Variant for Phi3 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         contract::author_phi3(builder)
     }
 
+    /// This row's text, for whichever backend asked.
+    ///
+    /// `rope_rescaled: false`, and the reason is which ROWS are here:
+    /// both are the 4k releases (`phi-3-mini-4k`, `phi-3-medium-4k`),
+    /// whose configs state a plain `rope_theta` and no scaling. The
+    /// 128k releases extend by LongRoPE — a per-channel factor table
+    /// that is a different statement entirely — and they have no row in
+    /// this table, so nothing here may claim to serve them.
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        Ok(project::trace(&self.shape, class, load))
+        project::trace(
+            &self.shape,
+            project::MetalRow {
+                rope_theta: self.rope_theta,
+                norm_eps: self.norm_eps,
+                window: self.window,
+                rope_rescaled: false,
+            },
+            class,
+            load,
+        )
     }
 
     /// Phi-3's own markers: `<|user|>\n … <|end|>\n`. Close enough to
@@ -468,10 +486,10 @@ mod tests {
         let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
-        let policy = crate::policy::Policy::default();
+        let policy = crate::shared::policy::Policy::default();
 
         for v in VARIANTS {
-            let mut builder = crate::builder::Builder::new(
+            let mut builder = crate::shared::builder::Builder::new(
                 &metadata,
                 v.id(),
                 v.load_shape(),

@@ -8,7 +8,7 @@
 //! what the driver alone knows.
 //!
 //! Which is less than it was. The loading policy stated all seven
-//! [`model::policy::Policy`] fields here, and `driver-metal` stated the same
+//! [`model::shared::policy::Policy`] fields here, and `driver-metal` stated the same
 //! seven, differing in exactly two; the comment below the file check said the
 //! other driver "carried the same block, bit for bit". Equal requests have to
 //! author equal contracts, and two copies of a policy cannot promise that —
@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use model::boot::Binding;
-use model::policy::Mxfp4MoePolicy;
+use model::shared::policy::Mxfp4MoePolicy;
 use model_loader::plan::{LoadPlan, StorageTarget};
 use model_loader::types::BackendKind;
 
@@ -62,14 +62,14 @@ pub use model::boot::LoadPlanError;
 /// The two answers this driver contributes are [`Binding::HF_FUSED`], and
 /// both are claims about the forward path rather than preferences:
 ///
-/// - [`Projections::Fused`](model::policy::Projections::Fused) because the
+/// - [`Projections::Fused`](model::shared::policy::Projections::Fused) because the
 ///   dense attention and MLP GEMMs take one operand — `layer.N.qkv`,
 ///   `layer.N.gate_up`. The driver used to build those itself, at load, by
 ///   reading three tensors BACK off the device and re-uploading their
 ///   concatenation. The plan states the same joins as `BulkExtentWrite`s into
 ///   the arena, so the bytes land fused the first and only time they are
 ///   copied.
-/// - [`Naming::Hf`](model::policy::Naming::Hf) because this driver binds
+/// - [`Naming::Hf`](model::shared::policy::Naming::Hf) because this driver binds
 ///   checkpoint names.
 ///
 /// The remaining five policy fields, the author call, the compile and the

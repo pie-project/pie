@@ -78,6 +78,21 @@ pub struct Dims {
     pub kv_heads: u32,
     /// Elements per head.
     pub head_dim: u32,
+    /// Elements one reduction spans, when that is not the whole row.
+    ///
+    /// A hidden-state norm reduces over its row and this equals
+    /// [`width`](Self::width); a QK-norm reduces over one HEAD of a stacked
+    /// projection and it does not. The kernel already knew — `rms.metal`
+    /// gives threadgroup `gid` the span `gid * axis_size` — and the grid did
+    /// not, so a launch covered one reduction where the statement stated
+    /// thirty-two.
+    ///
+    /// Read off the statement's own scalar run through
+    /// [`KernelSig::grid_param`](crate::lowering::kernels::KernelSig::grid_param),
+    /// which is the same channel gemma-4's per-layer `rotary_dims` takes and
+    /// for the same reason: one fire-wide number cannot be both of a model's
+    /// two shapes.
+    pub axis: u32,
     /// Channels a partial rope rotates.
     pub rotary_dims: u32,
     /// Experts the router scores.
@@ -182,7 +197,7 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
                 return Err(Ungeometric::PartialTile { rows, tile: bm });
             }
         }
-        Rule::Rms => shapes::rms(dims.width, rows),
+        Rule::Rms => shapes::rms(dims.width, dims.axis, rows),
         Rule::Rope => rope_rows(dims.rotary_dims, rope_heads(dims)?, rows),
         Rule::Elementwise => shapes::elementwise_mb(dims.width, rows),
         Rule::ElementwiseRows => embed_rows(dims.width, rows),
@@ -299,6 +314,9 @@ mod tests {
             q_heads: 16,
             kv_heads: 4,
             head_dim: 128,
+            // A norm over the whole row, which is what most statements are.
+            // The QK-norm case has its own fixture below.
+            axis: 4096,
             rotary_dims: 64,
             n_experts: 128,
             experts_per_token: 8,
@@ -318,7 +336,7 @@ mod tests {
         let d = Dims { rows: 1, ..dims() };
         for (rule, expected) in [
             (Rule::Qmv, shapes::qmv(d.width)),
-            (Rule::Rms, shapes::rms(d.width, 1)),
+            (Rule::Rms, shapes::rms(d.width, d.axis, 1)),
             (Rule::Rope, shapes::rope(d.rotary_dims, d.width / d.head_dim)),
             (Rule::Elementwise, shapes::residual(d.width)),
             (Rule::ElementwiseRows, shapes::embed(d.width)),
@@ -654,6 +672,115 @@ mod tests {
                  zero's rectangle. Measure what the kernel does with M>1 before \
                  this dispatches: either the rule grows a row axis, or it earns \
                  a real place on ROW_INVARIANT."
+            );
+        }
+    }
+
+    /// **A QK-norm reduces over a head, and the grid has to cover all of
+    /// them.**
+    ///
+    /// `rms.metal` gives threadgroup `gid` the span `gid * axis_size`, so a
+    /// launch over a 8192-wide Q whose norm spans 256 channels needs 32
+    /// threadgroups per row. It used to get one per row, sized on the width:
+    /// head 0 was normalized and the other 31 were left as the projection
+    /// wrote them.
+    ///
+    /// Nothing reported it and nothing could. The tensor is fully written —
+    /// just not fully normalized — so no NaN, no zero, no unwritten slot.
+    /// It surfaced only where the missing threadgroups happen to be whole
+    /// tokens: a prefill whose second row came back all zeros.
+    ///
+    /// Falsified by the shape of the assertion: sizing on the width instead
+    /// of the axis gives `[1024 * rows, 1, 1]`, which is what this rejects.
+    #[test]
+    fn a_qk_norm_covers_every_head_and_a_row_norm_is_the_case_where_it_is_one() {
+        let q_width = 8192;
+        let head_dim = 256;
+        let rows = 3;
+        let d = Dims {
+            rows,
+            width: q_width,
+            axis: head_dim,
+            ..dims()
+        };
+        let launch = eval(Rule::Rms, d).expect("a norm has a grid");
+        let threads = head_dim / 4;
+        assert_eq!(launch.tg, [threads, 1, 1], "a threadgroup spans one HEAD");
+        assert_eq!(
+            launch.grid,
+            [threads * (q_width / head_dim) * rows, 1, 1],
+            "one threadgroup per head per row, not one per row"
+        );
+        assert_eq!(
+            launch.grid[0] / launch.tg[0],
+            (q_width / head_dim) * rows,
+            "32 heads x 3 rows of reductions"
+        );
+
+        // THE SAME FUNCTION at `axis == width`, which is every hidden-state
+        // norm in the tree and the reason this change moves nothing else.
+        let whole = Dims {
+            rows,
+            width: 4096,
+            axis: 4096,
+            ..dims()
+        };
+        assert_eq!(
+            eval(Rule::Rms, whole).expect("a norm has a grid"),
+            Launch {
+                grid: [1024 * rows, 1, 1],
+                tg: [1024, 1, 1],
+            },
+            "a norm spanning its row is the one-head case"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stated_head_width {
+    use super::*;
+
+    /// **A rope counts heads by the width the kernel is told, not the fire's.**
+    ///
+    /// `rope_neox_mb` finds a token's row by multiplying the two back
+    /// together — `row_base = m * n_head * head_dim` — so the grid's head
+    /// count and the kernel's head width are one quantity stated twice. When
+    /// they disagree the product is not the row.
+    ///
+    /// gemma-4 is the deployment that disagrees: 512-wide heads on its
+    /// full-attention layers, 256-wide on its sliding ones. Against the
+    /// fire's 256 a 16 384-wide Q counted 64 heads, the kernel multiplied 64
+    /// by its own 512 and stepped 32 768 elements per row — twice the row.
+    /// Row 1 was written over row 2, and every row past the second landed off
+    /// the end of the tensor entirely. The rotation applied to almost
+    /// nothing, in every fire, decode included.
+    #[test]
+    fn a_rope_steps_exactly_one_row_per_token() {
+        let width = 16_384;
+        for (head_dim, heads) in [(512, 32), (256, 64)] {
+            let dims = Dims {
+                rows: 3,
+                width,
+                head_dim,
+                rotary_dims: 128,
+                in_width: width,
+                q_heads: 32,
+                kv_heads: 4,
+                axis: width,
+                n_experts: 0,
+                experts_per_token: 0,
+            };
+            let launch = eval(Rule::Rope, dims).expect("a rope grids");
+            assert_eq!(
+                launch.grid[1], heads,
+                "a {width}-wide tensor of {head_dim}-wide heads has {heads} of them"
+            );
+            // The property that matters, stated as the kernel computes it.
+            assert_eq!(
+                launch.grid[1] * head_dim,
+                width,
+                "the head count times the head width is one row, or the \
+                 kernel's `m * n_head * head_dim` is not the mth row"
             );
         }
     }

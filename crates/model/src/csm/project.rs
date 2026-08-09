@@ -300,8 +300,8 @@ mod tests {
     /// for the backbone would say yes to one.
     #[test]
     fn the_manifest_asks_for_the_depth_decoder_and_the_codec_too() {
-        let names: Vec<&str> =
-            manifest(&CsmFacts::csm_1b()).tensors.iter().map(|t| t.name.as_str()).collect();
+        let binding = manifest(&CsmFacts::csm_1b());
+        let names: Vec<&str> = binding.tensors.iter().map(|t| t.name.as_str()).collect();
         assert!(names.iter().any(|n| n.starts_with("backbone_model.")), "no backbone");
         assert!(names.iter().any(|n| n.starts_with("depth_decoder.")), "no depth decoder");
         assert!(names.iter().any(|n| n.starts_with("codec_model.")), "no codec");

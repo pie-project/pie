@@ -144,13 +144,12 @@ use driver_metal::bind::encode::Pipelines;
 use driver_metal::lowering::executor::{FireTable, Resolver, Slice};
 use driver_metal::lowering::frame::{Step, lower_step};
 use driver_metal::pools::kv::Pool;
-    use driver_metal::layout::kv::Shape;
+use driver_metal::layout::kv::Shape;
 use driver_metal::weights::load::load;
 use driver_metal::lowering::resolve::{Names, Store};
 use driver_metal::layout::region::Region as _;
-use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-use model::families::llama_like::forward::llama_like_metal;
-use model_compiler::trace::FireClass;
+use model::catalog::MetalBinding;
+use model_compiler::trace::{FireClass, ForwardPlan};
 
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -161,6 +160,150 @@ fn kernels_dir() -> PathBuf {
 
 fn snapshot() -> Option<PathBuf> {
     std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT").map(PathBuf::from)
+}
+
+/// Two bf16 ulps at `v`, which is what "a tolerance about the FORMAT" means
+/// once the readout is not llama's.
+///
+/// The tolerance here was `0.05` — about two ulps at SIX, which is where
+/// llama-3.2's top logit sits. gemma-4's top logit sits at THIRTY, where one
+/// ulp is `0.125`, so the same absolute number is a fifth of an ulp and
+/// demands of a bf16 readout a precision bf16 does not have. A constant
+/// tolerance is a tolerance calibrated on one checkpoint's magnitudes.
+///
+/// bf16 keeps 8 significand bits, so the gap between neighbours at `v` is
+/// `2^(exponent(v) - 7)`.
+fn bf16_slack(v: f32) -> f32 {
+    if v == 0.0 {
+        return f32::EPSILON;
+    }
+    2.0 * (v.abs().log2().floor() - 7.0).exp2()
+}
+
+/// One hand-taken MLX measurement: which checkpoint, which token, and the
+/// answer MLX gave for it at position zero.
+///
+/// A table rather than a constant, because "the reference" was never one
+/// thing. Every entry is a MEASUREMENT someone took once, and the checkpoint
+/// it was taken on is part of it -- so the honest structure is a row per
+/// checkpoint and a lookup, not a constant plus a skip.
+struct Reference {
+    /// Matched against `PIE_METAL_SMOKE_CHECKPOINT`'s path.
+    model: &'static str,
+    /// The one token the fire posts. A family's own, not a shared constant:
+    /// llama-3.2 begins at 128000 and gemma-4 at 2.
+    bos: u32,
+    /// MLX's top five, in order, with the logits it gave them.
+    top: [(usize, f32); 5],
+    /// The whole distribution's span, because five agreeing logits at the top
+    /// is consistent with a distribution that is wrong everywhere else.
+    span: (f32, f32),
+    /// Three tokens well DOWN the distribution, with MLX's logit for each.
+    ///
+    /// The span was carrying this weight and cannot: "five agreeing logits at
+    /// the top is consistent with a distribution that is wrong everywhere
+    /// else" is exactly right, and the answer to it is a reading from
+    /// somewhere else -- not the two most extreme values, which on a capped
+    /// readout are the two the cap has erased. gemma's floor is ONE token
+    /// (1852, at -27.75; the next is -19.75), and it sits where `tanh`'s
+    /// slope is 0.14.
+    ///
+    /// Ranks 100, 1000 and 10000 out of a 262144-token vocabulary, far from
+    /// the cap, where a bf16 ulp is a bf16 ulp and a disagreement is a
+    /// disagreement.
+    mid: [(usize, f32); 3],
+    /// `final_logit_softcapping`, or zero for a readout that has none.
+    ///
+    /// A LOGIT AT THE CAP IS A LOGIT THE CAP HAS ERASED. `cap * tanh(x/cap)`
+    /// has derivative `1 - (v/cap)^2`, which at gemma's top logit -- `v` of
+    /// 29.875 against a cap of 30 -- is 0.008: a hundred and twenty units of
+    /// pre-cap logit arrive as one unit of post-cap value. Comparing two
+    /// implementations there measures `tanh`'s asymptote and not the fire, so
+    /// the value is not compared and the TOKEN still is.
+    cap: f32,
+}
+
+/// Taken by hand with `mlx_lm.utils.load`, one forward over `[[bos]]`, the
+/// last row of the logits read as f32.
+///
+/// GEMMA'S TOP LOGIT IS EXACTLY 30.0, which is `final_logit_softcapping`.
+/// MLX saturates it too, so the saturation this crate kept re-reading as a
+/// symptom is the model's own design and not a defect -- `tanh` reaches its
+/// asymptote in bf16 long before the cap is loose.
+const REFERENCES: &[Reference] = &[
+    Reference {
+        model: "Llama-3.2-1B-Instruct-4bit",
+        bos: 128_000,
+        top: [
+            (16309, 6.406_25),
+            (2, 5.949_219),
+            (1757, 5.859_375),
+            (791, 5.781_25),
+            (475, 5.601_562),
+        ],
+        span: (-4.613, 6.406),
+        mid: [(111_912, 3.595_703), (34917, 2.455_078), (22631, 1.400_391)],
+        cap: 0.0,
+    },
+    Reference {
+        model: "gemma-4-31b-it-4bit",
+        bos: 2,
+        top: [
+            (236_773, 30.0),
+            (236_798, 29.875),
+            (236_780, 29.875),
+            (236_799, 29.75),
+            (236_814, 29.625),
+        ],
+        span: (-27.75, 30.0),
+        mid: [(10541, 22.5), (18373, 19.25), (223_439, 14.75)],
+        cap: 30.0,
+    },
+];
+
+/// The reference for whichever checkpoint the runner has, or `None` with a
+/// SKIP naming what is missing.
+fn reference_for(snapshot: &Path) -> Option<&'static Reference> {
+    let path = snapshot.to_string_lossy();
+    let found = REFERENCES.iter().find(|r| path.contains(r.model));
+    if found.is_none() {
+        eprintln!(
+            "SKIP: no MLX reference has been measured for `{}`. Taking one is \
+             a `mlx_lm` load, one forward over `[[bos]]`, and a row in \
+             `REFERENCES`.",
+            snapshot.display()
+        );
+    }
+    found
+}
+
+/// Whether a hardcoded reference was measured on THIS checkpoint.
+///
+/// A reference is a MEASUREMENT: someone ran MLX once, by hand, over one
+/// snapshot, and copied the numbers in. `PIE_METAL_SMOKE_CHECKPOINT` names
+/// whichever checkpoint the runner happens to have, and the two are unrelated
+/// -- so a test that states llama-3.2-1B's top five and runs against
+/// gemma-4-31b asserts "MLX says token 16309" about a number MLX was never
+/// asked for. It fails, which is worse than not running: it names a defect in
+/// the driver for a difference that is entirely in the rig, and it does so in
+/// the same report as the failures that ARE real.
+///
+/// So the reference states its checkpoint and the fire is skipped otherwise.
+/// SKIPPED and not passed: nothing was checked, and a suite that says
+/// "12 passed" about a checkpoint it never compared is the same lie in the
+/// other direction. Taking the reference for a second checkpoint is a
+/// half-hour of `mlx_lm` and a second table beside the first.
+fn reference_taken_on(snapshot: &Path, model: &str) -> bool {
+    let taken = snapshot.to_string_lossy().contains(model);
+    if !taken {
+        eprintln!(
+            "SKIP: the reference in this test was measured on `{model}` and \
+             PIE_METAL_SMOKE_CHECKPOINT is `{}`. Comparing a different \
+             checkpoint against it would report the rig as a driver defect.",
+            snapshot.display()
+        );
+    }
+    taken
 }
 
 /// WHICH MODEL a snapshot is, at what affine point, and in what shape.
@@ -195,6 +338,36 @@ fn served(
         .unwrap_or_else(|e| panic!("{} did not read as a checkpoint: {e:?}", snapshot.display()));
     let row = model::catalog::identify(&meta, &model::catalog::Override::None)
         .unwrap_or_else(|e| panic!("{}: {e}", snapshot.display()));
+    // The DRIVER'S OWN pre-staging gate, asked here for the same reason
+    // `serve/load.rs` asks it before staging: everything below this line
+    // reads seventeen gigabytes off the disk and onto a device.
+    //
+    // A panic and not a SKIP, which is the opposite of `reference_taken_on`
+    // just above, and the difference is whose fault it is. A missing MLX
+    // reference is a gap in the rig — nobody measured that checkpoint — and
+    // skipping states that honestly. A row this build states no Metal text
+    // for is a MISCONFIGURED RUNNER: `load_model` would refuse the same
+    // snapshot at the same question, so there is no version of this suite
+    // that checks anything on it, and quietly printing SKIP twelve times
+    // would read as "the device tests ran".
+    //
+    // `REFERENCES` still carries `gemma-4-31b-it-4bit`, and it is now exactly
+    // such a snapshot: gemma-4's row refuses Metal in its own words, because
+    // its text is `gemma4_cuda` and this build has no shared-cache attention.
+    // The measurement stays — it cost half an hour of `mlx_lm` and it is
+    // correct — but pointing the runner at it now says so in one sentence
+    // instead of failing on a logit comparison against a text that was never
+    // gemma-4's.
+    driver_metal::model::binding::serves(row).unwrap_or_else(|e| {
+        panic!(
+            "`{}` is `{}`, and this build states no Metal text for it: {e}. \
+             `load_model` refuses this snapshot before staging, so nothing \
+             below could run against it — point PIE_METAL_SMOKE_CHECKPOINT at \
+             a checkpoint this build serves.",
+            snapshot.display(),
+            row.id()
+        )
+    });
     let config = match model_loader::checkpoint::read::read_meta(
         &meta,
         model::encoding::CONFIG_OBJECT,
@@ -218,6 +391,64 @@ fn served(
     )
     .unwrap_or_else(|e| panic!("`{}` projects no decodable geometry: {}", row.id(), e.0));
     (row, encoding, dg)
+}
+
+/// Every arena region the lowering states, each byte in exactly one of them.
+///
+/// # Why this is not `lowered.args` filtered
+///
+/// Two things about `Arg::Arena` make the stated tuple the wrong span to read.
+///
+/// **`width * bytes` is one ROW.** A decode's value is `rows` of them, so a
+/// reader that takes the stated width looks at the FIRST TOKEN's slice and
+/// calls it the region. It then cannot tell "nothing wrote this" from "the
+/// write landed at the wrong offset inside it" -- and on gemma-4-31b it
+/// cannot see the failure at all, because the embedding gather's output is
+/// three rows of zero and one row of NaN and the NaN is not the first row.
+///
+/// **An arena REUSES offsets.** That is what an arena is for: the same `at`
+/// carries a different tensor at different points in the schedule, so one
+/// start appears several times with different widths, and a stated span can
+/// run past where the next region begins. A reader that walks the list in
+/// order reads those bytes once per descriptor. The arithmetic says so
+/// plainly -- gemma-4-31b's arena holds 2,496,512 bf16 values and the census
+/// reported 2,673,664 of them.
+///
+/// So: distinct starts, each given the bytes up to the next one. Where
+/// descriptors at one start disagree about element width the widest wins,
+/// because reading an f32 as bf16 hands back the low sixteen bits of every
+/// value and those bit patterns are NaN about as often as not.
+///
+/// `skip` names starts to leave out AFTER the boundaries are computed, which
+/// is how the NaN detector drops integer values without moving the edges of
+/// the float regions beside them.
+fn arena_regions(
+    lowered: &model_compiler::lower::Lowered,
+    arena_len: usize,
+    skip: &[usize],
+) -> Vec<(usize, usize, usize)> {
+    let mut by_start: BTreeMap<usize, usize> = BTreeMap::new();
+    for a in &lowered.args {
+        if let model_compiler::lower::Arg::Arena { at, bytes, .. } = a {
+            let e = by_start.entry(*at).or_insert(*bytes as usize);
+            *e = (*e).max(*bytes as usize);
+        }
+    }
+    let starts: Vec<usize> = by_start.keys().copied().collect();
+    let mut out = Vec::with_capacity(starts.len());
+    for (i, at) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(arena_len).min(arena_len);
+        if *at >= end || skip.contains(at) {
+            continue;
+        }
+        out.push((*at, end - at, by_start[at]));
+    }
+    out
+}
+
+/// How many values a region of `len` bytes holds at `element` bytes each.
+fn len_in_elements(len: usize, element: usize) -> usize {
+    if element == 0 { 0 } else { len / element }
 }
 
 /// What a run of the whole arena found.
@@ -267,6 +498,103 @@ fn census(bytes: &[u8], element: usize) -> Census {
     c
 }
 
+/// The pool this checkpoint's own geometry states, with `pages` per layer.
+///
+/// **Read off `DecodeGeometry`, exactly as `serve::load` reads it.** Every one
+/// of the ten fires in this file used to build its own `Shape` with
+/// `global_head_dim: 0, global_kv_heads: 0, full_attn_every: 0` -- which is
+/// "one attention shape for the whole stack", true of every family here but
+/// gemma-4. gemma-4 states a SECOND shape for its full-attention layers (head
+/// dim 512 against the sliding layers' 256, a quarter the KV heads) and one
+/// layer in six is full, so a pool laid out at 256 hands `sdpa_..._d_512` a
+/// layer half as wide as it reads. Layers 5 and 11 survive it; layer 17 is far
+/// enough in that the over-read leaves the allocation, and the fire's first
+/// NaN was at statement 358 of layer 17 -- in the rig, not in the driver.
+///
+/// A gate that builds its own geometry does not test the driver's. This asks
+/// the same source, so a deployment whose shape this file has never seen is
+/// laid out right without a line being added here.
+fn pool_shape(dg: &driver_metal::batch::DecodeGeometry, pages: u32) -> Shape {
+    Shape {
+        layers: dg.n_layers,
+        kv_heads: dg.n_kv_heads,
+        head_dim: dg.head_dim,
+        page_size: 16,
+        pages,
+        element_bytes: 2,
+        global_head_dim: dg.global_head_dim,
+        global_kv_heads: dg.global_kv_heads,
+        full_attn_every: dg.full_attn_every,
+    }
+}
+
+/// What THIS load observed, exactly as `serve/load.rs` observes it.
+///
+/// Eleven gates below used to call `model::text::facts_from(&dg, |t| …)` and
+/// get back twenty-nine model facts rebuilt from nine tensor probes. The
+/// probes are gone: a checkpoint states its identity ONCE, when
+/// `catalog::identify` reads its tensors in [`served`], and everything the
+/// text needs after that is the row's to state.
+///
+/// What is left is genuinely the load's: the affine point the bytes are
+/// packed at, and whether the expert bank arrived still in MXFP4. A gate that
+/// re-derived either of those would be testing its own arithmetic — this asks
+/// the driver's own [`observed`](driver_metal::model::binding::observed), so a
+/// binding that changes shape breaks here the same way it breaks in `serve`.
+fn observed(
+    dg: &driver_metal::batch::DecodeGeometry,
+    loaded: &driver_metal::weights::load::Loaded,
+) -> MetalBinding {
+    driver_metal::model::binding::observed(dg.quant, |t| loaded.mxfp4.contains(t))
+}
+
+/// The row's own Metal text, through the one door the driver uses.
+///
+/// This was `llama_like_metal(&facts, &metal, class)` — a family's forward
+/// function called directly, with facts this file had assembled. Two things
+/// were wrong with it and both were load-bearing. It named a FAMILY, so a
+/// checkpoint of any other family got llama's text and the gate below then
+/// compared a real GPU's numbers against the wrong program. And it went
+/// around `Variant::trace`, so the text under test was never the text
+/// `serve/launch.rs` runs — which is the only text worth pointing a real
+/// device at.
+///
+/// A refusal PANICS here for the same reason [`served`] panics: these gates
+/// are the only place this workspace compares Metal's arithmetic against a
+/// reference, and a silent skip is how that comparison stops happening.
+fn text(
+    row: &'static dyn model::catalog::Variant,
+    class: FireClass,
+    binding: &MetalBinding,
+) -> ForwardPlan {
+    driver_metal::model::binding::text(row, class, binding).unwrap_or_else(|e| {
+        panic!(
+            "`{}` states no metal {class:?} text: {e}. `served` gates on the \
+             decode text, so reaching this means the row answers one fire \
+             class and not the other",
+            row.id()
+        )
+    })
+}
+
+/// The dispatch geometry every fire below runs under.
+///
+/// Eleven copies of this literal used to read `facts.q_heads`, `facts.head_dim`
+/// and four more off the rebuilt facts. They read the DEPLOYMENT's projection
+/// now, which is where those numbers were always from — `facts_from` copied
+/// them out of the same `DecodeGeometry` this takes — so nothing about the
+/// dispatch moved, only the number of documents it is read from.
+fn dispatch_geometry(dg: &driver_metal::batch::DecodeGeometry) -> Geometry {
+    Geometry {
+        q_heads: dg.n_q_heads,
+        kv_heads: dg.n_kv_heads,
+        head_dim: dg.head_dim,
+        rotary_dims: dg.head_dim,
+        n_experts: dg.n_experts,
+        experts_per_token: dg.experts_per_token,
+    }
+}
+
 /// The checkpoint's weights, the fire's tables, and the pool's geometry.
 struct Live<'a> {
     store: Store<'a>,
@@ -301,7 +629,7 @@ impl Resolver for Live<'_> {
 /// How many dispatches the fire plans, and how many have an empty grid.
 fn plan_count(
     lowered: &model_compiler::lower::Lowered,
-    facts: &model::families::llama_like::forward::facts::LlamaLikeFacts,
+    dg: &driver_metal::batch::DecodeGeometry,
     live: &mut Live<'_>,
 ) -> String {
     let dispatches = driver_metal::lowering::dispatch::plan(
@@ -313,14 +641,7 @@ fn plan_count(
                 bytes: 1 << 30,
             },
         },
-        Geometry {
-            q_heads: facts.q_heads,
-            kv_heads: facts.kv_heads,
-            head_dim: facts.head_dim,
-            rotary_dims: facts.head_dim,
-            n_experts: facts.n_experts,
-            experts_per_token: facts.experts_per_token,
-        },
+        dispatch_geometry(dg),
         live,
     )
     .expect("the fire plans");
@@ -346,9 +667,46 @@ fn stage_tables(
     freqs: &[f32],
 ) -> driver_metal::bind::tables::Staged {
     let n = step.token_ids.len() as u32;
-    let positions: Vec<u32> = (0..n).collect();
-    let each: Vec<u32> = (0..n).collect();
-    let indptr: Vec<u32> = (0..=n).collect();
+    // FROM `qo_indptr`, because that is where the step says which rows belong
+    // to which request -- and the three tables that answer "whose row is
+    // this?" used to answer it without reading it.
+    //
+    // `req_of_token` was `0..n`: every token its own request, whatever the
+    // step said. `position_ids` was `0..n`: fire-global, so a second request's
+    // first token was rotated as though it were the fifth token of the first.
+    // `kv_page_indptr` was `0..=n`: one page per TOKEN rather than per
+    // request, so no request had a second page to attend to.
+    //
+    // Together they made every batched fire look like a batch of one-token
+    // requests, which is a legitimate step and the one step that cannot
+    // disagree with anything. `a_request_prefills_the_same_way_beside_another_one`
+    // is the gate that exists to catch a request leaking into another's rows,
+    // and against these tables it was comparing two fires that both said
+    // there was nothing to leak between.
+    let requests = step.qo_indptr.len().saturating_sub(1);
+    let mut req_of_token: Vec<u32> = Vec::with_capacity(n as usize);
+    let mut positions: Vec<u32> = Vec::with_capacity(n as usize);
+    for r in 0..requests {
+        let (from, to) = (step.qo_indptr[r], step.qo_indptr[r + 1]);
+        for row in from..to {
+            req_of_token.push(r as u32);
+            positions.push(row - from);
+        }
+    }
+    if req_of_token.len() != n as usize {
+        // A step whose CSR does not cover its rows -- the legacy single-request
+        // spelling. One request, counted from zero.
+        req_of_token = vec![0; n as usize];
+        positions = (0..n).collect();
+    }
+    // ONE PAGE PER REQUEST, in request order, wide enough for the rows it
+    // holds. `page_size` is the pool's, and every step here is far inside it.
+    let pages_per_request = 1u32;
+    let each: Vec<u32> = (0..(requests as u32 * pages_per_request).max(n)).collect();
+    let indptr: Vec<u32> = (0..=requests as u32)
+        .map(|r| r * pages_per_request)
+        .collect();
+    let kv_write_page: Vec<u32> = req_of_token.clone();
     let w_off: Vec<u32> = positions.iter().map(|p| p % page_size.max(1)).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
     driver_metal::bind::tables::stage(
@@ -356,10 +714,10 @@ fn stage_tables(
         driver_metal::bind::tables::Frame {
             token_ids: step.token_ids,
             position_ids: &positions,
-            req_of_token: &each,
+            req_of_token: &req_of_token,
             kv_page_indices: &each,
             kv_page_indptr: &indptr,
-            kv_write_page: &each,
+            kv_write_page: &kv_write_page,
             kv_write_offset: &w_off,
             rope_frequencies: &inv_freq,
             sampling_indices: step.sampling_indices,
@@ -384,8 +742,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     // Four lanes, one token each: the decode a scheduler posts.
     let step = Step {
@@ -394,20 +751,10 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         sampling_indices: &[0, 1, 2, 3],
         ..Step::default()
     };
-    let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
+    let plan = text(row, FireClass::Decode, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 64,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 64);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
@@ -421,8 +768,8 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     };
 
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -440,14 +787,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         pages: &pages,
     };
 
-    let geometry = Geometry {
-        q_heads: facts.q_heads,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        rotary_dims: facts.head_dim,
-        n_experts: facts.n_experts,
-        experts_per_token: facts.experts_per_token,
-    };
+    let geometry = dispatch_geometry(&dg);
     let (timing, arena) = driver_metal::fire::run::run_keeping_arena(
         &context,
         &compiler,
@@ -533,51 +873,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // Regions rather than the whole buffer: an arena is mixed-dtype and one
     // census over all of it is meaningful only for the dtype that happens to
     // dominate.
-    let mut regions: Vec<(usize, usize, usize)> = lowered
-        .args
-        .iter()
-        .filter_map(|a| match a {
-            model_compiler::lower::Arg::Arena { at, width, bytes } => {
-                Some((*at, *width as usize * *bytes as usize, *bytes as usize))
-            }
-            _ => None,
-        })
-        .collect();
-    regions.sort_unstable();
-    regions.dedup();
-    // Widen each region to where the NEXT one starts. `width * bytes` is one
-    // ROW and a decode's value is `rows` of them, so censusing the stated
-    // width looks at the first token's slice and calls it the region -- which
-    // cannot tell "nothing wrote this" from "the write landed at the wrong
-    // offset inside it".
-    //
-    // An arena REUSES offsets: the same `at` carries different tensors at
-    // different points in the schedule, so the same start appears several
-    // times with different widths, and a stated `width * bytes` can run past
-    // where the next region begins. Counting those descriptors one after
-    // another censuses the same bytes once per descriptor. That is not a
-    // presentation detail -- gemma-4-31b's arena holds 2,496,512 bf16 values
-    // and the run counted 2,673,664 of them, which is how this was found.
-    //
-    // So the census walks DISTINCT starts and gives each the bytes up to the
-    // next one. Each byte is then read exactly once. Where descriptors at one
-    // start disagree about the element width, the widest wins: reading f32 as
-    // bf16 reports the low sixteen bits of every value as a number, and those
-    // bit patterns are NaN about as often as not.
-    let mut by_start: BTreeMap<usize, usize> = BTreeMap::new();
-    for (at, _, bytes) in &regions {
-        let e = by_start.entry(*at).or_insert(*bytes);
-        *e = (*e).max(*bytes);
-    }
-    let starts: Vec<usize> = by_start.keys().copied().collect();
-    let mut regions: Vec<(usize, usize, usize)> = Vec::with_capacity(starts.len());
-    for (i, at) in starts.iter().enumerate() {
-        let end = starts.get(i + 1).copied().unwrap_or(read.len()).min(read.len());
-        if *at >= end {
-            continue;
-        }
-        regions.push((*at, end - at, by_start[at]));
-    }
+    let regions = arena_regions(&lowered, read.len(), &[]);
 
     // Which statement each arena offset belongs to, and whether it is that
     // statement's OUTPUT. A region nothing wrote is diagnosable only if the
@@ -590,6 +886,8 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         // says how many of the widthed operands are results — the same split
         // `dispatch::reorder` makes. A region that is only ever an INPUT is
         // one nothing was ever supposed to write.
+        // See the rectangle census below: a row that states no `Out` has no
+        // arena output, and only a MISSING row is unknown.
         let results = kernels::sig_in(kernels_metal::KERNELS, symbol)
             .map(|sig| {
                 sig.operands
@@ -599,7 +897,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
                         _ => None,
                     })
                     .max()
-                    .unwrap_or(1)
+                    .unwrap_or(0)
             })
             .unwrap_or(1);
         let widthed: Vec<&model_compiler::lower::Arg> = args
@@ -626,7 +924,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     eprintln!(
         "{} launch(es) -> {} dispatch(es)",
         lowered.launches.len(),
-        plan_count(&lowered, &facts, &mut live)
+        plan_count(&lowered, &dg, &mut live)
     );
 
     let mut c = Census::default();
@@ -642,23 +940,32 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         c.zero += r.zero;
         c.nan += r.nan;
         c.inf += r.inf;
-        if r.finite_nonzero == 0 && writers.contains_key(at) {
-            unwritten.push(format!(
-                "  @{at} ({} elements x{element}): {}",
-                len / element,
-                writers[at]
-            ));
-        }
         widest_by_element.push((*element, r.max_abs));
         c.max_abs = c.max_abs.max(r.max_abs);
+        // "Nothing wrote this" and "this was written with NaN" are opposite
+        // findings and `finite_nonzero == 0` is true of BOTH -- a region of
+        // nothing but NaN has no finite non-zero value in it. The arena is
+        // memset to zero on the host before a dispatch is encoded
+        // (`fire::run`), so a NaN in it is a WRITE, and labelling one as an
+        // absent write points diagnosis at binding when the answer is
+        // arithmetic. Read the zeros, not the finite values.
+        let untouched = r.zero == len_in_elements(*len, *element);
         eprintln!(
-            "  @{at:>8} {len:>8} B x{element}: {:>7} nz, {:>7} zero, max |v| = {}{}",
+            "  @{at:>8} {len:>8} B x{element}: {:>7} nz, {:>7} zero, {:>7} NaN, max |v| = {}{}",
             r.finite_nonzero,
             r.zero,
+            r.nan,
             r.max_abs,
-            if r.finite_nonzero == 0 {
+            if untouched {
                 format!(
                     "   <- NOTHING WROTE THIS ({})",
+                    writers
+                        .get(at)
+                        .map_or("NO LAUNCH WRITES IT — read-only", String::as_str)
+                )
+            } else if r.finite_nonzero == 0 && r.nan > 0 {
+                format!(
+                    "   <- WRITTEN, ALL NaN ({})",
                     writers
                         .get(at)
                         .map_or("NO LAUNCH WRITES IT — read-only", String::as_str)
@@ -702,17 +1009,26 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
          zero epsilon does to a near-zero row.",
         c.inf
     );
-    // Measured 648205 non-zero to 8179 zero: 99% of the arena holds a value.
-    // It was 171268 to 485116 while the gather was the single-row one, which
-    // is the same defect the lane count below names.
-    assert!(
-        c.finite_nonzero > c.zero * 10,
-        "the arena is {} zero to {} non-zero. A projection told its extents \
-         are zero no-ops and leaves exactly this, so a near-empty arena is a \
-         fire that ran and did not compute.",
-        c.zero,
-        c.finite_nonzero
-    );
+    // A ZERO IS CAPACITY, NOT SILENCE, so the arena-wide ratio is gone.
+    //
+    // This asserted `finite_nonzero > zero * 10`, calibrated on llama-1B:
+    // 648205 non-zero to 8179 zero, 99% of the arena holding a value. It read
+    // as "a near-empty arena is a fire that ran and did not compute", and it
+    // did catch the single-row gather.
+    //
+    // But an arena region is sized for the WIDEST fire the plan admits, and
+    // this one is a decode of a single row. gemma-4-31b measures 617740
+    // non-zero to 1878772 zero, and the two vocabulary regions alone
+    // contribute 1572864 of those zeros -- each is 1048576 elements holding
+    // one 262144-wide row. Every one of those zeros is a row this fire does
+    // not have. llama passed only because its arena happens to be sized close
+    // to its decode; the ratio was measuring the plan's shape and reading it
+    // as the fire's health.
+    //
+    // The question the ratio was reaching for is asked exactly below, and
+    // asked better: EVERY REGION A LAUNCH DECLARES AS ITS OUTPUT MUST HOLD A
+    // VALUE. That is per-region, so a region's capacity cannot drown a
+    // region's silence, and it names the launch that owed the write.
 
     // MAGNITUDES, and the bounds are loose on purpose: what is being caught is
     // saturation, not inaccuracy. A llama-1B decode measures its widest
@@ -768,6 +1084,117 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // attribution said which statements, and a prefix bisection
     // (`the_second_lane_stops_somewhere_and_this_says_where`) put the stop at
     // statement 0 -- three steps, each narrowing, none of them a guess.
+    // ── the declared outputs, censused as RECTANGLES ──
+    //
+    // Not as the regions above: `arena_regions` cuts the arena at every
+    // offset any argument names, so a statement's output rectangle is cut
+    // wherever another statement addresses part of it, and neither half is a
+    // thing the plan declared. gemma's @65536 came out as a 10240 element
+    // region holding nothing followed by an 11264 element region holding
+    // everything, and the rectangle both belong to is one 21504 element
+    // output that was written.
+    //
+    // Offsets are REUSED -- an arena slot takes a new tenant once its value
+    // is dead -- so the question a single read at the end of the fire can
+    // answer is not "was this ever written" but *"did the LAST statement to
+    // declare these bytes as its output leave them zero?"*. That one is
+    // answerable and is the one that means something: whatever wrote earlier
+    // has been overwritten by design, and the final tenant is the value the
+    // fire actually carries out.
+    // Ownership is per BYTE, not per offset. Output rectangles overlap --
+    // gemma's @174080 spans 65536 bytes and swallows both @184320 and
+    // @217088 -- because the arena hands a slot to a new tenant the moment
+    // the old value dies. So "the last statement to declare this offset"
+    // still is not the last statement to WRITE these bytes. Paint ownership
+    // in launch order, later wins, and ask each launch only about the bytes
+    // it still owns when the fire retires.
+    let mut owner: Vec<u32> = vec![u32::MAX; read.len()];
+    let mut rects: Vec<(usize, usize, String)> = Vec::new();
+    for (n, launch) in lowered.launches.iter().enumerate() {
+        let symbol = &lowered.kernels[launch.kernel as usize];
+        let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
+        // NO `Out` OPERAND MEANS NO ARENA OUTPUT, which is not the same as
+        // an unknown row. `kv_append_paged` writes the KV POOL -- its
+        // results are `Source::KvKeys` and `Source::KvValues` -- and states
+        // no `Out(i)` at all. `.max()` over an empty iterator is `None`, and
+        // falling that through to the same `unwrap_or(1)` that covers a
+        // MISSING row made the kernel's last input look like its output.
+        let results = kernels::sig_in(kernels_metal::KERNELS, symbol).map_or(1, |sig| {
+            sig.operands
+                .iter()
+                .filter_map(|o| match o.source {
+                    kernels::Source::Out(i) => Some(usize::from(i) + 1),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+        });
+        let widthed: Vec<&model_compiler::lower::Arg> = args
+            .iter()
+            .filter(|a| !matches!(a, model_compiler::lower::Arg::Weight(_)))
+            .collect();
+        let split = widthed.len().saturating_sub(results);
+        let rows = (launch.rows.end - launch.rows.start).max(1) as usize;
+        for arg in widthed.iter().skip(split) {
+            if let model_compiler::lower::Arg::Arena { at, width, bytes } = arg {
+                let end = (at + *width as usize * rows * *bytes as usize).min(read.len());
+                if *at >= end {
+                    continue;
+                }
+                let id = rects.len() as u32;
+                rects.push((
+                    *bytes as usize,
+                    *at,
+                    format!("[{n}] {symbol} @{at} w{width} x{rows} rows"),
+                ));
+                owner[*at..end].fill(id);
+            }
+        }
+    }
+    let mut owned: Vec<Vec<u8>> = vec![Vec::new(); rects.len()];
+    let mut span: Vec<(usize, usize)> = vec![(usize::MAX, 0); rects.len()];
+    for (i, byte) in read.iter().enumerate() {
+        if owner[i] != u32::MAX {
+            let id = owner[i] as usize;
+            owned[id].push(*byte);
+            span[id].0 = span[id].0.min(i);
+            span[id].1 = i + 1;
+        }
+    }
+    for (id, (element, at, who)) in rects.iter().enumerate() {
+        let mine = &owned[id];
+        if mine.len() < *element {
+            continue;
+        }
+        let r = census(mine, *element);
+        if r.zero == len_in_elements(mine.len(), *element) {
+            unwritten.push(format!(
+                "  {who}: all {} of its surviving elements are zero, \
+                 at element {}..{} of its own rectangle",
+                mine.len() / element,
+                (span[id].0 - at) / element,
+                (span[id].1 - at) / element
+            ));
+        }
+    }
+
+    // A REGION IS NOT A RECTANGLE, and this list has to be read knowing it.
+    //
+    // `arena_regions` cuts the arena at every offset any argument names, so a
+    // statement's output rectangle is cut wherever another statement happens
+    // to address part of it. gemma-4-31b's @65536 is such a cut: every launch
+    // that names the offset states `w5376` over `rows 0..4` -- one 21504
+    // element rectangle -- and the census reports it as a 10240 element
+    // region holding nothing followed by an 11264 element region holding
+    // everything. The rectangle is partly written; neither half is a thing
+    // the plan ever declared.
+    //
+    // So an entry here is one of two findings and does not yet say which:
+    // a statement that wrote nothing, or the unwritten part of a statement
+    // that wrote something. The `touched by` line is what tells them apart --
+    // it prints the width and row span every launch states for the offset,
+    // and a region whose length is not `width * rows * element` is a cut
+    // rather than a rectangle.
     eprintln!("{} declared output(s) nothing filled", unwritten.len());
     assert!(
         unwritten.is_empty(),
@@ -872,16 +1299,22 @@ fn bisect(class: FireClass) {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, _metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
-    let (_, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
+
+    // The CHECKPOINT'S OWN token, when a reference names one. Posting
+    // llama-3.2's 128000 to gemma-4 is posting a token gemma does not have
+    // -- it is inside gemma's 262144 vocabulary, so nothing rejects it, and
+    // the trail is then a trail of a fire nobody would run. Every value in it
+    // is unanswerable against a reference taken on a real token.
+    let bos = reference_for(&snapshot).map_or(128_000, |r| r.bos);
+    let four = [bos, bos + 1, bos + 2, bos + 3];
+    let two = [bos, bos + 1];
 
     // A decode posts four independent lanes; a prefill posts one sequence.
     let decode = class == FireClass::Decode;
     let step = if decode {
         Step {
-            token_ids: &[128_000, 9906, 1917, 128_001],
+            token_ids: &four,
             qo_indptr: &[0, 1, 2, 3, 4],
             sampling_indices: &[0, 1, 2, 3],
             ..Step::default()
@@ -890,26 +1323,16 @@ fn bisect(class: FireClass) {
         // TWO rows, which the GEMM's tile does not divide -- the guard's
         // GEMV arm is what serves them.
         Step {
-            token_ids: &[128_000, 9906],
+            token_ids: &two,
             qo_indptr: &[0, 2],
             sampling_indices: &[0],
             ..Step::default()
         }
     };
-    let plan = llama_like_metal(&facts, &metal, class);
+    let plan = text(row, class, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 64,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 64);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
@@ -922,8 +1345,8 @@ fn bisect(class: FireClass) {
         })
     };
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -944,14 +1367,7 @@ fn bisect(class: FireClass) {
         shape,
         pages: &pages,
     };
-    let geometry = Geometry {
-        q_heads: facts.q_heads,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        rotary_dims: facts.head_dim,
-        n_experts: facts.n_experts,
-        experts_per_token: facts.experts_per_token,
-    };
+    let geometry = dispatch_geometry(&dg);
 
     // Every launch's OUTPUT rectangle, so a prefix can be judged by what its
     // last statement was supposed to write rather than by the whole arena.
@@ -975,10 +1391,38 @@ fn bisect(class: FireClass) {
         })
         .collect();
 
-    // The prefixes worth running: the first twelve statements are one layer's
-    // worth, which is where a per-row defect either appears or does not.
+    // The prefixes worth running: ONE LAYER's worth, read off the plan.
+    //
+    // This was `1..=12`, with a comment calling twelve "one layer's worth".
+    // Twelve is llama's layer. gemma-4's is twenty-one, and its MLP -- the
+    // half of a block a per-row defect is as likely to sit in as the
+    // attention -- begins at statement fifteen, so the dump stopped three
+    // statements before the arithmetic that actually broke on the 31b and
+    // reported the attention as though that were the whole block.
+    //
+    // A layer boundary is stated: every launch carries the layers it runs
+    // over, so the first statement belonging to layer 1 ends layer 0. No
+    // family constant, and a family whose block is longer still gets its
+    // whole block.
+    //
+    // HOW MANY blocks, because a stack's layers are not all the same block.
+    // gemma-4 alternates: five sliding layers then a full-attention one, and
+    // the full one is a different SHAPE -- twice the head width, a quarter of
+    // the KV heads, and V taken from the K projection rather than projected.
+    // Layer 0 is sliding, so a walk that stops at one layer has never run the
+    // other kind at all, and every defect that lives there reads as
+    // accumulation. Default one, because one is what a first look wants.
+    let layers: u16 = std::env::var("PIE_METAL_BISECT_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let one_layer = lowered
+        .launches
+        .iter()
+        .position(|l| l.layers.start >= layers)
+        .unwrap_or(lowered.launches.len());
     let mut first_bad: Option<(usize, String)> = None;
-    for n in 1..=12.min(lowered.launches.len()) {
+    for n in 1..=one_layer.min(lowered.launches.len()) {
         let arena = Allocation::new(
             &context,
             (lowered.arena_bytes as u64).max(1),
@@ -1044,21 +1488,38 @@ fn bisect(class: FireClass) {
         //
         //   embed 0.361, attn_norm 2.207, q_proj 1.320, v 0.413,
         //   o_proj 0.114, after attn 0.312, L0 out 20.03, L1 out 408.75
-        let widest = {
+        //
+        // WHERE in the row, not just how large. A magnitude alone cannot tell
+        // a tail from a whole row: a kernel whose grid drops its last partial
+        // group and one whose arithmetic is wrong everywhere report the same
+        // number, and the element index separates them in one line.
+        let (widest, widest_at) = {
             let (a, b) = (*at, (at + row).min(read.len()));
             read[a..b]
                 .chunks_exact(*element)
-                .map(|c| {
-                    if *element == 4 {
+                .enumerate()
+                .map(|(i, c)| {
+                    let v = if *element == 4 {
                         f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs()
                     } else {
                         f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16).abs()
-                    }
+                    };
+                    (v, i)
                 })
-                .fold(0.0f32, f32::max)
+                .fold((0.0f32, 0usize), |acc, x| if x.0 > acc.0 { x } else { acc })
         };
+        // WHICH SIX, because a row is not six elements long. A kernel that
+        // writes the front of every row and nothing else -- a grid short of
+        // its width, a threadgroup short of its simdgroups -- prints a
+        // perfect front and a correct maximum if the maximum happens to sit
+        // there, and gemma-4's does. `PIE_METAL_BISECT_AT` moves the window.
+        let window_at: usize = std::env::var("PIE_METAL_BISECT_AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let head: Vec<String> = read[*at..(at + row).min(read.len())]
             .chunks_exact(*element)
+            .skip(window_at)
             .take(6)
             .map(|c| {
                 let v = if *element == 4 {
@@ -1070,8 +1531,11 @@ fn bisect(class: FireClass) {
             })
             .collect();
         eprintln!(
-            "  [{:>2}] {symbol:<44} @{at} row0 {} row1 {} max|v| {widest:.5} [{}]",
+            "  [{:>2}] L{:<2} {symbol:<44} @{at} w{width} g{:?}/{:?} row0 {} row1 {} max|v| {widest:.5}@{widest_at} [{}]",
             n - 1,
+            lowered.launches[n - 1].layers.start,
+            prefix[n - 1].grid,
+            prefix[n - 1].threadgroup,
             if r0 { "yes" } else { "NO " },
             if r1 { "yes" } else { "NO " },
             head.join(", "),
@@ -1149,6 +1613,16 @@ fn bisect(class: FireClass) {
 /// Prints and passes. A checkpoint with no NaN says so and this is a no-op;
 /// making it an assertion would fail every green run for the one model that
 /// is not.
+///
+/// # The step is the GATE's step, and that is load-bearing
+///
+/// This fired ONE token while
+/// `a_real_checkpoints_weights_produce_finite_varied_activations` -- the gate
+/// whose failure it exists to locate -- fires FOUR. On gemma-4-31b that was
+/// the difference between "the whole fire is NaN-free" and 766,208 NaNs, and
+/// this test reported the first, in a run whose only purpose was to explain
+/// the second. A locator that fires a different program than the gate cannot
+/// locate the gate's failure; it can only be confidently silent.
 #[test]
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
@@ -1165,41 +1639,23 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     let step = Step {
-        token_ids: &[128_000],
-        qo_indptr: &[0, 1],
-        sampling_indices: &[0],
+        token_ids: &[128_000, 9906, 1917, 128_001],
+        qo_indptr: &[0, 1, 2, 3, 4],
+        sampling_indices: &[0, 1, 2, 3],
         ..Step::default()
     };
-    let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
+    let plan = text(row, FireClass::Decode, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
-    let geometry = Geometry {
-        q_heads: facts.q_heads,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        rotary_dims: facts.head_dim,
-        n_experts: facts.n_experts,
-        experts_per_token: facts.experts_per_token,
-    };
+    let geometry = dispatch_geometry(&dg);
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 64,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 64);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -1220,19 +1676,15 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
         .filter(|(_, v)| matches!(v.dtype, model_compiler::trace::DType::I32))
         .filter_map(|(id, _)| lowered.value_offset.get(id).copied())
         .collect();
-    let mut float_spans: Vec<(usize, usize, usize)> = lowered
-        .args
-        .iter()
-        .filter_map(|a| match a {
-            model_compiler::lower::Arg::Arena { at, width, bytes } => {
-                Some((*at, *width as usize * *bytes as usize, *bytes as usize))
-            }
-            _ => None,
-        })
-        .filter(|(at, _, _)| !int_offsets.contains(at))
-        .collect();
-    float_spans.sort_unstable();
-    float_spans.dedup();
+    // The SAME reader the census uses. This used to take the stated
+    // `width * bytes`, which is one row -- so the detector looked at the
+    // first token's slice of each value and reported "no statement writes a
+    // NaN" for a fire whose very first statement, the embedding gather,
+    // writes three rows of zero and one row of NaN. The census said 1,028,352
+    // NaN and this said none, in the same file, about the same arena. One of
+    // the two readings had to be wrong and it was this one.
+    let skip: Vec<usize> = int_offsets.iter().copied().collect();
+    let float_spans = arena_regions(&lowered, lowered.arena_bytes as usize, &skip);
     eprintln!(
         "{} float span(s), {} integer value(s) excluded",
         float_spans.len(),
@@ -1240,7 +1692,7 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
     );
 
     // Run the first `n` statements and say whether the arena holds a NaN.
-    let mut nan_after = |n: usize| -> bool {
+    let mut probe = |n: usize| -> (Option<(usize, usize, usize)>, f32) {
         let arena = Allocation::new(
             &context,
             (lowered.arena_bytes as u64).max(1),
@@ -1313,27 +1765,97 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
         // exactly that. So a detector that reads the whole arena as floats
         // reports the sort as the first NaN of every mixture, every time, and
         // says nothing.
-        float_spans.iter().any(|&(at, len, element)| {
-            raw[at..(at + len).min(raw.len())]
+        //
+        // The widest finite magnitude comes back with the answer, because the
+        // two ways to arrive at a NaN look identical in a yes/no and want
+        // opposite investigations: a value that GREW until bf16 could not
+        // hold it (a missing or doubled scale, compounding per layer) and a
+        // value that was finite and became NaN in one step (a bad read).
+        //
+        // WHERE the NaN is, not only that there is one. "The arena holds a
+        // NaN" names a fire, and the arena is every live value at once; the
+        // statement that first holds one is not always the statement that
+        // WROTE one, because a plan reuses offsets and the detector reads
+        // them all. The byte offset says which value, and the element index
+        // within it says whether the damage is a tail or the whole row --
+        // the same distinction the per-statement dump had to make before it
+        // could tell an out-of-bounds read from bad arithmetic.
+        let mut nan = None;
+        let mut widest = 0.0f32;
+        for &(at, len, element) in &float_spans {
+            for (i, c) in raw[at..(at + len).min(raw.len())]
                 .chunks_exact(element)
-                .any(|c| {
-                    let v = if element == 4 {
-                        f32::from_le_bytes([c[0], c[1], c[2], c[3]])
-                    } else {
-                        f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)
-                    };
-                    v.is_nan()
-                })
-        })
+                .enumerate()
+            {
+                let v = if element == 4 {
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                } else {
+                    f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)
+                };
+                if v.is_nan() {
+                    if nan.is_none() {
+                        nan = Some((at, i, len / element));
+                    }
+                } else if v.abs() > widest {
+                    widest = v.abs();
+                }
+            }
+        }
+        (nan, widest)
     };
+    let mut nan_after = |n: usize| -> bool { probe(n).0.is_some() };
 
     let total = lowered.launches.len();
     if !nan_after(total) {
         eprintln!("the whole fire ({total} statements) is NaN-free");
         return;
     }
-    // The smallest prefix that has one.
-    let (mut lo, mut hi) = (0usize, total);
+    // The smallest prefix that has one -- COARSE SWEEP first, then bisect
+    // inside the interval that flipped.
+    //
+    // A plain bisection over `nan_after` assumes the predicate is monotonic:
+    // that once the arena holds a NaN it holds one forever. An arena REUSES
+    // offsets, which is what it is for, so a later statement writing finite
+    // values over a region that held a NaN takes it back out and the
+    // predicate flips false again. Bisecting a predicate that is not
+    // monotonic returns SOME boundary, not the FIRST one, and nothing in the
+    // output distinguishes the two.
+    //
+    // A linear scan would be exact and is 1255 GPU runs. A sweep of `STEPS`
+    // evenly spaced probes finds the first coarse interval that flips, and
+    // bisecting inside that interval is exact within it -- so the answer is
+    // wrong only if a NaN appears AND is fully overwritten inside one stride.
+    // That is a far weaker assumption than "never overwritten", it costs
+    // about thirty probes rather than eleven, and the stride is reported so
+    // the reader can judge it.
+    const STEPS: usize = 32;
+    let stride = total.div_ceil(STEPS).max(1);
+    let mut lo = 0usize;
+    let mut hi = total;
+    let mut swept = false;
+    let mut at = stride.min(total);
+    while at <= total {
+        if nan_after(at) {
+            lo = at - stride.min(at);
+            hi = at;
+            swept = true;
+            break;
+        }
+        if at == total {
+            break;
+        }
+        at = (at + stride).min(total);
+    }
+    if !swept {
+        // Every coarse probe was clean and the full fire is not: the NaN
+        // lives and dies inside one stride. Say so rather than bisect a
+        // predicate already known to be false at both ends of every interval.
+        eprintln!(
+            "the full fire holds a NaN but none of the {STEPS} probes every              {stride} statements does -- it is written and overwritten inside              one stride, which a prefix search cannot narrow further"
+        );
+        return;
+    }
+    eprintln!("swept every {stride} statements; the flip is in {lo}..{hi}");
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
         if nan_after(mid) {
@@ -1344,20 +1866,194 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
     }
     let launch = &lowered.launches[hi - 1];
     let symbol = &lowered.kernels[launch.kernel as usize];
+    // Named by its WEIGHTS, not just its symbol. `affine_qmv_fast` is thirteen
+    // different projections in one layer, and a symbol says which arithmetic
+    // ran, never which tensor it ran over -- the same distinction the fine
+    // magnitude walk below already had to make before it could name up_proj.
+    let operands: Vec<&str> = lowered.args[launch.args.start as usize..launch.args.end as usize]
+        .iter()
+        .filter_map(|a| match a {
+            model_compiler::lower::Arg::Weight(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    // WHERE it landed, and how much of the value is gone. A NaN at element
+    // zero of a value and a NaN only in its tail are different defects: the
+    // first is arithmetic that was wrong from the start, the second is a read
+    // that ran off the end. The statement name cannot tell them apart.
+    let site = match probe(hi).0 {
+        Some((at, i, of)) => format!(
+            "\n  first NaN at arena byte {at}, element {i} of {of}{}",
+            lowered
+                .value_offset
+                .iter()
+                .position(|o| *o == at)
+                .map_or(String::new(), |v| format!(" (value {v})"))
+        ),
+        None => String::new(),
+    };
     eprintln!(
-        "\nthe first NaN appears at statement {} of {total}: `{symbol}`, layer {:?}, rows {:?}",
+        "\nthe first NaN appears at statement {} of {total}: `{symbol}`, layer {:?}, rows {:?}\n  over {operands:?}{site}",
         hi - 1,
         launch.layers,
         launch.rows
     );
-    // Its neighbours, because a symbol alone does not say what it was handed.
-    for i in hi.saturating_sub(4)..(hi + 2).min(total) {
-        let l = &lowered.launches[i];
+    // How wide the arena's finite values were on the way in. A NaN at the end
+    // of a climb is a scale that compounds; a NaN one step after a settled
+    // magnitude is a read. The statement alone cannot tell them apart.
+    // From the START, not just the last few: an infinity found six statements
+    // back says only that the answer is further back still. On gemma-4-31b
+    // the arena is already infinite at statement 69, so the NaN at 74 is a
+    // CONSEQUENCE -- inf minus inf, or inf times zero -- and the question is
+    // where the magnitudes left bf16's range, which is a different statement
+    // and possibly a different layer.
+    //
+    // Swept coarsely and then walked one statement at a time, for the same
+    // reason the NaN search is: fourteen points over 1255 statements name an
+    // interval of ninety, and an interval is not a kernel. The interval to
+    // walk is the one whose magnitude RATIO is largest, which needs no
+    // threshold -- "sane" is not a number this driver knows, and a reuse that
+    // takes the magnitude back down has a ratio below one and so cannot be
+    // mistaken for the climb.
+    eprintln!("  widest finite |v| from the start:");
+    let mut trail: Vec<(usize, f32, bool)> = Vec::new();
+    let points = 14usize;
+    let step = (hi.max(1)).div_ceil(points).max(1);
+    let mut at = 0usize;
+    loop {
+        let (nan, widest) = probe(at);
         eprintln!(
-            "  [{i:3}]{} {} layer {:?}",
+            "    after {at:>4}: {widest:>12.4e}{}",
+            if nan.is_some() { "  (holds a NaN)" } else { "" }
+        );
+        trail.push((at, widest, nan.is_some()));
+        if at >= hi - 1 {
+            break;
+        }
+        at = (at + step).min(hi - 1);
+    }
+    // The steepest climb, by ratio rather than by difference: a jump from
+    // 1e3 to 5e28 and one from 5e28 to 1e29 differ by about the same amount
+    // and are not the same event.
+    //
+    // A RATIO NEEDS TWO MAGNITUDES, and neither zero nor an infinity is one.
+    // The first draft ordered those two by the value reached, which made
+    // every interval ending at `inf` the maximum -- so on gemma-4-31b it
+    // named 72..74, the three statements before the NaN, when the trail
+    // printed directly above it showed the arena going 1.0e3 to 5.1e28
+    // between 12 and 18. It picked the END of the climb over its start,
+    // which is the exact mistake the whole magnitude trail exists to stop
+    // the bisection making.
+    //
+    // So: intervals with two finite non-zero endpoints are ranked; the rest
+    // are skipped, because the trail above already shows them. If every
+    // interval is skipped -- the arena's first write is already infinite --
+    // the first one reaching a non-finite value is walked instead, since
+    // then there is no climb to find and the question is which statement
+    // wrote it.
+    let ranked = trail
+        .windows(2)
+        .filter(|w| w[0].1 > 0.0 && w[0].1.is_finite() && w[1].1.is_finite())
+        .max_by(|a, b| (a[1].1 / a[0].1).total_cmp(&(b[1].1 / b[0].1)))
+        .map(|w| (w[0].0, w[1].0));
+    let steepest = ranked.or_else(|| {
+        trail
+            .windows(2)
+            .find(|w| !w[1].1.is_finite())
+            .map(|w| (w[0].0, w[1].0))
+    });
+    if let Some((from, to)) = steepest {
+        eprintln!(
+            "  the steepest climb is {from}..{to}; every statement in it, \
+             with what wrote:"
+        );
+        let mut previous = f32::NAN;
+        for n in from..=to {
+            let (nan, widest) = probe(n);
+            let nan = nan.is_some();
+            let symbol = if n == 0 {
+                "<the arena as staged>"
+            } else {
+                &lowered.kernels[lowered.launches[n - 1].kernel as usize]
+            };
+            let layer = if n == 0 {
+                String::new()
+            } else {
+                format!(" layer {:?}", lowered.launches[n - 1].layers)
+            };
+            // The multiplier this one statement applied, which is the number
+            // being looked for -- the trail above only says the interval.
+            let factor = if previous.is_finite() && previous > 0.0 {
+                format!("  x{:.3e}", widest / previous)
+            } else {
+                String::new()
+            };
+            // The WEIGHTS it was handed, which is the question a symbol
+            // cannot answer: statements 16 and 17 of gemma-4-31b are the
+            // same kernel over the same shape, and only one of them leaves
+            // bf16's range. What differs is the tensor.
+            let weights: Vec<&str> = if n == 0 {
+                Vec::new()
+            } else {
+                let a = &lowered.launches[n - 1].args;
+                lowered.args[a.start as usize..a.end as usize]
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        model_compiler::lower::Arg::Weight(name) => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            eprintln!(
+                "    after {n:>4}: {widest:>12.4e}{}{factor}   `{symbol}`{layer} {}",
+                if nan { "  (holds a NaN)" } else { "" },
+                weights.join(" ")
+            );
+            previous = widest;
+        }
+    }
+    // Its neighbours, because a symbol alone does not say what it was handed.
+    //
+    // The WHOLE layer, not four statements either side. A NaN inside an
+    // attention block is a question about the block -- which shape its sdpa
+    // took, whether a projection was suppressed, which norms ran -- and four
+    // statements show the arithmetic without the structure. The bound comes
+    // from the plan's own layer numbering, so a family whose layer is 21
+    // statements gets 21 and llama's 12 gets 12.
+    let layer = lowered.launches[hi - 1].layers.start;
+    let first = lowered
+        .launches
+        .iter()
+        .position(|l| l.layers.start >= layer)
+        .unwrap_or(hi - 1);
+    let last = lowered
+        .launches
+        .iter()
+        .rposition(|l| l.layers.start <= layer)
+        .map_or(hi, |i| i + 1);
+    eprintln!("\n  every statement of layer {layer}:");
+    for i in first..last.min(total) {
+        let l = &lowered.launches[i];
+        // The RECTANGLES as well as the names. A NaN that begins exactly at
+        // one operand's width is a slot too small for what was written into
+        // it, and that is visible only if the widths are on the page next to
+        // the statement that wrote them.
+        let mut names = Vec::new();
+        for a in &lowered.args[l.args.start as usize..l.args.end as usize] {
+            match a {
+                model_compiler::lower::Arg::Weight(name) => names.push(name.clone()),
+                model_compiler::lower::Arg::Arena { at, width, .. } => {
+                    names.push(format!("@{at}w{width}"));
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "  [{i:3}]{} {:<40} rows {:?} {}",
             if i == hi - 1 { " <-" } else { "   " },
             lowered.kernels[l.kernel as usize],
-            l.layers
+            l.rows,
+            names.join(" ")
         );
     }
 }
@@ -1419,6 +2115,9 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
+    let Some(reference) = reference_for(&snapshot) else {
+        return;
+    };
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
         return;
@@ -1428,30 +2127,19 @@ fn one_token_at_position_zero_agrees_with_mlx() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     // ONE request, ONE token, position zero.
     let step = Step {
-        token_ids: &[128_000],
+        token_ids: &[reference.bos],
         qo_indptr: &[0, 1],
         sampling_indices: &[0],
         ..Step::default()
     };
-    let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
+    let plan = text(row, FireClass::Decode, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 16,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 16);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
@@ -1464,8 +2152,8 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         })
     };
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -1488,14 +2176,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         &compiler,
         &mut pipelines,
         &lowered,
-        Geometry {
-            q_heads: facts.q_heads,
-            kv_heads: facts.kv_heads,
-            head_dim: facts.head_dim,
-            rotary_dims: facts.head_dim,
-            n_experts: facts.n_experts,
-            experts_per_token: facts.experts_per_token,
-        },
+        dispatch_geometry(&dg),
         &mut live,
     )
     .expect("the fire runs");
@@ -1538,7 +2219,11 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     let (lo, hi) = logits
         .iter()
         .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-    eprintln!("argmax {} over {vocab} logits, span [{lo}, {hi}]", order[0]);
+    eprintln!(
+        "argmax {} argmin {} over {vocab} logits, span [{lo}, {hi}]",
+        order[0],
+        order[order.len() - 1]
+    );
     for (i, &t) in order.iter().take(5).enumerate() {
         eprintln!("  top{i}: {t} logit {:.6}", logits[t]);
     }
@@ -1550,35 +2235,120 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     // tolerance because the driver's readout IS bf16 -- 8 mantissa bits, so
     // about 0.4% near six -- where MLX accumulates wider. A tolerance is
     // therefore a statement about the FORMAT and not slack for a wrong answer.
-    const MLX: [(usize, f32); 5] = [
-        (16309, 6.406_25),
-        (2, 5.949_219),
-        (1757, 5.859_375),
-        (791, 5.781_25),
-        (475, 5.601_562),
-    ];
-    for (i, (want, logit)) in MLX.iter().enumerate() {
-        let got = order[i];
+    // A TIE HAS NO ORDER, and this used to demand one. MLX gives 236798 and
+    // 236780 the same 29.875 and so does this driver; which of the two a sort
+    // puts first is a property of the sort. Asserting rank-for-rank reported
+    // that as "MLX says 236798 and this says 236780" -- a defect in neither.
+    //
+    // The set is what a tied top five states, and it is not weaker: five
+    // tokens out of 262144 in any order is the same claim about the fire.
+    let mut want_set: Vec<usize> = reference.top.iter().map(|(t, _)| *t).collect();
+    let mut got_set: Vec<usize> = order[..reference.top.len()].to_vec();
+    want_set.sort_unstable();
+    got_set.sort_unstable();
+    assert_eq!(
+        got_set, want_set,
+        "MLX's top five are {want_set:?} and this driver's are {got_set:?}. At \
+         position zero rope is the identity and attention has one key, so \
+         nothing position-dependent can explain a difference."
+    );
+
+    // The ARGMAX exactly, whenever MLX's own top two are further apart than
+    // the readout can resolve -- where they are not, the tie above is the
+    // whole of what can be claimed.
+    if (reference.top[0].1 - reference.top[1].1).abs() > bf16_slack(reference.top[0].1) {
         assert_eq!(
-            got, *want,
-            "rank {i}: MLX says token {want} and this says {got}. At position \
-             zero rope is the identity and attention has one key, so nothing \
-             position-dependent can explain a difference."
+            order[0], reference.top[0].0,
+            "MLX's argmax is {} and this driver's is {}.",
+            reference.top[0].0, order[0]
         );
-        let mine = logits[got];
+    }
+
+    // The value, with the tolerance the CAP dictates rather than one the
+    // readout alone would.
+    //
+    // `cap * tanh(x/cap)` has slope `1 - (v/cap)^2`, so a post-cap ulp stands
+    // for `ulp / slope` of pre-cap logit. At gemma's 29.625 against a cap of
+    // 30 that slope is 0.025: forty units of pre-cap logit arrive as one unit
+    // of post-cap value, and two implementations agreeing there is a
+    // statement about `tanh`'s asymptote and not about either fire.
+    //
+    // So the tolerance carries the slope, and the PRE-CAP value each side
+    // implies is printed beside it -- the assertion says what can be claimed
+    // and the report keeps what was measured. gemma-4-31b at position zero:
+    // every one of the top five is within a bf16 ulp POST-cap, and the
+    // pre-cap logits they imply differ by up to 13%, which is the reading
+    // this gate cannot settle and a pre-cap comparison would.
+    for (want, logit) in &reference.top {
+        let mine = logits[*want];
+        let slack = if reference.cap > 0.0 {
+            let slope = 1.0 - (logit / reference.cap).powi(2);
+            bf16_slack(*logit) / slope.max(f32::EPSILON)
+        } else {
+            bf16_slack(*logit)
+        };
+        if reference.cap > 0.0 {
+            let pre = |v: f32| reference.cap * (v / reference.cap).atanh();
+            eprintln!(
+                "  token {want}: MLX {logit} / this {mine}  (pre-cap {:.1} / {:.1})",
+                pre(*logit),
+                pre(mine)
+            );
+        }
         assert!(
-            (mine - logit).abs() < 0.05,
+            (mine - logit).abs() <= slack,
             "token {want}: MLX logit {logit}, this {mine} — further apart than \
-             bf16 explains."
+             bf16 and the cap's slope explain ({slack})."
         );
     }
 
     // The SPAN, because five agreeing logits at the top is consistent with a
-    // distribution that is wrong everywhere else. MLX: [-4.613, 6.406].
-    assert!(
-        (hi - 6.406).abs() < 0.05 && (lo + 4.613).abs() < 0.05,
-        "the distribution spans [{lo}, {hi}] where MLX spans [-4.613, 6.406]."
-    );
+    // distribution that is wrong everywhere else.
+    let (want_lo, want_hi) = reference.span;
+    eprintln!("span [{lo}, {hi}] against MLX's [{want_lo}, {want_hi}]");
+
+    // THE READING FROM SOMEWHERE ELSE. Three tokens down the distribution,
+    // where the cap does not reach and a bf16 ulp is the whole tolerance.
+    //
+    // This replaces asserting on the span's two ends, which for gemma are the
+    // two values the cap has erased -- and one of which (the floor) is a
+    // single outlier token whose pre-cap logit is -48.7 where this driver's
+    // is -27.9. That disagreement is real and is recorded in the north star;
+    // it is not what the span was ever asked to establish, and a gate that
+    // reports it as "the distribution is wrong" while ranks 100, 1000 and
+    // 10000 agree to a bf16 ulp is reporting the wrong thing.
+    for (token, want) in &reference.mid {
+        let mine = logits[*token];
+        if reference.cap > 0.0 {
+            let pre = |v: f32| reference.cap * (v / reference.cap).atanh();
+            eprintln!(
+                "  mid {token}: MLX {want} / this {mine}  (pre-cap {:.2} / {:.2}, ratio {:.4})",
+                pre(*want),
+                pre(mine),
+                pre(mine) / pre(*want)
+            );
+        }
+    }
+    // AT THE DISTRIBUTION'S SCALE, not at each value's own.
+    //
+    // A logit is a dot product over `hidden` terms, and its error is set by
+    // the size of those terms rather than by the size of what they sum to.
+    // llama's rank-10000 logit is 1.40; two ulps OF 1.40 is 0.016, and the
+    // same accumulation that lands 6.41 to within 0.03 cannot land 1.40 to
+    // within 0.016. Measured, it lands 1.4375 -- 2.4 ulps of itself and half
+    // an ulp of the readout's widest value, which is the number that says
+    // what the accumulation could do.
+    let scale = bf16_slack(want_lo.abs().max(want_hi.abs()));
+    for (token, want) in &reference.mid {
+        let mine = logits[*token];
+        assert!(
+            (mine - want).abs() <= scale,
+            "token {token}, well down the distribution: MLX says {want} and \
+             this says {mine}, further apart than {scale}. The cap does not \
+             reach here, so this is the whole distribution disagreeing and \
+             not its erased extremes."
+        );
+    }
 }
 
 /// **A two-token PREFILL, held to the same reference.**
@@ -1615,6 +2385,10 @@ fn a_two_token_prefill_agrees_with_mlx() {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
+    // The reference below is llama-3.2-1B-Instruct-4bit's, taken by hand.
+    if !reference_taken_on(&snapshot, "Llama-3.2-1B-Instruct-4bit") {
+        return;
+    }
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
         return;
@@ -1624,8 +2398,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     // ONE request, TWO tokens: a prefill.
     //
@@ -1640,20 +2413,10 @@ fn a_two_token_prefill_agrees_with_mlx() {
         sampling_indices: &[1],
         ..Step::default()
     };
-    let plan = llama_like_metal(&facts, &metal, FireClass::Prefill);
+    let plan = text(row, FireClass::Prefill, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 16,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 16);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
@@ -1666,8 +2429,8 @@ fn a_two_token_prefill_agrees_with_mlx() {
         })
     };
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -1694,14 +2457,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
         &compiler,
         &mut pipelines,
         &lowered,
-        Geometry {
-            q_heads: facts.q_heads,
-            kv_heads: facts.kv_heads,
-            head_dim: facts.head_dim,
-            rotary_dims: facts.head_dim,
-            n_experts: facts.n_experts,
-            experts_per_token: facts.experts_per_token,
-        },
+        dispatch_geometry(&dg),
         &mut live,
     )
     .expect("the prefill runs");
@@ -1809,8 +2565,7 @@ fn a_prefill_rotates_its_second_row() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     // The SAME token twice. Same embedding, same projection, so the two K rows
     // leave the matmul bit-identical and only the rotation can part them.
@@ -1820,20 +2575,10 @@ fn a_prefill_rotates_its_second_row() {
         sampling_indices: &[1],
         ..Step::default()
     };
-    let plan = llama_like_metal(&facts, &metal, FireClass::Prefill);
+    let plan = text(row, FireClass::Prefill, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 16,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 16);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
@@ -1846,8 +2591,8 @@ fn a_prefill_rotates_its_second_row() {
         })
     };
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -1855,10 +2600,28 @@ fn a_prefill_rotates_its_second_row() {
             original_max: dg.rope_original_max_position as f32,
         }),
     );
-    assert!(
-        metal.rope_freq_table,
-        "this checkpoint rescales its ladder, so the freqs lane is the one under test"
-    );
+    // This is the FREQS lane's fire; the base lane's twin below is the other.
+    // A checkpoint whose ladder is not rescaled never reaches this kernel, so
+    // running it would prove nothing about the shader under test.
+    //
+    // SKIPPED rather than asserted. The assertion read the right fact and drew
+    // the wrong conclusion from it: "this deployment takes the other lane" is
+    // a statement about the CHECKPOINT, and a suite that reports it as a
+    // driver failure puts it in the same list as the failures that are real.
+    // gemma-4 takes the base lane for its sliding layers, and said FAILED for
+    // it beside the NaN that mattered.
+    //
+    // The fact used to be read off a `LlamaLikeMetalFacts` this file rebuilt
+    // from the tensors; it is read off the DEPLOYMENT's ladder now, which is
+    // the same number one seam earlier and no longer a second opinion about
+    // the checkpoint that could disagree with the text's.
+    if dg.rope_freq_factor <= 0.0 {
+        eprintln!(
+            "SKIP: this checkpoint does not rescale its ladder, so the BASE \
+             lane is the one it takes -- see the twin below."
+        );
+        return;
+    }
     let staged = stage_prefill(&context, &step, shape.page_size, &freqs);
 
     let named = HashMap::new();
@@ -1874,14 +2637,7 @@ fn a_prefill_rotates_its_second_row() {
         &compiler,
         &mut pipelines,
         &lowered,
-        Geometry {
-            q_heads: facts.q_heads,
-            kv_heads: facts.kv_heads,
-            head_dim: facts.head_dim,
-            rotary_dims: facts.head_dim,
-            n_experts: facts.n_experts,
-            experts_per_token: facts.experts_per_token,
-        },
+        dispatch_geometry(&dg),
         &mut live,
     )
     .expect("the prefill runs");
@@ -1935,9 +2691,23 @@ fn a_prefill_rotates_its_second_row() {
 /// eight-head buffer and `neox_mb` strided its rows by q's width. Fixing the
 /// lane alone leaves this failing; fixing the axis alone leaves the one above
 /// failing. Neither is visible from a single lane, so both lanes stay.
+///
+/// **How the lane is chosen changed, and it had to.** This gate used to force
+/// its lane with `metal.rope_freq_table = false` — it took the facts the
+/// driver had rebuilt from the tensors, overwrote one of them, and traced the
+/// text from the result. That knob does not exist any more: the ladder is the
+/// ROW's statement, reached through `Variant::trace`, and a test that could
+/// still flip it would be testing a text no deployment can ask for. So the
+/// lane is chosen by WHICH snapshot `PIE_METAL_SMOKE_CHECKPOINT` names, and
+/// this gate skips the snapshots that take the other one. `qwen3-0.6b` does
+/// not rescale and lands here; `llama-3.2-1b` does and lands in the twin
+/// above. Both are pinned live by `catalog_coverage.rs`, so neither lane can
+/// quietly stop being reachable — and running the suite against one snapshot
+/// now covers one lane, which is why the twins report their skip loudly.
 #[test]
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
-fn a_prefill_rotates_its_second_row_on_the_base_ladder() {    let Some(snapshot) = snapshot() else {
+fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
+    let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
@@ -1950,8 +2720,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {    let Some(snapshot)
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, mut metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     // The SAME token twice. Same embedding, same projection, so the two K rows
     // leave the matmul bit-identical and only the rotation can part them.
@@ -1961,21 +2730,20 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {    let Some(snapshot)
         sampling_indices: &[1],
         ..Step::default()
     };
-    metal.rope_freq_table = false;
-    let plan = llama_like_metal(&facts, &metal, FireClass::Prefill);
+    // This is the BASE lane's fire; the twin above is the FREQS one. See this
+    // gate's doc for why the lane is the snapshot's to choose and not this
+    // test's to force.
+    if dg.rope_freq_factor > 0.0 {
+        eprintln!(
+            "SKIP: this checkpoint rescales its ladder, so the FREQS \
+             lane is the one it takes -- see the twin above."
+        );
+        return;
+    }
+    let plan = text(row, FireClass::Prefill, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 16,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 16);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
@@ -1988,8 +2756,8 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {    let Some(snapshot)
         })
     };
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -2012,14 +2780,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {    let Some(snapshot)
         &compiler,
         &mut pipelines,
         &lowered,
-        Geometry {
-            q_heads: facts.q_heads,
-            kv_heads: facts.kv_heads,
-            head_dim: facts.head_dim,
-            rotary_dims: facts.head_dim,
-            n_experts: facts.n_experts,
-            experts_per_token: facts.experts_per_token,
-        },
+        dispatch_geometry(&dg),
         &mut live,
     )
     .expect("the prefill runs");
@@ -2073,8 +2834,41 @@ fn stage_prefill(
     freqs: &[f32],
 ) -> driver_metal::bind::tables::Staged {
     let n = step.token_ids.len() as u32;
-    let positions: Vec<u32> = (0..n).collect();
-    let zeros: Vec<u32> = vec![0; n as usize];
+    // FROM `qo_indptr`. This staged EVERY prefill as one request: positions
+    // `0..n` counted across the whole fire, `req_of_token` all zero, a single
+    // page, and `kv_page_indptr = [0, 1]` saying "one request" whatever the
+    // step said.
+    //
+    // For a one-request prefill that is exactly right, which is why it
+    // survived. For a TWO-request prefill it is a different fire than the one
+    // asked for: the two requests are concatenated into one sequence, the
+    // second one's first token is rotated as though it were the third token
+    // of the first, and both write their keys into the same page where causal
+    // attention then lets the second read the first's.
+    //
+    // `a_request_prefills_the_same_way_beside_another_one` is the gate for
+    // precisely that leak, and it was staging the leak itself.
+    let requests = step.qo_indptr.len().saturating_sub(1);
+    let mut req_of_token: Vec<u32> = Vec::with_capacity(n as usize);
+    let mut positions: Vec<u32> = Vec::with_capacity(n as usize);
+    for r in 0..requests {
+        let (from, to) = (step.qo_indptr[r], step.qo_indptr[r + 1]);
+        for row in from..to {
+            req_of_token.push(r as u32);
+            positions.push(row - from);
+        }
+    }
+    if req_of_token.len() != n as usize {
+        req_of_token = vec![0; n as usize];
+        positions = (0..n).collect();
+    }
+    // ONE PAGE PER REQUEST, so a request's keys are somewhere another request
+    // is not looking. Each request's rows are far inside one page here; a
+    // longer prefill would need a run of them, and `pages_for` is where that
+    // would go.
+    let requests = requests.max(1) as u32;
+    let each: Vec<u32> = (0..requests).collect();
+    let indptr: Vec<u32> = (0..=requests).collect();
     let w_off: Vec<u32> = positions.iter().map(|p| p % page_size.max(1)).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
     driver_metal::bind::tables::stage(
@@ -2082,10 +2876,10 @@ fn stage_prefill(
         driver_metal::bind::tables::Frame {
             token_ids: step.token_ids,
             position_ids: &positions,
-            req_of_token: &zeros,
-            kv_page_indices: &[0],
-            kv_page_indptr: &[0, 1],
-            kv_write_page: &zeros,
+            req_of_token: &req_of_token,
+            kv_page_indices: &each,
+            kv_page_indptr: &indptr,
+            kv_write_page: &req_of_token,
             kv_write_offset: &w_off,
             rope_frequencies: &inv_freq,
             sampling_indices: step.sampling_indices,
@@ -2117,6 +2911,10 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
+    // The reference below is llama-3.2-1B-Instruct-4bit's, taken by hand.
+    if !reference_taken_on(&snapshot, "Llama-3.2-1B-Instruct-4bit") {
+        return;
+    }
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
         return;
@@ -2126,22 +2924,11 @@ fn a_generation_agrees_with_mlx_token_for_token() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     // ONE pool for the whole generation. That is the point: every fire after
     // the first reads what its predecessors wrote.
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 16,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 16);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
@@ -2154,8 +2941,8 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         })
     };
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -2191,7 +2978,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             sampling_indices: &[n - 1],
             ..Step::default()
         };
-        let plan = llama_like_metal(&facts, &metal, class);
+        let plan = text(row, class, &binding);
         let lowered = lower_step(&plan, &step).expect("the step lowers");
 
         // One request, one page list. The write destinations advance with the
@@ -2226,14 +3013,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             &compiler,
             &mut pipelines,
             &lowered,
-            Geometry {
-                q_heads: facts.q_heads,
-                kv_heads: facts.kv_heads,
-                head_dim: facts.head_dim,
-                rotary_dims: facts.head_dim,
-                n_experts: facts.n_experts,
-                experts_per_token: facts.experts_per_token,
-            },
+            dispatch_geometry(&dg),
             &mut live,
         )
         .expect("the fire runs");
@@ -2319,8 +3099,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     let step = Step {
         token_ids: &[128_000],
@@ -2328,20 +3107,10 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         sampling_indices: &[0],
         ..Step::default()
     };
-    let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
+    let plan = text(row, FireClass::Decode, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 16,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 16);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
@@ -2354,8 +3123,8 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         })
     };
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -2364,14 +3133,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         }),
     );
     let staged = stage_tables(&context, &step, shape.page_size, &freqs);
-    let geometry = Geometry {
-        q_heads: facts.q_heads,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        rotary_dims: facts.head_dim,
-        n_experts: facts.n_experts,
-        experts_per_token: facts.experts_per_token,
-    };
+    let geometry = dispatch_geometry(&dg);
     let (at, vocab, element) = {
         let r = lowered.readout.expect("the text states an exit seam");
         (r.at, r.vocab as usize, r.bytes as usize)
@@ -2407,12 +3169,14 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     )
     .expect("the encoded fire runs");
     // SAFETY: the command buffer retired before the call returned.
-    let encoded = logits_of(unsafe {
+    let encoded_arena = unsafe {
         core::slice::from_raw_parts(
             arena.contents().as_ptr().cast_const().cast::<u8>(),
             arena.len() as usize,
         )
-    });
+    }
+    .to_vec();
+    let encoded = logits_of(&encoded_arena);
 
     // ── The REPLAYED path, which is what serves. ──
     //
@@ -2421,7 +3185,9 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     // the weights, the pool's layers, the tables — and `submit` adds the
     // arena and the scalars it leases.
     let mut regions = driver_metal::device::Regions::new();
-    regions.add(&loaded.region);
+    for region in &loaded.regions {
+        regions.add(region);
+    }
     for l in 0..shape.layers {
         if let Some(layer) = pool.layer(l) {
             layer.k.register(&mut regions);
@@ -2440,6 +3206,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         shape,
         pages: &pages,
     };
+    let replayed_arena;
     let replayed = {
         let mut machine = driver_metal::fire::run::Machine {
             context: &context,
@@ -2457,13 +3224,51 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
             .wait_for(fire.value)
             .expect("the replayed fire retires");
         // SAFETY: waited for above.
-        logits_of(unsafe {
+        replayed_arena = unsafe {
             core::slice::from_raw_parts(
                 fire.arena.contents().as_ptr().cast_const().cast::<u8>(),
                 fire.arena.len() as usize,
             )
-        })
+        }
+        .to_vec();
+        logits_of(&replayed_arena)
     };
+    // WHICH STATEMENT the two paths part at, not which logits.
+    //
+    // The readout is the last value a fire writes, so comparing it says only
+    // that something upstream differs -- the same blindness the NaN detector
+    // had before it reported the arena offset. The arenas are the whole
+    // computation, and the first byte they disagree on lands in one value,
+    // which one launch wrote.
+    if encoded_arena != replayed_arena {
+        let at = encoded_arena
+            .iter()
+            .zip(&replayed_arena)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        let value = lowered
+            .value_offset
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| **o <= at)
+            .max_by_key(|(_, o)| **o);
+        let wrote = value.and_then(|(v, o)| {
+            lowered
+                .launches
+                .iter()
+                .position(|l| {
+                    lowered.args[l.args.start as usize..l.args.end as usize]
+                        .iter()
+                        .any(|a| matches!(a, model_compiler::lower::Arg::Arena { at, .. } if at == o))
+                })
+                .map(|n| (v, *o, n, lowered.kernels[lowered.launches[n].kernel as usize].clone()))
+        });
+        eprintln!(
+            "  the arenas first differ at byte {at} of {}; {:?}",
+            encoded_arena.len(),
+            wrote.map(|(v, o, n, k)| format!("value {v} @{o}, first bound by statement {n} `{k}`"))
+        );
+    }
 
     // The fire was RECORDED, not silently encoded. `submit` falls back when a
     // recording cannot be made -- right for serving, useless here, and
@@ -2483,6 +3288,23 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         "encoded argmax {} ({:.6}), replayed argmax {} ({:.6}) over {vocab} logits",
         order[0], encoded[order[0]], replayed_order[0], replayed[replayed_order[0]]
     );
+    // HOW they differ, not only that they do. An equality assertion over a
+    // quarter of a million logits prints two lists and says nothing: one
+    // operand bound to the wrong buffer and a recording that resolved nothing
+    // both fail it, and the counts tell them apart -- a handful of differing
+    // logits is an operand, all of them NaN is a resolution.
+    let differ = encoded
+        .iter()
+        .zip(&replayed)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    if differ > 0 {
+        eprintln!(
+            "  {differ} of {vocab} logits differ; encoded holds {} NaN, replayed {}",
+            encoded.iter().filter(|v| v.is_nan()).count(),
+            replayed.iter().filter(|v| v.is_nan()).count()
+        );
+    }
 
     // BIT-IDENTICAL, not within a tolerance. The two paths issue the same
     // kernels over the same buffers in the same order; the only difference is
@@ -2570,8 +3392,8 @@ struct Rig<'a> {
     context: &'a Context,
     compiler: &'a Compiler,
     loaded: &'a driver_metal::weights::load::Loaded,
-    facts: &'a LlamaLikeFacts,
-    metal: &'a LlamaLikeMetalFacts,
+    row: &'static dyn model::catalog::Variant,
+    binding: &'a MetalBinding,
     dg: &'a driver_metal::batch::DecodeGeometry,
 }
 
@@ -2605,24 +3427,14 @@ fn prefill_logits_on(
         context,
         compiler,
         loaded,
-        facts,
-        metal,
+        row,
+        binding,
         dg,
     } = *rig;
-    let plan = llama_like_metal(facts, metal, FireClass::Prefill);
+    let plan = text(row, FireClass::Prefill, binding);
     let lowered = lower_step(&plan, step).expect("the step lowers");
 
-    let shape = Shape {
-        layers: facts.layers,
-        kv_heads: facts.kv_heads,
-        head_dim: facts.head_dim,
-        page_size: 16,
-        pages: 16,
-        element_bytes: 2,
-        global_head_dim: 0,
-        global_kv_heads: 0,
-        full_attn_every: 0,
-    };
+    let shape = pool_shape(&dg, 16);
     // The arena outlives the pool: an elastic buffer charges its tiles back
     // on drop, and dropping the arena first would leave nothing to charge.
     let arena_for_pool = driver_metal::device::Arena::new(1024 * 1024 * 1024, 0);
@@ -2645,8 +3457,8 @@ fn prefill_logits_on(
         })
     };
     let freqs = driver_metal::model::rope::frequencies(
-        facts.head_dim,
-        metal.rope_theta,
+        dg.head_dim,
+        dg.rope_theta,
         (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
             factor: dg.rope_freq_factor,
             low: dg.rope_low_freq_factor,
@@ -2668,14 +3480,7 @@ fn prefill_logits_on(
         compiler,
         pipelines,
         &lowered,
-        Geometry {
-            q_heads: facts.q_heads,
-            kv_heads: facts.kv_heads,
-            head_dim: facts.head_dim,
-            rotary_dims: facts.head_dim,
-            n_experts: facts.n_experts,
-            experts_per_token: facts.experts_per_token,
-        },
+        dispatch_geometry(&dg),
         &mut live,
     )
     .expect("the prefill runs");
@@ -2726,15 +3531,14 @@ fn a_request_prefills_the_same_way_beside_another_one() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     let rig = Rig {
         context: &context,
         compiler: &compiler,
         loaded: &loaded,
-        facts: &facts,
-        metal: &metal,
+        row,
+        binding: &binding,
         dg: &dg,
     };
 
@@ -2772,9 +3576,20 @@ fn a_request_prefills_the_same_way_beside_another_one() {
     let solo_b = prefill_logits(&rig, &mut pipelines, &second_alone);
 
     assert_eq!(batched.len(), 2, "the fire samples both requests");
+    // WHICH KIND of nothing, because zeros and NaNs are different bugs: an
+    // all-zero row is a lane that never ran, an all-NaN row is one that ran
+    // on bad operands, and "produced distributions at all" named neither.
+    let describe = |row: &[f32]| {
+        let nan = row.iter().filter(|v| v.is_nan()).count();
+        let zero = row.iter().filter(|v| **v == 0.0).count();
+        format!("{} logits: {nan} NaN, {zero} zero", row.len())
+    };
     assert!(
         solo_b[0].iter().any(|v| v.is_finite() && *v != 0.0),
-        "the solo prefills produced distributions at all"
+        "the three-token solo prefill produced no distribution -- {}; \
+         the two-token one beside it is {}",
+        describe(&solo_b[0]),
+        describe(&solo[0])
     );
     for (which, alone, batched) in [
         ("first", &solo[0], &batched[0]),
@@ -2834,15 +3649,14 @@ fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
 
     let (row, encoding, dg) = served(&snapshot);
     let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
-    let (facts, metal) =
-        driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let binding = observed(&dg, &loaded);
 
     let rig = Rig {
         context: &context,
         compiler: &compiler,
         loaded: &loaded,
-        facts: &facts,
-        metal: &metal,
+        row,
+        binding: &binding,
         dg: &dg,
     };
 

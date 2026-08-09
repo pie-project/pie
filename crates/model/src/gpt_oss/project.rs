@@ -78,6 +78,16 @@ pub fn manifest(f: &GptOssFacts) -> Manifest {
         .with(TensorSpec::required("layer.{}.mlp.experts.down_proj_bias", [experts, hidden]))
 }
 
+/// gpt-oss's gate alpha, the 1.702 that makes `x * sigmoid(alpha * x)`
+/// the GELU approximation its MLP is written against.
+///
+/// A CONSTANT and not a fact, because no published gpt-oss config
+/// states it: `swiglu_limit` is a row's number and this is the
+/// activation's own. It had no home at all before — the driver carried
+/// a `swiglu_alpha` field nothing ever wrote, so every gpt-oss reaching
+/// a Metal text would have gated on alpha zero.
+const GATE_ALPHA: f32 = 1.702;
+
 /// This row's deployment.
 ///
 /// The window table is the row's alternation rule expanded, not a list
@@ -89,6 +99,9 @@ pub fn deployment(f: &GptOssFacts, rope_theta: f32, norm_eps: f32, sliding_windo
     let head_dim = f.head_dim;
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
+            // One shape for every layer, which is what this row was
+            // already saying by having no per-layer count.
+            kv_heads: f.kv_heads,
             head_dim,
             window: if f.is_sliding(l) { sliding_window } else { -1 },
             kv_source: l,
@@ -116,6 +129,8 @@ pub fn deployment(f: &GptOssFacts, rope_theta: f32, norm_eps: f32, sliding_windo
             // reads the max of the two.
             intermediate: 0,
             moe_intermediate: f.intermediate,
+            experts_per_token: f.top_k,
+            shared_intermediate: 0,
             vocab: f.vocab,
         },
         attention,
@@ -130,6 +145,14 @@ pub fn deployment(f: &GptOssFacts, rope_theta: f32, norm_eps: f32, sliding_windo
         logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
+        // Not a gemma: the gain is the multiplier, stored directly.
+        norm_unit_offset: false,
+        v_norm: false,
+        k_eq_v: false,
+        mlp_gate: crate::deployment::MlpGate::SiluClamped {
+            limit: f.swiglu_limit,
+            alpha: GATE_ALPHA,
+        },
         scales: std::collections::BTreeMap::new(),
         // Filled by the ROW, not by the shape: a family label and a
         // published context ceiling are facts about a checkpoint, and a
@@ -160,6 +183,45 @@ pub fn cuda_facts(f: &GptOssFacts, load: Deployed<'_>) -> super::forward::facts:
             .collect(),
     }
 }
+
+/// Why this build has no Metal text for a gpt-oss row.
+///
+/// A `const` so the test that asserts the refusal NAMES the missing
+/// thing compares against the same string the caller is shown, rather
+/// than against a paraphrase that can drift away from it — the shape
+/// `csm::project::NO_TRACE` set for the same reason.
+///
+/// Its forward is `gpt_oss_cuda`, and this is the closest call
+/// of the ten: `llama_like_metal` does carry attention sinks, the
+/// clamped `SwiGlu` and an MXFP4 expert bank, and `driver-metal`'s
+/// deleted `LLAMA_LIKE` table listed `gpt_oss` as served —
+/// `LlamaLikeMetalFacts::gpt_oss_20b()` is still there as a fixture.
+/// It refuses all the same, on the rule this refactor exists to state:
+/// this row's shape is `GptOssFacts`, `llama_like_metal` takes a
+/// `LlamaLikeFacts`, and a projection between them would be a
+/// derivation of a model's facts from something other than its row —
+/// which is precisely what `facts_from_with` was. Wiring it needs a
+/// gpt-oss Metal TEXT, not a shape cast.
+///
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine, and a pie whose Metal half had this text would serve the same
+/// row unchanged. What is missing is a TEXT in this build, which is a
+/// fact about the build.
+///
+/// Stating it is the whole of what replaces `driver-metal`'s
+/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
+/// reduced by a punctuation-stripping `canonical()`, consulted before
+/// any text was traced and free to disagree with what the tracer would
+/// actually do. It listed `gemma4`, which the load path refused on
+/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// that answers for itself cannot disagree with a list, because there
+/// is no list.
+pub const NO_METAL: &str = "gpt-oss has no Metal text in this build: its forward is `gpt_oss_cuda` — the \
+     grouped seven-rectangle expert leg, the clamped GLU and attention sinks — \
+     and while the one Metal text here (`llama_like_metal`) states sinks and a \
+     clamped GLU of its own, it takes a `LlamaLikeFacts` and this row is a \
+     `GptOssFacts`; a shape cast between them would be the tensor-sniffing this \
+     catalog replaced, so what is wanted is a gpt-oss Metal text";
 
 /// Trace this row's CUDA text for one fire class.
 #[cfg(feature = "forward")]

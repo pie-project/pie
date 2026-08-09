@@ -158,6 +158,7 @@ pub fn deployment(
     mixture: Option<Gemma4Mixture>,
     sliding_window: i32,
     norm_eps: f32,
+    k_eq_v: bool,
     load: Deployed<'_>,
 ) -> Deployment {
     let attention = (0..f.layers).map(|l| layer_attention(f, sliding_window, l)).collect();
@@ -181,6 +182,8 @@ pub fn deployment(
             // a dense 2112, so a planner told 704 for both would size the
             // forward workspace at a third of what the dense layers ask.
             moe_intermediate: mixture.map_or(0, |m| m.moe_intermediate),
+            experts_per_token: mixture.map_or(0, |m| m.experts_per_token),
+            shared_intermediate: 0,
             vocab: f.vocab,
         },
         attention,
@@ -192,6 +195,19 @@ pub fn deployment(
         logit_softcap: f.logit_softcap,
         ple_dim: i32::try_from(f.ple_dim).unwrap_or(0),
         norm: NormPlacement::Pre,
+        // THE EXCEPTION, and the reason this is a field rather than a
+        // reading of the placement: gemma-4 sandwiches its norms like
+        // every gemma before it and stores a plain multiplier anyway.
+        // `forward/mod.rs` fires `NormVariant::Plain` at all fourteen of
+        // its norm sites for the same reason.
+        norm_unit_offset: false,
+        // gemma-4 alone. A weightless per-head RMS over V, run
+        // before the KV write. See `Deployment::v_norm`.
+        v_norm: true,
+        // The ROW's, not the shape's: two gemma-4 checkpoints of one
+        // geometry disagree about it.
+        k_eq_v,
+        mlp_gate: crate::deployment::MlpGate::GeluTanh,
         scales: scales(f, load),
         // The ROW's, not the shape's: a family label and a context
         // ceiling are facts about a checkpoint and this sees geometry.
@@ -215,6 +231,11 @@ fn layer_attention(f: &Gemma4Facts, sliding_window: i32, l: u32) -> LayerAttenti
     let full = f.is_full_attn(l);
     LayerAttention {
         head_dim: f.head_dim_of(l),
+        // The other half of the head shape, and the reason this whole
+        // generation was refused: a full layer is 4x256 where a sliding
+        // one is 16x256 on the 31b, so a page sized at the sliding count
+        // runs three quarters past the end of a full layer's K.
+        kv_heads: f.kv_heads_of(l),
         // A full-attention layer sees the whole context. `max(0)` is the
         // driver's own clamp: a config stating no window means none, and
         // a negative one reaching a kernel as a length is a fault.
@@ -262,6 +283,194 @@ fn scales(f: &Gemma4Facts, load: Deployed<'_>) -> BTreeMap<String, f32> {
     scales
 }
 
+/// This row as the SHAPE `llama_like_metal` reads.
+///
+/// The sliding layers' widths, because that is what a shape holds: one
+/// `head_dim` and one `kv_heads`. The full layers' are per-layer facts
+/// and travel on [`metal_facts`] beside the window list that says which
+/// layers they belong to — the same split [`deployment`] makes, where
+/// `Geometry::head_dim` is the checkpoint's 256 and the 512 reaches a
+/// driver through `LayerAttention`.
+#[cfg(feature = "forward")]
+#[must_use]
+pub fn metal_shape(
+    f: &Gemma4Facts,
+    mixture: Option<Gemma4Mixture>,
+) -> crate::shared::llama_like::spec::LlamaLikeFacts {
+    use crate::shared::llama_like::spec::LlamaLikeFacts;
+    use model_compiler::facts::{NormPlacement as SpecNorm, QkNorm};
+    use model_compiler::trace::{NormVariant, RopeKind};
+
+    LlamaLikeFacts {
+        hidden: f.hidden,
+        layers: f.layers,
+        q_heads: f.q_heads,
+        kv_heads: f.kv_heads,
+        head_dim: f.head_dim,
+        n_experts: mixture.map_or(0, |m| m.num_experts),
+        experts_per_token: mixture.map_or(0, |m| m.experts_per_token),
+        moe_intermediate: mixture.map_or(0, |m| m.moe_intermediate),
+        // No shared expert: gemma-4's second branch is the DENSE MLP,
+        // which `dense_beside_moe` states, not an extra bank.
+        shared_intermediate: 0,
+        intermediate: f.intermediate,
+        vocab: f.vocab,
+        // Two plain bases, one per layer kind; `rope_theta_sliding`
+        // carries the second and `rope_theta_at` picks.
+        rope: RopeKind::Standard,
+        // PLAIN, and this is the exception `deployment` states as
+        // `norm_unit_offset: false`: gemma-4 sandwiches its norms like
+        // every gemma before it and stores a plain multiplier anyway.
+        // `forward/mod.rs` fires `NormVariant::Plain` at all fourteen of
+        // its norm sites for the same reason, and reading the FAMILY
+        // instead of the field is how every gemma-4 norm came out off by
+        // `(1 + w)/w`.
+        norm_variant: NormVariant::Plain,
+        norm_placement: SpecNorm::Sandwich,
+        qk_norm: QkNorm::PerHead,
+        // FALSE, unlike the CUDA row: no Metal deployment publishes a
+        // fused bank. Stated here as well as on `metal_facts` because
+        // `llama_like`'s SEMANTIC text reads this one.
+        fused_qkv: false,
+        tied_embeddings: f.tied_embeddings,
+        qkv_bias: false,
+    }
+}
+
+/// This row as the shape and the binding facts `llama_like_metal` reads.
+///
+/// # This replaces a refusal that was wrong about the text it named
+///
+/// `NO_METAL` stood here and said `llama_like_metal` "states the widths
+/// without the fused-projection split or the shared-cache attention
+/// built on them". It states all three. `LlamaLikeMetalFacts` carries
+/// `global_head_dim`,
+/// `global_kv_heads`, `full_partial_rotary`, `rope_theta_sliding`,
+/// `v_from_k`, `kv_shared_layers`, `per_layer_emb_dim`,
+/// `per_layer_scalar`, `embed_scale` and `dense_beside_moe`; the text
+/// reads them through `head_dim_at`/`kv_heads_at`/`rotary_dim_at`, and
+/// its own comments are measurements taken ON gemma-4-31b — "layer 17's
+/// k_proj lowered to `@151552w4096` and the fire's first NaN was at
+/// element 2048 of exactly that value".
+///
+/// What was true is that nothing PROJECTED this row into those facts.
+/// `driver-metal/src/model/text.rs` did, from tensor probes, and
+/// gemma-4-31b passed all twelve real-weight gates at 5d7e05526 —
+/// including `one_token_at_position_zero_agrees_with_mlx`. Deleting it
+/// in favour of the catalog moved the projection here and it was never
+/// written, so the refusal recorded the gap as a property of the text.
+///
+/// Every number below is the row's own, and the per-layer ones come off
+/// [`Gemma4Facts`]'s helpers — `is_full_attn`, `head_dim_of`,
+/// `kv_heads_of`, `kv_source` — which are the SAME helpers
+/// [`layer_attention`] uses. One list, asked twice, rather than two that
+/// can disagree about which layers are full.
+///
+/// That a row answers for ITSELF is the whole of what replaced
+/// `driver-metal`'s `LLAMA_LIKE` — an eleven-entry table of
+/// architecture STRINGS, reduced by a punctuation-stripping
+/// `canonical()`, consulted before any text was traced and free to
+/// disagree with what the tracer would actually do. It listed `gemma4`
+/// and omitted `gemma3`, whose text it models. A row that projects
+/// itself cannot disagree with a list, because there is no list; the
+/// refusal that briefly stood in its place could, and did.
+#[cfg(feature = "forward")]
+#[must_use]
+pub fn metal_facts(
+    f: &Gemma4Facts,
+    mixture: Option<Gemma4Mixture>,
+    sliding_window: i32,
+    norm_eps: f32,
+    k_eq_v: bool,
+    bind: &crate::catalog::MetalBinding,
+) -> crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts {
+    use crate::shared::llama_like::forward::facts::{Activation, LlamaLikeMetalFacts};
+    use model_compiler::dsl::{ScaleLayout, WeightRepr};
+
+    LlamaLikeMetalFacts {
+        // ── the LOAD's six, identical to the llama-like projection's ──
+        fuse_residual_gemv: bind.fuse_residual_gemv,
+        paged_multi_batch: bind.paged_multi_batch,
+        qmm_multi_batch: bind.qmm_multi_batch,
+        proj_repr: WeightRepr::Scaled {
+            layout: ScaleLayout::PerGroup,
+            group: bind.quant_group,
+            axis: 0,
+            zero_point: true,
+        },
+        affine_bits: bind.quant_bits,
+        moe_repr: bind.moe_mxfp4.then_some(WeightRepr::Mxfp4Marlin),
+        moe_bits: 4,
+        qmm_tile: crate::shared::llama_like::project::QMM_TILE,
+        // No Metal deployment publishes a fused bank; `compile_load_plan`
+        // authors with `Projections::InPlace`.
+        gate_up_fused: false,
+        qkv_fused: false,
+        rms_eps: norm_eps,
+        // The FULL layers' base is the model's, and the SLIDING layers'
+        // is the second one. Stating both is what lets `rope_theta_at`
+        // pick off the window list rather than a second list of its own.
+        rope_theta: ROPE_THETA_GLOBAL,
+        rope_theta_sliding: ROPE_THETA_LOCAL,
+        // The three that make this row's two attention shapes one text.
+        // `head_dim`/`kv_heads` on the shape are the SLIDING layers'; a
+        // full layer is twice as wide per head, carries a quarter the KV
+        // heads and rotates 128 of its 512 channels.
+        global_head_dim: f.global_head_dim,
+        global_kv_heads: f.global_kv_heads,
+        full_partial_rotary: if f.global_head_dim == 0 {
+            0.0
+        } else {
+            f64::from(f.global_rotary_dim) as f32 / f.global_head_dim as f32
+        },
+        // The ROW's, not the shape's: two gemma-4 checkpoints of one
+        // geometry disagree about it, which is why `deployment` takes it
+        // as a parameter and this does too.
+        v_from_k: k_eq_v,
+        // TRUE, and gemma-4 alone: a weightless per-head RMS over V, run
+        // before the KV write. There is no tensor to ask about it, so
+        // nothing in a checkpoint could ever contradict a wrong answer —
+        // which is why `Deployment::v_norm` is where it is stated.
+        v_norm: true,
+        // gemma-4 runs the dense MLP and the bank off the SAME
+        // post-attention residual and adds them, which is the five norms
+        // round one block its forward states.
+        dense_beside_moe: mixture.is_some(),
+        // TRUE, and asked of the row rather than the tensors: gemma-4-31b
+        // states `hidden_size_per_layer_input: 0` and has the scalar
+        // anyway, which is the trap the deleted probe fell into from the
+        // other side -- "the gemma-shaped fields are populated" and "has
+        // a PLE" are not the same question.
+        per_layer_scalar: f.ple_dim == 0,
+        // `sqrt(hidden)`, which the forward states as `sqrt_hidden`. A
+        // gemma that got no scale had a widest gathered value of 0.058
+        // where MLX's reference for the same snapshot is seventy times
+        // that.
+        embed_scale: (f64::from(f.hidden) as f32).sqrt(),
+        // ZERO, which is "derive `1/sqrt(head_dim)`" -- and gemma-4's
+        // per-layer table already states `sm_scale: 1.0` because Q and K
+        // are normed per head before the dot. The Metal text derives from
+        // the layer's OWN width, which is the same reading.
+        attn_scale: 0.0,
+        per_layer_emb_dim: f.ple_dim,
+        kv_shared_layers: f.kv_shared_layers,
+        logit_softcap: f.logit_softcap,
+        // gpt-oss's alone.
+        attn_sinks: false,
+        // The TANH approximation, not the erf one. The two agree to about
+        // 2% at the origin and diverge from there.
+        activation: Activation::Geglu,
+        // Two plain bases, both expressible; no rescaling ladder.
+        rope_freq_table: false,
+        // The per-layer window list every `*_at` reads to decide which
+        // layers are full. Built from `is_full_attn`, the same helper
+        // `layer_attention` uses, so the two cannot disagree.
+        window_left: (0..f.layers)
+            .map(|l| if f.is_full_attn(l) { -1 } else { sliding_window.max(0) })
+            .collect(),
+    }
+}
+
 /// Trace this row's CUDA text for one fire class.
 ///
 /// The backend facts are built HERE rather than held on the row, and the
@@ -301,7 +510,7 @@ mod tests {
     const NORM_EPS: f32 = 1e-6;
 
     fn e4b() -> crate::deployment::Deployment {
-        deployment(&Gemma4Facts::gemma_4_e4b(), None, E4B_WINDOW, NORM_EPS, Deployed::single())
+        deployment(&Gemma4Facts::gemma_4_e4b(), None, E4B_WINDOW, NORM_EPS, false, Deployed::single())
     }
 
     fn spec(m: &crate::manifest::Manifest, name: &str) -> crate::manifest::TensorSpec {
@@ -460,7 +669,7 @@ mod tests {
         assert_eq!(d.advertised, Advertised::default(), "the row fills this, not the projection");
         assert_eq!(
             d.towers,
-            Towers::default(),
+            crate::deployment::Towers::default(),
             "two rows of one shape ship different encoders, so a projection of the \
              shape cannot know which"
         );
@@ -481,6 +690,7 @@ mod tests {
             Some(Gemma4Mixture::gemma_4_26b_a4b()),
             1024,
             NORM_EPS,
+            false,
             Deployed::single(),
         );
         assert_eq!(routed.shape.intermediate, 2112, "the DENSE width stays in `intermediate`");
@@ -552,7 +762,7 @@ mod tests {
     /// `max(0)` turns "unstated" into "zero" rather than into garbage.
     #[test]
     fn an_unstated_window_clamps_to_zero_rather_than_reaching_a_kernel_negative() {
-        let d = deployment(&Gemma4Facts::gemma_4_e4b(), None, -1, NORM_EPS, Deployed::single());
+        let d = deployment(&Gemma4Facts::gemma_4_e4b(), None, -1, NORM_EPS, false, Deployed::single());
         assert_eq!(d.attention[0].window, 0, "a sliding layer with no stated window");
         assert_eq!(d.attention[5].window, -1, "a full layer still sees everything");
     }
@@ -607,7 +817,7 @@ mod tests {
             logit_softcap: 0.0,
             ..Gemma4Facts::gemma_4_e4b()
         };
-        let d = deployment(&f, None, 512, NORM_EPS, Deployed::single());
+        let d = deployment(&f, None, 512, NORM_EPS, false, Deployed::single());
         assert!(!d.shares_kv());
         for l in 0..4u32 {
             assert_eq!(d.attention[l as usize].kv_source, l);
@@ -663,7 +873,16 @@ mod tests {
             None,
             E4B_WINDOW,
             NORM_EPS,
-            Deployed { tp_size: 1, layer_scalars: &scalars },
+            false,
+            Deployed {
+                // Stated, not defaulted: this build's gemma-4 text is
+                // CUDA-only, and a row that fell through to a default
+                // backend would be the same silent assumption the
+                // deleted `LLAMA_LIKE` table made from the other side.
+                backend: crate::catalog::Backend::Cuda,
+                tp_size: 1,
+                layer_scalars: &scalars,
+            },
         );
         assert_eq!(loaded.scales.len(), 7);
         assert_eq!(loaded.scales["layer.0.ple_norm"], 0.5);
@@ -680,6 +899,7 @@ mod tests {
             Some(Gemma4Mixture::gemma_4_26b_a4b()),
             1024,
             NORM_EPS,
+            false,
             Deployed::single(),
         );
         assert_eq!(d.ple_dim, 0);
@@ -692,7 +912,7 @@ mod tests {
     #[test]
     fn the_second_geometry_schedules_its_last_layer_full() {
         let f = Gemma4Facts::gemma_4_e2b();
-        let d = deployment(&f, None, 512, NORM_EPS, Deployed::single());
+        let d = deployment(&f, None, 512, NORM_EPS, false, Deployed::single());
         assert_eq!(d.attention.len(), 35);
         assert_eq!(d.attention[34].head_dim, 512, "layer 34 is a full layer");
         assert_eq!(d.attention[34].window, -1);
@@ -703,5 +923,24 @@ mod tests {
         }
         assert_eq!(d.attention[15].kv_source, 13, "the last earlier sliding layer");
         assert_eq!(d.attention[34].kv_source, 14, "the last earlier full layer");
+    }
+
+    /// gemma-4 sandwiches its norms and stores a PLAIN multiplier, and it is
+    /// the only stack that does both.
+    ///
+    /// The row is the only place that can say so. Every driver that inferred
+    /// this from the norm placement got it wrong here and did not fail
+    /// loudly: `(1 + w)/w` is 1.002 where `w` is 444 and 1.38 where `w` is
+    /// 2.6, so the largest gains agreed to three digits while the ordinary
+    /// ones were off by a third.
+    #[test]
+    fn the_sandwich_does_not_imply_the_fold() {
+        for d in [e4b(), deployment(&Gemma4Facts::gemma_4_e2b(), None, 512, NORM_EPS, false, Deployed::single())] {
+            assert!(
+                !d.norm_unit_offset,
+                "gemma-4 stores the multiplier; `forward/mod.rs` fires \
+                 `NormVariant::Plain` at all fourteen of its norm sites"
+            );
+        }
     }
 }

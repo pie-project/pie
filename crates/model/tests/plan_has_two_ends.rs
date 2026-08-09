@@ -36,11 +36,11 @@ use model_compiler::trace::{FireClass, ForwardPlan, OpKind};
 /// diff. The `Decode` class alone, because both ends are class-invariant
 /// — a prefill has the same prologue and the same readout.
 fn plans() -> Vec<(&'static str, ForwardPlan)> {
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     vec![
         (
             "llama_like",
-            model::families::llama_like::forward::llama_like_cuda(
+            model::shared::llama_like::forward::llama_like_cuda(
                 &LlamaLikeFacts::qwen3_0_6b(),
                 &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
                 FireClass::Decode,

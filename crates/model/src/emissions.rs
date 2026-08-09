@@ -12,8 +12,8 @@
 //! along from the bin, because which digest corrected which guess is the
 //! history that explains the values.
 
-use crate::families::llama_like::forward::emit::emit_llama_like_cuda_inc;
-use crate::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use crate::shared::llama_like::forward::emit::emit_llama_like_cuda_inc;
+use crate::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use crate::qwen_3_5::forward::emit::emit_qwen35_cuda_inc;
 use crate::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
 

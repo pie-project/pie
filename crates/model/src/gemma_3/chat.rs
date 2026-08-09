@@ -1,7 +1,7 @@
 //! Gemma 3's chat template — which is also gemma-3n's, and therefore
-//! lives in [`families`](crate::families).
+//! lives in [`families`](crate::shared).
 //!
-//! The implementation moved to `families/gemma_chat.rs` unchanged. It had
+//! The implementation moved to `shared/gemma_chat.rs` unchanged. It had
 //! to: gemma-3n binds this same template, and a generation naming a
 //! sibling is the one thing `tests/sibling_isolation.rs` forbids —
 //! `Gemma3Variant` has carried a `Gemma3n` arm since the day it was
@@ -12,4 +12,4 @@
 //! path every caller spells, and moving a file is not a reason to make
 //! them spell a different one.
 
-pub use crate::families::gemma_chat::{Gemma3Instruct, Gemma3Variant};
+pub use crate::shared::gemma_chat::{Gemma3Instruct, Gemma3Variant};

@@ -10,7 +10,7 @@
 //! pointing at a template that lived in a SIBLING generation's
 //! directory. Three keys, three tables, and one of them reaching across
 //! an edge the isolation rule forbids — the template is
-//! [`crate::families::deepseek`] now, so this row names a family and not
+//! [`crate::shared::deepseek`] now, so this row names a family and not
 //! a sibling.
 //!
 //! The three tables also disagreed with the model. `dsv4_facts_from_hf`
@@ -238,17 +238,17 @@ impl Variant for Dsv4 {
     #[cfg(feature = "contract")]
     fn author(
         &self,
-        builder: &mut crate::builder::Builder<'_>,
+        builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::policy::Naming::Hf => contract::author_deepseek_v4(builder),
+            crate::shared::policy::Naming::Hf => contract::author_deepseek_v4(builder),
             // `MLX_ROWS` never held this generation, and the absence was
             // an `Ok(None)` the caller read as "no contract" — a silence
             // shaped exactly like a generation nobody had written yet.
             // Stated as the refusal it always was: an MLX conversion
             // would spell the experts some third way, and the shard rule
             // this generation carries is written against `.ffn.experts.`.
-            crate::policy::Naming::Mlx => crate::builder::fail(
+            crate::shared::policy::Naming::Mlx => crate::shared::builder::fail(
                 "deepseek-v4: no MLX authoring pass exists for this generation, \
                  so there is no name layout to author against",
             ),
@@ -257,18 +257,34 @@ impl Variant for Dsv4 {
 
     /// # Errors
     ///
-    /// Never, today: the text traces for both fire classes. The `Result`
-    /// is the trait's, and it is what lets [`Self::deployment`] refuse
-    /// before anything reaches here — a row whose store is unbuilt is
-    /// turned away at load, so this is only ever reached by a caller
-    /// that wants the declaration itself.
+    /// Whatever [`Self::deployment`] refuses, because it is asked first
+    /// and the two questions are one question: "does this build serve
+    /// this row". The text itself traces for both fire classes.
+    ///
+    /// It has to be asked here rather than assumed. This doc used to
+    /// claim "a row whose store is unbuilt is turned away at load, so
+    /// this is only ever reached by a caller that wants the declaration
+    /// itself" — but nothing sequenced the two calls, and the caller it
+    /// described was hypothetical. The row refused at the door and
+    /// handed out a fire anyway.
     #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        let _ = load;
+        // METAL, refused by name. `llama_like_metal` is the only Metal
+        // text in this build and it is not this model's — see
+        // [`project::NO_METAL`] for what it states instead and why
+        // reaching for it would trace a different model under this
+        // row's id. The refusal is stated HERE, at the row, rather than
+        // consulted from a list of architecture strings a driver keeps:
+        // a list is a fourth place for the answer to live and a fourth
+        // place for it to be wrong.
+        if let crate::catalog::Backend::Metal(_) = load.backend {
+            return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
+        }
+        self.deployment(load)?;
         Ok(project::trace(&self.shape, class))
     }
 
@@ -282,7 +298,7 @@ impl Variant for Dsv4 {
     /// wrong one generates past the end of its turn.
     #[cfg(feature = "chat")]
     fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(crate::families::deepseek::R1Instruct::new(tokenizer))
+        Arc::new(crate::shared::deepseek::R1Instruct::new(tokenizer))
     }
 }
 
@@ -397,14 +413,30 @@ mod tests {
     /// declaration exists, and this build cannot provision the store it
     /// needs. The family string is what the goldens are keyed on, so a
     /// rename here is a rename of every recorded plan.
+    ///
+    /// That distinction is real, and the call it belongs to is
+    /// [`project::trace`] — TOTAL, like `plan`, a fact about the row.
+    /// [`Variant::trace`] is the other thing: capability-gated, and it
+    /// must refuse exactly where the door does. This test used to ask
+    /// the gated one, which is how "the declaration exists" turned into
+    /// "the serving path hands out a fire for a row it just turned
+    /// away".
     #[cfg(feature = "forward")]
     #[test]
     fn the_declaration_traces_where_the_deployment_refuses() {
         use model_compiler::trace::FireClass;
         let v = row("deepseek-v4");
+        assert!(
+            v.deployment(Deployed::single()).is_err(),
+            "this test is about a row this build refuses; that is the premise",
+        );
         for (class, suffix) in [(FireClass::Decode, "decode"), (FireClass::Prefill, "prefill")] {
-            let plan = v.trace(class, Deployed::single()).expect("the text is written");
+            let plan = project::trace(&v.shape, class);
             assert_eq!(plan.family, format!("deepseek_v4.cuda.{suffix}"));
+            assert!(
+                v.trace(class, Deployed::single()).is_err(),
+                "the serving path must refuse where the door refused",
+            );
         }
     }
 
@@ -417,7 +449,7 @@ mod tests {
     #[test]
     fn an_mlx_checkpoint_is_refused_rather_than_authored_empty() {
         use crate::encoding::Encoding as StoredEncoding;
-        use crate::policy::{Naming, Policy};
+        use crate::shared::policy::{Naming, Policy};
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
@@ -428,7 +460,7 @@ mod tests {
 
         let mlx = Policy { naming: Naming::Mlx, ..Policy::default() };
         let mut b =
-            crate::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &mlx);
+            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &mlx);
         assert_eq!(b.naming(), Naming::Mlx);
         assert!(
             v.author(&mut b).is_err(),
@@ -440,7 +472,7 @@ mod tests {
         // checkpoint authors an empty contract without refusing.
         let hf = Policy::default();
         let mut b =
-            crate::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &hf);
+            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &hf);
         assert_eq!(b.naming(), Naming::Hf);
         assert!(v.author(&mut b).is_ok(), "the HF pass is the one this row has");
     }
@@ -540,5 +572,73 @@ mod tests {
             "a label can name many rows and never fewer; the moment it names fewer, \
              something is dispatching on the label again",
         );
+    }
+
+    /// A METAL load is refused BY NAME rather than traced as a llama.
+    ///
+    /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
+    /// table answered "does this build serve you" from an architecture
+    /// STRING reduced by `canonical()`, in a driver, before any text was
+    /// traced — so it could say yes to a row whose text does not exist
+    /// (it listed `gemma4`) and no to one whose text does (it omitted
+    /// `gemma3`). The row answers now, and what it answers with is a
+    /// sentence naming what is missing.
+    ///
+    /// The comparison is against [`project::NO_METAL`] itself and not a
+    /// paraphrase, so the sentence a caller is shown is the sentence
+    /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
+    #[cfg(feature = "forward")]
+    #[test]
+    fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
+        use crate::catalog::{Backend, Deployed, MetalBinding};
+        use crate::deployment::Refusal;
+        use model_compiler::trace::FireClass;
+
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+        };
+        assert!(!VARIANTS.is_empty());
+        for v in VARIANTS {
+            for class in [FireClass::Prefill, FireClass::Decode] {
+                let err = v
+                    .trace(class, Deployed::metal(&bind))
+                    .expect_err("this build has no Metal text for this generation");
+                assert_eq!(
+                    err,
+                    Refusal::Unsupported(project::NO_METAL),
+                    "`{}` refused a Metal load with a sentence that is not the \
+                     one the row states",
+                    v.id
+                );
+            }
+        }
+        // And the refusal is about the BACKEND and nothing else.
+        //
+        // Stated as "not the Metal sentence" rather than `is_ok()`,
+        // because this family's CUDA answer is not `Ok` either: MLA has
+        // no store in ANY build, `deployment` has always said so, and
+        // `trace` now asks it first instead of firing a text for a row
+        // the door already turned away. Asserting `is_ok()` here would
+        // make this test a second, quieter claim that the MLA store is
+        // built -- which is the coupling `Deployed::metal` exists to
+        // avoid. What "unchanged" means is that no CUDA caller ever sees
+        // a sentence about Metal.
+        for v in VARIANTS {
+            let cuda = v.trace(FireClass::Decode, Deployed::single());
+            assert_ne!(
+                cuda.as_ref().err(),
+                Some(&Refusal::Unsupported(project::NO_METAL)),
+                "`{}` answered a CUDA load with a sentence about Metal",
+                v.id
+            );
+        }
+        // A `Backend::Cuda` is what `Deployed::single()` states, so the
+        // arm above is reached by every existing caller unchanged.
+        assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }

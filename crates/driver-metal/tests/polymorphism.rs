@@ -32,8 +32,8 @@
 
 use std::collections::BTreeSet;
 
-use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-use model::families::llama_like::forward::llama_like_metal;
+use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Fire, Lowered, Row, Uncovered, lower};
 use model_compiler::trace::FireClass;
 

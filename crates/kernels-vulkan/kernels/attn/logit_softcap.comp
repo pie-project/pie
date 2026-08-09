@@ -1,0 +1,21 @@
+#version 450
+
+#include "common/bf16.glsl"
+
+// gemma4 final logit softcap. The old per-row vocabulary bound deliberately
+// stays unused: the Vulkan elementwise launch already is the whole extent.
+
+layout(local_size_x = 256) in;
+PIE_BUFFER_RO(0, Logits, logits);
+PIE_BUFFER_RW(1, Out, out_);
+
+struct SoftcapParams { float cap; uint unused; };
+layout(std430, binding = 2) readonly buffer Params { SoftcapParams p; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    float x = PIE_LOAD(logits[gid]);
+    out_[gid] = PIE_STORE(p.cap * tanh(x / p.cap));
+}
+
+// pie:instantiate logit_softcap_bfloat16

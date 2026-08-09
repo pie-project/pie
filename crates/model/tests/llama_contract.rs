@@ -34,11 +34,11 @@ use model_loader::plan::compile as compile_load_plan;
 use model_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use model_loader::verify::ContractView;
 
-use model::builder::Builder;
+use model::shared::builder::Builder;
 use model::catalog::{Deployed, LoadShape, Variant};
 use model::deployment::{Deployment, Refusal};
 use model::encoding::Encoding as StoredEncoding;
-use model::policy::Policy;
+use model::shared::policy::Policy;
 use model::contract::author;
 
 // ── the fixture checkpoint ──────────────────────────────────────────

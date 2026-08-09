@@ -77,9 +77,36 @@ fn workspace_root() -> PathBuf {
 /// `any(..)` gate is satisfiable more than one way, so it is recorded as no
 /// requirement rather than as a wrong one.
 fn module_gates(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
-    let src = std::fs::read_to_string(root.join("crates/model/src/lib.rs"))
-        .expect("model/src/lib.rs is readable");
     let mut gates = BTreeMap::new();
+    // TWO files, because the vocabulary a consumer names moved.
+    //
+    // It used to be one: `model::builder`, `model::policy` and the rest
+    // were `pub mod` lines in `lib.rs`, each carrying its own aspect
+    // gate, and reading that file was reading every gate. They live in
+    // `shared/` now, behind a `pub mod shared;` that is UNGATED — so a
+    // reader that stopped at `lib.rs` would resolve every
+    // `model::shared::builder` to "no requirement" and report nothing,
+    // forever. That is the disarmed-guard failure this file exists to
+    // prevent, arriving by a layout change rather than a code one.
+    //
+    // The inner modules are keyed `shared::<name>`, which is the path a
+    // consumer actually writes.
+    for (file, prefix) in [
+        ("crates/model/src/lib.rs", ""),
+        ("crates/model/src/shared/mod.rs", "shared::"),
+    ] {
+        read_gates_into(&mut gates, &std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|e| panic!("{file} is readable: {e}")), prefix);
+    }
+    gates
+}
+
+/// One file's `pub mod` lines, folded into the map under `prefix`.
+fn read_gates_into(
+    gates: &mut BTreeMap<String, BTreeSet<String>>,
+    src: &str,
+    prefix: &str,
+) {
     let mut pending: Option<String> = None;
     for line in src.lines() {
         let line = line.trim();
@@ -102,13 +129,12 @@ fn module_gates(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
                     }
                 }
             }
-            gates.insert(name.to_string(), needs);
+            gates.insert(format!("{prefix}{name}"), needs);
         }
         if !line.starts_with("///") && !line.starts_with("//") && !line.is_empty() {
             pending = None;
         }
     }
-    gates
 }
 
 /// The features a consumer's LIBRARY dependency on `model` declares.
@@ -139,7 +165,7 @@ fn declared_features(root: &Path, consumer: &str) -> BTreeSet<String> {
             entry.push_str(next.trim());
         }
         let mut features = BTreeSet::new();
-        if let Some(i) = entry.find("features") {
+        if let Some(i) = entry.find("features = [") {
             let rest = &entry[i..];
             if let (Some(a), Some(b)) = (rest.find('['), rest.find(']')) {
                 for part in rest[a + 1..b].split(',') {
@@ -150,9 +176,46 @@ fn declared_features(root: &Path, consumer: &str) -> BTreeSet<String> {
                 }
             }
         }
+        // A `features = [..]` list is what a consumer ADDS, not what it
+        // gets. Unless it opts out, cargo also turns on `default`, and a
+        // reader that ignored that would report a consumer wrong for a
+        // feature it holds — `engine` names `model::instruct`, declares
+        // only `forward`, and compiles, because `default = ["chat"]`.
+        //
+        // A guard that cries wolf gets deleted, and this one is worth
+        // keeping, so it has to read the same rule cargo does.
+        if !entry.contains("default-features = false") {
+            features.extend(default_features(root));
+        }
         return features;
     }
     panic!("{consumer}/Cargo.toml has no `model = ` line in [dependencies]");
+}
+
+/// The features `model` turns on when a consumer does not opt out.
+fn default_features(root: &Path) -> BTreeSet<String> {
+    let manifest = std::fs::read_to_string(root.join("crates/model/Cargo.toml"))
+        .expect("model/Cargo.toml is readable");
+    let mut section = String::new();
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            section = t.to_string();
+            continue;
+        }
+        if section != "[features]" || !t.starts_with("default = [") {
+            continue;
+        }
+        let (Some(a), Some(b)) = (t.find('['), t.find(']')) else {
+            break;
+        };
+        return t[a + 1..b]
+            .split(',')
+            .map(|p| p.trim().trim_matches('"').trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+    }
+    BTreeSet::new()
 }
 
 /// Every `model::<root>` used under a consumer's `src/`, with one file that
@@ -182,13 +245,31 @@ fn used_roots(root: &Path, consumer: &str) -> BTreeMap<String, String> {
                 let mut rest = code;
                 while let Some(i) = rest.find("model::") {
                     rest = &rest[i + 7..];
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
-                        .collect();
-                    if !name.is_empty() {
-                        used.entry(name).or_insert_with(|| shown.clone());
+                    let ident = |t: &str| -> String {
+                        t.chars()
+                            .take_while(|c| {
+                                c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_'
+                            })
+                            .collect()
+                    };
+                    let name = ident(rest);
+                    if name.is_empty() {
+                        continue;
                     }
+                    // `shared` is a door and not a module a gate hangs on, so
+                    // the name that matters is the one BEHIND it. Recording
+                    // `shared` alone would resolve every use of the authoring
+                    // DSL to the ungated outer module and report nothing.
+                    let name = if name == "shared" {
+                        let after = &rest[name.len()..];
+                        match after.strip_prefix("::").map(ident) {
+                            Some(inner) if !inner.is_empty() => format!("shared::{inner}"),
+                            _ => name,
+                        }
+                    } else {
+                        name
+                    };
+                    used.entry(name).or_insert_with(|| shown.clone());
                 }
             }
         }
@@ -249,38 +330,18 @@ fn the_gate_reader_still_finds_gates() {
         gates.len()
     );
     assert_eq!(
-        gates.get("weight_names").map(BTreeSet::len),
+        gates.get("shared::weight_names").map(BTreeSet::len),
         Some(1),
-        "`weight_names` is gated on `contract` alone"
-    );
-    // THE `any(..)` CASE, which is the one that decides whether a
-    // consumer gets reported wrong for a gate it satisfies.
-    //
-    // It used to be `deployment_cuda`, gated on `forward` AND `config`,
-    // where collecting both names and demanding both was right. Both
-    // that module and that feature are deleted, and the surviving
-    // multi-name gate is `families`, which is an `any(..)`. The rule
-    // INVERTS: `any(chat, forward)` is satisfied by either name, so
-    // recording it as a requirement of both would report both drivers
-    // wrong for a module they can see — each declares `forward`, and
-    // `driver-metal/src/model/text.rs` names `model::families` today.
-    //
-    // So the assertion is that the reader records it as NO requirement.
-    // `Some(empty)` rather than `None` is the whole point: `None` means
-    // the module was never seen, which reads as "no requirement" at the
-    // call site too and would disarm this module silently.
-    assert_eq!(
-        gates.get("families").map(BTreeSet::len),
-        Some(0),
-        "`families` is gated on `chat` OR `forward`; a reader that treats \
-         an `any(..)` as a requirement of every name in it reports a \
-         consumer wrong for a gate it satisfies"
+        "`weight_names` is gated on `contract` alone — and is keyed under \
+         `shared::` because that is the path a consumer writes"
     );
     assert!(
-        gates.contains_key("families"),
-        "`families` must be SEEN and recorded as unrequired, not missed — \
-         a module the reader never parsed also has no requirements, and \
-         the two are indistinguishable at the call site"
+        gates.contains_key("shared::builder"),
+        "the reader must descend into `shared/mod.rs`. Every module a \
+         consumer names for its vocabulary lives there now, behind an \
+         UNGATED `pub mod shared;` — a reader that stopped at lib.rs would \
+         resolve all of them to `shared`, find no requirement, and pass \
+         forever"
     );
     assert!(
         gates
@@ -288,5 +349,119 @@ fn the_gate_reader_still_finds_gates() {
             .is_some_and(std::collections::BTreeSet::is_empty),
         "`deployment` is ungated, and an ungated module must read as \
          no requirement rather than as absent"
+    );
+}
+
+/// THE `any(..)` CASE, asked of the reader directly.
+///
+/// This is the branch that decides whether a consumer gets reported
+/// wrong for a gate it satisfies: `any(chat, forward)` is satisfiable
+/// two ways, so recording it as a requirement of BOTH names would fail a
+/// driver for a module it can legitimately see.
+///
+/// It used to be pinned against real source — `deployment_cuda` was
+/// `all(forward, config)` and `families` was `any(chat, forward)`. Both
+/// are gone: `config` was deleted with the descriptor, and `families`
+/// became `shared/`, whose modules each carry a single-feature gate. No
+/// `any(..)` is left in the crate's surface.
+///
+/// So it is fed one. A branch with no live example is a branch that
+/// rots, and deleting the assertion instead would leave the code with
+/// nothing holding it — the same disarmed-guard shape the rest of this
+/// file is about. The input is spelled out here rather than found, which
+/// is the honest form of the claim: this is what the reader DOES, not
+/// what the tree happens to contain today.
+#[test]
+fn an_any_gate_reads_as_no_requirement_rather_than_as_both() {
+    let mut gates = BTreeMap::new();
+    read_gates_into(
+        &mut gates,
+        r#"
+#[cfg(any(feature = "chat", feature = "forward"))]
+pub mod either;
+#[cfg(all(feature = "chat", feature = "forward"))]
+pub mod both;
+#[cfg(feature = "contract")]
+pub mod one;
+pub mod ungated;
+"#,
+        "",
+    );
+
+    assert_eq!(
+        gates.get("either").map(BTreeSet::len),
+        Some(0),
+        "`any(..)` is satisfiable more than one way, so it is NO \
+         requirement — not a requirement of every name in it"
+    );
+    assert!(
+        gates.contains_key("either"),
+        "and it must be SEEN. `None` also reads as 'no requirement' at \
+         the call site, so a missed module and an unrequired one would be \
+         indistinguishable"
+    );
+    assert_eq!(
+        gates.get("both").map(BTreeSet::len),
+        Some(2),
+        "`all(..)` demands every name in it"
+    );
+    assert_eq!(gates.get("one").map(BTreeSet::len), Some(1));
+    assert_eq!(
+        gates.get("ungated").map(BTreeSet::len),
+        Some(0),
+        "an ungated module reads as no requirement rather than as absent"
+    );
+}
+
+/// The two halves of what a consumer actually holds.
+///
+/// `engine` is the live case: it declares `features = ["forward"]` and
+/// names `model::instruct`, which is gated on `chat`. It compiles,
+/// because it never wrote `default-features = false` and `default =
+/// ["chat"]`. `driver-cuda` is the other half — it opts out, so its
+/// list is the whole of it, and `chat` must NOT be granted to it.
+#[test]
+fn a_consumer_holds_the_defaults_it_did_not_opt_out_of() {
+    let root = workspace_root();
+    let defaults = default_features(&root);
+    assert!(
+        defaults.contains("chat"),
+        "model's `default` is where this rule gets its teeth; the reader \
+         found {defaults:?}"
+    );
+
+    assert!(
+        declared_features(&root, "engine").contains("chat"),
+        "`engine` does not opt out, so it holds `chat` whether or not it \
+         names it — reporting it wrong here is how this guard would earn \
+         its deletion"
+    );
+    assert!(
+        !declared_features(&root, "driver-cuda").contains("chat"),
+        "`driver-cuda` writes `default-features = false` precisely so a \
+         driver link carries no chat template. Granting it the defaults \
+         anyway would let that regress unnoticed"
+    );
+}
+
+/// The prefix is applied, so an inner module is keyed by the path a
+/// consumer writes.
+#[test]
+fn an_inner_module_is_keyed_under_its_door() {
+    let mut gates = BTreeMap::new();
+    read_gates_into(
+        &mut gates,
+        "#[cfg(feature = \"contract\")]\npub mod builder;\n",
+        "shared::",
+    );
+    assert_eq!(
+        gates.get("shared::builder").map(BTreeSet::len),
+        Some(1),
+        "`model::shared::builder` is what a consumer writes, so that is \
+         the key its gate has to hang on"
+    );
+    assert!(
+        !gates.contains_key("builder"),
+        "the bare name would collide with a root module of the same name"
     );
 }

@@ -3,7 +3,7 @@
 //! Uses channel-based formatting with analysis/final channels.
 //! Reasoning uses the `analysis` channel, not XML tags.
 
-use crate::decoders::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use tokenizer::Tokenizer;
 use std::sync::Arc;

@@ -10,8 +10,8 @@
 use model_loader::contract::Expr;
 use model_loader::error::Error;
 
-use crate::builder::{Builder};
-use crate::mlx;
+use crate::shared::builder::{Builder};
+use crate::shared::mlx;
 
 /// gemma4, gemma4_text.
 pub fn author_gemma4(b: &mut Builder<'_>) -> Result<(), Error> {

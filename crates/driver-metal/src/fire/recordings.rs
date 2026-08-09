@@ -7,7 +7,7 @@
 //! `driver-cuda`'s `SupergraphCache`. `.wiki/driver/real-metal-north-star.md`
 //! §5 names them one concept under two names and asks for this one.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::device::context::Context;
 use crate::device::recording::{Recording, record};
 use crate::device::regions::Regions;
@@ -30,6 +30,8 @@ pub struct Recordings {
     /// How many recordings have been made, for the test that asks whether
     /// the cache is a cache.
     recorded: usize,
+    /// The fingerprints that cannot be recorded, and why.
+    refused: std::collections::HashMap<u64, String>,
 }
 
 impl Recordings {
@@ -53,14 +55,36 @@ impl Recordings {
         dispatches: &[Dispatch<'_>],
     ) -> Result<&Recording> {
         let key = fingerprint(dispatches, params);
+        // REFUSED ONCE, not once a step. A fire that cannot be recorded --
+        // an operand in no registered allocation, or a weight more than
+        // 4 GiB into its buffer -- is refused for a reason that does not
+        // change while the addresses do not, and `commands` allocates one
+        // vector per dispatch before it can be asked. Remembering the refusal
+        // is what keeps a large checkpoint from paying 425 allocations every
+        // step to be told the same thing.
+        if let Some(why) = self.refused.get(&key) {
+            return Err(Error::Unrecordable {
+                what: "fire",
+                message: why.clone(),
+            });
+        }
         if let std::collections::hash_map::Entry::Vacant(slot) = self.by_fingerprint.entry(key) {
             // Lowered on a MISS only. `commands` allocates one vector per
             // dispatch, and a hit is the path that matters -- it exists to
             // skip the encode, so putting 425 allocations in front of it
             // would spend part of what recording buys.
             let commands = commands(pipelines, params, dispatches)?;
-            slot.insert(record(context, regions, &commands)?);
-            self.recorded += 1;
+            match record(context, regions, &commands) {
+                Ok(recording) => {
+                    slot.insert(recording);
+                    self.recorded += 1;
+                }
+                Err(err @ Error::Unrecordable { .. }) => {
+                    self.refused.insert(key, err.to_string());
+                    return Err(err);
+                }
+                Err(other) => return Err(other),
+            }
         }
         Ok(&self.by_fingerprint[&key])
     }
@@ -78,6 +102,9 @@ impl Recordings {
     /// would catch it, and this makes the intent visible.
     pub fn clear(&mut self) {
         self.by_fingerprint.clear();
+        // The refusals too: a refusal is a statement about where the operands
+        // are, and a reload is exactly the event that moves them.
+        self.refused.clear();
     }
 }
 

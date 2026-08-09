@@ -10,9 +10,9 @@ use model_loader::contract::{Expr, GroupContract, Scales, TensorContract};
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding, QuantGranularity, RepackLayout, ScaleForm, TensorId};
 
-use crate::builder::{Builder, align_up, is_raw, mxfp4_encoding};
-use crate::mlx;
-use crate::policy::Mxfp4MoePolicy;
+use crate::shared::builder::{Builder, align_up, is_raw, mxfp4_encoding};
+use crate::shared::mlx;
+use crate::shared::policy::Mxfp4MoePolicy;
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))

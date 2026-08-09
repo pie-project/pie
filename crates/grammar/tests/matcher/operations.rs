@@ -128,8 +128,7 @@ fn test_accept_string_rejection() {
 fn test_bitmask_simple_choices() {
     let mut m = make_matcher(r#"root ::= "ab" | "cd""#, "root", &["ab", "cd", "ef"]);
 
-    let mut bm = vec![0u32; bitmask::bitmask_size(3)];
-    m.fill_next_token_bitmask(&mut bm);
+    let bm = m.fill_next_token_mask();
 
     assert!(bitmask::get_bit(&bm, 0)); // "ab" allowed
     assert!(bitmask::get_bit(&bm, 1)); // "cd" allowed
@@ -144,10 +143,8 @@ fn test_bitmask_after_partial_accept() {
         &["a", "ab", "abc", "b", "bc", "c"],
     );
 
-    let mut bm = vec![0u32; bitmask::bitmask_size(6)];
-
     // Initially, tokens starting with "a" should be valid
-    m.fill_next_token_bitmask(&mut bm);
+    let mut bm = m.fill_next_token_mask();
     assert!(bitmask::get_bit(&bm, 0)); // "a"
     assert!(bitmask::get_bit(&bm, 1)); // "ab"
     assert!(bitmask::get_bit(&bm, 2)); // "abc"
@@ -157,7 +154,7 @@ fn test_bitmask_after_partial_accept() {
 
     // After accepting "a", need tokens continuing "bc"
     m.accept_token(0); // "a"
-    m.fill_next_token_bitmask(&mut bm);
+    bm = m.fill_next_token_mask();
     assert!(!bitmask::get_bit(&bm, 0)); // "a" — no
     assert!(!bitmask::get_bit(&bm, 1)); // "ab" — no
     assert!(!bitmask::get_bit(&bm, 2)); // "abc" — no
@@ -175,8 +172,7 @@ fn test_bitmask_stop_tokens() {
         vec![3], // <eos> is stop token
     );
 
-    let mut bm = vec![0u32; bitmask::bitmask_size(4)];
-    m.fill_next_token_bitmask(&mut bm);
+    let mut bm = m.fill_next_token_mask();
 
     assert!(bitmask::get_bit(&bm, 0)); // "a"
     assert!(bitmask::get_bit(&bm, 1)); // "ab"
@@ -185,7 +181,7 @@ fn test_bitmask_stop_tokens() {
 
     // After "a", grammar can terminate
     m.accept_token(0);
-    m.fill_next_token_bitmask(&mut bm);
+    bm = m.fill_next_token_mask();
     assert!(bitmask::get_bit(&bm, 2)); // "b" — completes "ab"
     assert!(bitmask::get_bit(&bm, 3)); // <eos> — grammar can stop
 }
@@ -200,8 +196,7 @@ fn test_bitmask_many_tokens() {
         ],
     );
 
-    let mut bm = vec![0u32; bitmask::bitmask_size(10)];
-    m.fill_next_token_bitmask(&mut bm);
+    let bm = m.fill_next_token_mask();
 
     // Tokens for "true", "false", "null" should be accepted
     assert!(bitmask::get_bit(&bm, 0)); // "t"
@@ -401,23 +396,21 @@ fn test_jump_forward_does_not_advance_parser() {
 fn test_accept_rollback_bitmask() {
     let mut m = make_matcher(r#"root ::= "abc""#, "root", &["a", "b", "c", "x"]);
 
-    let mut bm = vec![0u32; bitmask::bitmask_size(4)];
-
     // Initial bitmask
-    m.fill_next_token_bitmask(&mut bm);
+    let mut bm = m.fill_next_token_mask();
     assert!(bitmask::get_bit(&bm, 0)); // "a"
     assert!(!bitmask::get_bit(&bm, 1)); // "b"
     assert!(!bitmask::get_bit(&bm, 3)); // "x"
 
     // Accept "a"
     m.accept_token(0);
-    m.fill_next_token_bitmask(&mut bm);
+    bm = m.fill_next_token_mask();
     assert!(!bitmask::get_bit(&bm, 0)); // "a"
     assert!(bitmask::get_bit(&bm, 1)); // "b"
 
     // Rollback "a"
     m.rollback(1);
-    m.fill_next_token_bitmask(&mut bm);
+    bm = m.fill_next_token_mask();
     assert!(bitmask::get_bit(&bm, 0)); // "a" again valid
     assert!(!bitmask::get_bit(&bm, 1)); // "b" invalid again
 }
@@ -442,8 +435,7 @@ fn test_multitoken_string() {
 fn test_char_class_star_bitmask() {
     let mut m = make_matcher(r#"root ::= [a-z]*"#, "root", &["a", "b", "abc", "1", "A"]);
 
-    let mut bm = vec![0u32; bitmask::bitmask_size(5)];
-    m.fill_next_token_bitmask(&mut bm);
+    let bm = m.fill_next_token_mask();
 
     assert!(bitmask::get_bit(&bm, 0)); // "a"
     assert!(bitmask::get_bit(&bm, 1)); // "b"
@@ -465,8 +457,7 @@ subject ::= "world" | "there"
         &["hi", "hello", "hey", " ", "world", "there", "x"],
     );
 
-    let mut bm = vec![0u32; bitmask::bitmask_size(7)];
-    m.fill_next_token_bitmask(&mut bm);
+    let mut bm = m.fill_next_token_mask();
 
     assert!(bitmask::get_bit(&bm, 0)); // "hi"
     assert!(bitmask::get_bit(&bm, 1)); // "hello"
@@ -475,12 +466,12 @@ subject ::= "world" | "there"
     assert!(!bitmask::get_bit(&bm, 6)); // "x"
 
     m.accept_token(0); // "hi"
-    m.fill_next_token_bitmask(&mut bm);
+    bm = m.fill_next_token_mask();
     assert!(bitmask::get_bit(&bm, 3)); // " "
     assert!(!bitmask::get_bit(&bm, 0)); // "hi" — no
 
     m.accept_token(3); // " "
-    m.fill_next_token_bitmask(&mut bm);
+    bm = m.fill_next_token_mask();
     assert!(bitmask::get_bit(&bm, 4)); // "world"
     assert!(bitmask::get_bit(&bm, 5)); // "there"
     assert!(!bitmask::get_bit(&bm, 0)); // "hi" — no
@@ -536,16 +527,12 @@ fn test_json_rollback_and_bitmask_consistency() {
         &["{", "}", "\"", "a", ":", "1", ",", " "],
     );
 
-    let vocab_size = 8;
-    let bm_size = bitmask::bitmask_size(vocab_size);
-
     // Accept "{" then "\""
     assert!(m.accept_token(0)); // "{"
     assert!(m.accept_token(2)); // "\""
 
     // Record bitmask after two tokens
-    let mut bm_after = vec![0u32; bm_size];
-    m.fill_next_token_bitmask(&mut bm_after);
+    let bm_after = m.fill_next_token_mask();
 
     // Rollback both
     m.rollback(2);
@@ -555,8 +542,7 @@ fn test_json_rollback_and_bitmask_consistency() {
     assert!(m.accept_token(2)); // "\""
 
     // Verify bitmask matches
-    let mut bm_again = vec![0u32; bm_size];
-    m.fill_next_token_bitmask(&mut bm_again);
+    let bm_again = m.fill_next_token_mask();
 
     assert_eq!(
         bm_after, bm_again,
@@ -615,8 +601,7 @@ fn test_bitmask_larger_vocab_size() {
 
     let mut m = make_matcher(r#"root ::= "{""#, "root", &vocab);
 
-    let mut bm = vec![0u32; bitmask::bitmask_size(64)];
-    m.fill_next_token_bitmask(&mut bm);
+    let bm = m.fill_next_token_mask();
 
     // Only token 0 ("{") should be accepted
     assert!(bitmask::get_bit(&bm, 0));

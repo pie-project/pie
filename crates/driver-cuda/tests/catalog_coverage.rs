@@ -205,3 +205,183 @@ mod fire_class {
     }
 
 }
+
+/// The GQA group sizes this build's decode instantiates, and the rows
+/// they exclude.
+///
+/// A SECOND kind of unservable, and a later one: these rows project a
+/// `Deployment` fine — the shape is ordinary, the KV is paged, the
+/// author is written — and `serve::load` refuses them anyway because
+/// FlashInfer's decode was never instantiated at their ratio.
+///
+/// It is stated here rather than left to be discovered because the
+/// alternative is worse than a refusal. `refuse_unservable_gqa` asked
+/// this at HEAD and the catalog refactor dropped it on the floor: the
+/// check moved to `Deployment::servable_by` and, for one commit, nobody
+/// called it. An uninstantiated ratio reaching the decode is not a
+/// refusal but a THROW crossing the C ABI, which is undefined
+/// behaviour — so the cost of forgetting this is not a bad error
+/// message.
+///
+/// A line leaves by someone instantiating the group size in the kernel
+/// build, at which point `DECODE_GQA_GROUPS` grows and this test fails
+/// pointing at the line to delete.
+const UNSERVABLE_GQA: &[&str] = &[
+    // 40 over 8 is a group of five.
+    "olmo-3-32b",
+    "qwen2.5-14b",
+    "qwen2.5-32b",
+    "qwen3-14b",
+    // 14 over 2 and 28 over 4 are both seven.
+    "qwen2.5-0.5b",
+    "qwen2.5-7b",
+    // Twelve over two, which the `servable_by` doc names.
+    "qwen2.5-1.5b",
+    // 24 over 4 is six — the doc's OTHER named example, and the one
+    // that proves this is not the llama lineage's business: qwen3.6-27b
+    // is a GDN hybrid, reaching the same decode from a different
+    // generation with the same unservable ratio.
+    "qwen3.6-27b",
+    // 64 over 4 is sixteen.
+    "qwen3-235b-a22b",
+];
+
+#[test]
+fn every_deployable_row_is_servable_by_this_builds_decode_or_is_stated() {
+    use model::shared::llama_like::project::DECODE_GQA_GROUPS;
+
+    let stated: BTreeSet<&str> = UNSERVABLE_GQA.iter().copied().collect();
+    let mut refused: BTreeSet<&str> = BTreeSet::new();
+    let mut checked = 0usize;
+    for row in catalog::catalog() {
+        // Only rows that GET to the question. A row refused for its KV
+        // shape never reaches `servable_by`, and listing it here would
+        // record one gap as two.
+        let Ok(d) = row.deployment(Deployed::single()) else { continue };
+        checked += 1;
+        if d.servable_by(DECODE_GQA_GROUPS).is_err() {
+            refused.insert(row.id());
+        }
+    }
+
+    assert!(
+        checked > 20,
+        "only {checked} rows projected a deployment, so this audit is \
+         asking almost nothing"
+    );
+
+    let unstated: Vec<&str> = refused.difference(&stated).copied().collect();
+    assert!(
+        unstated.is_empty(),
+        "these rows deploy but this build's decode has no kernel at their \
+         GQA ratio, and nothing says so: a checkpoint matching one loads \
+         through every other check and is refused at the last door. State \
+         them or instantiate the group size: {unstated:?}"
+    );
+
+    let stale: Vec<&str> = stated.difference(&refused).copied().collect();
+    assert!(
+        stale.is_empty(),
+        "these rows are listed as unservable at their GQA ratio but this \
+         build serves them; delete their lines: {stale:?}"
+    );
+}
+
+/// The set this build states must be the set the refusal uses.
+///
+/// Pinned because `DECODE_GQA_GROUPS` is what makes the list above
+/// meaningful: a set that quietly grew to include everything would empty
+/// the list and pass, having stopped asking.
+#[test]
+fn the_instantiated_set_is_the_one_the_kernels_were_built_for() {
+    use model::shared::llama_like::project::DECODE_GQA_GROUPS;
+    assert_eq!(
+        DECODE_GQA_GROUPS,
+        &[1, 2, 3, 4, 8],
+        "FlashInfer's decode instantiations; changing this without changing \
+         the kernel build is how a throw reaches the C ABI"
+    );
+}
+
+/// The rows whose norm gain is stored as an OFFSET FROM ONE, so that
+/// firing the norm means `(1 + w) * x`.
+///
+/// Stated as a set for the same reason `NOT_YET_SERVABLE` is: the fact
+/// used to be READ OFF the norm placement, and that reading is wrong for
+/// exactly one published family. gemma-1, -2, -3 and -3n pair the
+/// sandwich with the offset; gemma-4 publishes the sandwich and stores a
+/// plain multiplier. A derivation cannot tell those apart, so every row
+/// answers and this list is the answer collected.
+///
+/// It did not fail loudly when it was derived, which is why a list is
+/// worth its maintenance. `(1 + w)/w` is 1.002 where `w` is 444 and 1.38
+/// where `w` is 2.6, so the largest gains agreed to three digits while
+/// the ordinary ones were off by a third — finite, plausible, wrong.
+const FOLDS_UNIT_OFFSET: &[&str] = &[
+    "gemma-2-2b",
+    "gemma-2-9b",
+    "gemma-2-27b",
+    "gemma-3-1b",
+    "gemma-3-4b",
+    "gemma-3-12b",
+    "gemma-3-27b",
+    "gemma-3n-e2b",
+    "gemma-3n-e4b",
+];
+
+/// Every deployable row's fold is the one this list states.
+///
+/// A new generation cannot join the catalog without landing on one side
+/// of this: either its id appears here or it is asserted not to fold.
+/// That is the whole point — the previous arrangement let a family
+/// inherit an answer nobody wrote down.
+#[test]
+fn the_norm_fold_is_stated_by_every_row_and_derived_by_none() {
+    let stated: BTreeSet<&str> = FOLDS_UNIT_OFFSET.iter().copied().collect();
+    let mut folds: BTreeSet<&str> = BTreeSet::new();
+    for row in catalog::catalog() {
+        if let Ok(d) = row.deployment(Deployed::single()) {
+            if d.norm_unit_offset {
+                folds.insert(row.id());
+            }
+        }
+    }
+
+    let unstated: Vec<&str> = folds.difference(&stated).copied().collect();
+    assert!(
+        unstated.is_empty(),
+        "these rows fold `(1 + w)` and are not stated to: {unstated:?}"
+    );
+    let stale: Vec<&str> = stated.difference(&folds).copied().collect();
+    assert!(
+        stale.is_empty(),
+        "these rows are stated to fold and do not: {stale:?}"
+    );
+}
+
+/// gemma-4 is the exception, and it is the reason the field exists.
+///
+/// Kept separate from the set above so that the ONE row that breaks the
+/// placement inference is named in a test of its own. A regression here
+/// is a whole generation served with a fold its checkpoint never asked
+/// for, and the failure is silent.
+#[test]
+fn gemma_4_sandwiches_its_norms_without_folding_them() {
+    let mut checked = 0;
+    for row in catalog::catalog() {
+        if !row.id().starts_with("gemma-4") {
+            continue;
+        }
+        let Ok(d) = row.deployment(Deployed::single()) else {
+            continue;
+        };
+        assert!(
+            !d.norm_unit_offset,
+            "`{}` must store a plain multiplier: `gemma_4/forward/mod.rs` \
+             fires `NormVariant::Plain` at all fourteen of its norm sites",
+            row.id()
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "the gemma-4 rows are gone; this test is now vacuous");
+}

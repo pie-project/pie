@@ -72,9 +72,9 @@ pub struct Shape {
     /// One full-attention layer every `full_attn_every`, or zero for a stack
     /// that does not alternate.
     ///
-    /// The same rule `model::text` derives `window_left` from, so the pool
-    /// and the text agree about which layers are full without a second list
-    /// to keep in step.
+    /// The same rule the row's own Metal text derives `window_left` from, so
+    /// the pool and the text agree about which layers are full without a
+    /// second list to keep in step.
     pub full_attn_every: u32,
 }
 

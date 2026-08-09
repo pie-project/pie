@@ -1,0 +1,56 @@
+#version 450
+
+#include "common/bf16.glsl"
+
+// The contiguous and paged KV appends share one binding contract and one scatter.
+// Scalars move to push constants, which is what pulls the paged write page and
+// offset down to bindings 10 and 11: the row keeps the Metal ring ABI's
+// placeholder operands (`ring_4` .. `ring_15`) so the two tables stay
+// comparable, but `kernels_vulkan::bindings()` numbers BUFFERS densely and
+// sends `head_dim`, `page_size` and `n_kv_heads` to the push block instead, so
+// the buffer run closes up by three.
+//
+// These read 9 and 10 until a SPIR-V-level audit compared the compiled
+// `OpDecorate Binding` set against the table: off by one, which would have made
+// the shader read `ring_11` as the write page and the write page as the offset.
+// Do not renumber these by hand -- ask
+// `cargo run --example dump_layout -- kv_append_paged`.
+
+layout(local_size_x = 256) in;
+PIE_BUFFER_RO(0, KNew, k_new);
+PIE_BUFFER_RO(1, VNew, v_new);
+PIE_BUFFER_RW(2, KDst, k_dst);
+PIE_BUFFER_RW(3, VDst, v_dst);
+
+#if defined(PIE_PAGED)
+layout(std430, binding = 10) readonly buffer WPage { uint w_page[]; };
+layout(std430, binding = 11) readonly buffer WOff { uint w_off[]; };
+layout(push_constant) uniform Push { int head_dim; int page_size; int n_kv_heads; } pc;
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    uint h = gl_GlobalInvocationID.y;
+    uint i = gl_GlobalInvocationID.z;
+    if (d >= uint(pc.head_dim)) return;
+    uint row_stride = uint(pc.n_kv_heads) * uint(pc.head_dim);
+    uint slot = w_page[i] * uint(pc.page_size) + w_off[i];
+    uint dst = slot * row_stride + h * uint(pc.head_dim) + d;
+    uint src = i * row_stride + h * uint(pc.head_dim) + d;
+    k_dst[uint(dst)] = k_new[src];
+    v_dst[uint(dst)] = v_new[src];
+}
+#else
+layout(std430, binding = 4) readonly buffer Pos { int pos[]; };
+layout(push_constant) uniform Push { int head_dim; PIE_STRIDE k_head_stride; PIE_STRIDE k_seq_stride; } pc;
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    uint h = gl_GlobalInvocationID.y;
+    if (d >= uint(pc.head_dim)) return;
+    uint dst = h * PIE_LOW(pc.k_head_stride) + uint(pos[0]) * PIE_LOW(pc.k_seq_stride) + d;
+    uint src = h * uint(pc.head_dim) + d;
+    k_dst[uint(dst)] = k_new[src];
+    v_dst[uint(dst)] = v_new[src];
+}
+#endif
+
+// pie:instantiate kv_append_bfloat16
+// pie:instantiate kv_append_paged_bfloat16 PIE_PAGED=1

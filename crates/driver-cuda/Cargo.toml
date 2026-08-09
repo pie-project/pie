@@ -63,7 +63,12 @@ _cuda = ["dep:cudarc"]
 # bridge needs the CUDA toolkit at BUILD time (real `cuda_runtime.h`, nvcc
 # for the archive), and this crate's toolkit-free build — cudarc resolves
 # symbols by `dlopen`, nothing links — is load-bearing for CI.
-bridge = ["dep:kernels-cuda"]
+#
+# `kernels-cuda/native` rather than `dep:kernels-cuda`: the table itself is
+# now a plain dependency (see `[dependencies]`), because `bind::launch` reads
+# a row's launch rule with no shim in the build. What `bridge` adds is the
+# ARCHIVE, which is that crate's `native` feature and nothing else.
+bridge = ["kernels-cuda/native"]
 
 # Phase D's door: the thirteen `pie_cuda_*` exports the engine binds
 # (retirement plan — "the cutover boundary, measured"). Implies `bridge`
@@ -193,8 +198,9 @@ driver-api = { path = "../driver-api", optional = true }
 model-loader = { path = "../model-loader", optional = true }
 
 # The boot config `create` receives as `config_bytes` — the C++ shell
-# parses the same TOML with toml++; `[model] descriptor` is where an HF
-# snapshot's descriptor path arrives.
+# parses the same TOML with toml++; `[model] id` names the catalog row
+# and `[model] config` points at the snapshot's own `config.json`, read
+# for the one field a row does not hold: the declared quantization.
 # NOT optional. `boot.rs` parses the driver's knobs out of the boot
 # TOML, and that is portable — it is text, and the answers it produces
 # size things in `layout/`. Making it optional put the one place this
@@ -205,9 +211,23 @@ toml = "1.1"
 # table also builds `libpie_kernels_cuda.a` (its `native` feature, CMake +
 # nvcc) and publishes the link-search paths. The `-l` directives are OURS to
 # emit, in build.rs, because a static archive must follow the shim that
-# references it on the link line. Optional so that without `bridge` the
-# archive build is not even in the graph.
-kernels-cuda = { path = "../kernels-cuda", default-features = false, features = ["native"], optional = true }
+# references it on the link line.
+#
+# `default-features = false` and NOT optional, which is the change Tier A
+# made and the dev-dependency below predicted: *"This moves to
+# `[dependencies]` when the first launcher is actually called."* It is
+# called now. `bind::device` resolves a row's `pie_g_*` entry point AT RUN
+# TIME, so the driver cannot load a kernel image without the table that says
+# which kernels are in it -- the same argument, in the same words,
+# `driver-metal` makes about `kernels-metal`. Table-only costs no nvcc: what
+# `bridge` turns on is `native`, above.
+kernels-cuda = { path = "../kernels-cuda", default-features = false }
+
+# The kernel contract vocabulary: `KernelSig`, `Ty`, and `LaunchRule` -- the
+# grid shape a row states, which `bind::launch` evaluates. A regular
+# dependency for the reason `driver-metal` states: a driver that dispatches
+# by reading a row cannot do it without the words a row is written in.
+kernels = { path = "../kernels" }
 
 # The launch ABI pilot reads the kernel table and generates both halves of the
 # flat entry points from it (`kernels_cuda::abi`). A dev-dependency rather
@@ -413,4 +433,11 @@ required-features = ["_cuda", "abi"]
 
 [[test]]
 name = "shape_analysis"
+required-features = ["_cuda"]
+
+# Tier A: the device-entry pilot. `_cuda` alone and NOT `bridge` -- the whole
+# claim is that a kernel can be launched with no shim in the build, so a test
+# that needed one would not be testing it.
+[[test]]
+name = "tier_a_pilot"
 required-features = ["_cuda"]

@@ -1,0 +1,24 @@
+// Per-layer scalar multiply: `out = x * scalar[0]`.
+//
+// The Metal port's important finding is preserved: the grid is the extent. The
+// params struct stays bound for ABI compatibility, but it is not a second bound
+// on the dispatch because prefill rows would otherwise be skipped.
+
+#version 450
+
+#include "common/bf16.glsl"
+#include "norm/rms_params.glsl"
+
+layout(local_size_x = 256) in;
+
+PIE_BUFFER_RO(0, X, x);
+PIE_BUFFER_RO(1, Scalar, scalar);
+PIE_BUFFER_RW(2, Out, out_);
+layout(std430, binding = 3) readonly buffer Params { LayerScalarParams p; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    out_[gid] = PIE_STORE(PIE_LOAD(x[gid]) * PIE_LOAD(scalar[0]));
+}
+
+// pie:instantiate layer_scalar_mul_bfloat16

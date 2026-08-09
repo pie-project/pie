@@ -1,7 +1,7 @@
 //! The three projections a Kimi K2 row makes: its tensor manifest, its
 //! `Deployment`, and its traced text.
 //!
-//! Mirrors `families/llama_like/project.rs`, and differs from it in the
+//! Mirrors `shared/llama_like/project.rs`, and differs from it in the
 //! one place this lineage differs: the attention is MULTI-HEAD LATENT,
 //! so the tensors are not `{q,k,v}_proj` and the cache row is not a
 //! head-split key. Every extent below is still the row's own arithmetic
@@ -32,10 +32,7 @@ use super::spec::KimiFacts;
 /// names an MLA dispatch there is nothing to point it at.
 #[must_use]
 pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    match kv {
-        KvStyle::Paged => true,
-        KvStyle::Mla { .. } | KvStyle::Dsv4 { .. } => false,
-    }
+    kv.has_a_store_in_this_build()
 }
 
 /// This row's tensors.
@@ -196,6 +193,9 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
     let sm_scale = 1.0 / (a.qk_head_dim() as f32).sqrt();
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
+            // One shape for every layer, which is what this row was
+            // already saying by having no per-layer count.
+            kv_heads: 1,
             head_dim: page_row,
             // Kimi K2 attends the whole context; a sliding window is
             // DeepSeek-V4's, and it says so on its own row.
@@ -234,6 +234,8 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
             // both layer kinds share — so both are stated and the
             // planner takes the wider.
             moe_intermediate: f.moe.moe_intermediate,
+            experts_per_token: f.moe.top_k,
+            shared_intermediate: f.moe.shared_intermediate,
             vocab: f.vocab,
         },
         attention,
@@ -251,6 +253,11 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
         logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
+        // Not a gemma: the gain is the multiplier, stored directly.
+        norm_unit_offset: false,
+        v_norm: false,
+        k_eq_v: false,
+        mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // From the ROW, not from the shape: a family label and a
         // published context ceiling are facts about a checkpoint, and a
@@ -275,6 +282,37 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
 pub fn cuda_facts(rope_yarn_original: bool) -> super::forward::facts::KimiCudaFacts {
     super::forward::facts::KimiCudaFacts { q_kv_a_fused: true, rope_yarn_original }
 }
+
+/// Why this build has no Metal text for a kimi-k2 row.
+///
+/// A `const` so the test that asserts the refusal NAMES the missing
+/// thing compares against the same string the caller is shown, rather
+/// than against a paraphrase that can drift away from it — the shape
+/// `csm::project::NO_TRACE` set for the same reason.
+///
+/// Its forward is `kimi_cuda`: MLA over a compressed latent,
+/// one planned dispatch per fire, with YaRN on the decoupled rotary
+/// half. `llama_like_metal` states dense paged attention over full
+/// K and V, which is a different cache and a different kernel.
+///
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine, and a pie whose Metal half had this text would serve the same
+/// row unchanged. What is missing is a TEXT in this build, which is a
+/// fact about the build.
+///
+/// Stating it is the whole of what replaces `driver-metal`'s
+/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
+/// reduced by a punctuation-stripping `canonical()`, consulted before
+/// any text was traced and free to disagree with what the tracer would
+/// actually do. It listed `gemma4`, which the load path refused on
+/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// that answers for itself cannot disagree with a list, because there
+/// is no list.
+pub const NO_METAL: &str = "kimi-k2 has no Metal text in this build: its forward is `kimi_cuda` — latent \
+     attention over a compressed KV with YaRN on the decoupled rotary half — and \
+     the one Metal text here (`llama_like_metal`) states dense paged attention \
+     over full K and V, a different cache reached through a different shape; the \
+     CUDA backend serves this row";
 
 /// Trace this row's CUDA text for one fire class.
 #[cfg(feature = "forward")]
@@ -334,7 +372,7 @@ mod tests {
         assert_eq!(spec(&m, "layer.{}.self_attn.q_a_proj").extents, vec![1536, 7168]);
         assert_eq!(
             spec(&m, "layer.{}.self_attn.q_b_proj").extents,
-            vec![u64::from(64 * (128 + 64)), 1536],
+            vec![64 * (128 + 64), 1536],
         );
         assert_eq!(spec(&m, "layer.{}.self_attn.q_a_layernorm").extents, vec![1536]);
 
@@ -347,7 +385,7 @@ mod tests {
         assert_eq!(spec(&m, "layer.{}.self_attn.kv_a_layernorm").extents, vec![512]);
         assert_eq!(
             spec(&m, "layer.{}.self_attn.kv_b_proj").extents,
-            vec![u64::from(64 * (128 + 128)), 512],
+            vec![64 * (128 + 128), 512],
         );
         // And the output reads the VALUE width, which is where MLA
         // stops looking like GQA.

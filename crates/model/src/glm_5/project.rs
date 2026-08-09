@@ -30,10 +30,7 @@ use super::spec::Glm5Facts;
 /// the enum, and a store that gets built is one arm changing here.
 #[must_use]
 pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    match kv {
-        KvStyle::Paged => true,
-        KvStyle::Mla { .. } | KvStyle::Dsv4 { .. } => false,
-    }
+    kv.has_a_store_in_this_build()
 }
 
 /// This row's tensors.
@@ -97,10 +94,10 @@ pub fn manifest(f: &Glm5Facts, tied_embeddings: bool) -> Manifest {
         // rank. One of these two rows is `Absent` for every row of this
         // lineage, so no checkpoint can satisfy both spellings.
         .either(!latent_q, "layer.{}.self_attn.q_proj", [q_b_width, hidden])
-        .with_if(
-            latent_q,
-            TensorSpec::required("layer.{}.self_attn.q_a_layernorm", [q_lora]),
-        )
+        // STATED absent rather than left out when there is no rank: a
+        // rank that is not there has no norm over it, and a manifest
+        // that omits the row cannot refuse a checkpoint that ships one.
+        .either(latent_q, "layer.{}.self_attn.q_a_layernorm", [q_lora])
         .with(TensorSpec::required(
             "layer.{}.self_attn.kv_a_proj_with_mqa",
             [kv_a_width, hidden],
@@ -208,6 +205,9 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
     let sm_scale = 1.0 / (a.qk_head_dim() as f32).sqrt();
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
+            // One shape for every layer, which is what this row was
+            // already saying by having no per-layer count.
+            kv_heads: 1,
             head_dim: page_row,
             // GLM-5 attends the whole context and SPARSIFIES it with the
             // DSA mask instead of windowing: the indexer's top-k is not
@@ -248,6 +248,8 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
             // workspace is one buffer both layer kinds share, so both
             // are stated and the planner takes the wider.
             moe_intermediate: f.moe.moe_intermediate,
+            experts_per_token: f.moe.top_k,
+            shared_intermediate: f.moe.shared_intermediate,
             vocab: f.vocab,
         },
         attention,
@@ -265,6 +267,11 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
+        // Not a gemma: the gain is the multiplier, stored directly.
+        norm_unit_offset: false,
+        v_norm: false,
+        k_eq_v: false,
+        mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // DEFAULT, and the row writes over it. None of the three
         // answers in here is geometry: an arch label is a coarse family
@@ -284,6 +291,37 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         towers: Default::default(),
     }
 }
+
+/// Why this build has no Metal text for a glm-5 row.
+///
+/// A `const` so the test that asserts the refusal NAMES the missing
+/// thing compares against the same string the caller is shown, rather
+/// than against a paraphrase that can drift away from it — the shape
+/// `csm::project::NO_TRACE` set for the same reason.
+///
+/// Its forward is `glm5_cuda`: MLA attention plus the DSA
+/// indexer, a sparse-attention selection pass with no counterpart
+/// anywhere in `llama_like_metal`, which serves dense paged attention
+/// only.
+///
+/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
+/// fine, and a pie whose Metal half had this text would serve the same
+/// row unchanged. What is missing is a TEXT in this build, which is a
+/// fact about the build.
+///
+/// Stating it is the whole of what replaces `driver-metal`'s
+/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
+/// reduced by a punctuation-stripping `canonical()`, consulted before
+/// any text was traced and free to disagree with what the tracer would
+/// actually do. It listed `gemma4`, which the load path refused on
+/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// that answers for itself cannot disagree with a list, because there
+/// is no list.
+pub const NO_METAL: &str = "glm-5 has no Metal text in this build: its forward is `glm5_cuda` — latent \
+     attention plus the DSA indexer that selects which keys each query scores — \
+     and the one Metal text here (`llama_like_metal`) serves dense paged \
+     attention over a `LlamaLikeFacts`, which is neither this attention nor \
+     this shape; the CUDA backend serves this row";
 
 /// Trace this row's CUDA text for one fire class.
 ///
@@ -328,7 +366,7 @@ mod tests {
         assert_eq!(spec(&m, "layer.{}.self_attn.q_a_proj").extents, vec![1536, 4096]);
         assert_eq!(
             spec(&m, "layer.{}.self_attn.q_b_proj").extents,
-            vec![u64::from(96 * (128 + 64)), 1536],
+            vec![96 * (128 + 64), 1536],
         );
         assert_eq!(spec(&m, "layer.{}.self_attn.q_a_layernorm").extents, vec![1536]);
 
@@ -341,7 +379,7 @@ mod tests {
         assert_eq!(spec(&m, "layer.{}.self_attn.kv_a_layernorm").extents, vec![512]);
         assert_eq!(
             spec(&m, "layer.{}.self_attn.kv_b_proj").extents,
-            vec![u64::from(96 * (128 + 128)), 512],
+            vec![96 * (128 + 128), 512],
         );
         // And the output reads the VALUE width, which is where MLA
         // stops looking like GQA.

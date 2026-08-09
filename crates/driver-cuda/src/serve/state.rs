@@ -17,9 +17,13 @@ pub(crate) struct Shell {
     /// The capabilities JSON `create` hands back; owned here so the
     /// pointer in [`PieDriverCaps`] lives as long as the driver.
     pub(crate) caps: Vec<u8>,
-    /// `[model] descriptor` from the boot TOML, for HF snapshots whose
-    /// descriptor does not ride inside the checkpoint.
-    pub(crate) boot_descriptor: Option<std::path::PathBuf>,
+    /// `[model] config` from the boot TOML, for HF snapshots whose
+    /// config does not ride inside the checkpoint.
+    ///
+    /// One field is read out of it — the declared quantization — which is
+    /// the one thing a catalog row cannot state, because the same model
+    /// is published at four bits and at eight.
+    pub(crate) boot_config: Option<std::path::PathBuf>,
     /// `[model] id` from the boot TOML: the operator's answer to "which
     /// model is this", when they have one.
     ///

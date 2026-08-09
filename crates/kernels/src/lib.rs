@@ -1313,6 +1313,45 @@ pub struct KernelSig {
     /// this family's north star calls a bug report against a table row; this
     /// is the row answering.
     pub grid_param: Option<u8>,
+    /// Where this row's HEAD WIDTH is stated, when the fire's is not it.
+    ///
+    /// [`Self::grid_param`]'s sibling, and it exists because the same
+    /// deployment breaks the same assumption twice. gemma-4's full-attention
+    /// layers have 512-wide heads and its sliding layers 256-wide ones, so a
+    /// fire-wide `head_dim` is wrong for one of them whichever it holds.
+    ///
+    /// A rope's row already STATES its head width -- `head_dim` is one of its
+    /// params, and the kernel reads the statement's number, not the fire's.
+    /// The grid did not: it divided the tensor's width by the FIRE's
+    /// `head_dim` to count heads. Two numbers for one quantity, and the
+    /// kernel multiplies them back together to find a row:
+    /// `row_base = m * n_head * head_dim`. When they disagree by two, every
+    /// row after the first is written two rows along and most of them land
+    /// past the tensor -- a rotation that silently applies to almost nothing.
+    ///
+    /// `Some(i)` means *"my head width is the statement's param `i`"*.
+    pub head_param: Option<u8>,
+    /// Where this row's HEAD COUNT is stated, when the fire's is not it.
+    ///
+    /// The third of the same family, and the one that shows a deployment
+    /// states a head SHAPE rather than a head width: gemma-4's full-attention
+    /// layers carry four KV heads of 512 channels where its sliding layers
+    /// carry sixteen of 256. A rule that spans heads needs both numbers, and
+    /// taking either from the fire is taking half of one layer's shape and
+    /// half of another's.
+    ///
+    /// Measured on gemma-4-31b. `kv_append_paged` is told `head_dim` and
+    /// `n_kv_heads` by its own params -- the kernel addresses the pool with
+    /// the statement's numbers -- while [`LaunchRule::PerHead`] built the grid
+    /// from the fire's. On a full-attention layer the kernel wrote at
+    /// `(slot * 4 + head) * 512 + channel` under a grid of `[256, 16]`, so
+    /// **channels 256..511 of every KV head were never written** and heads
+    /// 4..15 landed in the next token's rows. The gap does not fail: those
+    /// channels read back as the zeros the pool was born with, attention
+    /// returns a value whose second half is zero, and the fire completes.
+    ///
+    /// `Some(i)` means *"count my heads by the statement's param `i`"*.
+    pub heads_param: Option<u8>,
 }
 
 impl KernelSig {
@@ -1429,6 +1468,8 @@ macro_rules! kernel {
                 returns: "",
                 axes: &[],
                 grid_param: None,
+                head_param: None,
+                heads_param: None,
                 lowered_as: None,
             }
         }

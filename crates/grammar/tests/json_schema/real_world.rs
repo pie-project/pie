@@ -395,13 +395,10 @@ fn test_bitmask_mid_json_object() {
         &["{", "}", "\"", "name", ":", " ", "42", "true", "[", "]"],
     );
 
-    let vocab_size = 10;
-    let mut bm = vec![0u32; bitmask::bitmask_size(vocab_size)];
-
     // Accept {"name":
     assert!(m.accept_string(r#"{"name":"#));
 
-    m.fill_next_token_bitmask(&mut bm);
+    let bm = m.fill_next_token_mask();
 
     // After colon, expect value tokens: "\"", "42", "true", "{", "["
     assert!(
@@ -440,7 +437,7 @@ fn test_bitmask_after_comma_in_array() {
     // Accept [1,
     assert!(m.accept_string("[1,"));
 
-    m.fill_next_token_bitmask(&mut bm);
+    bm = m.fill_next_token_mask();
 
     // After comma in array, expect value tokens
     assert!(bitmask::get_bit(&bm, 3), "1 should be valid");

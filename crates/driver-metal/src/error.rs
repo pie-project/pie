@@ -163,7 +163,7 @@ pub enum Error {
     ///
     /// The seam's own refusals, and they are all one shape: a verb called
     /// before `load_model` allocated what it needs, a checkpoint whose family
-    /// no Metal text states, a boot config with no `[model] descriptor`, a
+    /// no Metal text states, a boot TOML with no `[model] config`, a
     /// verb this backend does not implement. Nothing is exhausted, nothing
     /// failed to compile, and no device declined anything — the fix is in the
     /// deployment or in the call order, never in the machine.

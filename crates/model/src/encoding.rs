@@ -10,7 +10,7 @@
 //! So a row is the LOGICAL model — the shapes — and the manifest
 //! matches modulo encoding, undoing the packing on the last axis before
 //! it compares. What is observed instead lands here and flows to the
-//! authoring pass as a [`Policy`](crate::policy::Policy) input, which is
+//! authoring pass as a [`Policy`](crate::shared::policy::Policy) input, which is
 //! where it always belonged: `push_mlx_affine_declared` needs to know a
 //! width, and a width is a property of a file.
 //!

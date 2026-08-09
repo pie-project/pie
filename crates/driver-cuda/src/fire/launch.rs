@@ -278,7 +278,10 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
     }
 
-    if cache.replay(key, epoch, stream).unwrap_or(false) {
+    // WHAT THIS FIRE WOULD HAND THE GRAPH, against what the graph
+    // recorded. See `recordings::capture_digest`.
+    let digest = crate::fire::recordings::capture_digest(ctx, regions, gdn);
+    if cache.replay(key, epoch, digest, stream).unwrap_or(false) {
         sg_trace(|| format!("replay {key:?}"));
         return Ok(lowered.launches.len());
     }
@@ -380,7 +383,7 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     if exec.launch(stream).is_err() {
         return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
     }
-    let _ = cache.insert_with_nodes(key, exec, epoch, nodes, eligibility);
+    let _ = cache.insert_with_nodes(key, exec, epoch, nodes, digest, eligibility);
     Ok(ran)
 }
 
@@ -2763,6 +2766,11 @@ pub(crate) fn step_impl(
         let built = build_lowering(
             row,
             model::catalog::Deployed {
+                // CUDA, stated rather than defaulted. The row answers for
+                // either backend now, and a caller that let the default
+                // choose would be the same silent assumption the deleted
+                // `LLAMA_LIKE` string table made from the Metal side.
+                backend: model::catalog::Backend::Cuda,
                 tp_size: model.tp_size,
                 layer_scalars: &model.gemma_layer_scalars,
             },
