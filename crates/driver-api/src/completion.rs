@@ -1,18 +1,75 @@
-use std::cell::UnsafeCell;
+//! What a driver signals with, and what the engine waits on.
+//!
+//! # Why this is contract and not scheduler internals
+//!
+//! It was `engine::driver::completion`, and the seam headers beside it said
+//! why it should stay there: *"the shell is the driver's state; the broker is
+//! the engine's, because a completion is what a SCHEDULER waits on and a
+//! driver has no opinion about it."*
+//!
+//! Half of that is true and the other half is contradicted by every backend
+//! in the tree. A driver does not WAIT on a completion — but it MINTS one:
+//! `Driver::launch` answers a [`SubmissionCompletion`], and `copy_kv`,
+//! `copy_state`, `resize_pool` and `encode` all answer one too. A type that
+//! appears in five of a trait's fourteen return positions is that trait's
+//! vocabulary, and a trait cannot be stated in a crate that cannot name its
+//! own return types.
+//!
+//! So the broker moved here with the trait. What stayed in `engine` is what
+//! actually is the scheduler's: which completion belongs to which work item,
+//! and what to do when one settles.
+//!
+//! # What went with the C boundary
+//!
+//! `PieRuntimeCallbacks` — an `abi_version`, a `*mut c_void` context and an
+//! `unsafe extern "C" fn(ctx, wait_id, epoch)` — was how a C++ driver told
+//! the runtime that something had finished. Handing a Rust driver a function
+//! pointer and an erased context to call back into a `CompletionBroker` it
+//! could have simply been given is a round trip through C for no reader:
+//! [`CompletionBroker`] is `Clone` and `Send`, and a driver holds one.
+//!
+//! `PieCompletion` went the same way and left [`CompletionTarget`] in its
+//! place — the same three fields with the `#[repr(C)]` and the null-pointer
+//! contract taken off, because a driver that is handed one is handed it by
+//! name.
+
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::Poll;
 
-use ::driver_api::{
-    PIE_DRIVER_ABI_VERSION, PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_PENDING,
-    PIE_TERMINAL_OUTCOME_RETRY, PIE_TERMINAL_OUTCOME_SUCCESS, PieCompletion, PieRuntimeCallbacks,
-    PieTerminalCell,
+use crate::local::{
+    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_PENDING, PIE_TERMINAL_OUTCOME_RETRY,
+    PIE_TERMINAL_OUTCOME_SUCCESS, TerminalCell,
 };
 use anyhow::{Result, anyhow};
 use crossbeam_queue::SegQueue;
 use waker::{FIRST_COMPLETION_EPOCH, WakerSlotId, WakerTable};
 
+/// Where a driver publishes one operation's outcome.
+///
+/// The owned counterpart of the `PieCompletion` descriptor: the same wait
+/// slot, the same epoch, the same terminal cell. What it no longer has is
+/// `#[repr(C)]` and a null-pointer convention, because it is handed to a Rust
+/// driver by name rather than laid out for a foreign reader.
+#[derive(Debug, Clone, Copy)]
+pub struct CompletionTarget {
+    /// The wait slot to publish on.
+    pub wait_id: u64,
+    /// The epoch to publish.
+    pub target_epoch: u64,
+    /// Where to publish the terminal outcome, or null for a frame launch
+    /// (whose members carry their own cells).
+    pub terminal_cell: *mut TerminalCell,
+}
+
+// SAFETY: the cell is an `AtomicU32` the driver publishes into and the engine
+// reads; a shared reference to it is all either side ever takes.
+unsafe impl Send for CompletionTarget {}
+unsafe impl Sync for CompletionTarget {}
+
+
+/// Keeps an instance's wait slots alive while a completion is in flight.
 pub trait CompletionLease: Send + Sync {
     fn is_closed(&self) -> bool;
 }
@@ -38,12 +95,12 @@ enum TerminalOutcome {
 }
 
 #[derive(Debug)]
-struct TerminalCellStorage(UnsafeCell<PieTerminalCell>);
+struct TerminalCellStorage(TerminalCell);
 
-// The driver mutates `outcome` atomically through the ABI pointer. `reserved0`
-// is written only before that release publication and is never read by Rust.
-unsafe impl Send for TerminalCellStorage {}
-unsafe impl Sync for TerminalCellStorage {}
+// No `unsafe impl Send`/`Sync` and no `UnsafeCell`: `TerminalCell::outcome`
+// is an `AtomicU32`, which is both, and a shared reference to it is all either
+// side ever needed. The wrapper survives only because the recycling pools are
+// typed on it.
 
 #[derive(Debug)]
 struct OwnedTerminalCell {
@@ -65,12 +122,9 @@ fn terminal_cell_quarantine() -> &'static SegQueue<Box<TerminalCellStorage>> {
 
 impl OwnedTerminalCell {
     fn new() -> Self {
-        let raw = terminal_cell_pool().pop().unwrap_or_else(|| {
-            Box::new(TerminalCellStorage(UnsafeCell::new(PieTerminalCell {
-                outcome: PIE_TERMINAL_OUTCOME_PENDING,
-                reserved0: 0,
-            })))
-        });
+        let raw = terminal_cell_pool()
+            .pop()
+            .unwrap_or_else(|| Box::new(TerminalCellStorage(TerminalCell::pending())));
         let cell = Self {
             raw: Some(raw),
             recyclable: false,
@@ -79,25 +133,24 @@ impl OwnedTerminalCell {
         cell
     }
 
-    fn as_mut_ptr(&self) -> *mut PieTerminalCell {
-        self.raw
+    fn cell(&self) -> &TerminalCell {
+        &self
+            .raw
             .as_deref()
             .expect("owned terminal cell is present")
             .0
-            .get()
+    }
+
+    fn as_mut_ptr(&self) -> *mut TerminalCell {
+        ptr::from_ref(self.cell()).cast_mut()
     }
 
     fn load(&self) -> TerminalOutcome {
-        load_terminal_outcome(self.as_mut_ptr())
+        classify_terminal_outcome(self.cell().load())
     }
 
     fn reset(&self) {
-        unsafe {
-            *self.as_mut_ptr() = PieTerminalCell {
-                outcome: PIE_TERMINAL_OUTCOME_PENDING,
-                reserved0: 0,
-            };
-        }
+        self.cell().reset();
     }
 
     fn mark_recyclable(&mut self) {
@@ -118,12 +171,18 @@ impl Drop for OwnedTerminalCell {
 }
 
 #[cfg(test)]
-fn terminal_atomic_ptr(cell: *mut PieTerminalCell) -> *const AtomicU32 {
+fn terminal_atomic_ptr(cell: *mut TerminalCell) -> *const AtomicU32 {
     cell.cast::<AtomicU32>()
 }
 
-fn load_terminal_outcome(cell: *mut PieTerminalCell) -> TerminalOutcome {
-    let value = unsafe { AtomicU32::from_ptr(cell.cast::<u32>()).load(Ordering::Acquire) };
+/// Read a cell the test reached through a raw pointer — including a stale one
+/// the ABA test deliberately keeps past its owner.
+#[cfg(test)]
+fn load_terminal_outcome(cell: *mut TerminalCell) -> TerminalOutcome {
+    classify_terminal_outcome(unsafe { (*cell).load() })
+}
+
+fn classify_terminal_outcome(value: u32) -> TerminalOutcome {
     match value {
         PIE_TERMINAL_OUTCOME_PENDING => TerminalOutcome::Pending,
         PIE_TERMINAL_OUTCOME_SUCCESS => TerminalOutcome::Success,
@@ -195,7 +254,7 @@ impl SubmissionCompletionState {
         }
     }
 
-    fn terminal_cell_ptr(&self) -> Option<*mut PieTerminalCell> {
+    fn terminal_cell_ptr(&self) -> Option<*mut TerminalCell> {
         match &self.mode {
             SubmissionCompletionMode::WakeOnly => None,
             SubmissionCompletionMode::Terminal { cell } => Some(cell.as_mut_ptr()),
@@ -251,14 +310,14 @@ impl BrokerInner {
     }
 }
 
-struct BrokerCallbackContext {
-    inner: Arc<BrokerInner>,
-}
-
+/// Mints the completions a driver answers with.
+///
+/// `Clone` and `Send`: a driver is handed one at create and keeps it for as
+/// long as it can finish work. That is what replaced the `{ctx, notify}` pair
+/// a C++ shell was handed — see the module header.
 #[derive(Clone)]
 pub struct CompletionBroker {
     inner: Arc<BrokerInner>,
-    callback_ctx: Arc<BrokerCallbackContext>,
 }
 
 impl Default for CompletionBroker {
@@ -275,22 +334,7 @@ impl CompletionBroker {
             closed: AtomicBool::new(false),
             close_message: Mutex::new(None),
         });
-        let callback_ctx = Arc::new(BrokerCallbackContext {
-            inner: Arc::clone(&inner),
-        });
-        Self {
-            inner,
-            callback_ctx,
-        }
-    }
-
-    pub fn runtime_callbacks(&self) -> PieRuntimeCallbacks {
-        PieRuntimeCallbacks {
-            abi_version: PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
-            ctx: Arc::as_ptr(&self.callback_ctx) as *mut std::ffi::c_void,
-            notify: Some(runtime_notify),
-        }
+        Self { inner }
     }
 
     fn make_submission_completion(
@@ -320,27 +364,36 @@ impl CompletionBroker {
         )
     }
 
-    pub fn pie_completion(&self, target_epoch: u64) -> (PieCompletion, SubmissionCompletion) {
+    /// Mint a completion for a control verb, with the terminal cell the
+    /// driver publishes its outcome into.
+    #[must_use]
+    pub fn control_completion(&self, target_epoch: u64) -> (CompletionTarget, SubmissionCompletion) {
         let completion = self.submission_completion(target_epoch);
-        let raw = PieCompletion {
+        let target = CompletionTarget {
             wait_id: completion.wait_id(),
             target_epoch,
             terminal_cell: completion
                 .terminal_cell_ptr()
                 .expect("control completion exposes a terminal cell"),
         };
-        (raw, completion)
+        (target, completion)
     }
 
-    pub fn launch_completion(&self, target_epoch: u64) -> (PieCompletion, SubmissionCompletion) {
+    /// Mint a completion for a frame launch.
+    ///
+    /// No terminal cell: a frame's outcome is published per member, through
+    /// `StepSubmission::terminal_cells`, and one more cell here would be a
+    /// second answer to a question the members already answer.
+    #[must_use]
+    pub fn launch_completion(&self, target_epoch: u64) -> (CompletionTarget, SubmissionCompletion) {
         let completion =
             self.make_submission_completion(target_epoch, SubmissionCompletionMode::WakeOnly);
-        let raw = PieCompletion {
+        let target = CompletionTarget {
             wait_id: completion.wait_id(),
             target_epoch,
             terminal_cell: ptr::null_mut(),
         };
-        (raw, completion)
+        (target, completion)
     }
 
     pub fn close_all(&self, message: impl Into<String>) {
@@ -353,7 +406,10 @@ impl CompletionBroker {
         }
     }
 
-    pub(crate) fn notify(&self, wait_id: u64, epoch: u64) {
+    /// Publish `epoch` on `wait_id`, waking whoever parked on it.
+    ///
+    /// This IS what the C `notify` callback did; a driver calls it directly.
+    pub fn notify(&self, wait_id: u64, epoch: u64) {
         if !self.inner.closed.load(Ordering::Acquire) {
             let _ = self.inner.table.publish(wait_id, epoch);
         }
@@ -442,7 +498,7 @@ impl SubmissionCompletion {
         }
     }
 
-    pub(crate) fn terminal_cell_ptr(&self) -> Option<*mut PieTerminalCell> {
+    pub fn terminal_cell_ptr(&self) -> Option<*mut TerminalCell> {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.terminal_cell_ptr(),
             SubmissionCompletionKind::ReadyOk
@@ -468,11 +524,11 @@ impl SubmissionCompletion {
 
     /// Non-blocking probe: whether the completion has settled (successfully
     /// or not) without registering any waker.
-    pub(crate) fn is_settled(&self) -> bool {
+    pub fn is_settled(&self) -> bool {
         self.check().is_some()
     }
 
-    pub(crate) fn check(&self) -> Option<Result<()>> {
+    pub fn check(&self) -> Option<Result<()>> {
         match &self.kind {
             SubmissionCompletionKind::ReadyOk => Some(Ok(())),
             SubmissionCompletionKind::ReadyErr(message) => Some(Err(anyhow!(message.clone()))),
@@ -597,7 +653,7 @@ const WORK_ITEM_RESOLUTION_SUCCESS: u32 = 1;
 const WORK_ITEM_RESOLUTION_FAILED: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WorkItemAttemptOutcome {
+pub enum WorkItemAttemptOutcome {
     Committed,
     Retry,
     Failed,
@@ -635,7 +691,7 @@ impl WorkItemCompletionState {
         self.target_epoch.load(Ordering::Acquire)
     }
 
-    fn terminal_cell_ptr(&self) -> *mut PieTerminalCell {
+    fn terminal_cell_ptr(&self) -> *mut TerminalCell {
         self.terminal.as_mut_ptr()
     }
 
@@ -792,45 +848,45 @@ impl WorkItemCompletion {
         self.state.target_epoch()
     }
 
-    pub(crate) fn terminal_cell_ptr(&self) -> *mut PieTerminalCell {
+    pub fn terminal_cell_ptr(&self) -> *mut TerminalCell {
         self.state.terminal_cell_ptr()
     }
 
-    pub(crate) fn commit_target_epoch(&self, target_epoch: u64) {
+    pub fn commit_target_epoch(&self, target_epoch: u64) {
         self.state.commit_target_epoch(target_epoch);
     }
 
-    pub(crate) fn reject(&self, message: impl Into<String>) {
+    pub fn reject(&self, message: impl Into<String>) {
         self.state.resolve_failure(message);
     }
 
-    pub(crate) fn reject_unsubmitted(&self, message: impl Into<String>) {
+    pub fn reject_unsubmitted(&self, message: impl Into<String>) {
         self.state.mark_native_retired();
         self.state.resolve_failure(message);
     }
 
-    pub(crate) fn request_cancel(&self) {
+    pub fn request_cancel(&self) {
         self.state.request_cancel();
     }
 
-    pub(crate) fn cancel_requested(&self) -> bool {
+    pub fn cancel_requested(&self) -> bool {
         self.state.cancel_requested()
     }
 
-    pub(crate) fn mark_native_retired(&self) {
+    pub fn mark_native_retired(&self) {
         self.state.mark_native_retired();
     }
 
-    pub(crate) fn resolve_from_terminal(&self) -> Result<WorkItemAttemptOutcome> {
+    pub fn resolve_from_terminal(&self) -> Result<WorkItemAttemptOutcome> {
         self.state.resolve_from_terminal()
     }
 
     /// Non-blocking probe: whether this work item completion has resolved.
-    pub(crate) fn is_settled(&self) -> bool {
+    pub fn is_settled(&self) -> bool {
         self.state.result().is_some()
     }
 
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
+    pub fn same_request(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
     }
 }
@@ -853,17 +909,6 @@ impl Drop for WorkItemCompletion {
     }
 }
 
-unsafe extern "C" fn runtime_notify(ctx: *mut std::ffi::c_void, wait_id: u64, epoch: u64) {
-    let _ = std::panic::catch_unwind(|| {
-        let Some(ctx) = (unsafe { (ctx as *const BrokerCallbackContext).as_ref() }) else {
-            return;
-        };
-        if ctx.inner.closed.load(Ordering::Acquire) {
-            return;
-        }
-        let _ = ctx.inner.table.publish(wait_id, epoch);
-    });
-}
 
 #[cfg(test)]
 mod tests {
@@ -884,12 +929,12 @@ mod tests {
 
     fn pool_contains(
         pool: &SegQueue<Box<TerminalCellStorage>>,
-        pointer: *mut PieTerminalCell,
+        pointer: *mut TerminalCell,
     ) -> bool {
         let mut drained = Vec::new();
         let mut found = false;
         while let Some(cell) = pool.pop() {
-            found |= cell.0.get() == pointer;
+            found |= ptr::from_ref(&cell.0).cast_mut() == pointer;
             drained.push(cell);
         }
         for cell in drained {
@@ -920,31 +965,24 @@ mod tests {
         (Arc::clone(&count), Waker::from(count))
     }
 
-    fn broker_callbacks(broker: &CompletionBroker) -> PieRuntimeCallbacks {
-        broker.runtime_callbacks()
-    }
-
-    fn store_terminal(cell: *mut PieTerminalCell, outcome: u32) {
+    fn store_terminal(cell: *mut TerminalCell, outcome: u32) {
         unsafe { (&*terminal_atomic_ptr(cell)).store(outcome, Ordering::Release) };
     }
 
     #[test]
     fn foreign_thread_publish_completes_waiter() {
         let broker = CompletionBroker::new();
-        let callbacks = broker_callbacks(&broker);
         let (raw, completion) = broker.launch_completion(3);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let callback_ctx = callbacks.ctx as usize;
-        let thread = std::thread::spawn(move || unsafe {
-            runtime_notify(
-                callback_ctx as *mut std::ffi::c_void,
-                raw.wait_id,
-                raw.target_epoch,
-            )
-        });
+        // The broker itself crosses the thread, which is what a driver does
+        // with it. This used to send a `usize`-laundered `*mut c_void` and
+        // call the `extern "C"` notify through it -- the erasure was the C
+        // boundary's, and what it was erasing was a `Clone + Send` handle.
+        let far_side = broker.clone();
+        let thread = std::thread::spawn(move || far_side.notify(raw.wait_id, raw.target_epoch));
         rt.block_on(async { completion.await.unwrap() });
         thread.join().unwrap();
     }
@@ -952,10 +990,9 @@ mod tests {
     #[test]
     fn control_completion_checks_terminal_outcome() {
         let broker = CompletionBroker::new();
-        let callbacks = broker_callbacks(&broker);
-        let (raw, completion) = broker.pie_completion(1);
+        let (raw, completion) = broker.control_completion(1);
         store_terminal(raw.terminal_cell, PIE_TERMINAL_OUTCOME_FAILED);
-        unsafe { runtime_notify(callbacks.ctx, raw.wait_id, 1) };
+        broker.notify(raw.wait_id, 1);
         let err = completion
             .check()
             .expect("terminal failure should settle")
@@ -966,14 +1003,13 @@ mod tests {
     #[test]
     fn control_completion_retains_cell_until_callback() {
         let broker = CompletionBroker::new();
-        let callbacks = broker_callbacks(&broker);
-        let (raw, completion) = broker.pie_completion(1);
+        let (raw, completion) = broker.control_completion(1);
         store_terminal(raw.terminal_cell, PIE_TERMINAL_OUTCOME_SUCCESS);
         assert!(
             completion.check().is_none(),
             "terminal publication alone must not retire callback-owned storage"
         );
-        unsafe { runtime_notify(callbacks.ctx, raw.wait_id, 1) };
+        broker.notify(raw.wait_id, 1);
         completion
             .check()
             .expect("callback should settle completion")
@@ -983,9 +1019,8 @@ mod tests {
     #[test]
     fn control_completion_rejects_callback_before_terminal_publication() {
         let broker = CompletionBroker::new();
-        let callbacks = broker_callbacks(&broker);
-        let (raw, completion) = broker.pie_completion(1);
-        unsafe { runtime_notify(callbacks.ctx, raw.wait_id, 1) };
+        let (raw, completion) = broker.control_completion(1);
+        broker.notify(raw.wait_id, 1);
         let err = completion
             .check()
             .expect("callback should settle completion")
@@ -996,7 +1031,7 @@ mod tests {
     #[test]
     fn stale_generation_callback_is_ignored() {
         let broker = CompletionBroker::new();
-        let (raw, completion) = broker.pie_completion(2);
+        let (raw, completion) = broker.control_completion(2);
         let stale = raw.wait_id;
         drop(completion);
         assert!(matches!(
@@ -1008,11 +1043,10 @@ mod tests {
     #[test]
     fn dropped_future_before_callback_is_safe() {
         let broker = CompletionBroker::new();
-        let callbacks = broker_callbacks(&broker);
-        let (raw, completion) = broker.pie_completion(2);
+        let (raw, completion) = broker.control_completion(2);
         let stale = raw.wait_id;
         drop(completion);
-        unsafe { runtime_notify(callbacks.ctx, stale, raw.target_epoch) };
+        broker.notify(stale, raw.target_epoch);
         assert!(matches!(
             WakerTable::global().publish(stale, 99),
             waker::WakeOutcome::Stale
@@ -1054,10 +1088,9 @@ mod tests {
     #[test]
     fn callbacks_are_ignored_after_broker_close() {
         let broker = CompletionBroker::new();
-        let callbacks = broker_callbacks(&broker);
         let (raw, completion) = broker.launch_completion(5);
         broker.close_all("driver closed");
-        unsafe { runtime_notify(callbacks.ctx, raw.wait_id, raw.target_epoch) };
+        broker.notify(raw.wait_id, raw.target_epoch);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1098,13 +1131,12 @@ mod tests {
     #[test]
     fn publish_racing_with_registration_wakes_or_fast_paths() {
         let broker = CompletionBroker::new();
-        let callbacks = broker_callbacks(&broker);
         let (raw, completion) = broker.launch_completion(5);
         let (count, waker) = counter_waker();
         let mut completion = Box::pin(completion);
         let mut cx = std::task::Context::from_waker(&waker);
         assert!(matches!(completion.as_mut().poll(&mut cx), Poll::Pending));
-        unsafe { runtime_notify(callbacks.ctx, raw.wait_id, 5) };
+        broker.notify(raw.wait_id, 5);
         assert!(count.0.load(Ordering::SeqCst) <= 1);
     }
 

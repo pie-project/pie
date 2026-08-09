@@ -25,116 +25,31 @@ constexpr int BLOCK = device::BLOCK;
 
 }  // namespace
 
-void attention_naive_bf16(
-    const void* q, const void* k, const void* v,
-    void* o,
-    int num_tokens,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    cudaStream_t stream)
-{
-    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-    dim3 grid(num_q_heads, num_tokens);
-    dim3 block(BLOCK);
-    const std::size_t shmem_bytes =
-        sizeof(float) * (static_cast<std::size_t>(num_tokens) + BLOCK);
-
-    device::attn_naive<bf16><<<grid, block, shmem_bytes, stream>>>(
-        static_cast<const bf16*>(q),
-        static_cast<const bf16*>(k),
-        static_cast<const bf16*>(v),
-        static_cast<bf16*>(o),
-        num_tokens, num_q_heads, num_kv_heads, head_dim, scale);
-}
-
-void attention_mtp_history_bf16(
-    const void* q,
-    const void* k_history,
-    const void* v_history,
-    void* o,
-    int num_tokens,
-    int history_steps,
-    int history_stride,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    cudaStream_t stream)
-{
-    if (num_tokens <= 0 || history_steps <= 0) return;
-    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    dim3 grid(num_q_heads, num_tokens);
-    dim3 block(BLOCK);
-    const std::size_t shmem_bytes =
-        sizeof(float) * (static_cast<std::size_t>(history_steps) + BLOCK);
-    device::attn_mtp_history<bf16><<<grid, block, shmem_bytes, stream>>>(
-        static_cast<const bf16*>(q),
-        static_cast<const bf16*>(k_history),
-        static_cast<const bf16*>(v_history),
-        static_cast<bf16*>(o),
-        num_tokens, history_steps, history_stride,
-        num_q_heads, num_kv_heads, head_dim, scale);
-}
-
-void attention_mtp_paged_history_bf16(
-    const void* q,
-    const void* k_pages,
-    const void* v_pages,
-    const void* k_history,
-    const void* v_history,
-    void* o,
-    const std::int32_t* position_ids,
-    const std::int32_t* request_ids,
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,
-    const std::uint32_t* kv_last_page_lens,
-    int num_tokens,
-    int history_steps,
-    int history_stride,
-    int max_global_tokens,
-    int page_size,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    bool hnd_layout,
-    bool global_cache_uses_prefix_position,
-    cudaStream_t stream)
-{
-    if (num_tokens <= 0 || history_steps <= 0) return;
-    if (max_global_tokens <= 0) {
-        attention_mtp_history_bf16(
-            q, k_history, v_history, o, num_tokens, history_steps,
-            history_stride, num_q_heads, num_kv_heads, head_dim, stream);
-        return;
-    }
-    // Keep the reference kernel inside portable shared-memory limits. Long
-    // contexts should use a FlashInfer-backed MTP decode path; until then,
-    // fall back to local draft history instead of failing the launch.
-    if (max_global_tokens + history_steps > 8192) {
-        attention_mtp_history_bf16(
-            q, k_history, v_history, o, num_tokens, history_steps,
-            history_stride, num_q_heads, num_kv_heads, head_dim, stream);
-        return;
-    }
-    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    dim3 grid(num_q_heads, num_tokens);
-    dim3 block(BLOCK);
-    const std::size_t shmem_bytes = sizeof(float) *
-        (static_cast<std::size_t>(max_global_tokens + history_steps) + BLOCK);
-    device::attn_mtp_paged_history<bf16><<<grid, block, shmem_bytes, stream>>>(
-        static_cast<const bf16*>(q),
-        static_cast<const bf16*>(k_pages),
-        static_cast<const bf16*>(v_pages),
-        static_cast<const bf16*>(k_history),
-        static_cast<const bf16*>(v_history),
-        static_cast<bf16*>(o),
-        position_ids, request_ids,
-        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        num_tokens, history_steps, history_stride, max_global_tokens,
-        page_size, num_q_heads, num_kv_heads, head_dim, hnd_layout, scale,
-        global_cache_uses_prefix_position);
-}
+// THREE LAUNCHERS WERE DELETED HERE, and the deletion is the second half of
+// a decision `new-horizon.md` §38 left open.
+//
+// `attention_naive_bf16`, `attention_mtp_history_bf16` and
+// `attention_mtp_paged_history_bf16` held one `<<<>>>` each. §38 deleted the
+// TABLE ROW for `attn::attention_mtp_paged_history_bf16` and kept the
+// launcher, on a keeper that named it "the ONLY caller of
+// `attention_mtp_history_bf16`" -- true, and a reason to delete the pair
+// together rather than a reason to keep either. `csrc-reachability-audit.py`
+// now reports all three unreachable from every shim root, which is the
+// measurement §38's keeper was waiting for: the cluster's whole consumer set
+// is the cluster.
+//
+// The fallback in `attention_mtp_paged_history_bf16` -- a host `if` on
+// `max_global_tokens + history_steps > 8192` choosing a different kernel --
+// went with it, and it is worth recording what it was, because it is the
+// same shape as the FlashInfer host dispatch this migration could not state:
+// a predicate over two operands selecting between two kernels with different
+// shared-memory budgets. No `LaunchRule` says that. It did not need one,
+// because nothing called it.
+//
+// The KERNELS are untouched. `attn/attention_naive.cuh` still carries
+// `attn_naive`, `attn_mtp_history` and `attn_mtp_paged_history`, and
+// `families::attn::ATTENTION_NAIVE` still compiles them -- a launcher's
+// deletion is a deletion of host code, and the device text outlives it.
 
 void mtp_shift_hidden_bf16(
     const void* target_hidden,

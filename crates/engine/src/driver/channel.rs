@@ -1,31 +1,16 @@
-//! Channel lifecycle: the registered native binding ([`RegisteredChannel`]),
-//! the owning-side handle applications hold ([`ChannelEndpoint`]) and its
-//! wait/poison/close semantics, plus the seed-value wire payload
-//! ([`ChannelValue`]) [`super::instance::InstanceBindingPlan`] carries.
+//! The owning-side channel handle applications hold ([`ChannelEndpoint`])
+//! and its wait/poison/close semantics.
+//!
+//! [`ChannelValue`] and [`RegisteredChannel`] are `driver-api`'s now and are
+//! re-exported below: a seed value is what a bind CARRIES and a registration
+//! is what a driver ANSWERS, so both are vocabulary the two sides share. What
+//! is left here is the half no driver ever holds — an endpoint has a closer
+//! that reaches back into the scheduler, and no verb on `Driver` takes one.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use ::driver_api::PieChannelEndpointBinding;
-
-/// One channel's initial (seed) value delivered at bind time — `channel` is
-/// the global channel identity, `bytes` its native-encoded wire payload. No
-/// IR semantics live here; this is purely the driver-facing seed-table
-/// entry `InstanceBindingPlan::seed_values` carries, next to the
-/// `LaunchPlan`/`InstanceBindingPlan` it feeds.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ChannelValue {
-    pub channel: u64,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegisteredChannel {
-    pub driver_id: usize,
-    pub binding: PieChannelEndpointBinding,
-    pub reader_wait_id: u64,
-    pub writer_wait_id: u64,
-}
+pub use ::driver_api::channel::{ChannelValue, RegisteredChannel};
 
 /// Notifies whichever layer owns the channel's native binding that this
 /// endpoint has closed (physically closes/deregisters `channel_id` on the
@@ -211,7 +196,7 @@ mod tests {
         let writer_wait_id = table.alloc();
         let endpoint = ChannelEndpoint::new(RegisteredChannel {
             driver_id: usize::MAX,
-            binding: PieChannelEndpointBinding {
+            binding: ::driver_api::ChannelBinding {
                 channel_id: 1,
                 mirror_base: mirror.as_ptr() as u64,
                 word_base: words.as_ptr() as u64,

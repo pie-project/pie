@@ -1,39 +1,50 @@
-//! Driver specs, backend storage (the `DriverId` registry), and concrete
-//! backend dispatch. Scheduler-handle lookup lives in the scheduler layer;
-//! this module keeps only what the driver ABI itself owns: `DriverSpec`
-//! plus the optional `DriverBackend` it's paired with.
+//! The driver registry: a [`DriverSpec`] and the [`Driver`] it is paired
+//! with, addressed by `DriverId`.
+//!
+//! # What this module stopped being
+//!
+//! It was the dispatcher. `DriverBackend` was an `enum` of five variants and
+//! fourteen `match`es over them — seventy arms, every body a forward — plus
+//! two more `match`es (`kind`, `device_domain`) that answered a driver's own
+//! properties on the driver's behalf.
+//!
+//! All of it is [`driver_api::Driver`] now, and `DriverBackend` is a
+//! `Box<dyn Driver>`. What that deleted, besides the arms:
+//!
+//! * **The size tuning.** Two variants were `Box`ed with `size_of`
+//!   measurements in their doc comments, a third carried an
+//!   `expect(clippy::large_enum_variant)` saying the real fix was "eighteen
+//!   call sites in code no backend here owns", and every registry entry paid
+//!   the widest variant's width on every build. A trait object is one word.
+//! * **A test that could only exist because of the shape.**
+//!   `each_backend_names_its_own_memory` checked that this crate had not
+//!   answered one backend's memory domain for another — a mistake only
+//!   possible while the `match` lived here. A driver states its own domain
+//!   now, so the test has nothing left to catch and is gone with the arm.
+//! * **The layering lie.** This module's header said "strictly leaf: no
+//!   `crate::{store,scheduler,pipeline,...}` imports" while
+//!   `register_program` called `crate::pipeline::program::lookup` and a test
+//!   called `crate::scheduler::device_domain`. The host-codegen splice that
+//!   needed the first is `pipeline::program::with_host_codegen`'s now, called
+//!   by the scheduler that owns the driver handle; the claim is true as
+//!   written for the first time.
+//!
+//! Selecting a backend is `open`'s: one function per device, each answering
+//! the same `Box<dyn Driver>`.
 
 use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
+use driver_api::{DeviceDomain, Driver};
 
-#[cfg(feature = "driver-cuda")]
-mod cuda;
-#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-mod metal;
-// NOT target-gated, unlike the Metal seam above it. Vulkan is a loader rather
-// than a platform: the same crate builds and runs on Linux, Windows and
-// Android, so the feature is the whole gate.
-mod remote;
-#[cfg(feature = "driver-vulkan")]
-mod vulkan;
-
-#[cfg(feature = "driver-cuda")]
-pub use cuda::CudaDriver;
-#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-pub use metal::MetalDriver;
-pub use remote::{RemoteDisconnectHandle, RemoteDriver};
-#[cfg(feature = "driver-vulkan")]
-pub use vulkan::VulkanDriver;
-
-use crate::driver::channel::RegisteredChannel;
-use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
-    StateCopyPlan,
-};
-use crate::driver::completion::SubmissionCompletion;
-use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::submission::FrameSubmission;
+/// One execution device, behind the contract.
+///
+/// A `Box` rather than an `enum`: see the module header for what the five
+/// variants cost. `dyn` dispatch adds one indirection per verb, and every
+/// verb here is per-frame or rarer — the CUDA seam this replaced reached its
+/// driver through a C ABI, a `*mut c_void` cast and seven descriptor
+/// validators, so the trait object is strictly cheaper than what was there.
+pub type DriverBackend = Box<dyn Driver>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerLimits {
@@ -61,7 +72,7 @@ pub struct DriverSpec {
     /// memory, and a driver that checks the domain -- which is the only
     /// defence against a copy between two unrelated pools -- refuses every
     /// prefix-cache hit and every swap.
-    pub device_domain: ::driver_api::PieMemoryDomain,
+    pub device_domain: DeviceDomain,
 }
 
 impl DriverSpec {
@@ -70,363 +81,104 @@ impl DriverSpec {
     }
 }
 
-/// Outcome of a frame launch post: admission is folded into the launch call
-/// (ABI v14), so a post either enters the driver with one completion, or
-/// reports why it cannot right now.
-pub enum FrameLaunchOutcome {
-    /// The frame was admitted and posted; one completion settles it.
-    Launched(SubmissionCompletion),
-    /// Admission is full right now; the engine re-posts later.
-    Exhausted,
-    /// The frame can never fit within the driver's physical budget ceiling.
-    Impossible,
-}
+/// Opening a device: one function per backend, all answering the contract.
+///
+/// Free functions rather than `DriverBackend::*_create` constructors, because
+/// there is no `DriverBackend` type to hang them off any more — and because
+/// what they have in common is the ANSWER, not the receiver.
+///
+/// Each takes the boot bytes it is given and reads what it needs. The boot
+/// TOML is the engine's format on purpose: a driver that parsed it would be
+/// the second thing entitled to an opinion about the file's shape, and the
+/// two would drift.
+pub mod open {
+    use super::{DriverBackend, Result};
 
-// Fires on `Remote`, and only once a small variant exists to compare it
-// against: `RemoteDriver` is 560 bytes inline and the boxed Vulkan arm is 8.
-// Boxing `Remote` too is the real answer and is not this change's to make --
-// it is eighteen call sites in code no backend here owns.
-#[cfg_attr(
-    feature = "driver-vulkan",
-    expect(
-        clippy::large_enum_variant,
-        reason = "\
-    the large variant is `Remote`, which this change does not own"
-    )
-)]
-pub enum DriverBackend {
-    #[cfg(feature = "driver-cuda")]
-    Cuda(CudaDriver),
-    #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-    Metal(MetalDriver),
-    /// Boxed, and it is the only variant that is. `VulkanDriver` carries the
-    /// device, the queue, the pipeline cache and the module map inline --
-    /// five times the next-largest variant -- and every `DriverBackend` in
-    /// the registry, on every backend, would pay that width.
-    #[cfg(feature = "driver-vulkan")]
-    Vulkan(Box<VulkanDriver>),
-    Remote(RemoteDriver),
-}
-
-impl DriverBackend {
-    pub fn kind(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(_) => "cuda",
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(_) => "metal",
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(_) => "vulkan",
-            Self::Remote(_) => "remote",
-        }
-    }
-
-    #[cfg(feature = "driver-cuda")]
-    pub fn cuda_create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
-        let (driver, facts) = CudaDriver::create(config_bytes)?;
-        Ok((Self::Cuda(driver), facts))
-    }
-
-    /// Open the Metal device. A library call: no ABI crossing, because the
-    /// driver on the other side is Rust.
+    /// Open a CUDA device.
     ///
     /// # Errors
     ///
-    /// No Metal 4 device.
-    #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-    pub fn metal_create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
-        let (driver, facts) = MetalDriver::create(config_bytes)?;
-        Ok((Self::Metal(driver), facts))
+    /// No device, or a boot config this driver refuses.
+    #[cfg(feature = "driver-cuda")]
+    pub fn cuda(config_bytes: &[u8]) -> Result<DriverBackend> {
+        Ok(Box::new(super::cuda::CudaDriver::create(config_bytes)?))
     }
 
-    /// Open a Vulkan device. A library call: no ABI crossing, because the
-    /// driver it talks to is Rust.
+    /// Open one CUDA device per rank, as one driver.
+    ///
+    /// # Errors
+    ///
+    /// Any rank's device failed to open.
+    #[cfg(feature = "driver-cuda")]
+    pub fn cuda_group(config_blobs: Vec<Vec<u8>>) -> Result<(DriverBackend, usize)> {
+        let (driver, ranks) = super::cuda::CudaDriver::create_group(config_blobs)?;
+        Ok((Box::new(driver), ranks))
+    }
+
+    /// Open the default Metal 4 device.
+    ///
+    /// # Errors
+    ///
+    /// No Metal 4 device, or a device whose queue could not be created.
+    #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+    pub fn metal(config_bytes: &[u8]) -> Result<DriverBackend> {
+        Ok(Box::new(super::metal::MetalDriver::create(config_bytes)?))
+    }
+
+    /// Open a Vulkan device.
     ///
     /// # Errors
     ///
     /// No Vulkan device, or no readable SPIR-V module directory.
     #[cfg(feature = "driver-vulkan")]
-    pub fn vulkan_create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
-        let (driver, facts) = VulkanDriver::create(config_bytes)?;
-        Ok((Self::Vulkan(Box::new(driver)), facts))
+    pub fn vulkan(config_bytes: &[u8]) -> Result<DriverBackend> {
+        Ok(Box::new(super::vulkan::VulkanDriver::create(config_bytes)?))
     }
 
-    #[cfg(feature = "driver-cuda")]
-    pub fn cuda_group_create(
-        config_blobs: Vec<Vec<u8>>,
-    ) -> Result<(Self, Vec<::driver_api::DeviceFacts>)> {
-        let (driver, facts) = CudaDriver::create_group(config_blobs)?;
-        Ok((Self::Cuda(driver), facts))
-    }
-
-    pub fn load_model(
-        &mut self,
-        descs: Vec<::driver_api::ModelLoadDesc>,
-    ) -> Result<::driver_api::DriverCapabilities> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.load_model(descs),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.load_model(descs),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.load_model(descs),
-            Self::Remote(driver) => driver.load_model(descs),
-        }
-    }
-
-    /// The backend whose kernels this driver wants the host to generate, or
-    /// `None` when it generates its own (or needs none). The variant already
-    /// says which native backend it is, so this needs no capability round-trip.
-    fn codegen_backend(&self) -> Option<&'static str> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(_) => Some("cuda"),
-            // A remote driver's own backend does its generation on the far
-            // side.
-            _ => None,
-        }
-    }
-
-    pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
-        // Attach whatever this driver reads and the caller did not already
-        // supply. Generation is memoised per program per backend, so a
-        // re-registration costs a lookup.
-        let registered = crate::pipeline::program::lookup(desc.program_hash);
-        let codegen_backend = self.codegen_backend();
-
-        // The driver no longer carries an emitter, so a fused region with no
-        // host source is a registration failure rather than a slower path.
-        let emitted = codegen_backend
-            .filter(|_| desc.emitted_kernels.is_empty())
-            .and_then(|backend| {
-                registered
-                    .as_ref()
-                    .and_then(|program| program.emitted(backend))
-            });
-
-        // The region analysis is the other half of the CUDA emitter's own
-        // contract -- which regions bind, and how the kernel's intrinsic side
-        // tables are laid out -- so it only means anything to a driver running
-        // those kernels.
-        let region_analysis = if desc.region_analysis.is_empty() && codegen_backend == Some("cuda")
-        {
-            registered
-                .as_ref()
-                .map(|program| program.region_analysis())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let owned;
-        let desc = if emitted.is_some() || !region_analysis.is_empty() {
-            let mut next = desc.clone();
-            if let Some(emitted) = emitted {
-                next.emitter_version = emitted.emitter_version;
-                next.emitted_kernels = emitted
-                    .kernels
-                    .iter()
-                    .map(|kernel| ::driver_api::EmittedKernel {
-                        kind: kernel.kind,
-                        stage_index: kernel.stage_index,
-                        region_index: kernel.region_index,
-                        entry_name: kernel.entry_name.clone(),
-                        source: kernel.source.clone(),
-                        error: kernel.error.clone(),
-                    })
-                    .collect();
-            }
-            if !region_analysis.is_empty() {
-                next.region_analysis = region_analysis;
-            }
-            owned = next;
-            &owned
-        } else {
-            desc
-        };
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.register_program(desc),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.register_program(desc),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.register_program(desc),
-            Self::Remote(driver) => driver.register_program(desc),
-        }
-    }
-
-    pub fn register_channel(
-        &mut self,
-        desc: &ChannelRegistrationPlan,
-    ) -> Result<RegisteredChannel> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.register_channel(desc),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.register_channel(desc),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.register_channel(desc),
-            Self::Remote(driver) => driver.register_channel(desc),
-        }
-    }
-
-    pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.bind_instance(desc),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.bind_instance(desc),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.bind_instance(desc),
-            Self::Remote(driver) => driver.bind_instance(desc),
-        }
-    }
-
-    /// Post one sealed frame. Admission is folded into the call: the driver
-    /// evaluates the frame-union demand and either admits (one completion
-    /// settles the whole frame) or reports Exhausted/Impossible without side
-    /// effects.
-    pub fn launch(&mut self, desc: &FrameSubmission) -> Result<FrameLaunchOutcome> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.launch(desc),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.launch(desc),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.launch(desc),
-            Self::Remote(driver) => driver.launch(desc),
-        }
-    }
-
-    pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.encode(plan),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.encode(plan),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.encode(plan),
-            Self::Remote(driver) => driver.encode(plan),
-        }
-    }
-
-    pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.copy_kv(desc),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.copy_kv(desc),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.copy_kv(desc),
-            Self::Remote(driver) => driver.copy_kv(desc),
-        }
-    }
-
-    pub fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.copy_state(desc),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.copy_state(desc),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.copy_state(desc),
-            Self::Remote(driver) => driver.copy_state(desc),
-        }
-    }
-
-    pub fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.resize_pool(desc),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.resize_pool(desc),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.resize_pool(desc),
-            Self::Remote(driver) => driver.resize_pool(desc),
-        }
-    }
-
-    pub fn close_instance(&mut self, id: u64) -> Result<()> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.close_instance(id),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.close_instance(id),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.close_instance(id),
-            Self::Remote(driver) => driver.close_instance(id),
-        }
-    }
-
-    pub fn close_channel(&mut self, id: u64) -> Result<()> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.close_channel(id),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.close_channel(id),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.close_channel(id),
-            Self::Remote(driver) => driver.close_channel(id),
-        }
-    }
-
-    pub fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.export_kv_handle(),
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(driver) => driver.export_kv_handle(),
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(driver) => driver.export_kv_handle(),
-            Self::Remote(_) => None,
-        }
-    }
-
-    /// Which memory this backend's KV pages live in.
+    /// Open a WebGPU adapter.
     ///
-    /// Answered by the variant, which is the only place that knows. See
-    /// [`DriverSpec::device_domain`] for what was there before and what it
-    /// cost.
-    pub fn device_domain(&self) -> ::driver_api::PieMemoryDomain {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(_) => ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
-            // `METAL_PRIVATE` and not `METAL_SHARED`: the shared tag is for
-            // memory the CPU addresses directly, and a KV page is a private
-            // buffer the driver copies through its own encoder.
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(_) => ::driver_api::PIE_MEMORY_DOMAIN_METAL_PRIVATE,
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(_) => ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE,
-            // The domain is the REMOTE driver's and this side cannot see it.
-            // CUDA is what every plan carried before this method existed, so
-            // answering it here changes nothing for the one backend that was
-            // ever right by accident, and leaves the question where it
-            // belongs: on the ABI, which does not carry the answer yet.
-            Self::Remote(_) => ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
-        }
-    }
-
-    pub fn disconnect(&self, message: impl Into<String>) {
-        // `Remote` is the only variant this question has ever been asked of,
-        // and since the interpreter backend went it is the only one LEFT that
-        // is not feature-gated -- so the pattern is irrefutable. Written as a
-        // `match` rather than a bare call so a second ungated variant lands
-        // here as a non-exhaustive arm instead of silently sharing this one.
-        match self {
-            Self::Remote(driver) => driver.disconnect(message),
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(_) => {}
-            #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-            Self::Metal(_) => {}
-            // In-process, like the two above it: there is no connection to
-            // drop. A Vulkan device that has gone away is a lost device at
-            // the next submit, which the driver reports there.
-            #[cfg(feature = "driver-vulkan")]
-            Self::Vulkan(_) => {}
-        }
+    /// Needs no SDK, no loader and no vendor runtime -- only an adapter --
+    /// which is the whole argument for this backend. There is no module
+    /// directory to find, because `kernels-wgpu` ships its shaders in the
+    /// rlib.
+    ///
+    /// # Errors
+    ///
+    /// No adapter, or an adapter whose storage-buffer limit cannot bind this
+    /// build's attention kernels.
+    #[cfg(feature = "driver-wgpu")]
+    pub fn wgpu(config_bytes: &[u8]) -> Result<DriverBackend> {
+        Ok(Box::new(super::wgpu::WgpuDriver::create(config_bytes)?))
     }
 }
+
+#[cfg(feature = "driver-cuda")]
+mod cuda;
+#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+mod metal;
+// NOT target-gated, unlike the Metal seam above it. Vulkan is a loader rather
+// than a platform: the same crate builds and runs on Linux, Windows and
+// Android, so the feature is the whole gate.
+mod remote;
+#[cfg(feature = "driver-vulkan")]
+mod vulkan;
+// Not target-gated either, and for a wider reason than Vulkan's. Vulkan is a
+// loader; this is a loader with no C in it. `driver-wgpu`'s whole closure is
+// pure Rust -- no SDK, no ICD, no `-sys` crate -- so the feature can be turned
+// on wherever this crate builds at all, which is not something the other three
+// seams can say.
+#[cfg(feature = "driver-wgpu")]
+mod wgpu;
+
+#[cfg(feature = "driver-cuda")]
+pub use cuda::CudaDriver;
+#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+pub use metal::MetalDriver;
+pub use remote::{RemoteDisconnectHandle, RemoteDriver};
+#[cfg(feature = "driver-vulkan")]
+pub use vulkan::VulkanDriver;
+#[cfg(feature = "driver-wgpu")]
+pub use wgpu::WgpuDriver;
 
 struct DriverRegistration {
     spec: DriverSpec,
@@ -490,105 +242,202 @@ pub fn unregister_driver(driver_id: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// Every backend names a domain, and no two name the same one.
+    /// Every verb of the wgpu seam is reachable through `dyn Driver`, with no
+    /// adapter, and each one either serves or refuses in words.
     ///
     /// # What this is guarding
     ///
-    /// `DriverSpec::device_domain` is stamped onto every `KvCopyPlan` the
-    /// scheduler builds, and it replaced a hardcoded
-    /// `PIE_MEMORY_DOMAIN_CUDA_DEVICE` at nine sites. A driver checks the tag
-    /// -- `driver-vulkan`'s `Pool::copy_plan` refuses a plan whose ends are
-    /// not both `VULKAN_DEVICE` -- so a backend that answered somebody else's
-    /// domain would be refused on every prefix-cache hit and every swap, and
-    /// a backend that answered a domain nobody validates would be accepted
-    /// into a pool it does not own.
+    /// An `impl` that compiles proves a method EXISTS. It does not prove the
+    /// method does anything: `todo!()`, `unimplemented!()` and a silent
+    /// `Ok(())` all type-check, and the last of those is the one that matters
+    /// here -- a verb that answered success without doing the work would take
+    /// a KV copy the scheduler then believes happened. So every verb is
+    /// called, through the trait object, and its answer is read.
     ///
-    /// Distinctness is the property that matters: the tag is only useful as a
-    /// discriminator. `Remote` is excluded because it deliberately answers
-    /// CUDA -- the remote side's real domain does not cross the ABI, and CUDA
-    /// is what every plan carried before this existed.
-    /// A REGISTERED Vulkan backend puts its own domain on its spec.
+    /// It matters more than it did: four of these verbs are DEFAULT methods
+    /// now, so this is also the test that a driver which overrides none of
+    /// them still refuses by name rather than silently succeeding.
     ///
-    /// The test above compares constants, which cannot see a match arm
-    /// returning the wrong one. This goes through the path the scheduler uses
-    /// -- construct the backend, register it, read the spec back -- so
-    /// answering CUDA for `Self::Vulkan` fails here.
-    ///
-    /// Needs a device and the module directory `kernels-vulkan` built, so it
-    /// skips when `PIE_KERNELS_VULKAN_SPV_DIR` is unset or no Vulkan device
-    /// answers. Skipping is stated rather than silent.
-    #[cfg(feature = "driver-vulkan")]
+    /// No adapter is opened, which is what makes this a CI test rather than a
+    /// GPU one: ten of the fourteen verbs are host code. `encode` and
+    /// `copy_state` refuse by name; `launch`, `copy_kv` and `resize_pool`
+    /// refuse because there is no shell yet, which is the same refusal a real
+    /// driver gives between `create` and `load_model`; the registry five are
+    /// served.
+    #[cfg(feature = "driver-wgpu")]
     #[test]
-    fn a_registered_vulkan_backend_carries_the_vulkan_domain() {
-        if std::env::var("PIE_KERNELS_VULKAN_SPV_DIR").is_err() {
-            eprintln!("skipped: PIE_KERNELS_VULKAN_SPV_DIR is unset");
-            return;
-        }
-        let Ok((backend, _facts)) = super::DriverBackend::vulkan_create(b"") else {
-            eprintln!("skipped: no Vulkan device answered");
-            return;
-        };
+    fn the_wgpu_variant_answers_every_verb_without_a_device() {
+        use ::driver_api::FrameLaunchOutcome;
+
+        // The trait object, not the concrete driver: what is under test is
+        // that every verb is reachable THROUGH the contract.
+        let mut backend: super::DriverBackend =
+            Box::new(super::wgpu::WgpuDriver::without_adapter());
+
+        assert_eq!(backend.kind(), "wgpu", "the seam's name in the handshake");
         assert_eq!(
             backend.device_domain(),
-            ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE
+            ::driver_api::PIE_MEMORY_DOMAIN_WEBGPU_DEVICE
         );
-        // `register_driver_backend` overwrites whatever the caller wrote, so
-        // the literal here is deliberately the wrong one.
-        let id = super::register_driver_backend(
-            super::DriverSpec {
-                num_kv_pages: 1,
-                limits: super::SchedulerLimits {
-                    max_forward_requests: 1,
-                    max_forward_tokens: 1,
-                    max_page_refs: 1,
+        assert!(
+            backend.export_kv_handle().is_none(),
+            "there is no cross-process sharing path in WebGPU to export"
+        );
+        // In-process: this is a no-op that must not panic.
+        backend.disconnect("a message nobody is listening to");
+
+        // THE REGISTRY FIVE, which are alive before any model. A program with
+        // one epilogue stage is the emptiest package the registry accepts.
+        let program = backend
+            .register_program(&::driver_api::ProgramRegistration {
+                program_hash: 0x_c0_ff_ee,
+                launch: ::driver_api::plan::LaunchPackage {
+                    channels: vec![::driver_api::plan::LaunchChannel {
+                        id: 9,
+                        capacity: 2,
+                        dtype: ::driver_api::PIE_CHANNEL_DTYPE_F32,
+                        flags: ::driver_api::PIE_CHANNEL_HOST_VISIBLE,
+                        extern_dir: -1,
+                        readiness: ::driver_api::PIE_READINESS_UNTOUCHED,
+                        shape: vec![4],
+                        extern_name: vec![],
+                    }],
+                    stages: vec![::driver_api::plan::LaunchStage {
+                        kind: 3,
+                        ..Default::default()
+                    }],
+                    plans: vec![::driver_api::plan::LaunchStagePlan::default()],
+                    ..Default::default()
                 },
-                device_geometry_port_mask: 0,
-                device_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
-            },
-            backend,
-        );
-        let spec = super::get_spec(id).expect("the driver just registered");
-        assert_eq!(
-            spec.device_domain,
-            ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE,
-            "the spec carries the backend's domain, not the caller's"
-        );
-        assert_eq!(
-            crate::scheduler::device_domain(id),
-            ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE,
-            "and the scheduler reads the same answer"
-        );
-        let _ = super::unregister_driver(id);
-    }
+                ..Default::default()
+            })
+            .expect("a one-stage program registers before any model is loaded");
 
-    #[test]
-    #[allow(clippy::vec_init_then_push, reason = "the entries are cfg-gated")]
-    fn each_backend_names_its_own_memory() {
-        // Built by pushing rather than as a literal because the entries are
-        // feature-gated; `vec![]` cannot carry a `cfg` per element.
-        let mut seen: Vec<(&str, ::driver_api::PieMemoryDomain)> = Vec::new();
-        #[cfg(feature = "driver-cuda")]
-        seen.push(("cuda", ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE));
-        #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-        seen.push(("metal", ::driver_api::PIE_MEMORY_DOMAIN_METAL_PRIVATE));
-        #[cfg(feature = "driver-vulkan")]
-        seen.push(("vulkan", ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE));
+        let channel = backend
+            .register_channel(&::driver_api::ChannelRegistrationPlan {
+                driver_id: 4,
+                channel_id: 9,
+                shape: vec![4],
+                dtype: ::driver_api::PIE_CHANNEL_DTYPE_F32,
+                host_role: ::driver_api::PIE_CHANNEL_HOST_ROLE_WRITER,
+                seeded: false,
+                extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_NONE,
+                capacity: 2,
+                reader_wait_id: 11,
+                writer_wait_id: 12,
+                extern_name: Vec::new(),
+            })
+            .expect("a channel matching the program's declaration");
+        assert_eq!(
+            (
+                channel.driver_id,
+                channel.reader_wait_id,
+                channel.writer_wait_id
+            ),
+            (4, 11, 12),
+            "the three fields the driver does not answer came from the wrong \
+             side, so this channel signals nobody"
+        );
 
-        for (name, domain) in &seen {
-            assert!(
-                ::driver_api::pie_memory_domain_is_valid(*domain),
-                "{name} names domain {domain}, which the ABI does not define"
-            );
-            assert_ne!(
-                *domain,
-                ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
-                "{name} names host memory for its device pages"
-            );
-        }
-        for (i, (a, da)) in seen.iter().enumerate() {
-            for (b, db) in &seen[i + 1..] {
-                assert_ne!(da, db, "{a} and {b} both claim domain {da}");
-            }
-        }
+        let instance = backend
+            .bind_instance(&::driver_api::InstanceBindingPlan {
+                driver_id: 4,
+                program_id: program,
+                // Zero is "any", not instance zero.
+                requested_instance_id: 0,
+                pacing_wait_id: 13,
+                channel_ids: vec![9],
+                seed_values: Vec::new(),
+                geometry_class: ::driver_api::geometry::GeometryClass::Host,
+            })
+            .expect("an instance over the one channel");
+        assert_eq!(instance.program_id, program);
+        assert_eq!(instance.pacing_wait_id, 13);
+
+        backend
+            .close_instance(instance.instance_id)
+            .expect("closes");
+        backend.close_channel(9).expect("closes");
+
+        // THE REFUSALS. Each is read, not merely counted: a refusal whose
+        // words do not name the field leaves the caller to guess.
+        //
+        // `launch` is served on this seam and cannot be served HERE: a frame
+        // is fired over a model's cache, and there is no model. So the words
+        // to check are the ones every pre-load verb gives -- which verb, and
+        // what it was waiting for -- and not the name of a missing feature.
+        let said = backend
+            .launch(&::driver_api::FrameSubmission {
+                instance_ids: vec![1],
+                kv_translation: vec![0],
+                kv_translation_indptr: vec![0, 1],
+                required_kv_pages: 1,
+                steps: Vec::new(),
+            })
+            .map(|outcome| match outcome {
+                FrameLaunchOutcome::Launched(_) => "launched",
+                FrameLaunchOutcome::Exhausted => "exhausted",
+                FrameLaunchOutcome::Impossible => "impossible",
+            })
+            .expect_err("a frame before a load has no cache to fire over");
+        let said = said.to_string();
+        assert!(
+            said.contains("launch") && said.contains("load_model"),
+            "the refusal names the verb and what it was waiting for: {said}"
+        );
+
+        // `let Err(..) else` rather than `expect_err`, here and below: the
+        // Ok type is `SubmissionCompletion`, which is deliberately not
+        // `Debug` -- it owns a raw terminal cell.
+        let Err(said) = backend.encode(&mut ::driver_api::MediaEncodePlan::default()) else {
+            panic!("there is no encode entry point in this driver")
+        };
+        let said = said.to_string();
+        assert!(said.contains("encode"), "{said}");
+
+        let Err(said) = backend.copy_state(&::driver_api::StateCopyPlan::default()) else {
+            panic!("no model this driver serves holds a recurrent state")
+        };
+        let said = said.to_string();
+        assert!(said.contains("recurrent"), "{said}");
+
+        // AND THE TWO THAT NEED A MODEL. Before `load_model` there is no pool
+        // to move a page within, and the answer says which verb was early
+        // rather than reporting a success nothing performed.
+        let Err(said) = backend.copy_kv(&::driver_api::KvCopyPlan {
+            src_domain: ::driver_api::PIE_MEMORY_DOMAIN_WEBGPU_DEVICE,
+            dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_WEBGPU_DEVICE,
+            src_page_ids: vec![0],
+            dst_page_ids: vec![1],
+            ..Default::default()
+        }) else {
+            panic!("a copy before a load has no pool to copy within")
+        };
+        let said = said.to_string();
+        assert!(
+            said.contains("copy_kv") && said.contains("load_model"),
+            "the refusal names the verb and what it was waiting for: {said}"
+        );
+
+        let Err(said) = backend.resize_pool(&::driver_api::PoolResizePlan {
+            pool_id: ::driver_api::PIE_ELASTIC_POOL_KV,
+            target_pages: 8,
+            ..Default::default()
+        }) else {
+            panic!("a resize before a load has no pool to resize")
+        };
+        let said = said.to_string();
+        assert!(said.contains("resize_pool"), "{said}");
+
+        // `load_model` with no descriptor, which is the one shape of it that
+        // needs no checkpoint on disk.
+        let said = backend
+            .load_model(Vec::new())
+            .expect_err("zero descriptors is not one model")
+            .to_string();
+        assert!(
+            said.contains("descriptor"),
+            "the refusal counts what it was given: {said}"
+        );
     }
 }

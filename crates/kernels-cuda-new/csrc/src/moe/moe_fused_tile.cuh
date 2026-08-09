@@ -1,55 +1,67 @@
 //===-- moe_fused_tile.cuh - fc1 + swiglu + fc2 in one CuTile kernel ------===//
 //
-// **READ THIS FIRST: this kernel is a measured NEGATIVE result.** It is
-// correct and it is slower than not fusing. It is carried because the
-// experiment cost a day and the answer should not have to be bought twice.
+// An ALTERNATIVE to firing `moe_grouped_gemm_tile.cuh` twice with an
+// activation between. Which of the two to prefer **flips with the grid**,
+// and getting that wrong is what three earlier versions of this header did.
 //
-//     island   permute+fc1+act+fc2+finalise   0.581 ms   573 GB/s
-//     two unfused tile GEMMs                  0.654      ~510
-//     THIS kernel, best of the sweep          0.984      336
+//     blocks   fused      two unfused GEMMs    ratio
+//        106   0.989 ms         0.654 ms       1.51x  fused LOSES
+//        212   1.360            1.315          1.03x  parity
+//        424   1.796            2.594          0.69x  fused wins
+//        848   2.638            5.145          0.51x
+//      1,696   4.430           10.244          0.43x  fused 2.3x faster
 //
-// L40S sm_89, 318 tokens / hidden 2048 / inter 256 / 256 experts / top-k 8,
-// held at the decode census of 106 live experts. Correct to 0.42% worst
-// relative error on positive data, which is 2^-8 and therefore the bf16
-// rounding floor -- the intermediate is stored bf16. The same harness reads
-// 5.36% on SIGNED data, and that gap is conditioning rather than a defect:
-// signed data cancels, the absolute error is unchanged, the relative error
-// against a small result is amplified.
+// L40S sm_89, 142 SMs, 106 live experts, FM=32, three repeats each and
+// stable to the third digit. `moe_fused_tile_preferred` below crosses at
+// 212.
 //
-// # Why it loses -- and NOT for the reason first published
+// # The earlier "fusion costs 1.5x" was one grid, and the grid was the cause
 //
-// The first version of this header blamed shared memory: 92-99 KB of a
-// 100 KB budget, "ONE block per SM, and 106 to 318 blocks each alone on an
-// SM cannot hide HBM latency." That reads the number backwards. Making the
-// extents and trip counts compile-time constants took this kernel from
-// 1.778 ms to 0.984 while leaving SHARED at 98,312 -- the tile compiler
-// stages deeply BECAUSE it can compute the addresses, and a full shared
-// budget is the budget being used rather than a symptom. The unfused GEMM
-// shows the same thing from the other side: 16 KB dynamic at 0.349 ms,
-// 96 KB static at 0.324.
+// This file used to open by saying it is a measured NEGATIVE result. That
+// was taken at exactly one point -- 106 blocks -- and 106 blocks on a
+// 142-SM part is **under one block per SM**. At that size the kernel is
+// latency-bound and its larger per-block footprint has nothing to hide
+// behind; it is not fusion that costs, it is having no parallelism.
 //
-// That header also asserted `cuda::tiles` "has no occupancy control". False:
-// `[[using cutile: hint(1000, occupancy=N)]]` exists and NVIDIA's own
-// `matmul.cuh` uses it. It does not happen to move THIS kernel -- 98,312
-// bytes of shared at occupancy 1, 2 and 4 alike -- but a wrong statement
-// about an API is worse than a measurement that did not move, because it
-// stops the next person looking.
+// The per-block cost says it plainly:
 //
-// What is left, with both corrected, is a smaller and less explained gap:
-// fusing costs 1.5x against not fusing, where the unfused pair does two of
-// this kernel's three stages. The fc2 leg reads each `W2[e]` once per block
-// either way; what fusion buys is not round-tripping the intermediate, and
-// what it costs is that the four resident `[FM, FIC]` chunks are live across
-// the whole fc2 loop. No measurement here separates those two, and the
-// honest statement is that the direction is established and the cause is
-// not.
+//     blocks   us per block
+//        106      9.34
+//        212      6.53
+//        424      4.22
+//        848      3.15
+//      1,696      2.60
 //
-// # What would change the answer
+// Still falling at twelve blocks per SM, which is what a latency-bound
+// kernel looks like -- and the unfused pair, whose grid is
+// `(N / kTileN, blocks)` and therefore 16x larger, was never in that regime
+// at any of these points.
 //
-// Two things untried, both from NVIDIA's `matmul.cuh`: the `GROUP_SIZE_M`
-// swizzle that groups blocks for L2 reuse, and `load_masked` with a
-// `view_padding::zero` policy in place of the shape divisibility this file
-// assumes. Neither is a tuning knob; both are structure.
+// What fusion buys is exactly what the CUTLASS island buys: `W2[e]` read
+// once per block instead of once per output chunk, and the intermediate
+// never round-tripping through HBM. Those are real and they show up as soon
+// as there is enough work to expose them.
+//
+// # Against the island, which still wins at both ends
+//
+//     routed rows   island   fused tile   two unfused
+//           2,544   0.581 ms   0.989 ms      0.654 ms
+//          54,272   3.134      4.428        10.246
+//
+// So the island is 1.13x ahead of the best tile option at decode scale and
+// 1.41x ahead at prefill scale -- and which tile option is "best" flips
+// between them. Its lead over the UNFUSED pair meanwhile grows from 1.13x to
+// 3.27x, which is the same story from the other side: batching is worth more
+// the more rows there are.
+//
+// # Correct, and the error bound
+//
+// 0.42% worst relative error on positive data at the small end, 0.52% at the
+// large -- 2^-8 is the bf16 rounding floor and the intermediate is stored
+// bf16. The same harness reads 5.4% and 9.5% on SIGNED data, and that gap is
+// conditioning rather than a defect: signed data cancels, the absolute error
+// is unchanged, the relative error against a small result is amplified.
+// Both are printed because either alone misleads.
 //
 // # `unsigned`, not `uint32_t`, and that is not style
 //
@@ -63,17 +75,31 @@
 // That is the whole value of compiling these through NVRTC rather than only
 // through `nvcc`: an AOT build cannot see this class of defect at all.
 //
+// # Resource usage, and the reading trap it sets
+//
+//     unfused grouped GEMM      REG 174    SHARED 98,304
+//     this kernel               REG 255    SHARED 98,312
+//
+// An earlier version of this header read that 98 KB as "one block per SM, so
+// occupancy has collapsed". It is the tile compiler using the shared budget,
+// not a symptom -- static shapes took this kernel from 1.778 ms to 0.984
+// while leaving SHARED unchanged. The occupancy problem was real but it was
+// the GRID, which is a launch parameter and not a resource figure.
+//
+// That header also asserted `cuda::tiles` "has no occupancy control". False:
+// `[[using cutile: hint(1000, occupancy=N)]]` exists and NVIDIA's own
+// `matmul.cuh` uses it. It does not happen to move this kernel.
+//
 // # Launch shape
 //
 // Tile kernels take `blockDim = (1,1,1)`; the thread count is the tile
 // runtime's to choose. Passing 128 or 256 instead measures identical to
 // three digits.
 //
-// Harness: `fused_bench.c` in the session workspace. Grid is
-// `(num_blocks,)`, one expert block per CUDA block, each owning the WHOLE
-// fc2 output panel -- which is what makes `W2[e]` a once-per-block read
-// rather than once per output chunk, i.e. the island's access pattern
-// stated directly. That part works; it is the occupancy that does not.
+// Grid is `(num_blocks,)`, one expert block per CUDA block, each owning the
+// WHOLE fc2 output panel -- which is what makes `W2[e]` a once-per-block
+// read, and also what makes the grid small. Those are the same decision seen
+// from two sides.
 //
 //===----------------------------------------------------------------------===//
 #pragma once
@@ -84,6 +110,21 @@
 namespace pie_cuda_driver::kernels::moe::device {
 
 namespace ct = ::cuda::tiles;
+
+/// Whether to fuse, or to fire `moe_grouped_gemm_tile` twice with an
+/// activation between.
+///
+/// Above 212 aligned blocks, which is where the grid stops being the
+/// binding constraint on a 142-SM part. Measured: 1.51x behind at 106,
+/// parity at 212, 0.69x at 424, 0.43x at 1,696.
+///
+/// The bound is a BLOCK count and not a row count on purpose -- what runs
+/// out at the bottom is parallelism, and blocks are what the machine
+/// schedules.
+constexpr bool moe_fused_tile_preferred(int blocks)
+{
+    return blocks >= 212;
+}
 
 #ifndef FM
 #define FM 32          // rows per block

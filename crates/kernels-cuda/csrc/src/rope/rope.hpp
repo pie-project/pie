@@ -18,13 +18,8 @@ namespace pie_cuda_driver::kernels::rope {
 
 // Build a per-token standard RoPE table. Layout is [num_tokens, head_dim]:
 // row[0:head_dim/2] contains cos, row[head_dim/2:head_dim] contains sin.
-void rope_standard_table(
-    const std::int32_t* positions,
-    float* table,
-    int num_tokens,
-    int head_dim,
-    float theta,
-    cudaStream_t stream);
+// `rope_standard_table` was declared here until §43.9; it is routed and its
+// launcher is deleted.
 
 // `interleaved=false` uses the half/half (NeoX) pairing (dim i with i+d/2),
 // used by Llama/Qwen. `interleaved=true` uses the GPT-J pairing (adjacent dims
@@ -91,19 +86,8 @@ void qk_rmsnorm_rope_bf16_devwin(
     float eps,
     cudaStream_t stream);
 
-void qk_rmsnorm_rope_bf16(
-    void* q,
-    void* k,
-    const void* q_weight,
-    const void* k_weight,
-    const std::int32_t* positions,
-    int num_tokens,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    float theta,
-    float eps,
-    cudaStream_t stream);
+// `qk_rmsnorm_rope_bf16` was declared here until §43.9; it is routed and its
+// launcher is deleted.
 
 // Same fused Q/K RMSNorm + standard RoPE, but preserves the bf16
 // materialization point of the unfused sequence:

@@ -49,18 +49,6 @@ void dequant_mxfp4_to_bf16(
 // tokens instead of once per route. `sorted_route_ids` / `counts` come from
 // `kernels::moe::moe_bucket_exact`. Output layout is identical to the per-route
 // kernel (indexed by original route id), so the consumers are unchanged.
-void mxfp4_moe_gate_up_decode_grouped_bf16(
-    const void* act_fp16,
-    const std::int32_t* sorted_route_ids,
-    const std::int32_t* counts,
-    const std::uint8_t* const* gate_up_packed,
-    const std::uint8_t* const* gate_up_scales,
-    const void* const* gate_bias,
-    const void* const* up_bias,
-    void* gate_out_bf16,
-    void* up_out_bf16,
-    int num_experts, int top_k, int hidden, int intermediate,
-    cudaStream_t stream);
 
 void mxfp4_moe_gate_up_decode_bf16(
     const void*          act_fp16,      // [num_tokens, hidden] fp16

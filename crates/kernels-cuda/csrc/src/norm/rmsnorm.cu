@@ -102,81 +102,19 @@ void rmsnorm_strided_bf16(
         hidden, x_row_stride, y_row_stride, eps);
 }
 
-void residual_add_rmsnorm_bf16(
-    void* hidden,
-    const void* residual,
-    const void* weight,
-    void* norm_out,
-    int num_rows,
-    int hidden_size,
-    float eps,
-    cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    dim3 grid(num_rows);
-    if (rmsnorm_vec8_ok(hidden, norm_out, weight, hidden_size,
-                        hidden_size, hidden_size) &&
-        (reinterpret_cast<std::uintptr_t>(residual) % 16) == 0) {
-        constexpr int VBLOCK = 512;
-        device::residual_add_rmsnorm_vec8<VBLOCK><<<grid, VBLOCK, 0, stream>>>(
-            static_cast<device::bf16*>(hidden),
-            static_cast<const device::bf16*>(residual),
-            static_cast<const device::bf16*>(weight),
-            static_cast<device::bf16*>(norm_out),
-            hidden_size, eps);
-        return;
-    }
-    dim3 block(BLOCK);
-    device::residual_add_rmsnorm<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<device::bf16*>(hidden),
-        static_cast<const device::bf16*>(residual),
-        static_cast<const device::bf16*>(weight),
-        static_cast<device::bf16*>(norm_out),
-        hidden_size, eps);
-}
-
-void residual_add_scale_rmsnorm_bf16(
-    void* hidden,
-    const void* residual,
-    float scale,
-    const void* next_weight,
-    void* norm_out,
-    int num_rows,
-    int hidden_size,
-    float eps,
-    cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    dim3 grid(num_rows);
-    dim3 block(BLOCK);
-    device::residual_add_scale_rmsnorm<device::bf16, BLOCK>
-        <<<grid, block, 0, stream>>>(
-            static_cast<device::bf16*>(hidden),
-            static_cast<const device::bf16*>(residual),
-            scale,
-            static_cast<const device::bf16*>(next_weight),
-            static_cast<device::bf16*>(norm_out),
-            hidden_size, eps);
-}
-
-void rmsnorm_residual_add_bf16(
-    const void* x,
-    const void* weight,
-    void* hidden,
-    int num_rows,
-    int hidden_size,
-    float eps,
-    cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    dim3 grid(num_rows);
-    dim3 block(BLOCK);
-    device::rmsnorm_residual_add<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(x),
-        static_cast<const device::bf16*>(weight),
-        static_cast<device::bf16*>(hidden),
-        hidden_size, eps);
-}
+// # Three fused norms went, and one of them is the §41 shape exactly
+//
+// §43 deleted `residual_add_rmsnorm_bf16`, `residual_add_scale_rmsnorm_bf16`
+// and `rmsnorm_residual_add_bf16`. The first and third are routed rows
+// (`device.rs`'s `JIT_DISPATCHED`) whose kernels stay in `norm/rmsnorm.cuh`.
+//
+// The middle one is the interesting one: it had a row until §28.4 measured
+// the row as a second name for a job a reached row already does, and
+// `launch_abi.rs` then carried the LAUNCHER as `NormNoRow::Orphaned` with the
+// reason written out -- "this one's last consumer is `sources.rs`'
+// `EXPECTED` `<<<>>>` census". A census is not a consumer. gemma-4 fires
+// `rmsnorm_residual_add_scale_rmsnorm_bf16`, four statements and 221 golden
+// lines, which is directly below and stays.
 
 void rmsnorm_residual_add_scale_rmsnorm_bf16(
     const void* x,
@@ -251,42 +189,12 @@ void rmsnorm_residual_add_scale_rmsnorm_bf16(
             hidden_size, eps);
 }
 
-void rmsnorm_gemma_bf16(
-    const void* x, const void* weight, void* y,
-    int num_rows, int hidden, float eps, cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    dim3 grid(num_rows);
-    if (rmsnorm_vec8_ok(x, y, weight, hidden, hidden, hidden)) {
-        constexpr int VBLOCK = 512;
-        device::rmsnorm_vec8<VBLOCK, /*WEIGHT_PLUS_ONE=*/true>
-            <<<grid, VBLOCK, 0, stream>>>(
-                static_cast<const device::bf16*>(x),
-                static_cast<const device::bf16*>(weight),
-                static_cast<device::bf16*>(y), nullptr,
-                hidden, hidden, hidden, eps);
-        return;
-    }
-    dim3 block(BLOCK);
-    device::rmsnorm_gemma<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(x),
-        static_cast<const device::bf16*>(weight),
-        static_cast<device::bf16*>(y),
-        hidden, hidden, hidden, eps);
-}
-
-void rmsnorm_no_scale_bf16(
-    const void* x, void* y,
-    int num_rows, int hidden, float eps, cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    dim3 grid(num_rows);
-    dim3 block(BLOCK);
-    device::rmsnorm_no_scale<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(x),
-        static_cast<device::bf16*>(y),
-        hidden, eps);
-}
+// `rmsnorm_gemma_bf16` and `rmsnorm_no_scale_bf16` were deleted here by §43.
+// Both rows are live and routed (`device.rs`'s `JIT_DISPATCHED`), and
+// `jit_parity.rs` carries a recorded AOT fingerprint for each from the day
+// they were routed, which is what survives the launcher. `gemma4_vision.cu`
+// used to call `rmsnorm_no_scale_bf16`; it now launches
+// `nd::rmsnorm_no_scale<bfd,256>` itself, so that hold is released too.
 
 void rmsnorm_gated_fp32_in_bf16(
     const void* x, const void* gate, const void* weight, void* y,
@@ -303,105 +211,23 @@ void rmsnorm_gated_fp32_in_bf16(
         hidden, eps);
 }
 
-void rmsnorm_gated_bf16(
-    const void* x, const void* gate, const void* weight, void* y,
-    int num_rows, int hidden, float eps, cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    dim3 grid(num_rows);
-    dim3 block(BLOCK);
-    device::rmsnorm_gated<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(x),
-        static_cast<const device::bf16*>(gate),
-        static_cast<const float*>(weight),
-        static_cast<device::bf16*>(y),
-        hidden, eps);
-}
+// `rmsnorm_gated_bf16` was deleted here by §43 -- routed to NVRTC out of
+// `norm/rmsnorm.cuh` (`device.rs`'s `JIT_DISPATCHED`), so the shim forwards
+// to nothing and the row fires the template instead. §10.10 step 5.
 
-// Sweep entry point: VBLOCK is fixed at 512, chosen on an H100. At decode
-// there is ONE row, so the whole kernel is a single block and VBLOCK decides
-// both how many threads sit idle (hidden 2816 is 352 vec8 vectors, so 160 of
-// 512 threads do nothing) and how deep the block reduction is (9 rounds at
-// 512 vs 7 at 128). Shapes for the sweep come from the models' configs.
+// # The two sweep entry points went, and with them the file's only `bool`
 //
-// The block width is an ARGUMENT here, which is the other reason no row names
-// this: a `LaunchRule` states one geometry, and a sweep is a caller asking for
-// five.
-bool rmsnorm_bf16_tuned(
-    const void* x, const void* weight, void* y, int num_rows, int hidden,
-    float eps, int vblock, cudaStream_t stream)
-{
-    if (num_rows <= 0 || hidden <= 0 || (hidden % 8) != 0) return false;
-    const dim3 grid(static_cast<unsigned>(num_rows));
-    auto go = [&](auto V) {
-        constexpr int VB = decltype(V)::value;
-        device::rmsnorm_vec8<VB, /*WEIGHT_PLUS_ONE=*/false>
-            <<<grid, VB, 0, stream>>>(
-                static_cast<const device::bf16*>(x),
-                static_cast<const device::bf16*>(weight),
-                static_cast<device::bf16*>(y), nullptr,
-                hidden, /*x_row_stride=*/hidden, /*y_row_stride=*/hidden, eps);
-    };
-#define PIE_RMS_CASE(V) \
-    if (vblock == (V)) { go(std::integral_constant<int, V>{}); return true; }
-    PIE_RMS_CASE(64) PIE_RMS_CASE(128) PIE_RMS_CASE(256)
-    PIE_RMS_CASE(512) PIE_RMS_CASE(1024)
-#undef PIE_RMS_CASE
-    return false;
-}
-
-// Sweep entry point for the fused residual-add + norm + scale + norm.
-// BLOCK is fixed at 256 and this kernel is the SCALAR form, so at hidden 2816
-// each thread walks 11 loads -- twice, once per norm. The file's own note on
-// the plain kernel records that vectorizing the same walk cut it ~7x. It
-// measures 10.79 us/call in-engine against 2.51 for the vectorized plain
-// norm, and is 8% of gemma-4-26B's decode step.
-bool rmsnorm_rasr_tuned(
-    const void* x, const void* weight, void* hidden, float scale,
-    const void* next_weight, void* norm_out, int num_rows, int hidden_size,
-    float eps, int block, cudaStream_t stream)
-{
-    if (num_rows <= 0 || hidden_size <= 0) return false;
-    dim3 grid(static_cast<unsigned>(num_rows));
-    const bool vec_ok = (hidden_size % 8) == 0 &&
-        (reinterpret_cast<std::uintptr_t>(x) % 16) == 0 &&
-        (reinterpret_cast<std::uintptr_t>(hidden) % 16) == 0 &&
-        (reinterpret_cast<std::uintptr_t>(norm_out) % 16) == 0 &&
-        (reinterpret_cast<std::uintptr_t>(weight) % 16) == 0 &&
-        (reinterpret_cast<std::uintptr_t>(next_weight) % 16) == 0;
-    if (block < 0) {   // negative block = "use the vectorized twin"
-        const int b = -block;
-        auto gov = [&](auto B) {
-            constexpr int kB = decltype(B)::value;
-            device::rmsnorm_rasr_vec8<kB><<<grid, kB, 0, stream>>>(
-                static_cast<const device::bf16*>(x),
-                static_cast<const device::bf16*>(weight),
-                static_cast<device::bf16*>(hidden), scale,
-                static_cast<const device::bf16*>(next_weight),
-                static_cast<device::bf16*>(norm_out), hidden_size, eps);
-        };
-        if (!vec_ok) return false;
-        if (b == 128) { gov(std::integral_constant<int,128>{}); return true; }
-        if (b == 256) { gov(std::integral_constant<int,256>{}); return true; }
-        if (b == 512) { gov(std::integral_constant<int,512>{}); return true; }
-        if (b == 1024){ gov(std::integral_constant<int,1024>{}); return true; }
-        return false;
-    }
-    auto go = [&](auto B) {
-        constexpr int kB = decltype(B)::value;
-        device::rmsnorm_residual_add_scale_rmsnorm<device::bf16, kB>
-            <<<grid, kB, 0, stream>>>(
-                static_cast<const device::bf16*>(x),
-                static_cast<const device::bf16*>(weight),
-                static_cast<device::bf16*>(hidden), scale,
-                static_cast<const device::bf16*>(next_weight),
-                static_cast<device::bf16*>(norm_out), hidden_size, eps);
-    };
-#define PIE_RASR_CASE(B) \
-    if (block == (B)) { go(std::integral_constant<int, B>{}); return true; }
-    PIE_RASR_CASE(128) PIE_RASR_CASE(256) PIE_RASR_CASE(512) PIE_RASR_CASE(1024)
-#undef PIE_RASR_CASE
-    return false;
-}
+// §43 deleted `rmsnorm_bf16_tuned` and `rmsnorm_rasr_tuned`, with their
+// `PIE_RMS_CASE` and `PIE_RASR_CASE` ladders. Both were microbenchmark sweep
+// entry points -- deliberately unrowed, because a `LaunchRule` states one
+// geometry and a sweep is a caller asking for five -- and the sweep that
+// called them is not in the tree: no bench, no example, no test, no `.cu`,
+// no `ffi::` fire. `launch_abi.rs` carried them as `NormNoRow::AutotunerProbe`
+// on exactly that reading, "returns bool and has zero driver call sites";
+// §41's audit turned "zero driver call sites" into "zero call sites".
+//
+// The measurements they were written for survive in the comments above their
+// callees and in `new-horizon.md`; what does not survive is a way to re-take
+// them without re-adding a sweep, which is the trade §43 made knowingly.
 
 }  // namespace pie_cuda_driver::kernels::norm

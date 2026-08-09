@@ -7,9 +7,10 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ::driver_api::{GeometryClass, PieInstanceBinding};
+use crate::geometry::GeometryClass;
+use crate::local::InstanceBinding;
 
-use super::channel::ChannelValue;
+use crate::channel::ChannelValue;
 
 pub type ProgramId = u64;
 pub type InstanceId = u64;
@@ -26,21 +27,18 @@ pub struct InstanceBindingPlan {
 }
 
 impl InstanceBindingPlan {
-    /// Every caller is a device backend and every one is feature-gated
-    /// (`backend/cuda.rs`, `backend/metal.rs`, `backend/vulkan.rs`), so a
-    /// build with none of those features has none. It used to have one
-    /// ungated caller — the interpreter backend — which is why this needed
-    /// no attribute before.
-    #[cfg_attr(
-        not(any(
-            feature = "driver-cuda",
-            feature = "driver-metal",
-            feature = "driver-vulkan"
-        )),
-        allow(dead_code, reason = "every caller is a feature-gated device backend")
-    )]
-    pub(crate) fn validate_binding(&self, binding: &PieInstanceBinding) -> anyhow::Result<()> {
-        ::driver_api::validate_instance_binding(binding)
+    /// Check that a driver's acknowledgement answers the plan that was sent.
+    ///
+    /// The check that the identity and the geometry class came back as asked
+    /// is the PLAN's to make rather than any one driver's: it is a property
+    /// of the request, and a driver that got it wrong is what this catches.
+    ///
+    /// # Errors
+    ///
+    /// A malformed binding, an identity the plan did not ask for, or a
+    /// geometry class the driver silently changed.
+    pub fn validate_binding(&self, binding: &InstanceBinding) -> anyhow::Result<()> {
+        crate::local::validate_instance_binding(binding)
             .map_err(|err| anyhow::anyhow!("invalid native instance binding: {err}"))?;
         if self.requested_instance_id != 0 {
             anyhow::ensure!(
@@ -61,7 +59,7 @@ impl InstanceBindingPlan {
 }
 
 #[derive(Debug)]
-pub(crate) struct BoundWaitSlots {
+pub struct BoundWaitSlots {
     pacing_wait_id: u64,
     completion_wait_ids: Mutex<Vec<u64>>,
     close_requested: AtomicBool,
@@ -83,7 +81,7 @@ impl BoundWaitSlots {
     fn acquire_completion_lease(
         this: &Arc<Self>,
         completion_wait_id: u64,
-    ) -> Arc<dyn crate::driver::completion::CompletionLease> {
+    ) -> Arc<dyn crate::completion::CompletionLease> {
         if this.close_requested.load(Ordering::Acquire) {
             return Arc::new(BoundWaitLease {
                 slots: Arc::clone(this),
@@ -111,7 +109,8 @@ impl BoundWaitSlots {
         })
     }
 
-    pub(crate) fn close(&self) {
+    /// Close the slots and sweep whoever is parked on them.
+    pub fn close(&self) {
         if !self.close_requested.swap(true, Ordering::AcqRel) {
             waker::WakerTable::global().sweep(&self.wait_ids());
             let completion_wait_ids = self.completion_wait_ids.lock().unwrap().clone();
@@ -155,7 +154,7 @@ impl BoundWaitSlots {
     }
 }
 
-impl crate::driver::completion::CompletionLease for BoundWaitLease {
+impl crate::completion::CompletionLease for BoundWaitLease {
     fn is_closed(&self) -> bool {
         self.slots.is_closed()
     }
@@ -191,7 +190,7 @@ impl BoundInstance {
     pub fn new(
         driver_id: usize,
         program_id: ProgramId,
-        binding: PieInstanceBinding,
+        binding: InstanceBinding,
         pacing_wait_id: u64,
     ) -> Self {
         let wait_slots = Arc::new(BoundWaitSlots::new(pacing_wait_id));
@@ -206,16 +205,17 @@ impl BoundInstance {
         }
     }
 
-    pub fn reserve_completion(&self) -> crate::driver::completion::WorkItemCompletion {
+    pub fn reserve_completion(&self) -> crate::completion::WorkItemCompletion {
         let wait_id = waker::WakerTable::global().alloc();
-        crate::driver::completion::WorkItemCompletion::with_guard(
+        crate::completion::WorkItemCompletion::with_guard(
             wait_id,
             0,
             BoundWaitSlots::acquire_completion_lease(&self.wait_slots, wait_id),
         )
     }
 
-    pub(crate) fn wait_slots(&self) -> Arc<BoundWaitSlots> {
+    /// The slots this instance's completions lease.
+    pub fn wait_slots(&self) -> Arc<BoundWaitSlots> {
         Arc::clone(&self.wait_slots)
     }
 
@@ -243,15 +243,15 @@ mod tests {
     #[test]
     fn accepts_driver_or_requested_identity() {
         binding_plan(0)
-            .validate_binding(&PieInstanceBinding {
+            .validate_binding(&InstanceBinding {
                 instance_id: 9,
-                ..PieInstanceBinding::default()
+                ..InstanceBinding::default()
             })
             .unwrap();
         binding_plan(7)
-            .validate_binding(&PieInstanceBinding {
+            .validate_binding(&InstanceBinding {
                 instance_id: 7,
-                ..PieInstanceBinding::default()
+                ..InstanceBinding::default()
             })
             .unwrap();
     }
@@ -260,14 +260,14 @@ mod tests {
     fn rejects_zero_or_mismatched_identity() {
         assert!(
             binding_plan(0)
-                .validate_binding(&PieInstanceBinding::default())
+                .validate_binding(&InstanceBinding::default())
                 .is_err()
         );
         assert!(
             binding_plan(7)
-                .validate_binding(&PieInstanceBinding {
+                .validate_binding(&InstanceBinding {
                     instance_id: 8,
-                    ..PieInstanceBinding::default()
+                    ..InstanceBinding::default()
                 })
                 .is_err()
         );
@@ -278,7 +278,7 @@ mod tests {
         let mut plan = binding_plan(0);
         plan.geometry_class = GeometryClass::DecodeEnvelope;
         assert!(
-            plan.validate_binding(&PieInstanceBinding {
+            plan.validate_binding(&InstanceBinding {
                 instance_id: 9,
                 geometry_class: GeometryClass::Host as u32,
                 reserved0: 0,

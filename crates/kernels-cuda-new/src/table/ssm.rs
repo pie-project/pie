@@ -12,29 +12,14 @@ use kernels::KernelSig;
 
 #[rustfmt::skip]
 pub static KERNELS: &[KernelSig] = &[
-    // The other mamba scan: nemotron_h takes FlashInfer's SSU on sm90+ and
-    // its own batched kernel elsewhere.
-    kernel!(flashinfer_mamba_ssu "ssm::flashinfer_mamba_ssu_bf16", whole = true,
-        returns = "bool",
-        operands = operands![
-            conv_out: U16s,
-            dt: U16s,
-            a: F32s,
-            d: U16s,
-            dt_bias: U16s,
-            state_base: U16sMut,
-            slot_ids: I32s,
-            y: U16sMut,
-            batch: I32,
-            num_heads: I32,
-            head_dim: I32,
-            state_size: I32,
-            num_groups: I32,
-            conv_dim: I32,
-            intermediate: I32,
-            state_cache_size: I32,
-            stream: Stream,
-        ]),
+    // The other mamba scan had a row here — `ssm::flashinfer_mamba_ssu_bf16`
+    // — and it is deleted. `cuda::flashinfer_mamba_ssu` had no caller in any
+    // model text, and `flashinfer_mamba_ssu_enabled()` needs sm90, so no
+    // deployment in reach fires it. The vendored source, the launcher
+    // (`csrc/src/ssm/flashinfer_mamba.{cu,hpp}`) and
+    // `examples/vendor_probe.rs` all stay — the probe measured the text
+    // vendoring and compiling under NVRTC (396,128 B cubin, 9 of 9 symbols),
+    // which is the finding that makes re-stating this row cheap.
     // The third linear-attention shape here, and not a variant of the other
     // two: mamba carries a `[head_dim, state_size]` slab per head and
     // advances it with a scalar `dA` from a per-token `dt` -- a selective

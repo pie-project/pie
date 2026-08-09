@@ -207,11 +207,11 @@ fn every_row_either_traces_metal_or_refuses_it_in_words() {
 /// the TEXT, and it is the claim that would have failed.
 #[test]
 fn the_rows_that_serve_metal_are_the_llama_like_ones() {
-    // The NINE generations whose forward reaches `llama_like_metal`: the
-    // seven that call the family projection directly, plus gemma-3 and
-    // gemma-4, whose own projections write their fields over the
-    // family's and call the same text.
-    let generations: [(&str, &[&'static dyn catalog::Variant]); 9] = [
+    // The TEN generations whose forward reaches `llama_like_metal`: the
+    // seven that call the family projection directly, plus gemma-3,
+    // gemma-4 and gpt-oss, whose own projections write their fields over
+    // the family's and call the same text.
+    let generations: [(&str, &[&'static dyn catalog::Variant]); 10] = [
         ("qwen_2", model::qwen_2::rows()),
         ("qwen_3", model::qwen_3::rows()),
         ("llama_3", model::llama_3::rows()),
@@ -221,6 +221,11 @@ fn the_rows_that_serve_metal_are_the_llama_like_ones() {
         ("olmo_3", model::olmo_3::rows()),
         ("gemma_3", model::gemma_3::rows()),
         ("gemma_4", model::gemma_4::rows()),
+        // The newest, and the one that took the most to get here: attention
+        // sinks, a clamped SwiGLU, mxfp4 expert banks, three kinds of bias
+        // the shared text did not state, and a YaRN ladder the driver's
+        // geometry declined to derive.
+        ("gpt_oss", model::gpt_oss::rows()),
     ];
     let expected: Vec<&'static str> = generations
         .iter()

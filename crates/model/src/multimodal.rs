@@ -610,12 +610,12 @@ pub fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(DynamicImage, f32)>, Strin
     let mut out = Vec::with_capacity(frames.len());
     let mut t_ms = 0.0f32;
     for f in frames {
+        // The denominator cannot be zero: a `Delay` wraps a `Ratio`, whose
+        // constructor asserts it, and the GIF decoder builds each frame's
+        // as `hundredths * 10 / 1` besides. A branch for it would be one
+        // no checkpoint or codec can reach.
         let (num, den) = f.delay().numer_denom_ms();
-        let frame_ms = if den != 0 {
-            num as f32 / den as f32
-        } else {
-            num as f32
-        };
+        let frame_ms = num as f32 / den as f32;
         out.push((DynamicImage::ImageRgba8(f.into_buffer()), t_ms / 1000.0));
         t_ms += frame_ms;
     }
@@ -2265,6 +2265,42 @@ mod tests {
     fn bytes_that_are_not_a_gif_are_refused() {
         let e = decode_gif_frames(b"not a gif at all").expect_err("accepted non-gif bytes");
         assert!(e.contains("gif"), "unhelpful refusal: {e}");
+    }
+
+    /// A GIF can be well-formed and still carry no picture.
+    ///
+    /// Header, logical screen descriptor, one comment block, trailer --
+    /// every byte legal, no image block. The decoder is happy and hands
+    /// back an empty frame list, which is the one case
+    /// `bytes_that_are_not_a_gif_are_refused` cannot reach because there
+    /// the decoder itself objects.
+    ///
+    /// The comment is not decoration. `read_info` reads ahead until the
+    /// header is provably over, and a trailer straight after the screen
+    /// descriptor leaves it waiting for a block that never comes, so the
+    /// codec refuses with an EOF and this function never runs. One
+    /// non-image block is what lets a legal empty GIF reach it.
+    ///
+    /// Refusing matters because the caller treats this as a video: an
+    /// empty timeline is a prompt whose media placeholder expands to no
+    /// frames at all, so the model is asked about a picture it was never
+    /// shown, and answers. A named refusal is the difference between a
+    /// failed request and a confident one about nothing.
+    #[test]
+    fn a_gif_with_no_frames_is_refused_rather_than_yielding_an_empty_timeline() {
+        let mut bytes = Vec::from(*b"GIF89a");
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // width
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // height
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00]); // no global table, bg, aspect
+        bytes.extend_from_slice(&[0x21, 0xFE, 0x00]); // an empty comment extension
+        bytes.push(0x3B); // trailer, and not one image block between
+
+        let e = decode_gif_frames(&bytes).expect_err("accepted a picture-less gif");
+        assert_eq!(
+            e, "gif has no frames",
+            "the decoder accepted these bytes, so this is the crate's own \
+             refusal and not the codec's"
+        );
     }
 
     /// The delimiter tables are an ABI: the host encodes these strings with

@@ -21,91 +21,31 @@
 #include "mlp/swiglu.hpp"
 
 namespace pie_cuda_driver::kernels::mlp {
-
-void situ_bf16(
-    const void* gate, const void* up, void* y,
-    int num_elements, float beta, float linear_beta, cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    const int grid = (num_elements + BLOCK - 1) / BLOCK;
-    device::situ<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(gate),
-        static_cast<const device::bf16*>(up),
-        static_cast<device::bf16*>(y),
-        num_elements, beta, linear_beta);
-}
-
-void swiglu_clamp_bf16(
-    const void* gate, const void* up, void* y,
-    int num_elements, float limit, cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    const int grid = (num_elements + BLOCK - 1) / BLOCK;
-    device::swiglu_clamp<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(gate),
-        static_cast<const device::bf16*>(up),
-        static_cast<device::bf16*>(y),
-        num_elements, limit);
-}
-
-void swiglu_bf16(
-    const void* gate, const void* up, void* y,
-    int num_elements, cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    const int grid = (num_elements + BLOCK - 1) / BLOCK;
-    device::swiglu<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(gate),
-        static_cast<const device::bf16*>(up),
-        static_cast<device::bf16*>(y),
-        num_elements);
-}
-
-// `dim3(rows, tiles)`, rows on x -- which is `LaunchRule::ElementwiseRows`
-// and the transpose of what this launcher used to write. The kernel's index
-// lines moved with it; see `mlp/swiglu.cuh`.
-void gpt_oss_glu_strided_bf16(
-    const void* gate, const void* up, void* y,
-    int rows, int cols, int in_stride, int out_stride, cudaStream_t stream,
-    float limit, float alpha)
-{
-    if (rows <= 0 || cols <= 0) return;
-    constexpr int BLOCK = 256;
-    dim3 grid(rows, (cols + BLOCK - 1) / BLOCK);
-    device::gpt_oss_glu_strided<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(gate),
-        static_cast<const device::bf16*>(up),
-        static_cast<device::bf16*>(y),
-        cols, in_stride, out_stride, limit, alpha);
-}
-
-void gpt_oss_glu_bf16(
-    const void* gate, const void* up, void* y,
-    int num_elements, cudaStream_t stream,
-    float limit, float alpha, void* y_fp16)
-{
-    constexpr int BLOCK = 256;
-    const int grid = (num_elements + BLOCK - 1) / BLOCK;
-    device::gpt_oss_glu<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(gate),
-        static_cast<const device::bf16*>(up),
-        static_cast<device::bf16*>(y),
-        static_cast<device::f16*>(y_fp16),
-        num_elements, limit, alpha);
-}
-
-void geglu_tanh_bf16(
-    const void* gate, const void* up, void* y,
-    int num_elements, cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    const int grid = (num_elements + BLOCK - 1) / BLOCK;
-    device::geglu_tanh<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(gate),
-        static_cast<const device::bf16*>(up),
-        static_cast<device::bf16*>(y),
-        num_elements);
-}
+// # Thirteen launchers went from here, and the file is the family's clearest
+// # case of a live JOB with a dead LAUNCHER
+//
+// `situ_bf16`, `swiglu_clamp_bf16`, `swiglu_bf16`, `gpt_oss_glu_bf16`,
+// `geglu_tanh_bf16`, `chunked_swiglu_clamp_bf16`, `chunked_geglu_tanh_bf16`,
+// `relu2_bf16`, `sigmoid_dot_scalar_gate_add_bf16` and `chunked_situ_bf16`
+// all still have rows in `table::mlp` AND in `families::mlp`, and every one
+// of those rows is in `device.rs`'s `JIT_DISPATCHED`: NVRTC compiles them out
+// of `mlp/swiglu.cuh` and the generated shim forwards to none of them. §41's
+// audit measured exactly that -- of twelve `table::mlp` rows the shim carries
+// two. What went is the ahead-of-time launcher, which is §10.10 step 5.
+//
+// Three had no row anywhere and no caller either:
+//
+//   * `gpt_oss_glu_strided_bf16` and `chunked_swiglu_strided_bf16` -- strided
+//     forks nothing ever asked for. The second was also the ONLY C++ caller
+//     of `chunked_swiglu_bf16`, so deleting it frees that row from a hold
+//     that was itself unreachable: orphaned at one remove, §41's shape.
+//   * `sigmoid_scalar_gate_add_bf16` and its `_strided_` callee -- their rows
+//     were removed once already, for the reason `families::mlp`'s header
+//     states: nothing writes those symbols into a plan.
+//
+// `chunked_swiglu_bf16` and `sigmoid_gate_inplace_bf16` stay: both are shim
+// roots, and the first's `I > 10000` scalar/vector fork is a host comparison
+// no `Source` can name.
 
 void sigmoid_gate_inplace_bf16(
     void* x, const void* gate, int n, cudaStream_t stream)
@@ -151,123 +91,5 @@ void chunked_swiglu_bf16(
     }
 }
 
-void chunked_swiglu_clamp_bf16(
-    const void* packed, void* y, int N, int I, float limit,
-    cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    const dim3 grid(N, (I + BLOCK - 1) / BLOCK);
-    device::chunked_swiglu_clamp<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(packed),
-        static_cast<device::bf16*>(y), I, limit);
-}
-
-void chunked_swiglu_strided_bf16(
-    const void* packed, void* y, int N, int I, int row_stride, cudaStream_t stream)
-{
-    if (N <= 0 || I <= 0) return;
-    if (row_stride == 2 * I) {
-        chunked_swiglu_bf16(packed, y, N, I, stream);
-        return;
-    }
-    constexpr int BLOCK = 128;
-    if (row_stride & 1) {
-        dim3 grid(N, (I + BLOCK - 1) / BLOCK);
-        device::chunked_swiglu_strided<device::bf16><<<grid, BLOCK, 0, stream>>>(
-            static_cast<const device::bf16*>(packed),
-            static_cast<device::bf16*>(y),
-            I, row_stride);
-        return;
-    }
-    dim3 grid(N, ((I + 1) / 2 + BLOCK - 1) / BLOCK);
-    device::chunked_swiglu_strided_vec2<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(packed),
-        static_cast<device::bf16*>(y),
-        N, I, row_stride);
-}
-
-void chunked_geglu_tanh_bf16(
-    const void* packed, void* y, int N, int I, cudaStream_t stream,
-    bool gate_second)
-{
-    if (N <= 0 || I <= 0) return;
-    constexpr int BLOCK = 128;
-    dim3 grid(N, (I + BLOCK - 1) / BLOCK);
-    const auto* p = static_cast<const device::bf16*>(packed);
-    auto* yp = static_cast<device::bf16*>(y);
-    if (gate_second) {
-        device::chunked_geglu_tanh_gate_second<device::bf16>
-            <<<grid, BLOCK, 0, stream>>>(p, yp, I);
-    } else {
-        device::chunked_geglu_tanh<device::bf16><<<grid, BLOCK, 0, stream>>>(p, yp, I);
-    }
-}
-
-void relu2_bf16(
-    const void* x, void* y, int num_elements, cudaStream_t stream)
-{
-    if (num_elements <= 0) return;
-    constexpr int BLOCK = 256;
-    const int grid = (num_elements + BLOCK - 1) / BLOCK;
-    device::relu2<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(x),
-        static_cast<device::bf16*>(y),
-        num_elements);
-}
-
-void sigmoid_scalar_gate_add_bf16(
-    void* out, const void* x, const void* scalar_gate, int N, int H,
-    cudaStream_t stream)
-{
-    sigmoid_scalar_gate_strided_add_bf16(
-        out, x, scalar_gate, N, H, /*stride=*/1, stream);
-}
-
-void sigmoid_scalar_gate_strided_add_bf16(
-    void* out, const void* x, const void* scalar_gate,
-    int N, int H, int stride, cudaStream_t stream)
-{
-    if (N <= 0 || H <= 0) return;
-    constexpr int BLOCK = 128;
-    dim3 grid(N, (H + BLOCK - 1) / BLOCK);
-    device::sigmoid_scalar_gate_add<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<device::bf16*>(out),
-        static_cast<const device::bf16*>(x),
-        static_cast<const device::bf16*>(scalar_gate),
-        H, stride);
-}
-
-void sigmoid_dot_scalar_gate_add_bf16(
-    const void* x, const void* gate_w, void* out, const void* y,
-    int N, int H, cudaStream_t stream)
-{
-    if (N <= 0 || H <= 0) return;
-    constexpr int BLOCK = 256;
-    device::sigmoid_dot_scalar_gate_add<device::bf16><<<
-        N, BLOCK, (BLOCK / 32) * sizeof(float), stream>>>(
-        static_cast<const device::bf16*>(x),
-        static_cast<const device::bf16*>(gate_w),
-        static_cast<device::bf16*>(out),
-        static_cast<const device::bf16*>(y),
-        H);
-}
-
-void chunked_situ_bf16(
-    const void* packed, void* y, int N, int I, float beta, float linear_beta,
-    bool gate_second, cudaStream_t stream)
-{
-    if (N <= 0 || I <= 0) return;
-    constexpr int BLOCK = 128;
-    const auto* p = static_cast<const device::bf16*>(packed);
-    auto* yp = static_cast<device::bf16*>(y);
-    dim3 grid(N, (I + BLOCK - 1) / BLOCK);
-    if (gate_second) {
-        device::chunked_situ_gate_second<device::bf16><<<grid, BLOCK, 0, stream>>>(
-            p, yp, I, beta, linear_beta);
-    } else {
-        device::chunked_situ<device::bf16><<<grid, BLOCK, 0, stream>>>(
-            p, yp, I, beta, linear_beta);
-    }
-}
 
 }  // namespace pie_cuda_driver::kernels::mlp

@@ -3,21 +3,20 @@
 // Every `__global__` this file used to hold now lives in `sample/argmax.cuh`,
 // which the JIT compiles at run time and which this file includes so the
 // ahead-of-time archive keeps exactly ONE definition of each. What stays here
-// is the half NVRTC cannot have, and in this family that half is large:
+// is the half NVRTC cannot have, and after §43's sweep that half is three
+// launchers rather than ten:
 //
-//   * `argmax_vec2_usable` -- a run-time test on a pointer's alignment and
-//     the vocab's parity that decides WHICH kernel to fire.
 //   * `cudaDeviceGetAttribute(cudaDevAttrMultiProcessorCount)`, which is
 //     where the fused GEMV's grid comes from.
-//   * A `static` scratch buffer that `cudaMalloc`s and grows, and launchers
-//     that fire two kernels to use it.
-//   * `centroid_top_k` clamped to the shared-memory shortlist the masked
-//     kernels index with it.
+//   * A `static` scratch buffer that `cudaMalloc`s and grows, and a launcher
+//     that fires two kernels to use it.
 //
-// Three kernels have rows in `kernels_cuda_new::families::sample`; the other
-// ten are blocked on one of the four above, and `sample/argmax.cuh`'s header
-// says which for each. A launcher whose grid comes from an occupancy query is
-// exactly the case a `LaunchRule` must not be invented for.
+// One of the three is a row (`table::sample`'s `lm_head_gemv_argmax_int8`)
+// and two are held by a sibling `.cpp`. Everything else this file used to
+// declare was reachable from nothing at all -- see the note below the
+// `static_assert`. A launcher whose grid comes from an occupancy query is
+// exactly the case a `LaunchRule` must not be invented for, and that is why
+// the one that stays, stays.
 //
 // The scalar layer and the fixed-width integer names come out of the prelude,
 // through the device header: NVRTC has no CUDA device headers, and
@@ -39,55 +38,30 @@ static_assert(device::kAccumWarps == kArgmaxAccumSlots,
               "the accumulator carries one slot per warp; "
               "kArgmaxAccumSlots must match kAccumThreads / 32");
 
-namespace {
+// # Seven launchers went from here, and one predicate with them
+//
+// `argmax_bf16`, `argmax_bf16_compact_scatter`, `argmax_fp32`,
+// `lm_head_gemv_argmax_bf16`, `masked_embedding_argmax_bf16`,
+// `topk_centroids_bf16` and `masked_embedding_tile_argmax_pairs_bf16` were
+// host launchers no root could reach: no `pie_k_*` shim entry forwards to
+// them, no `.cu` calls them, and `table::sample::KERNELS` holds exactly one
+// row -- `lm_head_gemv_argmax_int8`, still below. What names the other jobs
+// is `families::sample`, whose rows are DEVICE rows: NVRTC compiles
+// `sample/argmax.cuh` and the `examples/unit_probe_*.rs` probes fire them
+// there, which is a consumer of the header and never of a launcher here.
+//
+// `argmax_vec2_usable` went with them because it was their predicate and
+// only theirs -- the vec2/scalar choice is stated on the device rows as a
+// `Select`, which is where it belongs. The remaining launchers make no such
+// choice, so the file no longer needs the guard. If a vec2 launcher comes
+// back, the predicate comes back with it, from `families::sample`'s terms
+// rather than from a copy here.
+//
+// `argmax_accumulate_bf16` and `argmax_finalize_bf16` STAY and are not
+// rows: `gemm/gemm.cpp`'s chunked LM-head argmax calls both. §10.10 -- a
+// launcher goes when its WHOLE consumer set has gone, and a sibling `.cu`
+// is a consumer even when the row is not.
 
-// The vec2 kernels index rows as `base + row * vocab` and load through
-// `device::bf16x2`, so an odd vocab puts every second row on a 2-byte
-// boundary and the load faults. Production vocabs are even, which is why this
-// never fired, but the guard costs nothing.
-bool argmax_vec2_usable(const void* logits, int vocab) {
-    return (vocab % 2) == 0 &&
-           (reinterpret_cast<std::uintptr_t>(logits) % 4) == 0;
-}
-
-}  // namespace
-
-void argmax_bf16(
-    const void* logits, device::i32* token_ids,
-    int num_rows, int vocab, cudaStream_t stream)
-{
-    dim3 grid(num_rows);
-    dim3 block(device::BLOCK);
-    if (argmax_vec2_usable(logits, vocab)) {
-        device::argmax_vec2<device::bf16><<<grid, block, 0, stream>>>(
-            static_cast<const device::bf16*>(logits), token_ids, vocab);
-    } else {
-        device::argmax<device::bf16><<<grid, block, 0, stream>>>(
-            static_cast<const device::bf16*>(logits), token_ids, vocab);
-    }
-}
-
-void argmax_bf16_compact_scatter(
-    const void* logits,
-    const device::i32* row_indices,
-    device::i32* token_ids,
-    int num_rows,
-    int vocab,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || vocab <= 0) return;
-    dim3 grid(num_rows);
-    dim3 block(device::BLOCK);
-    if (argmax_vec2_usable(logits, vocab)) {
-        device::argmax_compact_scatter_vec2<device::bf16><<<grid, block, 0, stream>>>(
-            static_cast<const device::bf16*>(logits), row_indices,
-            token_ids, vocab);
-    } else {
-        device::argmax_compact_scatter<device::bf16><<<grid, block, 0, stream>>>(
-            static_cast<const device::bf16*>(logits), row_indices,
-            token_ids, vocab);
-    }
-}
 
 void argmax_accumulate_bf16(
     const void* slab,
@@ -176,159 +150,9 @@ void lm_head_gemv_argmax_int8(
         s_partial_pairs, token_ids, num_rows, num_blocks_x);
 }
 
-void lm_head_gemv_argmax_bf16(
-    const void* hidden_states,
-    const void* lm_head_weight,
-    device::i32* token_ids,
-    int num_rows,
-    int hidden,
-    int vocab,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || hidden <= 0 || vocab <= 0) return;
 
-    int num_sms = 0;
-    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
-    const int blocks_per_sm = 4;
-    const int max_blocks_x = num_sms * blocks_per_sm;
-    const int min_blocks_x =
-        (vocab + device::GEMV_WARPS - 1) / device::GEMV_WARPS;
-    const int num_blocks_x = std::min(max_blocks_x, min_blocks_x);
-    const device::usize shmem_bytes =
-        static_cast<device::usize>(hidden) * sizeof(float);
 
-    const device::usize pairs_elems =
-        static_cast<device::usize>(num_blocks_x) * num_rows;
-    static device::u64* s_partial_pairs_bf16 = nullptr;
-    static device::usize s_pairs_cap_bf16 = 0;
-    if (pairs_elems > s_pairs_cap_bf16) {
-        if (s_partial_pairs_bf16) cudaFree(s_partial_pairs_bf16);
-        cudaMalloc(&s_partial_pairs_bf16, pairs_elems * sizeof(device::u64));
-        s_pairs_cap_bf16 = pairs_elems;
-    }
 
-    dim3 grid(num_blocks_x, num_rows);
-    dim3 block(device::GEMV_BLOCK_DIM);
-    device::lm_head_gemv_argmax<device::bf16>
-        <<<grid, block, shmem_bytes, stream>>>(
-            static_cast<const device::bf16*>(hidden_states),
-            static_cast<const device::bf16*>(lm_head_weight),
-            s_partial_pairs_bf16,
-            num_rows,
-            hidden,
-            vocab,
-            num_blocks_x);
 
-    dim3 sel_block(128);
-    dim3 sel_grid((num_rows + sel_block.x - 1) / sel_block.x);
-    device::select_lm_head_argmax_pairs<<<sel_grid, sel_block, 0, stream>>>(
-        s_partial_pairs_bf16, token_ids, num_rows, num_blocks_x);
-}
-
-void argmax_fp32(
-    const void* logits,
-    device::i32* token_ids,
-    int num_rows,
-    int vocab,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || vocab <= 0) return;
-    dim3 grid(num_rows);
-    dim3 block(device::BLOCK);
-    device::argmax<device::f32><<<grid, block, 0, stream>>>(
-        static_cast<const float*>(logits), token_ids, vocab);
-}
-
-void masked_embedding_argmax_bf16(
-    const void* centroid_logits,
-    const void* hidden_states,
-    const void* lm_head_weight,
-    const device::i64* token_ordering,
-    device::i32* token_ids,
-    int num_rows,
-    int hidden,
-    int num_centroids,
-    int centroid_top_k,
-    int vocab_per_centroid,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || hidden <= 0 || num_centroids <= 0 ||
-        centroid_top_k <= 0 || vocab_per_centroid <= 0) {
-        return;
-    }
-    if (centroid_top_k > device::MAX_MASKED_TOP_K) {
-        centroid_top_k = device::MAX_MASKED_TOP_K;
-    }
-    dim3 grid(num_rows);
-    dim3 block(device::BLOCK);
-    device::masked_embedding_argmax<device::bf16><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(centroid_logits),
-        static_cast<const device::bf16*>(hidden_states),
-        static_cast<const device::bf16*>(lm_head_weight),
-        token_ordering,
-        token_ids,
-        hidden,
-        num_centroids,
-        centroid_top_k,
-        vocab_per_centroid);
-}
-
-void topk_centroids_bf16(
-    const void* centroid_logits,
-    device::i32* top_centroids,
-    int num_rows,
-    int num_centroids,
-    int centroid_top_k,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || num_centroids <= 0 || centroid_top_k <= 0) return;
-    if (centroid_top_k > device::MAX_MASKED_TOP_K) {
-        centroid_top_k = device::MAX_MASKED_TOP_K;
-    }
-    dim3 grid(num_rows);
-    dim3 block(device::BLOCK);
-    device::topk_centroids<device::bf16><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(centroid_logits),
-        top_centroids,
-        num_centroids,
-        centroid_top_k);
-}
-
-void masked_embedding_tile_argmax_pairs_bf16(
-    const device::i32* top_centroids,
-    const void* hidden_states,
-    const void* lm_head_weight,
-    const device::i64* token_ordering,
-    device::u64* partial_pairs,
-    int num_rows,
-    int hidden,
-    int centroid_top_k,
-    int vocab_per_centroid,
-    int num_tiles,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || hidden <= 0 || centroid_top_k <= 0 ||
-        vocab_per_centroid <= 0 || num_tiles <= 0) {
-        return;
-    }
-    if (centroid_top_k > device::MAX_MASKED_TOP_K) {
-        centroid_top_k = device::MAX_MASKED_TOP_K;
-    }
-    const int selected = centroid_top_k * vocab_per_centroid;
-    dim3 grid(num_rows, num_tiles);
-    dim3 block(device::BLOCK);
-    device::masked_embedding_tile_argmax_pairs<device::bf16>
-        <<<grid, block, 0, stream>>>(
-            top_centroids,
-            static_cast<const device::bf16*>(hidden_states),
-            static_cast<const device::bf16*>(lm_head_weight),
-            token_ordering,
-            partial_pairs,
-            hidden,
-            centroid_top_k,
-            vocab_per_centroid,
-            selected,
-            num_tiles);
-}
 
 }  // namespace pie_cuda_driver::kernels::sample

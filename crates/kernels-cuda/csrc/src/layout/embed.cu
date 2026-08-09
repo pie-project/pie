@@ -53,21 +53,9 @@ void embed_bf16(
     }
 }
 
-void embed_bf16_vocab_shard(
-    const device::i32* token_ids,
-    const void* weight,
-    void* y,
-    int num_tokens, int hidden, int local_vocab, int vocab_offset,
-    cudaStream_t stream)
-{
-    constexpr int BLOCK = 256;
-    dim3 grid(num_tokens);
-    dim3 block(BLOCK);
-    device::embed_vocab_shard<device::bf16><<<grid, block, 0, stream>>>(
-        token_ids,
-        static_cast<const device::bf16*>(weight),
-        static_cast<device::bf16*>(y),
-        hidden, local_vocab, vocab_offset);
-}
+// `embed_bf16_vocab_shard` was deleted here by §43: its row is routed to
+// NVRTC (`device.rs`'s `JIT_DISPATCHED`) out of `layout/embed.cuh`, so this
+// launcher was reachable from no root. `embed_bf16` stays because its `VEC`
+// choice is a host alignment test no `Source` can produce.
 
 }  // namespace pie_cuda_driver::kernels::layout

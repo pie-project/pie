@@ -7,6 +7,14 @@
 //
 //===----------------------------------------------------------------------===//
 #include "attn/attention_flashinfer_common.cuh"
+// The one `__global__` this file no longer defines: `attn_score_fold_heads`
+// moved out as text and is launched below, unchanged. The header states why
+// this translation unit is its ONLY permitted includer -- a non-template
+// `__global__` in a `.cuh` takes external linkage, so a second one is a
+// `multiple definition` at link. `attention_flashinfer_common.cuh` above is
+// the file the six `attention_flashinfer_hd<N>.cu` units share; this one is
+// not.
+#include "attn/attention_flashinfer.cuh"
 
 #include <atomic>
 #include <cstdio>
@@ -29,52 +37,6 @@ DecodePlanCachePtr make_decode_plan() {
 PrefillPlanCachePtr make_prefill_plan() {
     return PrefillPlanCachePtr(new PrefillPlanCache{});
 }
-
-std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache) {
-    if (!cache.valid) return 0;
-    return static_cast<std::uint32_t>(
-        (cache.plan_info.split_kv ? 2u : 1u) |
-        (cache.full_attention_variant ? 4u : 0u) |
-        (cache.hnd_layout ? 8u : 0u));
-}
-
-bool decode_plan_is_page_count_independent(const DecodePlanCache& cache) {
-    return cache.valid && cache.page_count_independent;
-}
-
-bool prefill_plan_graph_capturable(const PrefillPlanCache& cache) {
-    return cache.valid && cache.graph_capturable;
-}
-
-std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {    if (!cache.valid) return 0;
-    if (cache.use_sm90) {
-        return 0x00800000u |
-               static_cast<std::uint32_t>(
-                   hopper_prefill_graph_layout(cache.sm90_plan));
-    }
-    std::uint32_t tile_class = 0;
-    switch (cache.plan_info.cta_tile_q) {
-        case 16:  tile_class = 1; break;
-        case 32:  tile_class = 2; break;
-        case 64:  tile_class = 3; break;
-        case 128: tile_class = 4; break;
-        default:  tile_class = 0; break;
-    }
-    const std::uint32_t variant_class =
-        cache.full_attention_variant ? 1u : 0u;
-    const auto padded_batch_size = static_cast<std::uint32_t>(
-        std::min<std::int64_t>(cache.plan_info.padded_batch_size,
-                               0x000fffff));
-    return static_cast<std::uint32_t>(
-        0x100u |
-        (cache.plan_info.split_kv ? 1u : 0u) |
-        (tile_class << 1) |
-        (variant_class << 4) |
-        (cache.hnd_layout ? 32u : 0u) |
-        (cache.causal_mask ? 64u : 0u) |
-        (padded_batch_size << 8));
-}
-
 namespace {
 
 bool can_use_static_nonsplit_decode_plan(uint32_t num_requests) {
@@ -796,54 +758,11 @@ void dispatch_attention_flashinfer_decode_capture_bf16(
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Fold the per-head probability rows into one row per request.
-//
-// Eviction here is necessarily a per-REQUEST decision: the paged KV layout
-// carries a single page list per request, so a per-head keep-set has nowhere to
-// live. Quest already makes (and documents) the same collapse. Averaging rather
-// than summing keeps the folded row a probability distribution -- it sums to 1
-// over the live prefix -- so a policy can threshold it in absolute terms.
-//
-// The folded CSR is not a second array: `score_indptr[r]` counts
-// `num_q_heads * kv_len(r')` elements for every earlier request, so dividing it
-// by `num_q_heads` is exactly the folded offset. Deriving it removes the chance
-// of two CSRs disagreeing.
-__global__ void k_attn_score_fold_heads(
-    const float* __restrict__ scores,
-    const std::int32_t* __restrict__ score_indptr,
-    const std::uint32_t* __restrict__ kv_page_indptr,
-    const std::uint32_t* __restrict__ kv_last_page_lens,
-    int page_size,
-    int num_q_heads,
-    float* __restrict__ folded)
-{
-    const int request = static_cast<int>(blockIdx.x);
-    const int pages = static_cast<int>(kv_page_indptr[request + 1]) -
-                      static_cast<int>(kv_page_indptr[request]);
-    if (pages <= 0 || num_q_heads <= 0) return;
-    const int kv_len =
-        (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[request]);
-    if (kv_len <= 0) return;
-
-    const std::size_t base = static_cast<std::size_t>(score_indptr[request]);
-    const float* rows = scores + base;
-    float* out = folded + base / static_cast<std::size_t>(num_q_heads);
-    const float inv_heads = 1.f / static_cast<float>(num_q_heads);
-
-    for (int i = static_cast<int>(threadIdx.x) +
-                 static_cast<int>(blockIdx.y) * static_cast<int>(blockDim.x);
-         i < kv_len;
-         i += static_cast<int>(blockDim.x) * static_cast<int>(gridDim.y)) {
-        float total = 0.f;
-        for (int h = 0; h < num_q_heads; ++h) {
-            total += rows[static_cast<std::size_t>(h) *
-                              static_cast<std::size_t>(kv_len) +
-                          static_cast<std::size_t>(i)];
-        }
-        out[i] = total * inv_heads;
-    }
-}
-
+// The kernel this launches is `device::attn_score_fold_heads`, in
+// `attn/attention_flashinfer.cuh` -- the SPLIT, and there is one text of it.
+// What it does, why the fold averages, and why the folded CSR is derived
+// rather than passed are documented there, next to the body. The `<<<>>>`
+// below is unchanged: a split moves device text and never a launch.
 void attn_score_fold_heads(
     const float* scores,
     const std::int32_t* score_indptr_d,
@@ -861,7 +780,7 @@ void attn_score_fold_heads(
             "attn_score_fold_heads: null score buffer");
     }
     const dim3 grid(static_cast<unsigned>(num_requests), 64u);
-    k_attn_score_fold_heads<<<grid, 256, 0, stream>>>(
+    device::attn_score_fold_heads<<<grid, 256, 0, stream>>>(
         scores, score_indptr_d, kv_page_indptr_d, kv_last_page_lens_d,
         page_size, num_q_heads, folded);
     CUDA_CHECK(cudaGetLastError());
@@ -1494,181 +1413,10 @@ void dispatch_attention_flashinfer_prefill_custom(
         kv_last_page_lens_d, mask_d, mask_indptr_d, workspace, stream,
         logits_soft_cap, sm_scale, lse_out);
 }
-
-void attention_flashinfer_prefill_custom_bf16(
-    const void* q, void* k_pages, void* v_pages, void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t*  mask_d,
-    const std::int32_t*  mask_indptr_d,
-    const std::uint32_t* qo_indptr_h,
-    const std::uint32_t* kv_page_indptr_h,
-    int total_tokens,
-    int num_requests,
-    int num_q_heads, int num_kv_heads, int head_dim, int page_size,
-    AttentionWorkspaceView workspace,
-    cudaStream_t stream,
-    int /* window_left */,  // ignored — kCustom owns the mask
-    float logits_soft_cap,
-    float sm_scale,
-    float* lse_out,
-    bool hnd_layout)
-{
-    if (!attn_head_dim_instantiated(head_dim)) {
-        throw_unsupported_head_dim("flashinfer prefill (custom mask)", head_dim);
-    }
-
-    // 1. paged_kv_t (same as kCausal path).
-    ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
-        static_cast<uint32_t>(num_kv_heads),
-        static_cast<uint32_t>(page_size),
-        static_cast<uint32_t>(head_dim),
-        static_cast<uint32_t>(num_requests),
-        kv_layout(hnd_layout),
-        static_cast<DTypeKV*>(k_pages),
-        static_cast<DTypeKV*>(v_pages),
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indptr_d)),
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_last_page_lens_d)));
-
-    // 2. Plan (same as kCausal — the planner doesn't care about mask mode).
-    ::flashinfer::PrefillPlanInfo plan_info;
-    std::vector<IdType> qo_h(num_requests + 1);
-    std::vector<IdType> kv_h(num_requests + 1);
-    for (int r = 0; r <= num_requests; ++r) {
-        qo_h[r] = static_cast<IdType>(qo_indptr_h[r]);
-        kv_h[r] = static_cast<IdType>(kv_page_indptr_h[r]);
-    }
-
-    // See note above re: head_dims unsupported by `VariableLengthMergeStates`.
-    const bool head_dim_supports_split =
-        head_dim_supports_cascade_merge(static_cast<uint32_t>(head_dim));
-
-    auto status = ::flashinfer::PrefillPlan<IdType>(
-        workspace.float_buffer, workspace.float_bytes,
-        workspace.int_buffer, workspace.page_locked_int,
-        workspace.int_bytes,
-        plan_info,
-        qo_h.data(), kv_h.data(),
-        static_cast<uint32_t>(total_tokens),
-        static_cast<uint32_t>(num_requests),
-        static_cast<uint32_t>(num_q_heads),
-        static_cast<uint32_t>(num_kv_heads),
-        static_cast<uint32_t>(head_dim), static_cast<uint32_t>(head_dim),
-        static_cast<uint32_t>(page_size),
-        /*enable_cuda_graph=*/false,
-        sizeof(DTypeO),
-        /*window_left=*/-1,
-        /*fixed_split_size=*/-1,
-        /*disable_split_kv=*/!head_dim_supports_split,
-        /*num_colocated_ctas=*/0,
-        stream);
-    CUDA_CHECK(status);
-
-    // 3. Build params, including custom mask pointers.
-    PrefillParams params;
-    params.q = const_cast<DTypeQ*>(static_cast<const DTypeQ*>(q));
-    params.paged_kv = paged_kv;
-    params.maybe_custom_mask = const_cast<std::uint8_t*>(mask_d);
-    params.q_indptr = const_cast<IdType*>(reinterpret_cast<const IdType*>(qo_indptr_d));
-    params.maybe_mask_indptr = const_cast<IdType*>(mask_indptr_d);
-    params.maybe_q_rope_offset = nullptr;
-    params.o = static_cast<DTypeO*>(o);
-    params.lse = lse_out;
-    params.maybe_alibi_slopes = nullptr;
-    params.group_size = ::flashinfer::uint_fastdiv(
-        static_cast<uint32_t>(num_q_heads / num_kv_heads));
-    params.num_qo_heads = static_cast<uint32_t>(num_q_heads);
-    params.q_stride_n = static_cast<IdType>(num_q_heads * head_dim);
-    params.q_stride_h = static_cast<IdType>(head_dim);
-    params.window_left = -1;  // kCustom — caller-supplied bitmap is the source of truth
-    params.logits_soft_cap = logits_soft_cap;
-    params.sm_scale = (sm_scale > 0.f)
-        ? sm_scale
-        : 1.0f / std::sqrt(static_cast<float>(head_dim));
-    params.rope_rcp_scale = 1.0f;
-    params.rope_rcp_theta = 1.0f;
-
-    void* int_buf   = workspace.int_buffer;
-    void* float_buf = workspace.float_buffer;
-    params.request_indices   = offset_ptr<IdType>(int_buf, plan_info.request_indices_offset);
-    params.qo_tile_indices   = offset_ptr<IdType>(int_buf, plan_info.qo_tile_indices_offset);
-    params.kv_tile_indices   = offset_ptr<IdType>(int_buf, plan_info.kv_tile_indices_offset);
-    params.o_indptr          = offset_ptr<IdType>(int_buf, plan_info.o_indptr_offset);
-    params.kv_chunk_size_ptr = offset_ptr<IdType>(int_buf, plan_info.kv_chunk_size_ptr_offset);
-    params.padded_batch_size = static_cast<uint32_t>(plan_info.padded_batch_size);
-    params.partition_kv      = plan_info.split_kv;
-    params.max_total_num_rows = static_cast<uint32_t>(plan_info.total_num_rows);
-    params.merge_indptr      = nullptr;
-    params.block_valid_mask  = nullptr;
-    params.total_num_rows    = nullptr;
-    params.maybe_prefix_len_ptr = nullptr;
-    params.maybe_token_pos_in_items_ptr = nullptr;
-    params.token_pos_in_items_len = 0;
-    params.maybe_max_item_len_ptr = nullptr;
-
-    DTypeO* tmp_v = nullptr;
-    float*  tmp_s = nullptr;
-    if (plan_info.split_kv) {
-        params.merge_indptr = offset_ptr<IdType>(int_buf, plan_info.merge_indptr_offset);
-        tmp_v = offset_ptr<DTypeO>(float_buf, plan_info.v_offset);
-        tmp_s = offset_ptr<float>(float_buf, plan_info.s_offset);
-    }
-
-    // 4. Dispatch on head_dim; AttnHd::prefill_custom picks the soft-cap
-    //    variant, mirroring the kCausal path.
-    switch (head_dim) {
-#define PIE_ATTN_HEAD_DIM(HD)                                                \
-        case HD:                                                             \
-            status = AttnHd<HD>::prefill_custom(                             \
-                params, plan_info, tmp_v, tmp_s,                             \
-                current_device_supports_pdl(), stream, logits_soft_cap);     \
-            break;
-#include "kernels.def"
-        default:
-            throw_unsupported_head_dim("flashinfer prefill (custom mask)", head_dim);
-    }
-    CUDA_CHECK(status);
-}
-
-void attention_flashinfer_prefill_custom(
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t*  mask_d,
-    const std::int32_t*  mask_indptr_d,
-    const std::uint32_t* qo_indptr_h,
-    const std::uint32_t* kv_page_indptr_h,
-    int total_tokens,
-    int num_requests,
-    int num_q_heads,
-    AttentionWorkspaceView workspace,
-    cudaStream_t stream,
-    int window_left,
-    float logits_soft_cap,
-    float sm_scale,
-    float* lse_out)
-{
-    const int num_pages_in_batch = kv_page_indptr_h[num_requests];
-    dequant_kv_cache_layer_to_bf16_active(
-        kv_layer, kv_page_indices_d, num_pages_in_batch, stream);
-    attention_flashinfer_prefill_custom_bf16(
-        q,
-        kv_layer.k_bf16_pages,
-        kv_layer.v_bf16_pages,
-        o,
-        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-        mask_d, mask_indptr_d, qo_indptr_h, kv_page_indptr_h,
-        total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
-        kv_layer.head_dim, kv_layer.page_size, workspace, stream,
-        window_left, logits_soft_cap, sm_scale,
-        lse_out, kv_layer.hnd_layout);
-}
+// `attention_flashinfer_prefill_custom` WAS HERE, and it is deleted -- the
+// second `Backlog` keeper closed, on the same evidence: no `<<<>>>` in its
+// body, no caller in `csrc`, no shim entry, no row. It was the
+// `KvCacheLayerView` overload of `attention_flashinfer_prefill_custom_bf16`
+// above, which IS reached and stays.
 
 }  // namespace pie_cuda_driver::kernels::attn

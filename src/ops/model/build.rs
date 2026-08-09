@@ -25,10 +25,11 @@
 //!   one eagerly would build exactly the residency it exists to avoid.
 //!
 //! Which driver the artifact is for is `--backend`, and it is not cosmetic:
-//! CUDA binds fused q/k/v banks under HuggingFace names, Metal binds in-place
-//! projections under MLX names, and an artifact materialized for one is not
-//! what the other's bind path reads. It defaults to `cuda`, which is what the
-//! policy silently was before the flag existed.
+//! CUDA binds fused q/k/v banks under HuggingFace names, while Metal and
+//! Vulkan bind in-place projections under MLX names, and an artifact
+//! materialized for one family is not what the other's bind path reads. It
+//! defaults to `cuda`, which is what the policy silently was before the flag
+//! existed.
 //!
 //! `--backend metal` needed the family schemas to accept their own output
 //! first. A serve boot re-authors from *checkpoint* names, so an artifact
@@ -63,7 +64,7 @@ pub struct BuildArgs {
     /// directory, or a `.zt` artifact.
     pub source: String,
     /// Load-time requantization to bake in: `fp8`, `int8` or `mxfp4` for
-    /// `--backend cuda`, `int4` for `--backend metal`. Absent means none — the
+    /// `--backend cuda`, `int4` for `--backend metal` or `--backend vulkan`. Absent means none — the
     /// optimization is then the layout work alone (fused banks, expert stacks,
     /// dequantized schemes).
     ///
@@ -82,12 +83,12 @@ pub struct BuildArgs {
     /// needs the device's Marlin repack and cannot be materialized offline.
     #[arg(long)]
     pub moe: Option<String>,
-    /// Which driver will serve the artifact: `cuda` or `metal`.
+    /// Which driver will serve the artifact: `cuda`, `metal` or `vulkan`.
     ///
-    /// Not cosmetic and not inferable: the two drivers read different tensors.
-    /// CUDA binds fused q/k/v banks under HuggingFace names, Metal binds
-    /// in-place projections under MLX names, and an artifact materialized for
-    /// one is not the artifact the other's bind path reads. Stated as a flag
+    /// Not cosmetic and not inferable: the drivers read different tensors.
+    /// CUDA binds fused q/k/v banks under HuggingFace names; Metal and Vulkan
+    /// bind in-place projections under MLX names, and an artifact materialized
+    /// for one family is not what the other's bind path reads. Stated as a flag
     /// for the reason `--fp8-native` is: an offline run cannot probe the
     /// device it is optimizing for.
     #[arg(long, default_value = "cuda")]
@@ -204,27 +205,12 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
     // before anything is authored. The pair moves together -- there is no
     // driver that wants MLX names over fused banks -- so one flag sets both
     // and no combination can be spelled that no bind path reads.
-    let (projections, naming) = match args.backend.as_str() {
-        "cuda" => (Projections::Fused, Naming::Hf),
-        "metal" => (Projections::InPlace, Naming::Mlx),
-        other => bail!("--backend {other:?} is not `cuda` or `metal`"),
-    };
+    let (projections, naming) = bind_policy(&args.backend)?;
     // A requantization is only real if the serving driver's kernels read what
     // it produces, so the two flags are checked against each other rather than
     // each alone. Refusing here is the difference between an artifact that
     // cannot be bound and one that is quietly the wrong numbers.
-    match (args.backend.as_str(), runtime_quant) {
-        ("metal", RuntimeQuant::Fp8 | RuntimeQuant::Int8 | RuntimeQuant::Mxfp4) => bail!(
-            "--quant {} is CUDA's; Metal's matvecs read MLX affine, so `--quant int4` \
-             is the requantization this backend can serve",
-            args.quant.as_deref().unwrap_or("")
-        ),
-        ("cuda", RuntimeQuant::Int4) => bail!(
-            "--quant int4 is MLX affine, which no CUDA kernel reads; it is \
-             `--backend metal`'s requantization"
-        ),
-        _ => {}
-    }
+    quant_fits(&args.backend, runtime_quant, args.quant.as_deref())?;
     let policy = Policy {
         projections,
         naming,
@@ -415,4 +401,86 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
         crate::ui::bytes(written),
         crate::ui::short_path(&out_file)
     )))
+}
+
+/// What the named backend's bind path reads.
+///
+/// The pair moves together -- there is no driver that wants MLX names over
+/// fused banks -- so one flag sets both and no combination can be spelled
+/// that no bind path reads.
+///
+/// Vulkan reads exactly what Metal reads. The two drivers share no code, but
+/// they share a bind path shape: MLX names over in-place projections, matvecs
+/// over MLX affine int4. One arm rather than a second policy that happened to
+/// be equal, which would be a second thing to keep equal.
+fn bind_policy(backend: &str) -> Result<(Projections, Naming)> {
+    match backend {
+        "cuda" => Ok((Projections::Fused, Naming::Hf)),
+        "metal" | "vulkan" => Ok((Projections::InPlace, Naming::Mlx)),
+        other => bail!("--backend {other:?} is not `cuda`, `metal` or `vulkan`"),
+    }
+}
+
+/// Refuses a requantization the serving backend's kernels do not read.
+fn quant_fits(backend: &str, quant: RuntimeQuant, spelled: Option<&str>) -> Result<()> {
+    match (backend, quant) {
+        ("metal" | "vulkan", RuntimeQuant::Fp8 | RuntimeQuant::Int8 | RuntimeQuant::Mxfp4) => {
+            bail!(
+                "--quant {} is CUDA's; this backend's matvecs read MLX affine, so \
+                 `--quant int4` is the requantization it can serve",
+                spelled.unwrap_or("")
+            )
+        }
+        ("cuda", RuntimeQuant::Int4) => bail!(
+            "--quant int4 is MLX affine, which no CUDA kernel reads; it is \
+             what `--backend metal` and `--backend vulkan` requantize to"
+        ),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The flag decides which tensors exist, so every accepted spelling has
+    /// to name a bind path that reads them -- and Vulkan's is Metal's.
+    #[test]
+    fn a_vulkan_artifact_is_authored_the_way_a_vulkan_bind_reads_it() {
+        assert_eq!(
+            bind_policy("vulkan").unwrap(),
+            (Projections::InPlace, Naming::Mlx)
+        );
+        assert_eq!(
+            bind_policy("vulkan").unwrap(),
+            bind_policy("metal").unwrap()
+        );
+        assert_eq!(
+            bind_policy("cuda").unwrap(),
+            (Projections::Fused, Naming::Hf)
+        );
+        let refused = bind_policy("rocm").unwrap_err().to_string();
+        assert!(refused.contains("vulkan"), "got: {refused}");
+    }
+
+    /// A requantization the serving kernels cannot read is refused, and the
+    /// one they can is not. Vulkan's matvecs are the affine-U4 path, so it
+    /// takes `int4` and refuses CUDA's three.
+    #[test]
+    fn the_quant_a_vulkan_bind_cannot_read_is_refused() {
+        assert!(quant_fits("vulkan", RuntimeQuant::Int4, Some("int4")).is_ok());
+        assert!(quant_fits("vulkan", RuntimeQuant::None, None).is_ok());
+        for (quant, spelled) in [
+            (RuntimeQuant::Fp8, "fp8"),
+            (RuntimeQuant::Int8, "int8"),
+            (RuntimeQuant::Mxfp4, "mxfp4"),
+        ] {
+            let refused = quant_fits("vulkan", quant, Some(spelled))
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains(spelled), "got: {refused}");
+        }
+        assert!(quant_fits("cuda", RuntimeQuant::Int4, Some("int4")).is_err());
+        assert!(quant_fits("cuda", RuntimeQuant::Fp8, Some("fp8")).is_ok());
+    }
 }

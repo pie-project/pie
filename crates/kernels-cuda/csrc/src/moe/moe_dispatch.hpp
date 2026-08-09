@@ -33,12 +33,6 @@ void scatter_add_weighted_bf16(
 // processed, every per-expert contribution writes to the same single
 // destination row, so the indexed scatter degenerates to a flat
 // fma-on-row. Saves an expert_idx D2H copy + the gather kernel.
-void scalar_weighted_add_bf16(
-    void*       out,    // bf16, in-place
-    const void* src,    // bf16
-    float       weight,
-    int n,
-    cudaStream_t stream);
 
 // Batched version of the above for the N=1 MoE decode path: writes
 // `out[h] = Σ_k weights[k] * src[k * stride_h + h]` for h ∈ [0, hidden).
@@ -51,13 +45,6 @@ void scalar_weighted_add_bf16(
 // `batch` is small (=top_k=8 on Qwen3.6-MoE), `hidden` is the model's
 // hidden_size. Single launch replaces top_k separate scalar-weighted
 // adds.
-void batched_weighted_sum_bf16(
-    void*       out,
-    const void* src,
-    const float* weights,
-    int batch,
-    int hidden,
-    cudaStream_t stream);
 
 // Batched decode version: writes
 // `out[n, h] = sum_k weights[n, k] * src[n, k, h]`.
@@ -86,15 +73,6 @@ void token_batched_weighted_sum_add_bf16(
 // Fused combine for aligned MoE output. `route_to_aligned_row[route]`
 // maps the original route id (`token * top_k + k`) to its row in
 // `aligned_out`; accumulation still proceeds in top-k order for each token.
-void token_batched_weighted_sum_aligned_bf16(
-    void* out,
-    const void* aligned_out,
-    const float* weights,
-    const std::int32_t* route_to_aligned_row,
-    int num_tokens,
-    int top_k,
-    int hidden,
-    cudaStream_t stream);
 
 // On-device construction of the per-expert cuBLAS pointer arrays for the
 // N=1 MoE decode path. Replaces the host-side build_routing + 6
@@ -116,49 +94,10 @@ void token_batched_weighted_sum_aligned_bf16(
 //     weights_out     : [top_k] fp32 — `topk_w` copied through
 //     stride_gu       : 2 * I_moe * H (bf16 elements per expert in gate_up_proj)
 //     stride_dn       : H * I_moe       (bf16 elements per expert in down_proj)
-void build_moe_ptrs_decode_bf16(
-    const std::int32_t* topk_idx,
-    const float*        topk_w,
-    const void*         gate_up_base,
-    const void*         down_base,
-    const void*         norm_x,
-    void*               expert_gate_up,
-    void*               expert_act,
-    void*               expert_out,
-    const void**        a_gu_ptrs,
-    const void**        b_gu_ptrs,
-    void**              c_gu_ptrs,
-    const void**        a_dn_ptrs,
-    const void**        b_dn_ptrs,
-    void**              c_dn_ptrs,
-    float*              weights_out,
-    int top_k,
-    int H, int I_moe,
-    cudaStream_t stream);
 
 // Multi-token decode equivalent of `build_moe_ptrs_decode_bf16`.
 // Produces `num_tokens * top_k` pointer triples, treating each routed
 // token/expert pair as one M=1 batched-GEMM item.
-void build_moe_ptrs_decode_batched_bf16(
-    const std::int32_t* topk_idx,
-    const float*        topk_w,
-    const void*         gate_up_base,
-    const void*         down_base,
-    const void*         norm_x,
-    void*               expert_gate_up,
-    void*               expert_act,
-    void*               expert_out,
-    const void**        a_gu_ptrs,
-    const void**        b_gu_ptrs,
-    void**              c_gu_ptrs,
-    const void**        a_dn_ptrs,
-    const void**        b_dn_ptrs,
-    void**              c_dn_ptrs,
-    float*              weights_out,
-    int num_tokens,
-    int top_k,
-    int H, int I_moe,
-    cudaStream_t stream);
 
 // Bandwidth-optimal decode GEMVs for the sparse MoE hot path. At M=1 the
 // routed GEMMs have no weight reuse, so they are pure streaming reads;
@@ -168,10 +107,6 @@ void build_moe_ptrs_decode_batched_bf16(
 // chosen explicitly. Shapes for the sweep must come from a decode trace of the
 // model -- a hand-picked set already produced a confident number for a shape
 // that never runs, and cost two models a regression.
-bool moe_decode_gemv_tuned(
-    const std::int32_t* topk_idx, const void* act, const void* weight_base,
-    void* out, int routes, int top_k, int K, int N, long long expert_stride,
-    int warps, int unroll, cudaStream_t stream);
 
 void moe_gate_up_decode_gemv_bf16(
     const std::int32_t* topk_idx,
@@ -198,42 +133,12 @@ void moe_down_decode_gemv_bf16(
 // Tensor-core decode kernels for the sparse MoE hot path. Each routed
 // token/expert pair is treated as a 1-row GEMM, but computed with BF16 WMMA
 // tiles to avoid the overhead of many tiny cuBLAS batched GEMMs.
-void moe_gate_up_decode_wmma_bf16(
-    const std::int32_t* topk_idx,
-    const void* norm_x,
-    const void* gate_up_base,
-    void* expert_gate_up,
-    int num_tokens,
-    int top_k,
-    int H,
-    int I_moe,
-    cudaStream_t stream);
 
-void moe_down_decode_wmma_bf16(
-    const std::int32_t* topk_idx,
-    const void* expert_act,
-    const void* down_base,
-    void* expert_out,
-    int num_tokens,
-    int top_k,
-    int H,
-    int I_moe,
-    cudaStream_t stream);
 
 // Builds a two-entry pointer table for running two same-shaped BF16 GEMMs as
 // one cublasGemmBatchedEx call:
 //   out0 = act @ w0^T
 //   out1 = act @ w1^T
-void build_dual_bf16_gemm_ptrs(
-    const void* act,
-    const void* w0,
-    const void* w1,
-    void* out0,
-    void* out1,
-    const void** act_ptrs,
-    const void** w_ptrs,
-    void** out_ptrs,
-    cudaStream_t stream);
 
 // vLLM/SGL-style decode alignment. Sorts route ids [0, num_routes) by expert
 // into fixed-size blocks; padded entries are filled with sentinel num_routes.

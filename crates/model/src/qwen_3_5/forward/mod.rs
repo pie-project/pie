@@ -2244,6 +2244,207 @@ mod tests {
         )));
     }
 
+    /// The CUDA text NAMES both in-proj splits, and names them
+    /// differently.
+    ///
+    /// `gdn_block_fused_binding_traces_two_splits` pins the semantic form,
+    /// where both come out as one `SplitGdn` op and the executor picked a
+    /// kernel by comparing the widths against `conv_dim` / `V_dim` /
+    /// `V_h`. That comparison is the bug this arm exists to remove: a row
+    /// split and an INTERLEAVED b/a split are different arithmetic over
+    /// the same shapes, so any family whose `V_h` happened to equal its
+    /// `V_dim` got whichever the comparison hit first -- silently, since
+    /// both produce two tensors of the right size.
+    ///
+    /// So the assertion is on the two symbols being present and distinct,
+    /// not on their widths. `a` is still read from the ba split's SECOND
+    /// output, because the driver packs `ba` as `[b | a]` while `gdn_prep`
+    /// takes `[qkv, a, b]`.
+    #[test]
+    fn the_cuda_fused_in_proj_states_a_row_split_and_a_ba_split_by_name() {
+        let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
+        facts.gdn.fused_in_proj = true;
+        let cuda = Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+        let plan = qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::Prefill);
+
+        let splits: Vec<&str> = plan
+            .ops
+            .iter()
+            .filter(|op| op.layer == Some(0))
+            .filter_map(|op| match &op.kind {
+                OpKind::Launch { kernel, .. } if kernel.starts_with("layout::split") => {
+                    Some(kernel.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            splits,
+            vec!["layout::split_bf16_rows", "layout::split_qwen_gdn_ba_bf16"],
+            "the fused binding states one row split for qkv/z and the \
+             interleaved b/a split for the gates, in that order"
+        );
+        assert!(
+            !plan
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::SplitGdn { .. })),
+            "no semantic split survives into the CUDA text, or the \
+             executor is back to choosing a kernel from the widths"
+        );
+
+        let ba = plan
+            .ops
+            .iter()
+            .find(|op| {
+                matches!(&op.kind, OpKind::Launch { kernel, .. }
+                if kernel == "layout::split_qwen_gdn_ba_bf16")
+            })
+            .expect("the ba split was just asserted present");
+        let prep = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::GdnPrep { .. }) && op.layer == Some(0))
+            .expect("layer 0 is the GDN layer");
+        assert_eq!(prep.inputs[1], ba.outputs[1], "a is the split's second");
+        assert_eq!(prep.inputs[2], ba.outputs[0], "b is the split's first");
+    }
+
+    /// A CUDA MoE with no shared expert folds the shared block away, on
+    /// BOTH the aligned fast path and the general one.    ///
+    /// The semantic text is already held to this; the two CUDA texts are
+    /// separate statements and could drift from it independently. A text
+    /// that kept the block would bind `shared_gate_up`, `shared_down` and
+    /// `shared_gate` -- three weights the checkpoint of a
+    /// no-shared-expert row does not contain -- and the load would fail
+    /// with a missing-tensor message about a block the model does not
+    /// have.
+    #[test]
+    fn a_cuda_moe_with_no_shared_expert_folds_the_shared_block_on_both_paths() {
+        let with_shared = Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+        let without = Qwen35MoeMlpFacts {
+            shared_expert_intermediate: 0,
+            ..with_shared.clone()
+        };
+        // `moe_residual_fold` picks the ALIGNED fast path over the general
+        // one, and both have their own shared-expert arm.
+        for aligned in [true, false] {
+            let cuda = Qwen35CudaFacts {
+                moe_residual_fold: aligned,
+                ..Qwen35CudaFacts::qwen3_5_0_8b_synthetic()
+            };
+            let names = |facts: &Qwen35MoeMlpFacts| {
+                qwen3_5_moe_mlp_block_cuda(facts, &cuda)
+                    .ops
+                    .iter()
+                    .filter_map(|op| match &op.kind {
+                        OpKind::Matmul { weight, .. } => Some(weight.clone()),
+                        _ => None,
+                    })
+                    .filter(|w| w.contains("shared"))
+                    .count()
+            };
+            assert!(
+                names(&with_shared) > 0,
+                "aligned={aligned}: the shared block was never stated"
+            );
+            assert_eq!(
+                names(&without),
+                0,
+                "aligned={aligned}: a row with no shared expert still binds \
+                 its weights"
+            );
+        }
+    }
+
+    /// The UNFUSED full-attention binding states three projections where
+    /// the fused one states a bank and a split.
+    ///
+    /// The fused sibling is already held to its own shape. This is the
+    /// other half of the same claim, and it is the DEFAULT: a checkpoint
+    /// that ships `q_proj`/`k_proj`/`v_proj` separately is what the fused
+    /// path's environment switch turns off. A text that stated the fused
+    /// form anyway would name a `qgkv` bank no file contains.
+    #[test]
+    fn the_unfused_full_attention_binding_states_three_projections() {
+        let cuda = Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+        let plan = |fused_qkv| {
+            let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
+            facts.attn.fused_qkv = fused_qkv;
+            qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::Decode)
+        };
+        let full_attn_layer = {
+            let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+            (0..facts.layers)
+                .find(|&l| facts.is_full_attn(l))
+                .expect("the hybrid has a full-attention layer")
+        };
+        let projections = |fused_qkv| {
+            plan(fused_qkv)
+                .layer_ops(full_attn_layer)
+                .filter_map(|op| match &op.kind {
+                    OpKind::Matmul { weight, .. } => Some(weight.clone()),
+                    _ => None,
+                })
+                .filter(|w| w.contains("proj") || w.contains("qgkv"))
+                .count()
+        };
+        assert_eq!(
+            projections(false),
+            projections(true) + 2,
+            "the unfused binding did not state q, k and v separately"
+        );
+        assert!(
+            !plan(false)
+                .layer_ops(full_attn_layer)
+                .any(|op| matches!(&op.kind, OpKind::SplitQkv { .. })),
+            "an unfused binding has nothing to split"
+        );
+    }
+
+    /// The UNFUSED dense MLP states two matmuls into the pair form, and
+    /// names the two halves rather than the bank.
+    ///
+    /// Same claim as the attention's, one block down, and it is the
+    /// binding that decides -- not the checkpoint and not the kernel. A
+    /// text that stated the packed form for an unfused binding would bind
+    /// a `gate_up_proj` the file does not have, and the chunked kernel
+    /// would read the second half of a bank that is only half as wide.
+    #[test]
+    fn the_unfused_dense_mlp_states_both_halves_by_name() {
+        let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
+        facts.mlp = Qwen35MlpKind::Dense { intermediate: 512 };
+        let weights = |gate_up_fused| {
+            let cuda = Qwen35CudaFacts {
+                gate_up_fused,
+                ..Qwen35CudaFacts::qwen3_5_0_8b_synthetic()
+            };
+            qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::Decode)
+                .layer_ops(0)
+                .filter_map(|op| match &op.kind {
+                    OpKind::Matmul { weight, .. } => Some(weight.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let unfused = weights(false);
+        let fused = weights(true);
+        assert!(
+            unfused.iter().any(|w| w.ends_with("gate_proj"))
+                && unfused.iter().any(|w| w.ends_with("up_proj")),
+            "the unfused binding did not name the two halves: {unfused:?}"
+        );
+        assert!(
+            !unfused.iter().any(|w| w.contains("gate_up")),
+            "an unfused binding named the bank anyway: {unfused:?}"
+        );
+        assert!(
+            fused.iter().any(|w| w.contains("gate_up")),
+            "the fused binding did not name the bank: {fused:?}"
+        );
+        assert_eq!(unfused.len(), fused.len() + 1);
+    }
+
     /// The full-attention and hybrid traced forms survive serde — the new
     /// kinds, the partial rope, the per-head Gemma variant — and, per the
     /// additive rule, none of the new vocabulary appears in any pre-hybrid

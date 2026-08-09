@@ -84,6 +84,24 @@ bridge = ["kernels-cuda/native"]
 # shell into the same binary: same symbols, one provider.
 abi = ["bridge", "dep:driver-api", "dep:model-loader", "model/contract"]
 
+# The AOT-vs-JIT parity harness's half of the seam: `bind::dispatch_jit_probe`
+# and the second generated `match` it includes, in which every row a
+# `kernels-cuda-new` unit hosts takes its JIT arm whether or not it is routed.
+#
+# OFF EVERYWHERE BUT THE HARNESS, and the reason is timing rather than size.
+# Routing a row deletes its shim entry, so the only window in which its two
+# implementations can be compared is BEFORE the flip -- and a dispatcher
+# cannot hold both arms for one symbol. Two dispatchers can, which is what
+# this feature compiled: `tests/jit_parity.rs` fired one statement through
+# `dispatch` (the AOT arm, because the row is not routed yet) and through
+# `dispatch_jit_probe` (the arm routing will emit), and compares bytes.
+#
+# It is not a fallback and cannot become one: the probe's `match` contains no
+# `pie_k_*` call at all, so a row it declines has no JIT arm rather than a
+# second chance, and nothing inside the driver calls it. Needs `bridge`, which
+# is where the generated files come from.
+jit-parity = []
+
 [dependencies]
 # The CUDA version is pinned EXPLICITLY rather than through
 # `cuda-version-from-build-system`, and that is the whole reason this crate
@@ -372,6 +390,12 @@ required-features = ["_cuda"]
 name = "cublas_handle_parity"
 required-features = ["_cuda"]
 
+# §45's parity gate. `bridge` and not `_cuda`, because it constructs a
+# `DispatchCtx` to hand the ports, and that type is the bridge's.
+[[test]]
+name = "gemm_service_parity"
+required-features = ["bridge"]
+
 [[test]]
 name = "entry_validation"
 required-features = ["_cuda"]
@@ -477,6 +501,7 @@ required-features = ["_cuda"]
 name = "bridge_smoke"
 required-features = ["_cuda", "bridge"]
 
+
 [[test]]
 name = "executor_bind"
 required-features = ["_cuda"]
@@ -527,3 +552,4 @@ required-features = ["_cuda"]
 [[test]]
 name = "jit_dispatch"
 required-features = ["_cuda", "bridge"]
+

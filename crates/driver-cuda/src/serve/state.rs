@@ -1,4 +1,4 @@
-//! The shell's state: what `PieDriver` points at, and the device-lifetime
+//! The shell's state, and the device-lifetime
 //! things hung off it.
 //!
 //! A leaf. Nothing here calls into `load`, `launch`, `encode` or `transfer`
@@ -6,10 +6,15 @@
 //! read first. The types are the driver's nouns; the verbs are next door.
 
 use crate::fire::scratch::Scratch;
-use driver_api::local::{PIE_STATUS_DRIVER_ERROR, PieCompletion, PieDriver};
+use driver_api::completion::{CompletionBroker, CompletionTarget};
+use driver_api::local::PIE_STATUS_DRIVER_ERROR;
 
-/// The shell's state — what `PieDriver` points at.
-pub(crate) struct Shell {
+/// The shell's state.
+///
+/// It was what a `*mut PieDriver` pointed at, reached through a
+/// `cast::<Shell>().as_mut()` on every one of thirteen entry points. The
+/// entry points are methods now, so the receiver IS this.
+pub struct Shell {
     /// The capabilities JSON `create` hands back; owned here so the
     /// pointer in [`PieDriverCaps`] lives as long as the driver.
     pub(crate) caps: Vec<u8>,
@@ -155,9 +160,15 @@ pub(crate) struct Shell {
     /// The next never-used id (programs and instances share the counter —
     /// simpler, and nothing in the ABI wants them dense).
     pub(crate) next_id: u64,
-    /// The runtime's notify callback + its context, from `create`.
-    pub(crate) notify: driver_api::local::PieRuntimeNotifyFn,
-    pub(crate) notify_ctx: *mut std::ffi::c_void,
+    /// Who to tell when work finishes, from `create`.
+    ///
+    /// It was a `{notify: PieRuntimeNotifyFn, ctx: *mut c_void}` pair — a C
+    /// function pointer and an erased context — because the engine on the
+    /// other side had to be reachable from a C++ shell. The engine is Rust
+    /// and so is this, so the pair is the handle it was erasing: a
+    /// `CompletionBroker` is `Clone + Send`, and a stream callback publishes
+    /// through it by name.
+    pub(crate) broker: CompletionBroker,
     /// The hybrid's GDN state slabs, allocated on first hybrid launch.
     pub(crate) gdn: Option<GdnState>,
     /// The unionized supergraph's instantiated graphs, one per (R, N)
@@ -262,7 +273,7 @@ pub(crate) struct Shell {
 
 /// Driver-lifetime fire scratch.
 pub(crate) struct FireScratch {
-    pub(crate) ws:
+    pub ws:
         crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
     /// The PREFILL plan's own workspace, and it has to be its own.
     ///
@@ -276,13 +287,13 @@ pub(crate) struct FireScratch {
     /// raised, so that a union capture can walk an arm this fire does not
     /// take. That is a memory cost, not a correctness one — as long as the
     /// plans stop sharing storage. This is that separation.
-    pub(crate) prefill_ws:
+    pub prefill_ws:
         crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
-    pub(crate) decode_plan: crate::bind::DecodePlan,
+    pub decode_plan: crate::bind::DecodePlan,
     /// gemma-4's SECOND decode plan — the FULL layers' 512-wide
     /// geometry; single-kind families never plan it.
-    pub(crate) decode_plan_full: crate::bind::DecodePlan,
-    pub(crate) prefill_plan: crate::bind::PrefillPlan,
+    pub decode_plan_full: crate::bind::DecodePlan,
+    pub prefill_plan: crate::bind::PrefillPlan,
     /// A peel TAIL's decode plan, and its own workspace.
     ///
     /// Its own for the reason `prefill_ws` is its own: a FlashInfer plan
@@ -293,8 +304,8 @@ pub(crate) struct FireScratch {
     /// `Launch::peel`'s doc says a prepared plan "is found by the
     /// rectangle's ROW COUNT". A tail serves `[split, N)`, which is a
     /// different request count and therefore a different schedule.
-    pub(crate) tail_plan: crate::bind::DecodePlan,
-    pub(crate) tail_ws:
+    pub tail_plan: crate::bind::DecodePlan,
+    pub tail_ws:
         crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
 }
 
@@ -308,16 +319,16 @@ pub(crate) struct SwapPool {
     /// layers disagree on head dim, so neither the count nor the width is
     /// a constant. `pools::swap_pool::SwapPool` says what to allocate;
     /// this holds what was allocated.
-    pub(crate) regions: Vec<*mut std::ffi::c_void>,
+    pub regions: Vec<*mut std::ffi::c_void>,
     /// The plan those regions were allocated against — the geometry a
     /// `SwapPlan` is built from, and the record of what this pool can
     /// serve.
-    pub(crate) plan: crate::pools::swap_pool::SwapPoolLayout,
+    pub plan: crate::pools::swap_pool::SwapPoolLayout,
     /// The two stream roles the plan asked for. Kept for the driver's
     /// life: the C++ creates them once, and an eviction queued behind a
     /// restore is the stall the second stream exists to avoid.
-    pub(crate) evict: Option<crate::device::OwnedStream>,
-    pub(crate) restore: Option<crate::device::OwnedStream>,
+    pub evict: Option<crate::device::OwnedStream>,
+    pub restore: Option<crate::device::OwnedStream>,
 }
 
 impl SwapPool {
@@ -344,14 +355,14 @@ impl SwapPool {
 /// words, exactly the C++ registry's binding contract.
 #[derive(Clone, Copy)]
 pub(crate) struct ChannelState {
-    pub(crate) mirror: *mut std::ffi::c_void,
-    pub(crate) words: *mut std::ffi::c_void,
-    pub(crate) mirror_bytes: usize,
+    pub mirror: *mut std::ffi::c_void,
+    pub words: *mut std::ffi::c_void,
+    pub mirror_bytes: usize,
     /// WIRE bytes per cell — bit-packed for bools.
-    pub(crate) cell_bytes: usize,
+    pub cell_bytes: usize,
     /// `capacity + 1` — the ring modulus.
-    pub(crate) ring: u32,
-    pub(crate) host_role: u8,
+    pub ring: u32,
+    pub host_role: u8,
     /// Lanes in one cell, and the cell's element type.
     ///
     /// Kept because `cell_bytes` cannot be inverted: a bool cell is
@@ -361,14 +372,14 @@ pub(crate) struct ChannelState {
     /// the shape rather than the width — which is why a driver that only
     /// ever wrote to the host mirror could get away without these and one
     /// that fires a program cannot.
-    pub(crate) numel: usize,
-    pub(crate) dtype: driver::tensor_ir::DType,
+    pub numel: usize,
+    pub dtype: driver::tensor_ir::DType,
     /// `PIE_CHANNEL_EXTERN_*`: is this channel private to one instance,
     /// or does it cross between programs?
     ///
     /// Recorded rather than acted on, and `bind_instance` refuses an
     /// instance that names one. See [`ChannelState::is_extern`].
-    pub(crate) extern_dir: u8,
+    pub extern_dir: u8,
 }
 
 impl ChannelState {
@@ -398,7 +409,7 @@ impl ChannelState {
     /// `shared` ring in `register_channel`); that crate is deleted, so the
     /// contract is now `driver-api`'s vocabulary and this comment is the
     /// record of where the worked example went.
-    pub(crate) const fn is_extern(&self) -> bool {
+    pub const fn is_extern(&self) -> bool {
         self.extern_dir != driver_api::local::PIE_CHANNEL_EXTERN_NONE
     }
 
@@ -435,7 +446,7 @@ impl ChannelState {
 /// driver runs one fire ahead, which is the whole of the property and the
 /// smallest thing that has it.
 pub(crate) struct InFlight {
-    pub(crate) done: crate::device::Event,
+    pub done: crate::device::Event,
     /// Ordinary scratch. Named for what it is rather than listed, because
     /// the point is that nothing here is read again — it is held only so
     /// that dropping it does not synchronize at the wrong moment.
@@ -452,7 +463,7 @@ pub(crate) struct InFlight {
     /// Deferring rather than refcounting because the lifetime is already
     /// modelled here -- an in-flight fire is exactly the thing that might
     /// still be holding it, and this queue already knows when one retires.
-    pub(crate) closed_channels: Vec<ChannelState>,
+    pub closed_channels: Vec<ChannelState>,
 }
 
 /// Give back what a retired fire was holding.
@@ -481,9 +492,9 @@ pub(crate) const RUNAHEAD_DEPTH: usize = 2;
 /// What a lowering can depend on: see [`Shell::lowerings`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct LoweringKey {
-    pub(crate) model_id: u64,
-    pub(crate) class: model_compiler::trace::FireClass,
-    pub(crate) rows: u32,
+    pub model_id: u64,
+    pub class: model_compiler::trace::FireClass,
+    pub rows: u32,
     /// A digest of the fire's ROWS, not just how many.
     ///
     /// The lowering resolves five guards off the rows — `HasLora`,
@@ -495,8 +506,8 @@ pub(crate) struct LoweringKey {
     /// without one have the same shape and different launch lists, and a
     /// key that could not tell them apart would serve the first
     /// lowering to arrive to both.
-    pub(crate) rows_digest: u64,
-    pub(crate) union_asked: bool,
+    pub rows_digest: u64,
+    pub union_asked: bool,
 }
 
 /// FNV-1a over the rows' axes.
@@ -525,10 +536,10 @@ pub(crate) fn digest_rows(rows: &[model_compiler::lower::Row]) -> u64 {
 
 /// A traced, lowered and joined program, and whether it kept its union.
 pub(crate) struct LoweredFire {
-    pub(crate) plan: model_compiler::trace::ForwardPlan,
-    pub(crate) lowered: model_compiler::lower::Lowered,
-    pub(crate) dplan: crate::bind::DispatchPlan,
-    pub(crate) union: bool,
+    pub plan: model_compiler::trace::ForwardPlan,
+    pub lowered: model_compiler::lower::Lowered,
+    pub dplan: crate::bind::DispatchPlan,
+    pub union: bool,
 }
 
 /// EVERYTHING A FIRE STILL OWES WHEN ITS WORK IS ENQUEUED.
@@ -561,7 +572,7 @@ pub(crate) struct FireDebt {
     /// `cudaMemcpyAsync` into pageable host memory blocks until the copy
     /// completes, so a `Vec` here drains the stream inside
     /// `pie_cuda_launch` and undoes the run-ahead.
-    pub(crate) staging: Option<(*const u8, usize)>,
+    pub staging: Option<(*const u8, usize)>,
     /// One `(reader channel, logits row)` per request in the frame.
     ///
     /// A LIST, because a frame carries a roster and every request in it
@@ -572,14 +583,13 @@ pub(crate) struct FireDebt {
     /// The row is not the request's index: request `r` owns `qo_indptr[r]
     /// ..qo_indptr[r + 1]`, so its answer is at `qo_indptr[r + 1] - 1`. On
     /// a decode that equals `r`; on a prefill it does not.
-    pub(crate) readouts: Vec<(ChannelState, usize)>,
-    pub(crate) vocab: usize,
+    pub readouts: Vec<(ChannelState, usize)>,
+    pub vocab: usize,
     /// The terminal cells this frame publishes, and the completion the
     /// runtime is waiting on.
-    pub(crate) cells: Vec<*mut driver_api::local::PieTerminalCell>,
-    pub(crate) completion: PieCompletion,
-    pub(crate) notify: driver_api::local::PieRuntimeNotifyFn,
-    pub(crate) notify_ctx: *mut std::ffi::c_void,
+    pub cells: Vec<*mut driver_api::local::TerminalCell>,
+    pub completion: CompletionTarget,
+    pub(crate) broker: CompletionBroker,
 }
 
 // The debt crosses to a CUDA callback thread. Every field is either owned
@@ -627,27 +637,26 @@ pub(crate) unsafe extern "C" fn retire_fire(data: *mut std::ffi::c_void) {
         }
     }
 
-    // Then the terminal cells, then the notify — in that order, with a
-    // release between, because the runtime reads the cells the moment the
-    // notify lands.
+    // Then the terminal cells, then the notify — in that order, because the
+    // runtime reads the cells the moment the notify lands.
+    //
+    // `publish` is a RELEASE STORE on the cell's own `AtomicU32`, which is
+    // what pairs with the runtime's `load(Acquire)` on that same word. It
+    // replaces a non-atomic `write_volatile` followed by a `fence(Release)`:
+    // the write raced the reader's atomic load, and the fence was on the
+    // wrong side of the store to give that store a release anyway.
     for &cell in &debt.cells {
         if !cell.is_null() {
             unsafe {
-                std::ptr::addr_of_mut!((*cell).outcome)
-                    .write_volatile(driver_api::local::PIE_TERMINAL_OUTCOME_SUCCESS);
+                (*cell).publish(driver_api::local::PIE_TERMINAL_OUTCOME_SUCCESS);
             }
         }
     }
+    // Still fenced before the notify: the channel publishes above are a
+    // different plane, and the runtime reads those on the notify too.
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    if let Some(notify) = debt.notify {
-        unsafe {
-            notify(
-                debt.notify_ctx,
-                debt.completion.wait_id,
-                debt.completion.target_epoch,
-            )
-        };
-    }
+    debt.broker
+        .notify(debt.completion.wait_id, debt.completion.target_epoch);
 }
 
 impl ChannelState {
@@ -717,11 +726,11 @@ impl ChannelState {
 /// same two facts from a buffer's LENGTH: a layer's page stride and,
 /// from that, its head dim. Both are things the layout states.
 pub(crate) struct KvState {
-    pub(crate) cache:
+    pub cache:
         crate::pools::kv_cache_live::KvCache<crate::pools::kv_cache_live::AllResident>,
     /// Backing store for `cache`; dropping this frees the pages.
-    pub(crate) _held: Vec<crate::device::DeviceBuffer>,
-    pub(crate) num_pages: u32,
+    pub _held: Vec<crate::device::DeviceBuffer>,
+    pub num_pages: u32,
 }
 
 impl KvState {
@@ -797,22 +806,22 @@ impl KvState {
 /// pool rather than its own allocation.
 ///
 /// Slot ids are the ENGINE's (`rs_slot_ids` on the step,
-/// `PieStateCopyRange` on state copies); the shell only stores.
+/// `StateCopyRange` on state copies); the shell only stores.
 pub(crate) struct GdnState {
     /// The cache: the layout, the strides, and what to do to the buffers.
-    pub(crate) cache: crate::pools::recurrent_state_cache::RecurrentStateCache,
+    pub cache: crate::pools::recurrent_state_cache::RecurrentStateCache,
     /// The two pooled allocations, in `Buffer` order. `mtp` is absent
     /// until the MTP pending-hidden row has a writer.
-    pub(crate) conv: crate::device::DeviceBuffer,
-    pub(crate) recurrent: crate::device::DeviceBuffer,
+    pub conv: crate::device::DeviceBuffer,
+    pub recurrent: crate::device::DeviceBuffer,
     /// Which MODEL layers are linear, so a caller can map a model layer to
     /// the pool's linear index.
-    pub(crate) is_linear: Vec<bool>,
-    pub(crate) num_slots: u32,
-    pub(crate) conv_stride_elems: i64,
-    pub(crate) state_stride_elems: i64,
+    pub is_linear: Vec<bool>,
+    pub num_slots: u32,
+    pub conv_stride_elems: i64,
+    pub state_stride_elems: i64,
     /// Bytes per element of the recurrent store (2 = bf16 state).
-    pub(crate) state_elem_bytes: usize,
+    pub state_elem_bytes: usize,
 }
 
 impl GdnState {
@@ -1099,19 +1108,19 @@ pub(crate) fn install_kv(
 /// arm lands — it is the caller's transient memory, and copying an IR
 /// nothing can execute yet would be bytes without a reader.
 pub(crate) struct ProgramEntry {
-    pub(crate) program_hash: u64,
+    pub program_hash: u64,
     #[allow(dead_code)] // read when launch's compile cache lands
-    pub(crate) emitter_version: u32,
+    pub emitter_version: u32,
 }
 
 /// A bound instance: which program, the geometry the binding echoed, and
 /// the channels the instance attached.
 pub(crate) struct InstanceEntry {
     #[allow(dead_code)] // read when launch resolves frames to instances
-    pub(crate) program_id: u64,
+    pub program_id: u64,
     #[allow(dead_code)]
-    pub(crate) geometry_class: u32,
-    pub(crate) channel_ids: Vec<u64>,
+    pub geometry_class: u32,
+    pub channel_ids: Vec<u64>,
 }
 
 /// What a successful `load_model` leaves behind: the parsed config and
@@ -1126,7 +1135,7 @@ pub(crate) struct LoadedModel {
     /// `DriverCapabilities::model_id` and reaches the host's chat
     /// template — the same row, named once, rather than a `model_type`
     /// string re-interpreted by a second table on the far side.
-    pub(crate) id: &'static str,
+    pub id: &'static str,
     /// What this checkpoint IS, derived ONCE at load.
     ///
     /// It used to be a `Box<dyn PlannedFamily>` built from the
@@ -1138,23 +1147,23 @@ pub(crate) struct LoadedModel {
     /// And it carries no family name, so the fire path cannot recover
     /// one. `let is_gemma4 = family.planless_prefill()` appeared three
     /// times in this shell; a `Deployment` has nothing to ask.
-    pub(crate) deployment: model::deployment::Deployment,
+    pub deployment: model::deployment::Deployment,
     /// The caps JSON `load_model` answered with; owned like `Shell::caps`.
-    pub(crate) load_caps: Vec<u8>,
+    pub load_caps: Vec<u8>,
     /// Every tensor the plan named, as a span of the arena. A SPAN and not
     /// an allocation: a resident plan lays the whole model out contiguously,
     /// so a weight is an offset into one buffer rather than one of a thousand
     /// `cudaMalloc`s.
-    pub(crate) weights: std::collections::BTreeMap<String, crate::weights::stage::WeightSpan>,
+    pub weights: std::collections::BTreeMap<String, crate::weights::stage::WeightSpan>,
     /// The arena, and anything the plan published outside it. Held so the
     /// spans above stay valid; never indexed.
     #[allow(dead_code)]
-    pub(crate) owned: Vec<crate::device::DeviceBuffer>,
+    pub owned: Vec<crate::device::DeviceBuffer>,
     /// Trace-name RENAMES onto checkpoint names (`layer.3.attn_norm` →
     /// `model.layers.3.input_layernorm.weight`); concats get buffers of
     /// their own in `weights`, renames get a row here — no second copy of
     /// a tensor that already sits on the device.
-    pub(crate) aliases: std::collections::BTreeMap<String, String>,
+    pub aliases: std::collections::BTreeMap<String, String>,
     /// The per-layer `layer_scalar` [1] tensors a deployment names, read to
     /// host once at load (the C++ `read_bf16_scalar_once`) — the fused
     /// sandwich norm's whole-stream multiplier, carried into
@@ -1163,7 +1172,7 @@ pub(crate) struct LoadedModel {
     /// Empty for a deployment whose wiring names none, which is most of them.
     /// WHICH deployments name them is not asked here: `wiring.scalars` is the
     /// list, and this reads it.
-    pub(crate) layer_scalars: Vec<f32>,
+    pub layer_scalars: Vec<f32>,
     /// The group this rank's weights were sharded for, carried from the
     /// shell so a family's facts and its load plan cannot disagree about
     /// how wide a rank is. A forward derivation reads it to decide whether
@@ -1231,12 +1240,6 @@ pub(crate) fn channel_dtype(byte: u8) -> driver::tensor_ir::DType {
     driver::tensor_ir::DType::from_wire(byte).unwrap_or(driver::tensor_ir::DType::F32)
 }
 
-pub(crate) fn shell(driver: *mut PieDriver) -> Option<&'static mut Shell> {
-    // SAFETY: the only non-null `PieDriver` values in circulation are the
-    // boxes `pie_cuda_create` leaked; the engine's contract is to pass
-    // them back unmodified.
-    unsafe { driver.cast::<Shell>().as_mut() }
-}
 
 /// A borrowed ABI slice as a Rust slice; empty for null.
 pub(crate) fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {

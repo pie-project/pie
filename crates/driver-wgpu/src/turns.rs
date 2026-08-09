@@ -46,7 +46,7 @@ use model_compiler::trace::ForwardPlan;
 use crate::device::{Device, Pipelines};
 use crate::dispatch::Geometry;
 use crate::pages::{Book, Unhoused};
-use crate::resources::{Frame, Model, Pool, Unstageable, Weights};
+use crate::resources::{Frame, Model, Pool, Request, Unstageable, Weights};
 use crate::serve::{Fire, Fired, Logits, Modules, Unfired, Unread, fire, logits};
 use kernels_wgpu::Capability;
 
@@ -240,8 +240,64 @@ impl Serving<'_> {
                     .map_err(Unstepped::Unhoused)?,
             );
         }
+        let tokens: Vec<&[u32]> = turns.iter().map(|t| t.tokens.as_slice()).collect();
+        self.fire_over(device, pipelines, modules, held, &requests, &tokens)
+    }
+
+    /// One step over requests the CALLER allocated, touching no book.
+    ///
+    /// The engine's scheduler already owns eviction, prefix sharing and the
+    /// copy plans that move pages between conversations, and it hands a driver
+    /// a page CSR naming physical pages it chose. [`Serving::step`]'s
+    /// allocator is the right one for a server built on this crate alone and
+    /// the WRONG one for that caller: two allocators handing out page 7 is not
+    /// an error anybody sees, because attention then reads another
+    /// conversation's keys and the model answers fluently.
+    ///
+    /// So this exists in order that [`crate::frames`] does not have to touch
+    /// [`crate::pages::Book`]. It is the same fire as `step` — literally, they
+    /// share a body — differing only in who decided which pages.
+    ///
+    /// `tokens` is parallel to `requests`: one slice of token ids per request,
+    /// in the same order.
+    ///
+    /// # Errors
+    ///
+    /// Every [`Unstepped`] except [`Unstepped::Unhoused`], which is the book's
+    /// and this path has no book.
+    pub fn over<M: Modules>(
+        &self,
+        device: &Device,
+        pipelines: &mut Pipelines,
+        modules: &M,
+        held: &mut Held<'_>,
+        requests: &[Request],
+        tokens: &[&[u32]],
+    ) -> Result<Step, Unstepped> {
+        if requests.is_empty() {
+            return Err(Unstepped::Nothing);
+        }
+        self.fire_over(device, pipelines, modules, held, requests, tokens)
+    }
+
+    /// The body both paths share.
+    ///
+    /// Private, and one function rather than two, because the failure the split
+    /// would invite is precise: a fix to the sampling-index workaround below
+    /// applied to one path and not the other would make an engine-served fire
+    /// and a book-served fire read different rows of the same cache, and both
+    /// would answer.
+    fn fire_over<M: Modules>(
+        &self,
+        device: &Device,
+        pipelines: &mut Pipelines,
+        modules: &M,
+        held: &mut Held<'_>,
+        requests: &[Request],
+        tokens: &[&[u32]],
+    ) -> Result<Step, Unstepped> {
         let shape = held.pool.shape();
-        let frame = Frame::of(shape, &requests).map_err(Unstepped::Unstageable)?;
+        let frame = Frame::of(shape, requests).map_err(Unstepped::Unstageable)?;
         // EVERY ROW SAMPLES, and this is a workaround with a name.
         //
         // A frame's own seriation marks only the rows a request reads out, so a
@@ -313,7 +369,7 @@ impl Serving<'_> {
         // order the turns arrived. A step that wrote them in turn order would
         // feed every conversation somebody else's token whenever the seriation
         // reordered anything, and the answer would still look like text.
-        let ids = place(turns, &frame.request_of_token);
+        let ids = place(tokens, &frame.request_of_token);
         held.pool
             .state(device, crate::binding::FireTable::TokenIds, &ids)
             .map_err(Unstepped::Failed)?;
@@ -352,7 +408,7 @@ impl Serving<'_> {
             fired,
             rows: frame.rows(),
             positions: frame.positions.clone(),
-            readout_of: last_row_of(turns.len(), &frame.request_of_token),
+            readout_of: last_row_of(tokens.len(), &frame.request_of_token),
             pipelines: pipelines.built(),
         })
     }
@@ -393,15 +449,15 @@ fn last_row_of(turns: usize, request_of_token: &[u32]) -> Vec<usize> {
 /// on an arithmetic slip it could survive is worse than one that fires a wrong
 /// token.
 #[must_use]
-fn place(turns: &[Turn], request_of_token: &[u32]) -> Vec<u32> {
-    let mut taken = vec![0usize; turns.len()];
+fn place(tokens: &[&[u32]], request_of_token: &[u32]) -> Vec<u32> {
+    let mut taken = vec![0usize; tokens.len()];
     let mut ids = vec![0u32; request_of_token.len()];
     for (id, which) in ids.iter_mut().zip(request_of_token) {
         let which = *which as usize;
-        let Some(turn) = turns.get(which) else {
+        let Some(turn) = tokens.get(which) else {
             continue;
         };
-        *id = turn.tokens.get(taken[which]).copied().unwrap_or(0);
+        *id = turn.get(taken[which]).copied().unwrap_or(0);
         taken[which] += 1;
     }
     ids
@@ -418,12 +474,23 @@ mod tests {
         }
     }
 
+    /// What `place` now takes, since it serves the engine's path too.
+    ///
+    /// A [`Turn`] carries WHO it belongs to and the engine's frames carry no
+    /// such thing — their requests are already the scheduler's — so the shared
+    /// body speaks in token slices. These tests still build turns, because the
+    /// property they hold is about a conversation's tokens landing on that
+    /// conversation's rows.
+    fn tokens_of(turns: &[Turn]) -> Vec<&[u32]> {
+        turns.iter().map(|t| t.tokens.as_slice()).collect()
+    }
+
     /// A conversation's second row gets its second token.
     #[test]
     fn each_row_gets_its_own_turns_next_token() {
         let turns = [turn(1, &[11, 12, 13]), turn(2, &[21, 22])];
         assert_eq!(
-            place(&turns, &[0, 0, 0, 1, 1]),
+            place(&tokens_of(&turns), &[0, 0, 0, 1, 1]),
             vec![11, 12, 13, 21, 22],
             "in order, the placement is the concatenation"
         );
@@ -437,7 +504,10 @@ mod tests {
     #[test]
     fn an_interleaved_frame_does_not_hand_a_turn_another_turns_token() {
         let turns = [turn(1, &[11, 12, 13]), turn(2, &[21, 22])];
-        assert_eq!(place(&turns, &[1, 0, 1, 0, 0]), vec![21, 11, 22, 12, 13]);
+        assert_eq!(
+            place(&tokens_of(&turns), &[1, 0, 1, 0, 0]),
+            vec![21, 11, 22, 12, 13]
+        );
     }
 
     /// A turn's answer is its LAST row, not its first.
@@ -460,9 +530,9 @@ mod tests {
     #[test]
     fn a_row_with_no_token_left_is_zero() {
         let turns = [turn(1, &[11])];
-        assert_eq!(place(&turns, &[0, 0, 0]), vec![11, 0, 0]);
+        assert_eq!(place(&tokens_of(&turns), &[0, 0, 0]), vec![11, 0, 0]);
         assert_eq!(
-            place(&turns, &[0, 7]),
+            place(&tokens_of(&turns), &[0, 7]),
             vec![11, 0],
             "and so is an unknown turn"
         );

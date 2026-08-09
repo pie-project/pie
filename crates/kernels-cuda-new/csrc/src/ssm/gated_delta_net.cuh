@@ -36,9 +36,19 @@
 //
 // Five of the fourteen are rows now — `families::ssm::GATED_DELTA_NET`. The
 // other nine are refused on their own facts and not on the vocabulary's:
-// `recurrent_step_batched_gqa_smem` is reached through an ENVIRONMENT
-// VARIABLE (`PIE_QWEN35_GDN_SMEM_STEP`), which is a predicate no `Fact` can
-// hold; `..._fla` is a three-axis grid; the `_fused` pair and the chunked
+// `recurrent_step_batched_gqa_smem` is reached on a SHAPE the fire states
+// (`V_d == 128 && K_d == 128`), which `Term` cannot spell until §26.10(b)'s
+// `Term::IntIs` lands and which selects an arm that has no row and no
+// `LaunchRule` — it opens `grid(ceil(V_d/BV), R, V_h)` on
+// `K_d*BV*sizeof(bf16) + 2*K_d*sizeof(float)`, which is not `RecurrentScan`
+// in either shape or size. It used to be reached through an ENVIRONMENT
+// VARIABLE; §30 measured that arm against the one below it, found them
+// **byte-identical at eight shapes on both results**, and deleted the
+// variable rather than relocating it. What makes that identity hold is the
+// `__float2bfloat16` in this kernel's phase 2 — it rounds `state*g` where
+// the legacy kernel's HBM round trip rounds it, and it is not a redundant
+// conversion to be optimised away. `..._fla` is a three-axis grid; the
+// `_fused` pair and the chunked
 // prefills each want a second head width (`K_d * V_d`) or a chunk axis that
 // `Dims` does not carry. Their launchers stay.
 //

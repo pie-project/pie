@@ -132,3 +132,90 @@ fn every_source_file_is_named_by_a_mod_declaration() {
         reached.len()
     );
 }
+
+/// Every `tests/device_*.rs` is declared in `Cargo.toml` with
+/// `required-features = ["metal-4"]`.
+///
+/// # The same hazard, one directory across
+///
+/// `mod_audit`'s subject is a file the compiler never reads. This is its
+/// mirror: a file cargo reads **when it should not**. `Cargo.toml` says, in
+/// prose, that `required-features` *"keeps `cargo test -p driver-metal` with
+/// no feature to the portable half"* and lists the portable tests by name as
+/// *"the claim this file makes about what needs no GPU"*.
+///
+/// A `tests/*.rs` with no `[[test]]` entry is auto-discovered with no
+/// required features at all, so it joins that claim silently. `device_add_bias.rs`
+/// did: 31 files on disk, 30 declared, and on Linux it failed to compile
+/// against `driver_metal::{bind, device, program}` — three items that only
+/// exist behind `metal-4`. Every other `device_*` target was correctly
+/// listed, which is exactly why nobody looked: the convention was visibly
+/// held by thirty of thirty-one.
+///
+/// The manifest is parsed as TEXT rather than through a TOML crate. The
+/// check is "does a `[[test]]` block name this and require the feature",
+/// which is a two-line question, and adding a dependency to `driver-metal`
+/// to ask it would put a build edge on a portable test.
+#[test]
+fn every_device_test_requires_the_metal_feature() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+
+    // The declared set: a `name = "..."` that is followed, before the next
+    // `[[`, by the feature requirement.
+    let declared: BTreeSet<String> = manifest
+        .split("[[test]]")
+        .skip(1)
+        .filter(|block| block.contains(r#"required-features = ["metal-4"]"#))
+        .filter_map(|block| {
+            let rest = block.split_once("name = \"")?.1;
+            Some(rest.split_once('"')?.0.to_string())
+        })
+        .collect();
+
+    let mut undeclared = Vec::new();
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(root.join("tests")).expect("tests/").flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if path.extension().is_none_or(|e| e != "rs") || !stem.starts_with("device_") {
+            continue;
+        }
+        count += 1;
+        if !declared.contains(stem) {
+            undeclared.push(stem.to_string());
+        }
+    }
+
+    assert!(
+        undeclared.is_empty(),
+        "{} device test(s) have no `[[test]]` entry requiring `metal-4`: {undeclared:?}. \
+         Cargo auto-discovers them with NO required features, so `cargo test -p driver-metal` \
+         on a host without the feature compiles them against items that are not there. \
+         Add the entry or move the test off the `device_` prefix.",
+        undeclared.len()
+    );
+
+    // A DENOMINATOR, because a `read_dir` that matched nothing passes the
+    // loop above and proves nothing -- the failure this file exists to name,
+    // applied to itself.
+    assert!(
+        count > 20,
+        "only {count} `device_*` tests were scanned, so this is not reading the \
+         test directory and a missing declaration would not be seen"
+    );
+
+    // AND THE OTHER DIRECTION: a declared target with no file is a manifest
+    // that has outlived its test. Cargo errors on it, but only for the
+    // feature combination that builds it -- so on a host with no `metal-4`
+    // it is invisible, which is the same blind spot from the other side.
+    let missing: Vec<&String> = declared
+        .iter()
+        .filter(|name| !root.join("tests").join(format!("{name}.rs")).exists())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`Cargo.toml` declares {} test target(s) with no file: {missing:?}",
+        missing.len()
+    );
+}

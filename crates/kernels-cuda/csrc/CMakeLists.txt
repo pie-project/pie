@@ -485,7 +485,6 @@ endif()
 # ownership, so it did not survive the split.
 set(PIE_CUDA_GRAPH_KERNEL_SOURCES
   src/norm/altup.cu
-  src/attn/attn_sink.cu
   src/attn/dsa_indexer.cu
   src/attn/dsv4_compress.cu
   src/norm/dsv4_hc.cu
@@ -495,7 +494,6 @@ set(PIE_CUDA_GRAPH_KERNEL_SOURCES
   src/attn/mla_paged.cu
   src/ssm/nemotron_h.cu
   src/attn/page_compact.cu
-  src/attn/softcap.cu
   src/attn/attention_mla.cu
   src/ssm/flashinfer_mamba.cu)
 
@@ -553,12 +551,6 @@ add_library(pie_kernels_cuda STATIC
   # vision/ -- the multimodal towers, bridged at TOWER granularity (one
   # launcher per tower; the walk and its host prep stay C++ — see the
   # provenance headers and the retirement wiki's VL judgment).
-  src/vision/qwen3_vl_tower.cu
-  src/vision/qwen3_vl_tower_c.cpp
-  src/vision/vis_helpers.cpp
-  src/vision/gemma4_vision.cu
-  src/vision/gemma4_audio.cu
-  src/vision/gemma4_towers_c.cpp
   ${PIE_KERNELS_CUSTOM_ALL_REDUCE_SOURCE}
   src/tensor.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers
@@ -596,7 +588,6 @@ add_library(pie_kernels_cuda STATIC
   src/layout/envelope.cu
   src/ssm/gated_delta_net.cu
   src/ssm/kda.cu
-  src/attn/attn_res.cu
   src/layout/gather_rows.cu
   src/gemm/gemv.cu
   src/layout/gather_tokens.cu
@@ -868,129 +859,32 @@ set_target_properties(pie_flashinfer_cutlass_moe PROPERTIES
 target_sources(pie_kernels_cuda PRIVATE
   $<TARGET_OBJECTS:pie_flashinfer_cutlass_moe>)
 
-# ---- Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ------------------
-# Two vendored kernels with the same lineage and very different build costs, so
-# they are two options.
+# ---- Marlin: removed (§47) -----------------------------------------------
+# `third_party/marlin` (500 KB) and `third_party/marlin_moe` (156 KB) were
+# vendored here behind two options that defaulted APART -- the dense one OFF,
+# the MoE one ON and therefore compiled on every build. Neither had a reachable
+# caller.
 #
-# The dense, single-problem GEMM is OFF by default. marlin.cu is the build's
-# critical path -- 142s of a 228s clean build, because 150 explicit
-# instantiations of a 2082-line __global__ template produce 152 kernels
-# averaging 3098 SASS instructions each (91s cicc + 41s ptxas). Nothing else in
-# the driver comes close.
+#   * marlin_moe exported two functions and NOTHING in the tree called either.
+#     Its stated purpose was to let `kernels_manifest.hpp` answer the
+#     `native_mxfp4_moe` device capability -- but that answer required
+#     PIE_CUDA_HAS_MARLIN too, which was OFF here, and downstream
+#     `model-loader/src/plan.rs:194,:214` hard-code `native_mxfp4_moe: false`
+#     in both constructors regardless.
+#   * marlin exported five functions. Four had zero callers. The fifth,
+#     `launch_gptq_gemm_w4a16_bf16`, was called from exactly one place --
+#     `gemm.cpp`'s `w.dtype == INT4_PACKED` arm -- and no representation in
+#     this driver can produce an INT4 weight: `WeightRepr` (model-compiler
+#     `dsl.rs:92`) is `Bf16 | Scaled | Mxfp4Marlin`, and GPTQ/AWQ quant schemes
+#     appear only in tests asserting they are refused.
 #
-# What turning it off costs, and why that is an acceptable default:
-#   * GPTQ/AWQ INT4 dense GEMM throws at run time (ops/gemm.cpp) with a message
-#     naming this option. Those checkpoints are not part of pie's supported set.
-# Everything else -- every bf16 and FP8 model -- is untouched.
+# The live `gemm::act_x_wt_mxfp4_marlin` row is NOT affected and never used
+# this tree: it sets MXFP4_PACKED and lands in `act_x_w`'s dequant-then-cuBLAS
+# arm, which had no marlin `#ifdef`. The name is the only thing they shared.
 #
-# Vendored under third_party/marlin/; the wrapper exposes a torch-free C++ API.
-# Enable with -DPIE_CUDA_BUILD_MARLIN=ON or PIE_CUDA_BUILD_MARLIN=1.
-option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" OFF)
-# Env override (previously forwarded by worker/build.rs as -D...).
-if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
-  string(TOLOWER "$ENV{PIE_CUDA_BUILD_MARLIN}" _pie_marlin)
-  if(_pie_marlin MATCHES "^(1|on|true|yes)$")
-    set(PIE_CUDA_BUILD_MARLIN ON)
-  else()
-    set(PIE_CUDA_BUILD_MARLIN OFF)
-  endif()
-endif()
-
-# The expert-indexed MoE variant is ON by default, because it does not share
-# the cost that made the dense one opt-in: its generator is pruned to the
-# single quant configuration a pie model reaches (MXFP4 / bf16 / E8M0), so it
-# is one translation unit rather than fifteen.
-#
-# It is also what a supported model needs rather than an unsupported one.
-# GPT-OSS's MoE is native MXFP4, and without this kernel the driver answers
-# `native_mxfp4_moe = false` and the checkpoint falls back to per-route
-# dequant. Leaving it off is not neutral for that model; it is a decision to
-# serve it on the slow path.
-option(PIE_CUDA_BUILD_MARLIN_MOE
-  "Build vendored expert-indexed marlin MXFP4 MoE GEMM" ON)
-if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN_MOE})
-  string(TOLOWER "$ENV{PIE_CUDA_BUILD_MARLIN_MOE}" _pie_marlin_moe)
-  if(_pie_marlin_moe MATCHES "^(1|on|true|yes)$")
-    set(PIE_CUDA_BUILD_MARLIN_MOE ON)
-  else()
-    set(PIE_CUDA_BUILD_MARLIN_MOE OFF)
-  endif()
-endif()
-
-# kernels.def owns the shape list, but it cannot drive marlin.cu directly: a
-# macro cannot expand to an #include, and CUDA 13's static-linkage stubs force
-# the single-TU #include layout (see below). So the list is written out in
-# marlin.cu and reconciled here -- otherwise a drift between the two is
-# invisible until it shows up as a missing kernel at run time or as several
-# minutes of cicc time spent on shapes nothing dispatches.
-#
-# Deliberately outside the PIE_CUDA_BUILD_MARLIN gate: this only reads two
-# files, and now that marlin is off by default a gated check would never run,
-# letting drift accumulate until someone enables it.
-pie_read_kernels_def(PIE_MARLIN_SHAPE PIE_MARLIN_SHAPES)
-set(_pie_marlin_expected "")
-foreach(_pie_shape IN LISTS PIE_MARLIN_SHAPES)
-  string(REPLACE "," ";" _pie_parts "${_pie_shape}")
-  list(LENGTH _pie_parts _pie_nparts)
-  if(NOT _pie_nparts EQUAL 3)
-    message(FATAL_ERROR
-      "PIE_MARLIN_SHAPE(${_pie_shape}) in ${PIE_KERNELS_DEF} needs exactly "
-      "three arguments: (activation dtype, quant type, output dtype)")
-  endif()
-  list(GET _pie_parts 0 _pie_act)
-  list(GET _pie_parts 1 _pie_quant)
-  list(GET _pie_parts 2 _pie_out)
-  list(APPEND _pie_marlin_expected
-    "sm80_kernel_${_pie_act}_${_pie_quant}_${_pie_out}.cu")
-endforeach()
-
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/marlin.cu" _pie_marlin_src)
-string(REGEX MATCHALL "sm80_kernel_[A-Za-z0-9_]+\\.cu"
-  _pie_marlin_actual "${_pie_marlin_src}")
-list(SORT _pie_marlin_expected)
-list(SORT _pie_marlin_actual)
-if(NOT _pie_marlin_expected STREQUAL _pie_marlin_actual)
-  message(FATAL_ERROR
-    "marlin shape drift.\n"
-    "  kernels.def: ${_pie_marlin_expected}\n"
-    "  marlin.cu:   ${_pie_marlin_actual}\n"
-    "Update the #include block in third_party/marlin/marlin.cu to match "
-    "${PIE_KERNELS_DEF}.")
-endif()
-
-if(PIE_CUDA_BUILD_MARLIN)
-  # CUDA 13 generates __global__ template stubs with static linkage,
-  # breaking cross-TU explicit instantiations. marlin.cu #includes the
-  # sm80_kernel_*.cu files directly so instantiation and selection share a
-  # single TU. Do NOT list sm80_kernel_*.cu as separate sources -- they
-  # would double-define every template.
-  target_sources(pie_kernels_cuda PRIVATE
-    third_party/marlin/marlin.cu
-    third_party/marlin/gptq_marlin_repack.cu
-    third_party/marlin/awq_marlin_repack.cu
-    third_party/marlin/marlin_wrapper.cpp)
-  target_include_directories(pie_kernels_cuda PRIVATE
-    third_party/marlin)
-  target_compile_definitions(pie_kernels_cuda PRIVATE PIE_CUDA_HAS_MARLIN=1)
-endif()
-
-# The expert-indexed MoE variant of the same kernel. Separate directory and
-# namespace (`marlin_moe_wna16`) so it builds and is revised independently of
-# the single-problem path above; `ops.cu` includes its generated instantiation
-# for the same CUDA-13 linkage reason marlin.cu does.
-#
-# The generator is pruned to MXFP4 (bf16 x FE2M1 -> bf16, E8M0 scales): that is
-# the only configuration a pie model reaches, and every extra quant config is
-# another multi-minute nvcc translation unit. Pruning is what lets this one
-# default to ON while the dense path stays opt-in.
-if(PIE_CUDA_BUILD_MARLIN_MOE)
-  target_sources(pie_kernels_cuda PRIVATE
-    third_party/marlin_moe/ops.cu
-    third_party/marlin_moe/marlin_moe_wrapper.cpp)
-  target_include_directories(pie_kernels_cuda PRIVATE
-    third_party/marlin_moe)
-  target_compile_definitions(pie_kernels_cuda PRIVATE PIE_CUDA_HAS_MARLIN_MOE=1)
-endif()
+# Gone with them: this section's two options and env overrides, the
+# kernels.def/marlin.cu shape-drift reconciliation, `PIE_MARLIN_SHAPE`, and the
+# `PIE_CUDA_HAS_MARLIN*` compile definitions.
 
 # FlashInfer Mamba SSU on Hopper/Blackwell gates the vertical/horizontal
 # producer-consumer kernels behind FLASHINFER_MAMBA_ENABLE_SM90 at compile
@@ -1029,9 +923,5 @@ file(GENERATE
 include=${CMAKE_CURRENT_SOURCE_DIR}/src
 cccl=$<JOIN:${PIE_CCCL_INCLUDE_DIRS},:>
 flashinfer=${flashinfer_SOURCE_DIR}/include:${flashinfer_SOURCE_DIR}/csrc:${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include:${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include:${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include
-marlin=${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin
-marlin_moe=${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin_moe
-has_marlin=$<BOOL:${PIE_CUDA_BUILD_MARLIN}>
-has_marlin_moe=$<BOOL:${PIE_CUDA_BUILD_MARLIN_MOE}>
 mamba_sm90=$<BOOL:${PIE_CUDA_FLASHINFER_MAMBA_SM90}>
 ")

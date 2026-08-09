@@ -856,6 +856,11 @@ fn every_tile_kernel_is_an_alternative_with_a_predicate() {
         ("mlp/swiglu_tile.cuh", "swiglu_tile_preferred"),
         ("moe/topk_softmax_tile.cuh", "topk_softmax_tile_preferred"),
         ("norm/rmsnorm_rasr_tile.cuh", "rmsnorm_rasr_tile_preferred"),
+        ("moe/moe_fused_tile.cuh", "moe_fused_tile_preferred"),
+        ("layout/gather_rows_tile.cuh", "gather_rows_tile_preferred"),
+        ("quant/dequant_wna16_tile.cuh", "dequant_wna16_tile_preferred"),
+        ("quant/wna16_gemv_tile.cuh", "wna16_gemv_tile_preferred"),
+        ("rope/rope_tile.cuh", "rope_partial_tile_preferred"),
     ] {
         let src = std::fs::read_to_string(root.join(file)).expect(file);
         assert!(
@@ -876,8 +881,8 @@ fn every_tile_kernel_is_an_alternative_with_a_predicate() {
         .expect("csrc/src/tile_alternatives.cuh");
     let asserts = alts.matches("static_assert").count();
     assert!(
-        asserts >= 11,
-        "tile_alternatives.cuh has {asserts} static_asserts; it had 11, one per \
+        asserts >= 14,
+        "tile_alternatives.cuh has {asserts} static_asserts; it had 14, one per \
          measured endpoint. A predicate that is no longer pinned to its sweep \
          is a comment with a type"
     );
@@ -909,6 +914,10 @@ fn no_tile_kernel_spells_a_cstdint_type() {
     let tile_kernels = [
         "moe/moe_grouped_gemm_tile.cuh",
         "moe/moe_fused_tile.cuh",
+        "layout/gather_rows_tile.cuh",
+        "quant/dequant_wna16_tile.cuh",
+        "quant/wna16_gemv_tile.cuh",
+        "rope/rope_tile.cuh",
         "moe/topk_softmax_tile.cuh",
         "norm/rmsnorm_tile.cuh",
         "norm/rmsnorm_rasr_tile.cuh",
@@ -933,5 +942,479 @@ fn no_tile_kernel_spells_a_cstdint_type() {
                 );
             }
         }
+    }
+}
+
+/// The census of all 455 kernels must stay on the file, and must keep its
+/// wash and its exclusions.
+///
+/// `tile_alternatives.cuh` classifies every `__global__` in `csrc/src` into
+/// seven buckets, six of which have a measured representative in this crate.
+/// It is easy for a table like that to drift into listing only the
+/// favourable rows — so the gate checks the two that are NOT favourable:
+/// the COPY bucket is a measured wash, and a third of the tree cannot or
+/// should not move at all.
+#[test]
+fn the_kernel_census_keeps_its_unfavourable_rows() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/src");
+    let src = std::fs::read_to_string(root.join("tile_alternatives.cuh"))
+        .expect("csrc/src/tile_alternatives.cuh");
+
+    for (needle, why) in [
+        ("263", "the win column after the inferred bucket was measured and moved"),
+        ("455", "the census total. Without it the buckets are percentages of nothing"),
+        ("WASH", "the COPY bucket's verdict -- 35 kernels that a survey would \
+                  otherwise put in the win column"),
+        ("cannot, or should not", "the third of the tree that is excluded"),
+        ("No inferred rows", "the census closed its last hole by measuring the \
+                             GEMV bucket, and that claim is the reason to \
+                             trust the percentages"),
+    ] {
+        assert!(
+            src.contains(needle),
+            "tile_alternatives.cuh no longer records `{needle}` -- {why}"
+        );
+    }
+
+    let wash = std::fs::read_to_string(root.join("layout/gather_rows_tile.cuh"))
+        .expect("csrc/src/layout/gather_rows_tile.cuh");
+    assert!(
+        wash.contains("not faster"),
+        "gather_rows_tile.cuh no longer says it is not faster. It exists to \
+         make the COPY bucket's verdict a measurement rather than an \
+         assumption, and a kernel that does not announce that will be read as \
+         one that won"
+    );
+}
+
+/// The roofline band is an OBSERVATION and the predicates are MEASUREMENTS,
+/// and the file has to keep them apart.
+///
+/// Four bounds in this tree were derived independently and turned out to be
+/// the same machine fact: the tile advantage vanishes at roughly 3x L2 of
+/// touched bytes — last gap at 138 MB, first convergence at 134 MB, across
+/// an elementwise activation, a three-pass reduction, a 4x expansion and a
+/// weight-streaming GEMV.
+///
+/// The temptation is to rewrite the predicates in terms of it. They must not
+/// be: each is bounded at its own largest MEASURED point, which is tighter
+/// than the band, and widening a bound to a derived constant trades a
+/// measurement for a model. This whole file exists because a bound that is a
+/// model gets quoted as a measurement.
+#[test]
+fn the_roofline_band_stays_an_observation_not_a_bound() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/src");
+    let alts = std::fs::read_to_string(root.join("tile_alternatives.cuh"))
+        .expect("csrc/src/tile_alternatives.cuh");
+
+    for (needle, why) in [
+        ("138 MB", "the last measured point with a gap open"),
+        ("134", "the first measured point converged"),
+        ("do NOT use it", "the reason the predicates keep their own tighter \
+                           bounds instead of the derived band"),
+        ("do NOT unify", "the saturation crossovers are 1.5 and 7.2 blocks per \
+                          SM and are two facts, not one line"),
+    ] {
+        assert!(
+            alts.contains(needle),
+            "tile_alternatives.cuh no longer records `{needle}` -- {why}. See \
+             .wiki/driver/new-horizon.md 23.32"
+        );
+    }
+
+    // The bounds themselves must stay at their measured points, not drift out
+    // to the band.
+    let swig = std::fs::read_to_string(root.join("mlp/swiglu_tile.cuh")).expect("swiglu_tile");
+    assert!(
+        swig.contains("(16LL << 20)"),
+        "swiglu_tile_preferred no longer stops at 16 Mi elements -- 100.7 MB, \
+         its largest measured point. If it now stops at the roofline band it \
+         is a model wearing a measurement's clothes"
+    );
+}
+
+/// The rope alternative is faster AND more accurate, and both halves must
+/// stay on the file — the second is why it is declined.
+///
+/// It wins 1.2-1.4x on time and is three orders of magnitude closer to an
+/// fp64 reference at large rope angles, because `rope.cuh` uses `__sincosf`
+/// and this uses `ct::sin`/`ct::cos`. That is a behaviour change: rope error
+/// feeds attention scores, so the incumbent's trade may be deliberate.
+///
+/// A file recording only the speed would read as an obvious merge.
+#[test]
+fn the_rope_alternative_declines_on_accuracy_not_speed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/src");
+    let src = std::fs::read_to_string(root.join("rope/rope_tile.cuh")).expect("rope_tile.cuh");
+
+    for (needle, why) in [
+        ("__sincosf", "the incumbent's fast intrinsic, which is the cause"),
+        ("4.62e-04", "the incumbent's measured error against fp64"),
+        ("1.52e-07", "this kernel's, at the same point"),
+        ("behaviour change", "why a faster and more accurate kernel is still \
+                              declined rather than merged"),
+    ] {
+        assert!(
+            src.contains(needle),
+            "rope_tile.cuh no longer records `{needle}` -- {why}. A file that \
+             kept only the 1.4x would read as an obvious merge"
+        );
+    }
+}
+
+/// The rope `__sincosf` finding is about pie's own kernel, and it is a
+/// measured trade rather than a filed bug. Both halves have to stay: the
+/// error table (which says WHEN it matters) and the cost table (which says
+/// what the fix costs). A finding with only the first half is an alarm; with
+/// only the second it is an excuse.
+#[test]
+fn the_sincosf_trade_keeps_both_of_its_tables() {
+    let src = include_str!("../csrc/src/rope/rope.cuh");
+
+    // The error side, with the bf16 floor that turns it into a threshold.
+    for probe in ["1.91e-03", "1.05e-02", "3.9e-03", "64K"] {
+        assert!(
+            src.contains(probe),
+            "rope.cuh dropped `{probe}` from the __sincosf error table -- \
+             without it the reader cannot tell at what context length the \
+             fast intrinsic stops being free"
+        );
+    }
+
+    // The cost side, both forms, because the hoisting is the whole reason
+    // they differ and quoting one number for both would be wrong.
+    for probe in ["+5.2%", "+12.5%", "+20.4%"] {
+        assert!(
+            src.contains(probe),
+            "rope.cuh dropped `{probe}` from the cost table -- the accurate \
+             form is not free and the price differs 2x between the hoisted \
+             and unhoisted kernels"
+        );
+    }
+
+    assert!(
+        src.contains("trade, not a bug"),
+        "rope.cuh should say plainly that this is a trade being stated for \
+         its owner, not a defect being reported"
+    );
+}
+
+/// The ARGMAX census row was backwards for as long as it was priced off a
+/// plausible representative instead of a measured one. Both halves of the
+/// correction have to stay: the census must say LOSES, and the kernel must
+/// keep the piece-by-piece table that shows the loss is structural rather
+/// than a coding error someone could "fix".
+#[test]
+fn the_argmax_bucket_stays_corrected() {
+    let census = include_str!("../csrc/src/tile_alternatives.cuh");
+    let kernel = include_str!("../csrc/src/sample/argmax_tile.cuh");
+
+    assert!(
+        census.contains("ARGMAX        26   argmax_tile            LOSES 4x"),
+        "the ARGMAX census row must name argmax_tile and say it loses -- it \
+         previously quoted topk_softmax_tile at 1.28-1.40x, which is a \
+         128-wide reduction standing in for a 151,936-wide one"
+    );
+    assert!(
+        !census.contains("ARGMAX        26   topk_softmax_tile"),
+        "the withdrawn ARGMAX representative must not come back"
+    );
+
+    // The withdrawn mechanism must stay withdrawn, and visibly so.
+    assert!(
+        kernel.contains("WITHDRAWN"),
+        "argmax_tile.cuh first blamed the reduction WIDTH, which a \
+         fixed-grid sweep disproved (256 tiles costs nothing). The wrong \
+         mechanism has to stay on the page as withdrawn -- deleting it \
+         invites the next reader to derive it again"
+    );
+
+    // The floor is the whole argument: no index, no mask, still behind.
+    assert!(
+        kernel.contains("1.9x behind"),
+        "argmax_tile.cuh must keep the floor measurement -- reduce_max alone \
+         is already 1.9x behind, which is what makes the loss structural"
+    );
+    for probe in ["26.52", "48.16", "61.43", "0.24x"] {
+        assert!(
+            kernel.contains(probe),
+            "argmax_tile.cuh dropped `{probe}` from the piece-by-piece \
+             table; without all four rows the reader cannot tell which part \
+             is hopeless"
+        );
+    }
+
+    assert!(
+        kernel.contains("return false;"),
+        "argmax_tile_preferred must stay declined"
+    );
+}
+
+/// A tile hint attached to a variable declaration is silently ignored --
+/// nvcc says so with warning #20364-D. Every load in this tree's tile
+/// kernels therefore declares the tile on one line and assigns on the next.
+/// That shape looks like clumsy style and is not; this pins it.
+#[test]
+fn tile_loads_do_not_hint_a_declaration() {
+    for (name, src) in [
+        ("norm/rmsnorm_tile.cuh", include_str!("../csrc/src/norm/rmsnorm_tile.cuh")),
+        ("sample/argmax_tile.cuh", include_str!("../csrc/src/sample/argmax_tile.cuh")),
+    ] {
+        let mut lines = src.lines().peekable();
+        while let Some(line) = lines.next() {
+            if !line.contains("hint(1000") {
+                continue;
+            }
+            let Some(next) = lines.peek() else { continue };
+            let t = next.trim_start();
+            assert!(
+                !(t.starts_with("auto ") || t.starts_with("const auto ")),
+                "{name}: a cutile hint sits on a declaration (`{t}`) -- nvcc \
+                 warning #20364-D says the hint is IGNORED there. Declare the \
+                 tile first, assign on the next line."
+            );
+        }
+    }
+}
+
+/// The reduction surface took three sweeps and two pushed, wrong one-line
+/// laws. The gate protects the thing that cost the most to learn: that the
+/// surface is two-dimensional and neither variable alone predicts a cell.
+/// A later edit that "simplifies" this back to one sentence is repeating
+/// the mistake, so both withdrawn laws stay on the page.
+#[test]
+fn the_reduction_surface_stays_two_dimensional() {
+    let census = include_str!("../csrc/src/tile_alternatives.cuh");
+
+    assert!(
+        census.contains("WITHDRAWN #1") && census.contains("WITHDRAWN #2"),
+        "both withdrawn laws must stay visible -- `width is what costs` and \
+         `width is free, blocks are everything` were each fitted to one \
+         slice, each read well, and each was wrong. Deleting them invites a \
+         third"
+    );
+    assert!(
+        census.contains("There is no
+// one-line law here."),
+        "the census must say plainly that there is no one-line law -- that \
+         sentence is the whole finding"
+    );
+
+    // The unconfounded column is the evidence that width is not free. It is
+    // the first thing a later edit would drop as redundant.
+    assert!(
+        census.contains("1.07    1.07    1.08    1.09    1.12    1.24    1.29"),
+        "the 1-tile row of the surface must stay"
+    );
+    assert!(
+        census.contains("0.66    0.67    0.75*   1.01*   1.12*   1.15*   1.18*"),
+        "the 256-tile row must stay, with its L2 markers -- it is the row \
+         that shows both variables acting at once"
+    );
+    assert!(
+        census.contains("all L2-resident, so nothing but the width changes"),
+        "the census must keep the note that the 8-block column is the clean \
+         one; without it the width claim has the same defect as the two \
+         withdrawn laws"
+    );
+
+    // And the non-monotone row, which is why no single rule fits.
+    assert!(
+        census.contains("is not monotone in either"),
+        "the 16-tile row is not monotone in width OR grid, and saying so is \
+         what stops the next reader from fitting a third law"
+    );
+}
+
+/// The REDUCE row is the census's second-biggest bucket and it was priced
+/// off one representative, exactly like ARGMAX was. The surface made that
+/// checkable, so it was checked by counting every strided reduction in the
+/// tree rather than sampling one. This gate holds the count AND the
+/// residual, because an enumeration that quietly drops its unknowns is
+/// worse than the inference it replaced.
+#[test]
+fn the_reduce_bucket_is_enumerated_not_sampled() {
+    let census = include_str!("../csrc/src/tile_alternatives.cuh");
+
+    assert!(
+        census.contains("The counting rule is a test, not this comment"),
+        "the census must point at the executable counting rule. The first \
+         version of this audit used a shell pipeline that gave 43, 45 or 46 \
+         for the same bucket depending on the regex, and a count that moves \
+         with the pattern is not an enumeration"
+    );
+    assert!(
+        census.contains("reduction_axis_counts"),
+        "the census must name the function that defines the count, so the \
+         next reader can re-run it instead of trusting the table"
+    );
+
+    // The honest denominator. Folding the unclassified sites into the safe
+    // bucket would make the audit look complete and make it a sample again.
+    assert!(
+        census.contains("axis not in the list above"),
+        "the census must keep the unclassified count visible -- two thirds \
+         classified is the real coverage and hiding the third is how a \
+         representative becomes a claim"
+    );
+    assert!(
+        census.contains("`inter`, the FFN intermediate width"),
+        "the census must name `inter` as the one unclassified axis that can \
+         cross the 16-tile boundary; that is the whole value of having \
+         looked at the unclassified set"
+    );
+
+    // The residual is the honest half and the first thing to go stale.
+    assert!(
+        census.contains("cannot be settled"),
+        "the 11 data-dependent sites must stay marked as unresolved -- \
+         ptir's `len` is structurally argmax and its width is a property of \
+         the PTIR program, not of this tree"
+    );
+    assert!(
+        census.contains("len <= 16 * 1024") && census.contains("len >= 64 * 1024"),
+        "the census must hand the next person the boundary a ptir predicate \
+         would need, in both directions, or they will do what the ARGMAX \
+         row did"
+    );
+}
+
+/// The reduction count in the census is derived from source, and the first
+/// attempt at it gave 43, 45 or 46 for the same bucket depending on which
+/// regex asked. A count that moves with the pattern is not an enumeration,
+/// so the counting RULE lives here, in code that runs, and the census quotes
+/// this test rather than a shell pipeline nobody can re-run.
+///
+/// The rule: a line that, after trimming, starts with `for (`, mentions
+/// `threadIdx.x` or `= tid;`, and compares against the named axis.
+fn reduction_axis_counts() -> std::collections::BTreeMap<String, usize> {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    // Axis -> width bucket. Sizes are the ones this tree actually names.
+    const SMALL: &[&str] = &[
+        "head_dim", "K_d", "V_d", "kv_lora", "half", "D", "H", "cols", "dim",
+        "num_experts", "num_routes", "nkeys", "heads_here", "nvec", "vecs",
+        "width", "C", "E", "N", "d", "t", "ratio", "window",
+    ];
+    const MEDIUM: &[&str] = &["hidden", "hidden_size"];
+    const DYNAMIC: &[&str] = &["len", "total", "num_tokens"];
+    const LONG: &[&str] = &["vocab"];
+
+    let mut out: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/src")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().is_none_or(|x| x != "cuh") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            for line in text.lines() {
+                let l = line.trim();
+                if !l.starts_with("for (") {
+                    continue;
+                }
+                if !(l.contains("threadIdx.x") || l.contains("= tid;")) {
+                    continue;
+                }
+                *out.entry("all_strided".to_string()).or_default() += 1;
+                let mut hit = false;
+                for (bucket, axes) in [
+                    ("small", SMALL), ("medium", MEDIUM),
+                    ("dynamic", DYNAMIC), ("long", LONG),
+                ] {
+                    if axes.iter().any(|a| l.contains(&format!("< {a};"))
+                        || l.contains(&format!("< {a} "))
+                        || l.contains(&format!("< {a})")))
+                    {
+                        *out.entry(bucket.to_string()).or_default() += 1;
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
+                    *out.entry("unclassified".to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The census's REDUCE audit must match what the tree actually contains.
+/// When this fails the census needs re-counting -- that is the outcome it
+/// exists to force, not an annoyance to silence.
+#[test]
+fn the_reduction_count_still_matches_the_tree() {
+    let counts = reduction_axis_counts();
+    let census = include_str!("../csrc/src/tile_alternatives.cuh");
+
+    let long = *counts.get("long").unwrap_or(&0);
+    assert_eq!(
+        long, 2,
+        "the census records exactly 2 reductions over a LONG axis (argmax \
+         over `vocab`, both declined) and the tree now has {long}. A new one \
+         is a new ARGMAX row waiting to happen: price it against the surface \
+         in tile_alternatives.cuh before assuming it wins."
+    );
+
+    // Checked in context, not as a bare substring: `census.contains("25")`
+    // passes on any four-digit number that happens to contain it, which is
+    // how the first version of this test passed while the census said 244
+    // and the tree said 161.
+    for (bucket, label) in [
+        ("small", "<= 1 tile"),
+        ("medium", "3-7 tiles (hidden 2816-7168)"),
+        ("dynamic", "data-dependent"),
+        ("long", "> 16 tiles"),
+        ("all_strided", "all strided block reductions"),
+        ("unclassified", "axis not in the list above"),
+    ] {
+        let n = *counts.get(bucket).unwrap_or(&0);
+        let row = census
+            .lines()
+            .find(|l| l.contains(label))
+            .unwrap_or_else(|| panic!(
+                "the census lost the `{label}` row of the REDUCE audit table"
+            ));
+        let found: Vec<usize> = row
+            .split_whitespace()
+            .filter_map(|w| w.parse::<usize>().ok())
+            .collect();
+        assert!(
+            found.contains(&n),
+            "the census row `{label}` does not carry {n}, the count this \
+             test derives from the tree for `{bucket}` (row reads: {row}). \
+             Re-derive the REDUCE audit table -- a census derived from \
+             source is worth exactly what its last re-derivation was."
+        );
+    }
+
+    let classified: usize = ["small", "medium", "dynamic", "long"]
+        .iter()
+        .map(|b| counts.get(*b).copied().unwrap_or(0))
+        .sum();
+    let row = census
+        .lines()
+        .find(|l| l.trim_start().starts_with("//     classified"))
+        .expect("the census lost the `classified` subtotal");
+    assert!(
+        row.split_whitespace().any(|w| w == classified.to_string()),
+        "the census says a different classified subtotal than the {classified} \
+         this test counts"
+    );
+}
+
+#[test]
+#[ignore]
+fn print_reduction_counts() {
+    for (k, v) in reduction_axis_counts() {
+        println!("REDUCTION_COUNT {k} = {v}");
     }
 }

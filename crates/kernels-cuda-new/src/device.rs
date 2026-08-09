@@ -188,9 +188,14 @@
 //!   as kernel PARAMETERS. Its blockers are the ones its own header states —
 //!   a per-head `dim3(num_q_heads, num_tokens)`, `extern __shared__` sized by
 //!   `max_global_tokens + history_steps`, and a launcher that switches to a
-//!   different kernel on a comparison no [`Term`] can spell.
+//!   different kernel on a comparison no [`Term`] can spell. The ROW is gone
+//!   since §38 — nothing reached it — so this is now a finding about
+//!   `attention_naive.cu:80`, the launcher, which stays: it is the only
+//!   caller of `attention_mtp_history_bf16` at `:52`, and deleting it would
+//!   orphan two launchers and two `<<<>>>` at once.
 //!
-//! So: five rows, and four findings that a flag was the wrong diagnosis.
+//! So: five launchers, four of them rows, and four findings that a flag was
+//! the wrong diagnosis.
 
 use kernels::KernelSig;
 use kernels::LaunchRule;
@@ -582,11 +587,33 @@ static ELEMENTWISE_SIGS: [KernelSig; 3] = [
 /// so the host launcher behind it has no consumer left.
 ///
 /// `norm::residual_add_bf16` is deliberately absent. Its launcher is called
-/// from `gemm.cpp` and `gemma4_vision.cu` as a building block — C++ composing
-/// with C++, which no Rust dispatch can intercept — so deleting it would
-/// break two kernels that have not migrated. The rule is the one §10.2 found
-/// for shared headers, one level up: **a launcher goes when its whole
-/// consumer set has gone**, and the shim is only one consumer.
+/// from `gemm.cpp` as a building block — C++ composing with C++, which no
+/// Rust dispatch can intercept — so deleting it would break a kernel that
+/// has not migrated. The rule is the one §10.2 found for shared headers, one
+/// level up: **a launcher goes when its whole consumer set has gone**, and
+/// the shim is only one consumer.
+///
+/// This named `gemma4_vision.cu` as a second caller and that half is now
+/// **stale**: the tower converted to direct launches and calls
+/// `norm::rmsnorm_bf16` six times, not `residual_add`. Left recorded rather
+/// than silently corrected, because a consumer set that decays without
+/// anything noticing is the same failure as a wall in front of a door nobody
+/// opens — the sentence stayed true-sounding for exactly as long as nobody
+/// re-measured it. The current set is 11 symbols wide and lives in
+/// `examples/dispatch_countdown.rs`, where a stale entry exits 101.
+///
+/// **And the paragraph above decayed in its turn, within the day.** The six
+/// `rmsnorm_bf16` calls it records are now zero: `towers-move` inlined
+/// `rmsnorm_strided_bf16`'s body into the tower (byte-identical on real
+/// gemma-4-E4B-it weights, 133,156 bytes, with a negative control forcing the
+/// wrong arm that moves 44.79% of them) and relocated the three towers to
+/// `driver-cuda/csrc/vision/` entirely. `norm::rmsnorm_bf16`'s C++ consumer
+/// set is `norm/rmsnorm.cu` alone. Appended rather than rewritten, in this
+/// comment's own idiom — but the lesson has changed shape on the second pass:
+/// recording a decay does not stop the next one, it only dates it. The set is
+/// 9 symbols now, not 11, and what actually catches this is that
+/// `dispatch_countdown` re-derives every citation from the sources on each
+/// run and exits 101; prose that describes a measurement is not one.
 pub static JIT_DISPATCHED: &[&str] = &[
     // Tier A's six, and the payoff it never collected. `537294a7a` moved the
     // `__global__`s into `altup_aux.cuh` and proved them on a device, but the
@@ -601,6 +628,290 @@ pub static JIT_DISPATCHED: &[&str] = &[
     "norm::tanh_bf16",
     // The pointwise pair's scalar half (§10.8).
     "norm::scalar_mul_bf16",
+    // BATCH 1 -- `layout`, the rows that state their sources. §37.
+    //
+    // The first rows dispatched since the list was written, and the reason
+    // the gap was three months wide is not that these were hard: it is that
+    // `jit_dispatched()` joined against two tables and these live in eight
+    // others, so naming one here failed with "is dispatched to the JIT and
+    // has no row" -- a message about the row, when the row was there and the
+    // LOOKUP was narrow. `device::row` now scans `unit::rows()`.
+    //
+    // `layout` is first because it is the family with the least to argue
+    // about: every row is a copy or a permutation with a stated rectangle,
+    // none takes a plan or a cache view, and none has a C++ caller -- the
+    // whole family is absent from the held set, which is 8 symbols across
+    // `gemm.cpp`, `rmsnorm.cu` and `quant_bf16_to_fp8.cu`.
+    //
+    // FOUR OF THE EIGHT ARE NOT HERE, and the four are the lesson. Adding
+    // all eight failed `routed_rows_have_an_arm` in `driver-cuda/build.rs`
+    // on `concat_bf16_rows`, `copy_if_valid_slot`, `deinterleave_rows_bf16`
+    // and `deinterleave_vec_bf16` -- rows whose operands carry
+    // `Source::Unbound`, which `emit_rust_dispatch` skips WHOLE, before it
+    // ever reaches the JIT branch. They have no generated arm of either
+    // kind; a hand-written arm calls `ffi::pie_k_*` for them. Naming one
+    // here deletes the shim entry that hand arm links against, which is
+    // §22.1's link error rather than §22.1's fire-time lie -- the same
+    // defect from the other side.
+    //
+    // So "migrated" and "routable" differ by more than a C++ caller: a row
+    // must also SAY WHERE ITS ARGUMENTS COME FROM. Four of layout's eight do
+    // not, and their doc comments already said so ("this row generates no
+    // dispatch and claims none") -- one page away from a list that would
+    // have broken on it.
+    "layout::gather_bf16_rows",
+    "layout::split_bf16_rows",
+    "layout::split_qwen_gdn_ba_bf16",
+    "layout::transpose_bf16_nld_to_lnd",
+    // BATCH 2 -- `mlp`, the whole ready set of the unit, and the first batch
+    // landed on MEASURED parity rather than on argument. §40.
+    //
+    // The unit is the batch, not the family: a unit is one `.cuh`, one NVRTC
+    // translation unit and one set of instantiations, so a batch that is a
+    // unit either compiles as a whole or fails as a whole, and the failure
+    // names the file. `mlp` has 12 ready-or-held rows across
+    // `mlp/swiglu.cuh` and `mlp/gaussian_topk.cuh`; the eleven here are the
+    // ready ones and `chunked_swiglu_bf16` is held by `mlp/swiglu.cu`.
+    //
+    // EVERY ONE OF THESE FIRED BOTH WAYS AND MATCHED BYTE FOR BYTE.
+    // `driver-cuda/tests/jit_parity.rs` fires the same `BoundLaunch` through
+    // `bind::dispatch` (the archive, while the row is still unrouted) and
+    // through `bind::dispatch_jit_probe` (the arm routing emits, generated
+    // by the same emitter), and compares whole allocations including a
+    // 256-byte guard tail: 33 shapes, 0 differing bytes. Three shapes per
+    // row, one of them narrow on the axis the row's `LaunchRule` adds,
+    // because §21's 16x RMSNorm grid wrote 491,520 values past the rectangle
+    // with 0 differing INSIDE it and `AltUpStreams` hid at `kv_heads = 8`.
+    //
+    // The inputs are spread over 57 exponents, 2^-27 to 2^29, on purpose:
+    // the archive is compiled by nvcc with `--fmad` at its default TRUE and
+    // NVRTC compiles with `--fmad=false`, so these two arms are NOT obliged
+    // to agree by construction. They do -- the bf16 round absorbs the ulp on
+    // every shape measured -- but that is a MEASUREMENT, and it is why the
+    // fixtures do not use benign data: `env-audit` measured benign data
+    // showing 0 difference everywhere while wide exponents exposed five real
+    // bytes at three shapes.
+    "mlp::chunked_geglu_tanh_bf16",
+    "mlp::chunked_situ_bf16",
+    "mlp::chunked_swiglu_clamp_bf16",
+    "mlp::gaussian_topk_bf16",
+    "mlp::geglu_tanh_bf16",
+    "mlp::gpt_oss_glu_bf16",
+    "mlp::relu2_bf16",
+    "mlp::sigmoid_dot_scalar_gate_add_bf16",
+    "mlp::situ_bf16",
+    "mlp::swiglu_bf16",
+    "mlp::swiglu_clamp_bf16",
+    // BATCH 3 -- `norm/rmsnorm`, the unit whose GRID has been wrong before.
+    //
+    // Five of the unit's eight rows. `rmsnorm_bf16` and `rmsnorm_strided_bf16`
+    // stay because `norm/rmsnorm.cu` still calls them from C++ —
+    // `rmsnorm_bf16_with_fp16` forwarding into both — and `add_bias_bf16` is
+    // held by `gemm.cpp`.
+    //
+    // This sentence said "and `vision/gemma4_vision.cu`, six calls in the
+    // vision tower alone" when the batch landed, which was true then and was
+    // false eight hours later: `towers-move` converted the tower to direct
+    // launches, inlined `rmsnorm_strided_bf16`'s body verbatim, and moved all
+    // three towers out of the archive. The two rows are still held, so the
+    // batch is unaffected — but the REASON changed under a comment that had
+    // no way to notice, which is why the count these rows belong to is
+    // re-derived from the sources by `dispatch_countdown` on every run rather
+    // than read from here.
+    //
+    // This unit is where the failures this migration actually has were
+    // measured: §21's 16x grid wrote 491,520 values PAST the rectangle with
+    // ZERO differing inside it, and five rows here once moved 35,266-61,757
+    // bytes carrying the same 32,768 values. Both are shape errors that no
+    // per-row text comparison can see, so the fixtures give the two
+    // `RowsPerHead` rows a fourth shape with `per_head_dim = Some(64)` and a
+    // width of 320 -- five heads, not a power of two -- which is the axis the
+    // rule splits on and the one every `Rms` shape collapses. 18 shapes, 0
+    // differing bytes.
+    "norm::residual_add_rmsnorm_bf16",
+    "norm::rmsnorm_gated_bf16",
+    "norm::rmsnorm_gemma_bf16",
+    "norm::rmsnorm_no_scale_bf16",
+    "norm::rmsnorm_residual_add_bf16",
+    // BATCH 4 -- five small units, and the first rows this migration HELD
+    // BACK on measured evidence rather than on a C++ caller. §40.
+    //
+    // `ssm/gated_delta_net_prep` (3 of 4), `attn/softcap` (1 of 1),
+    // `attn/attn_sink` (2 of 2), `attn/attn_res` (1 of 1), `norm/altup`
+    // (2 of 2). 33 shapes fired both ways, 0 differing bytes.
+    //
+    // TWO ROWS OF `attn/head_dim_pad` ARE ABSENT AND THEY ARE THE POINT.
+    // `pad_head_dim_bf16` and `strip_head_dim_bf16` pass their head count to
+    // the kernel as `Width(In(0)) / CtxNonZero("head_dim")`, and the
+    // archive's launcher builds its grid from that same argument --
+    // `dim3(num_heads, num_tokens)` in `attn/head_dim_pad.cu`. The JIT's grid
+    // comes from `LaunchRule::PerHead`, which reads `Dims::kv_heads`, i.e.
+    // `ctx.num_kv_heads` -- a field no part of the row mentions. At 12 heads
+    // of 64 with `num_kv_heads = 6` the two arms differ in 6,100 of 12,544
+    // bytes and 4,588 of 9,472: the JIT writes half the rectangle. They agree
+    // exactly when the context happens to equal the quotient. That is a
+    // `LaunchRule` fix, not a routing decision, and until it lands these two
+    // rows keep their launcher.
+    //
+    // `ssm::repeat_interleave_heads_fp32` is the fourth prep row and is also
+    // absent: its arm guards on `gdn.is_some() && join_out(spec, 0, frame,
+    // resolver)`, so proving it needs a `GdnCtx` and an output resolved as a
+    // REGION, neither of which the parity fixtures can state yet.
+    "attn::attention_sink_rescale_bf16",
+    "attn::attn_res_blend_bf16",
+    "attn::logit_softcap_bf16",
+    // THREE ROWS BELOW WERE PROVED AGAINST POISON, AND THE WINDOW HAS CLOSED.
+    //
+    // `attn::lse_log2_to_ln`, `mlp::gaussian_topk_bf16` and
+    // `attn::logit_softcap_bf16` are in-place transforms that name no
+    // `Source::In` at all: the operand each one reads IS its output. Their
+    // parity fixtures left that output poison-filled, so both arms agreed
+    // exactly about what the kernel does to `0xa5, 0xc4, 0xe3, ...` read as
+    // floats, and all three were routed on that agreement.
+    //
+    // The harness's permutation control found them -- rotating every input
+    // moved nothing, because there were no inputs -- and by then all three
+    // archive launchers had been deleted, the deletions these very routings
+    // authorised. Un-routing any of them now fails to COMPILE:
+    // `lse_log2_to_ln` is no longer a member of
+    // `pie_cuda_driver::kernels::attn`. Their fixtures are corrected and
+    // their digests re-measured from the JIT arm alone, and the harness
+    // counts them under `recalled`, never `compared`.
+    //
+    // All three are almost certainly right -- each is a few lines of
+    // arithmetic whose text §8 proves byte-identical -- but this file should
+    // not claim a comparison that no longer exists. It is the sharpest thing
+    // this session measured about why the harness had to come first, and it
+    // is now prevented rather than described:
+    // `jit_parity.rs::every_case_names_a_row_with_both_implementations`
+    // refuses a fixture that leaves an in-place row's operand poison.
+    //
+    // `attn::lse_log2_to_ln`, and the window for re-proving it HAS CLOSED.
+    //
+    // Routed in batch 4 on a fixture that stated an input slot the row does
+    // not have: its only operand is `lse: F32sMut <- Source::Out(0)`, an
+    // in-place transform with no `In` at all, and the fixture left that
+    // output poison-filled. Both arms therefore agreed byte-for-byte about
+    // what log2->ln does to `0xa5, 0xc4, 0xe3, ...` reinterpreted as f32.
+    // The parity harness's permutation control found it -- rotating every
+    // input moved nothing, because there were no inputs -- and by then the
+    // archive's launcher had already been deleted, the deletion this row's
+    // own routing authorised. Un-routing it now fails to COMPILE:
+    // `lse_log2_to_ln` is no longer a member of
+    // `pie_cuda_driver::kernels::attn`.
+    //
+    // So its corrected fixture is recorded as a JIT-only digest and the
+    // harness counts it under `recalled`, never `compared`. The row is
+    // almost certainly right -- it is four lines of arithmetic and its text
+    // is proved byte-identical by §8 -- but this file should not claim a
+    // comparison that no longer exists. It is the clearest demonstration
+    // this session produced of why the harness had to come first.
+    "attn::lse_log2_to_ln",
+    "norm::altup_correct_bf16",
+    "norm::altup_predict_bf16",
+    "ssm::bf16_to_fp32",
+    "ssm::fp32_to_bf16",
+    "ssm::l2norm_scale_bf16_to_fp32",
+    // BATCH 5 -- two rows, and the third one is why the batch is two.
+    //
+    // `attn/kimi_mla` states three rows; `moe/topk_sigmoid` states one. All
+    // four are armed and hosted. The two below agreed with the archive in
+    // every byte of every allocation at three shapes each, including
+    // `topk_sigmoid` at `experts = 4, k = 2` where the routing table is
+    // narrower than a warp.
+    //
+    // `attn::kimi_split_q_b_bf16` is HELD, and the harness is the only reason
+    // anyone knows to hold it. The row's extent is `total <- InElements(0)`
+    // -- the input's element count -- but `LaunchRule::Elementwise` sizes the
+    // grid from `width_of(b, n_in + 0)`, the FIRST OUTPUT's width. This row
+    // splits a q projection into `q_nope` and `q_pe`, so its input is
+    // strictly wider than out 0 by construction, and the JIT under-covers by
+    // exactly that ratio: at 6 rows of 8 heads (nope 128, rope 64) it wrote 4
+    // of 6 rows, leaving 4,082 of 12,544 bytes of `q_nope` and 2,041 of 6,400
+    // of `q_pe` still holding the poison fill. The archive's launcher reads
+    // the same `total` the row states, which is why the two disagree.
+    //
+    // It is worth saying how nearly this was missed. The row's third shape --
+    // 1 row, 1 head -- agrees in every byte, because 200 elements round up
+    // into a 256-thread block that covers all 255 the kernel wanted. One
+    // shape would have certified it. The divergence is now an INVERTED
+    // assertion in `driver-cuda/tests/jit_parity.rs`: if those shapes ever
+    // agree, the test fails and says to route the row.
+    "attn::kimi_split_kv_a_norm_bf16",
+    "moe::topk_sigmoid_bf16",
+    // BATCH 6 -- one row of two, and the one held is held for a reason no
+    // gate in this crate could have raised.
+    //
+    // `moe/topk_softmax` states two armed rows. This one agreed with the
+    // archive in every byte at 8x64, 3x4 (k = 1, narrower than a warp) and
+    // 1x129. It is also the row that answers whether `Bool` and `I32` can
+    // spell the same operand: the AOT row declares `normalize: Bool` and the
+    // device row `I32`, because the C++ host function narrows a `bool` with
+    // `? 1 : 0` and the `__global__` takes an `int`. Both put the same four
+    // bytes in the cell, and only comparing the RESULT could say so.
+    //
+    // `moe::topk_softmax_bf16` is HELD, and not because anything is wrong
+    // with it. The ahead-of-time symbol is a LADDER: its launcher picks
+    // between five warp rungs and the block form on `num_experts` and `K` at
+    // run time, and the device row names the block form -- the one thing a
+    // row cannot state, as this family's own header says. So the two arms
+    // fire DIFFERENT `__global__`s at 64 and 129 experts and fold the same
+    // logits in different orders: 53 of 512 bytes of `topk_idx` differ at
+    // 8x64 and 4 of 276 at 1x129, while `topk_w` agrees in every byte at
+    // every shape.
+    //
+    // The binding is right, and here is the measurement that says so: with
+    // `PIE_TOPK_WARP=0` -- the documented switch that forces the launcher to
+    // the block form -- all three shapes agree in EVERY byte. Routing this
+    // row would therefore not be a migration but a behaviour change, and the
+    // countdown is not worth a silently different expert ranking.
+    "moe::topk_sigmoid_bias_fp32",
+    // BATCH 7 -- EVERY REMAINING ARMED ROW, IN ONE COMMIT.
+    //
+    // 34 rows carried a generated arm; 30 are here. The four absent are the
+    // four this session already measured divergent, and no re-measurement was
+    // done to leave them out -- the numbers were in hand:
+    // `pad_head_dim_bf16` 6,100/12,544 and `strip_head_dim_bf16` 4,588/9,472
+    // (`LaunchRule::PerHead` reads `ctx.num_kv_heads`, which no part of the
+    // row mentions); `kimi_split_q_b_bf16` 4,082/12,544 + 2,041/6,400
+    // unwritten (`Elementwise` grids on out 0, the extent is `InElements(0)`);
+    // `topk_softmax_bf16` 53/512 index bytes, a run-time rung ladder the row
+    // can only name one rung of. All four are `LaunchRule` work, not routing
+    // decisions.
+    //
+    // The other 30 are proven by the build, which is what the four compulsory
+    // compiles check: `routed_rows_have_an_arm` for the arm, the `bridge`
+    // link for the shim edge, and `cargo check` toolkit-free.
+    "attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
+    "attn::attention_naive_paged",
+    "mlp::chunked_swiglu_bf16",
+    "moe::topk_sqrtsoftplus_bf16",
+    "moe::token_batched_weighted_sum_bf16",
+    "moe::token_batched_weighted_sum_add_bf16",
+    "moe::gather_moe_aligned_inputs_bf16",
+    "moe::moe_align_decode",
+    "norm::attn_sink_correction_bf16",
+    "norm::per_head_rmsnorm_bf16",
+    "norm::hc_expand_bf16",
+    "quant::mxfp4_moe_gate_up_decode_bf16",
+    "quant::mxfp4_moe_down_decode_bf16",
+    "quant::wna16_gate_up_decode_bf16",
+    "quant::wna16_down_decode_bf16",
+    "rope::rope_standard_table",
+    "rope::rope_partial_bf16",
+    "rope::qk_rmsnorm_rope_bf16",
+    "ssm::repeat_interleave_heads_fp32",
+    "ssm::recurrent_gated_delta_step_batched",
+    "ssm::recurrent_gated_delta_step_batched_state_bf16",
+    "ssm::recurrent_gated_delta_step_batched_gqa",
+    "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa",
+    "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+    "ssm::nemotron_prepare_mamba_params",
+    "ssm::nemotron_prepare_mamba_dt_da",
+    "ssm::zamba_rmsnorm_gated_bf16",
+    "ssm::causal_conv1d_update_batched_bf16",
+    "ssm::kda_gate_beta_bf16",
+    "ssm::kda_o_norm_gated_bf16",
 ];
 
 /// [`ELEMENTWISE`]'s rows that [`JIT_DISPATCHED`] names, as the emitters take
@@ -608,11 +919,26 @@ pub static JIT_DISPATCHED: &[&str] = &[
 ///
 /// A function rather than a second static, so the two lists cannot drift: the
 /// symbols are stated once and this is the join.
+///
+/// # The join is over every unit, and the narrow version was the whole gate
+///
+/// This filtered `ALTUP_AUX.iter().chain(ELEMENTWISE)`, which is two units of
+/// fifteen families. Both build scripts call it — `driver-cuda/build.rs:324`
+/// and `kernels-cuda/build.rs:215` — and it decides two things:
+/// [`crate::abi::emit_c_shim`] SKIPS a row it names, and
+/// [`crate::abi::emit_rust_dispatch`] reads that row's device operands
+/// instead of its AOT ones. So a migrated family symbol added to
+/// [`JIT_DISPATCHED`] kept its shim entry and kept being routed to it; the
+/// name would have been inert, and the only thing standing between that and
+/// a silent no-op was `assert_eq!(jit_dispatched().len(),
+/// JIT_DISPATCHED.len())` in [`every_dispatched_symbol_has_a_row`].
+///
+/// That assertion is why this was a loud failure rather than a quiet one,
+/// and it is worth keeping for exactly that reason: **the list and the join
+/// must have the same length, or one of them is not what it claims.**
 #[must_use]
 pub fn jit_dispatched() -> Vec<&'static DeviceKernel> {
-    ALTUP_AUX
-        .iter()
-        .chain(ELEMENTWISE)
+    crate::unit::rows()
         .filter(|d| JIT_DISPATCHED.contains(&d.sig.symbol))
         .collect()
 }
@@ -1514,12 +1840,32 @@ pub fn specialisation(symbol: &str) -> Option<&'static Specialisation> {
 /// ROW and not the unit — a typecheck emitter, say, or a test. The launch
 /// path uses the unit form, because it needs the index to reach the module
 /// cache anyway.
+///
+/// # This scanned two tables and said it scanned all of them
+///
+/// The body was `ALTUP_AUX.iter().chain(ELEMENTWISE)` while the sentence
+/// above said "every device table this crate knows" — true when it was
+/// written, when those two WERE the tables, and false from the first family
+/// unit onwards. [`crate::unit::UNITS`] is `families::ALL` concatenated, and
+/// `device::ALTUP_AUX`/`device::ELEMENTWISE` are merely the `rows` of two
+/// units in [`crate::families::norm::UNITS`] — so the old body was a strict
+/// subset of this one, by 15 families to 2.
+///
+/// It mattered in exactly one place and it mattered a lot:
+/// [`every_dispatched_symbol_has_a_row`] uses this, so a migrated family
+/// symbol added to [`JIT_DISPATCHED`] failed with **`is dispatched to the
+/// JIT and has no row`** — a message that blames the row, when the row is
+/// there and the LOOKUP could not see it. `git log -S "JIT_DISPATCHED"`
+/// returns one commit: the list has never been extended past altup, and this
+/// is why.
+///
+/// [`crate::runtime::fire`] has its own `row`, through `unit_of`, which is
+/// the wide one — so the LAUNCH path was always correct and only the
+/// gatekeeping was narrow. Two functions of one name with different domains
+/// is how a defect hides in plain sight for a whole migration.
 #[must_use]
 pub fn row(symbol: &str) -> Option<&'static DeviceKernel> {
-    ALTUP_AUX
-        .iter()
-        .chain(ELEMENTWISE)
-        .find(|entry| entry.sig.symbol == symbol)
+    crate::unit::rows().find(|entry| entry.sig.symbol == symbol)
 }
 
 #[cfg(test)]
@@ -1563,6 +1909,43 @@ mod tests {
             assert_eq!(row(entry.sig.symbol).map(|r| r.sig.symbol), Some(entry.sig.symbol));
         }
         assert!(row("norm::a_kernel_nobody_wrote").is_none());
+    }
+
+    /// ...and "the tables" means EVERY unit's, not the two this module holds.
+    ///
+    /// `the_lookup_is_the_tables` above passes on a `row` that scans only
+    /// `ALTUP_AUX` and `ELEMENTWISE`, because those are the rows it feeds it
+    /// — a gate asserting its own denominator, which is the failure
+    /// `new-horizon.md` §21 names five times. This one feeds it
+    /// [`crate::unit::rows`], so it fails on the narrow body for every
+    /// migrated family row at once.
+    ///
+    /// It is not a hypothetical regression. The narrow body is why
+    /// [`JIT_DISPATCHED`] has never grown past altup: adding a family symbol
+    /// to it failed with *"is dispatched to the JIT and has no row"*, which
+    /// names the row as the problem and sent three attempts looking at the
+    /// row.
+    #[test]
+    fn the_lookup_is_every_unit_s_tables() {
+        let mut checked = 0usize;
+        for entry in crate::unit::rows() {
+            assert_eq!(
+                row(entry.sig.symbol).map(|r| r.sig.symbol),
+                Some(entry.sig.symbol),
+                "`{}` is a row of unit `{}` and `device::row` cannot find it",
+                entry.sig.symbol,
+                crate::unit::unit_of(entry.sig.symbol).map_or("<none>", |(_, u)| u.name),
+            );
+            checked += 1;
+        }
+        // A DENOMINATOR, because the loop above is vacuous over an empty
+        // iterator and would pass on one.
+        assert!(
+            checked > ALTUP_AUX.len() + ELEMENTWISE.len(),
+            "only {checked} rows scanned; this module alone holds {}, so the \
+             iterator is not the whole table and this test proves nothing",
+            ALTUP_AUX.len() + ELEMENTWISE.len(),
+        );
     }
 
     /// Every Tier A row states a rule. `Unstated` is what a row says when it

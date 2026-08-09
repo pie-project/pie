@@ -215,45 +215,14 @@ void write_kv_to_pages(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void write_kv_to_pages_at_positions_bf16(
-    KvCacheLayerView layer,
-    const void* k_curr,
-    const void* v_curr,
-    const std::int32_t* positions,
-    int position_delta,
-    const std::uint32_t* qo_indptr,
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,
-    int total_tokens,
-    int num_requests,
-    cudaStream_t stream)
-{
-    if (!layer.is_native_bf16()) {
-        throw std::runtime_error(
-            "write_kv_to_pages_at_positions_bf16 requires native bf16 KV cache");
-    }
-    constexpr int BLOCK = 256;
-    if (layer.hnd_layout) {
-        device::write_kv_at_positions<true><<<total_tokens, BLOCK, 0, stream>>>(
-            static_cast<const device::bf16*>(k_curr),
-            static_cast<const device::bf16*>(v_curr),
-            static_cast<device::bf16*>(layer.k_pages),
-            static_cast<device::bf16*>(layer.v_pages),
-            positions, position_delta, qo_indptr, kv_page_indices,
-            kv_page_indptr, num_requests, layer.page_size,
-            layer.num_kv_heads, layer.head_dim);
-    } else {
-        device::write_kv_at_positions<false><<<total_tokens, BLOCK, 0, stream>>>(
-            static_cast<const device::bf16*>(k_curr),
-            static_cast<const device::bf16*>(v_curr),
-            static_cast<device::bf16*>(layer.k_pages),
-            static_cast<device::bf16*>(layer.v_pages),
-            positions, position_delta, qo_indptr, kv_page_indices,
-            kv_page_indptr, num_requests, layer.page_size,
-            layer.num_kv_heads, layer.head_dim);
-    }
-    CUDA_CHECK(cudaGetLastError());
-}
+// `write_kv_to_pages_at_positions_bf16` WAS HERE, and it is deleted.
+//
+// It held two `<<<>>>` -- one per cache half -- and `launch_abi.rs` recorded
+// it as `NoRow::KernelsInternal`. The audit measured the sibling that called
+// it and found none reachable. The KERNEL is untouched: `attn/kv_paged.cuh`
+// still carries `write_kv_at_positions` and `families::attn::KV_PAGED`'s
+// twenty rows still compile it, so a caller that wants explicit positions has
+// a row to fire rather than eleven arguments to assemble.
 
 void write_kv_explicit_bf16_devwin(
     KvCacheLayerView layer,
@@ -300,57 +269,14 @@ void write_kv_explicit_bf16_devwin(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void write_kv_to_pages_bf16_devwin(
-    KvCacheLayerView layer,
-    const void* k_curr,
-    const void* v_curr,
-    const std::uint32_t* qo_indptr,
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,
-    const std::uint32_t* kv_last_page_lens,
-    const std::uint32_t* win_d,
-    int n_max,
-    int num_requests,
-    cudaStream_t stream,
-    const std::uint8_t* row_valid)
-{
-    if (!layer.is_native_bf16()) {
-        throw std::runtime_error(
-            "write_kv_to_pages_bf16_devwin requires native bf16 KV cache "
-            "(the same argument as the host first_token form)");
-    }
-    if (n_max <= 0) return;
-    // Envelope maintenance (quest) is NOT wired on this variant yet —
-    // same disposition as the explicit devwin write.
-    if (layer.has_envelopes()) {
-        throw std::runtime_error(
-            "write_kv_to_pages_bf16_devwin: envelope maintenance not yet "
-            "windowed — use the host-window form");
-    }
-    constexpr int BLOCK = 256;
-    if (layer.hnd_layout) {
-        device::write_kv<true><<<n_max, BLOCK, 0, stream>>>(
-            static_cast<const device::bf16*>(k_curr),
-            static_cast<const device::bf16*>(v_curr),
-            static_cast<device::bf16*>(layer.k_pages),
-            static_cast<device::bf16*>(layer.v_pages),
-            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            row_valid, win_d,
-            num_requests, layer.page_size, layer.num_kv_heads,
-            layer.head_dim, /*first_token=*/0);
-    } else {
-        device::write_kv<false><<<n_max, BLOCK, 0, stream>>>(
-            static_cast<const device::bf16*>(k_curr),
-            static_cast<const device::bf16*>(v_curr),
-            static_cast<device::bf16*>(layer.k_pages),
-            static_cast<device::bf16*>(layer.v_pages),
-            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            row_valid, win_d,
-            num_requests, layer.page_size, layer.num_kv_heads,
-            layer.head_dim, /*first_token=*/0);
-    }
-    CUDA_CHECK(cudaGetLastError());
-}
+// `write_kv_to_pages_bf16_devwin` WAS HERE, and it is deleted.
+//
+// It held two `<<<>>>`, and `launch_abi.rs` recorded it as
+// `NoRow::Orphaned(&[Keeper::Launches])` -- "nothing calls it at all", kept
+// only because deleting it moves `kernels-cuda/tests/sources.rs`' `EXPECTED`
+// census. That is a keeper that says *delete me and re-derive the number*,
+// which is what this change does. Its `_devwin` sibling
+// `write_kv_explicit_bf16_devwin` below is reached and stays.
 
 void write_kv_explicit_bf16(
     KvCacheLayerView layer,

@@ -1,130 +1,75 @@
 use anyhow::{Result, anyhow};
 
-use crate::driver::FrameLaunchOutcome;
-use crate::driver::abi::{
-    ChannelDescBorrow, EncodeDescBorrow, FrameDescBorrow, InstanceDescBorrow, KvCopyDescBorrow,
-    PoolResizeDescBorrow, ProgramDescBorrow, StateCopyDescBorrow,
-};
-use crate::driver::channel::RegisteredChannel;
-use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
-    StateCopyPlan,
-};
-use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
-use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::submission::FrameSubmission;
 use ::driver_api::{
-    PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
-    PieModelLoadDesc,
+    BoundInstance, ChannelRegistrationPlan, CompletionBroker, Driver, FrameLaunchOutcome,
+    FrameSubmission, InstanceBindingPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan,
+    ProgramRegistration, RegisteredChannel, StateCopyPlan, SubmissionCompletion,
 };
-// THE DRIVER'S OWN FUNCTIONS, called directly.
+// THE DRIVER, AS A RUST TYPE.
 //
-// These used to arrive through an `unsafe extern "C"` block declaring thirteen
-// `pie_cuda_*` symbols, which the linker resolved against this same workspace.
-// Both sides were Rust: the declaration existed because the driver on the far
-// side used to be C++, and it outlived it. A Rust crate calling a Rust crate
-// through a C linkage gets no type checking across the call, no lifetimes, and
-// a `*mut PieDriver` where a `&mut Shell` would do.
-use driver_cuda::serve::{
-    pie_cuda_bind_instance, pie_cuda_close_channel, pie_cuda_close_instance, pie_cuda_copy_kv,
-    pie_cuda_copy_state, pie_cuda_create, pie_cuda_destroy, pie_cuda_encode, pie_cuda_launch,
-    pie_cuda_load_model, pie_cuda_register_channel, pie_cuda_register_program,
-    pie_cuda_resize_pool,
-};
+// This was thirteen free functions and a `*mut PieDriver`, imported from
+// `driver_cuda::serve` and called with the descriptor structs `crate::driver::abi`
+// built for them. Before that it was the same thirteen names reached through an
+// `unsafe extern "C"` block, which the linker resolved against this same
+// workspace: both sides were Rust, and the declaration existed only because the
+// driver on the far side used to be C++.
+//
+// What the shape cost, measured: seven `#[repr(C)]` descriptors that existed to
+// be built here and taken apart there, two `*DescBorrow` marshallers, a JSON
+// blob handed back through an out-parameter because a C function that fails
+// cannot return two things, and a null check plus a validator call on every
+// entry. `driver_cuda::serve::Shell` is a struct with methods now.
+use driver_cuda::serve::Shell;
 
 struct CudaDriverHandle {
-    driver: *mut PieDriver,
+    shell: Shell,
     broker: CompletionBroker,
-    device_facts: ::driver_api::DeviceFacts,
     kv_handle: Option<::driver_api::KvHandle>,
+}
+
+/// Turn the shell's status into an error that names the verb.
+///
+/// `driver-cuda` still answers `i32` internally — it is that crate's own
+/// convention across several thousand lines, and no longer an ABI now that
+/// nothing foreign reads it. This is the one place it is translated.
+fn status<T>(result: std::result::Result<T, i32>, verb: &'static str) -> Result<T> {
+    result.map_err(|code| anyhow!("driver-cuda {verb} failed with status {code}"))
 }
 
 impl CudaDriverHandle {
     fn create(config_bytes: &[u8]) -> Result<Self> {
         let broker = CompletionBroker::new();
-        let desc = PieDriverCreateDesc {
-            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
-            config_bytes: PieBytes {
-                ptr: config_bytes.as_ptr(),
-                len: config_bytes.len(),
-            },
-            runtime: broker.runtime_callbacks(),
-        };
-        let mut caps = PieDriverCaps::default();
-        let driver = unsafe { pie_cuda_create(&desc, &mut caps) };
-        if driver.is_null() {
-            return Err(anyhow!("pie_cuda_create returned null"));
-        }
-        let device_facts: ::driver_api::DeviceFacts = match parse_json(caps, "device facts") {
-            Ok(device_facts) => device_facts,
-            Err(error) => {
-                unsafe { pie_cuda_destroy(driver) };
-                return Err(error);
-            }
-        };
+        let shell = status(Shell::open(config_bytes, broker.clone()), "create")?;
         Ok(Self {
-            driver,
+            shell,
             broker,
-            device_facts,
             kv_handle: None,
         })
     }
 
     fn device_facts(&self) -> &::driver_api::DeviceFacts {
-        &self.device_facts
+        self.shell.device_facts()
     }
 
     fn load_model(
         &mut self,
         desc: &::driver_api::ModelLoadDesc,
     ) -> Result<::driver_api::DriverCapabilities> {
-        let snapshot = desc
-            .snapshot_dir
-            .to_str()
-            .ok_or_else(|| anyhow!("model snapshot path must be UTF-8"))?;
-        let raw = PieModelLoadDesc {
-            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
-            component: desc.component as u32,
-            mxfp4_moe: desc.mxfp4_moe as u32,
-            runtime_quant: PieBytes {
-                ptr: desc.runtime_quant.as_ptr(),
-                len: desc.runtime_quant.len(),
-            },
-            snapshot_dir: PieBytes {
-                ptr: snapshot.as_ptr(),
-                len: snapshot.len(),
-            },
-        };
-        let mut caps = PieDriverCaps::default();
-        sync_status(
-            unsafe { pie_cuda_load_model(self.driver, &raw, &mut caps) },
-            "pie_cuda_load_model",
-        )?;
-        let capabilities: ::driver_api::DriverCapabilities =
-            parse_json(caps, "model capabilities")?;
+        let capabilities = status(self.shell.load_model(desc), "load_model")?;
         self.kv_handle = capabilities.kv_handle.clone();
         Ok(capabilities)
     }
 
     fn register_program(&mut self, plan: &ProgramRegistration) -> Result<u64> {
-        let borrowed = ProgramDescBorrow::new(plan);
-        let mut out = 0u64;
-        sync_status(
-            unsafe { pie_cuda_register_program(self.driver, borrowed.as_raw(), &mut out) },
-            "pie_cuda_register_program",
-        )?;
-        Ok(out)
+        status(self.shell.register_program(plan), "register_program")
     }
 
     fn register_channel(&mut self, plan: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
-        let borrowed = ChannelDescBorrow::new(plan);
-        let mut binding = PieChannelEndpointBinding::default();
-        sync_status(
-            unsafe { pie_cuda_register_channel(self.driver, borrowed.as_raw(), &mut binding) },
-            "pie_cuda_register_channel",
-        )?;
-        ::driver_api::validate_channel_endpoint_binding(&binding, borrowed.as_raw())
+        let binding = status(self.shell.register_channel(plan), "register_channel")?;
+        // Still checked, and against the PLAN rather than against a
+        // `#[repr(C)]` copy of it. This is the direction the type system
+        // cannot check: what a driver ANSWERED.
+        ::driver_api::validate_channel_endpoint_binding(&binding, plan)
             .map_err(|error| anyhow!(error))?;
         Ok(RegisteredChannel {
             driver_id: plan.driver_id,
@@ -135,14 +80,9 @@ impl CudaDriverHandle {
     }
 
     fn bind_instance(&mut self, plan: &InstanceBindingPlan) -> Result<BoundInstance> {
-        let borrowed = InstanceDescBorrow::new(plan);
-        let mut binding = ::driver_api::PieInstanceBinding::default();
-        sync_status(
-            unsafe { pie_cuda_bind_instance(self.driver, borrowed.as_raw(), &mut binding) },
-            "pie_cuda_bind_instance",
-        )?;
+        let binding = status(self.shell.bind_instance(plan), "bind_instance")?;
         if let Err(error) = plan.validate_binding(&binding) {
-            let _ = unsafe { pie_cuda_close_instance(self.driver, binding.instance_id) };
+            let _ = self.shell.close_instance(binding.instance_id);
             return Err(error);
         }
         Ok(BoundInstance::new(
@@ -155,74 +95,47 @@ impl CudaDriverHandle {
 
     fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         let target_epoch = 1;
-        let (raw, completion) = self.broker.launch_completion(target_epoch);
-        let borrowed = FrameDescBorrow::from_submission(frame);
-        let status = unsafe { pie_cuda_launch(self.driver, borrowed.as_raw(), raw) };
-        match status {
-            ::driver_api::PIE_STATUS_EXHAUSTED => Ok(FrameLaunchOutcome::Exhausted),
-            ::driver_api::PIE_STATUS_IMPOSSIBLE => Ok(FrameLaunchOutcome::Impossible),
-            status => {
-                sync_status(status, "pie_cuda_launch")?;
+        let (target, completion) = self.broker.launch_completion(target_epoch);
+        match self.shell.launch(frame, target) {
+            Err(::driver_api::PIE_STATUS_EXHAUSTED) => Ok(FrameLaunchOutcome::Exhausted),
+            Err(::driver_api::PIE_STATUS_IMPOSSIBLE) => Ok(FrameLaunchOutcome::Impossible),
+            other => {
+                status(other, "launch")?;
                 Ok(FrameLaunchOutcome::Launched(completion))
             }
         }
     }
 
     fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
-        let (raw, completion) = self.broker.pie_completion(1);
-        let borrowed = EncodeDescBorrow::new(plan);
-        sync_status(
-            unsafe { pie_cuda_encode(self.driver, borrowed.as_raw(), raw) },
-            "pie_cuda_encode",
-        )?;
+        let (target, completion) = self.broker.control_completion(1);
+        status(self.shell.encode(plan, target), "encode")?;
         Ok(completion)
     }
 
     fn copy_kv(&mut self, plan: &KvCopyPlan) -> Result<SubmissionCompletion> {
-        let target_epoch = 1;
-        let (raw, completion) = self.broker.pie_completion(target_epoch);
-        let borrowed = KvCopyDescBorrow::new(plan);
-        sync_status(
-            unsafe { pie_cuda_copy_kv(self.driver, borrowed.as_raw(), raw) },
-            "pie_cuda_copy_kv",
-        )?;
+        let (target, completion) = self.broker.control_completion(1);
+        status(self.shell.copy_kv(plan, target), "copy_kv")?;
         Ok(completion)
     }
 
     fn copy_state(&mut self, plan: &StateCopyPlan) -> Result<SubmissionCompletion> {
-        let target_epoch = 1;
-        let (raw, completion) = self.broker.pie_completion(target_epoch);
-        let borrowed = StateCopyDescBorrow::new(plan);
-        sync_status(
-            unsafe { pie_cuda_copy_state(self.driver, borrowed.as_raw(), raw) },
-            "pie_cuda_copy_state",
-        )?;
+        let (target, completion) = self.broker.control_completion(1);
+        status(self.shell.copy_state(plan, target), "copy_state")?;
         Ok(completion)
     }
 
     fn resize_pool(&mut self, plan: &PoolResizePlan) -> Result<SubmissionCompletion> {
-        let target_epoch = 1;
-        let (raw, completion) = self.broker.pie_completion(target_epoch);
-        let borrowed = PoolResizeDescBorrow::new(plan);
-        sync_status(
-            unsafe { pie_cuda_resize_pool(self.driver, borrowed.as_raw(), raw) },
-            "pie_cuda_resize_pool",
-        )?;
+        let (target, completion) = self.broker.control_completion(1);
+        status(self.shell.resize_pool(plan, target), "resize_pool")?;
         Ok(completion)
     }
 
     fn close_instance(&mut self, instance_id: u64) -> Result<()> {
-        sync_status(
-            unsafe { pie_cuda_close_instance(self.driver, instance_id) },
-            "pie_cuda_close_instance",
-        )
+        status(self.shell.close_instance(instance_id), "close_instance")
     }
 
     fn close_channel(&mut self, channel_id: u64) -> Result<()> {
-        sync_status(
-            unsafe { pie_cuda_close_channel(self.driver, channel_id) },
-            "pie_cuda_close_channel",
-        )
+        status(self.shell.close_channel(channel_id), "close_channel")
     }
 
     fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
@@ -230,15 +143,16 @@ impl CudaDriverHandle {
     }
 }
 
-unsafe impl Send for CudaDriverHandle {}
-unsafe impl Sync for CudaDriverHandle {}
+// NO `unsafe impl Send`/`Sync`. The pair that was here existed because the
+// handle carried a `*mut PieDriver` — a raw pointer, which is neither — and
+// the compiler had to be told what the C boundary made unprovable. The field
+// is a `Shell` now, so both are derived.
 
 impl Drop for CudaDriverHandle {
     fn drop(&mut self) {
+        // The shell's own `Drop` drains the stream and frees the pinned
+        // endpoints; what is left here is telling whoever is still waiting.
         self.broker.close_all("cuda driver dropped");
-        if !self.driver.is_null() {
-            unsafe { pie_cuda_destroy(self.driver) };
-        }
     }
 }
 
@@ -248,17 +162,30 @@ pub struct CudaDriver {
 }
 
 impl CudaDriver {
-    pub fn create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
-        let (driver, mut facts) = Self::create_group(vec![config_bytes.to_vec()])?;
-        let facts = facts
-            .pop()
-            .ok_or_else(|| anyhow!("cuda create returned no device facts"))?;
-        Ok((driver, facts))
+    /// Open one device.
+    ///
+    /// # Errors
+    ///
+    /// No device, or a boot config this driver refuses.
+    pub fn create(config_bytes: &[u8]) -> Result<Self> {
+        let (driver, ranks) = Self::create_group(vec![config_bytes.to_vec()])?;
+        if ranks != 1 {
+            return Err(anyhow!("cuda create opened {ranks} ranks, expected one"));
+        }
+        Ok(driver)
     }
 
-    pub fn create_group(
-        config_blobs: Vec<Vec<u8>>,
-    ) -> Result<(Self, Vec<::driver_api::DeviceFacts>)> {
+    /// Open one device per rank config, as one driver.
+    ///
+    /// Answers how many ranks opened rather than a `Vec<DeviceFacts>`: the
+    /// facts are readable off the driver ([`Driver::device_facts`] for the
+    /// leader, [`Self::rank_facts`] for all of them), and a second copy
+    /// handed back at create was one the caller had to keep in step.
+    ///
+    /// # Errors
+    ///
+    /// An empty rank list, or any rank whose device failed to open.
+    pub fn create_group(config_blobs: Vec<Vec<u8>>) -> Result<(Self, usize)> {
         if config_blobs.is_empty() {
             return Err(anyhow!("cuda group requires at least one rank config"));
         }
@@ -297,23 +224,32 @@ impl CudaDriver {
 
         let mut created = created;
         let leader = created.remove(0);
-        let mut device_facts = Vec::with_capacity(created.len() + 1);
-        device_facts.push(leader.device_facts().clone());
-        device_facts.extend(created.iter().map(|driver| driver.device_facts().clone()));
+        let ranks = created.len() + 1;
         Ok((
             Self {
                 leader,
                 followers: created,
             },
-            device_facts,
+            ranks,
         ))
     }
 
+    /// This build has no CUDA driver.
+    ///
+    /// # Errors
+    ///
+    /// Always.
     pub fn unsupported() -> Result<Self> {
         Err(anyhow!("CUDA local driver is not available in this build"))
     }
 
-    pub fn device_facts(&self) -> Vec<::driver_api::DeviceFacts> {
+    /// Every rank's facts, leader first.
+    ///
+    /// Named apart from [`Driver::device_facts`], which answers the leader's
+    /// by reference as the contract requires. This is the GROUP's, and a
+    /// caller that did not open a group has no use for it.
+    #[must_use]
+    pub fn rank_facts(&self) -> Vec<::driver_api::DeviceFacts> {
         std::iter::once(self.leader.device_facts().clone())
             .chain(
                 self.followers
@@ -323,7 +259,27 @@ impl CudaDriver {
             .collect()
     }
 
-    pub fn load_model(
+}
+
+impl Driver for CudaDriver {
+    fn kind(&self) -> &'static str {
+        "cuda"
+    }
+
+    fn device_domain(&self) -> ::driver_api::DeviceDomain {
+        ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE
+    }
+
+    /// The LEADER's facts.
+    ///
+    /// A group is one driver with one contract, and the rank that answers for
+    /// it is rank 0. Every rank's facts are [`CudaDriver::rank_facts`], which
+    /// only a caller that opened a group has any use for.
+    fn device_facts(&self) -> Option<&::driver_api::DeviceFacts> {
+        Some(self.leader.device_facts())
+    }
+
+    fn load_model(
         &mut self,
         descs: Vec<::driver_api::ModelLoadDesc>,
     ) -> Result<::driver_api::DriverCapabilities> {
@@ -369,26 +325,26 @@ impl CudaDriver {
         Ok(leader)
     }
 
-    pub fn register_program(&mut self, plan: &ProgramRegistration) -> Result<u64> {
+    fn register_program(&mut self, plan: &ProgramRegistration) -> Result<u64> {
         self.leader.register_program(plan)
     }
 
-    pub fn register_channel(
+    fn register_channel(
         &mut self,
         plan: &ChannelRegistrationPlan,
     ) -> Result<RegisteredChannel> {
         self.leader.register_channel(plan)
     }
 
-    pub fn bind_instance(&mut self, plan: &InstanceBindingPlan) -> Result<BoundInstance> {
+    fn bind_instance(&mut self, plan: &InstanceBindingPlan) -> Result<BoundInstance> {
         self.leader.bind_instance(plan)
     }
 
-    pub fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
+    fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         self.leader.launch(frame)
     }
 
-    pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+    fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
         if !self.followers.is_empty() {
             return Err(anyhow!(
                 "media encode does not support tensor-parallel groups"
@@ -397,27 +353,27 @@ impl CudaDriver {
         self.leader.encode(plan)
     }
 
-    pub fn copy_kv(&mut self, plan: &KvCopyPlan) -> Result<SubmissionCompletion> {
+    fn copy_kv(&mut self, plan: &KvCopyPlan) -> Result<SubmissionCompletion> {
         self.leader.copy_kv(plan)
     }
 
-    pub fn copy_state(&mut self, plan: &StateCopyPlan) -> Result<SubmissionCompletion> {
+    fn copy_state(&mut self, plan: &StateCopyPlan) -> Result<SubmissionCompletion> {
         self.leader.copy_state(plan)
     }
 
-    pub fn resize_pool(&mut self, plan: &PoolResizePlan) -> Result<SubmissionCompletion> {
+    fn resize_pool(&mut self, plan: &PoolResizePlan) -> Result<SubmissionCompletion> {
         self.leader.resize_pool(plan)
     }
 
-    pub fn close_instance(&mut self, instance_id: u64) -> Result<()> {
+    fn close_instance(&mut self, instance_id: u64) -> Result<()> {
         self.leader.close_instance(instance_id)
     }
 
-    pub fn close_channel(&mut self, channel_id: u64) -> Result<()> {
+    fn close_channel(&mut self, channel_id: u64) -> Result<()> {
         self.leader.close_channel(channel_id)
     }
 
-    pub fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
+    fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
         self.followers
             .is_empty()
             .then(|| self.leader.export_kv_handle())

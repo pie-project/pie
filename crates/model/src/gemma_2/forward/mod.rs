@@ -88,7 +88,6 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
     // The MTP passes stay unstated, because those genuinely are different
     // passes and not this one under another name.
     let family = format!("gemma_2.cuda.{}", class.suffix());
-    let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
         let embedded = dsl::embedded_prologue(t, facts.hidden);
         // `sqrt(hidden)` on the embedding — a launch, not a fold.
@@ -108,29 +107,13 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
             let q = matmul(&x, &w.q_proj);
             let k = matmul(&x, &w.k_proj);
             let v = matmul(&x, &w.v_proj);
-            let (q, k) = if a.qk_norm {
-                let qn = NormW {
-                    name: format!("layer.{l}.q_norm"),
-                    variant: NormVariant::Gemma,
-                    per_head: Some(a.head_dim),
-                    layer: Some(l),
-                };
-                let kn = NormW {
-                    name: format!("layer.{l}.k_norm"),
-                    variant: NormVariant::Gemma,
-                    per_head: Some(a.head_dim),
-                    layer: Some(l),
-                };
-                (dsl::cuda::rmsnorm(&q, &qn), dsl::cuda::rmsnorm(&k, &kn))
-            } else {
-                (q, k)
-            };
-            // The pre-attention query scale is its OWN launch.
-            let q = if a.query_pre_attn_scale {
-                dsl::cuda::scalar_mul(&q, &format!("layer.{l}.query_scale"), None)
-            } else {
-                q
-            };
+            // No q/k norm here: gemma-2 does not ship one, and the
+            // manifest says so as an absence. A later gemma that does is
+            // its own generation with its own trace.
+            //
+            // The pre-attention query scale is its OWN launch, and every
+            // gemma-2 applies it.
+            let q = dsl::cuda::scalar_mul(&q, &format!("layer.{l}.query_scale"), None);
             let (q, k) = dsl::cuda::rope(&q, &k);
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&k, &v, &kv);

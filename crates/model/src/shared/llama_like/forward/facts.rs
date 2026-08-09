@@ -309,26 +309,6 @@ pub struct LlamaLikeMetalFacts {
     /// fire that runs.
     #[serde(default)]
     pub gate_up_fused: bool,
-    /// The deployment bound ONE packed `q‖k‖v` bank.
-    ///
-    /// The twin of [`Self::gate_up_fused`], and here for the same reason
-    /// its own doc gives about `LlamaLikeFacts::fused_qkv`: that field
-    /// says "this is a *binding* fact, not an architecture fact", and a
-    /// binding fact stated by the ROW is stated by whichever backend
-    /// wrote the row down. Eight llama-3 rows say `true`, which is CUDA's
-    /// answer, and Metal's is **false** — `compile_load_plan` authors
-    /// with `Projections::InPlace`, so the MLX path publishes
-    /// `self_attn.{q,k,v}_proj` separately and no Metal deployment has a
-    /// `qkv` handle at all (`lowering::resolve` says so in those words).
-    ///
-    /// It cost a whole checkpoint. `driver-metal/src/model/text.rs` used
-    /// to build `LlamaLikeFacts` itself and answer this from the staged
-    /// tensors; deleting it in favour of the catalog left the row's CUDA
-    /// answer reaching the Metal text, which asked for `layer.0.qkv` and
-    /// got `Unbound { symbol: "affine_qmv_fast_bfloat16_gs_64_b_4", why:
-    /// UnknownWeight("layer.0.qkv") }` on llama-3.2-1B.
-    #[serde(default)]
-    pub qkv_fused: bool,
     /// `rms_norm_eps`, the epsilon every norm of this deployment carries.
     ///
     /// A load-time fact and not a constant: it comes from the checkpoint's
@@ -608,9 +588,15 @@ impl LlamaLikeMetalFacts {
                 limit: 7.0,
                 alpha: 1.702,
             },
-            // `rope_theta: 150000`, a plain geometric ladder.
+            // `rope_theta: 150000`, and a YaRN-rescaled ladder over it:
+            // `rope_scaling` states factor 32, beta_fast 32, beta_slow 1,
+            // `truncate: false`. A theta alone cannot express that, so the
+            // driver derives the table at load and answers it as
+            // `Source::RopeFrequencies`. This said `false` and called 150000
+            // "a plain geometric ladder" from the day it was written, which
+            // was true of nothing: the row has always carried the YaRN block.
             rope_theta: 150_000.0,
-            rope_freq_table: false,
+            rope_freq_table: true,
             rms_eps: 1e-5,
             // `sliding_window: 128`, ALTERNATING: every other layer attends
             // the window and the rest attend everything. `window_left_at`
@@ -623,6 +609,14 @@ impl LlamaLikeMetalFacts {
             // Measured off the tensors too — `experts.gate_proj.weight` is
             // `[32, 2880, 360]` beside `scales` `[32, 2880, 90]`, and
             // 2880/90 is 32.
+            //
+            // The 98 is a count that stops one entry short of the point.
+            // There are 122 overrides, not 98: the other 24 are the
+            // `mlp.router` gates at affine/64/EIGHT, and they are easy to
+            // miss because theirs are the only entries with no `mode` key at
+            // all. That is two affine points in one file, which is one more
+            // than the driver instantiates kernel sets for, and it is why
+            // `Loaded::affine_point` refuses this checkpoint by name.
             //
             // This fixture is the one thing that states gpt-oss's Metal
             // facts, and it stated `moe_repr: None` by inheritance — an
@@ -747,7 +741,6 @@ impl LlamaLikeMetalFacts {
             // `RowScalars::norm_topk_prob`.
             norm_topk_prob: true,
             // No Metal deployment publishes a fused bank; see the field.
-            qkv_fused: false,
             // The symbols this text names are the affine ones
             // (`affine_qmv_fast`, `embed_gather_4bit`), so the deployment
             // they describe is a quantized checkpoint. MLX stores the pair

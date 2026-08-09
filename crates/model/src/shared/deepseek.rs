@@ -183,9 +183,6 @@ impl Instruct for R1Instruct {
     }
 
     fn tool_call_grammar(&self, tools: &[String]) -> Option<ToolGrammar> {
-        if tools.is_empty() {
-            return None;
-        }
         // Build an EBNF grammar that constrains generation to valid R1 tool calls.
         // Format: <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME
         //         ```json\n{...}\n```<｜tool▁call▁end｜>[more calls]<｜tool▁calls▁end｜>
@@ -203,6 +200,15 @@ impl Instruct for R1Instruct {
             }
         }
         if names.is_empty() {
+            // This answers for an empty offer too, which is why there is no
+            // separate check on `tools`: no tools means the walk pushes
+            // nothing means no alternation, so a guard up top would decide
+            // exactly what this one decides.
+            //
+            // `None` rather than the grammar with an empty `tool-name ::=`.
+            // An empty alternation is not a rule matching nothing, it is a
+            // rule the sampler cannot compile, and the fire carrying it
+            // fails at the door instead of simply generating no call.
             return None;
         }
 
@@ -424,6 +430,49 @@ mod tests {
     fn tool_call_grammar_none_for_empty() {
         let inst = r1();
         assert!(inst.tool_call_grammar(&[]).is_none());
+    }
+
+    /// An offer can be non-empty and still name nothing.
+    ///
+    /// R1 reads only the nested `function.name` spelling, so a caller
+    /// sending a flat `{"name": …}`, or a schema with no name at all, or
+    /// text that is not JSON, contributes no alternative. If any of those
+    /// left the grammar to be built anyway, `tool-name ::=` comes out with
+    /// an empty body -- which the sampler rejects, so the fire fails
+    /// rather than the model simply declining to call a tool.
+    ///
+    /// The good entry in the second case proves the walk SKIPS the bad
+    /// ones rather than aborting on them: dropping the whole offer because
+    /// one member of it was malformed would take the caller's other tools
+    /// away.
+    #[test]
+    fn an_offer_that_names_nothing_constrains_nothing() {
+        let inst = r1();
+        for offered in [
+            r#"{"name":"get_weather"}"#,
+            r#"{"function":{"parameters":{}}}"#,
+            r#"{"function":{"name":42}}"#,
+            "not json at all",
+        ] {
+            assert!(
+                inst.tool_call_grammar(&[offered.to_string()]).is_none(),
+                "{offered:?} names no function, so there is no alternation \
+                 to constrain generation with"
+            );
+        }
+
+        let mixed = inst
+            .tool_call_grammar(&[
+                "not json at all".to_string(),
+                r#"{"function":{"name":"get_weather"}}"#.to_string(),
+            ])
+            .expect("one good entry still yields a grammar");
+        assert!(
+            mixed.source.contains(r#"tool-name ::= "get_weather""#),
+            "the unreadable entry is dropped without leaving an empty \
+             alternative beside the good one, got {:?}",
+            mixed.source
+        );
     }
 
     #[test]

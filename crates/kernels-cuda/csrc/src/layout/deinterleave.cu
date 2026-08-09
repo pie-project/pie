@@ -74,42 +74,12 @@ void concat_bf16_rows(
         left_dim, right_dim);
 }
 
-void split_bf16_rows(
-    const void* src, void* left, void* right,
-    int N, int left_dim, int right_dim, cudaStream_t stream)
-{
-    if (N <= 0 || left_dim <= 0 || right_dim <= 0) return;
-    device::split_rows<device::bf16><<<N, 256, 0, stream>>>(
-        static_cast<const device::bf16*>(src),
-        static_cast<device::bf16*>(left),
-        static_cast<device::bf16*>(right),
-        left_dim, right_dim);
-}
-
-void split_qwen_gdn_ba_bf16(
-    const void* ba, void* b_out, void* a_out,
-    int N, int v_h, cudaStream_t stream)
-{
-    if (N <= 0 || v_h <= 0) return;
-    device::split_qwen_gdn_ba<device::bf16><<<N, 64, 0, stream>>>(
-        static_cast<const device::bf16*>(ba),
-        static_cast<device::bf16*>(b_out),
-        static_cast<device::bf16*>(a_out),
-        v_h);
-}
-
-void repeat_interleave_heads_bf16(
-    const void* in, void* out,
-    int N, int kv_heads, int q_heads, int head_dim, cudaStream_t stream)
-{
-    if (N <= 0 || kv_heads <= 0 || q_heads <= 0 || head_dim <= 0) return;
-    if (q_heads % kv_heads != 0) return;
-    const int block = (head_dim < 128) ? 64 : 128;
-    dim3 grid(N, q_heads);
-    device::repeat_interleave_heads<device::bf16><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(in),
-        static_cast<device::bf16*>(out),
-        N, kv_heads, q_heads, head_dim);
-}
+// `split_bf16_rows`, `split_qwen_gdn_ba_bf16` and
+// `repeat_interleave_heads_bf16` were deleted here by §43. The first two are
+// still jobs -- `device.rs`'s `JIT_DISPATCHED` routes both rows to NVRTC out
+// of `layout/deinterleave.cuh`, so what went is the ahead-of-time launcher
+// and not the kernel: §10.10 step 5, the launcher goes AFTER the row moves.
+// The third had no row and no caller in any language, which the `.cuh` said
+// in prose long before the audit measured it.
 
 }  // namespace pie_cuda_driver::kernels::layout

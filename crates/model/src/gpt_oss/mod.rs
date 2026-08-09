@@ -15,8 +15,10 @@
 //! bound it into `GptOssCudaFacts::window_left`, and then had
 //! `PlannedFamily::window_by_layer()` read it BACK OUT to build the
 //! deployment's table — a rule spelled once, transported through a
-//! backend struct, and re-read as data. [`project::deployment`] and
-//! [`project::cuda_facts`] now expand the same `is_sliding` rule.
+//! backend struct, and re-read as data. [`project::deployment`] expands
+//! `is_sliding` directly, and it is the only expansion: the text states
+//! no window, because every gpt-oss layer takes the sink spelling and
+//! the driver reads the window per layer from the deployment.
 //!
 //! Then the encodings. `openai/gpt-oss-20b` publishes MXFP4 expert
 //! blocks; the dequantized release publishes bf16 banks under different
@@ -151,6 +153,9 @@ const ROPE_SCALING: crate::deployment::RopeScaling = crate::deployment::RopeScal
     beta_slow: 1.0,
     attention_factor: 1.346_573_6,
     original_max_position: 4_096,
+    // STATED by every gpt-oss config, and the only family in the corpus
+    // that writes it. HF would default it to `true`.
+    truncate: false,
 };
 
 /// The generation's rows.
@@ -180,9 +185,6 @@ pub const VARIANTS: &[GptOss] = &[
             vocab: 201_088,
             tied_embeddings: false,
             swiglu_limit: 7.0,
-            attention_bias: true,
-            rope_yarn_original: true,
-            attn_sinks: true,
         },
         rope_theta: 150_000.0,
         norm_eps: 1e-5,
@@ -207,9 +209,6 @@ pub const VARIANTS: &[GptOss] = &[
             vocab: 201_088,
             tied_embeddings: false,
             swiglu_limit: 7.0,
-            attention_bias: true,
-            rope_yarn_original: true,
-            attn_sinks: true,
         },
         rope_theta: 150_000.0,
         norm_eps: 1e-5,
@@ -292,16 +291,40 @@ impl Variant for GptOss {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        // METAL, refused by name. `llama_like_metal` is the only Metal
-        // text in this build and it is not this model's — see
-        // [`project::NO_METAL`] for what it states instead and why
-        // reaching for it would trace a different model under this
-        // row's id. The refusal is stated HERE, at the row, rather than
-        // consulted from a list of architecture strings a driver keeps:
-        // a list is a fourth place for the answer to live and a fourth
-        // place for it to be wrong.
-        if let crate::catalog::Backend::Metal(_) = load.backend {
-            return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
+        // METAL, through the SHARED text. This arm returned
+        // `project::NO_METAL` for as long as the projection below did not
+        // exist, and that refusal's own doc had narrowed the gap to one
+        // thing: "no `metal_shape` / `metal_facts` pair, so `Variant::trace`
+        // has no Metal text to hand back". These are that pair.
+        //
+        // What it named as already present was present -- the sinks reach the
+        // shader, the clamped GLU is a symbol, `routed_qmv` picks
+        // `mxfp4_qmv_routed_bias` off `moe_repr` -- but the doc's list was
+        // not complete. gpt-oss also biases its attention landing and its
+        // ROUTER, and the shared Metal text stated neither, because no Metal
+        // kernel added a bias at all until `norm/add_bias.metal` and no
+        // binder resolved its width until `dispatch::derived`. Those are the
+        // three that landed together.
+        if let crate::catalog::Backend::Metal(bind) = load.backend {
+            let shape = project::metal_shape(&self.shape);
+            let facts = project::metal_facts(&self.shape, bind);
+            // The KERNEL SET's refusals, taken from the same function every
+            // other llama-like row asks, and not restated here. Two of the
+            // three can fire for a gpt-oss: a sharded load, and a routed leg
+            // at an affine encoding no `affine_qmv_routed` is instantiated
+            // for.
+            //
+            // Skipping this was not a missing nicety. `the_text_this_driver
+            // _runs_is_the_text_the_row_states` walks every row at g128/b8 as
+            // well as g64/b4, and without the gate the row named
+            // `affine_qmv_routed_bfloat16_gs_128_b_8` -- a symbol no `kernel!`
+            // declares -- and the trace panicked rather than refusing. The
+            // head-dim arm cannot fire here (gpt-oss is 64) and stating it
+            // anyway is the point of sharing the function.
+            crate::shared::llama_like::project::metal_kernel_refusal(&shape, &facts, load, bind)?;
+            return Ok(crate::shared::llama_like::forward::llama_like_metal(
+                &shape, &facts, class,
+            ));
         }
         Ok(project::trace(&self.shape, class, load))
     }
@@ -345,6 +368,7 @@ mod tests {
             beta_slow,
             attention_factor,
             original_max_position,
+            truncate,
         } = ROPE_SCALING
         else {
             panic!("gpt-oss rescales by YaRN");
@@ -353,6 +377,11 @@ mod tests {
         assert_eq!(beta_fast, 32.0);
         assert_eq!(beta_slow, 1.0);
         assert_eq!(original_max_position, 4_096);
+        // The one number in this block the config writes DOWN rather than
+        // omits, and the only family in the corpus that does. HF's default
+        // is the opposite, so a row copying the common case would snap the
+        // ramp gpt-oss deliberately leaves unsnapped.
+        assert!(!truncate, "gpt-oss states `truncate: false`");
         let formula = 0.1 * f64::from(factor).ln() + 1.0;
         assert!(
             (f64::from(attention_factor) - formula).abs() < 1e-6,
@@ -505,7 +534,6 @@ mod tests {
     #[test]
     fn every_row_ships_attention_sinks() {
         for v in VARIANTS {
-            assert!(v.shape.attn_sinks, "{}", v.id);
             let sinks = v
                 .manifest()
                 .tensors
@@ -592,7 +620,10 @@ mod tests {
         assert_eq!(l.experts_per_token, f.top_k);
         assert_eq!(l.moe_intermediate, f.intermediate, "the per-expert width");
         assert_eq!(l.intermediate, 0, "neither vocabulary claims a dense block");
-        assert_eq!(l.qkv_bias, f.attention_bias);
+        assert!(
+            l.qkv_bias,
+            "gpt-oss biases q/k/v, and the epilogue folds it"
+        );
         assert_eq!(l.tied_embeddings, f.tied_embeddings);
     }
 
@@ -664,52 +695,88 @@ mod tests {
         }
     }
 
-    /// A METAL load is refused BY NAME rather than traced as a llama.
+    /// A METAL load is traced as THIS ROW and not as a llama.
     ///
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row this build cannot resolve
-    /// (it listed `gpt_oss`, whose every publication either fails this
-    /// crate's manifest or names tensors `driver-metal` has no handle
-    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
-    /// sentence naming what is missing.
+    /// traced — so it could say yes to a row this build could not resolve
+    /// and no to one whose text it models. The row answers now.
     ///
-    /// The comparison is against [`project::NO_METAL`] itself and not a
-    /// paraphrase, so the sentence a caller is shown is the sentence
-    /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
+    /// # This used to assert a REFUSAL, and the refusal was the whole risk
+    ///
+    /// It pinned `project::NO_METAL` verbatim, on the ground that a row
+    /// which cannot be served must say so by name rather than be quietly
+    /// handed the shared llama text. That was right while it was true. It
+    /// stopped being true when `metal_shape`/`metal_facts` were written,
+    /// and the danger the old test guarded against is exactly what this one
+    /// now has to rule out: the shared text is `llama_like_metal`, and a
+    /// projection that got a field wrong would trace a *llama* under this
+    /// row's id and nothing would say so.
+    ///
+    /// So the assertions are the four things that make this text gpt-oss's
+    /// and not any other row's — the sinks, the clamp, the routed MXFP4
+    /// bank, and the three biases. Each is a tensor or a symbol no llama
+    /// names, and each was separately missing at some point in getting
+    /// here.
     #[test]
-    fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
+    fn a_metal_load_is_traced_as_this_row_and_not_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
-        use crate::deployment::Refusal;
         use model_compiler::trace::FireClass;
 
+        // `moe_mxfp4` TRUE, which is what `binding::observed` answers for
+        // every gpt-oss published: the checkpoint lists its dense tensors as
+        // affine/64/4 and leaves the expert banks to the top-level mxfp4/32.
         let bind = MetalBinding {
             quant_group: 64,
             quant_bits: 4,
-            moe_mxfp4: false,
+            moe_mxfp4: true,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
-            add_bias: false,
+            add_bias: true,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {
             for class in [FireClass::Prefill, FireClass::Decode] {
-                let err = v
+                let plan = v
                     .trace(class, Deployed::metal(&bind))
-                    .expect_err("this build has no Metal text for this generation");
-                assert_eq!(
-                    err,
-                    Refusal::Unsupported(project::NO_METAL),
-                    "`{}` refused a Metal load with a sentence that is not the \
-                     one the row states",
-                    v.id
+                    .expect("this build has a Metal text for this generation");
+                let text = format!("{plan:?}");
+                for (want, why) in [
+                    (
+                        "attn_sinks",
+                        "the learned per-head logit every gpt-oss layer carries",
+                    ),
+                    (
+                        "swiglu",
+                        "the CLAMPED gate, which is a different kernel and not a scalar",
+                    ),
+                    (
+                        "mxfp4_qmv_routed_bias",
+                        "the expert bank's own encoding -- an affine reading of it \
+                         produced 909,207 NaNs",
+                    ),
+                    ("o_bias", "the attention landing's bias"),
+                    ("router_bias", "the ROUTER's bias, which moves a ranking"),
+                    ("q_bias", "the projection biases"),
+                ] {
+                    assert!(
+                        text.contains(want),
+                        "`{}`'s {class:?} Metal text names no `{want}` -- {why}",
+                        v.id
+                    );
+                }
+                assert!(
+                    plan.family.contains("metal"),
+                    "`{}` was served `{}`, which is not a Metal text",
+                    v.id,
+                    plan.family
                 );
             }
         }
-        // And the refusal is about the BACKEND and nothing else: the
-        // same rows keep answering a CUDA load exactly as they did.
+        // And the text is about the BACKEND and nothing else: the same rows
+        // keep answering a CUDA load exactly as they did.
         for v in VARIANTS {
             assert!(
                 v.trace(FireClass::Decode, Deployed::single()).is_ok(),

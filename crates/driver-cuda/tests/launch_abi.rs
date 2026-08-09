@@ -240,7 +240,7 @@ fn every_mlp_row_states_its_launcher_exactly() {
     );
     let shim = kernels_cuda_new::abi::emit_c_shim(
         &[table],
-        &["mlp/swiglu.hpp", "mlp/gaussian_topk.hpp"],
+        &["mlp/swiglu.hpp"],
         &kernels_cuda_new::device::jit_dispatched(),
     )
     .expect("no entry-point collisions");
@@ -294,9 +294,7 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
         "quant/quant_bf16_to_fp8.hpp",
         "quant/quant_bf16_to_mxfp4.hpp",
         "layout/embed.hpp",
-        "layout/gather_rows.hpp",
         "layout/slot_ops.hpp",
-        "layout/split_gate_up.hpp",
         "layout/deinterleave.hpp",
         "gemm/gemm.hpp",
         "gemm/gemv.hpp",
@@ -306,8 +304,6 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
         "moe/moe_grouped_gemm.hpp",
         "moe/flashinfer_moe.hpp",
         "sample/argmax.hpp",
-        "../third_party/marlin_moe/marlin_moe_wrapper.hpp",
-        "moe/topk_sigmoid.hpp",
         "moe/topk_softmax.hpp",
     ];
     let shim = kernels_cuda_new::abi::emit_c_shim(
@@ -356,7 +352,6 @@ fn every_ssm_row_states_its_launcher_exactly() {
         &[table],
         &[
             "ssm/causal_conv1d.hpp",
-            "ssm/flashinfer_mamba.hpp",
             "ssm/gated_delta_net.hpp",
             "ssm/kda.hpp",
             "ssm/nemotron_h.hpp",
@@ -469,15 +464,53 @@ enum NoRow {
     KernelsInternal,
     /// **Nothing calls it at all** — not the driver, not a sibling `.cu`, not
     /// `dsl::cuda`. It had a row until `new-horizon.md` §28.4 measured the
-    /// row as a second name for a job a reached row already does, and the row
-    /// went; the launcher stays because §10.10 says a launcher goes only when
-    /// its WHOLE consumer set has gone, and this one's last consumer is
-    /// `kernels-cuda/tests/sources.rs`' `EXPECTED = 401` `<<<>>>` census.
-    /// That is a backlog entry, and this is where it is written down.
+    /// row as a second name for a job a reached row already does, or until
+    /// §38 measured the row's whole consumer set as empty, and the row went;
+    /// the launcher stays because §10.10 says a launcher goes only when its
+    /// WHOLE consumer set has gone.
     ///
     /// Checked exactly as `KernelsInternal` is, and then harder: the driver
-    /// must not mention it AND no `.cu` in `csrc` may call it.
-    Orphaned,
+    /// must not mention it AND no `.cu` in `csrc` may call it. And then
+    /// harder again — it must name at least one [`Keeper`], and every
+    /// keeper it names is opened and read. This doc used to assert the
+    /// keeper in prose, for all of them at once: *"its last consumer is
+    /// `sources.rs`' `EXPECTED = 401` `<<<>>>` census"*. §38.10 measured
+    /// that and it was true of **one of the three** entries it was written
+    /// for. Two of them hold no `<<<>>>` at all. That is the §34 lesson
+    /// arriving one level down: a reason stated once for a list is not a
+    /// reason checked per entry.
+    Orphaned(&'static [Keeper]),
+}
+
+/// **What is still holding an [`NoRow::Orphaned`] launcher, checked.**
+///
+/// An exception list is a silencer unless the exception costs something to
+/// state. `Orphaned` already pays once — nothing may call it, and both the
+/// driver and every `.cu` body are read to prove that. A keeper is the
+/// second half and the more useful one: it says what a DELETION would cost,
+/// which is the number a reader actually needs, and it is wrong loudly
+/// rather than quietly.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Keeper {
+    /// **Its body holds `<<<>>>` that `kernels-cuda/tests/sources.rs`'
+    /// `EXPECTED` counts.** Deleting it moves 401, which is the one number
+    /// this session is not allowed to move without saying so.
+    Launches,
+    /// **It is the ONLY caller of the named launcher.** Deleting it is a
+    /// two-launcher edit, not a one-function edit: the named one goes from
+    /// `KernelsInternal` to `Orphaned` in the same commit.
+    SoleCallerOf(&'static str),
+    /// **A probe cites its defining `.cu` by path**, so re-adding the row is
+    /// a one-line edit rather than an archaeology exercise. §31's precedent:
+    /// the probe is what makes a row cheap to re-add, and a launcher with no
+    /// declaration would not be cheap at all.
+    Probed(&'static str),
+    /// **Nothing holds it.** The honest empty answer, and it is the one that
+    /// says *delete me* — so it is checked to be TRUE rather than
+    /// convenient: a `Backlog` entry whose body launches is refused, because
+    /// that is the lie that would make a deletion look free when it costs a
+    /// `<<<>>>`.
+    Backlog,
 }
 
 /// Every launcher `attn`'s headers declare is a row, or is one of five
@@ -487,11 +520,13 @@ enum NoRow {
 /// because for `rope` it is true. For `attn` it is false BY DESIGN, and a
 /// test that asserted it anyway would have to be deleted rather than
 /// answered. What is actually load-bearing is that no launcher joins these
-/// headers without someone deciding which kind it is: 77 declarations against
-/// 43 rows is not a gap to close, it is 34 decisions, and this is where they
-/// are written down. Seven of the 34 arrived at once, when §28.4's audit
-/// measured seven rows as duplicates and deleted them — a decision moving
-/// from "row" to "stated reason" is the same decision, restated.
+/// headers without someone deciding which kind it is: **78 declarations
+/// against 40 rows is not a gap to close, it is 38 decisions**, and this is
+/// where they are written down. Seven of the 38 arrived at once, when
+/// §28.4's audit measured seven rows as duplicates and deleted them, and two
+/// more when §38 measured two rows' consumer sets as empty — a decision
+/// moving from "row" to "stated reason" is the same decision, restated, and
+/// the count above moves one for one as it does.
 ///
 /// `KernelsInternal` is not taken on trust — the claim is "the driver never
 /// calls this", the driver's sources are next door, and so it is checked.
@@ -507,29 +542,65 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         ("plan_attention_mla_bf16",                     NoRow::Prepare),
         ("prepare_attention_xqa_decode_bf16",           NoRow::Prepare),
         ("set_decode_plan_int_base",                    NoRow::Prepare),
-        ("xqa_decode_bf16_warmup_current_device",       NoRow::Warmup),
-        ("xqa_decode_bf16_gqa5_warmup_current_device",  NoRow::Warmup),
         ("split_qkv_bf16",                              NoRow::DriverInternal),
         ("split_qkv_bf16_devwin",                       NoRow::DriverInternal),
         ("pack_dense_mask",                             NoRow::DriverInternal),
         ("pack_structured_mask",                        NoRow::DriverInternal),
         ("copy_kv_cells_bf16",                          NoRow::DriverInternal),
         ("attention_flashinfer_prefill_bf16",           NoRow::KernelsInternal),
+        // ORPHANED BY THIS SESSION'S OWN DELETION, and left standing on
+        // purpose. `attention_flashinfer_prefill_custom_bf16` was
+        // `KernelsInternal` and the sibling that called it was
+        // `attention_flashinfer_prefill_custom`, which §44 deleted as a
+        // closed `Backlog`. So the pair went from "one dead caller" to "no
+        // caller" in one edit — §41's orphaned-at-one-remove, produced
+        // rather than found, and the reason a transitive audit has to be
+        // re-run after a deletion and not only before.
+        //
+        // It is NOT deleted with it, and the asymmetry is the point. The two
+        // `Backlog` entries §44 collected were host code this tree can
+        // restate: a `dim3`, a guard, a forward. This one is a FlashInfer
+        // custom-mask prefill dispatch — a `switch` over `kernels.def` into
+        // vendored templates whose host geometry is precisely what §44
+        // measured as unstateable in the `LaunchRule` vocabulary. A `Backlog`
+        // keeper claims "nothing holds it", and something does hold this: the
+        // cost of writing it again. That is not a `Keeper` variant and must
+        // not become one for a single entry (§10.5), so it is stated here in
+        // the kind that is still literally true — no driver call, no row —
+        // and handed to whoever ports the FlashInfer prefill.
         ("attention_flashinfer_prefill_custom_bf16",    NoRow::KernelsInternal),
         ("dispatch_attention_flashinfer_decode_capture_bf16", NoRow::KernelsInternal),
         ("dispatch_attention_flashinfer_prefill_custom_bf16", NoRow::KernelsInternal),
-        ("attention_mtp_history_bf16",                  NoRow::KernelsInternal),
-        ("attention_naive_bf16",                        NoRow::KernelsInternal),
-        ("attention_naive_paged_custom",                NoRow::KernelsInternal),
-        ("attention_naive_paged_decode",                NoRow::KernelsInternal),
-        ("attention_xqa_decode_bf16",                   NoRow::KernelsInternal),
-        ("add_ape_f32",                                 NoRow::KernelsInternal),
-        ("attention_compressed_bf16",                   NoRow::KernelsInternal),
-        ("average_pool_bf16",                           NoRow::KernelsInternal),
-        ("dsv4_compress_gather_bf16",                   NoRow::KernelsInternal),
-        ("gated_softmax_pool_bf16",                     NoRow::KernelsInternal),
-        ("write_kv_to_pages_at_positions_bf16",         NoRow::KernelsInternal),
         ("write_mla_to_pages_bf16",                     NoRow::KernelsInternal),
+        // ── §44's deletions ──────────────────────────────────────────
+        // FOURTEEN entries stood here and are gone with their launchers.
+        // Two `Warmup` (`xqa_decode_bf16_warmup_current_device` and its
+        // gqa5 half), eleven `KernelsInternal`
+        // (`attention_mtp_history_bf16`, `attention_naive_bf16`,
+        // `attention_naive_paged_custom`, `attention_naive_paged_decode`,
+        // `attention_xqa_decode_bf16`, `add_ape_f32`,
+        // `attention_compressed_bf16`, `average_pool_bf16`,
+        // `dsv4_compress_gather_bf16`, `gated_softmax_pool_bf16`,
+        // `write_kv_to_pages_at_positions_bf16`) and two `Orphaned`
+        // (`write_kv_to_pages_bf16_devwin`,
+        // `attention_mtp_paged_history_bf16`).
+        //
+        // `KernelsInternal` says "only sibling `.cu` files call it", and for
+        // all eleven the audit measured WHICH siblings: none that anything
+        // reaches. `attention_compressed_bf16` is the shape of it — five
+        // unpaged DSv4 launchers where the only caller of four of them was
+        // the fifth. A cycle of dead callers reads as `KernelsInternal` from
+        // inside and as nothing at all from outside, which is why the claim
+        // had to be checked transitively and not one hop.
+        //
+        // The two `Orphaned` are §38's own keepers, honoured rather than
+        // ignored: `Keeper::Launches` said deleting them moves
+        // `kernels-cuda/tests/sources.rs`' `EXPECTED`, and it does — the
+        // number is RE-DERIVED from the tree in the same change, which is
+        // what that keeper was asking for.
+        //
+        // `merge_attention_states_bf16` below is NOT among them, for the
+        // reason its own keeper gives, and it still holds.
         // §28.4's seven: each had a row, each row was a second name for a
         // job a reached row already does, and none of the seven wrappers in
         // `dsl.rs` had a caller. The four below are still reached from a
@@ -539,14 +610,40 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         ("dispatch_attention_flashinfer_decode_bf16",   NoRow::KernelsInternal),
         ("dispatch_attention_flashinfer_prefill_sm90_bf16", NoRow::KernelsInternal),
         ("attention_naive_paged_bf16",                  NoRow::KernelsInternal),
-        ("write_kv_to_pages_bf16_devwin",               NoRow::Orphaned),
-        ("qkv_decode_qk_norm_rope_write_kv_bf16_devwin", NoRow::Orphaned),
-        ("attention_flashinfer_prefill_custom",         NoRow::Orphaned),
+        // §38.10's two `Backlog` entries — "Nothing holds them. They are
+        // deletions waiting for their evidence" — are gone, with their
+        // launchers. The evidence was the `Backlog` claim itself, which this
+        // test already checks (`!body.contains("<<<")`), plus the audit
+        // finding no caller on any channel. A `Backlog` that is never
+        // collected is an exception list being the thing it exists to stop.
+        // §38's two: not duplicates — each had a real, still-true wall in
+        // front of it (`merge_attention_states_bf16` a two-geometry host
+        // `if` in `cascade.cuh:638-666`, `attention_mtp_paged_history_bf16`
+        // a three-way switch on `max_global_tokens + history_steps > 8192`)
+        // and a consumer set that was empty on every channel §28.2 lists.
+        // A wall in front of a door nobody opens is not a wall, so the rows
+        // went and the launchers stayed. Their last consumers are named:
+        // `attention_mtp_paged_history_bf16` is the ONLY caller of
+        // `attention_mtp_history_bf16` above, so deleting it would orphan
+        // two launchers and move `sources.rs`' `EXPECTED` off 401;
+        // `merge_attention_states_bf16` is cited by file AND LINE from
+        // `kernels-cuda-new/examples/vendor_probe.rs:199`, which is what
+        // makes re-adding the row cheap if a model ever wants it.
+        ("merge_attention_states_bf16",
+            NoRow::Orphaned(&[Keeper::Probed("kernels-cuda-new/examples/vendor_probe.rs")])),
     ];
 
     let declared = declared_launchers();
+    // 78 before §44, 58 after. The floor moves DOWN as the archive is
+    // retired and it must, because it is a tripwire on the SCANNER and not
+    // on the tree: it fires when `declared_launchers` stops finding
+    // declarations for a reason that is not a deletion — a header renamed, a
+    // `void` on the wrong line, a directory moved. Left at 77 it would have
+    // fired on twenty honest deletions and said "the shape assumption broke"
+    // about a change that broke nothing, which is the failure mode a floor
+    // has instead of a bug.
     assert!(
-        declared.len() >= 77,
+        declared.len() >= 55,
         "the scan found {} declarations, so its shape assumption broke",
         declared.len()
     );
@@ -593,7 +690,7 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     let wrong: Vec<&str> = exceptions
         .iter()
         .filter(|(_, why)| {
-            *why == NoRow::KernelsInternal || *why == NoRow::Orphaned
+            *why == NoRow::KernelsInternal || matches!(why, NoRow::Orphaned(_))
         })
         .map(|(n, _)| *n)
         .filter(|n| mentions_word(&driver_text, n))
@@ -618,7 +715,7 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     );
     let not_orphans: Vec<&str> = exceptions
         .iter()
-        .filter(|(_, why)| *why == NoRow::Orphaned)
+        .filter(|(_, why)| matches!(why, NoRow::Orphaned(_)))
         .map(|(n, _)| *n)
         .filter(|n| mentions_word(&cu_text, n))
         .collect();
@@ -627,6 +724,148 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         "called `Orphaned` but a sibling `.cu` calls it, so it is really \
          `KernelsInternal`: {not_orphans:?}"
     );
+
+    // And every `Orphaned` names at least one `Keeper`, and every keeper is
+    // opened and read. This is the half that makes the exception cost
+    // something to state: `Orphaned` says what does NOT reach it, a keeper
+    // says what a deletion WOULD cost, and only the second is a number.
+    let mut checked = 0;
+    for (name, why) in exceptions {
+        let NoRow::Orphaned(keepers) = why else { continue };
+        assert!(
+            !keepers.is_empty(),
+            "`{name}` is `Orphaned` and names no keeper. Say what still holds it, or say \
+             `Keeper::Backlog` and mean it"
+        );
+        let (file, body) = cu_definition(name).unwrap_or_else(|| {
+            panic!("`{name}` is `Orphaned` but no `.cu` under `csrc` defines it")
+        });
+        for keeper in *keepers {
+            match keeper {
+                Keeper::Launches => assert!(
+                    body.contains("<<<"),
+                    "`{name}` claims `Launches` and its body in {file} holds no `<<<>>>`, so \
+                     `sources.rs`' EXPECTED would not move if it went. That is a `Backlog`"
+                ),
+                Keeper::SoleCallerOf(target) => {
+                    let inside = call_sites_in(&body, target);
+                    let everywhere = orphan_call_sites(target);
+                    assert!(
+                        inside > 0,
+                        "`{name}` claims to be the sole caller of `{target}` and its body in \
+                         {file} does not call it at all"
+                    );
+                    assert_eq!(
+                        inside, everywhere,
+                        "`{name}` claims to be the SOLE caller of `{target}`, and `{target}` \
+                         is called {everywhere} time(s) across `csrc` of which {inside} are \
+                         here. Deleting `{name}` would not orphan `{target}` after all"
+                    );
+                }
+                Keeper::Probed(probe) => {
+                    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(probe);
+                    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                        panic!("`{name}` cites the probe `{probe}`, which does not open")
+                    });
+                    let leaf = Path::new(&file)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .expect("a .cu file name");
+                    assert!(
+                        text.contains(leaf),
+                        "`{name}` claims `{probe}` cites it, and that file never names \
+                         `{leaf}`. A citation nobody opens is the thing this whole column \
+                         exists to stop being"
+                    );
+                }
+                Keeper::Backlog => {
+                    assert_eq!(
+                        *keepers,
+                        &[Keeper::Backlog],
+                        "`{name}` says `Backlog` beside a real keeper; `Backlog` means the \
+                         list is empty, so it may not pad one"
+                    );
+                    assert!(
+                        !body.contains("<<<"),
+                        "`{name}` says nothing holds it and its body in {file} launches. \
+                         That is the one `Backlog` lie worth checking: it would make a \
+                         deletion look free when it costs a `<<<>>>` off EXPECTED = 401"
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    // ONE, and it used to be six. The other five were collected rather than
+    // lost: two `Backlog` entries became deletions, `write_kv_to_pages_bf16_devwin`'s
+    // `Launches` became a deletion and a re-derived `EXPECTED`, and
+    // `attention_mtp_paged_history_bf16`'s `Launches` + `SoleCallerOf` pair
+    // became a two-launcher deletion of exactly the kind that keeper
+    // described. What is left is `merge_attention_states_bf16`'s
+    // `Probed`, which is the one keeper naming a consumer that still exists.
+    //
+    // The floor is worth keeping at one rather than deleting: its job is to
+    // catch the `Orphaned` column going empty of keepers while entries
+    // remain, which would mean the second half of the claim had quietly
+    // stopped being made. It is not a target.
+    assert!(checked >= 1, "only {checked} keeper(s) read, so the keeper check is vacuous");
+}
+
+/// The `.cu` body of a launcher: from its `void <name>(` line to the first
+/// line that is exactly `}`, which is how every launcher in this tree closes.
+fn cu_definition(name: &str) -> Option<(String, String)> {
+    fn walk(dir: &Path, name: &str, out: &mut Option<(String, String)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, name, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("cu")
+                && out.is_none()
+                && let Ok(text) = std::fs::read_to_string(&p)
+            {
+                let lines: Vec<&str> = text.lines().collect();
+                let opens = format!("void {name}(");
+                for (i, line) in lines.iter().enumerate() {
+                    if line.trim_start().starts_with(&opens) {
+                        let end = lines[i..]
+                            .iter()
+                            .position(|l| l.trim_end() == "}")
+                            .map_or(lines.len(), |k| i + k + 1);
+                        *out = Some((
+                            p.display().to_string(),
+                            lines[i..end].join("\n"),
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    let mut out = None;
+    walk(&csrc(), name, &mut out);
+    out
+}
+
+/// Calls to `target` inside one body — `target(`, not on a comment line and
+/// not the line that declares or defines it.
+fn call_sites_in(body: &str, target: &str) -> usize {
+    let opens = format!("void {target}(");
+    let call = format!("{target}(");
+    body.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//") && !t.starts_with(&opens) && t.contains(&call)
+        })
+        .count()
+}
+
+/// The same count over every `.cu` under `csrc`, so "sole" can be checked
+/// rather than believed.
+fn orphan_call_sites(target: &str) -> usize {
+    let mut text = String::new();
+    collect_cu_bodies(&csrc(), &mut text);
+    call_sites_in(&text, target)
 }
 
 /// Every `.cu` under `csrc`, with its own declarations, definitions and
@@ -958,7 +1197,6 @@ fn the_whole_bridge_generates_for_both_sides() {
     for dir in &dirs {
         headers.extend(headers_in(dir));
     }
-    headers.push("../third_party/marlin_moe/marlin_moe_wrapper.hpp".into());
     assert!(
         dirs.iter().any(|d| d == "comm"),
         "the directory scan found no `comm/`, so the case that motivated it \
@@ -1293,10 +1531,15 @@ fn every_sample_row_states_its_launcher_exactly() {
 /// * `SecondNamespaceRoot` closes on a LAYERING decision, written out at
 ///   the `dist::` rows in `gemm.rs`: `abi::cpp_path` spells one root
 ///   (`::pie_cuda_driver::kernels::`), and these launchers live beside it
-///   rather than under it — `::pie_cuda_driver::marlin_moe` for the
-///   vendored MoE GEMM, a driver-side namespace for the collectives. Each
-///   HAS a statable signature; what is missing is which side of the
+///   rather than under it — a driver-side namespace for the collectives.
+///   Each HAS a statable signature; what is missing is which side of the
 ///   boundary the symbol admits to being on.
+///
+///   It also closes the OTHER way, and did once: `marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16`
+///   sat here for `::pie_cuda_driver::marlin_moe`, and the row is now gone —
+///   nothing called `dsl::cuda::mxfp4_moe_gemm_w4a16`, and
+///   `weights/plan.rs`'s `native_mxfp4_moe = false` means nothing plans the
+///   lowering it served. An unstated row can be answered by deleting it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Unstated {
     NotACppFunction,
@@ -1310,7 +1553,6 @@ fn the_unstated_rows_are_exactly_the_ones_with_a_written_reason() {
         ("dist::all_reduce_bf16",                        Unstated::SecondNamespaceRoot),
         ("dist::all_reduce_bf16_out",                    Unstated::SecondNamespaceRoot),
         ("dist::all_gather_bf16",                        Unstated::SecondNamespaceRoot),
-        ("marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16", Unstated::SecondNamespaceRoot),
         ("qwen35_verify_stash_store",                    Unstated::NotACppFunction),
         ("qwen35_verify_stash_load",                     Unstated::NotACppFunction),
         ("pie_lora_qkv_correction",                      Unstated::NotACppFunction),
@@ -1453,19 +1695,25 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
     let exceptions: &[(&str, NormNoRow)] = &[
         ("rmsnorm_bf16",                    NormNoRow::EmitterChosen),
         ("add_bias_bf16",                   NormNoRow::EmitterChosen),
-        ("rmsnorm_gemma_bf16",              NormNoRow::EmitterChosen),
         ("rmsnorm_gated_fp32_in_bf16",      NormNoRow::EmitterChosen),
-        ("rmsnorm_bf16_tuned",              NormNoRow::AutotunerProbe),
-        ("rmsnorm_rasr_tuned",              NormNoRow::AutotunerProbe),
-        // §28.4's two, deleted here. `add_bias_bf16_strided` is the
-        // contiguous `add_bias_bf16`'s row-pitch overload, and that one is
-        // `EmitterChosen` two lines up — the strided spelling is the header's,
-        // and `lower.rs` chooses the flat one. `residual_add_scale_rmsnorm_bf16`
-        // claimed gemma-4's end-of-layer shape in its own doc, and gemma-4
-        // fires `rmsnorm_residual_add_scale_rmsnorm_bf16` instead: a different,
-        // four-statement row with 221 golden lines.
-        ("add_bias_bf16_strided",           NormNoRow::Orphaned),
-        ("residual_add_scale_rmsnorm_bf16", NormNoRow::Orphaned),
+        // `rmsnorm_gemma_bf16` was `EmitterChosen` here until §43. It still
+        // is chosen by `lower.rs`; what changed is that the SYMBOL is routed
+        // (`device::JIT_DISPATCHED`), so the shim forwards to nothing, no
+        // root reached the ahead-of-time launcher, and §43 deleted it. A
+        // routed row needs no exception because it declares no launcher.
+        //
+        // `rmsnorm_bf16_tuned` and `rmsnorm_rasr_tuned` were the two
+        // `AutotunerProbe`s and `add_bias_bf16_strided` /
+        // `residual_add_scale_rmsnorm_bf16` the two `Orphaned`s. §41's
+        // transitive audit measured all four as reachable from no root at
+        // all and §43 deleted them. The `Orphaned` doc named their last
+        // consumer as `sources.rs`' `<<<>>>` census; a census counts, it does
+        // not call, and that is the whole reason the kind existed.
+        //
+        // All three kinds stay in the enum. `EmitterChosen` still has three
+        // members, and the other two are checkable claims that cost nothing
+        // while empty and would otherwise have to be reinvented -- with the
+        // checks -- the next time a launcher earns one.
     ];
 
     // `bool ` is load-bearing: the probes are the only non-`void` launchers,
@@ -1479,10 +1727,13 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
     // every migration is a number nobody reads -- and the thing it was
     // guarding against is a scan that silently matched NOTHING.
     //
-    // So the guard names two launchers that are still there instead: one
-    // `void`, one `bool`, which is what makes the two prefixes above
-    // load-bearing rather than decorative.
-    for expected in ["rmsnorm_bf16", "rmsnorm_bf16_tuned"] {
+    // So the guard names two launchers that are still there instead. Both
+    // are `void` since §43: `rmsnorm_bf16_tuned` was the `bool` witness and
+    // it was the last non-`void` launcher `norm` had, so the `"bool "` prefix
+    // above is now a scan for a shape that is absent rather than a shape that
+    // is present. It stays because a probe is exactly the thing that comes
+    // back, and a scan that stopped looking would not notice the day it does.
+    for expected in ["rmsnorm_bf16", "rmsnorm_strided_bf16"] {
         assert!(
             declared.iter().any(|d| d == expected),
             "the scan found {} declarations and `{expected}` is not among \

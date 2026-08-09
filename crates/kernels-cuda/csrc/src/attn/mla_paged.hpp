@@ -36,10 +36,6 @@ void write_mla_to_pages(
     int num_requests,
     cudaStream_t stream,
     const std::uint8_t* row_valid = nullptr);
-
-// True when `mla_prepare_bf16` can serve this head dim.
-bool mla_prepare_supported(int qk_rope_head_dim);
-
 // Original-YaRN rope scaling (DeepSeek-V2/V3, Kimi). Pass nullptr for plain
 // RoPE.
 struct YarnOriginalParams {

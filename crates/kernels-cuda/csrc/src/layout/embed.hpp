@@ -21,14 +21,5 @@ void embed_bf16(
     int vocab,
     cudaStream_t stream);
 
-void embed_bf16_vocab_shard(
-    const std::int32_t* token_ids,  // [num_tokens]
-    const void* weight,             // [local_vocab, hidden]
-    void* y,                        // [num_tokens, hidden]
-    int num_tokens,
-    int hidden,
-    int local_vocab,
-    int vocab_offset,
-    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels::layout

@@ -89,9 +89,7 @@ fn mxfp4_groups(b: &mut Builder<'_>) -> Result<(), Error> {
             // exactly as the native path does, so it needs the same pairing
             // stated. Publishing the scale as a plain tensor leaves
             // quant_meta empty and the bind fails.
-            if let Some(scales) = scales {
-                b.set_scales(scales, mxfp4_block_scales(format!("{base}.weight")));
-            }
+            b.set_scales(scales, mxfp4_block_scales(format!("{base}.weight")));
             b.push_direct(bias, format!("{base}.bias"), None)?;
         }
         b.consume(block.id);
@@ -166,9 +164,7 @@ fn native_gate_up(
             Encoding::Raw(DType::U8),
             vec![experts, intermediate_native, groups],
         );
-        if let Some(scales) = scales {
-            b.set_scales(scales, mxfp4_block_scales(format!("{out_base}.weight")));
-        }
+        b.set_scales(scales, mxfp4_block_scales(format!("{out_base}.weight")));
 
         // The bias needed a `DenseRowGather` kernel only because the algebra
         // could not say "every other row of this rank's band". It can, so
@@ -234,9 +230,7 @@ fn native_down(
         Encoding::Raw(DType::U8),
         vec![experts, hidden, intermediate_native / 32],
     );
-    if let Some(scales) = scales {
-        b.set_scales(scales, mxfp4_block_scales(format!("{base}.weight")));
-    }
+    b.set_scales(scales, mxfp4_block_scales(format!("{base}.weight")));
 
     b.push_direct(bias, format!("{base}.bias"), None)?;
     Ok(())
@@ -266,6 +260,7 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
 
         let mut tensors: Vec<TensorContract> = Vec::new();
         let mut consumed: Vec<TensorId> = Vec::new();
+        let mut grouped: Vec<&str> = Vec::new();
         for half in ["gate_up_proj", "down_proj"] {
             let (Some(block), Some(scale)) = (
                 b.find(&format!("{prefix}{half}_blocks")),
@@ -312,6 +307,7 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
 
             consumed.push(block.id);
             consumed.push(scale.id);
+            grouped.push(half);
         }
         if tensors.is_empty() {
             continue;
@@ -323,12 +319,28 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
         });
 
         // The biases stay resident, under the names the bind already reads.
-        for half in ["gate_up_proj", "down_proj"] {
-            if let Some(bias) = b.find(&format!("{prefix}{half}_bias")) {
-                let id = bias.id;
-                b.push_direct(bias, format!("{bound}{half}.bias"), None)?;
-                b.consume(id);
-            }
+        //
+        // A half whose bank went into the group has to bring one. The
+        // resident path can decline an incomplete triple and leave all of
+        // it to the generic publisher; by this point the group is pushed,
+        // so the alternatives are a refusal and a model that runs its
+        // experts with no bias at all -- wrong numbers rather than a load
+        // error, and only on the streaming policy, so the resident build
+        // of the same checkpoint would look fine.
+        //
+        // `grouped` rather than both names: a half whose bank was absent
+        // was left to the generic publisher above, and its bias with it.
+        for half in grouped {
+            let Some(bias) = b.find(&format!("{prefix}{half}_bias")) else {
+                return fail(format!(
+                    "GPT-OSS expert bank '{prefix}{half}' is streamed but \
+                     '{prefix}{half}_bias' is not in the checkpoint; the bind \
+                     reads the bias resident beside the group"
+                ));
+            };
+            let id = bias.id;
+            b.push_direct(bias, format!("{bound}{half}.bias"), None)?;
+            b.consume(id);
         }
         for id in consumed {
             b.consume(id);
@@ -367,9 +379,7 @@ pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
         {
             continue;
         }
-        let Some(output) = gptoss_mlx_name(&raw.name)? else {
-            continue;
-        };
+        let output = gptoss_mlx_name(&raw.name)?;
         if raw.name.ends_with(".weight") && is_raw(&raw.encoding, DType::U32) {
             let base = &raw.name[..raw.name.len() - ".weight".len()];
             let scales = b.find(&format!("{base}.scales"));
@@ -431,15 +441,15 @@ pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn gptoss_mlx_name(raw_name: &str) -> Result<Option<String>, Error> {
+fn gptoss_mlx_name(raw_name: &str) -> Result<String, Error> {
     // The head is its own tensor here — NOT the embedding under another name.
     if raw_name.starts_with("lm_head.") {
-        return Ok(Some(raw_name.to_string()));
+        return Ok(raw_name.to_string());
     }
     // Its own output is a valid input: see `mlx::already_lowered`. After the
     // `lm_head.` arm above, which this family answers with an identity anyway.
     if mlx::already_lowered(raw_name) {
-        return Ok(Some(raw_name.to_string()));
+        return Ok(raw_name.to_string());
     }
     let Some(rest) = raw_name.strip_prefix("model.") else {
         return fail(format!(
@@ -447,13 +457,13 @@ fn gptoss_mlx_name(raw_name: &str) -> Result<Option<String>, Error> {
         ));
     };
     if rest.starts_with("embed_tokens.") {
-        return Ok(Some(rest.to_string()));
+        return Ok(rest.to_string());
     }
     if rest == "norm.weight" {
-        return Ok(Some("final_norm.weight".to_string()));
+        return Ok("final_norm.weight".to_string());
     }
     let (layer, member) = mlx::layer_member(rest, "GptOss", raw_name)?;
-    Ok(Some(format!("layers.{layer}.{member}")))
+    Ok(format!("layers.{layer}.{member}"))
 }
 
 /// Declare the experts the way the PUBLISHED checkpoint stores them: the
@@ -498,9 +508,7 @@ fn declare_mxfp4_experts_mlx(b: &mut Builder<'_>, declared: &mut usize) -> Resul
         let groups = blocks.shape[2];
         let cols = groups * 32;
 
-        let Some(mapped) = gptoss_mlx_name(&base)? else {
-            continue;
-        };
+        let mapped = gptoss_mlx_name(&base)?;
         let fused = base.ends_with("gate_up_proj");
         if !fused && !base.ends_with("down_proj") {
             return fail(format!(
@@ -529,11 +537,9 @@ fn declare_mxfp4_experts_mlx(b: &mut Builder<'_>, declared: &mut usize) -> Resul
                     } else {
                         Expr::src(source)
                     };
-                    if let Some(index) =
-                        b.define(as_name.clone(), expr, Encoding::Raw(DType::U8), Some(shape))
-                    {
-                        b.mark_internal(index);
-                    }
+                    let index =
+                        b.define(as_name.clone(), expr, Encoding::Raw(DType::U8), Some(shape));
+                    b.mark_internal(index);
                     Expr::out(&as_name)
                 };
             let half_blocks = select(
@@ -554,17 +560,16 @@ fn declare_mxfp4_experts_mlx(b: &mut Builder<'_>, declared: &mut usize) -> Resul
                 half_blocks,
                 half_scales,
                 experts * rows,
-                cols,
+                groups,
                 format!("{name}.mxfp4_scales"),
-            )?;
-            if let Some(index) = b.define(
+            );
+            let index = b.define(
                 format!("{name}.dequantized"),
                 values,
                 Encoding::Raw(DType::BF16),
                 Some(vec![experts * rows, cols]),
-            ) {
-                b.mark_internal(index);
-            }
+            );
+            b.mark_internal(index);
             mlx::push_encoded_affine(
                 b,
                 Expr::out(format!("{name}.dequantized")),
@@ -1066,6 +1071,32 @@ mod tests {
             assert!(
                 names(&contract).contains(&format!("{E}{half}.bias").as_str()),
                 "{half}'s bias stays resident"
+            );
+        }
+    }
+
+    /// A streamed bank whose bias is missing is refused, where the
+    /// resident path merely declines.
+    ///
+    /// The two stances differ because the two paths differ in what they
+    /// have already done. `a_blocks_tensor_with_no_companion_is_left_alone`
+    /// is the resident case: nothing is published yet, so an incomplete
+    /// triple goes to the generic publisher whole. Here the group is
+    /// pushed before the bias is looked for, so declining leaves a
+    /// streamed mixture with no bias -- which is not a load error, it is
+    /// gpt-oss generating with one term of its expert MLP dropped, and
+    /// only under the streaming policy, so the resident build of the same
+    /// checkpoint looks fine.
+    #[test]
+    fn a_streamed_bank_with_no_bias_is_refused() {
+        for half in ["gate_up_proj", "down_proj"] {
+            let msg = refusal(streamed(without(
+                cuda_checkpoint(),
+                &format!("{E}{half}_bias"),
+            )));
+            assert!(
+                msg.contains(&format!("{E}{half}")) && msg.contains("bias"),
+                "{half}: {msg}"
             );
         }
     }
@@ -1605,6 +1636,59 @@ mod tests {
             );
         }
     }
+    /// An expert bank with NO bias beside it is declared anyway.
+    ///
+    /// The bias is optional in the published layout, and a pass that
+    /// required one would refuse a checkpoint that is complete. The weights
+    /// still land; only the bias entries are absent, which is the honest
+    /// contract for a file that has no biases in it.
+    #[test]
+    fn a_published_expert_bank_with_no_bias_is_still_declared() {
+        let mut t = published_experts();
+        t.retain(|raw| !raw.name.ends_with("_proj_bias"));
+        let contract = mlx(t).expect("a bank with no bias authors");
+        let p = "layers.0.mlp.experts.";
+        for half in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(
+                names(&contract).contains(&format!("{p}{half}.weight").as_str()),
+                "{half} was dropped with its absent bias: {:?}",
+                names(&contract)
+            );
+            assert!(
+                !names(&contract).contains(&format!("{p}{half}.bias").as_str()),
+                "{half} grew a bias the checkpoint does not have"
+            );
+        }
+    }
+
+    /// A bank the group-64 re-encoding cannot take is refused HERE, at
+    /// authoring, rather than by a kernel reading past the end of a group.
+    ///
+    /// The re-encode is `mlx_lm convert -q`'s, and its kernels read 64
+    /// columns to a group. A projection whose column count is not a
+    /// multiple of 64 has a final short group, and the matvec reads it at
+    /// the full stride -- off the end of the buffer for the last row of
+    /// every expert.
+    #[test]
+    fn an_expert_bank_the_re_encoding_cannot_take_is_refused_at_authoring() {
+        // 96 columns: three 32-wide MXFP4 groups, which is not two 64-wide
+        // affine ones.
+        let short = 96 / 32;
+        let mut t = published_experts();
+        for raw in &mut t {
+            if raw.name == format!("{ME}down_proj_blocks") {
+                raw.shape = vec![EXPERTS, HIDDEN, short, 16];
+            } else if raw.name == format!("{ME}down_proj_scales") {
+                raw.shape = vec![EXPERTS, HIDDEN, short];
+            }
+        }
+        let msg = refusal(mlx(t));
+        assert!(
+            msg.contains("96 columns") && msg.contains("group-64"),
+            "{msg}"
+        );
+    }
+
     // ── The rename the Metal binder looks up ─────────────────────────
 
     /// `gptoss_mlx_name` maps every checkpoint tensor to the name the
@@ -1639,7 +1723,7 @@ mod tests {
         ] {
             assert_eq!(
                 gptoss_mlx_name(raw).expect("a declared mapping"),
-                Some(bound.to_string()),
+                bound,
                 "{raw}"
             );
         }
@@ -1656,7 +1740,7 @@ mod tests {
         for produced in ["embed_tokens.weight", "final_norm.weight", "lm_head.weight"] {
             assert_eq!(
                 gptoss_mlx_name(produced).expect("its own output is accepted"),
-                Some(produced.to_string()),
+                produced,
                 "a re-load of a lowered artifact refuses {produced}"
             );
         }
@@ -1720,7 +1804,7 @@ mod tests {
     fn the_untied_head_is_answered_before_the_shared_lowered_table_sees_it() {
         assert_eq!(
             gptoss_mlx_name("lm_head.weight").expect("mapped"),
-            Some("lm_head.weight".to_string())
+            "lm_head.weight"
         );
         // Stated so the claim above is checked rather than asserted: if
         // the shared table grows an `lm_head.` entry that answers
@@ -1728,8 +1812,7 @@ mod tests {
         // what says so.
         assert!(
             !crate::shared::mlx::already_lowered("lm_head.weight")
-                || gptoss_mlx_name("lm_head.weight").expect("mapped")
-                    == Some("lm_head.weight".to_string()),
+                || gptoss_mlx_name("lm_head.weight").expect("mapped") == "lm_head.weight",
             "the shared lowered table now answers `lm_head.` too, and the \
              two answers must agree or the arm order is load-bearing"
         );

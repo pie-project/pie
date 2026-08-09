@@ -70,6 +70,8 @@ pub const VARIANTS: &[Llama3] = &[Llama3 {
         fused_qkv: true,
         tied_embeddings: false,
         qkv_bias: false,
+        o_bias: false,
+        router_bias: false,
     },
     rope_theta: 10_000.0,
     norm_eps: 1e-6,

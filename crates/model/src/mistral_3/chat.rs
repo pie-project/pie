@@ -132,9 +132,6 @@ impl Instruct for MistralInstruct {
     }
 
     fn tool_call_grammar(&self, tools: &[String]) -> Option<ToolGrammar> {
-        if tools.is_empty() {
-            return None;
-        }
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
@@ -148,6 +145,17 @@ impl Instruct for MistralInstruct {
                 }
             }
         }
+        // The ONE early return, and it answers for an empty offer too: no
+        // tools means no names means no alternation. A `tools.is_empty()`
+        // guard above the walk used to say the same thing three lines
+        // earlier, which is one more place for the two answers to differ
+        // and none for them to differ usefully -- a control that deleted
+        // it could not be told from the original.
+        //
+        // `None` and not `Some` of an empty alternation: `tool-name ::=`
+        // with no body is not a rule that matches nothing, it is a grammar
+        // the sampler cannot compile, and the fire carrying it fails at
+        // the door rather than sampling freely.
         if names.is_empty() {
             return None;
         }
@@ -453,6 +461,122 @@ mod window_tests {
             Some(("get_weather".into(), r#"{"city":"Oslo"}"#.into())),
             "the grammar admits {sentence:?}, which the decoder did not read as that call"
         );
+    }
+
+    /// Offering no tools tokenizes to nothing, and offering some does not.
+    ///
+    /// `equip` writes the `[AVAILABLE_TOOLS]` block into the prompt. With
+    /// an empty list the early return is the whole behaviour: without it
+    /// the model is handed an empty JSON array between the two markers,
+    /// which reads as "these are the tools, and there are none" rather
+    /// than as a turn with no tool block at all -- a distinction mistral's
+    /// template makes and its training reflects.
+    #[test]
+    fn no_tools_offered_writes_no_tool_block() {
+        let inst = inst();
+        assert!(
+            inst.equip(&[]).is_empty(),
+            "an empty offer is no block, not an empty one"
+        );
+        let some = inst.equip(&[r#"{"name":"f"}"#.to_string()]);
+        assert!(
+            some.starts_with(&inst.tools_start[..]) && some.ends_with(&inst.tools_end[..]),
+            "a non-empty offer is wrapped in the two markers"
+        );
+    }
+
+    /// A grammar is offered only when a NAME was found, and the two ways
+    /// to have none are different.
+    ///
+    /// `tool-name ::= {alternatives}` is the one rule the caller's tools
+    /// contribute to. With no alternatives the rule's body is empty, which
+    /// is not a GBNF rule that matches nothing -- it is a grammar the
+    /// sampler cannot compile, and the fire that carries it fails at the
+    /// door rather than generating unconstrained. So an offer that yields
+    /// no names has to come back `None`, meaning "sample freely", and not
+    /// `Some` of an empty alternation.
+    ///
+    /// Both ways to get there are asked: a string that is not JSON at all,
+    /// and one that is JSON with no `name` anywhere the two spellings
+    /// look.
+    #[test]
+    fn an_offer_that_names_nothing_constrains_nothing() {
+        let inst = inst();
+        assert!(
+            inst.tool_call_grammar(&[]).is_none(),
+            "no tools offered is no alternation, answered by the same line \
+             that answers a nameless offer"
+        );
+        for offer in [
+            "not json at all",
+            r#"{"function":{"description":"no name here"}}"#,
+            r#"{"arguments":{}}"#,
+            "[]",
+            "42",
+        ] {
+            assert!(
+                inst.tool_call_grammar(&[offer.to_string()]).is_none(),
+                "{offer} names no tool, so there is no alternation to constrain to"
+            );
+        }
+    }
+
+    /// A nameless offer beside a named one is DROPPED, not fatal.
+    ///
+    /// The walk skips what it cannot name and keeps going, so one
+    /// malformed entry in a list does not cost the caller the constraint
+    /// on the rest. The grammar that comes back must mention the name it
+    /// found and nothing else -- an empty alternative left in the rule
+    /// (`"f" | `) is the same uncompilable grammar as an empty rule.
+    #[test]
+    fn a_nameless_offer_beside_a_named_one_is_dropped_and_the_rest_still_binds() {
+        let inst = inst();
+        let grammar = inst
+            .tool_call_grammar(&[
+                "not json".to_string(),
+                r#"{"function":{"name":"get_weather"}}"#.to_string(),
+                r#"{"description":"nameless"}"#.to_string(),
+            ])
+            .expect("one of the three names a tool");
+        let rule = grammar
+            .source
+            .lines()
+            .find(|l| l.starts_with("tool-name ::="))
+            .expect("the grammar states a tool-name rule");
+        assert_eq!(
+            rule, r#"tool-name ::= "get_weather""#,
+            "the two nameless offers must leave no empty alternative behind"
+        );
+    }
+
+    /// Both spellings of a name are read, and the nested one wins.
+    ///
+    /// OpenAI's schema nests the name under `function`; some callers send
+    /// it flat. Reading only one spelling would silently drop half the
+    /// callers' tools from the alternation, which is the same outcome as
+    /// offering no grammar for them.
+    #[test]
+    fn a_name_is_read_from_either_spelling() {
+        let inst = inst();
+        for (offer, want) in [
+            (r#"{"function":{"name":"nested"}}"#, "nested"),
+            (r#"{"name":"flat"}"#, "flat"),
+            // Both present: `function.name` is the schema's, and the flat
+            // one is the fallback -- reading the fallback first would take
+            // the wrong name off a well-formed OpenAI tool.
+            (r#"{"name":"flat","function":{"name":"nested"}}"#, "nested"),
+        ] {
+            let grammar = inst
+                .tool_call_grammar(&[offer.to_string()])
+                .expect("the offer names a tool");
+            assert!(
+                grammar
+                    .source
+                    .contains(&format!(r#"tool-name ::= "{want}""#)),
+                "{offer} should name {want}: {}",
+                grammar.source
+            );
+        }
     }
 
     #[test]

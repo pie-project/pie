@@ -161,23 +161,32 @@ pub fn manifest(f: &Glm5Facts, tied_embeddings: bool) -> Manifest {
 /// being absent from a second table and dying at its first fire inside a
 /// walk, which is what this generation did.
 ///
-/// [`Deployment::advertised`] is left DEFAULT here, and deliberately: a
-/// projection sees geometry and nothing else, while none of that
-/// struct's three answers is a shape. An arch label is a coarse family
-/// name a guest program matches on, and a context ceiling is a
-/// training-time fact two checkpoints of identical geometry can disagree
-/// about. The ROW states them, over the top of this.
+/// `advertised` arrives from the ROW as an argument rather than being
+/// derived here, because none of its three answers is a shape: an arch
+/// label is a coarse family name a guest program matches on, a context
+/// ceiling is a training-time fact two checkpoints of identical geometry
+/// can disagree about, and whether a tower ships is a question about the
+/// checkpoint's files. This function sees geometry and nothing else.
+///
+/// It is a PARAMETER and not a field the caller writes afterwards. The
+/// caller used to project, `?` the refusal, and only then assign the
+/// label -- which put the assignment past a refusal this build always
+/// takes, so the row's label was carried by no code that ran. Passing it
+/// in is what makes the projection total in fact and not only in the
+/// sentence above.
 ///
 /// # Errors
 ///
 /// [`Refusal::Unsupported`] when this build provisions no store for the
 /// row's [`KvStyle`].
-pub fn deployment(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Result<Deployment, Refusal> {
-    let planned = plan(f, rope_theta, norm_eps);
-    match planned.kv.store_refusal() {
-        Some(no_store) => Err(no_store),
-        None => Ok(planned),
-    }
+pub fn deployment(
+    f: &Glm5Facts,
+    rope_theta: f32,
+    norm_eps: f32,
+    advertised: Advertised,
+) -> Result<Deployment, Refusal> {
+    let planned = plan(f, rope_theta, norm_eps, advertised);
+    planned.provisioned()
 }
 
 /// The projection itself, which is TOTAL: a row's deployment is a fact
@@ -188,7 +197,7 @@ pub fn deployment(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Result<Deplo
 /// [`KvStyle::has_a_store_in_this_build`]'s, and collapsing them is how a capability
 /// question turns back into a family name.
 #[must_use]
-fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
+fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -> Deployment {
     let a = &f.attn;
     // MLA's page row holds the LATENT plus the one shared rope half —
     // `kv_a_width()` — and not a head-split key. That is what this
@@ -279,15 +288,15 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
-        // DEFAULT, and the row writes over it. None of the three
-        // answers in here is geometry: an arch label is a coarse family
-        // name, a context ceiling is a training-time fact, and whether a
-        // tower ships is a question about the checkpoint's files. A
-        // projection that filled them would be deriving a family name
-        // from a shape, which is the inference that put
+        // Carried, unread. None of the three answers in here is
+        // geometry: an arch label is a coarse family name, a context
+        // ceiling is a training-time fact, and whether a tower ships is
+        // a question about the checkpoint's files. A projection that
+        // filled them from what it can see would be deriving a family
+        // name from a shape, which is the inference that put
         // `Gemma4ForConditionalGeneration` in a table row it did not
         // belong in.
-        advertised: Advertised::default(),
+        advertised,
         // Unscaled, because nothing in this tree says otherwise:
         // `synthetic--glm-moe-dsa.json` states no `rope_scaling` block at
         // all, and the ladder is used as written. A row that invented a
@@ -675,7 +684,7 @@ mod tests {
     #[test]
     fn the_geometry_is_the_rows_own_numbers() {
         let f = glm5();
-        let d = plan(&f, 10_000.0, 1e-5);
+        let d = plan(&f, 10_000.0, 1e-5, Advertised::default());
         assert_eq!(d.layers, 46);
         assert_eq!(d.attention.len(), 46);
         assert_eq!(d.shape.hidden, 4096);
@@ -708,7 +717,7 @@ mod tests {
     /// columns on this row and move the difference out of the KV pool.
     #[test]
     fn the_workspace_is_sized_from_the_wider_of_two_mlps() {
-        let d = plan(&glm5(), 10_000.0, 1e-5);
+        let d = plan(&glm5(), 10_000.0, 1e-5, Advertised::default());
         assert_eq!(d.shape.widest_mlp(), 10_944);
     }
 
@@ -717,7 +726,7 @@ mod tests {
     #[test]
     fn every_layer_attends_the_whole_context_through_its_own_pages() {
         let f = glm5();
-        let d = plan(&f, 10_000.0, 1e-5);
+        let d = plan(&f, 10_000.0, 1e-5, Advertised::default());
         let expected = 1.0 / (192.0f32).sqrt();
         for (l, a) in d.attention.iter().enumerate() {
             assert_eq!(a.head_dim, 576, "the page row is the latent plus rope");
@@ -735,7 +744,7 @@ mod tests {
     /// worse model rather than a failure.
     #[test]
     fn the_softmax_scale_is_the_dot_width_and_not_the_page_row() {
-        let d = plan(&glm5(), 10_000.0, 1e-5);
+        let d = plan(&glm5(), 10_000.0, 1e-5, Advertised::default());
         let over_page_row = 1.0 / (576.0f32).sqrt();
         assert!((d.attention[0].sm_scale - over_page_row).abs() > 1e-4);
     }
@@ -745,7 +754,7 @@ mod tests {
     /// config.
     #[test]
     fn the_kv_style_carries_the_rows_own_ranks() {
-        let d = plan(&glm5(), 10_000.0, 1e-5);
+        let d = plan(&glm5(), 10_000.0, 1e-5, Advertised::default());
         match d.kv {
             KvStyle::Mla {
                 kv_lora_rank,
@@ -762,31 +771,36 @@ mod tests {
     /// at the first fire inside a walk.
     #[test]
     fn a_build_with_no_mla_store_refuses_the_row() {
-        let err = deployment(&glm5(), 10_000.0, 1e-5)
+        let err = deployment(&glm5(), 10_000.0, 1e-5, Advertised::default())
             .expect_err("no MLA store is built in this tree, so the row cannot be served");
         assert!(matches!(err, Refusal::Unsupported(_)));
     }
 
-    /// The projection states NO family label, and that silence is the
-    /// property. `glm_moe_dsa` is derivable from this shape — the DSA
-    /// indexer is in it — and a projection that derived it would be
-    /// re-inventing the `architectures[0]` inference that put
-    /// `Gemma4ForConditionalGeneration` in a table row it did not belong
-    /// in. The ROW says it, over the top of this.
+    /// What the row advertises rides through the projection untouched.
+    ///
+    /// It is CARRIED and not derived because the derivation it replaces
+    /// read `model_type` and `max_position_embeddings` off a resident
+    /// `HfConfig` at load. A projection that filled the label in from
+    /// what it can see would be re-inventing the `architectures[0]`
+    /// inference that put `Gemma4ForConditionalGeneration` in a table row
+    /// it did not belong in.
     #[test]
-    fn the_projection_states_no_family_label_because_a_label_is_not_geometry() {
-        let d = plan(&glm5(), 10_000.0, 1e-5);
+    fn the_rows_advertised_label_is_carried_and_not_rewritten() {
+        let stated = Advertised {
+            arch: "glm_moe_dsa",
+            max_model_len: 1000000,
+            media_encode: false,
+        };
+        let d = plan(&glm5(), 10_000.0, 1e-5, stated.clone());
         assert_eq!(
-            d.advertised,
-            Advertised::default(),
-            "a projection that fills this in has derived a family name from a shape",
+            d.advertised, stated,
+            "a projection that edits the label is inventing one, and one that \
+             defaults it has dropped what the row said"
         );
-        assert!(
-            d.advertised.arch.is_empty(),
-            "an empty label is a row that has not spoken yet"
-        );
-        assert_eq!(d.advertised.max_model_len, 0);
-        assert!(!d.advertised.media_encode);
+        // The default has to be distinguishable from the stated value, or
+        // the assertion above passes on a projection that ignores its
+        // argument entirely.
+        assert_ne!(stated, Advertised::default());
     }
 
     /// The ladder is used AS WRITTEN and no tower ships, and both are
@@ -797,7 +811,7 @@ mod tests {
     /// measured.
     #[test]
     fn the_rope_ladder_is_unscaled_and_no_tower_ships() {
-        let d = plan(&glm5(), 10_000.0, 1e-5);
+        let d = plan(&glm5(), 10_000.0, 1e-5, Advertised::default());
         assert!(
             d.rope_scaling.is_none(),
             "no committed config states a rescaling to read"
@@ -815,7 +829,7 @@ mod tests {
     /// deployment be described and refused in one place.
     #[test]
     fn the_plan_exists_even_where_the_build_refuses_it() {
-        let planned = plan(&glm5(), 10_000.0, 1e-5);
+        let planned = plan(&glm5(), 10_000.0, 1e-5, Advertised::default());
         assert!(!planned.kv.has_a_store_in_this_build());
         assert!(KvStyle::Paged.has_a_store_in_this_build());
         assert!(!KvStyle::CompressedPlane { ratios: Vec::new() }.has_a_store_in_this_build());

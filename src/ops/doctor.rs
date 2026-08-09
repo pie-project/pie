@@ -146,6 +146,8 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
                     let feature = match *name {
                         "cuda_native" => "driver-cuda",
                         "metal" => "driver-metal",
+                        "vulkan" => "driver-vulkan",
+                        "wgpu" => "driver-wgpu",
                         other => other,
                     };
                     (

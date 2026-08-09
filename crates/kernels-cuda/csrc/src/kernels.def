@@ -22,7 +22,6 @@
 //              logits_soft_cap
 //   MoE        CUTLASS tile shape M/N/K and pipeline stages (occupancy
 //              heuristic, resolved at run time)
-//   marlin     thread-config / shape search
 //
 // Target axes (sm80 vs sm90, CMAKE_CUDA_ARCHITECTURES) stay in CMakeLists.txt.
 //
@@ -33,9 +32,6 @@
 #endif
 #ifndef PIE_ATTN_DECODE_GQA
 #define PIE_ATTN_DECODE_GQA(g)
-#endif
-#ifndef PIE_MARLIN_SHAPE
-#define PIE_MARLIN_SHAPE(act, quant, out)
 #endif
 #ifndef PIE_MOE_ACTIVATION
 #define PIE_MOE_ACTIVATION(name)
@@ -77,33 +73,19 @@ PIE_ATTN_DECODE_GQA(3)
 PIE_ATTN_DECODE_GQA(4)
 PIE_ATTN_DECODE_GQA(8)
 
-// ---- marlin: (activation dtype, quant type, output dtype) -----------------
-// Unlike attention, this list is fixed by pie's own code rather than by the
-// checkpoint, so pruning is unconditionally safe: the driver only ever calls
-// the bf16 launchers (ops/gemm.cpp launch_gptq_gemm_w4a16_bf16 and
-// launch_mxfp4_gemm_w4a16_bf16). The remaining upstream combos (fp16, int8,
-// u8b128, fe4m3fn) are dead code worth roughly five minutes of cicc time.
-//
-// These expand to #includes inside marlin.cu's single translation unit: CUDA
-// 13 gives __global__ template stubs static linkage, so splitting them into
-// separate TUs does not link (see CMakeLists.txt).
-PIE_MARLIN_SHAPE(bfloat16, u4,     bfloat16)  // AWQ-style u4, no zero-point bias
-PIE_MARLIN_SHAPE(bfloat16, u4b8,   bfloat16)  // GPTQ u4, bias-8 zero point
-PIE_MARLIN_SHAPE(bfloat16, fe2m1f, bfloat16)  // MXFP4 (gpt_oss)
-
 // ---- MoE: CUTLASS grouped-GEMM epilogue -----------------------------------
 // FlashInfer's MoeGemmRunner::moeGemmBiasAct switches on a runtime
 // ActivationType and instantiates one CUTLASS epilogue per case, dragging the
 // whole grouped-GEMM template stack along with each. pie reaches exactly one:
 // nemotron_h is the only consumer of CutlassMoeFCRunner and passes Relu2
 // (ops/flashinfer_moe.cu holds the only ActivationType:: uses in
-// crates/driver-cuda/csrc/src). Like marlin, pie's code fixes this, not the checkpoint.
+// crates/driver-cuda/csrc/src). pie's own code fixes this, not the checkpoint.
 //
 // Consequence for CMake: the vendored fused sm80 launchers are only reachable
 // when the epilogue is Silu or FtGelu, so with Relu2 alone they are dead and
 // third_party/flashinfer_generated/ drops out of the build entirely.
 //
-// NOTE: unlike attention and marlin, a missing entry here cannot be caught at
+// NOTE: unlike attention, a missing entry here cannot be caught at
 // compile time -- the arch -> runner binding is a runtime decision. Routing a
 // new MoE arch through CutlassMoeFCRunner requires adding its activation here,
 // or it throws at run time.
@@ -134,10 +116,10 @@ PIE_MOE_ACTIVATION(Identity)  // second grouped GEMM (fc2) of every gated MoE
 //
 // pie reaches exactly one pattern: kernels/custom_all_reduce.cu sets
 // kARResidualRMSNorm and nothing else. The other nine are FP8/FP4 quant
-// epilogues that no pie call site can select. As with marlin and MoE, pie's
-// own code fixes this rather than the checkpoint, so pruning is safe.
+// epilogues that no pie call site can select. As with MoE, pie's own code
+// fixes this rather than the checkpoint, so pruning is safe.
 //
-// Unlike marlin, this needs no vendored header and no CMake reconciliation:
+// This needs no vendored header and no CMake reconciliation:
 // allreduce_fusion_kernel_launcher is public, so custom_all_reduce.cu expands
 // the list below into its own dispatch switch and simply never calls
 // flashinfer's. That also means a missing entry surfaces as a runtime throw,
@@ -150,6 +132,5 @@ PIE_AR_FUSION_PATTERN(kARResidualRMSNorm)
 
 #undef PIE_ATTN_HEAD_DIM
 #undef PIE_ATTN_DECODE_GQA
-#undef PIE_MARLIN_SHAPE
 #undef PIE_MOE_ACTIVATION
 #undef PIE_AR_FUSION_PATTERN

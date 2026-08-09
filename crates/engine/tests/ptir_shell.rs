@@ -11,9 +11,10 @@
 //!
 //! It lives HERE rather than beside the driver because building a
 //! registerable program needs the producer half — `tensor_compiler`'s
-//! bind → compile → emit chain, and `engine`'s `ProgramDescBorrow` to
-//! lower the result into the C records `register_program` reads. The
-//! engine has both, and a dev-dependency the other way would be a cycle.
+//! bind → compile → emit chain. `register_program` takes the owned
+//! `ProgramRegistration` directly now, so there is no lowering step left --
+//! what the compiler produces is what the driver reads. The engine has the
+//! producer, and a dev-dependency the other way would be a cycle.
 //!
 //! # What it claims
 //!
@@ -26,13 +27,12 @@
 #![cfg(feature = "driver-cuda")]
 
 use driver_api::local::{
-    PIE_DRIVER_ABI_VERSION, PIE_STATUS_OK, PieBytes, PieChannelEndpointBinding, PieCompletion,
-    PieDriverCaps, PieDriverCreateDesc, PieFrameDesc, PieInstanceBinding, PieInstanceDesc,
-    PieModelLoadDesc, PieRuntimeCallbacks, PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice,
-    PieU32Slice, PieU64Slice,
+    PIE_DRIVER_ABI_VERSION, PIE_STATUS_OK, PieBytes, ChannelBinding, PieCompletion,
+    PieDriverCaps, PieDriverCreateDesc, InstanceBinding, PieInstanceDesc, PieModelLoadDesc,
+    PieRuntimeCallbacks, TerminalCell,
 };
 use driver_api::plan::{ChannelRegistrationPlan, ProgramRegistration};
-use engine::driver::abi::{ChannelDescBorrow, ProgramDescBorrow};
+use engine::driver::abi::ChannelDescBorrow;
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -196,7 +196,7 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    fn of(binding: &PieChannelEndpointBinding) -> Self {
+    fn of(binding: &ChannelBinding) -> Self {
         Self {
             mirror: binding.mirror_base as *mut u8,
             words: binding.word_base as *mut u64,
@@ -284,10 +284,8 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
 
     // ── Register the program. ──
     let program = registration(argmax_program());
-    let borrow = ProgramDescBorrow::new(&program);
     let mut program_id = 0u64;
-    let status =
-        driver_cuda::serve::pie_cuda_register_program(driver, borrow.as_raw(), &mut program_id);
+    let status = driver_cuda::serve::pie_cuda_register_program(driver, &program, &mut program_id);
     assert_eq!(status, PIE_STATUS_OK, "the program registers");
 
     // ── Register its two channels, in the order the program indexes
@@ -325,7 +323,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
             extern_name: Vec::new(),
         };
         let borrow = ChannelDescBorrow::new(&plan);
-        let mut binding = PieChannelEndpointBinding::default();
+        let mut binding = ChannelBinding::default();
         let status =
             driver_cuda::serve::pie_cuda_register_channel(driver, borrow.as_raw(), &mut binding);
         assert_eq!(status, PIE_STATUS_OK, "channel {index} registers");
@@ -342,7 +340,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
         },
         ..Default::default()
     };
-    let mut instance = PieInstanceBinding::default();
+    let mut instance = InstanceBinding::default();
     let status = driver_cuda::serve::pie_cuda_bind_instance(driver, &inst, &mut instance);
     assert_eq!(status, PIE_STATUS_OK, "the instance binds");
 
@@ -360,43 +358,28 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     assert!(output.take().is_none(), "nothing published before the fire");
 
     // ── One decode token, which is what carries the program. ──
-    let mut cell = PieTerminalCell {
-        outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
-        reserved0: 0,
-    };
-    let cell_ptr: *mut PieTerminalCell = &mut cell;
-    let u32s = |v: &[u32]| PieU32Slice {
-        ptr: v.as_ptr(),
-        len: v.len(),
-    };
-    let (roster, sub_indptr, sub_class) = ([0u32], [0u32, 1], [0u32]);
-    let (tokens, positions) = ([7u32], [0u32]);
-    let (pages, page_indptr, last_lens, qo) = ([0u32], [0u32, 1], [1u32], [0u32, 1]);
-    let step = PieStepDesc {
-        roster_rows: u32s(&roster),
-        sub_batch_indptr: u32s(&sub_indptr),
-        sub_batch_class: u32s(&sub_class),
-        terminal_cells: PieTerminalCellPtrSlice {
-            ptr: &cell_ptr,
-            len: 1,
+    let mut cell = TerminalCell::pending();
+    let cell_ptr: *mut TerminalCell = &mut cell;
+    let step = driver_api::StepSubmission {
+        plan: driver_api::LaunchPlan {
+            token_ids: vec![7],
+            position_ids: vec![0],
+            kv_page_indices: vec![0],
+            kv_page_indptr: vec![0, 1],
+            kv_last_page_lens: vec![1],
+            qo_indptr: vec![0, 1],
+            ..Default::default()
         },
-        token_ids: u32s(&tokens),
-        position_ids: u32s(&positions),
-        kv_page_indices: u32s(&pages),
-        kv_page_indptr: u32s(&page_indptr),
-        kv_last_page_lens: u32s(&last_lens),
-        qo_indptr: u32s(&qo),
+        roster_rows: vec![0],
+        sub_batch_indptr: vec![0, 1],
+        sub_batch_class: vec![0],
+        terminal_cells: vec![cell_ptr],
         ..Default::default()
     };
-    let instance_ids: [u64; 1] = [instance.instance_id];
-    let frame = PieFrameDesc {
-        abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice {
-            ptr: instance_ids.as_ptr(),
-            len: 1,
-        },
+    let frame = driver_api::FrameSubmission {
+        instance_ids: vec![instance.instance_id],
         required_kv_pages: 1,
-        steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
+        steps: vec![step],
         ..Default::default()
     };
     let completion = PieCompletion {
@@ -471,10 +454,9 @@ fn every_request_in_a_frame_samples_its_own_row() {
     );
 
     let program = registration(argmax_program());
-    let borrow = ProgramDescBorrow::new(&program);
     let mut program_id = 0u64;
     assert_eq!(
-        driver_cuda::serve::pie_cuda_register_program(driver, borrow.as_raw(), &mut program_id),
+        driver_cuda::serve::pie_cuda_register_program(driver, &program, &mut program_id),
         PIE_STATUS_OK,
         "the program registers"
     );
@@ -517,7 +499,7 @@ fn every_request_in_a_frame_samples_its_own_row() {
                 extern_name: Vec::new(),
             };
             let borrow = ChannelDescBorrow::new(&plan);
-            let mut binding = PieChannelEndpointBinding::default();
+            let mut binding = ChannelBinding::default();
             assert_eq!(
                 driver_cuda::serve::pie_cuda_register_channel(
                     driver,
@@ -538,7 +520,7 @@ fn every_request_in_a_frame_samples_its_own_row() {
             },
             ..Default::default()
         };
-        let mut instance = PieInstanceBinding::default();
+        let mut instance = InstanceBinding::default();
         assert_eq!(
             driver_cuda::serve::pie_cuda_bind_instance(driver, &inst, &mut instance),
             PIE_STATUS_OK,
@@ -565,48 +547,29 @@ fn every_request_in_a_frame_samples_its_own_row() {
 
     // TWO decode tokens, one per request. `qo_indptr` is what says so,
     // and it is what the shell reads to find each request's logits row.
-    let mut cells = [
-        PieTerminalCell {
-            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
-            reserved0: 0,
+    let mut cells = [TerminalCell::pending(), TerminalCell::pending()];
+    let (first, rest) = cells.split_at_mut(1);
+    let cell_ptrs: Vec<*mut TerminalCell> = vec![&mut first[0], &mut rest[0]];
+    let step = driver_api::StepSubmission {
+        plan: driver_api::LaunchPlan {
+            token_ids: vec![7, 11],
+            position_ids: vec![0, 0],
+            kv_page_indices: vec![0, 1],
+            kv_page_indptr: vec![0, 1, 2],
+            kv_last_page_lens: vec![1, 1],
+            qo_indptr: vec![0, 1, 2],
+            ..Default::default()
         },
-        PieTerminalCell {
-            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
-            reserved0: 0,
-        },
-    ];
-    let cell_ptrs: [*mut PieTerminalCell; 2] = [&mut cells[0], &mut cells[1]];
-    let u32s = |v: &[u32]| PieU32Slice {
-        ptr: v.as_ptr(),
-        len: v.len(),
-    };
-    let (roster, sub_indptr, sub_class) = ([0u32, 1], [0u32, 2], [0u32]);
-    let (tokens, positions) = ([7u32, 11], [0u32, 0]);
-    let (pages, page_indptr, last_lens, qo) = ([0u32, 1], [0u32, 1, 2], [1u32, 1], [0u32, 1, 2]);
-    let step = PieStepDesc {
-        roster_rows: u32s(&roster),
-        sub_batch_indptr: u32s(&sub_indptr),
-        sub_batch_class: u32s(&sub_class),
-        terminal_cells: PieTerminalCellPtrSlice {
-            ptr: cell_ptrs.as_ptr(),
-            len: 2,
-        },
-        token_ids: u32s(&tokens),
-        position_ids: u32s(&positions),
-        kv_page_indices: u32s(&pages),
-        kv_page_indptr: u32s(&page_indptr),
-        kv_last_page_lens: u32s(&last_lens),
-        qo_indptr: u32s(&qo),
+        roster_rows: vec![0, 1],
+        sub_batch_indptr: vec![0, 2],
+        sub_batch_class: vec![0],
+        terminal_cells: cell_ptrs,
         ..Default::default()
     };
-    let frame = PieFrameDesc {
-        abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice {
-            ptr: instances.as_ptr(),
-            len: instances.len(),
-        },
+    let frame = driver_api::FrameSubmission {
+        instance_ids: instances.to_vec(),
         required_kv_pages: 2,
-        steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
+        steps: vec![step],
         ..Default::default()
     };
     let before = FIRED.load(std::sync::atomic::Ordering::Acquire);

@@ -26,9 +26,6 @@ void rmsnorm_bf16(
 // As above, plus an fp16 copy of the result for a consumer that wants fp16.
 // `y_fp16` may be null, in which case this is exactly `rmsnorm_bf16`.
 // Sweep entry point for the microbenchmark: block width chosen explicitly.
-bool rmsnorm_bf16_tuned(
-    const void* x, const void* weight, void* y, int num_rows, int hidden,
-    float eps, int vblock, cudaStream_t stream);
 
 void rmsnorm_bf16_with_fp16(
     const void* x, const void* weight, void* y, void* y_fp16,
@@ -50,44 +47,17 @@ void rmsnorm_strided_bf16(
 //   norm_out = rmsnorm(hidden, weight)
 // The hidden update matches residual_add_bf16's bf16 rounding before
 // the norm pass, so it is numerically equivalent to the two-kernel sequence.
-void residual_add_rmsnorm_bf16(
-    void* hidden,          // [num_rows, hidden_size] bf16, in-place
-    const void* residual,  // [num_rows, hidden_size] bf16
-    const void* weight,    // [hidden_size]
-    void* norm_out,        // [num_rows, hidden_size] bf16
-    int num_rows,
-    int hidden_size,
-    float eps,
-    cudaStream_t stream);
 
 // Fused Gemma4 end-of-layer helper:
 //   hidden = round_bf16(round_bf16(hidden + residual) * round_bf16(scale))
 //   norm_out = rmsnorm(hidden, next_weight)
 // This matches the separate PLE residual add, layer scalar, and next-layer
 // attention pre-norm sequence while avoiding two extra full-row passes.
-void residual_add_scale_rmsnorm_bf16(
-    void* hidden,
-    const void* residual,
-    float scale,
-    const void* next_weight,
-    void* norm_out,
-    int num_rows,
-    int hidden_size,
-    float eps,
-    cudaStream_t stream);
 
 // Fuses:
 //   tmp = rmsnorm(x, weight)
 //   hidden = round_bf16(hidden + tmp)
 // preserving the bf16 tmp materialization of the unfused sequence.
-void rmsnorm_residual_add_bf16(
-    const void* x,
-    const void* weight,
-    void* hidden,
-    int num_rows,
-    int hidden_size,
-    float eps,
-    cudaStream_t stream);
 
 // Fuses:
 //   tmp = rmsnorm(x, weight)
@@ -112,31 +82,12 @@ void rmsnorm_residual_add_scale_rmsnorm_bf16(
 // tensor be inspected/initialized like a residual gate, but downstream
 // math expects the +1 shift.
 // Sweep entry point for the microbenchmark: block width chosen explicitly.
-bool rmsnorm_rasr_tuned(
-    const void* x, const void* weight, void* hidden, float scale,
-    const void* next_weight, void* norm_out, int num_rows, int hidden_size,
-    float eps, int block, cudaStream_t stream);
 
-void rmsnorm_gemma_bf16(
-    const void* x,
-    const void* weight,
-    void* y,
-    int num_rows,
-    int hidden,
-    float eps,
-    cudaStream_t stream);
 
 // RMSNorm with no learnable scale (gamma == 1). Used by Gemma-4's
 // V-Norm — `v / rms(v)` per-head, no weight. Equivalent to running
 // `rmsnorm_bf16` against an all-ones weight tensor, but
 // allocation-free.
-void rmsnorm_no_scale_bf16(
-    const void* x,
-    void* y,
-    int num_rows,
-    int hidden,
-    float eps,
-    cudaStream_t stream);
 
 // RMSNorm fused with sigmoid-gating (Qwen3.5 GatedDeltaNet's `norm`
 // step on `core_attn_out`). Per-row:
@@ -145,15 +96,6 @@ void rmsnorm_no_scale_bf16(
 //   y     = weight * x_hat * silu(gate)
 //
 // Plain weight (no `1+w` convention). `gate` matches `x` in shape.
-void rmsnorm_gated_bf16(
-    const void* x,
-    const void* gate,
-    const void* weight,
-    void* y,
-    int num_rows,
-    int hidden,
-    float eps,
-    cudaStream_t stream);
 
 // Same as `rmsnorm_gated_bf16` but `x` is fp32 — used by the
 // Qwen3.5 linear-attention path where the GDN recurrent step outputs

@@ -69,15 +69,6 @@ struct Gemma4VisionInputs {
     int num_images = 0;
 };
 
-// Encode each image (vision tower → projector) and overwrite the soft-token
-// rows of `hidden` (bf16 `[n_rows, text_hidden]`) at each image's anchor row.
-// No-op if `in.weights == nullptr` or `in.num_images == 0`.
-void scatter_gemma4_vision(const Gemma4VisionInputs& in,
-                           __nv_bfloat16* hidden,
-                           int n_rows,
-                           int text_hidden,
-                           cudaStream_t stream = 0);
-
 void encode_gemma4_vision(const Gemma4VisionInputs& in,
                           std::uint16_t* output_rows_h,
                           std::size_t output_bytes,

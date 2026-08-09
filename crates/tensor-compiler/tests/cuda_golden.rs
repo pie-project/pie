@@ -541,17 +541,24 @@ fn emit_driver_test_kernel_fixtures() {
         }
         std::fs::write(out_dir.join(format!("{name}.kernels")), body).unwrap();
 
-        // The launch package travels with the kernels for the same reason: the
-        // driver's C++ tests cannot run the host's planner, and the driver no
-        // longer decodes PTIR, so the one thing it *does* accept has to be
-        // handed to them as a fixture. Written as a relocatable image of the
-        // very same `#[repr(C)]` records the engine ships (see
-        // `driver_api::image`), not as a second wire format.
-        std::fs::write(
-            out_dir.join(format!("{name}.launch")),
-            driver_api::image::encode(&tensor_compiler::codegen::launch::build(&bound, &stages)),
-        )
-        .unwrap();
+        // THE LAUNCH PACKAGE IS STILL BUILT, AND NO LONGER WRITTEN.
+        //
+        // It used to travel with the kernels as a relocatable image of the
+        // `#[repr(C)]` records the engine shipped, because the driver's C++
+        // tests could not run the host's planner and the driver no longer
+        // decoded PTIR. Those tests are gone, `register_program` takes an
+        // owned `ProgramRegistration`, and `driver_api::image` — the encoder
+        // that wrote this — went with the record family it encoded.
+        //
+        // Building it stays, because that is the part with value here: the
+        // planner running over every corpus trace is what this test's
+        // zero-tolerance drift assert below is about, and a trace the
+        // planner cannot plan should fail here rather than pass quietly.
+        let launch = tensor_compiler::codegen::launch::build(&bound, &stages);
+        assert!(
+            !launch.stages.is_empty(),
+            "{name}: the planner produced a package with no stage"
+        );
 
         // Same reasoning for the region analysis. Its record is nested, so it
         // is written as one line per region followed by one line per direct

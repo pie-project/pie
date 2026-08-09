@@ -38,6 +38,24 @@
 //! be carried into an NVRTC header set. What moved is the device text those
 //! three functions launch.
 //!
+//! What has since ALSO moved is the three functions themselves, though not
+//! into a row. They were compiled by `kernels-cuda` and are now compiled by
+//! `driver-cuda`, from `crates/driver-cuda/csrc/vision/`; the rows did not
+//! change and neither did the shim entries. The reason is the sentence above
+//! read the other way round: every `.cuh` those three functions include is
+//! in THIS crate's `csrc/src` — the five in `vision/` that the table below
+//! rows, plus `norm/rmsnorm.cuh`, `norm/elementwise.cuh`, `mlp/swiglu.cuh`
+//! and `ssm/causal_conv1d.cuh` — so the archive was never holding a tower's
+//! device code. It was holding a host walk over device code that had already
+//! arrived here. `new-horizon.md` §42 has the measurement, and the argument
+//! for why `Execution::Composed` is the near miss that does not fit: it
+//! carries a `&'static [Step]`, and a tower's trip count is data.
+//!
+//! For anyone routing `norm::rmsnorm_bf16`: the Gemma-4 vision tower used to
+//! call it six times and no longer calls it at all, having taken the two
+//! `<<<>>>` arms verbatim. That launcher's C++ consumer set is now
+//! `norm/rmsnorm.cu` alone.
+//!
 //! # The accounting, measured
 //!
 //! | file | `__global__` | `<<<` lines | of another file's kernels |

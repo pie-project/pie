@@ -119,7 +119,7 @@ pub struct Compiled {
     /// came from is exactly the drift `Compiled` exists to make
     /// impossible.
     pub plans: Arc<Vec<LaunchStagePlan>>,
-    /// Each stage's ATTACHMENT POINT — `PieLaunchStage::kind`: Prologue
+    /// Each stage's ATTACHMENT POINT — `LaunchStage::kind`: Prologue
     /// 0, OnAttnProj 1, OnAttn 2, Epilogue 3.
     ///
     /// Carried because `LaunchStagePlan` has no `kind` field and the
@@ -189,7 +189,7 @@ mod kind_tests {
     }
 }
 
-/// The attachment points a stage can have, as `PieLaunchStage::kind`
+/// The attachment points a stage can have, as `LaunchStage::kind`
 /// numbers them.
 pub mod stage_kind {
     /// Runs before the forward; where `fwd.adapter`'s `lora` sink lands.

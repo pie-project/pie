@@ -140,6 +140,8 @@ const fn gemma_3_shape(
         fused_qkv: true,
         tied_embeddings: true,
         qkv_bias: false,
+        o_bias: false,
+        router_bias: false,
     }
 }
 

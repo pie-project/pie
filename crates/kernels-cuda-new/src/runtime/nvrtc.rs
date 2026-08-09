@@ -475,9 +475,11 @@ pub fn compile_under(
     };
     let log = program.log();
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
-        return Err(CompileError::Nvrtc(
-            log.unwrap_or_else(|| "NVRTC rejected the source and offered no log".into()),
-        ));
+        let log = log.unwrap_or_else(|| "NVRTC rejected the source and offered no log".into());
+        if let Some(diagnosis) = tile_header_mismatch(&log) {
+            return Err(CompileError::Nvrtc(format!("{log}\n\n{diagnosis}")));
+        }
+        return Err(CompileError::Nvrtc(log));
     }
     let log = log.unwrap_or_default();
 
@@ -514,8 +516,129 @@ pub fn compile_under(
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
         return Err(CompileError::Driver("nvrtcGetCUBIN", code as i32));
     }
+    unassembled_tile_ir(unit.name, &cubin)?;
 
     Ok(Compiled { cubin, lowered, elapsed: started.elapsed(), log })
+}
+
+/// Refuse an image that is Tile IR rather than SASS.
+///
+/// # The one failure this layer could not see
+///
+/// Every other way a unit can fail is loud: NVRTC rejects the source, or
+/// `admits` declines the compiler, or a name expression resolves to nothing.
+/// A TILE unit under a tile-capable NVRTC fails in none of those ways and is
+/// still broken. Measured on this box with NVRTC 13.3.33 and a bf16 tile
+/// `mma`:
+///
+/// ```text
+///   nvrtcCompileProgram      rc = 0
+///   nvrtcGetCUBIN            47,560 bytes, `.note.nv.tkinfo` and NO `.text`
+///   cuModuleLoadData         SUCCESS
+///   cuModuleGetFunction      CUDA_ERROR_NOT_FOUND
+/// ```
+///
+/// A tile kernel does not compile to SASS. NVRTC emits **Tile IR**, and
+/// something downstream has to assemble it: a driver new enough to do it at
+/// load — 580.159.03 is not, and loads the image without assembling — or
+/// `tileiras` over `nvrtcGetTileIR`'s output before the cubin is cached.
+///
+/// So without this check a tile unit compiles clean, is CACHED, loads, and
+/// fails at the first launch, one layer away from anything that could explain
+/// it. With it, the compile refuses and says what to install.
+///
+/// # Why a byte scan and not an ELF parse
+///
+/// This is a guard, not a loader. It answers one question — did NVRTC hand
+/// back something with executable code in it — and the two section names are
+/// unambiguous enough to answer it by looking. A parse would be more precise
+/// about a case that does not arise: nothing else in this crate produces a
+/// cubin, and an image with neither marker is left alone rather than guessed
+/// at.
+///
+/// `.wiki/driver/new-horizon.md` §23.18 has the end-to-end transcript of the
+/// path that does work, and the note beside [`crate::unit::DEMANDS`] says why
+/// a [`Toolchain`] floor alone is not enough to make a tile unit sound.
+fn unassembled_tile_ir(unit: &str, cubin: &[u8]) -> Result<(), CompileError> {
+    let has = |needle: &[u8]| cubin.windows(needle.len()).any(|w| w == needle);
+    if has(b".note.nv.tkinfo") && !has(b".text.") {
+        return Err(CompileError::Refused(format!(
+            "`{unit}` compiled to Tile IR, not SASS: the image carries \
+             `.note.nv.tkinfo` and no `.text`, so it would load and then answer \
+             `cuModuleGetFunction` with NOT_FOUND at the first launch. A tile \
+             unit needs its Tile IR assembled -- `tileiras` over \
+             `nvrtcGetTileIR`, with CUDA_ROOT set, or a driver new enough to \
+             assemble at load. See new-horizon.md 23.18"
+        )));
+    }
+    Ok(())
+}
+
+/// Recognise the one CuTile failure whose message names nothing that caused
+/// it, and say what did.
+///
+/// # The trap
+///
+/// The tile frontend does not know what a `__nv_bfloat16` is. It learns it
+/// from a marker in the RUNTIME header: CUDA 13.3's `cuda_bf16.h` tags the
+/// struct `__NV_TL_BUILTIN__`, which the frontend expands to
+/// `__tile_builtin__`. Under 13.0 headers that marker site does not exist, so
+/// a 2-byte struct lowers as `tile<2 x i8>` and tile codegen aborts:
+///
+/// ```text
+///   cuda_tile.h(1364): error: Internal Compiler Error (tile codegen):
+///                      "Unexpected element type in tile!"
+/// ```
+///
+/// Nothing in that message is about headers, versions, or bf16.
+///
+/// The pieces are four independently versioned pip wheels with no cross-check
+/// between them -- `nvidia-cuda-nvcc`, `-nvrtc`, `-tileiras` and
+/// `-cuda-runtime`. Only the last one carries the marker, and it is the one
+/// nothing forces you to upgrade, so the default outcome of a partial upgrade
+/// is a frontend that speaks tile over headers that do not.
+///
+/// # Why this is worth code rather than a doc
+///
+/// It is already a doc. `.wiki/driver/new-horizon.md` has the A/B that proves
+/// it -- adding `__tile_builtin__` by hand to the 13.0 header makes the same
+/// source compile -- and the analysis cost a day and a withdrawn bug report.
+/// It then caught the author of that analysis a THIRD time, with the wiki
+/// page open, because the ICE looks like a compiler bug and reads like one.
+///
+/// A message is cheaper than a memory.
+///
+/// # The check it recommends
+///
+/// `cuda_tf32.h` ships only in 13.3 and later. Its presence beside
+/// `cuda_bf16.h` is a one-`ls` proxy for the marker and needs no parsing, and
+/// grepping the marker itself is the exact test when the proxy is ambiguous.
+fn tile_header_mismatch(log: &str) -> Option<String> {
+    let ice = log.contains("Unexpected element type in tile!");
+    let tile_codegen = log.contains("tile codegen");
+    if !(ice || (tile_codegen && log.contains("Internal Compiler Error"))) {
+        return None;
+    }
+
+    Some(
+        "This is almost certainly NOT a compiler bug. It is a version skew \
+         between the tile frontend and the CUDA RUNTIME headers.\n\n\
+         A 16-bit type only becomes a tile element because CUDA 13.3's \
+         `cuda_bf16.h` / `cuda_fp16.h` mark it `__NV_TL_BUILTIN__`, which the \
+         frontend expands to `__tile_builtin__`. Under 13.0 headers that \
+         marker site does not exist, the 2-byte struct lowers as `tile<2 x \
+         i8>`, and tile codegen aborts with the message above -- which names \
+         neither headers nor bf16.\n\n\
+         Check the runtime headers on the include path, not NVRTC's version:\n\
+         \n\
+         \x20   ls  <include>/cuda_tf32.h          # ships only in 13.3+\n\
+         \x20   grep -c __NV_TL_BUILTIN__ <include>/cuda_bf16.h   # 0 is the bug\n\
+         \n\
+         The four wheels version independently and nothing cross-checks them: \
+         nvidia-cuda-nvcc, -nvrtc, -tileiras and -cuda-runtime. Only the last \
+         carries the marker. See new-horizon.md on the 16-bit header trap."
+            .to_string(),
+    )
 }
 
 /// The compile options, in the order NVRTC is handed them.
@@ -633,7 +756,9 @@ impl Drop for Program {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompileError, admits, compile_rows, compile_under, options, version};
+    use super::{
+        CompileError, admits, compile_rows, compile_under, options, unassembled_tile_ir, version,
+    };
     use crate::device::DeviceKernel;
     use crate::families::norm::ALTUP_AUX as NORM_ALTUP_AUX;
     use crate::unit::Toolchain;
@@ -853,5 +978,138 @@ mod tests {
         assert!(have.major >= 11, "NVRTC has reported a major version since 7.0: {have}");
         assert!(!have.is_any(), "`any` is the absence of a floor, never a version");
         println!("nvrtcVersion says {have}");
+    }
+
+    /// The Tile IR guard, against images shaped like the two NVRTC produces.
+    ///
+    /// Not synthetic in the part that matters: the section names are the ones
+    /// `cuobjdump -elf` prints for a real tile cubin (`.note.nv.tkinfo`, no
+    /// `.text`) and for a real SASS one (`.text.<mangled>`), measured on this
+    /// box with NVRTC 13.3.33.
+    #[test]
+    fn tile_ir_is_refused_and_sass_is_not() {
+        // What `nvrtcGetCUBIN` returns for a `__tile_global__`: a note section
+        // and no code. It loads. It has no entry point.
+        let tile_ir = b"\x7fELF...\x00.note.nv.tkinfo\x00.nv.info\x00".to_vec();
+        let err = unassembled_tile_ir("moe/moe_grouped_gemm_tile", &tile_ir)
+            .expect_err("an image with tkinfo and no .text must be refused");
+        let said = format!("{err:?}");
+        assert!(
+            said.contains("Tile IR") && said.contains("tileiras"),
+            "the refusal has to name what happened and what to install: {said}"
+        );
+
+        // What it returns for every unit this crate declares today.
+        let sass = b"\x7fELF...\x00.text._ZN3pie6kernel1kEv\x00.nv.info\x00".to_vec();
+        assert!(
+            unassembled_tile_ir("norm/rmsnorm", &sass).is_ok(),
+            "an ordinary cubin must pass untouched"
+        );
+
+        // And the AOT-assembled form, which carries BOTH -- `nvcc --tilecubin`
+        // output has `.note.nv.tkinfo` next to real `.text`. It runs, so it
+        // must not be refused.
+        let assembled = b"\x7fELF\x00.note.nv.tkinfo\x00.text._ZN1kEv\x00".to_vec();
+        assert!(
+            unassembled_tile_ir("moe/moe_grouped_gemm_tile", &assembled).is_ok(),
+            "tkinfo WITH .text is an assembled tile cubin and this box runs those"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tile_header_trap {
+    use super::tile_header_mismatch;
+
+    /// The real message, copied from a failing build on this box: nvcc 13.3.73
+    /// with `nvidia-cuda-runtime` still at 13.0 headers, compiling the tree's
+    /// own `norm/rmsnorm_tile.cuh` -- a kernel known to be correct, which is
+    /// what makes the ICE so convincing.
+    const REAL_ICE: &str = r#"/opt/cu13/include/crt/cuda_tile.h(1364): error: Internal Compiler Error (tile codegen): "Unexpected element type in tile!"
+Compilation aborted."#;
+
+    #[test]
+    fn the_ice_gets_a_cause_attached() {
+        let d = tile_header_mismatch(REAL_ICE).expect(
+            "the bf16 tile-codegen ICE must be recognised -- it is the one              CuTile failure whose message names nothing that caused it",
+        );
+
+        // The cause, in the words that make it searchable.
+        assert!(d.contains("__NV_TL_BUILTIN__"), "the marker must be named");
+        assert!(
+            d.contains("NOT a compiler bug"),
+            "the message must say this plainly. A day and a withdrawn bug              report went into learning it, and the ICE reads like a compiler              bug to everyone who meets it"
+        );
+
+        // And the check, which is the part that ends the debugging session.
+        assert!(
+            d.contains("cuda_tf32.h"),
+            "the message must give the one-`ls` proxy; a version number does              not answer the question because the RUNTIME wheel is the one              that matters and it versions independently"
+        );
+        assert!(
+            d.contains("grep -c __NV_TL_BUILTIN__"),
+            "and the exact test for when the proxy is ambiguous"
+        );
+    }
+
+    /// Each recognition branch, pinned on its own.
+    ///
+    /// The first version of this test used only the real transcript, which
+    /// carries BOTH signatures -- so deleting either branch left it passing.
+    /// A gate that survives the removal of what it guards is not a gate, and
+    /// these two inputs are exactly the discriminating ones.
+    #[test]
+    fn each_branch_is_pinned_separately() {
+        // The message alone, as a future release might phrase it with no
+        // "Internal Compiler Error" banner.
+        assert!(
+            tile_header_mismatch("error: \"Unexpected element type in tile!\"").is_some(),
+            "the element-type message must be recognised on its own -- it is \
+             the specific symptom of an unmarked 16-bit type and the banner \
+             around it is not load-bearing"
+        );
+
+        // And the banner alone, for a tile codegen ICE whose detail text
+        // changes. Same cause, worth the same pointer.
+        assert!(
+            tile_header_mismatch(
+                "cuda_tile.h(902): error: Internal Compiler Error (tile codegen): \"???\""
+            )
+            .is_some(),
+            "a tile-codegen ICE with different detail text must still get the \
+             pointer; the header skew is by far the likeliest cause of any of \
+             them and the message costs nothing when it is wrong"
+        );
+    }
+
+    /// The diagnosis must not fire on ordinary source errors. A wrong
+    /// suggestion is worse than none -- it sends the reader to reinstall
+    /// wheels over a typo.
+    #[test]
+    fn ordinary_failures_are_left_alone() {
+        for log in [
+            r#"kernel.cu(12): error: identifier "foo" is undefined"#,
+            r#"kernel.cu(3): error: no instance of function template "cuda::tiles::store" matches the argument list"#,
+            r#"cuda_tile.h(55): error: #error "This file needs C++20 features""#,
+            "",
+        ] {
+            assert!(
+                tile_header_mismatch(log).is_none(),
+                "the header-trap diagnosis fired on an unrelated failure: {log}"
+            );
+        }
+    }
+
+    /// The C++20 case above is deliberately in that list and deserves saying
+    /// out loud: it is a REAL and common tile misconfiguration, and it already
+    /// says exactly what to do. Attaching a header-version essay to a message
+    /// that is already actionable would make this guard noise.
+    #[test]
+    fn a_self_explaining_error_is_not_decorated() {
+        let clear = r#"cuda_tile.h(55): error: #error "This file needs C++20 features. Please compile with c++20 or later dialect""#;
+        assert!(
+            tile_header_mismatch(clear).is_none(),
+            "an error that already names its own fix must be left alone"
+        );
     }
 }

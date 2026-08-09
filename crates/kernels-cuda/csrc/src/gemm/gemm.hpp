@@ -316,26 +316,12 @@ void batched_act_x_w(
 // with a shared output width `N` and reduction dim `K`, but its own row count
 // `M_array[group]`.
 //
-// POINTER-ARRAY RESIDENCY (measured hazard): cublasGemmGroupedBatchedEx
-// does not consume the act/W/y pointer arrays synchronously at call time.
-// Transient host arrays handed to back-to-back grouped calls produced
-// illegal-address / misaligned-address faults (repro: lora grouped lanes;
-// a stream sync between calls or device-resident arrays both cure it).
-// Callers must pass DEVICE-RESIDENT pointer arrays whose slots are not
-// rewritten while a call may still read them — the nemotron_h MoE and the
-// llama_like lora grouping both stage through per-use device slots.
-// `M_array` and the internal int/scalar arrays are consumed at call time
-// and may be transient host memory.
-void grouped_act_x_wt_bf16(
-    cublasHandle_t handle,
-    const void* const* act_ptrs_host,
-    const void* const* W_ptrs_host,
-    void* const*       y_ptrs_host,
-    const int*         M_array_host,
-    int group_count,
-    int N,
-    int K,
-    float beta = 0.f);
+// `grouped_act_x_wt_bf16` WAS DECLARED HERE, under a long note about pointer-
+// array residency. The note moved with the body, to
+// `driver-cuda/src/bind/service.rs::gemm_grouped_act_x_wt_bf16` -- the
+// hazard is the LIBRARY's (`cublasGemmGroupedBatchedEx` does not consume the
+// act/W/y arrays synchronously) and it belongs beside the call, wherever the
+// call is. §45.
 
 // ── Legacy bf16-only entry points ─────────────────────────────────────
 // Thin wrappers around the dispatchers above. Kept as the primary entry
@@ -354,49 +340,22 @@ inline void act_x_wt_bf16(
                  y, M, N, K, beta);
 }
 
-// Same storage convention as `act_x_wt_bf16`, but materialises the
-// output as fp32. Used by routers that are specified to compute logits in
-// fp32 before top-k selection.
-void act_x_wt_bf16_out_fp32(
-    cublasHandle_t handle,
-    const void* act,
-    const void* W,
-    float* y,
-    int M,
-    int N,
-    int K);
-
-// Dense bf16 linear with a broadcast row bias: y[m][n] = sum_k act[m][k] *
-// W[n][k] + bias[n]. `bias` may be null, in which case this is exactly
-// `act_x_wt_bf16`.
+// THREE DECLARATIONS WERE HERE and all three are gone from this archive:
 //
-// At M=1 -- the decode shape -- the bias is folded into the GEMV epilogue,
-// which removes an entire kernel launch per biased projection. gpt-oss-20b
-// has five of them per layer, so at 24 layers that was 120 launches per
-// decode step at ~3.6 us each against a 2.2 us empty-launch floor: 11.9% of
-// decode GPU time spent re-reading and re-writing a few KB. The fold is
-// bit-identical (see `launch_gemv_bf16`).
+//   `act_x_wt_bf16_out_fp32`  -- one `cublasGemmEx`, now
+//       `driver-cuda/src/bind/service.rs::gemm_act_x_wt_bf16_out_fp32`.
+//   `act_x_wt_bias_bf16`      -- the GEMM-then-`add_bias` composition, now
+//       `bind::service::gemm_act_x_wt_bias_bf16`. It went because its body
+//       CALLED `kernels::norm::add_bias_bf16`, a migrated row of ours, and
+//       a C++ caller is one no Rust dispatch can intercept. The `M == 1`
+//       fused-bias arm went with it; `gemv.hpp` states that fold to be
+//       bit-identical to the separate `add_bias_bf16`, so the composition
+//       writes the same bytes for one more launch.
+//   `act_x_wt_bf16_cublas`    -- DEAD before any of this: no caller in any
+//       source file in the worktree. It held this file's last call into
+//       `gemv.cu`.
 //
-// The fold only happens when the dense autotuner has *already* chosen the
-// GEMV for this shape, so a shape where cuBLAS wins is never forced onto a
-// slower kernel just to save a launch. Set PIE_GEMV_FUSED_BIAS=0 to disable.
-void act_x_wt_bias_bf16(
-    cublasHandle_t handle,
-    const void* act, const void* W, const void* bias, void* y,
-    int M, int N, int K,
-    cudaStream_t stream,
-    // `beta = 1` accumulates into `y`, which is what a projection writing
-    // straight into a residual wants. The GEMV epilogue folds it next to the
-    // bias, so asking for both costs no more launches than asking for either.
-    float beta = 0.f);
-
-// Same math as `act_x_wt_bf16`, but bypasses the cuBLASLt BF16
-// dispatcher. This is useful for a few skinny-M packed projections where
-// Lt's heuristic is slower than cuBLAS GEMMEx.
-void act_x_wt_bf16_cublas(
-    cublasHandle_t handle,
-    const void* act, const void* W, void* y,
-    int M, int N, int K, float beta = 0.f);
+// See `new-horizon.md` §45.
 
 inline void batched_act_x_wt_bf16(
     cublasHandle_t handle,
@@ -429,15 +388,10 @@ void maybe_bench_lm_head_algos(
 // `cublasGemmStridedBatchedEx` instead of the scalar one-thread-per-output
 // kernels they replace (those stride the inner loop by `kv_lora_rank` and
 // reach a small fraction of HBM bandwidth).
-void mla_absorb_q_to_latent_bf16(
-    cublasHandle_t handle,
-    const void* q_nope, const void* kv_b_proj, void* q_latent,
-    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank);
-
-void mla_absorb_latent_to_v_bf16(
-    cublasHandle_t handle,
-    const void* attn_latent, const void* kv_b_proj, void* attn_v,
-    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank);
+// ...and both are `driver-cuda/src/bind/service.rs`'s now --
+// `gemm_mla_absorb_q_to_latent_bf16` and `gemm_mla_absorb_latent_to_v_bf16`,
+// one `cublasGemmStridedBatchedEx` each through cudarc. The description above
+// is left because it is the arithmetic, not the implementation. §45.
 
 }  // namespace pie_cuda_driver::kernels::gemm
 

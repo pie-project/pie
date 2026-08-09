@@ -379,30 +379,31 @@ pub fn push_encoded_affine(
 /// dequantizer turns that declaration into values. The scales have to be
 /// *declared* before they can be scaled by, so this leaves an internal
 /// tensor behind under `scales_tensor`.
+///
+/// The width arrives as a GROUP count, not a column count. Every caller
+/// reads it off the packed tensor's own group axis and would have had to
+/// multiply by 32 to state columns, so taking columns meant a runtime
+/// check that the number divided back -- a refusal no caller could
+/// reach, guarding an arithmetic identity. Stated this way the whole
+/// number of blocks is the only representable width.
 pub fn mxfp4_values(
     b: &mut Builder<'_>,
     blocks: Expr,
     scales: Expr,
     rows: i64,
-    cols: i64,
+    groups: i64,
     scales_tensor: String,
-) -> Result<Expr, Error> {
-    if cols % 32 != 0 {
-        return fail(format!(
-            "MXFP4 tensor '{scales_tensor}' has {cols} columns, which is not a \
-             whole number of 32-element blocks"
-        ));
-    }
-    let groups = vec![rows, cols / 32];
+) -> Expr {
+    let cols = groups * 32;
+    let group_shape = vec![rows, groups];
     let e8m0 = Encoding::Raw(DType::E8M0);
-    if let Some(declared) = b.define(
+    let declared = b.define(
         scales_tensor.clone(),
-        scales.transmute(TensorType::new(groups.clone(), e8m0.clone())),
+        scales.transmute(TensorType::new(group_shape.clone(), e8m0.clone())),
         e8m0,
-        Some(groups),
-    ) {
-        b.mark_internal(declared);
-    }
+        Some(group_shape),
+    );
+    b.mark_internal(declared);
 
     let quant = Encoding::Quant(QuantSpec {
         scheme: QuantScheme::Mxfp4E2M1E8M0,
@@ -411,9 +412,9 @@ pub fn mxfp4_values(
         group_size: 32,
         channel_axis: Some(Axis(1)),
     });
-    Ok(blocks
+    blocks
         .transmute(TensorType::new(vec![rows, cols], quant))
-        .scale_per_block(Expr::out(&scales_tensor)))
+        .scale_per_block(Expr::out(&scales_tensor))
 }
 
 /// The one rule every routed family's mixture is named by.
@@ -578,14 +579,13 @@ pub fn author_mlx_file(
                 // encode to read rather than nest inside it.
                 let widened = format!("{output}.bf16");
                 let bf16 = Encoding::Raw(DType::BF16);
-                if let Some(declared) = b.define(
+                let declared = b.define(
                     widened.clone(),
                     Expr::src(&raw.name).cast(bf16.clone()),
                     bf16,
                     Some(raw.shape.clone()),
-                ) {
-                    b.mark_internal(declared);
-                }
+                );
+                b.mark_internal(declared);
                 Expr::out(&widened)
             } else {
                 push_direct(b, raw, output);
@@ -1471,6 +1471,10 @@ mod quant_tests {
 
     /// The scales have to be declared before they can be scaled by, so the
     /// pair leaves an internal tensor behind.
+    ///
+    /// The width is a group count: `8` groups is `256` columns, and there
+    /// is no third width to refuse, which is why this is the only test
+    /// the function has.
     #[test]
     fn mxfp4_values_leaves_its_scales_declared_and_internal() {
         let mut captured = None;
@@ -1480,9 +1484,9 @@ mod quant_tests {
                 Expr::src("blocks"),
                 Expr::src("scales"),
                 512,
-                256,
+                256 / 32,
                 "out.scales".into(),
-            )?);
+            ));
             Ok(())
         });
         let (shape, encoding) = declared(&contract, "out.scales");
@@ -1496,23 +1500,5 @@ mod quant_tests {
             "the scales are an intermediate, not a runtime tensor"
         );
         assert!(captured.is_some(), "the values expression came back");
-    }
-
-    #[test]
-    fn a_column_count_that_is_not_whole_blocks_is_refused() {
-        let err = try_author(|b| {
-            mxfp4_values(
-                b,
-                Expr::src("b"),
-                Expr::src("s"),
-                512,
-                100,
-                "out.scales".into(),
-            )?;
-            Ok(())
-        })
-        .expect_err("100 is not a whole number of 32-element blocks");
-        let msg = message(err);
-        assert!(msg.contains("'out.scales' has 100 columns"), "{msg}");
     }
 }

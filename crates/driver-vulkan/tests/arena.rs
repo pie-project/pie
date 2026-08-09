@@ -313,6 +313,13 @@ const REACHES: &[(&str, Reaches)] = &[
         Reaches::DriverSupplies(1),
     ),
     ("neox_mb_bfloat16", Reaches::DriverSupplies(1)),
+    // The same rotation with its ladder handed over rather than raised: a
+    // rescaled deployment has no base for the shader to exponentiate, so the
+    // frequencies arrive as a buffer. Two the plan does not name -- the
+    // positions `neox_mb` is also short of, and that frequency table -- and
+    // `rope.rs` is where both come from, because a rescaling is a fact about
+    // the deployment rather than about the architecture the text states.
+    ("neox_freqs_mb_bfloat16", Reaches::DriverSupplies(2)),
     ("row_gather_bfloat16", Reaches::DriverSupplies(2)),
     // Twelve slots and six holes -- two of them Metal's ring-ABI placeholders
     // at 10 and 11, kept on purpose. Four real bindings the plan does not
@@ -333,8 +340,8 @@ const REACHES: &[(&str, Reaches)] = &[
 /// The claim `driver-metal`'s `model_bind` makes for its own table, asked of
 /// this one: on both backends an entry point is compiled from a name, so a
 /// text that states a symbol the table knows needs no arm written to receive
-/// it. Nineteen distinct symbols, and `kernels-vulkan` has a module for all
-/// nineteen.
+/// it. Twenty-two distinct symbols, and `kernels-vulkan` has a module for all
+/// twenty-two.
 ///
 /// It is a smaller number than the table's 480 because a lowering is not yet
 /// the whole of a fire -- `Lowered::residue` holds the statements that still
@@ -794,6 +801,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
         "add_bias_bfloat16",
         "kv_append_paged_bfloat16",
         "neox_mb_bfloat16",
+        "neox_freqs_mb_bfloat16",
         "row_gather_bfloat16",
         "sdpa_paged_decode_bfloat16_d_128",
         "sdpa_paged_decode_sink_bfloat16_d_64",
@@ -1430,6 +1438,29 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         [3584, 25136, 64],
         "the widest grid in any dimension changed"
     );
+    // And all three are inside what Vulkan GUARANTEES a device will
+    // dispatch. `maxComputeWorkGroupCount` is 65535 per axis at the
+    // specification's floor -- the card this was measured on answers exactly
+    // that on y and z -- and a grid past it is undefined rather than
+    // refused, so a card that ran the part that fits would return success
+    // over an output computed for some of its rows.
+    //
+    // The margin is not comfortable, and saying so is the point of pinning
+    // it: the widest is the LM head's matvec, whose y is the vocabulary over
+    // eight -- 25136 for gpt-oss's 201088 -- so a vocabulary past ~524000
+    // reaches the floor with nothing else changing. The x axis is the fire's
+    // rows, so a prefill of more than 65535 rows reaches it on a device that
+    // does not raise the limit.
+    //
+    // `Device::check` refuses either by name rather than truncating. This
+    // assertion says the refusal is not refusing work these texts do.
+    for (axis, widest) in widest_grid.iter().enumerate() {
+        assert!(
+            *widest <= 65_535,
+            "axis {axis} reaches {widest} workgroups, past the 65535 Vulkan \
+             guarantees, so these plans no longer run on a device at the floor"
+        );
+    }
 }
 
 /// Every row that names one of the pool's numbers is handed that number, and

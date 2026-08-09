@@ -46,7 +46,7 @@
 use driver_api::local::{
     PIE_ELASTIC_POOL_KV, PIE_ELASTIC_POOL_STATE, PIE_ELASTIC_POOL_WORKSPACE,
     PIE_MEMORY_DOMAIN_METAL_SHARED, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_UNSUPPORTED,
-    PieMemoryDomain,
+    DeviceDomain,
 };
 use driver_api::plan::{KvCopyPlan, PoolResizePlan, StateCopyPlan};
 
@@ -79,9 +79,9 @@ pub enum Refusal {
     /// refused rather than silently reinterpreted as a same-domain one.
     ForeignDomain {
         /// The source domain the request named.
-        src: PieMemoryDomain,
+        src: DeviceDomain,
         /// The destination domain the request named.
-        dst: PieMemoryDomain,
+        dst: DeviceDomain,
     },
     /// No paged KV pool is allocated: the configured page count and page size
     /// produced a zero-sized pool, or its allocation failed at setup.
@@ -359,8 +359,8 @@ pub fn plan_pool_resize(plan: &PoolResizePlan, caps: Capabilities) -> Result<Res
 #[cfg(test)]
 mod tests {
     use driver_api::local::{
-        PIE_MEMORY_DOMAIN_HOST_PINNED, PIE_MEMORY_DOMAIN_METAL_PRIVATE, PieKvMoveCell,
-        PieStateCopyRange,
+        PIE_MEMORY_DOMAIN_HOST_PINNED, PIE_MEMORY_DOMAIN_METAL_PRIVATE, KvMoveCell,
+        StateCopyRange,
     };
 
     use super::*;
@@ -381,7 +381,7 @@ mod tests {
         }
     }
 
-    fn kv(src: Vec<u32>, dst: Vec<u32>, cells: Vec<PieKvMoveCell>) -> KvCopyPlan {
+    fn kv(src: Vec<u32>, dst: Vec<u32>, cells: Vec<KvMoveCell>) -> KvCopyPlan {
         KvCopyPlan {
             src_domain: PIE_MEMORY_DOMAIN_METAL_SHARED,
             dst_domain: PIE_MEMORY_DOMAIN_METAL_SHARED,
@@ -392,8 +392,8 @@ mod tests {
         }
     }
 
-    fn cell(dst_page: u32, dst_row: u32, src_page: u32, src_row: u32) -> PieKvMoveCell {
-        PieKvMoveCell {
+    fn cell(dst_page: u32, dst_row: u32, src_page: u32, src_row: u32) -> KvMoveCell {
+        KvMoveCell {
             dst_page_id: dst_page,
             dst_token_offset: dst_row,
             src_page_id: src_page,
@@ -521,11 +521,11 @@ mod tests {
         assert_eq!(work.pages_touched, 0, "an empty request grows nothing");
     }
 
-    fn range(src: u32, dst: u32) -> PieStateCopyRange {
-        PieStateCopyRange {
+    fn range(src: u32, dst: u32) -> StateCopyRange {
+        StateCopyRange {
             src_slot_id: src,
             dst_slot_id: dst,
-            ..PieStateCopyRange::default()
+            ..StateCopyRange::default()
         }
     }
 

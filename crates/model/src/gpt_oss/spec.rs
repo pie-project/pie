@@ -41,22 +41,6 @@ pub struct GptOssFacts {
     /// and the clamp is a DIFFERENT KERNEL, so this decides which
     /// activation the text states rather than being a runtime scalar.
     pub swiglu_limit: f32,
-    /// Whether the checkpoint biases q/k/v/o, the router, and the expert
-    /// projections (`attention_bias`). gpt-oss biases all of them; the
-    /// q/k/v biases FOLD INTO the projection's epilogue and the rest are
-    /// their own launches.
-    pub attention_bias: bool,
-    /// Whether this deployment's rope is the YaRN-paper one. gpt-oss's
-    /// config asks for it (factor 32 over an original 4096 context) and
-    /// the driver resolves it at load, so it is a fact and not a fire's
-    /// question — and a WRONG one here is not a crash but a silently
-    /// unscaled rotation, which is how it went unnoticed.
-    pub rope_yarn_original: bool,
-    /// Every layer carries `attn_sinks` on gpt-oss. The driver asks
-    /// `layer.attn_sinks != nullptr` per layer and only requests an LSE
-    /// from attention where the answer is yes — so this is what decides
-    /// whether the attention statement produces one value or two.
-    pub attn_sinks: bool,
 }
 
 impl GptOssFacts {
@@ -95,9 +79,6 @@ impl GptOssFacts {
             vocab: 201088,
             tied_embeddings: false,
             swiglu_limit: 7.0,
-            attention_bias: true,
-            rope_yarn_original: true,
-            attn_sinks: true,
         }
     }
 }
@@ -220,29 +201,26 @@ mod tests {
         assert!((f.swiglu_limit - 7.0).abs() < f32::EPSILON);
     }
 
-    /// The three booleans the driver branches on, pinned together.
+    /// The one boolean left, and why the other three are not booleans.
     ///
-    /// Each one selects a launch: `attn_sinks` decides whether attention
-    /// yields an LSE alongside its value, `attention_bias` decides
-    /// whether the projections carry an epilogue, and
-    /// `tied_embeddings` decides whether the unembedding is its own
-    /// tensor. A flipped bool here is a plan that still lowers.
+    /// `attention_bias`, `rope_yarn_original` and `attn_sinks` were
+    /// per-row facts that every row answered the same way: gpt-oss biases
+    /// q/k/v/o, the router and the experts; its rope is the YaRN-paper
+    /// one; and every one of its layers carries a sink. A field only two
+    /// rows can fill, both identically, is not a fact about the row -- it
+    /// is a place for one of them to be wrong. All three are now stated
+    /// unconditionally by the trace and the manifest.
+    ///
+    /// `tied_embeddings` stays a field because it is a question the
+    /// FAMILY does not answer: it is false here, and tying it would read
+    /// the unembedding out of the token table.
     #[test]
-    fn the_branching_booleans_are_the_ones_the_checkpoint_states() {
+    fn the_branching_boolean_is_the_one_the_checkpoint_states() {
         let f = GptOssFacts::gpt_oss_20b();
-        assert!(f.attn_sinks, "every gpt-oss layer carries `attn_sinks`");
-        assert!(
-            f.attention_bias,
-            "gpt-oss biases q/k/v/o, the router, and the experts"
-        );
         assert!(
             !f.tied_embeddings,
             "gpt-oss ships a separate `lm_head`; tying it would read the \
              unembedding out of the token table"
-        );
-        assert!(
-            f.rope_yarn_original,
-            "the row rescales rope by the YaRN paper's rule"
         );
     }
 

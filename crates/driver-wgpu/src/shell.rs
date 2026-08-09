@@ -33,9 +33,17 @@
 //!
 //! Not the engine's seam. `driver-metal`'s `serve::Shell` answers fourteen verbs
 //! because it is the whole of what a driver owes the runtime. This is the part
-//! of that which is about running a model: open, hold weights, take turns, plus
-//! the five registration verbs [`crate::programs`] already serves. The rest is a
-//! scheduler's vocabulary.
+//! of that which is about running a model: open, hold weights, take turns,
+//! serve a frame, plus the five registration verbs [`crate::programs`] already
+//! serves. The rest is a scheduler's vocabulary.
+//!
+//! [`Shell::launch`] is where the two allocators are kept apart. It fires over
+//! the PHYSICAL pages a `FrameSubmission` names and never asks the [`Book`] for
+//! one, because the engine's scheduler already handed them out; the book below
+//! belongs to [`Shell::step`], which is the entry point for a server built on
+//! this crate alone. Firing a frame through `step` would put two allocators on
+//! one pool, and the failure is not a fault or a NaN — attention reads another
+//! conversation's keys and the model answers fluently.
 //!
 //! Not a sampler, and not a tokenizer. A [`Step`] comes back with its
 //! distributions, as it does one layer down.
@@ -45,6 +53,7 @@ use model_compiler::trace::ForwardPlan;
 
 use crate::device::{Device, Failed, Pipelines, Unavailable};
 use crate::dispatch::Geometry;
+use crate::frames::{Launched, Unlaunched, pages_named, requests_of, tokens_of};
 use crate::pages::Book;
 use crate::programs::{Programs, Unregistered};
 use crate::resources::{Pool, Shape, Weights};
@@ -516,6 +525,101 @@ impl Shell {
         )
     }
 
+    /// Serve one frame from the engine.
+    ///
+    /// # What this does that [`Self::step`] does not
+    ///
+    /// Nothing to the book. The engine's scheduler owns page allocation —
+    /// eviction, prefix sharing, the copy plans — and hands down the physical
+    /// pages it chose; running those through this driver's own allocator would
+    /// give two allocators one page and no way to notice. See [`crate::frames`].
+    ///
+    /// # The order, and why it is this one
+    ///
+    /// * admit first, WITHOUT side effects, so a refused frame can be re-posted
+    ///   rather than undone;
+    /// * grow the pool to the highest page the frame NAMES, since the pool may
+    ///   have been trimmed below a mark the scheduler was right to hand out;
+    /// * convert every step's CSRs BEFORE firing any of them, so a frame with a
+    ///   malformed third step does not append the first two;
+    /// * then fire, in the frame's own execution order, because step `n + 1`
+    ///   reads the cache step `n` appended.
+    ///
+    /// # Errors
+    ///
+    /// [`Unlaunched`]. A frame the pool cannot hold is an `Ok` answer —
+    /// [`Launched::Exhausted`] or [`Launched::Impossible`] — and not an error,
+    /// because a full cache is a scheduling fact rather than a fault.
+    pub fn launch(&mut self, frame: &driver_api::FrameSubmission) -> Result<Launched, Unlaunched> {
+        if frame.steps.is_empty() {
+            return Err(Unlaunched::Malformed("a frame of no steps".to_string()));
+        }
+        let need = pages_named(frame);
+        // Against what the pool COULD hold rather than what it holds now: the
+        // pool gives pages back down to a high-water mark, and a frame past
+        // that mark is one it can serve after growing. Calling that impossible
+        // would have the scheduler permanently drop work it had correctly
+        // admitted, because the pool had been idle.
+        if need > self.pool.ceiling(&self.device) {
+            return Ok(Launched::Impossible);
+        }
+        if need > self.pool.shape().pages {
+            self.pool
+                .resize(&self.device, need)
+                .map_err(|e| Unlaunched::Unstepped(crate::turns::Unstepped::Failed(e)))?;
+        }
+
+        // Every step converted before any is fired. A frame whose third step
+        // does not close its CSR would otherwise have appended the first two
+        // steps' keys, and the scheduler's retry of the same frame would append
+        // them twice.
+        let mut work = Vec::with_capacity(frame.steps.len());
+        for step in &frame.steps {
+            step.plan
+                .validate_geometry()
+                .map_err(|e| Unlaunched::Malformed(format!("this frame's geometry: {e}")))?;
+            step.plan
+                .validate_kv_writes(self.pool.shape().page_size)
+                .map_err(|e| Unlaunched::Malformed(format!("this frame's KV writes: {e}")))?;
+            // Before any conversion: a plan naming something this driver does
+            // not implement is refused by the field's own name rather than
+            // served without it. See `frames::unserved_in`.
+            if let Some(what) = crate::frames::unserved_in(&step.plan) {
+                return Err(Unlaunched::Unserved(what));
+            }
+            work.push((requests_of(&step.plan)?, tokens_of(&step.plan)?));
+        }
+
+        let mut out = Vec::with_capacity(work.len());
+        for (requests, tokens) in &work {
+            let borrowed: Vec<&[u32]> = tokens.iter().map(Vec::as_slice).collect();
+            let serving = Serving {
+                plan: &self.text.decode,
+                prefill: &self.text.prefill,
+                geometry: self.text.geometry,
+                tier: self.tier,
+            };
+            let mut held = Held {
+                book: &mut self.book,
+                pool: &mut self.pool,
+                weights: &self.weights,
+            };
+            out.push(
+                serving
+                    .over(
+                        &self.device,
+                        &mut self.pipelines,
+                        &self.modules,
+                        &mut held,
+                        requests,
+                        &borrowed,
+                    )
+                    .map_err(Unlaunched::Unstepped)?,
+            );
+        }
+        Ok(Launched::Ran(out))
+    }
+
     /// Give `to` a copy of `from`'s history.
     ///
     /// The two halves of a fork live in two places on purpose — the book owns
@@ -657,7 +761,7 @@ impl Shell {
     pub fn register_channel(
         &mut self,
         desc: &driver_api::ChannelRegistrationPlan,
-    ) -> Result<driver_api::PieChannelEndpointBinding, Unregistered> {
+    ) -> Result<driver_api::ChannelBinding, Unregistered> {
         self.programs.register_channel(desc)
     }
 
@@ -674,7 +778,7 @@ impl Shell {
         geometry_class: u32,
         channel_ids: &[u64],
         seeds: &[(u64, Vec<u8>)],
-    ) -> Result<driver_api::PieInstanceBinding, Unregistered> {
+    ) -> Result<driver_api::InstanceBinding, Unregistered> {
         self.programs
             .bind_instance(program_id, requested, geometry_class, channel_ids, seeds)
     }

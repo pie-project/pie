@@ -132,18 +132,30 @@ pub trait ScoreOps {
     );
 }
 
-/// The live [`ScoreOps`] (retirement plan phase B), behind `bridge` for the
-/// fold launch. The memset and the CSR upload are stream-ordered like the
-/// C++'s (`cudaMemsetAsync` / `cudaMemcpyAsync` on the fire's stream); the
-/// CSR source is pageable host memory in both drivers, which the runtime
-/// staging-copies — same behaviour, stated rather than assumed.
-#[cfg(feature = "bridge")]
+/// The live [`ScoreOps`] (retirement plan phase B). The memset and the CSR
+/// upload are stream-ordered like the C++'s (`cudaMemsetAsync` /
+/// `cudaMemcpyAsync` on the fire's stream); the CSR source is pageable host
+/// memory in both drivers, which the runtime staging-copies — same behaviour,
+/// stated rather than assumed.
+///
+/// # Why this is no longer `#[cfg(feature = "bridge")]`
+///
+/// It was, and only for `fold_heads`: that method called
+/// `bind::abi::ffi::pie_k_attn_attn_score_fold_heads`, a generated shim entry
+/// into `attention_flashinfer.cu`'s launcher, which exists only when the
+/// kernels archive is linked. **It no longer calls it.** The fold's device
+/// text is `kernels-cuda-new`'s `attn/attention_flashinfer` unit, NVRTC
+/// compiles it, and this method builds its own [`Launch`]. Nothing on this
+/// path needs the archive, so nothing on this path is gated on it — which is
+/// the whole claim of the migration made checkable: `_cuda` without `bridge`
+/// now reaches a real fold.
+#[cfg(feature = "_cuda")]
 #[derive(Debug, Clone, Copy)]
 pub struct LiveScoreOps {
     stream: *mut std::ffi::c_void,
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl LiveScoreOps {
     /// Ops ordered on the fire's stream.
     #[must_use]
@@ -152,7 +164,46 @@ impl LiveScoreOps {
     }
 }
 
-#[cfg(feature = "bridge")]
+/// The fold's symbol, in the JIT table.
+///
+/// `attn::attn_score_fold_heads` is `families::attn::ATTN_SCORE_FOLD_SIGS`'
+/// only row and `table::attn`'s row of the same name — one string, resolved
+/// through `unit_of` rather than declared here, so a rename in that crate is
+/// a refusal here and not a silent miss.
+#[cfg(feature = "_cuda")]
+const FOLD_SYMBOL: &str = "attn::attn_score_fold_heads";
+
+/// The fold's grid fanout: `attention_flashinfer.cu:828`'s literal `64u`.
+///
+/// **This constant is the reason the fold is fired by hand.** It is not an
+/// extent. The kernel's inner loop is
+/// `for (int i = blockIdx.y; i < n; i += gridDim.y)` over the request's KV
+/// positions, so `gridDim.y` is an OCCUPANCY FANOUT: every value of it
+/// computes the same floats, and `1` computes them correctly in a
+/// sixty-fourth of the blocks. That is why no [`kernels::LaunchRule`] states
+/// it and why one must not be added to make it look stated —
+/// `families::attn::ATTN_SCORE_FOLD` carries the argument at length, and the
+/// short form is that a rule is a function of the fire's rectangle and `64`
+/// is not in the rectangle. It is a property of a kernel's grid-stride loop,
+/// and the only other one in the whole of `csrc/src` is a *different* literal
+/// (`:1138`'s `32u`), so there is no shared rule to write.
+///
+/// Naming it here puts it beside the launch that uses it and one `git grep`
+/// from the `<<<>>>` it was copied from.
+#[cfg(feature = "_cuda")]
+const FOLD_GRID_Y: u32 = 64;
+
+/// The fold's block width: `attention_flashinfer.cu:829`'s `256`.
+///
+/// Also load-bearing and also not tuning: the kernel folds warp partials
+/// through `__shared__ float red[256 / 32]`, so a launch at another width
+/// would read reduction slots nothing wrote — a plausible score row rather
+/// than a fault, which is the same hazard `PAGE_COMPACT_ROWS` records for its
+/// own `BLOCK`.
+#[cfg(feature = "_cuda")]
+const FOLD_BLOCK: u32 = 256;
+
+#[cfg(feature = "_cuda")]
 impl ScoreOps for LiveScoreOps {
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn memset_async(&mut self, dst: *mut u8, value: u8, bytes: usize) {
@@ -177,6 +228,36 @@ impl ScoreOps for LiveScoreOps {
         assert!(code == cudaError::cudaSuccess, "cudaMemcpyAsync: {code:?}");
     }
 
+    /// The fold, fired at a geometry this driver states and no rule does.
+    ///
+    /// # What this replaced, line for line
+    ///
+    /// `attn::attn_score_fold_heads` in
+    /// `kernels-cuda/csrc/src/attn/attention_flashinfer.cu:812-832` — a
+    /// nine-argument host launcher whose whole body is two guards, a `dim3`
+    /// and a `<<<>>>`. The seven-argument kernel it launched is now
+    /// `kernels-cuda-new`'s `attn/attention_flashinfer` unit; the two guards
+    /// and the `dim3` are here. The launcher's remaining two arguments were
+    /// `num_requests`, which was only ever `grid.x`, and `stream`, which was
+    /// only ever the launch's — neither is a kernel operand, and this is
+    /// where that stops being invisible.
+    ///
+    /// # The guards, and why they are two different things
+    ///
+    /// `num_requests <= 0` returns, exactly as the C++ did. An empty fire is
+    /// not an error — the capture publishes an empty payload — and it must be
+    /// caught HERE, because a zero `grid.x` reaching
+    /// [`kernels_cuda_new::runtime::KernelModule::fire`] is `Error::Geometry`
+    /// and would turn a legal no-op into a refusal.
+    ///
+    /// A null buffer PANICS, because the C++ threw. This crate's C++ threw
+    /// through a shim that caught, and the catch is gone with the shim, so
+    /// the refusal has to be spelled in Rust or it is not spelled at all. It
+    /// is a panic and not a log-and-return for the reason the module header
+    /// gives about `LostGeometry`: a fold that does not run leaves `folded`
+    /// holding the memset pattern, and the payload published over it is a
+    /// score row of zeros that every downstream policy will happily read.
+    /// Silence here is a wrong answer, not a missing one.
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn fold_heads(
         &mut self,
@@ -189,18 +270,64 @@ impl ScoreOps for LiveScoreOps {
         num_q_heads: i32,
         folded: *mut f32,
     ) {
-        unsafe {
-            crate::bind::abi::ffi::pie_k_attn_attn_score_fold_heads(
-                raw,
-                score_indptr_d,
-                kv_page_indptr_d,
-                kv_last_page_lens_d,
-                page_size,
-                num_requests,
-                num_q_heads,
-                folded,
-                self.stream,
-            );
+        use kernels_cuda_new::runtime::{ArgValue, Args, Launch, Stream, cache};
+
+        // `attention_flashinfer.cu:817` — `if (num_requests <= 0) return;`
+        if num_requests <= 0 {
+            return;
+        }
+        // `attention_flashinfer.cu:818-822` — the launcher's throw, as a
+        // refusal that cannot be mistaken for a fold.
+        assert!(
+            !raw.is_null() && !folded.is_null() && !score_indptr_d.is_null(),
+            "attn_score_fold_heads: scores, folded and score_indptr must all be device \
+             pointers (raw={raw:?}, folded={folded:?}, indptr={score_indptr_d:?})"
+        );
+
+        let Some((index, unit)) = kernels_cuda_new::unit::unit_of(FOLD_SYMBOL) else {
+            panic!("{FOLD_SYMBOL} is in no JIT unit — this driver and its kernel table disagree");
+        };
+        let Some(sig) = unit.row(FOLD_SYMBOL).map(|row| row.sig) else {
+            panic!("{FOLD_SYMBOL} named unit `{}` and is not one of its rows", unit.name);
+        };
+        let module = match cache::module(index, unit) {
+            Ok(module) => module,
+            Err(why) => panic!("{FOLD_SYMBOL}: unit `{}` would not compile or load: {why}", unit.name),
+        };
+
+        // The row's operands, in the row's order. `Args::bind` checks them
+        // against the signature, so a drift between this list and
+        // `ATTN_SCORE_FOLD_SIGS` is a refusal and not a shifted argument.
+        let values = [
+            ArgValue::Ptr(raw.cast_mut().cast()),
+            ArgValue::Ptr(score_indptr_d.cast_mut().cast()),
+            ArgValue::Ptr(kv_page_indptr_d.cast_mut().cast()),
+            ArgValue::Ptr(kv_last_page_lens_d.cast_mut().cast()),
+            ArgValue::I32(page_size),
+            ArgValue::I32(num_q_heads),
+            ArgValue::Ptr(folded.cast()),
+        ];
+        let mut args = match Args::bind(sig, &values) {
+            Ok(args) => args,
+            Err(why) => panic!("{FOLD_SYMBOL}: {why}"),
+        };
+
+        // `attention_flashinfer.cu:828-829`, transcribed. `num_requests` is
+        // `grid.x` because the kernel indexes the request by `blockIdx.x`;
+        // see `FOLD_GRID_Y` for why the second axis is a constant here and
+        // not a rule there.
+        let launch = Launch {
+            grid: [num_requests.unsigned_abs(), FOLD_GRID_Y, 1],
+            block: [FOLD_BLOCK, 1, 1],
+            smem: 0,
+        };
+
+        // SAFETY: the caller of `publish` holds the fire's stream live across
+        // the launch — the same assertion the `pie_k_*` call made when it
+        // handed `self.stream` to a C++ launcher that put it in a `<<<>>>`.
+        let stream = unsafe { Stream::from_runtime(self.stream) };
+        if let Err(why) = module.fire(sig, launch, &mut args, stream) {
+            panic!("{FOLD_SYMBOL}: {why}");
         }
     }
 }

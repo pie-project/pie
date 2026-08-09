@@ -1390,9 +1390,95 @@ pub const MLA_PAGED: Unit = Unit {
     options: &[],
 };
 
+/// The one `__global__` `attn/attention_flashinfer.cuh` holds.
+///
+/// The other three `__global__`s of `attention_flashinfer.cu` stay in the
+/// `.cu`, and the header says why in one line: *"They move when something
+/// asks for them."*
+pub static ATTN_SCORE_FOLD_ROWS: &[DeviceKernel] = &[DeviceKernel {
+    sig: &ATTN_SCORE_FOLD_SIGS[0],
+    template_path: "attn::device::attn_score_fold_heads",
+    // Not a template, and the header argues at length that it must not
+    // become one: every buffer is `float` or page-table metadata, the block
+    // width arrives as `blockDim.x` and the fanout as `gridDim.y`, so a
+    // `template <int BLOCK>` would be a parameter the body never mentions
+    // and an arm that cannot differ from its sibling.
+    elem: DeviceKernel::PLAIN,
+}];
+
+#[rustfmt::skip]
+static ATTN_SCORE_FOLD_SIGS: [KernelSig; 1] = [
+    // `LaunchRule::Unstated`, and this is a refusal that was argued rather
+    // than a gap nobody filled.
+    //
+    // The launcher is `attention_flashinfer.cu`:
+    //
+    //     const dim3 grid(static_cast<unsigned>(num_requests), 64u);
+    //     device::attn_score_fold_heads<<<grid, 256, 0, stream>>>(
+    //
+    // `dim3(requests, 64)` at 256 threads, no shared memory. `64` is not in
+    // `Dims`: not heads, not requests, not pages, not a head dimension. It
+    // is an occupancy constant — a guess about one GPU, made once.
+    //
+    // The rule CANNOT be chosen by measuring bytes. The body strides
+    // `i += blockDim.x * gridDim.y`, so every value of `gridDim.y` produces
+    // the same floats; `LaunchRule::PerRequest` would pass any parity test
+    // ever written for this kernel and be wrong by 64x in blocks alone.
+    //
+    // The tempting repair is a parameterised `PerRequestFanout(64)`, and the
+    // measurement that kills it: there are exactly TWO literal grid axes in
+    // all of `csrc/src`, both in this one file — `(num_requests, 64u)` and
+    // `(cache.num_requests, 32u)`. DIFFERENT literals. There is no shared
+    // rule waiting to be extracted, only two constants that share a file, and
+    // a rule covering both would be vocabulary growth for a single literal —
+    // which is what §10.5 exists to forbid.
+    //
+    // So the vocabulary declines to lie and the driver builds the `Launch` by
+    // hand. `KernelModule::fire`'s own doc anticipates it — *"reaching here
+    // with one means a caller built a `Launch` by hand"* — and
+    // `runtime::fire::fire` still refuses `Unstated` through `launch::eval`,
+    // so the hand-built path is the ONLY path and it is visible at the one
+    // site that takes it. `driver-cuda`'s `fire/attn_score.rs` carries the 64
+    // and the 256 as named constants with the `.cu` line cited beside them:
+    // the number is a citation, not a derivation.
+    kernel!(attn_score_fold_heads "attn::attn_score_fold_heads",
+        file = Some("attn/attention_flashinfer.cuh"),
+        launch = LaunchRule::Unstated,
+        whole = true,
+        operands = operands![
+            scores: Buf,
+            score_indptr: I32s,
+            kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            page_size: I32,
+            num_q_heads: I32,
+            folded: BufMut,
+        ]),
+];
+
+/// The per-head → per-request score fold, as a JIT unit.
+///
+/// This is the migration in one launcher: the `__global__` is ours, the
+/// geometry is a literal, and nothing about either needs the archive. The
+/// device text is `attention_flashinfer.cuh`; the launch is
+/// `driver-cuda`'s `fire/attn_score.rs`. `model-compiler` cannot tell.
+pub const ATTN_SCORE_FOLD: Unit = Unit {
+    name: "attn/attention_flashinfer",
+    root: include_str!("../../csrc/src/attn/attention_flashinfer.cuh"),
+    rows: ATTN_SCORE_FOLD_ROWS,
+    options: &[],
+};
+
 /// The units the heavy half of `attn` compiles.
-pub const UNITS_HEAVY: &[Unit] =
-    &[KV_PAGED, DSV4_COMPRESS, KIMI_MLA, MLA_PAGED, QKV_FUSED, ATTENTION_NAIVE_PAGED];
+pub const UNITS_HEAVY: &[Unit] = &[
+    KV_PAGED,
+    DSV4_COMPRESS,
+    KIMI_MLA,
+    MLA_PAGED,
+    QKV_FUSED,
+    ATTENTION_NAIVE_PAGED,
+    ATTN_SCORE_FOLD,
+];
 
 /// The reference paged attention — `attention_naive_paged.cuh`'s two rows.
 ///

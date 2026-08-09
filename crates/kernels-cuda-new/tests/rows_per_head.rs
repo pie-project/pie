@@ -527,25 +527,28 @@ fn the_five_rows_are_stated_and_hosted() {
 /// and the host launchers stayed in `kernels-cuda/csrc`, which is where a
 /// `<<<>>>` lives.
 ///
-/// Five launchers, one grid. If any of them stops being `dim3 grid(num_rows)`
+/// Two launchers, one grid. If either stops being `dim3 grid(num_rows)`
 /// over `constexpr int BLOCK = 256`, the rows below state a rule that is no
 /// longer the launcher's and the right response is to follow the change
 /// rather than to drop the pin.
+///
+/// It was FIVE until `new-horizon.md` §43. `rmsnorm_gemma_bf16`,
+/// `rmsnorm_no_scale_bf16` and `rmsnorm_gated_bf16` are routed rows
+/// (`device::JIT_DISPATCHED`): their kernels fire under NVRTC out of
+/// `norm/rmsnorm.cuh` and their ahead-of-time launchers were reachable from
+/// no root, so §43 deleted them. What is lost with them is real and worth
+/// naming — five independent witnesses to one grid became two, and three of
+/// the rows below now rest on the two that remain plus the `.cuh`. The
+/// device text those three rows fire is pinned where it now lives, by
+/// `families::norm` and `examples/unit_probe_norm.rs`.
 #[test]
 fn the_launcher_text_is_the_one_these_rows_were_written_from() {
     const CU: &str = include_str!("../../kernels-cuda/csrc/src/norm/rmsnorm.cu");
 
-    // `(launcher, the device template it launches)`, and the cited lines.
-    const LAUNCHERS: [(&str, &str); 5] = [
-        // `:38-44` — a forward, so its grid is `rmsnorm_strided_bf16`'s.
+    // `(launcher, the device template it launches)`.
+    const LAUNCHERS: [(&str, &str); 2] = [
+        // `rmsnorm_bf16` is a forward, so its grid is this one's.
         ("void rmsnorm_strided_bf16(", "device::rmsnorm<device::bf16, BLOCK>"),
-        // `:254-276`
-        ("void rmsnorm_gemma_bf16(", "device::rmsnorm_gemma<device::bf16, BLOCK>"),
-        // `:278-289`
-        ("void rmsnorm_no_scale_bf16(", "device::rmsnorm_no_scale<device::bf16, BLOCK>"),
-        // `:306-319`
-        ("void rmsnorm_gated_bf16(", "device::rmsnorm_gated<device::bf16, BLOCK>"),
-        // `:291-304`
         ("void rmsnorm_gated_fp32_in_bf16(", "device::rmsnorm_gated_f32_in<device::bf16, BLOCK>"),
     ];
 

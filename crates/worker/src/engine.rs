@@ -404,7 +404,13 @@ fn model_identity(
             hasher.update(options.mxfp4_moe.as_bytes());
             hasher.update(options.weight_dtype.as_bytes());
         }
-        config::DriverKind::Metal => {}
+        // Nothing to add for any of the three. The identity already carries
+        // the kind itself, and none of them has an option that changes what
+        // the weights ARE -- no requantization, no expert lowering choice, and
+        // wgpu's one knob is a page count that sizes a pool. An option folded
+        // in here would make two runs that serve the same bytes trade no
+        // cached layout.
+        config::DriverKind::Metal | config::DriverKind::Vulkan | config::DriverKind::Wgpu => {}
     }
     Ok(driver_api::ModelIdentity {
         hash: *hasher.finalize().as_bytes(),
@@ -1275,5 +1281,4 @@ mod tests {
         let second = model_artifact_digest(&local).unwrap();
         assert_ne!(first, second);
     }
-
 }

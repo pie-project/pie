@@ -112,6 +112,31 @@ wgpu = { version = "30", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+# `tests/arena.rs` and `tests/checkpoint.rs`: real models to lower, so that the
+# offsets, the symbols and the scalar runs under test are the ones
+# `model-compiler` actually assigns rather than ones a test invented. Every
+# other test in this crate builds its `Lowered` by hand, which checks that the
+# binder agrees with the test.
+#
+# `default-features = false` drops `chat`, which is a tokenizer and three image
+# decoders no file here names. `contract` IS taken, and only
+# `tests/checkpoint.rs` needs it: that feature carries `catalog::identify`,
+# `contract::author` and `boot::compile_load_plan_for` -- the conversion from a
+# publisher's tensor names to the ones a plan states, which is the thing
+# `src/names.rs` claims to translate and which cannot be measured without
+# compiling a real contract against a real checkpoint. There is no `forward`
+# feature to ask for any more -- it was deleted, and the forward texts are
+# ungated. Dev-only, so `tests/pure.rs` (which drops dev kinds) is untouched by
+# it, and nothing in `src/` reads a checkpoint.
+model = { path = "../model", default-features = false, features = ["contract"] }
+
+# `tests/checkpoint.rs` only: the tensor names and extents a real snapshot
+# states, which is the one place a weight's SIZE exists -- `Arg::Weight`
+# carries a name and no width. A dev-dependency and not a real one on purpose,
+# the same way `driver-vulkan` takes it: a driver that depended on a checkpoint
+# FORMAT would be a driver that could not simply be handed bytes.
+model-loader = { path = "../model-loader" }
+
 # `tests/pure.rs` only: reading what `cargo metadata` says the resolver did, so
 # that "this crate is pure Rust" is asked of the closure rather than of a
 # reading of the manifests. That question is this crate's headline -- `wgpu`
@@ -149,4 +174,16 @@ name = "pure"
 # `#[cfg(feature = "native")]` and does not exist.
 [[test]]
 name = "device"
+required-features = ["native"]
+
+# The one suite that needs a real MODEL and not only a real adapter: a
+# checkpoint's weights held under the names a plan binds, fired, and read back.
+#
+# Same stanza as `device` above and for the same reasons, including the note
+# about landing together. What it adds is a SECOND thing that can be absent:
+# `device` skips when no adapter answers, and this skips when no adapter
+# answers OR no snapshot on this machine is the model it serves. A build box
+# has neither and says so on its way past.
+[[test]]
+name = "serving"
 required-features = ["native"]

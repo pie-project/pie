@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use ::driver_api::{PIE_MEMORY_DOMAIN_HOST_PINNED, PieKvMoveCell, PiePoolRange, PieStateCopyRange};
+use ::driver_api::{PIE_MEMORY_DOMAIN_HOST_PINNED, KvMoveCell, PoolRange, StateCopyRange};
 use anyhow::Result;
 
 use crate::driver::{
@@ -345,7 +345,7 @@ pub(crate) async fn copy_h2h(
 
 pub(crate) async fn copy_kv_cells(
     driver_idx: DriverId,
-    cells: Vec<PieKvMoveCell>,
+    cells: Vec<KvMoveCell>,
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
         .copy_kv(KvCopyPlan {
@@ -368,7 +368,7 @@ pub(crate) async fn copy_rs_d2d(
     let slot_ranges = src_slots
         .iter()
         .zip(dst_slots.iter())
-        .map(|(&src_slot_id, &dst_slot_id)| PieStateCopyRange {
+        .map(|(&src_slot_id, &dst_slot_id)| StateCopyRange {
             src_slot_id,
             dst_slot_id,
             src_token_offset: 0,
@@ -385,8 +385,8 @@ pub(crate) async fn resize_pool(
     driver_idx: DriverId,
     pool_id: u64,
     target_pages: u64,
-    map_ranges: Vec<PiePoolRange>,
-    unmap_ranges: Vec<PiePoolRange>,
+    map_ranges: Vec<PoolRange>,
+    unmap_ranges: Vec<PoolRange>,
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?
         .resize_pool(PoolResizePlan {

@@ -149,6 +149,20 @@ pub enum Failed {
         /// What the caller bound.
         given: u64,
     },
+    /// A grid is wider on one axis than the device will dispatch.
+    ///
+    /// Refused rather than clamped or split. Clamping computes part of an
+    /// output and says nothing; splitting is a decision about what a launch
+    /// MEANS -- whether its workgroup index may restart -- and a driver does
+    /// not get to make that on a kernel's behalf.
+    Grid {
+        /// 0, 1 or 2: x, y or z.
+        axis: u32,
+        /// What the geometry asked for.
+        groups: u32,
+        /// What `maxComputeWorkGroupCount` allows on that axis.
+        limit: u32,
+    },
     /// A Vulkan call failed.
     Vulkan(String),
 }
@@ -156,6 +170,15 @@ pub enum Failed {
 impl core::fmt::Display for Failed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Grid {
+                axis,
+                groups,
+                limit,
+            } => write!(
+                f,
+                "a grid of {groups} workgroups on axis {axis} is past this \
+                 device's limit of {limit}"
+            ),
             Self::Geometry(e) => write!(f, "no launch geometry: {e}"),
             Self::Module(e) => write!(f, "the module is malformed: {e}"),
             Self::Bindings { module, bound } => write!(
@@ -256,6 +279,15 @@ pub struct Device {
     /// address a storage buffer from an offset this does not divide, and a
     /// driver that binds a sub-range of an arena is doing nothing else.
     min_storage_offset: u64,
+    /// `maxComputeWorkGroupCount`, per axis.
+    ///
+    /// The limit with the widest spread in Vulkan. This card answers
+    /// 2147483647 on every axis; the specification GUARANTEES only 65535, and
+    /// devices that answer exactly that are common. A dispatch past it is not
+    /// clamped and not an error the queue returns -- it is undefined, which on
+    /// a card that runs the first 65535 workgroups is a plan that computed
+    /// part of its output and reported success.
+    max_groups: [u32; 3],
     /// Is host memory and device memory the same memory?
     ///
     /// Read from `deviceType`, not from the heaps. A discrete card exposes a
@@ -277,6 +309,22 @@ pub struct Device {
     /// queue are externally synchronised objects. The lock is not a
     /// concession: it is the same serialisation the queue already imposed.
     scratch: Mutex<Scratch>,
+    /// How many buffers this device has allocated, ever.
+    ///
+    /// Kept for [`Device::allocations`]. Every buffer is its own
+    /// `vkAllocateMemory`, and `maxMemoryAllocationCount` is a hard ceiling
+    /// -- 4096 on a good many devices -- so how often a fire asks is not a
+    /// matter of speed alone. A test that counts is the only way to say the
+    /// difference between one allocation per fire and one per scalar block,
+    /// since both answer correctly.
+    allocations: std::sync::atomic::AtomicU32,
+    /// How many buffers this device has freed, ever.
+    ///
+    /// The other half of [`Device::live_buffers`]. A path that returns early
+    /// and forgets what it took leaks device memory silently -- the card has
+    /// twenty-four gigabytes and a scalar block is tens of bytes, so nothing
+    /// downstream ever fails -- and this is what makes that countable.
+    frees: std::sync::atomic::AtomicU32,
 }
 
 /// What one fire allocates, kept between fires.
@@ -729,6 +777,7 @@ impl Device {
             name,
             max_push: props.limits.max_push_constants_size,
             min_storage_offset: props.limits.min_storage_buffer_offset_alignment,
+            max_groups: props.limits.max_compute_work_group_count,
             unified: matches!(
                 props.device_type,
                 vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
@@ -736,6 +785,8 @@ impl Device {
             validated,
             tiers,
             scratch: Mutex::new(scratch),
+            allocations: std::sync::atomic::AtomicU32::new(0),
+            frees: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -750,6 +801,25 @@ impl Device {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .made
+    }
+
+    /// How many buffers this device has been asked for, ever.
+    ///
+    /// Counts allocations that succeeded. See the field for why the number,
+    /// and not just the elapsed time, is what a test should hold.
+    #[must_use]
+    pub fn allocations(&self) -> u32 {
+        self.allocations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many buffers this device holds that nothing has freed.
+    ///
+    /// A fire that returns -- with an answer or with a refusal -- should leave
+    /// this where it found it.
+    #[must_use]
+    pub fn live_buffers(&self) -> u32 {
+        self.allocations()
+            .saturating_sub(self.frees.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// What the device calls itself.
@@ -807,6 +877,16 @@ impl Device {
     #[must_use]
     pub fn max_push(&self) -> u32 {
         self.max_push
+    }
+
+    /// `maxComputeWorkGroupCount`: the widest grid this device will dispatch.
+    ///
+    /// Per axis, because they differ: the specification's floor is 65535 on
+    /// all three, and a card that raises the first one has not necessarily
+    /// raised the others.
+    #[must_use]
+    pub fn max_groups(&self) -> [u32; 3] {
+        self.max_groups
     }
 
     /// `minStorageBufferOffsetAlignment`: the granularity a sub-range may
@@ -935,6 +1015,8 @@ impl Device {
             size,
             mapped: need.size,
         };
+        self.allocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !bytes.is_empty() {
             self.write(&buffer, bytes)?;
         }
@@ -1057,6 +1139,8 @@ impl Device {
             self.device.destroy_buffer(buffer.handle, None);
             self.device.free_memory(buffer.memory, None);
         }
+        self.frees
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Run one dispatch to completion and wait for it.
@@ -1186,6 +1270,22 @@ impl Device {
                 "a dispatch of {:?} workgroups would run nothing and report success",
                 one.groups
             )));
+        }
+        // And the other end of the same argument. A grid past
+        // `maxComputeWorkGroupCount` is undefined rather than refused: the
+        // card may dispatch the part that fits and return success, which is
+        // an output computed for some of its rows and stale for the rest --
+        // fluent, plausible, wrong. Named here, before anything is recorded,
+        // because the alternative is a plan that runs on this card and
+        // silently truncates on one whose limit is the specification's floor.
+        for (axis, (groups, limit)) in one.groups.iter().zip(self.max_groups).enumerate() {
+            if *groups > limit {
+                return Err(Failed::Grid {
+                    axis: axis as u32,
+                    groups: *groups,
+                    limit,
+                });
+            }
         }
         for (binding, bound) in slots(pipeline).zip(one.buffers) {
             let Some(Some(needs)) = pipeline.declared.block_bytes.get(binding) else {

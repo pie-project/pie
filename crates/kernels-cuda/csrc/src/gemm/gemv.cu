@@ -5,9 +5,9 @@
 #include "gemm/gemv.hpp"
 
 
+// `<type_traits>` was here for the sweep entry points' `std::integral_constant`
+// dispatch. They are deleted and nothing left in the file names it.
 #include <cstdint>
-#include <cstdlib>
-#include <type_traits>
 
 namespace pie_cuda_driver::kernels::gemm {
 
@@ -111,14 +111,46 @@ __global__ void gemv_bf16_kernel(
 // This kernel is 78% of Qwen3.6-27B's decode step and 77% of gemma-4-31B's,
 // so the depth is worth taking from a measurement. Hopper keeps 4: it was
 // tuned there and nothing here re-measured it on that part.
+//
+// # This answered to `getenv("PIE_GEMV_B200_TUNING")`, and it must not
+//
+// The variable set the return to 4 -- "revert to the Hopper constants
+// without a rebuild" -- and it reached THREE launchers, not one: this
+// function's answer gates the row-per-warp unroll in `gemv_bf16`, the
+// warps AND unroll of the split-K form in the same launcher, and the fused
+// QKV kernel in `gemv3_bf16`. It is deleted, and unlike
+// `PIE_QWEN35_GDN_SMEM_STEP` (§30) it is NOT deleted because the arms agree.
+// They do not. Measured on an L40S, nine shapes, both arms fired against
+// byte-identical inputs with a poisoned output buffer, a permutation control
+// that moved ~89% of the weight bytes and a truncation control that left half
+// the output poison, all firing at every shape (§36 has the run):
+//
+//   arms                                    benign data   wide-exponent data
+//   gemv_bf16_kernel<4,4>  vs <4,2>            0 bytes       0 bytes
+//   gemv_splitk_bf16_kernel<8,1> vs <4,2>      0 bytes       5 bytes / 9 shapes
+//   gemv3_bf16_kernel<8,1> vs <2,2>            0 bytes       3 bytes / 9 shapes
+//
+// The unroll depth alone is safe by construction and measured so: at kUnroll
+// 4 and 2 a lane visits the same vectors in the same order (i, i+32, i+64 …),
+// so the fp32 accumulation is the same additions in the same sequence. The
+// WARP count is not: eight warps partition K at stride 256 and four at
+// stride 128, and the shared-memory tree then sums different partials. That
+// is below bf16's last bit on model-shaped weights, which is why the benign
+// column is zero, and it is NOT below it once the exponents spread.
+//
+// So the variable did what an env-var selector always does: it made the same
+// trace on the same weights on the same GPU emit different bits, with nothing
+// in the plan, the replay, or another backend able to say which arm ran. A
+// bisect switch is not worth that, and nothing in the repository ever set it.
+//
+// What is left is a DEVICE FACT, which is a different thing with a different
+// fix: `cudaDevAttrComputeCapabilityMajor` is a property of the machine, the
+// same on every replay on that machine, and discoverable by any backend that
+// asks. It is still answered here rather than carried from load -- §36 says
+// what carrying it would take -- but it is answerable, and an environment
+// variable is not.
 inline int gemv_unroll_depth() {
     static const int depth = [] {
-        // PIE_GEMV_B200_TUNING=0 reverts to the Hopper-tuned constants (this
-        // predicate gates both the row-per-warp unroll and the split-K
-        // warps/unroll), so a corruption can be bisected against them without
-        // a rebuild.
-        const char* off = std::getenv("PIE_GEMV_B200_TUNING");
-        if (off != nullptr && off[0] == '0') return 4;
         int dev = 0, major = 0;
         if (cudaGetDevice(&dev) != cudaSuccess) return 4;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
@@ -228,100 +260,6 @@ __global__ void gemv_splitk_bf16_kernel(
     out[row] = v;
 }
 
-// Three projections, one launch, one grid.
-//
-// q/k/v share an activation and differ only in their weight and row count, and
-// running them separately leaves the two small ones alone on the device. At
-// gpt-oss's decode shape the tuner measures q (N=4096) at 11.2 us and 2.1 TB/s
-// but k and v (N=512) at 6.0 us each for an eighth of the bytes -- 0.5 TB/s,
-// because 512 rows is not enough grid to cover the memory latency whatever the
-// kernel does with them. Concatenating the grids gives the small two the same
-// occupancy the large one already had, for exactly the same traffic. vLLM
-// arrives at the same place from the other direction, by fusing the weights at
-// load and issuing one GEMM.
-template <int kWarps, int kUnrollP = 1>
-__global__ void gemv3_bf16_kernel(
-    const device::bf16* __restrict__ w0,
-    const device::bf16* __restrict__ w1,
-    const device::bf16* __restrict__ w2,
-    const device::bf16* __restrict__ b0,
-    const device::bf16* __restrict__ b1,
-    const device::bf16* __restrict__ b2,
-    device::bf16* __restrict__ o0,
-    device::bf16* __restrict__ o1,
-    device::bf16* __restrict__ o2,
-    const device::bf16* __restrict__ act,
-    int n0, int n1, int n2, int K)
-{
-    int row = blockIdx.x;
-    const device::bf16* weight;
-    const device::bf16* bias;
-    device::bf16* out;
-    if (row < n0)            { weight = w0; bias = b0; out = o0; }
-    else if (row < n0 + n1)  { row -= n0;      weight = w1; bias = b1; out = o1; }
-    else                     { row -= n0 + n1; weight = w2; bias = b2; out = o2; }
-
-    const int warp = threadIdx.y;
-    const float4* w4 =
-        reinterpret_cast<const float4*>(weight + (long long)row * K);
-    const float4* x4 = reinterpret_cast<const float4*>(act);
-    const int vectors = K / 8;
-
-    // Same shape as gemv_splitk_bf16_kernel, and the same fix: written flat
-    // each lane keeps ONE load in flight. Default kUnrollP = 1 keeps the
-    // shipping code byte-identical.
-    float acc = 0.f;
-    constexpr int kU = kUnrollP;
-    const int stride = kWarps * 32;
-    int i = warp * 32 + threadIdx.x;
-    for (; i + stride * (kU - 1) < vectors; i += stride * kU) {
-        float4 wv[kU];
-        float4 xv[kU];
-        #pragma unroll
-        for (int u = 0; u < kU; ++u) {
-            wv[u] = w4[i + stride * u];
-            xv[u] = x4[i + stride * u];
-        }
-        #pragma unroll
-        for (int u = 0; u < kU; ++u) {
-            const device::bf16* wb =
-                reinterpret_cast<const device::bf16*>(&wv[u]);
-            const device::bf16* xb =
-                reinterpret_cast<const device::bf16*>(&xv[u]);
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                acc += device::bf16_to_f32(wb[j]) * device::bf16_to_f32(xb[j]);
-            }
-        }
-    }
-    for (; i < vectors; i += stride) {
-        float4 wv = w4[i];
-        float4 xv = x4[i];
-        const device::bf16* wb = reinterpret_cast<const device::bf16*>(&wv);
-        const device::bf16* xb = reinterpret_cast<const device::bf16*>(&xv);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            acc += device::bf16_to_f32(wb[j]) * device::bf16_to_f32(xb[j]);
-        }
-    }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
-    }
-    __shared__ float partial[kWarps];
-    if (threadIdx.x == 0) partial[warp] = acc;
-    __syncthreads();
-    if (warp != 0 || threadIdx.x != 0) return;
-    float total = 0.f;
-    #pragma unroll
-    for (int w = 0; w < kWarps; ++w) total += partial[w];
-    device::bf16 v = device::f32_to_bf16(total);
-    if (bias != nullptr) {
-        v = device::f32_to_bf16(device::bf16_to_f32(v) + device::bf16_to_f32(bias[row]));
-    }
-    out[row] = v;
-}
-
 bool aligned16(const void* p) {
     return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0;
 }
@@ -347,11 +285,35 @@ bool gemv_bf16(
     // inside the block is strictly more parallel for the same traffic. 2048
     // rows is 512 blocks, about four per SM, which is where the row-per-warp
     // form stops being the constraint.
-    static const int kSplitKMaxRows = [] {
-        const char* v = std::getenv("PIE_GEMV_SPLITK_MAX_ROWS");
-        const int n = (v != nullptr) ? std::atoi(v) : 4096;
-        return (n >= 0) ? n : 4096;
-    }();
+    //
+    // # 4096 is the default it always had, and it is a constant now
+    //
+    // This read `getenv("PIE_GEMV_SPLITK_MAX_ROWS")`, defaulting to 4096.
+    // That is a threshold, not a toggle, and the two sides of it are two
+    // DIFFERENT `__global__`s at different grids -- `N` blocks of `32 x 8`
+    // against `N/4` blocks of `32 x 4` -- so the variable chose which kernel
+    // ran at all. Measured on an L40S at nine shapes with wide-exponent
+    // weights (§36), split-K and row-per-warp disagree at two of them, 1 byte
+    // each: the split is over K, the reduction tree differs, and bf16 does
+    // not always absorb it. Under graph replay they also differ in TIME, in
+    // both directions and by more than the constant admits:
+    //
+    //   N        split-K<8,1>   row-per-warp<4,4>
+    //   32          1.48 us        2.47 us     split-K 1.67x
+    //   512         2.39           3.09        split-K 1.29x
+    //   2048        3.47           3.32        row-per-warp 1.05x
+    //   4096        5.32           4.73        row-per-warp 1.12x
+    //   8192        9.10           7.59        row-per-warp 1.20x
+    //
+    // So on a 142-SM L40S the crossover is near 2048 -- which is the number
+    // the paragraph above names -- and the shipping 4096 takes the slower
+    // kernel over 2048 < N <= 4096. The value is NOT changed here: 4096 is
+    // what every deployment runs today, the tables it came from were taken on
+    // a 132-SM B200, and moving it is a separate claim that wants a B200 to
+    // make. What changes is that it is a named constant with its provenance
+    // written down instead of a string read from the environment, so a replay
+    // sees the same kernel the plan does.
+    constexpr int kSplitKMaxRows = 4096;
     if (N <= kSplitKMaxRows) {
         // Warps per block and unroll depth, measured under GRAPH REPLAY at the
         // shapes these five models actually decode through.
@@ -427,173 +389,34 @@ bool gemv_bf16(
     return true;
 }
 
-// Sweep entry point for the fused QKV GEMV. Shapes must come from a model.
-bool gemv3_bf16_tuned(
-    const void* w0, const void* w1, const void* w2,
-    const void* act, void* o0, void* o1, void* o2,
-    int n0, int n1, int n2, int K, int warps, int unroll,
-    cudaStream_t stream)
-{
-    if (K <= 0 || (K % 8) != 0) return false;
-    const auto* a = static_cast<const device::bf16*>(act);
-    auto go = [&](auto W, auto U) {
-        constexpr int kW = decltype(W)::value, kU = decltype(U)::value;
-        gemv3_bf16_kernel<kW, kU>
-            <<<dim3(static_cast<unsigned>(n0 + n1 + n2)), dim3(32, kW), 0,
-               stream>>>(
-                static_cast<const device::bf16*>(w0),
-                static_cast<const device::bf16*>(w1),
-                static_cast<const device::bf16*>(w2),
-                nullptr, nullptr, nullptr,
-                static_cast<device::bf16*>(o0),
-                static_cast<device::bf16*>(o1),
-                static_cast<device::bf16*>(o2), a, n0, n1, n2, K);
-    };
-#define PIE_G3_CASE(W, U) \
-    if (warps == (W) && unroll == (U)) {                                   \
-        go(std::integral_constant<int, W>{},                               \
-           std::integral_constant<int, U>{});                              \
-        return true;                                                       \
-    }
-    PIE_G3_CASE(2,1) PIE_G3_CASE(4,1) PIE_G3_CASE(8,1) PIE_G3_CASE(16,1)
-    PIE_G3_CASE(2,2) PIE_G3_CASE(4,2) PIE_G3_CASE(8,2) PIE_G3_CASE(4,4)
-#undef PIE_G3_CASE
-    return false;
-}
+// ── DELETED: the fused QKV triple and the three sweep entry points ────
+//
+// `gemv3_bf16`, `gemv3_bf16_tuned`, `gemv_bf16_tuned` and `gemv_splitk_tuned`
+// were here, with `gemv3_bf16_kernel` above them: five `<<<>>>` over one
+// `__global__` nobody launched. §10.10's rule is that a launcher goes when its
+// WHOLE consumer set has gone, so each was checked on its own rather than as a
+// group, over `.cu/.cpp/.cuh/.hpp/.rs/.py/.txt/.cmake/.toml` in the whole
+// worktree:
+//
+//   gemv3_bf16          declared in `gemv.hpp`, defined here, called nowhere.
+//                       Its table row was deleted by §27 (no model text
+//                       lowered `cuda::gemv3`); `gemm.cpp` calls only
+//                       `gemv_bf16`.
+//   gemv3_bf16_tuned    sweep entry. No harness: `benches/` is Python against
+//                       the served engine and `driver/cuda/bench/gemv_bench.cu`
+//                       -- named in the comment that stood here -- is in no
+//                       source directory of this repository.
+//   gemv_bf16_tuned     the same, for the row-per-warp form.
+//   gemv_splitk_tuned   the same, for the split-K form.
+//
+// `scripts/csrc-reachability-audit.py` reports all four UNREACHABLE from every
+// root, and it over-approximates reachability on purpose. Its one blind spot
+// is a call through a function pointer; §37 inspected all 22 non-call
+// name-mentions in the tree and found none, and none of these four names
+// appears as anything but a declaration, a definition or prose.
+//
+// `gemv_splitk_bf16_kernel` STAYS: `gemv_bf16` launches it twice, at
+// `<4,2>` and `<8,1>`. `gemv3_bf16_kernel` went with its two callers.
 
-bool gemv3_bf16(
-    const void* w0, const void* w1, const void* w2,
-    const void* b0, const void* b1, const void* b2,
-    void* o0, void* o1, void* o2,
-    const void* act,
-    int n0, int n1, int n2, int K,
-    cudaStream_t stream)
-{
-    if (n0 <= 0 || n1 <= 0 || n2 <= 0 || K <= 0 || (K % 8) != 0) return false;
-    if (w0 == nullptr || w1 == nullptr || w2 == nullptr || act == nullptr) {
-        return false;
-    }
-    if (o0 == nullptr || o1 == nullptr || o2 == nullptr) return false;
-    if (!aligned16(w0) || !aligned16(w1) || !aligned16(w2) ||
-        !aligned16(act)) {
-        return false;
-    }
-    // Warps per block and unroll depth. Same structure as the split-K kernel
-    // -- one block per output row, warps dividing K -- and the same answer:
-    // eight warps is the worst of the configurations measured. Timed under
-    // GRAPH REPLAY at the QKV shapes these models decode through:
-    //
-    //   shape             MB    w8u1   best        gain
-    //   gptoss QKV      29.5    8.59   5.66 w2u1   34%
-    //   gemma26 QKV     46.1   12.61   7.18 w2u2   43%
-    //   qwen35 QKV      21.0    7.22   4.59 w2u2   36%
-    //   gemma31 QKV    176.2   45.02  29.42 w2u2   35%
-    //
-    // Two warps with a 2-deep unroll: best or within a few percent on all
-    // four. Hopper keeps w=8,u=1, where it was tuned.
-    if (gemv_unroll_depth() == 2) {   // same sm_100+ predicate
-        constexpr int kW = 2;
-        gemv3_bf16_kernel<kW, /*kUnrollP=*/2>
-            <<<dim3(static_cast<unsigned>(n0 + n1 + n2)), dim3(32, kW), 0,
-               stream>>>(
-                static_cast<const device::bf16*>(w0),
-                static_cast<const device::bf16*>(w1),
-                static_cast<const device::bf16*>(w2),
-                static_cast<const device::bf16*>(b0),
-                static_cast<const device::bf16*>(b1),
-                static_cast<const device::bf16*>(b2),
-                static_cast<device::bf16*>(o0),
-                static_cast<device::bf16*>(o1),
-                static_cast<device::bf16*>(o2),
-                static_cast<const device::bf16*>(act), n0, n1, n2, K);
-        return true;
-    }
-    constexpr int kSplitWarps = 8;
-    gemv3_bf16_kernel<kSplitWarps>
-        <<<dim3(static_cast<unsigned>(n0 + n1 + n2)), dim3(32, kSplitWarps), 0,
-           stream>>>(
-            static_cast<const device::bf16*>(w0),
-            static_cast<const device::bf16*>(w1),
-            static_cast<const device::bf16*>(w2),
-            static_cast<const device::bf16*>(b0),
-            static_cast<const device::bf16*>(b1),
-            static_cast<const device::bf16*>(b2),
-            static_cast<device::bf16*>(o0),
-            static_cast<device::bf16*>(o1),
-            static_cast<device::bf16*>(o2),
-            static_cast<const device::bf16*>(act),
-            n0, n1, n2, K);
-    return true;
-}
-
-
-// Sweep entry point for driver/cuda/bench/gemv_bench.cu. The row-per-warp
-// GEMV's rows-per-block and unroll depth are compile-time constants chosen on
-// an H100; this exposes the combinations so B200 can be measured rather than
-// assumed. `warps`/`unroll` outside the instantiated set fall back to the
-// shipping <4,4>.
-bool gemv_bf16_tuned(
-    const void* weight, const void* act, const void* bias, void* out,
-    int N, int K, int warps, int unroll, cudaStream_t stream)
-{
-    if (N <= 0 || K <= 0 || (K % 8) != 0) return false;
-    const auto* w = static_cast<const device::bf16*>(weight);
-    const auto* a = static_cast<const device::bf16*>(act);
-    const auto* b = static_cast<const device::bf16*>(bias);
-    auto* o = static_cast<device::bf16*>(out);
-    auto go = [&](auto W, auto U) {
-        constexpr int kW = decltype(W)::value, kU = decltype(U)::value;
-        const long long blocks = (N + kW - 1) / kW;
-        gemv_bf16_kernel<kW, kU>
-            <<<dim3(static_cast<unsigned>(blocks)), dim3(32, kW), 0, stream>>>(
-                w, a, b, o, N, K, 0.f);
-    };
-#define PIE_GEMV_CASE(W, U) \
-    if (warps == (W) && unroll == (U)) {                                  \
-        go(std::integral_constant<int, W>{},                              \
-           std::integral_constant<int, U>{});                             \
-        return true;                                                      \
-    }
-    PIE_GEMV_CASE(1, 4) PIE_GEMV_CASE(2, 4) PIE_GEMV_CASE(4, 4)
-    PIE_GEMV_CASE(8, 4) PIE_GEMV_CASE(4, 2) PIE_GEMV_CASE(4, 8)
-    PIE_GEMV_CASE(2, 8) PIE_GEMV_CASE(8, 8) PIE_GEMV_CASE(1, 8)
-    PIE_GEMV_CASE(2, 2) PIE_GEMV_CASE(8, 2) PIE_GEMV_CASE(16, 4)
-#undef PIE_GEMV_CASE
-    return false;
-}
-
-// Sweep entry point for the split-K form's warps-per-block. `kSplitWarps = 8`
-// is another constant fixed on an H100, and this kernel is 18% of
-// Qwen3.6-35B-A3B's decode step (270 calls at 4.12 us). The row-per-warp
-// kernel's unroll depth turned out to want a different value on Blackwell, so
-// this one is worth measuring rather than inheriting too.
-bool gemv_splitk_tuned(
-    const void* weight, const void* act, const void* bias, void* out,
-    int N, int K, int warps, int unroll, cudaStream_t stream)
-{
-    if (N <= 0 || K <= 0 || (K % 8) != 0) return false;
-    const auto* w = static_cast<const device::bf16*>(weight);
-    const auto* a = static_cast<const device::bf16*>(act);
-    const auto* b = static_cast<const device::bf16*>(bias);
-    auto* o = static_cast<device::bf16*>(out);
-    auto go = [&](auto W, auto U) {
-        constexpr int kW = decltype(W)::value, kU = decltype(U)::value;
-        gemv_splitk_bf16_kernel<kW, kU>
-            <<<dim3(static_cast<unsigned>(N)), dim3(32, kW), 0, stream>>>(
-                w, a, b, o, N, K, 0.f);
-    };
-#define PIE_SPLITK_CASE(W, U) \
-    if (warps == (W) && unroll == (U)) {                                   \
-        go(std::integral_constant<int, W>{},                               \
-           std::integral_constant<int, U>{});                              \
-        return true;                                                       \
-    }
-    PIE_SPLITK_CASE(2,1) PIE_SPLITK_CASE(4,1) PIE_SPLITK_CASE(8,1)
-    PIE_SPLITK_CASE(16,1) PIE_SPLITK_CASE(2,2) PIE_SPLITK_CASE(4,2)
-    PIE_SPLITK_CASE(8,2) PIE_SPLITK_CASE(16,2) PIE_SPLITK_CASE(4,4)
-    PIE_SPLITK_CASE(8,4) PIE_SPLITK_CASE(2,4)
-#undef PIE_SPLITK_CASE
-    return false;
-}
 
 }  // namespace pie_cuda_driver::kernels::gemm

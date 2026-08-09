@@ -34,6 +34,12 @@ pub mod headers;
 /// instead of through the generated shim.
 pub mod jit;
 
+/// Stage C, the other half: the rows the driver executes ITSELF — cuBLAS
+/// through `cudarc`, and the compositions whose steps it issues in order.
+/// `kernels_cuda_new::execution::Execution::Service` classified them; this
+/// is the consumer that makes the classification cost the C++ its body.
+pub mod service;
+
 /// Tier A: the arithmetic a stated [`kernels::LaunchRule`] names — what
 /// the C++ launchers computed inside `<<<>>>`.
 pub mod launch;
@@ -1182,6 +1188,22 @@ pub enum DispatchRefusal {
 /// The included file is `emit_rust_dispatch`'s output over the same
 /// tables the shim and the bindings come from — one read of one table in
 /// one build script, so the three cannot disagree with each other.
+///
+/// # The second file, and why it is a parameter rather than a second function
+///
+/// [`Arms::JitProbe`] includes `rust_dispatch_probe.rs` instead — the same
+/// arms with every device-twinned row on its JIT branch, routed or not. It is
+/// selected here rather than in a function of its own because everything above
+/// the `include!` is the scaffolding a generated arm reads (`width_of`,
+/// `jit_dims`, `w_named`, the join accessors, `is_set`), and a second copy of
+/// five hundred lines of it would be free to drift from the one the
+/// dispatcher uses — at which point the harness would be measuring the copy.
+///
+/// **This is not a fallback and cannot be one.** The two arms are chosen by
+/// the CALLER and neither reaches the other: [`dispatch`] passes
+/// [`Arms::Whole`] and nothing else, [`dispatch_jit_probe`] passes
+/// [`Arms::JitProbe`] and returns the `bool` unchanged, and the probe variant
+/// does not exist at all unless the `jit-parity` feature is on.
 #[cfg(feature = "bridge")]
 fn dispatch_generated<R: Resolver>(
     b: &BoundLaunch<'_>,
@@ -1192,6 +1214,7 @@ fn dispatch_generated<R: Resolver>(
     gdn: Option<&GdnCtx>,
     resolver: &mut R,
     rows: i32,
+    arms: Arms,
 ) -> bool {
     // What a generated branch may read about an operand: its row width,
     // its row count, and the product. Free functions rather than inline
@@ -1721,7 +1744,76 @@ fn dispatch_generated<R: Resolver>(
         .as_deref()
         .and_then(|n| resolver.weight(n))
         .unwrap_or(core::ptr::null());
-    include!(concat!(env!("OUT_DIR"), "/rust_dispatch.rs"))
+    match arms {
+        Arms::Whole => include!(concat!(env!("OUT_DIR"), "/rust_dispatch.rs")),
+        #[cfg(feature = "jit-parity")]
+        Arms::JitProbe => include!(concat!(env!("OUT_DIR"), "/rust_dispatch_probe.rs")),
+    }
+}
+
+/// Which generated `match` [`dispatch_generated`] runs.
+///
+/// One variant in every shipping build. The second exists only under
+/// `jit-parity`, which is off everywhere but the parity harness — see
+/// [`dispatch_jit_probe`].
+#[cfg(feature = "bridge")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arms {
+    /// The dispatcher: the JIT arm for a routed row, the `pie_k_*` arm for
+    /// every other stated row.
+    Whole,
+    /// The probe: the JIT arm for every row a unit hosts, and no arm at all
+    /// for a row without one.
+    #[cfg(feature = "jit-parity")]
+    JitProbe,
+}
+
+/// Fire a bound launch through the arm ROUTING WOULD EMIT, whether or not the
+/// row is routed. Answers whether there was one.
+///
+/// # What this is for
+///
+/// A row's shim entry disappears the moment its symbol is routed, so after the
+/// flip nothing in Rust can call its ahead-of-time launcher and the two paths
+/// can never be compared again. Before the flip they can — the dispatcher
+/// holds the AOT arm and this holds the JIT one — and
+/// `tests/jit_parity.rs` fires one statement through both and compares
+/// output bytes. That window is the only one there is, which is why this
+/// exists at all.
+///
+/// # Why it is not a fallback, in three ways
+///
+/// * It is compiled only under `jit-parity`, which no shipping build sets.
+/// * It never reaches the AOT path: the probe's `match` contains no `pie_k_*`
+///   call, so a row it declines is a row with no JIT arm, and the `false` says
+///   exactly that.
+/// * Nothing calls it from inside the driver. [`dispatch`] does not know it
+///   exists.
+///
+/// A `false` here is therefore never "try the other one" — it is the harness's
+/// gate 2 failing, and the harness reports it as the row having no arm.
+#[cfg(all(feature = "bridge", feature = "jit-parity"))]
+pub fn dispatch_jit_probe<R: Resolver>(
+    bound: &BoundLaunch<'_>,
+    spec: &LaunchSpec,
+    frame: Frame,
+    resolver: &mut R,
+    ctx: &DispatchCtx,
+    attn: Option<&AttnCtx>,
+    gdn: Option<&GdnCtx>,
+) -> bool {
+    let rows = i32::try_from(bound.rows.end - bound.rows.start).expect("rows fit i32");
+    dispatch_generated(
+        bound,
+        spec,
+        frame,
+        ctx,
+        attn,
+        gdn,
+        resolver,
+        rows,
+        Arms::JitProbe,
+    )
 }
 
 /// Dispatch one bound launch through its `pie_k_*` entry.
@@ -1755,7 +1847,7 @@ pub fn dispatch<R: Resolver>(
     // needs no arm, and the branch for it is emitted from the row — so
     // the hand-written match below is what is LEFT, not what is normal.
     // It shrinks as rows state their sources, which is a row's work.
-    if dispatch_generated(bound, spec, frame, ctx, attn, gdn, resolver, rows) {
+    if dispatch_generated(bound, spec, frame, ctx, attn, gdn, resolver, rows, Arms::Whole) {
         return Ok(());
     }
 

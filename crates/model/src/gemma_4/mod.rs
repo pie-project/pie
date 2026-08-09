@@ -916,21 +916,30 @@ mod tests {
             // generic llama states ONE `head_dim` and ONE `kv_heads`;
             // this row's full layers are twice as wide per head and
             // carry a quarter the KV heads, and the facts say so.
+            //
+            // Asserted rather than asked: `metal_facts` divides the
+            // rotary dim by this width, so a row that stated 0 would
+            // publish an infinite rotary fraction rather than take some
+            // other arm.
             let facts = project::metal_facts(&v.shape, v.row(), &bind);
-            if v.shape.global_head_dim > 0 {
-                two_shaped += 1;
-                assert_eq!(facts.global_head_dim, v.shape.global_head_dim);
-                assert_eq!(facts.global_kv_heads, v.shape.global_kv_heads);
-                let full = (0..v.shape.layers).find(|l| v.shape.is_full_attn(*l));
-                let slide = (0..v.shape.layers).find(|l| !v.shape.is_full_attn(*l));
-                if let (Some(full), Some(slide)) = (full, slide) {
-                    assert_ne!(
-                        facts.head_dim_at(full, v.shape.head_dim),
-                        facts.head_dim_at(slide, v.shape.head_dim),
-                        "`{}` reads one width at both layer kinds",
-                        v.id
-                    );
-                }
+            assert!(
+                v.shape.global_head_dim > 0,
+                "`{}` states no full-layer head dim, which is a llama and \
+                 not a gemma-4",
+                v.id
+            );
+            two_shaped += 1;
+            assert_eq!(facts.global_head_dim, v.shape.global_head_dim);
+            assert_eq!(facts.global_kv_heads, v.shape.global_kv_heads);
+            let full = (0..v.shape.layers).find(|l| v.shape.is_full_attn(*l));
+            let slide = (0..v.shape.layers).find(|l| !v.shape.is_full_attn(*l));
+            if let (Some(full), Some(slide)) = (full, slide) {
+                assert_ne!(
+                    facts.head_dim_at(full, v.shape.head_dim),
+                    facts.head_dim_at(slide, v.shape.head_dim),
+                    "`{}` reads one width at both layer kinds",
+                    v.id
+                );
             }
             // Two rotary bases, and `rope_theta_at` picks off the same
             // window list the widths do.

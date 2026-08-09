@@ -159,4 +159,3 @@ fn build_model(
         },
     })
 }
-

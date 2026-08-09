@@ -155,6 +155,8 @@ fn list(global: &bootstrap::GlobalArgs, prefix: Option<String>) -> Result<Answer
         .and_then(|s| match s {
             "cuda_native" | "cuda" => Some(worker::config::DriverKind::CudaNative),
             "metal" => Some(worker::config::DriverKind::Metal),
+            "vulkan" => Some(worker::config::DriverKind::Vulkan),
+            "wgpu" => Some(worker::config::DriverKind::Wgpu),
             _ => None,
         })
         .unwrap_or(default_driver_kind());
@@ -327,6 +329,8 @@ fn driver_kind(file: &toml::Value) -> worker::config::DriverKind {
         .and_then(|s| match s {
             "cuda_native" | "cuda" => Some(worker::config::DriverKind::CudaNative),
             "metal" => Some(worker::config::DriverKind::Metal),
+            "vulkan" => Some(worker::config::DriverKind::Vulkan),
+            "wgpu" => Some(worker::config::DriverKind::Wgpu),
             _ => None,
         })
         .unwrap_or(default_driver_kind())
@@ -343,6 +347,23 @@ fn default_driver_kind() -> worker::config::DriverKind {
     #[cfg(all(feature = "driver-metal", not(feature = "driver-cuda")))]
     {
         return worker::config::DriverKind::Metal;
+    }
+    #[cfg(all(
+        feature = "driver-vulkan",
+        not(feature = "driver-cuda"),
+        not(feature = "driver-metal")
+    ))]
+    {
+        return worker::config::DriverKind::Vulkan;
+    }
+    #[cfg(all(
+        feature = "driver-wgpu",
+        not(feature = "driver-cuda"),
+        not(feature = "driver-metal"),
+        not(feature = "driver-vulkan")
+    ))]
+    {
+        return worker::config::DriverKind::Wgpu;
     }
     #[allow(unreachable_code)]
     worker::config::DriverKind::CudaNative
@@ -1187,10 +1208,8 @@ name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [driver]
-type = "dummy"
-device = ["cpu"]
-vocab_size = 151936
-arch_name = "qwen3"
+type = "vulkan"
+device = ["vulkan:0"]
 "#;
         std::fs::write(&path, original).unwrap();
 
@@ -1215,10 +1234,8 @@ name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [driver]
-type = "dummy"
-device = ["cpu"]
-vocab_size = 151936
-arch_name = "qwen3"
+type = "vulkan"
+device = ["vulkan:0"]
 "#
     }
 
@@ -1322,10 +1339,8 @@ name = "default"
 model = "Qwen/Qwen3-0.6B"
 
 [driver]
-type = "dummy"          # trailing note
-device = ["cpu"]
-vocab_size = 151936
-arch_name = "qwen3"
+type = "vulkan"         # trailing note
+device = ["vulkan:0"]
 "#;
         let (written, _) = typed_by_schema(annotated, "server.port", "9090").unwrap();
         assert!(written.contains("# pie configuration"), "got: {written}");

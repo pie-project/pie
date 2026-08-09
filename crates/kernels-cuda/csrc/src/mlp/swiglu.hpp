@@ -1,109 +1,21 @@
 #pragma once
 
-// Gated MLP activations:
-//   * SwiGLU       — y = silu(gate) * up                  (Llama / Qwen / Mistral / OLMo / Phi)
-//   * GeGLU(tanh)  — y = gelu_tanh(gate) * up             (Gemma family — `gelu_pytorch_tanh`)
+// The two gated-MLP launchers the ahead-of-time archive still needs.
 //
-// `silu(x)        = x * sigmoid(x) = x / (1 + exp(-x))`
-// `gelu_tanh(x)   = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))`
+// This header used to declare sixteen — SwiGLU, GeGLU-tanh, SiTU, GPT-OSS
+// and their clamped, strided and chunked forks. §43 deleted fourteen of
+// them. TEN still have rows in `table::mlp` and `families::mlp`: every one
+// of those rows is in `device.rs`'s `JIT_DISPATCHED`, so NVRTC compiles the
+// kernel out of `mlp/swiglu.cuh` and the generated shim forwards to none of
+// the launchers. The other four had no row anywhere and no caller in any
+// language. The activations themselves are documented where they now run —
+// `mlp/swiglu.cuh` and `families::mlp` — not here.
 //
-// Element-wise. `gate`, `up`, `y` are bf16 row-major, all the same size.
+// Element-wise throughout. `gate`, `up`, `y` are bf16 row-major.
 
 #include <cuda_runtime.h>
 
 namespace pie_cuda_driver::kernels::mlp {
-
-// Standard SwiGLU. Used by Llama / Qwen / Mistral / Mixtral.
-//     y = silu(gate) * up = gate * sigmoid(gate) * up
-void swiglu_bf16(
-    const void* gate,
-    const void* up,
-    void* y,
-    int num_elements,
-    cudaStream_t stream);
-
-// GeLU-tanh-glu (Gemma).
-void geglu_tanh_bf16(
-    const void* gate,
-    const void* up,
-    void* y,
-    int num_elements,
-    cudaStream_t stream);
-
-// GPT-OSS expert activation. Distinct from SwiGLU on three counts:
-//
-//   * Asymmetric clamp on gate (upper-only): `gate' = min(gate, +limit)`.
-//   * QuickGELU-style activation: `glu = gate' * sigmoid(alpha * gate')`
-//     with `alpha = 1.702`. (Standard SwiGLU uses `alpha = 1`.)
-//   * Symmetric clamp on up plus a `+1` residual shift:
-//         up' = clamp(up, -limit, +limit)
-//         y   = (up' + 1) * glu
-//
-// Matches `transformers/models/gpt_oss/modeling_gpt_oss.py::_apply_gate`.
-// Strided variant: `gate`/`up` are read at `in_stride` (Marlin's padded
-// intermediate width) and `y` is written densely at `cols`.
-void gpt_oss_glu_strided_bf16(
-    const void* gate,
-    const void* up,
-    void* y,
-    int rows,
-    int cols,
-    int in_stride,
-    int out_stride,
-    cudaStream_t stream,
-    float limit,
-    float alpha = 1.702f);
-
-// `y_fp16`, when non-null, receives the same activation in fp16 -- what the
-// MXFP4 decode GEMV consumes -- so the separate cast kernel that used to
-// follow this one disappears.
-void gpt_oss_glu_bf16(
-    const void* gate,
-    const void* up,
-    void* y,
-    int num_elements,
-    cudaStream_t stream,
-    float limit,
-    float alpha = 1.702f,
-    void* y_fp16 = nullptr);
-
-// DeepSeek-V4 expert / shared-expert activation — vLLM's
-// `SiluAndMulWithClamp(swiglu_limit, alpha=1.0, beta=0.0)`:
-//
-//     gate' = min(gate, +limit)
-//     up'   = clamp(up, -limit, +limit)
-//     y     = gate' * sigmoid(gate') * up'
-//
-// Same clamping as `gpt_oss_glu_bf16` but with the plain SiLU
-// sigmoid slope and no `+1` shift on the up branch.
-void swiglu_clamp_bf16(
-    const void* gate,
-    const void* up,
-    void* y,
-    int num_elements,
-    float limit,
-    cudaStream_t stream);
-
-// Kimi-K3's SiTU ("Sigmoid Tanh Unit") gated activation:
-//
-//     situ(gate) = beta * tanh(gate / beta) * sigmoid(gate)
-//     y          = situ(gate) * linear_beta * tanh(up / linear_beta)
-//
-// `linear_beta <= 0` leaves the `up` branch untouched, which is the form the
-// reference takes when `activation_situ_linear_beta` is absent. Both branches
-// are evaluated in fp32 before narrowing, because the tanh saturates far
-// enough out (beta 4, linear_beta 25 on K3) that bf16 intermediates lose the
-// distinction the gate is there to make.
-//
-// Matches `SituAndMul` in Moonshot's `modeling_kimi_linear.py`.
-void situ_bf16(
-    const void* gate,
-    const void* up,
-    void* y,
-    int num_elements,
-    float beta,
-    float linear_beta,
-    cudaStream_t stream);
 
 // Elementwise `x[i] *= sigmoid(gate[i])`. Used by Qwen3.5 full-
 // attention's per-token output gate (a' = a * σ(g)).
@@ -129,85 +41,5 @@ void chunked_swiglu_bf16(
     int N, int I,
     cudaStream_t stream,
     bool gate_second = false);
-
-// Kimi-K3's routed experts fuse SiTU with the gate/up split the same way, so
-// the grouped GEMM's `[N, 2*I]` output becomes `[N, I]` in one pass:
-//
-//     y[n, i] = situ(packed[n, i]) * linear_beta * tanh(packed[n, I+i] / linear_beta)
-void chunked_situ_bf16(
-    const void* packed,  // [N, 2*I] bf16
-    void*       y,       // [N, I]   bf16
-    int N, int I,
-    float beta,
-    float linear_beta,
-    bool gate_second,
-    cudaStream_t stream);
-
-// Clamped variant of `chunked_swiglu_bf16`, matching `swiglu_clamp_bf16`:
-// [-limit, limit] before the product. DeepSeek-V4 ships `swiglu_limit`.
-void chunked_swiglu_clamp_bf16(
-    const void* packed,  // [N, 2*I] bf16 (gate first, up second)
-    void*       y,       // [N, I]   bf16
-    int N, int I, float limit,
-    cudaStream_t stream);
-
-void chunked_swiglu_strided_bf16(
-    const void* packed,  // [N, row_stride] bf16 (gate first, up second)
-    void*       y,       // [N, I] bf16
-    int N, int I, int row_stride,
-    cudaStream_t stream);
-
-// GELU-tanh variant of `chunked_swiglu_bf16` — same fused gate/up
-// split, but emits `gelu_tanh(gate) * up` instead of `silu(gate) * up`.
-// Used by Gemma-4 26B-A4B's routed-expert block (its dense MLP also
-// uses GeGLU-tanh, see `geglu_tanh_bf16`).
-//
-// `gate_second` selects the [linear|gate] order flashinfer's CUTLASS MoE
-// requires; the default is HuggingFace's [gate|up].
-void chunked_geglu_tanh_bf16(
-    const void* packed,  // [N, 2*I] bf16 (gate first, up second)
-    void*       y,       // [N, I]   bf16
-    int N, int I,
-    cudaStream_t stream,
-    bool gate_second = false);
-
-// ReLU-squared activation used by Nemotron-H MLP experts:
-//     y = relu(x) ** 2
-void relu2_bf16(
-    const void* x,
-    void* y,
-    int num_elements,
-    cudaStream_t stream);
-
-// Per-token sigmoid gate on a `[N, H]` tensor for the Qwen3.6-MoE shared
-// expert, where the gate is a single scalar per token (output of the `[N, 1]`
-// shared_expert_gate projection), FUSED with the add that always followed it:
-// `out += x * sigmoid(gate)`. Saves one kernel launch and one bf16 read/write
-// pass over the shared expert output on decode/spec-verification shapes.
-//
-// The unfused `sigmoid_scalar_gate_inplace_bf16` pair these superseded was
-// deleted once nothing called it -- see the note in swiglu.cu.
-void sigmoid_scalar_gate_add_bf16(
-    void*       out,           // bf16 [N, H], in-place add destination
-    const void* x,             // bf16 [N, H]
-    const void* scalar_gate,   // bf16 [N]
-    int N, int H,
-    cudaStream_t stream);
-
-void sigmoid_scalar_gate_strided_add_bf16(
-    void*       out,           // bf16 [N, H], in-place add destination
-    const void* x,             // bf16 [N, H]
-    const void* scalar_gate,   // bf16 [N, stride]
-    int N, int H, int stride,
-    cudaStream_t stream);
-
-
-void sigmoid_dot_scalar_gate_add_bf16(
-    const void* x,       // bf16 [N, H]
-    const void* gate_w,  // bf16 [H]
-    void*       out,     // bf16 [N, H], in-place add destination
-    const void* y,       // bf16 [N, H]
-    int N, int H,
-    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels::mlp

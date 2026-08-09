@@ -4,7 +4,7 @@ pub mod facts;
 
 use self::facts::{GptOssCudaFacts, GptOssFacts};
 use model_compiler::dsl::{self, MatW, NormW, Val, WeightRepr, matmul};
-use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
+use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 // ── gpt-oss ────────────────────────────────────────────────────────────
 
@@ -127,7 +127,6 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left = model_compiler::facts::window_left_at(&cuda.window_left, l);
             let w = GptOssLayerW::new(l, facts);
             let kv = dsl::Kv::at(t, l);
             let normed = dsl::cuda::rmsnorm(&y, &w.attn_norm);
@@ -140,46 +139,35 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
             // three extra launches per layer and a different accumulation
             // order, and nothing that only asks whether the trace LOWERS
             // would have said so.
-            let proj = |x: &Val, w: &MatW, b: &MatW| {
-                if facts.attention_bias {
-                    dsl::cuda::gemm_bias(x, w, b)
-                } else {
-                    matmul(x, w)
-                }
-            };
+            // Every gpt-oss biases q/k/v/o, the router and the experts, so
+            // every projection here is the fused epilogue and not a matmul.
+            let proj = |x: &Val, w: &MatW, b: &MatW| dsl::cuda::gemm_bias(x, w, b);
             let q = proj(&normed, &w.q_proj, &w.q_bias);
             let k = proj(&normed, &w.k_proj, &w.k_bias);
             let v = proj(&normed, &w.v_proj, &w.v_bias);
 
-            // The adapter seam -- and ONLY when the bias is not folded.
+            // NO q/v adapter seam here, and that is the honest answer
+            // rather than a limitation being hidden.
             //
             // `attn.qv`'s position rule is that the correction lands on the
-            // BASE projection, not on base + bias. When `attention_bias` is
-            // set this family folds the bias into the GEMM's own epilogue
-            // (`kernels::gemm::act_x_wt_bias_bf16`), so there is no point in the trace
-            // where the base projection exists as a value: the first thing
-            // that exists is already base + bias.
+            // BASE projection, not on base + bias. This family folds the
+            // bias into the GEMM's own epilogue
+            // (`kernels::gemm::act_x_wt_bias_bf16`), so there is no point
+            // in the trace where the base projection exists as a value: the
+            // first thing that exists is already base + bias.
             //
-            // So such a deployment states no q/v adapter seam, and that is
-            // the honest answer rather than a limitation being hidden. The
-            // rule found this -- `seam::check_plan` refused the statement
-            // with "value 2 comes from Launch", because a bias-folded
-            // projection is a `Launch` and not a `Matmul`. Stating it anyway
-            // would have put every adapter's delta on the wrong operand.
-            if !facts.attention_bias {
-                dsl::seam(q.trace(), &dsl::seam::ATTN_QV, &[&q, &v], Some(l));
-            }
+            // The rule found this -- `seam::check_plan` refused the
+            // statement with "value 2 comes from Launch", because a
+            // bias-folded projection is a `Launch` and not a `Matmul`.
+            // Stating it anyway would have put every adapter's delta on the
+            // wrong operand.
 
             // gpt-oss scales, and the driver had to be TAUGHT to: this
             // family shares llama_like's cfg, where `apply_rope_config`
             // had already resolved the scaling, and `mixtral.cpp` spelled
             // a plain `kernels::rope::rope_bf16` anyway. The declaration states
             // the kernel the fixed pass fires.
-            let (q, k) = if facts.rope_yarn_original {
-                dsl::cuda::rope_yarn_original(&q, &k)
-            } else {
-                dsl::rope(&q, &k, RopeKind::Standard)
-            };
+            let (q, k) = dsl::cuda::rope_yarn_original(&q, &k);
             dsl::cuda::write_kv_to_pages(&k, &v, &kv);
 
             // The dispatch is the ONLY thing the two classes disagree
@@ -188,16 +176,17 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
             // under the cap takes the same fused GEMVs — which is why
             // this family has a prefill class at all.
             //
-            // The sink layers ask for the LSE; a layer without sinks
-            // takes the one-value dispatch and saves the write.
+            // EVERY gpt-oss layer carries sinks, so every layer asks for
+            // the LSE and pays the per-layer write.
+            //
+            // The sliding window is not stated here. It is a per-layer
+            // ARGUMENT the driver reads out of the deployment
+            // (`LayerAttention::window`, reached as `window_left_by_layer`)
+            // rather than a kernel this text selects, which is why the
+            // alternation `is_sliding` describes leaves no mark on the plan.
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            let a = if facts.attn_sinks {
-                let (o, lse) = dsl::cuda::attention_for_lse(class, &q, &kv, facts.q_heads);
-                dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks)
-            } else {
-                dsl::cuda::attention_for(class, &q, &kv, window_left)
-                    .expect("the class states its attention")
-            };
+            let (o, lse) = dsl::cuda::attention_for_lse(class, &q, &kv, facts.q_heads);
+            let a = dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks);
 
             // Post-attention observation. On the sink layers this sees the
             // RESCALED output, not the raw dispatch result -- the rescale
@@ -209,9 +198,7 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
             // `kernels::norm::add_bias_bf16`. The one place in this layer where
             // the split spelling is the truthful one.
             y += matmul(&a, &w.o_proj);
-            if facts.attention_bias {
-                y = dsl::add_bias(&y, &w.o_bias);
-            }
+            y = dsl::add_bias(&y, &w.o_bias);
 
             // ── The MoE block ───────────────────────────────────────
             let mlp_in = dsl::cuda::rmsnorm(&y, &w.mlp_norm);

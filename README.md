@@ -65,11 +65,11 @@ pie-client submit text-completion -- --prompt "The capital of France is"
 |---|---|
 | `src/` | The `pie` CLI and the three role daemons — the invariant entry point |
 | `crates/engine/` | Inferlet runtime |
-| `crates/tensor-*/` | Tensor-program toolchain: authoring eDSL → PTIR → planning → CUDA/Metal codegen (+ the reference interpreter) |
+| `crates/tensor-*/` | Tensor-program toolchain: authoring eDSL → PTIR → planning → CUDA/Metal/Vulkan codegen (+ the reference interpreter) |
 | `crates/model*/` | What a model is: the registries, the generations, the checkpoint loader, the forward compiler |
 | `crates/controller/` | Cluster-coordination control plane (pairing · roles · health) |
 | `crates/transport/` | Worker↔worker P2P KV-tensor data plane |
-| `crates/driver*/` | Backend drivers (CUDA · Metal) + the shared execution-shell substrate |
+| `crates/driver*/` | Backend drivers (CUDA · Metal · Vulkan) + the shared execution-shell substrate |
 | `crates/*-api`, `crates/*-abi` | Boundary contracts (`client` · `controller` · `worker` · `inferlet` · `driver`) — the dependency floor |
 | `tests/inferlets/` | Curated inferlet E2E fixtures |
 | `sdk/inferlet/` | SDKs for programs that run ON pie (Python · JavaScript · tools) |

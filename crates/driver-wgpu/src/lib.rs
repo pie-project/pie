@@ -139,9 +139,17 @@
 //! [`programs`] serves the five registration verbs — programs, channels,
 //! instances, and closing the last two — none of which touches a device. Its
 //! whole body is the conversion between the ABI's records and the `driver`
-//! crate's, which already owns the plane for the other shells. What it does
-//! NOT do is RUN a program; that is a stated hole rather than a half-served
-//! verb.
+//! crate's, which already owns the plane for the other shells. It also RUNS a
+//! program, on the host, through `driver`'s reference interpreter; what drives
+//! that loop is [`frames::run_programs`] rather than the shell, because the
+//! registry is alive from the engine seam's `create` and the shell is not.
+//!
+//! [`frames`] is the engine's `FrameSubmission` turned into fires: the page
+//! CSRs converted to [`resources::Request`]s, the fields this driver does not
+//! implement refused by their own names, and the programs of each step fired
+//! over the rows it read out. It is the half of `shell::Shell::launch` that
+//! needs no adapter, which is why every one of its refusals has a test on a
+//! machine with no GPU.
 //!
 //! # This crate has no `unsafe` at all, and that is a real advantage
 //!
@@ -242,6 +250,12 @@ pub mod rope;
 // `Resolve::Buffer` every caller names.
 #[cfg(feature = "native")]
 pub mod device;
+// The engine's frame, turned into fires. Gated with the rest of the serving
+// path because it names `turns::Serving`, though nothing in it touches a
+// device -- which is what lets `frames::unserved_in` and `frames::pages_named`
+// be tested with no adapter at all.
+#[cfg(feature = "native")]
+pub mod frames;
 #[cfg(feature = "native")]
 pub mod serve;
 #[cfg(feature = "native")]

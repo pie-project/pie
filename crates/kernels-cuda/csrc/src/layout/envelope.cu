@@ -102,29 +102,10 @@ void launch_envelope_recompute_bf16(
         page_size, num_kv_heads, head_dim);
 }
 
-void launch_envelope_dot_f32(
-    const float* q,
-    const device::u16* env_min,
-    const device::u16* env_max,
-    float* score,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int p_max,
-    int live_pages,
-    cudaStream_t stream)
-{
-    if (p_max <= 0 || num_kv_heads <= 0) return;
-    constexpr int BLOCK = 128;
-    const dim3 grid(static_cast<unsigned>(p_max),
-                    static_cast<unsigned>(num_kv_heads));
-    device::dot<BLOCK><<<grid, BLOCK, 0, stream>>>(
-        q,
-        reinterpret_cast<const device::bf16*>(env_min),
-        reinterpret_cast<const device::bf16*>(env_max),
-        score,
-        num_q_heads, num_kv_heads, head_dim, p_max, live_pages);
-}
+// `launch_envelope_dot_f32` was deleted here by §43. Alone among the five it
+// had no caller at all: no shim entry, no row, and -- unlike its four
+// neighbours -- no call from `attn/kv_paged.cu`. The four that stay are held
+// by that file and by the `(page, kv_head)` grid no `LaunchRule` spells.
 
 void launch_envelope_update_appended_bf16(
     const device::u16* k_pages,

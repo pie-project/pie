@@ -55,7 +55,7 @@ impl Shell {
     pub fn register_channel(
         &mut self,
         desc: &driver_api::ChannelRegistrationPlan,
-    ) -> Result<driver_api::PieChannelEndpointBinding> {
+    ) -> Result<driver_api::ChannelBinding> {
         let spec = crate::channel::ChannelSpec {
             id: desc.channel_id,
             dtype: desc.dtype,
@@ -67,7 +67,7 @@ impl Shell {
             extern_name: desc.extern_name.clone(),
         };
         let endpoint = self.registry.register_channel(spec)?;
-        Ok(driver_api::PieChannelEndpointBinding {
+        Ok(driver_api::ChannelBinding {
             channel_id: endpoint.channel_id,
             mirror_base: endpoint.mirror_base,
             word_base: endpoint.word_base,
@@ -101,12 +101,12 @@ impl Shell {
         geometry_class: u32,
         channel_ids: &[u64],
         seeds: &[(u64, Vec<u8>)],
-    ) -> Result<driver_api::PieInstanceBinding> {
+    ) -> Result<driver_api::InstanceBinding> {
         let geometry = crate::channel::Geometry::from_wire(geometry_class)?;
         let instance_id =
             self.registry
                 .bind_instance(program_id, requested, geometry, channel_ids, seeds)?;
-        Ok(driver_api::PieInstanceBinding {
+        Ok(driver_api::InstanceBinding {
             instance_id,
             geometry_class,
             reserved0: 0,

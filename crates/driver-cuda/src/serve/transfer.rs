@@ -6,12 +6,11 @@
 //! §3 rule 3 states as a rule and `store/control.rs` on the Metal side
 //! records the bug it prevents.
 
-use super::state::{KvState, SwapPool, shell, slice_of};
-use super::{checked, guard};
+use super::guard;
+use super::state::{KvState, Shell, SwapPool};
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK,
-    PIE_STATUS_UNSUPPORTED, PieCompletion, PieDriver, PieKvCopyDesc, PiePoolResizeDesc,
-    PieStateCopyDesc,
+    PIE_STATUS_UNSUPPORTED,
 };
 
 /// KV copies across all four domains: whole-page moves (`src_page_ids` →
@@ -27,38 +26,47 @@ use driver_api::local::{
 /// pool derives its regions from `KvCacheLayout::page_buffers`, which
 /// answers per layer and per buffer, and `SwapPlan` builds the copy list
 /// against that same geometry.
-pub fn pie_cuda_copy_kv(
-    driver: *mut PieDriver,
-    copy: *const PieKvCopyDesc,
-    completion: PieCompletion,
-) -> i32 {
-    guard("pie_cuda_copy_kv", PIE_STATUS_DRIVER_ERROR, move || {
+impl Shell {
+    /// Move KV pages, within this device or across the host boundary.
+    ///
+    /// # Errors
+    ///
+    /// A plan whose ends are not both in a domain this driver owns, or a
+    /// page list the pool does not hold.
+    pub fn copy_kv(
+        &mut self,
+        copy: &driver_api::KvCopyPlan,
+        completion: driver_api::completion::CompletionTarget,
+    ) -> Result<(), i32> {
+        guard("copy_kv", Err(PIE_STATUS_DRIVER_ERROR), move || {
         use driver_api::local::PIE_MEMORY_DOMAIN_CUDA_DEVICE;
 
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let desc = match checked(copy, driver_api::local::validate_kv_copy_desc, "copy_kv") {
-            Ok(d) => d,
-            Err(status) => return status,
-        };
+        let state = self;
+        // The two rules a `Vec` does not state: both domains name a real
+        // one, and the page lists are parallel. The rest of
+        // `validate_kv_copy_desc` was `ptr/len mismatch`.
+        if let Err(why) = copy.validate() {
+            eprintln!("[driver-cuda] copy_kv: {why}");
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
+        }
+        let desc = copy;
         let host_src = desc.src_domain != PIE_MEMORY_DOMAIN_CUDA_DEVICE;
         let host_dst = desc.dst_domain != PIE_MEMORY_DOMAIN_CUDA_DEVICE;
         if host_src && host_dst {
             eprintln!("[driver-cuda] copy_kv: host-to-host moves have no device leg");
-            return PIE_STATUS_UNSUPPORTED;
+            return Err(PIE_STATUS_UNSUPPORTED);
         }
         let (Some(model), Some(_kv)) = (state.model.as_ref(), state.kv.as_ref()) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         };
-        let src_pages = slice_of(desc.src_page_ids.ptr, desc.src_page_ids.len);
-        let dst_pages = slice_of(desc.dst_page_ids.ptr, desc.dst_page_ids.len);
+        let src_pages = desc.src_page_ids.as_slice();
+        let dst_pages = desc.dst_page_ids.as_slice();
         if src_pages.len() != dst_pages.len() {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         }
-        let cells = slice_of(desc.cells.ptr, desc.cells.len);
+        let cells = desc.cells.as_slice();
         if (host_src || host_dst) && !cells.is_empty() {
-            return PIE_STATUS_INVALID_ARGUMENT; // cell moves are device-only
+            return Err(PIE_STATUS_INVALID_ARGUMENT); // cell moves are device-only
         }
         let (kv_heads, head_dim) = (
             i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
@@ -108,7 +116,7 @@ pub fn pie_cuda_copy_kv(
                         for &r in &regions {
                             ops.free_host(r);
                         }
-                        return PIE_STATUS_EXHAUSTED;
+                        return Err(PIE_STATUS_EXHAUSTED);
                     };
                     regions.push(p);
                 }
@@ -141,14 +149,14 @@ pub fn pie_cuda_copy_kv(
         // why those are made with the pool rather than here.
         let stream = match crate::device::OwnedStream::new(0) {
             Ok(s) => s,
-            Err(_) => return PIE_STATUS_DRIVER_ERROR,
+            Err(_) => return Err(PIE_STATUS_DRIVER_ERROR),
         };
         use cudarc::runtime::sys::{cudaError, cudaMemcpyAsync, cudaMemcpyKind};
         let kv_ref = state.kv.as_ref().expect("checked");
         for (s_id, d_id) in src_pages.iter().zip(dst_pages) {
             if (!host_src && *s_id >= kv_ref.num_pages) || (!host_dst && *d_id >= kv_ref.num_pages)
             {
-                return PIE_STATUS_INVALID_ARGUMENT;
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
         }
 
@@ -187,7 +195,7 @@ pub fn pie_cuda_copy_kv(
             _ => dev_geometry,
         };
         let Ok(plan) = SwapPlan::build(&geometry, direction, src_pages, dst_pages) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         };
         // A host leg rides the pool's own stream for its direction; a
         // device leg rides this call's.
@@ -233,7 +241,7 @@ pub fn pie_cuda_copy_kv(
                     // `swap.take(); old.free()` — a `cudaFreeHost` of
                     // regions those copies are still reading.
                     let _ = leg.synchronize();
-                    return PIE_STATUS_UNSUPPORTED;
+                    return Err(PIE_STATUS_UNSUPPORTED);
                 }
                 continue;
             };
@@ -257,7 +265,7 @@ pub fn pie_cuda_copy_kv(
             if code != cudaError::cudaSuccess {
                 // Same reason as the partial-move return above.
                 let _ = leg.synchronize();
-                return PIE_STATUS_DRIVER_ERROR;
+                return Err(PIE_STATUS_DRIVER_ERROR);
             }
         }
 
@@ -277,7 +285,7 @@ pub fn pie_cuda_copy_kv(
             let soff: Vec<u32> = cells.iter().map(|c| c.src_token_offset).collect();
             let (d_dp, d_doff, d_sp, d_soff) = match (up(&dp), up(&doff), up(&sp), up(&soff)) {
                 (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
-                _ => return PIE_STATUS_EXHAUSTED,
+                _ => return Err(PIE_STATUS_EXHAUSTED),
             };
             // Only the layers that OWN pages: a shared layer's cells live
             // in its source's pool, so visiting it too would copy them
@@ -341,52 +349,44 @@ pub fn pie_cuda_copy_kv(
         // pool's stream loaded, which is the state the whole fix is about.
         let (a, b) = (stream.as_ref().synchronize(), leg.synchronize());
         if a.is_err() || b.is_err() {
-            return PIE_STATUS_DRIVER_ERROR;
+            return Err(PIE_STATUS_DRIVER_ERROR);
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        if let Some(notify) = state.notify {
-            unsafe {
-                notify(
-                    state.notify_ctx,
-                    completion.wait_id,
-                    completion.target_epoch,
-                )
-            };
-        }
-        PIE_STATUS_OK
+        state
+            .broker
+            .notify(completion.wait_id, completion.target_epoch);
+        Ok(())
     })
-}
+    }
 
-/// Direct recurrent-state copies: WHOLE-SLOT d2d over the hybrid's GDN
-/// slabs (conv + recurrent, every linear layer), the C++ shape
-/// (`context.cpp` ignores the token fields — those ride for the rs
-/// BUFFER pool, spec-decode machinery). Slot ids are the engine's; the
-/// slabs grow with migration to cover them.
-pub fn pie_cuda_copy_state(
-    driver: *mut PieDriver,
-    copy: *const PieStateCopyDesc,
-    _completion: PieCompletion,
-) -> i32 {
-    guard("pie_cuda_copy_state", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let desc = match checked(
-            copy,
-            driver_api::local::validate_state_copy_desc,
-            "copy_state",
-        ) {
-            Ok(d) => d,
-            Err(status) => return status,
-        };
+    /// Direct recurrent-state copies: WHOLE-SLOT d2d over the hybrid's GDN
+    /// slabs (conv + recurrent, every linear layer), the C++ shape
+    /// (`context.cpp` ignores the token fields — those ride for the rs
+    /// BUFFER pool, spec-decode machinery). Slot ids are the engine's; the
+    /// slabs grow with migration to cover them.
+    /// Move recurrent state.
+    ///
+    /// # Errors
+    ///
+    /// No recurrent state allocated, or a range outside a slot.
+    pub fn copy_state(
+        &mut self,
+        copy: &driver_api::StateCopyPlan,
+        _completion: driver_api::completion::CompletionTarget,
+    ) -> Result<(), i32> {
+        guard("copy_state", Err(PIE_STATUS_DRIVER_ERROR), move || {
+        let state = self;
+        // `validate_state_copy_desc` stated only `ptr/len mismatch` and the
+        // header words. A `StateCopyPlan` cannot be in either state.
+        let desc = copy;
         let Some(gdn) = state.gdn.as_mut() else {
             // No recurrent family is loaded — the C++ shape: state copies
             // only mean something once the rs cache exists.
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         };
-        let ranges = slice_of(desc.slot_ranges.ptr, desc.slot_ranges.len);
+        let ranges = desc.slot_ranges.as_slice();
         let Ok(stream) = crate::device::OwnedStream::new(0) else {
-            return PIE_STATUS_DRIVER_ERROR;
+            return Err(PIE_STATUS_DRIVER_ERROR);
         };
         let alloc = crate::device::Allocator::new();
         let need = ranges
@@ -399,7 +399,7 @@ pub fn pie_cuda_copy_state(
         // did too — three copies of one rule, and a fourth caller that
         // forgot would be a capture replaying into a freed slab.
         if let Err(code) = gdn.ensure_slots(need, &mut state.fire_arrays.epoch, &alloc, &stream) {
-            return code;
+            return Err(code);
         }
         for range in ranges {
             // WHOLE SLOTS, and this comment used to name the function it
@@ -418,49 +418,48 @@ pub fn pie_cuda_copy_state(
                 i32::try_from(range.dst_slot_id).unwrap_or(-1),
             ) else {
                 eprintln!("[driver-cuda] copy_state: a range names a slot the cache lacks");
-                return PIE_STATUS_INVALID_ARGUMENT;
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
             if let Err(code) = gdn.apply(&ops, stream.as_ref()) {
-                return code;
+                return Err(code);
             }
         }
         if stream.as_ref().synchronize().is_err() {
-            return PIE_STATUS_DRIVER_ERROR;
+            return Err(PIE_STATUS_DRIVER_ERROR);
         }
-        PIE_STATUS_OK
+        Ok(())
     })
-}
+    }
 
-/// Resize the KV pool to `target_pages`, MIGRATING the surviving pages —
-/// the migration the launch-time growth deliberately skipped. Shrinks
-/// drop the tail; `map_ranges`/`unmap_ranges` (the elastic-VMM form) are
-/// accepted but the shell's pools are plain allocations, so the target
-/// page count is the whole contract here — stated, not hidden.
-pub fn pie_cuda_resize_pool(
-    driver: *mut PieDriver,
-    resize: *const PiePoolResizeDesc,
-    completion: PieCompletion,
-) -> i32 {
-    guard("pie_cuda_resize_pool", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let desc = match checked(
-            resize,
-            driver_api::local::validate_pool_resize_desc,
-            "resize_pool",
-        ) {
-            Ok(d) => d,
-            Err(status) => return status,
-        };
+    /// Resize the KV pool to `target_pages`, MIGRATING the surviving pages —
+    /// the migration the launch-time growth deliberately skipped. Shrinks
+    /// drop the tail; `map_ranges`/`unmap_ranges` (the elastic-VMM form) are
+    /// accepted but the shell's pools are plain allocations, so the target
+    /// page count is the whole contract here — stated, not hidden.
+    /// Commit or release pool pages.
+    ///
+    /// # Errors
+    ///
+    /// A target past the reserved address space, or memory the arena could
+    /// not get back.
+    pub fn resize_pool(
+        &mut self,
+        resize: &driver_api::PoolResizePlan,
+        completion: driver_api::completion::CompletionTarget,
+    ) -> Result<(), i32> {
+        guard("resize_pool", Err(PIE_STATUS_DRIVER_ERROR), move || {
+        let state = self;
+        // Same as `copy_state`: that validator stated `ptr/len mismatch` and
+        // the header words, and this plan has neither.
+        let desc = resize;
         let Ok(target) = u32::try_from(desc.target_pages) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         };
         if target == 0 {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         }
         let Some(model) = state.model.as_ref() else {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         };
         // The head dim is per LAYER on the row and no longer needed as a
         // scalar here: `PerLayer::head_dim` below takes the table.
@@ -469,7 +468,7 @@ pub fn pie_cuda_resize_pool(
 
         let stream = match crate::device::OwnedStream::new(0) {
             Ok(s) => s,
-            Err(_) => return PIE_STATUS_DRIVER_ERROR,
+            Err(_) => return Err(PIE_STATUS_DRIVER_ERROR),
         };
         let alloc = crate::device::Allocator::new();
         // BORROWED, not taken. This read `state.kv.take()`, and seven
@@ -518,7 +517,7 @@ pub fn pie_cuda_resize_pool(
             .map(|o| o.cache.layout().with_num_pages(target as i32))
         {
             Some(Ok(l)) => l,
-            Some(Err(_)) => return PIE_STATUS_INVALID_ARGUMENT,
+            Some(Err(_)) => return Err(PIE_STATUS_INVALID_ARGUMENT),
             None => {
                 let per = crate::pools::kv_cache::PerLayer {
                     head_dim: dep.attention.iter().map(|a| a.head_dim as i32).collect(),
@@ -529,7 +528,7 @@ pub fn pie_cuda_resize_pool(
                     num_kv_heads: vec![kv_heads; n_layers],
                 };
                 if per.check_sharing().is_err() {
-                    return PIE_STATUS_INVALID_ARGUMENT;
+                    return Err(PIE_STATUS_INVALID_ARGUMENT);
                 }
                 let f = state.kv_format;
                 match crate::pools::kv_cache::KvCacheLayout::plan_per_layer(
@@ -542,19 +541,19 @@ pub fn pie_cuda_resize_pool(
                     false,
                 ) {
                     Ok(l) => l,
-                    Err(_) => return PIE_STATUS_INVALID_ARGUMENT,
+                    Err(_) => return Err(PIE_STATUS_INVALID_ARGUMENT),
                 }
             }
         };
 
         let mut ops = crate::pools::kv_cache_live::LiveKvCacheOps::new(stream.as_ref(), &alloc);
         let Ok(cache) = crate::pools::kv_cache_live::KvCache::materialize(layout, &mut ops) else {
-            return PIE_STATUS_EXHAUSTED;
+            return Err(PIE_STATUS_EXHAUSTED);
         };
         let mut held = ops.into_held();
         for b in &mut held {
             if b.memset(0, stream.as_ref()).is_err() {
-                return PIE_STATUS_DRIVER_ERROR;
+                return Err(PIE_STATUS_DRIVER_ERROR);
             }
         }
         let fresh = KvState {
@@ -585,13 +584,13 @@ pub fn pie_cuda_resize_pool(
                         )
                     };
                     if code != cudaError::cudaSuccess {
-                        return PIE_STATUS_DRIVER_ERROR;
+                        return Err(PIE_STATUS_DRIVER_ERROR);
                     }
                 }
             }
         }
         if stream.as_ref().synchronize().is_err() {
-            return PIE_STATUS_DRIVER_ERROR;
+            return Err(PIE_STATUS_DRIVER_ERROR);
         }
         // A RESIZE MOVES THE KV PAGES, and a captured graph baked their old
         // addresses into every attention launch. `install_kv` is what tells
@@ -600,15 +599,10 @@ pub fn pie_cuda_resize_pool(
         // fires became capturable at all.
         crate::serve::state::install_kv(&mut state.kv, &mut state.fire_arrays.epoch, fresh);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        if let Some(notify) = state.notify {
-            unsafe {
-                notify(
-                    state.notify_ctx,
-                    completion.wait_id,
-                    completion.target_epoch,
-                )
-            };
-        }
-        PIE_STATUS_OK
+        state
+            .broker
+            .notify(completion.wait_id, completion.target_epoch);
+        Ok(())
     })
+    }
 }

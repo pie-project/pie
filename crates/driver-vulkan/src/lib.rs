@@ -270,7 +270,8 @@
 //! instead. A wrong rotary theta does NOT break it, which is recorded at the
 //! test as a real limit on what it proves.
 //!
-//! That fire found the crate's own instrument to be wrong. The cross-check//! measures a per-element RELATIVE difference and reports 1.99 on real
+//! That fire found the crate's own instrument to be wrong. The cross-check
+//! measures a per-element RELATIVE difference and reports 1.99 on real
 //! weights, which reads like a broken kernel; the largest ABSOLUTE
 //! disagreement is 0.469 on a distribution spanning 40.4, and the ratio is
 //! only large because 393_717 logits sit near zero. A tiled GEMM reduces 1024
@@ -386,6 +387,19 @@
 //! a user mask, `max_layers`, `hook_page_mask`, `dense_device_mask`, images,
 //! audio and pre-embedded rows -- and [`frames::unserved_in`] is the list.
 //!
+//! Refusing by PRESENCE is what that list originally did, and for three of the
+//! eight it was the wrong reading. The multimodal side-channels are CSRs with
+//! one boundary per request, so a text-only batch of two carries `[0, 0, 0]`
+//! in each of them: present, and naming nothing. And the engine SYNTHESISES a
+//! causal mask -- `all_true(pos + 1)` -- for every request in a frame that
+//! mixes a prefill with a device-resolved decode, because the bridge's mask
+//! view is one flattened row per query row. Both refusals fired on frames that
+//! asked for nothing this driver cannot do, and neither could be seen from a
+//! single request. What is read now is the CONTENT: a CSR's last boundary, and
+//! a mask's runs against the position of the query it belongs to. A sliding
+//! window and a mask with a hole are still refused, because dropping a real
+//! restriction silently is the failure this list exists to prevent.
+//!
 //! The reason each one is refused rather than ignored is that none of them
 //! fails loudly when dropped. A frame whose `max_layers` is ignored runs the
 //! full depth; one whose `hook_page_mask` is ignored reads the pages the
@@ -399,9 +413,19 @@
 //! [`pages::Book`] is this driver's own allocator and the right one for a
 //! server built on this crate alone. The ENGINE has its own -- it runs
 //! eviction, prefix sharing and the copy plans -- and hands down a
-//! `kv_page_indices` CSR naming physical pages it chose. Two allocators
-//! handing out page 7 is not an error anybody sees: attention reads another
-//! conversation's keys and the model stays fluent.
+//! `kv_page_indices` CSR. Two allocators handing out page 7 is not an error
+//! anybody sees: attention reads another conversation's keys and the model
+//! stays fluent.
+//!
+//! **That CSR does not name the pages it looks like it names.** Its entries
+//! are the conversation's OWN working set -- page 0 is the first page of this
+//! conversation -- and `FrameSubmission::kv_translation`, partitioned per
+//! roster row, says which pool page each one was placed in. [`envelope`] is
+//! where the two are joined, and the reason it is a module rather than a line
+//! is that skipping the translation is invisible to every gate a single
+//! conversation can pass: an identity map onto itself is consistent with
+//! itself. It took two conversations at once to see it, and what it looks like
+//! is the second one answering the first one's question fluently.
 //!
 //! So [`shell::Shell::launch`] does not touch the book at all. [`frames`]
 //! splits a frame's CSRs into this driver's [`resources::Request`]s and
@@ -436,6 +460,33 @@
 //! stage on the DEVICE: this driver advertises no codegen backend, holds the
 //! emitted kernels a registration carries, and runs the stages the
 //! interpreter can. That is the shape `driver-metal` serves too.
+//!
+//! # A decode that states none of its own geometry
+//!
+//! Every inferlet in this tree decodes with a device-carried loop, and such a
+//! step arrives with its geometry ELIDED: one placeholder token, one
+//! placeholder position, and empty page tables. The tokens do not exist when
+//! the frame is sealed, because they are what the PREVIOUS step's program put
+//! on a channel. The engine offers this shape as `GeometryClass::
+//! DecodeEnvelope`, and only to a driver that advertises the ports it will
+//! resolve.
+//!
+//! [`envelope::fill`] is that resolution: host members are copied through the
+//! page translation, envelope members take their token and position from the
+//! channels the last fire wrote, and the page span follows from the position.
+//! It costs one invariant, and the invariant is worth naming because it was
+//! deliberate: a frame of envelope steps CANNOT be converted whole and then
+//! fired, since step n+1 does not exist until step n has run. The engine seam
+//! drives those one at a time; [`shell::Shell::launch`] keeps the stronger
+//! order for a frame of ordinary host-wire steps, which is why it splits into
+//! `admit`, `prepare` and `serve`.
+//!
+//! A channel whose producer has not run yet is `Filled::Early` -- not a fault
+//! and not a fire. Its members are published as RETRY and the scheduler posts
+//! them again. Instrumenting a real `pie serve` never reached it, because the
+//! program that fills a channel runs in the same call that reads it; it is
+//! kept because `NotReady` is a state the resolver can return, and answering
+//! it with a fire would sample a distribution nobody computed.
 
 // The manifest deliberately does not take the workspace lint table, because it
 // forbids `unsafe_code` and every `ash` entry point is unsafe. The rest of that
@@ -458,6 +509,12 @@ pub mod binding;
 pub mod device;
 #[cfg(feature = "native")]
 pub mod dispatch;
+// A step's geometry, filled in from the channels the last fire wrote it into
+// and translated from working-set pages to physical ones. Gated with the
+// serving half because it reads the program registry, though it is arithmetic
+// over CSRs and needs no device.
+#[cfg(feature = "native")]
+pub mod envelope;
 // Two constants and a function over a `Device`. Ungated so that
 // `facts::PAGE_SIZE` and `facts::BACKEND` -- which an engine reads to CHOOSE a
 // backend, before it has one -- do not require Vulkan to be present.

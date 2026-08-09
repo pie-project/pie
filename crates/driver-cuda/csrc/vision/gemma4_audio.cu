@@ -292,30 +292,17 @@ void run_gemma4_audio(const AudioRawWeights& w,
     ACK(cudaStreamSynchronize(S));
 }
 
-void scatter_gemma4_audio(const Gemma4AudioInputs& ain, bf* hidden,
-                          int /*n_rows*/, int text_hidden, cudaStream_t S){
-    if(ain.weights==nullptr || ain.num_clips<=0) return;
-    const AudioRawWeights& w=*ain.weights;
-    const int n_mel=ain.n_mel;
-    for(int ci=0; ci<ain.num_clips; ++ci){
-        const long blo=ain.feature_byte_indptr_h[ci], bhi=ain.feature_byte_indptr_h[ci+1];
-        const int n_floats=(int)((bhi-blo)/4);
-        const int n_frames=n_floats/n_mel;
-        if(n_frames<=0) continue;
-        const int out_len=gemma4_audio_subsampled_len(n_frames);
-        const float* feat_h=ain.features_h + blo/4;
-        const std::uint32_t anchor=ain.anchor_rows_h[ci];
-
-        // encode → projected [out_len, text_hidden] → overwrite the anchor rows.
-        DeviceScratch scratch;
-        bf* proj_d=scratch.alloc<bf>((long)out_len*text_hidden);
-        run_gemma4_audio(w, feat_h, n_frames, n_mel, out_len, proj_d, S);
-        ACK(cudaMemcpyAsync(hidden + (long)anchor*text_hidden, proj_d,
-                            (long)out_len*text_hidden*sizeof(bf),
-                            cudaMemcpyDeviceToDevice, S));
-        ACK(cudaStreamSynchronize(S));
-    }
-}
+// `scatter_gemma4_audio` WAS HERE, and it is deleted.
+//
+// The audio twin of `scatter_gemma4_vision`: encode each clip and overwrite
+// the soft-token rows of a device `hidden` buffer in place. `encode_gemma4_
+// audio` below superseded it when gemma-4's towers moved to the encode ABI,
+// and its consumer set was empty by the same evidence -- the transitive audit
+// reports it UNREACHABLE, and a repository-wide search for the name finds its
+// declaration, its definition and nothing else.
+//
+// It launched nothing itself; what it reached, `run_gemma4_audio`, survives on
+// `encode_gemma4_audio`'s consumption and keeps all thirty-five.
 
 void encode_gemma4_audio(const Gemma4AudioInputs& ain,
                          std::uint16_t* output_rows_h,

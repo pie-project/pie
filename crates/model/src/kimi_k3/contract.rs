@@ -40,9 +40,19 @@ pub fn author_kimi_k3(b: &mut Builder<'_>) -> Result<(), Error> {
     b.shard_axis_fn(kimi_k3_shard_axis);
     b.shard_embed_tokens();
     a_log_bands(b)?;
-    // Checkpoint order, matching `kimi_k3_moe_gate_up_swapped()` on the
-    // forward side. The two have to agree: a load that swaps the halves and
-    // a matmul that does not is silently wrong output.
+    // Checkpoint order, kept -- `[gate; up]`, the order
+    // `mlp::chunked_swiglu_bf16` reads with its `gate_second` at the
+    // default. A load that swaps the halves while the matmul does not is
+    // silently wrong output rather than a load error.
+    //
+    // NOT settled, and stated here rather than assumed: the CUTLASS
+    // grouped GEMM wants the opposite (`moe/flashinfer_moe.hpp`: "fc1
+    // weights must be stacked as [up; gate]") and its enum lists `kimi`
+    // under `Swiglu`. This crate cannot tell which epilogue a given fire
+    // reaches -- `driver-cuda`'s own `gate_second` is written `false`
+    // once and read nowhere -- so the two conventions have no checkable
+    // meeting point. Whichever way it resolves, it resolves HERE and on
+    // the sibling that states `true`, together.
     bf16_expert_stacks(b, /*gate_second=*/ false)?;
     // Deliberately *not* `author_dense_contract`: its
     // `dense_fused_projection_joins` would join `self_attn.{q,k,v}_proj`
@@ -366,22 +376,20 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
         let e8m0 = Encoding::Raw(DType::E8M0);
         let gu_scale = format!("{moe}experts.gate_up.scale");
         let dn_scale = format!("{moe}experts.down.scale");
-        if let Some(gu) = b.define(
+        let gu = b.define(
             gu_scale.clone(),
             Expr::concat(0, gate_up_scales),
             e8m0.clone(),
             Some(vec![experts, 2 * local_inter, latent / GROUP]),
-        ) {
-            b.mark_internal(gu);
-        }
-        if let Some(dn) = b.define(
+        );
+        b.mark_internal(gu);
+        let dn = b.define(
             dn_scale.clone(),
             Expr::concat(0, down_scales),
             e8m0,
             Some(vec![experts, latent, local_inter / GROUP]),
-        ) {
-            b.mark_internal(dn);
-        }
+        );
+        b.mark_internal(dn);
         b.define(
             format!("{moe}experts.gate_up_proj"),
             Expr::concat(0, gate_up).scale_per_block(Expr::out(&gu_scale)),
@@ -896,8 +904,10 @@ mod tests {
 
     /// `gate_second` reorders the *stack*, and nothing else.
     ///
-    /// It has to agree with `kimi_k3_moe_gate_up_swapped()` on the forward
-    /// side: a load that swaps the halves and a matmul that does not is
+    /// It has to agree with whichever epilogue the halves reach: the
+    /// CUTLASS grouped GEMM reads gate from the SECOND half of fc1
+    /// (`moe/flashinfer_moe.hpp`) and `mlp::chunked_swiglu_bf16` reads it
+    /// from the first. A load that swaps while the matmul does not is
     /// silently wrong output, which is the whole reason the flag is passed
     /// explicitly rather than defaulted. The per-expert republish is gate
     /// over up either way, because that path reads its halves by name.
@@ -1083,10 +1093,10 @@ mod tests {
     /// An encode component declares no decoder weight, and the pass runs to
     /// the end anyway.
     ///
-    /// `define` answers `None` for everything here, which is what the two
-    /// `if let Some` arms around `mark_internal` are for: that function
-    /// *indexes* the contract, so an index that was never handed out would
-    /// panic rather than be skipped. `allow_encode_scope` gets past the
+    /// `define` answers `None` for everything here, which is why
+    /// `mark_internal` takes an `Option`: that function *indexes* the
+    /// contract, so an index that was never handed out would panic rather
+    /// than be skipped. `allow_encode_scope` gets past the
     /// first guard in `finish` so the second one — the empty contract — is
     /// what reports, which is the thing being asserted.
     #[test]

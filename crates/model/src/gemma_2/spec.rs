@@ -19,13 +19,6 @@ pub struct Gemma2AttnFacts {
     pub heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
-    /// `cfg.use_qk_norm`: gemma-2 proper has none; the flag exists
-    /// because the same loader serves later gemmas that do.
-    pub qk_norm: bool,
-    /// `cfg.query_pre_attn_scalar` — the query is scaled by a named
-    /// constant BEFORE attention, which is a launch
-    /// (`launch_scalar_mul_bf16`) and not a kernel parameter.
-    pub query_pre_attn_scale: bool,
     /// `cfg.attn_logit_softcap` — a DISPATCH parameter, not a launch:
     /// the attention kernel takes it, so nothing states it separately.
     pub attn_logit_softcap: bool,
@@ -118,8 +111,6 @@ impl Gemma2Facts {
                 heads: 16,
                 kv_heads: 8,
                 head_dim: 256,
-                qk_norm: false,
-                query_pre_attn_scale: true,
                 attn_logit_softcap: true,
             },
         }

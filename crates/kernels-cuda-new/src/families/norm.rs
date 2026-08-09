@@ -1482,7 +1482,20 @@ pub static RMSNORM_STRIDED_VEC8: Specialisation = Specialisation {
             Term::Aligned { operand: 2, bytes: 16 },
             Term::Aligned { operand: 1, bytes: 16 },
         ],
-        row: &RMSNORM_ROWS[4],
+        // `RMSNORM_ROWS[3]`, and the index moved once — which is the whole
+        // reason the list's doc says appending is the only safe operation.
+        // It said `[4]`, and `[4]` became `norm::rmsnorm_bf16` when the five
+        // `RowsPerHead` rows landed. `agrees()` caught it exactly as designed:
+        // *"arm `vec8` states RowsPerHead where the base states Rms; a
+        // specialisation chooses an instantiation, not a geometry"* — seven
+        // failures in `tests/specialise.rs`, every one naming the mismatch.
+        //
+        // The check worked; the index is what was fragile. A `by-symbol`
+        // lookup would remove the hazard, but `Specialisation` is a `static`
+        // and a name search is not `const` — so the guard below is the
+        // mitigation, and it is why this comment names the symbol as well as
+        // the slot.
+        row: &RMSNORM_ROWS[3],
         // `rmsnorm`'s seven arguments into `rmsnorm_vec8`'s eight. The only
         // difference between the two parameter lists is `y_fp16` third, which
         // `rmsnorm.cu` passes as a literal `nullptr` in exactly this slot.

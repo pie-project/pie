@@ -441,6 +441,8 @@ pub fn metal_shape(
         fused_qkv: false,
         tied_embeddings: f.tied_embeddings,
         qkv_bias: false,
+        o_bias: false,
+        router_bias: false,
     }
 }
 
@@ -522,7 +524,6 @@ pub fn metal_facts(
         // No Metal deployment publishes a fused bank; `compile_load_plan`
         // authors with `Projections::InPlace`.
         gate_up_fused: false,
-        qkv_fused: false,
         rms_eps: norm_eps,
         // The FULL layers' base is the model's, and the SLIDING layers'
         // is the second one. Stating both is what lets `rope_theta_at`
@@ -535,11 +536,12 @@ pub fn metal_facts(
         // heads and rotates 128 of its 512 channels.
         global_head_dim: f.global_head_dim,
         global_kv_heads: f.global_kv_heads,
-        full_partial_rotary: if f.global_head_dim == 0 {
-            0.0
-        } else {
-            f64::from(f.global_rotary_dim) as f32 / f.global_head_dim as f32
-        },
+        // A division, not a case. The two attention geometries ARE this
+        // family -- every gemma-4 row states a full-layer head dim, and a
+        // row answering 0 would be a llama. A guard for it is a branch no
+        // row can take, and `every_row_states_both_geometries` is what
+        // keeps that true.
+        full_partial_rotary: f64::from(f.global_rotary_dim) as f32 / f.global_head_dim as f32,
         // The ROW's, not the shape's: two gemma-4 checkpoints of one
         // geometry disagree about it, which is why `deployment` takes it
         // as a parameter and this does too.
@@ -1275,6 +1277,60 @@ mod tests {
             deployment(&f, row(true), Deployed::single()),
             deployment(&f, row(false), Deployed::single()),
             "a projection that is not V's does not change what a rank reserves"
+        );
+    }
+
+    /// `full_partial_rotary` is a FRACTION, and the shape it is divided
+    /// out of does not appear beside it — so an inverted division reads
+    /// as a plausible float and nothing downstream refuses it. The
+    /// consumer clamps with `want.min(dim)`, which turns 4.0 into "rotate
+    /// every channel" rather than into an error: a full gemma-4 layer
+    /// would rotate 512 channels where the checkpoint rotates 128, and
+    /// the model would produce fluent nonsense at long range.
+    ///
+    /// Asserted where the fraction becomes a WIDTH rather than on the
+    /// float, because the width is the thing the kernel is launched with
+    /// and the two attention geometries answer it differently.
+    #[test]
+    fn a_full_layer_rotates_a_quarter_of_its_channels_and_a_sliding_one_all_of_them() {
+        use crate::catalog::MetalBinding;
+        let f = Gemma4Facts::gemma_4_e4b();
+        let m = super::metal_facts(
+            &f,
+            RowScalars {
+                mixture: None,
+                sliding_window: E4B_WINDOW,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
+            &MetalBinding {
+                quant_group: 64,
+                quant_bits: 4,
+                moe_mxfp4: false,
+                fuse_residual_gemv: true,
+                paged_multi_batch: true,
+                qmm_multi_batch: true,
+                add_bias: false,
+            },
+        );
+        let full = (0..f.layers)
+            .find(|&l| f.is_full_attn(l))
+            .expect("gemma-4 interleaves full layers");
+        let sliding = (0..f.layers)
+            .find(|&l| !f.is_full_attn(l))
+            .expect("gemma-4 interleaves sliding layers");
+        assert_eq!(
+            m.rotary_dim_at(full, f.head_dim),
+            f.global_rotary_dim,
+            "the full layer rotates the row's stated {} of {} channels",
+            f.global_rotary_dim,
+            f.global_head_dim,
+        );
+        assert_eq!(
+            m.rotary_dim_at(sliding, f.head_dim),
+            f.head_dim,
+            "the fraction is the FULL layers' alone; a sliding layer \
+             rotates every one of its own channels"
         );
     }
 }

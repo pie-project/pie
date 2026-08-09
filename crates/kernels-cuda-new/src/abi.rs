@@ -123,16 +123,25 @@ pub fn emit_c_shim(
     includes: &[&str],
     jit: &[&'static crate::device::DeviceKernel],
 ) -> Result<String, String> {
-    // A ROW COMPILED AT RUN TIME HAS NO ENTRY HERE.
+    // A ROW COMPILED AT RUN TIME HAS NO ENTRY HERE. NEITHER HAS ONE THE
+    // DRIVER RUNS ITSELF.
     //
     // The shim exists to let Rust reach a host launcher through a C symbol.
     // A row that NVRTC compiles and `bind::jit::fire` launches has no host
     // launcher to reach, so an entry for it would forward to a `.cu` function
     // that is not there -- which is the link error that used to make deleting
     // one impossible. Skipping it here is what lets the `.cu` go.
+    //
+    // `crate::execution::RUST_SERVED` is the same mechanism for the other
+    // kind of body: a row whose C++ was one `cublasGemmEx` and whose
+    // arguments `driver-cuda::bind::service` now assembles in Rust. Skipping
+    // it here is what lets the `.cpp` go, and `gemm/gemm.cpp` -- 2,470 lines
+    // holding six migrated rows hostage, with not one `__global__` in it --
+    // is why the door was needed.
     let rows: Vec<&'static KernelSig> = stated(tables)
         .into_iter()
         .filter(|k| !jit.iter().any(|d| d.sig.symbol == k.symbol))
+        .filter(|k| !crate::execution::RUST_SERVED.contains(&k.symbol))
         .collect();
     let mut seen: Vec<(String, &str)> = Vec::new();
     let mut out = String::new();
@@ -280,6 +289,18 @@ fn bindings(tables: &[&'static [KernelSig]], by: &str, portable_only: bool) -> S
     );
     for k in stated(tables) {
         if portable_only && k.operands.iter().any(|o| o.ty.needs_mirror()) {
+            continue;
+        }
+        // A ROW THE DRIVER SERVES HAS NO ENTRY POINT TO DECLARE.
+        //
+        // `emit_c_shim` skipped it, so the archive does not define
+        // `pie_k_<entry>`, and a declaration of a symbol nothing defines
+        // compiles and fails at LINK -- which is the afternoon
+        // `driver-cuda/build.rs`'s "a declaration with no definition is only
+        // legitimate for a routed row" check exists to prevent. A routed row
+        // is exempt there because `bind::jit::fire` is its path; a served row
+        // is not exempt and must not be, so the declaration goes instead.
+        if crate::execution::RUST_SERVED.contains(&k.symbol) {
             continue;
         }
         out.push_str(&format!("    /// `{}`\n", k.symbol));
@@ -904,14 +925,66 @@ fn arg_value_variant(ty: kernels::Ty) -> Option<&'static str> {
         kernels::Ty::U32 => "crate::bind::device::ArgValue::U32",
         kernels::Ty::F32 => "crate::bind::device::ArgValue::F32",
         kernels::Ty::Usize => "crate::bind::device::ArgValue::Usize",
+        // THE TWO THE DRIVER'S ENUM DID NOT HAVE, and which the catch-all
+        // below was answering `Ptr` for.
+        //
+        // `Ty::I64` is every batched SSM row's `slot_stride_elems` and
+        // `Ty::Bool` is `moe_norm_topk`, `write_state`, `hnd_layout`. Both
+        // are host scalars and neither is an address, so the old `_ => Ptr`
+        // was not a missing variant — it was a WRONG one, and the two halves
+        // failed differently: `bool as *mut c_void` is a compile error in a
+        // generated file, while `i64 as *mut c_void` compiles, launches, and
+        // is refused by `Args::bind` at fire time as "declared I64 and was
+        // bound a pointer" — a refusal, once per launch, on a device.
+        //
+        // 26 hosted rows carry one of the two. They are marshalled here
+        // because `runtime::args::ArgValue` has had both for some time; what
+        // was missing was this driver's twin, which is now added beside them.
+        kernels::Ty::I64 => "crate::bind::device::ArgValue::I64",
+        kernels::Ty::Bool => "crate::bind::device::ArgValue::Bool",
         // The two by-value enums cross as ONE driver variant, for the reason
         // `runtime::ArgValue::U8` states: a kind says how a value is
         // marshalled, a `Ty` says what it means, and the swap the two `Ty`s
         // exist to catch is caught by `emit_device_typecheck`'s
         // function-pointer initialisation rather than by a marshalling kind.
         kernels::Ty::KvScheme | kernels::Ty::KvDType => "crate::bind::device::ArgValue::U8",
-        kernels::Ty::Stream | kernels::Ty::CublasHandle => return None,
-        _ => "crate::bind::device::ArgValue::Ptr",
+        // AND THE POINTERS, LISTED. This was `_ => Ptr`, which is the same
+        // sentence as "everything I have not thought about is an address" —
+        // and the two scalars above are what that cost. The list is
+        // `runtime::args::is_pointer`'s, which is the side that CHECKS it:
+        // a row whose operand is pointer-shaped there and not here loses its
+        // arm (loud, at the build gate), and one that is pointer-shaped here
+        // and not there is refused by `Args::bind` (loud, at the fire). The
+        // duplication is paid because layer 2 may not depend on the runtime.
+        kernels::Ty::Buf
+        | kernels::Ty::BufMut
+        | kernels::Ty::I32s
+        | kernels::Ty::I32sMut
+        | kernels::Ty::I64s
+        | kernels::Ty::U32s
+        | kernels::Ty::U32sMut
+        | kernels::Ty::U8s
+        | kernels::Ty::U8sMut
+        | kernels::Ty::U16s
+        | kernels::Ty::U16sMut
+        | kernels::Ty::I8s
+        | kernels::Ty::I8sMut
+        | kernels::Ty::Bf16s
+        | kernels::Ty::F16s
+        | kernels::Ty::F32s
+        | kernels::Ty::F32sMut
+        | kernels::Ty::BufArray
+        | kernels::Ty::BufArrayMut
+        | kernels::Ty::BufArrayOut
+        | kernels::Ty::BufArrayOutMut
+        | kernels::Ty::U8Array
+        | kernels::Ty::I32Array => "crate::bind::device::ArgValue::Ptr",
+        // EVERYTHING ELSE IS A ROW THAT IS NOT READY, and saying so is the
+        // point: a `Stream` belongs to the launch rather than to the argument
+        // list, and a by-value view or a `Dtype` enum has no marshalling here
+        // at all. `None` skips the JIT branch, `routed_rows_have_an_arm`
+        // refuses the symbol at build time, and the row is left where it is.
+        _ => return None,
     })
 }
 
@@ -1353,9 +1426,79 @@ pub fn emit_rust_dispatch(
     tables: &[&'static [KernelSig]],
     jit: &[&'static crate::device::DeviceKernel],
 ) -> String {
-    let mut out = String::from(
-        "// GENERATED by `kernels_cuda_new::abi::emit_rust_dispatch` — DO NOT EDIT.\n\
-         //\n\
+    emit_dispatch(tables, jit, Arms::Whole)
+}
+
+/// The SAME arms, JIT ONLY — the half a parity harness needs before a row is
+/// routed.
+///
+/// # Why this exists, and why it is the same function underneath
+///
+/// Routing a row DELETES its shim entry ([`emit_c_shim`] skips what
+/// [`crate::device::JIT_DISPATCHED`] names), so the moment a row is routed
+/// there is no way left for Rust to call its ahead-of-time launcher. The
+/// comparison that would have proved the flip safe becomes unbuildable the
+/// instant the flip lands, which is why nothing had ever run it: the AOT arm
+/// and the JIT arm cannot both exist for one symbol **in one dispatcher**.
+///
+/// They can exist in two. This emits a second `match` over the same tables in
+/// which every row with a device twin takes the JIT branch and every other row
+/// is ABSENT — no `pie_k_*` call, so the probe cannot silently measure the AOT
+/// path twice, which is the one way a parity harness can certify nothing while
+/// passing. The production dispatcher is unchanged and still holds the AOT arm
+/// for an unrouted row, so one binary can fire one statement both ways.
+///
+/// **It is not a fallback and cannot become one.** Nothing chains the two:
+/// `dispatch` never calls this, the probe never calls `dispatch`, and a symbol
+/// this declines gets `false` rather than a second attempt. The driver
+/// compiles it behind its own feature, off in every shipping build.
+///
+/// The arm text is produced by the identical code path — same guard, same
+/// staging, same `jit_dims` call, same operand expressions — because it is the
+/// same loop with one `continue` added. That is what makes the harness's claim
+/// worth anything: what it fires is what routing will emit, and
+/// `driver-cuda/build.rs` asserts the two files agree arm for arm on every
+/// routed symbol rather than leaving that to this paragraph.
+#[must_use]
+pub fn emit_rust_dispatch_probe(
+    tables: &[&'static [KernelSig]],
+    jit: &[&'static crate::device::DeviceKernel],
+) -> String {
+    emit_dispatch(tables, jit, Arms::JitOnly)
+}
+
+/// Which arms [`emit_dispatch`] writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arms {
+    /// The dispatcher: a JIT arm for a routed row, the `pie_k_*` arm for
+    /// every other stated row.
+    Whole,
+    /// The probe: the JIT arm and nothing else.
+    JitOnly,
+}
+
+fn emit_dispatch(
+    tables: &[&'static [KernelSig]],
+    jit: &[&'static crate::device::DeviceKernel],
+    arms: Arms,
+) -> String {
+    let mut out = String::from(match arms {
+        Arms::Whole => "// GENERATED by `kernels_cuda_new::abi::emit_rust_dispatch` — DO NOT EDIT.\n",
+        // Named apart because the two files are the same shape and only one
+        // of them is the dispatcher: a reader who opens the wrong one and
+        // finds a JIT arm for an unrouted row would read it as a routing
+        // that never happened.
+        Arms::JitOnly => {
+            "// GENERATED by `kernels_cuda_new::abi::emit_rust_dispatch_probe` — DO NOT EDIT.\n\
+             //\n\
+             // THE PROBE, not the dispatcher: every row with a device twin\n\
+             // takes its JIT arm here whether or not it is routed, and a row\n\
+             // without one is absent rather than sent to `pie_k_*`. Nothing\n\
+             // in a shipping build includes this file.\n"
+        }
+    });
+    out.push_str(
+        "//\n\
          // One branch per kernel! row that states both its operand types\n\
          // and where each argument comes from. A row missing either is\n\
          // absent here and belongs to a hand-written arm until it states\n\
@@ -1389,6 +1532,15 @@ pub fn emit_rust_dispatch(
         // the fallthrough for a switched row is `UnknownKernel`. So `k` names
         // the symbol and `g` states the shape.
         let device = jit.iter().find(|d| d.sig.symbol == k.symbol);
+        // THE PROBE HAS NO OTHER ARM. A row with no device twin is left out
+        // of the probe entirely rather than given its `pie_k_*` arm: a
+        // harness that fired the AOT launcher on both sides would compare a
+        // buffer with itself and report parity for a row that has no JIT
+        // path at all. `false` from the probe says "no JIT arm", which is a
+        // gate 2 failure and is what the harness must see.
+        if arms == Arms::JitOnly && device.is_none() {
+            continue;
+        }
         let g: &'static KernelSig = device.map_or(k, |d| d.sig);
 
         // THE ARITY THE SOURCES ASK FOR, as part of the match — the C++
@@ -1787,6 +1939,32 @@ pub fn emit_rust_dispatch(
                     } else {
                         rust_bind_expr(o)?
                     };
+                    // AND THEN CAST TO THE ADDRESS TYPE, because "crosses as
+                    // an address" was true of the expressions this had seen
+                    // and not of the ones it had not.
+                    //
+                    // Every routed row until now bound its pointers from
+                    // `b.args[..].ptr`, which is already `*mut c_void`, so
+                    // the paragraph above described the code correctly by
+                    // accident. The first row reading a DRIVER CONTEXT field
+                    // instead -- `layout::gather_bf16_rows`, whose `I32s`
+                    // operand resolves to `ctx.sampling_indices: *const i32`
+                    // -- produced `ArgValue::Ptr(*const i32)` and a `types
+                    // differ in mutability` error in a generated file.
+                    //
+                    // A cast rather than a wider `ArgValue`: the variant
+                    // means "this operand crosses as an address", and an
+                    // address has one type. Constness is not lost, it is
+                    // checked somewhere better -- `Args::bind` tests it
+                    // against the ROW, which is where the claim that an
+                    // operand is read-only actually lives, and which catches
+                    // the mismatch a `*const`-preserving variant would only
+                    // catch when the two happened to meet.
+                    let expr = if variant.ends_with("::Ptr") {
+                        format!("({expr}) as *mut ::core::ffi::c_void")
+                    } else {
+                        expr
+                    };
                     Some(format!("{variant}({expr})"))
                 })
                 .collect()
@@ -1830,6 +2008,34 @@ pub fn emit_rust_dispatch(
             out.push_str(&format!(
                 "{pattern}{guard} => {{\n{stage}{}\n}}\n",
                 call.join("\n")
+            ));
+            continue;
+        }
+        // THE THIRD ARM: A ROW THE DRIVER EXECUTES ITSELF.
+        //
+        // Same `pattern`, same `guard`, same `stage`, same `binds` — built by
+        // the same code, from the same operand list, a dozen lines above.
+        // Only the callee's path differs, and that is the whole design: the
+        // model compiler must not be able to tell whether a symbol is cuBLAS
+        // or a JIT'd kernel, and the one thing that decides which arm a row
+        // gets is a list of strings no lowering reads.
+        //
+        // `ctx` leads because the SERVICE carries what the service needs. The
+        // rows these arms serve used to state `handle: CublasHandle <-
+        // Source::Ctx("cublas")` as their first operand, and that spelling
+        // put one backend's library type in a vocabulary two backends share
+        // — zero Metal rows name it. The handle did not disappear; it moved
+        // to where it was always coming from.
+        //
+        // `true` unconditionally, for `bind::jit::fire`'s reason: the row has
+        // no shim entry, so there is no hand arm to fall through to, and a
+        // `false` here would report a refusal as an unknown kernel.
+        if crate::execution::RUST_SERVED.contains(&k.symbol) {
+            let served = entry_name(k.symbol);
+            let served = served.strip_prefix(PREFIX).unwrap_or(&served);
+            out.push_str(&format!(
+                "{pattern}{guard} => {{\n{stage}    unsafe {{ crate::bind::service::{served}(\n        ctx,\n        {},\n    ) }};\n    true\n}}\n",
+                binds.join(",\n        "),
             ));
             continue;
         }

@@ -46,7 +46,6 @@ int flashinfer_cutlass_moe_min_rows();
 /// crossover is far lower than its weight-traffic model suggests. Each model
 /// passes its own compiled-in default; `PIE_MOE_GEMV_MAX_TOKENS` overrides it,
 /// and `0` disables the GEMV path entirely.
-int moe_gemv_max_tokens(int fallback);
 
 std::size_t flashinfer_cutlass_moe_workspace_bytes(
     MoeActivation activation,

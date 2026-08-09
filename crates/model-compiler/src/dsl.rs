@@ -111,9 +111,19 @@ pub enum WeightRepr {
 }
 
 /// Where a scaled weight's scales apply.
+///
+/// Two layouts, mirroring `model_loader::types::QuantGranularity` exactly —
+/// which is the only vocabulary a checkpoint can state a scale in, whether it
+/// SHIPS the scales (`contract::Scales::granularity`) or the loader encodes
+/// them (`plan/build.rs::ScaleLayout::for_encode`). A third variant,
+/// `PerTensor`, was here and named `gemm::act_x_wt_tensor_scaled`; it had no
+/// constructor anywhere in the workspace outside this file, and no checkpoint
+/// format in the tree could have grown one without the loader growing a
+/// granularity first. It is deleted rather than left as a route nothing can
+/// take. The C++ entry point stays in `kernels-cuda/csrc/src/gemm/gemm.hpp`,
+/// so re-stating it is a variant, an arm and a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ScaleLayout {
-    PerTensor,
     PerChannel,
     PerGroup,
 }
@@ -186,10 +196,6 @@ impl MatW {
                 layout: ScaleLayout::PerChannel,
                 ..
             } => Some("gemm::act_x_wt_channel_scaled"),
-            WeightRepr::Scaled {
-                layout: ScaleLayout::PerTensor,
-                ..
-            } => Some("gemm::act_x_wt_tensor_scaled"),
         }
     }
 }
@@ -281,6 +287,14 @@ pub struct Layer {
     pub k_bias: MatW,
     pub v_bias: MatW,
     pub o_proj: MatW,
+    /// The attention landing's bias, for a family that publishes one.
+    ///
+    /// gpt-oss does, and its width is the model's, not the projection's --
+    /// `o_proj` maps heads back to `hidden`, so the bias is one number per
+    /// hidden channel. Separate from [`Layer::o_proj`] rather than folded
+    /// into a `gemm_bias` because the folded form is a different kernel with
+    /// a different accumulation order; see that function's doc.
+    pub o_bias: MatW,
     /// The PACKED gate‖up bank, for a deployment whose loader join
     /// materialised one.
     pub gate_up: MatW,
@@ -298,6 +312,14 @@ pub struct Layer {
     /// deployment simply never names these, exactly as a deployment whose
     /// loader did not join gate and up never names `gate_up`.
     pub router: MatW,
+    /// The router's bias -- one number per EXPERT, added to the logits
+    /// before the top-k.
+    ///
+    /// The most consequential bias in a mixture and the least forgiving. A
+    /// projection bias shifts an activation the next norm largely absorbs;
+    /// this one shifts a ranking, so a text that drops it does not compute
+    /// a slightly different answer, it routes to different experts.
+    pub router_bias: MatW,
     /// The expert banks. `MatW::name` carries no expert index -- the routed
     /// kernel indexes the bank by the slot it read, which is what makes it
     /// ONE weight rather than `n_experts` of them.
@@ -476,11 +498,13 @@ impl M {
             k_bias: mat("k_bias", f.kv_width),
             v_bias: mat("v_bias", f.kv_width),
             o_proj: mat("o_proj", f.hidden),
+            o_bias: mat("o_bias", f.hidden),
             gate_up: mat("gate_up", 2 * f.intermediate),
             gate_proj: mat("gate_proj", f.intermediate),
             up_proj: mat("up_proj", f.intermediate),
             down: mat("down", f.hidden),
             router: mat("router", f.n_experts),
+            router_bias: mat("router_bias", f.n_experts),
             expert_gate: mat("expert_gate", f.moe_intermediate),
             expert_up: mat("expert_up", f.moe_intermediate),
             expert_down: mat("expert_down", f.hidden),

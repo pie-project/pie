@@ -2033,7 +2033,7 @@ pub async fn copy_into_inner<C: FireContext>(
         .zip(kv_move_src_pages.into_iter().zip(src_tok_idx))
         .map(
             |((dst_page_id, dst_token_offset), (src_page_id, src_token_offset))| {
-                ::driver_api::PieKvMoveCell {
+                ::driver_api::KvMoveCell {
                     dst_page_id,
                     dst_token_offset,
                     src_page_id,

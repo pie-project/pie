@@ -129,10 +129,20 @@ fn every_descriptor_is_dereferenced_through_its_validator() {
 fn every_descriptor_entry_point_calls_checked() {
     let src = shell_source();
     let calls = src.matches("checked(").count();
-    // Eleven entry points take a descriptor; `checked(` also appears in
-    // its own definition, so the floor is the count of entry points.
+    // Five entry points still take a C DESCRIPTOR: create, load_model,
+    // register_channel, bind_instance and the create out-params. `checked(`
+    // also appears in its own definition, so the floor is the count of those
+    // entry points.
+    //
+    // It was eleven. The frame verb, the three transfer verbs, the encode
+    // verb and the program verb take owned plans now, which have no pointer
+    // to check — `launch_validates_its_frame`, `copy_kv_validates_its_plan`
+    // and `encode_validates_its_plan` below are the floors that keep the
+    // three with rules of their own honest. The program verb needs none:
+    // `validate_program_desc` stated an `abi_version` and two reserved words
+    // and nothing else, all three of which a `ProgramRegistration` lacks.
     assert!(
-        calls >= 10,
+        calls >= 4,
         "only {calls} `checked(` sites — an entry point stopped validating \
          its descriptor, or the helper was renamed and this floor was not"
     );
@@ -173,14 +183,8 @@ fn no_validator_is_deferred() {
     for validator in [
         "validate_driver_create_desc",
         "validate_model_load_desc",
-        "validate_program_desc",
         "validate_channel_desc",
         "validate_instance_desc",
-        "validate_frame_desc",
-        "validate_encode_desc",
-        "validate_kv_copy_desc",
-        "validate_state_copy_desc",
-        "validate_pool_resize_desc",
     ] {
         // The NAME, not a call: a validator reaches `checked` as a value
         // (`checked(p, local::validate_x, "…")`) or inside a closure when
@@ -194,6 +198,65 @@ fn no_validator_is_deferred() {
              the ones this shell used to hand-roll at 51 sites"
         );
     }
+}
+
+/// The launch entry point validates its frame.
+///
+/// It is separate from `no_validator_is_deferred` because the frame is the
+/// one verb that no longer takes a C descriptor: `validate_frame_desc` and
+/// `checked` do not apply to a `FrameSubmission`, which owns its `Vec`s and
+/// has no pointer to be null. The RULES did not go anywhere — they are
+/// `FrameSubmission::validate`, and `driver-api`'s `validation_tests` pin
+/// each one — but the call site here is what keeps them on the path a
+/// launch actually takes, which is the whole point of
+/// `validators-unskippable`.
+#[test]
+fn launch_validates_its_frame() {
+    let src = shell_source();
+    assert!(
+        src.contains("frame.validate()"),
+        "`pie_cuda_launch` no longer calls `frame.validate()` — the frame \
+         verb stopped validating, and its rules (roster bounds, one terminal \
+         cell per member and distinct across steps, the CSRs, the \
+         recurrent-state parallelism) are checked nowhere else on this path"
+    );
+}
+
+/// The KV-copy verb validates its plan.
+///
+/// The other two transfer verbs need no floor: `validate_state_copy_desc`
+/// and `validate_pool_resize_desc` stated nothing but `ptr/len mismatch` and
+/// the header words, so an owned plan carries their whole content in its
+/// type. `copy_kv` had two rules that a `Vec` does not state — both domains
+/// name a real one, and the page lists are parallel — and this is what keeps
+/// them on the path a copy takes.
+#[test]
+fn copy_kv_validates_its_plan() {
+    let src = shell_source();
+    assert!(
+        src.contains("copy.validate()"),
+        "`pie_cuda_copy_kv` no longer calls `copy.validate()` — a copy with \
+         an unknown memory domain, or with more source pages than \
+         destinations, is checked nowhere else on this path"
+    );
+}
+
+/// The encode verb validates its plan.
+///
+/// The heaviest of the three: `validate_encode_desc` was mostly NOT about
+/// the C shape. It checks that the image and audio planes describe the same
+/// counts, that each byte payload is `f32`-aligned and EXACTLY partitioned
+/// by its CSR, and that a plane with no anchors carries no payload — none of
+/// which a `Vec` states. All of it is `MediaEncodePlan::validate`.
+#[test]
+fn encode_validates_its_plan() {
+    let src = shell_source();
+    assert!(
+        src.contains("encode.validate()"),
+        "`pie_cuda_encode` no longer calls `encode.validate()` — a media \
+         payload with no anchor to attach it to, a misaligned pixel buffer, \
+         or a CSR that does not partition its bytes is checked nowhere else"
+    );
 }
 
 /// Every ABI entry point catches its own panics.

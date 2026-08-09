@@ -4708,9 +4708,12 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         vocab: VOCAB as u32,
         tied_embeddings: false,
         swiglu_limit: 7.0,
-        attention_bias: true,
-        rope_yarn_original: true,
-        attn_sinks: true,
+        // `attention_bias`, `rope_yarn_original` and `attn_sinks` were fields
+        // here until `78facaf25` -- "three flags both rows answered the same
+        // way" -- deleted them from `GptOssFacts`. This literal was not
+        // updated with them and the test has not compiled since. Removed
+        // here, unrelated to §45, because a target that does not build is a
+        // gate that does not run.
     };
     let plan = gpt_oss_cuda(
         &facts,

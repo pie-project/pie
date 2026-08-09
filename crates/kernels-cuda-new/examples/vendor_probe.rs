@@ -235,7 +235,8 @@ namespace fi = ::flashinfer;
     /// constants, and the launcher refuses any shape that does not match them.
     const MAMBA: Candidate = Candidate {
         row: "ssm::flashinfer_mamba_ssu_bf16",
-        launcher: "kernels-cuda/csrc/src/ssm/flashinfer_mamba.cu:30",
+        launcher: "deleted by new-horizon.md §43 -- nothing reached it; \
+                   this probe and csrc/vendor are what make it cheap to re-add",
         roots: &["flashinfer/mamba/selective_state_update.cuh"],
         source: r#"
 #include <cstdint>
@@ -269,12 +270,12 @@ namespace fm = ::flashinfer::mamba;
     /// **Row 2.** Multi-GPU, staged from upstream.
     ///
     /// `AllReduceFusionPattern::kARResidualRMSNorm` and `fp32_acc = true` are
-    /// what `custom_all_reduce.cu:694-699` sets; `NRanks` is a template
+    /// what `custom_all_reduce.cu:656-661` sets; `NRanks` is a template
     /// argument the launcher takes from `world_size_`, and 2 is the smallest
     /// value the dispatch instantiates.
     const TRTLLM: Candidate = Candidate {
         row: "comm::all_reduce_residual_rmsnorm_bf16",
-        launcher: "kernels-cuda/csrc/src/comm/custom_all_reduce.cu:184-187, :661",
+        launcher: "kernels-cuda/csrc/src/comm/custom_all_reduce.cu:153-158, :623",
         roots: &["flashinfer/comm/trtllm_allreduce_fusion.cuh"],
         source: r#"
 #include <cuda_bf16.h>

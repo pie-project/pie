@@ -510,6 +510,7 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
 
     let stated = stated_rope_scaling(o);
     let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
+    let flag = |v: &Value, k: &str| v.get(k).and_then(Value::as_bool);
 
     match (stated, dep.rope_scaling) {
         (None, None) => {}
@@ -562,6 +563,7 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
                 beta_slow,
                 attention_factor,
                 original_max_position,
+                truncate,
             }),
         ) => {
             if kind != "yarn" {
@@ -586,6 +588,13 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
                 num(&v, "attention_factor"),
                 attention_factor,
             );
+            // Compared only when the config states it, for the same reason
+            // as `attention_factor` -- but the two omissions mean different
+            // things. An absent `attention_factor` is a formula the row
+            // evaluates; an absent `truncate` is HF's `true`, and the whole
+            // corpus omits it except gpt-oss, which is the family whose
+            // ramp would move if a row copied the majority.
+            c.bool("rope_scaling.truncate", flag(&v, "truncate"), truncate);
         }
     }
 }

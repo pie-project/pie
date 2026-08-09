@@ -141,24 +141,30 @@ fn block_scales_to_fp32(b: &mut Builder<'_>) -> Result<(), Error> {
         // dropped. Both shapes are in hand, so the block size is read off
         // them instead of assumed.
         let weight_shape = companion.shape.clone();
-        if let Some(defined) = defined
-            && let (Some(&scale_cols), Some(&weight_cols)) =
-                (shape.last().filter(|&&c| c > 0), weight_shape.last())
-        {
-            let block = weight_cols / scale_cols;
-            if block > 0 {
-                b.set_scales(
-                    defined,
-                    Scales {
-                        of: b.output_name(&weight),
-                        granularity: QuantGranularity::PerGroup,
-                        group_size: block as u32,
-                        channel_axis: 0,
-                        form: ScaleForm::F32Factors,
-                    },
-                );
-            }
-        }
+        let scale_cols = *shape.last().unwrap_or(&0);
+        let weight_cols = *weight_shape.last().unwrap_or(&0);
+        // A pair that states no block size is refused rather than dropped.
+        // Dropping it publishes the fp8 weight with NOTHING to scale it by,
+        // and fp8 read as if it were already fp32-bound is not a small
+        // error -- it is every number in that tensor off by its own
+        // exponent, silently.
+        let Some(block) = weight_cols.checked_div(scale_cols).filter(|&b| b > 0) else {
+            return fail(format!(
+                "deepseek_v4 block scales: '{}' is {shape:?} beside a \
+                 {weight_shape:?} weight, which states no block size",
+                raw.name
+            ));
+        };
+        b.set_scales(
+            defined,
+            Scales {
+                of: b.output_name(&weight),
+                granularity: QuantGranularity::PerGroup,
+                group_size: block as u32,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            },
+        );
         b.consume(id);
     }
     Ok(())
@@ -186,11 +192,6 @@ fn bf16_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
     let mut layer = 0u32;
     loop {
         let ffn = format!("{}{layer}.ffn.", b.decoder_layer_prefix_value());
-        if b.find(&b.source_name(&format!("{ffn}experts.0.w1.weight")))
-            .is_none()
-        {
-            break;
-        }
         let mut gate_up = Vec::new();
         let mut gate_up_scales = Vec::new();
         let mut down = Vec::new();
@@ -307,9 +308,12 @@ fn bf16_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
             consumed.extend(parts.iter().map(|part| part.id));
             expert += 1;
         }
+        // The end of the bank, stated once. This used to be probed twice
+        // -- here and by the loop above, on the same name -- which made
+        // one of the two dead. A layer with no expert 0 is the layer past
+        // the last MoE one, and the walk stops.
         if gate_up.is_empty() {
-            layer += 1;
-            continue;
+            break;
         }
         let experts = gate_up.len() as i64;
 
@@ -340,22 +344,20 @@ fn bf16_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
         let e8m0 = Encoding::Raw(DType::E8M0);
         let gu_scale = format!("{ffn}experts.gate_up.scale");
         let dn_scale = format!("{ffn}experts.down.scale");
-        if let Some(gu) = b.define(
+        let gu = b.define(
             gu_scale.clone(),
             Expr::concat(0, gate_up_scales),
             e8m0.clone(),
             Some(vec![experts, 2 * local_inter, hidden / GROUP]),
-        ) {
-            b.mark_internal(gu);
-        }
-        if let Some(dn) = b.define(
+        );
+        b.mark_internal(gu);
+        let dn = b.define(
             dn_scale.clone(),
             Expr::concat(0, down_scales),
             e8m0,
             Some(vec![experts, hidden, local_inter / GROUP]),
-        ) {
-            b.mark_internal(dn);
-        }
+        );
+        b.mark_internal(dn);
         b.define(
             format!("{ffn}experts.gate_up.weight"),
             Expr::concat(0, gate_up).scale_per_block(Expr::out(&gu_scale)),
@@ -473,21 +475,11 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
             }
             experts += 1;
         }
-        // UNREACHABLE TODAY, and kept for when it is not. The outer
-        // probe above and this loop's own probe are the same name --
-        // `{ffn}experts.0.w1.weight` -- so reaching here at all means
-        // the first iteration succeeded and `experts >= 1`. A control
-        // that deleted this branch changed nothing, which is how that
-        // was found.
-        //
-        // It stays because the check below is an EQUALITY against the
-        // row's count: if the two probes ever diverge, a dense layer
-        // would arrive here with zero experts and be refused for
-        // disagreeing with a row it never contradicted.
-        if experts == 0 {
-            layer += 1;
-            continue;
-        }
+        // `experts >= 1` here, always: the probe that opened this layer
+        // and this loop's own probe are the same name, so reaching the
+        // count at all means the first iteration succeeded. There is no
+        // zero case to handle, and a branch for one would be a branch no
+        // input can enter.
 
         // The loops above probe a NAME to decide whether expert `e`
         // exists, so a checkpoint missing exactly that name does not look
@@ -1310,12 +1302,11 @@ mod tests {
     /// fire there -- a dense layer stacking zero experts against a row
     /// that states 64 is the normal case, not a short bank.
     ///
-    /// The two passes reach that answer differently, and only one of
-    /// them is testable here. `bf16_expert_stacks` really does walk into
-    /// the layer and find nothing. `streamed_expert_groups` breaks out
-    /// of its OUTER loop first, so its own `experts == 0` branch cannot
-    /// fire -- a control that deleted it changed nothing. The branch is
-    /// kept and says so where it lives.
+    /// Both passes reach that answer by the same single probe: a layer
+    /// with no `experts.0.w1.weight` is the layer past the last MoE one,
+    /// and the walk stops. Neither pass carries a separate zero-expert
+    /// branch, because reaching the count at all means the probe found
+    /// expert 0.
     #[test]
     fn a_dense_layer_is_passed_over_rather_than_counted_against_the_row() {
         for streaming in [false, true] {
@@ -1355,6 +1346,161 @@ mod tests {
                     "a missing {suffix} at streaming={streaming}: {why}"
                 );
             }
+        }
+    }
+
+    /// The walk stops at the first layer with no experts, and does not
+    /// resume past it.
+    ///
+    /// The layer index is read off the NAMES that are present, so "no
+    /// expert 0 here" is the only end-of-bank signal there is. A walk that
+    /// skipped the gap and kept going would stack a later layer's experts
+    /// into a slab the forward pass indexes by a layer number that no
+    /// longer matches.
+    #[test]
+    fn the_expert_walk_stops_at_the_first_layer_with_none() {
+        for streaming in [false, true] {
+            // Experts at layer 0 and layer 2, nothing at layer 1.
+            let mut ck = moe(1);
+            ck = expert(ck, "layers.2.ffn.", 0);
+            let policy = Policy {
+                stream_routed_experts: streaming,
+                ..Policy::default()
+            };
+            let c = run(ck, 1, &policy).expect("a gapped checkpoint authors");
+            let published = names(&c);
+            assert!(
+                published
+                    .iter()
+                    .any(|n| n.contains("layers.2.ffn.experts.0.w1.weight")),
+                "streaming={streaming}: layer 2 was neither stacked nor left \
+                 to the dense tail: {published:?}"
+            );
+        }
+    }
+
+    /// The streaming pass reads expert 0 as its shape oracle, and refuses
+    /// there too.
+    ///
+    /// Expert 0 is read TWICE by that pass -- once for its shapes, once by
+    /// the counting walk -- and only the second reading is what the test
+    /// above exercises, because it removes a part of expert 1. A hole in
+    /// expert 0 is caught before the count is even started, and the message
+    /// has to locate it just the same.
+    #[test]
+    fn the_streaming_shape_oracle_refuses_a_hole_in_expert_zero() {
+        let streaming = Policy {
+            stream_routed_experts: true,
+            ..Policy::default()
+        };
+        // Not `w1.weight`: that name is the walk's probe, and removing it
+        // says "no experts here" rather than "this expert is broken".
+        for suffix in ["w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"] {
+            let mut ck = moe(2);
+            let gone = format!("layers.0.ffn.experts.0.{suffix}");
+            ck.0.retain(|t| t.name != gone);
+            let why = run(ck, 1, &streaming).expect_err("a hole in expert 0 is refused");
+            let Error::Contract(why) = why else {
+                panic!("expected a contract refusal, got {why:?}")
+            };
+            assert!(
+                why.contains("expert group") && why.contains("missing a weight or scale"),
+                "a missing {suffix}: {why}"
+            );
+        }
+    }
+
+    /// A checkpoint whose experts are not packed nibbles is left whole by
+    /// the streaming pass, exactly as the stacking pass leaves it.
+    ///
+    /// Both passes read the rewrite as theirs to decline: an expert stored
+    /// some other way is published as it is by the dense tail. Declining
+    /// HALF of it -- rewriting the layers it understood and leaving the
+    /// rest -- would be the one outcome neither pass can defend.
+    #[test]
+    fn the_streaming_pass_leaves_experts_that_are_not_packed_nibbles_alone() {
+        for (streaming, kind) in [(false, "stacking"), (true, "streaming")] {
+            let mut ck = moe(1);
+            for t in &mut ck.0 {
+                if t.name.ends_with("w1.weight") || t.name.ends_with("w2.weight") {
+                    t.encoding = bf16();
+                }
+            }
+            let policy = Policy {
+                stream_routed_experts: streaming,
+                ..Policy::default()
+            };
+            let c = run(ck, 1, &policy).expect("an unpacked bank is published as it is");
+            assert!(
+                !names(&c).iter().any(|n| n.contains("gate_up")),
+                "the {kind} pass rewrote a bank it does not understand: {:?}",
+                names(&c)
+            );
+            assert!(
+                names(&c).iter().any(|n| n.contains("experts.0.w1.weight")),
+                "the {kind} pass dropped the bank instead of leaving it: {:?}",
+                names(&c)
+            );
+        }
+    }
+
+    /// An expert weight that is not rank 2 is refused by both passes.
+    ///
+    /// The shapes are read positionally -- `[I_full, H/2]` -- so a rank
+    /// this pass did not expect would index into the wrong axis and derive
+    /// an intermediate size from a number that is not one.
+    #[test]
+    fn an_expert_weight_that_is_not_rank_two_is_refused() {
+        for (streaming, wanted) in [(false, "expert stack"), (true, "expert group")] {
+            for which in ["w1.weight", "w2.weight"] {
+                let mut ck = moe(1);
+                for t in &mut ck.0 {
+                    if t.name == format!("layers.0.ffn.experts.0.{which}") {
+                        t.shape = vec![1, t.shape[0], t.shape[1]];
+                    }
+                }
+                let policy = Policy {
+                    stream_routed_experts: streaming,
+                    ..Policy::default()
+                };
+                let why = run(ck, 1, &policy).expect_err("a rank-3 expert is refused");
+                let Error::Contract(why) = why else {
+                    panic!("expected a contract refusal, got {why:?}")
+                };
+                assert!(
+                    why.contains(wanted) && why.contains("rank-2 expert weights"),
+                    "a rank-3 {which} at streaming={streaming}: {why}"
+                );
+            }
+        }
+    }
+
+    /// A block-scale pair whose shapes state no block size is refused, not
+    /// silently unpaired.
+    ///
+    /// The alternative was to publish the fp8 weight with no scales beside
+    /// it. Nothing downstream notices: the tensor is the right shape and
+    /// the right dtype, and the executor simply has no exponent to apply.
+    /// Every number in it is then off by its own block exponent, in a
+    /// model that still runs.
+    #[test]
+    fn a_block_scale_pair_that_states_no_block_size_is_refused() {
+        for (case, shape) in [
+            ("more scale columns than weight columns", vec![H, H * 2]),
+            ("a rank-0 scale", Vec::new()),
+        ] {
+            let ck = Ck::new()
+                .push("model.norm.weight", &[H], bf16())
+                .push("layers.0.attn.q.weight", &[H, H], fp8())
+                .push("layers.0.attn.q.scale", &shape, u8e());
+            let why = plain(ck).expect_err("an unusable pairing is refused");
+            let Error::Contract(why) = why else {
+                panic!("expected a contract refusal, got {why:?}")
+            };
+            assert!(
+                why.contains("states no block size") && why.contains("attn.q.scale"),
+                "{case}: {why}"
+            );
         }
     }
 

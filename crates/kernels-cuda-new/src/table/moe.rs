@@ -106,9 +106,16 @@ pub static KERNELS: &[KernelSig] = &[
             k_groups: I32,
             stream: Stream,
         ]),
-    // Namespaced in the symbol because it lives in the vendored `marlin_moe`
-    // tree, the same way the `ops::` entries do.
-    kernel!(mxfp4_moe_gemm_w4a16 "marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16", whole = true),
+    // The vendored expert-indexed Marlin MoE GEMM had a row here —
+    // `marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16` — and it is deleted.
+    // Its `KernelSig::operands` was EMPTY, so nothing could ever have
+    // bound it; `cuda::mxfp4_moe_gemm_w4a16` had no caller in any model
+    // text; and `driver-cuda/src/weights/plan.rs:147` answers
+    // `native_mxfp4_moe = false` on purpose, so nothing plans the
+    // lowering the launcher serves. The vendored tree and
+    // `marlin_moe_wrapper.{cpp,hpp}` stay: `PIE_CUDA_BUILD_MARLIN_MOE`
+    // defaults ON and `kernels_manifest.hpp:139` reads
+    // `PIE_CUDA_HAS_MARLIN_MOE` to answer the device capability.
     kernel!(topk_sqrtsoftplus "moe::topk_sqrtsoftplus_bf16",
         operands = operands![
             logits: Buf <- Source::In(0),

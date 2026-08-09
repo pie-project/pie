@@ -118,23 +118,15 @@ pub static KERNELS: &[KernelSig] = &[
     // off the weight's own, which is how the loader already finds them.
     // A dense statement names one tensor; a quantized one names two or
     // three, and says so.
-    kernel!(gemm_xwt_tensor_scaled "gemm::act_x_wt_tensor_scaled",
-        operands = operands![
-            handle: CublasHandle,
-            act: Buf,
-            w: Buf,
-            w_dtype: Dtype,
-            w_nbytes: Usize,
-            scale: Buf,
-            scale_dtype: Dtype,
-            scale_numel: Usize,
-            zero_point: Buf,
-            y: BufMut,
-            m: I32,
-            n: I32,
-            k: I32,
-            beta: F32,
-        ]),
+    //
+    // THREE ways, not four. `gemm::act_x_wt_tensor_scaled` was the
+    // fourth and is deleted: `ScaleLayout::PerTensor` had no constructor
+    // outside `dsl.rs`, and `model-loader`'s `QuantGranularity` — which
+    // every shipped scale and every loader-encoded scale states — spells
+    // only `PerChannel` and `PerGroup`, so no checkpoint format in this
+    // tree could publish the fact the fourth arm selected on. The C++
+    // entry point stays in `gemm/gemm.hpp`; re-stating the row is an
+    // eight-line edit the day the loader grows the granularity.
     kernel!(gemm_xwt_channel_scaled "gemm::act_x_wt_channel_scaled",
         operands = operands![
             handle: CublasHandle,
@@ -188,25 +180,25 @@ pub static KERNELS: &[KernelSig] = &[
             k: I32,
             beta: F32,
         ]),
-    // Its batched twin: one GEMM per pointer-array entry. `whole` for the
-    // same reason `gemm_grouped` is -- the batch is addressed through
-    // device pointer arrays built for the WHOLE fire, so a row window
-    // would leave them pointing at rows the window does not own.
-    kernel!(gemm_batched_xwt "gemm::batched_act_x_wt_bf16", whole = true,
-        operands = operands![
-            handle: CublasHandle,
-            act_ptrs_dev: BufArray,
-            w_ptrs_dev: BufArray,
-            y_ptrs_dev: BufArrayMut,
-            m: I32,
-            n: I32,
-            k: I32,
-            batch_count: I32,
-            beta: F32,
-        ]),
+    // `gemm::batched_act_x_wt_bf16` WAS HERE — the batched twin, one GEMM
+    // per pointer-array entry. Deleted by `new-horizon.md` §38: its whole
+    // consumer set was `dsl::cuda::gemm_batched_xwt`, which no model text,
+    // golden, lowering, driver fire or test ever called. The LAUNCHER stays
+    // (§10.10) and so does everything it forwards into:
+    // `gemm.hpp:401`'s `inline batched_act_x_wt_bf16` is a one-line
+    // forwarder to `batched_act_x_w` (`gemm.hpp:303`, `gemm.cpp:2397`),
+    // which is separately declared, separately callable, and the only
+    // entry to `gemm_batched_bf16_impl`'s `cublasGemmGroupedBatchedEx`.
+    // Deleting the row removed the shim entry, not the arithmetic.
     kernel!(gemm_out_fp32 "gemm::act_x_wt_bf16_out_fp32",
         operands = operands![
-            handle: CublasHandle <- Source::Ctx("cublas"),
+            // NO `handle: CublasHandle` — §45. `execution::RUST_SERVED`
+            // names this row, so its body is `driver-cuda`'s
+            // `bind::service::gemm_act_x_wt_bf16_out_fp32` and the handle
+            // comes off the dispatch context the arm already holds. A
+            // `Ty::CublasHandle` here was one backend's library type in a
+            // vocabulary two backends share, bound from `Source::Ctx` and
+            // therefore carrying nothing the statement said.
             act: Buf <- Source::In(0),
             w: Buf <- Source::Weight(0),
             y: F32sMut <- Source::Out(0),
@@ -218,7 +210,12 @@ pub static KERNELS: &[KernelSig] = &[
     // cut a group in half.
     kernel!(gemm_grouped "gemm::grouped_act_x_wt_bf16", whole = true,
         operands = operands![
-            handle: CublasHandle,
+            // The handle went the same way, and this row is the one where it
+            // shows least: every operand is `Source::Unbound`, so no arm is
+            // emitted at all and the only consumer is `fire::lora`'s
+            // hand-written staged apply — which calls
+            // `bind::service::gemm_grouped_act_x_wt_bf16` directly and holds
+            // a handle of its own.
             act_ptrs_host: BufArray,
             w_ptrs_host: BufArray,
             y_ptrs_host: BufArrayMut,
@@ -228,19 +225,13 @@ pub static KERNELS: &[KernelSig] = &[
             k: I32,
             beta: F32,
         ]),
-    // The fused Q/K/V triple, and the first row to state a RETURN: the
-    // bool answers "did the fused form run", so a caller that ignores it
-    // has fired nothing.
-    kernel!(gemv3 "gemm::gemv3_bf16",
-        returns = "bool",
-        operands = operands![
-            w0: Buf, w1: Buf, w2: Buf,
-            b0: Buf, b1: Buf, b2: Buf,
-            o0: BufMut, o1: BufMut, o2: BufMut,
-            act: Buf,
-            n0: I32, n1: I32, n2: I32, k: I32,
-            stream: Stream,
-        ]),
+    // The fused Q/K/V triple had a row here — `gemm::gemv3_bf16` — and it
+    // is deleted. `cuda::gemv3` had no caller in any model text, and the
+    // fusion this row names is three `matmul` statements a text already
+    // knows how to write (§27). `gemv.cu` keeps the launcher and its
+    // `__global__`: `gemm.cpp:544,962,2356` call the file's OTHER entry
+    // point, `gemv_bf16`, from the live `act_x_wt_bf16` path, so the file
+    // is left whole for the reason `families/gemm.rs` already gives.
     // The sink rescale, and the fp32 LSE it eats. The LSE has no row of
     // its own: it is a second OUTPUT of the decode dispatch, requested
     // by an argument, so the kernel that changes is none.

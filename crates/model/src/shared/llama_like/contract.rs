@@ -214,6 +214,52 @@ mod tests {
         }
     }
 
+    /// The routed mixture, renamed here and refused here.
+    ///
+    /// A llama-like row can be a mixture -- the shape carries
+    /// `n_experts`, and two rows in this file's own spec state 128 and
+    /// 32 -- so the MLX rename asks the shared routed rule. Neither
+    /// answer it can give had ever been taken, and the two failures are
+    /// opposite:
+    ///
+    /// * A `switch_mlp` member left unrenamed is a name the Metal binder
+    ///   does not know, and `Store::checkpoint_names` answers an empty
+    ///   candidate list rather than an error -- the routed bank is
+    ///   simply absent from the forward pass and the model generates
+    ///   from its attention alone.
+    /// * A SHARED expert accepted on this schema is worse than absent:
+    ///   this family's mixture REPLACES the dense MLP, so there is no
+    ///   shared block to run and the tensor would be loaded, allocated,
+    ///   and never read.
+    ///
+    /// The `false` this text passes for `has_shared_expert` is that
+    /// second claim, and it is the manifest's claim too.
+    #[test]
+    fn the_routed_bank_is_renamed_and_a_shared_expert_is_refused() {
+        for (raw, want) in [
+            (
+                "model.layers.7.mlp.switch_mlp.gate_proj.weight",
+                "layers.7.mlp.experts.gate_proj.weight",
+            ),
+            (
+                "model.language_model.layers.7.mlp.switch_mlp.down_proj.scales",
+                "layers.7.mlp.experts.down_proj.scales",
+            ),
+        ] {
+            assert_eq!(mapped(raw, false), Some(want.to_string()), "{raw}");
+        }
+        for raw in [
+            "model.layers.7.mlp.shared_expert.up_proj.weight",
+            "model.layers.7.mlp.shared_experts.up_proj.weight",
+            "model.layers.7.mlp.experts.0.gate_proj.weight",
+        ] {
+            let refused = llama_mlx_name(raw, false)
+                .expect_err("this schema serves neither spelling")
+                .to_string();
+            assert!(refused.contains(raw), "the refusal names it: {refused}");
+        }
+    }
+
     /// A name with no rule is refused, and the refusal names it.
     ///
     /// This is the arm the whole function is shaped around. Falling through

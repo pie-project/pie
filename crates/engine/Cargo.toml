@@ -36,6 +36,12 @@ driver-metal = { path = "../driver-metal", optional = true }
 # would be a driver that could not be handed bytes. So the conversion runs
 # here, on the side that already reads checkpoints.
 driver-vulkan = { path = "../driver-vulkan", optional = true }
+# The Rust WebGPU shell. Same arrangement as `driver-vulkan` above and for the
+# same reason -- it keeps `model-loader` a DEV-dependency and proves the
+# closure with `tests/pure.rs`, so the checkpoint is read on this side -- with
+# one thing neither sibling has: no SDK, no loader, no `-sys` crate anywhere in
+# its closure. See the `driver-wgpu` feature below.
+driver-wgpu = { path = "../driver-wgpu", optional = true }
 model-loader = { path = "../model-loader", default-features = false, optional = true }
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
@@ -151,6 +157,47 @@ driver-vulkan = [
     # -- the identification and the load plan. This crate already takes
     # `model` for `forward`; `contract` is the half that reads a publisher's
     # checkpoint, and only this backend needs it.
+    "model/contract",
+]
+# The Rust WebGPU shell's seam. A library call, like the two above, and gated
+# on the feature ALONE.
+#
+# `driver-wgpu/native` is not optional here, for the reason
+# `driver-vulkan/native` and `driver-metal/metal-4` are not: that crate has no
+# default feature so its portable half -- which parses the WGSL it will
+# dispatch and checks it against the kernel table, with no adapter present --
+# can be tested without a GPU. Omitting it makes `driver_wgpu::device` an empty
+# module and `driver_wgpu::shell` absent, and the failure arrives at model load
+# instead of at `cargo build`.
+#
+# `model-loader` and `model/contract` come with it because THIS crate loads the
+# checkpoint for that driver, exactly as it does for Vulkan -- see
+# `src/driver/backend/wgpu.rs` for why loading is on this side of the seam.
+#
+# THE ARGUMENT THIS BACKEND HAS THAT NEITHER SIBLING DOES, for whoever decides
+# what ships on by default:
+#
+# `driver-cuda` needs a CUDA toolkit and an NVIDIA card. `driver-metal` needs a
+# Mac. `driver-vulkan` needs a loader and an ICD. This one needs NONE of them.
+# Its whole dependency closure is pure Rust -- `driver-wgpu/tests/pure.rs`
+# asserts that with `native` ON, which is the version of the claim that matters
+# -- `naga` compiles the shaders in-process so there is no module directory to
+# ship beside the binary, it builds for `wasm32-unknown-unknown` including the
+# browser backend (`tests/browser.rs`), and it reaches Vulkan, Metal, D3D12 and
+# WebGPU through one binary. Nothing about turning it on can fail to build on a
+# machine that can build the engine at all.
+#
+# That makes it the only driver that could reasonably be a DEFAULT feature.
+# This change deliberately does not make it one: the existing three are all
+# opt-in, "which backends a build carries" is a deployment policy rather than a
+# seam's decision, and `create` still opens an adapter -- so a default would
+# turn a machine with no GPU from "no backend compiled in" into "a backend that
+# fails at boot". The case is stated here so that whoever makes that call has
+# it in one place rather than reconstructing it.
+driver-wgpu = [
+    "dep:driver-wgpu",
+    "driver-wgpu/native",
+    "dep:model-loader",
     "model/contract",
 ]
 # Host-side performance probes. Each scenario is a separate flag so you

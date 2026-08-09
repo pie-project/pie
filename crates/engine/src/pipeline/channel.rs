@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::driver::ChannelEndpoint;
-use ::driver_api::PieChannelEndpointBinding;
+use ::driver_api::ChannelBinding;
 use tensor_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use tensor_ir::types::DType;
 
@@ -359,28 +359,28 @@ impl ChannelCell {
             self.device_reserved_head += 1;
             expected
         } else {
-            crate::driver::command::CHANNEL_TICKET_NONE
+            ::driver_api::CHANNEL_TICKET_NONE
         };
         let expected_tail = if publish {
             let expected = self.device_reserved_tail;
             self.device_reserved_tail += 1;
             expected
         } else {
-            crate::driver::command::CHANNEL_TICKET_NONE
+            ::driver_api::CHANNEL_TICKET_NONE
         };
         (expected_head, expected_tail)
     }
 
     pub fn rollback_device_ticket(&mut self, expected_head: u64, expected_tail: u64) -> bool {
         let mut complete = true;
-        if expected_tail != crate::driver::command::CHANNEL_TICKET_NONE {
+        if expected_tail != ::driver_api::CHANNEL_TICKET_NONE {
             if self.device_reserved_tail == expected_tail + 1 {
                 self.device_reserved_tail = expected_tail;
             } else {
                 complete = false;
             }
         }
-        if expected_head != crate::driver::command::CHANNEL_TICKET_NONE {
+        if expected_head != ::driver_api::CHANNEL_TICKET_NONE {
             if self.device_reserved_head == expected_head + 1 {
                 self.device_reserved_head = expected_head;
             } else {
@@ -571,7 +571,7 @@ impl ChannelCell {
 
     fn replace_ring_cell(
         &self,
-        binding: PieChannelEndpointBinding,
+        binding: ChannelBinding,
         sequence: u64,
         native: &[u8],
     ) -> Result<(), ChannelError> {
@@ -619,7 +619,7 @@ impl ChannelCell {
     /// not-yet-consumed producer cell.
     fn write_writer_ring(
         &mut self,
-        binding: PieChannelEndpointBinding,
+        binding: ChannelBinding,
         native: &[u8],
     ) -> Result<(), ChannelError> {
         let poison = load_word(binding.word_base, binding.poison_word_index as usize);
@@ -1422,7 +1422,7 @@ mod tests {
         let table = waker::WakerTable::global();
         let endpoint = ChannelEndpoint::new(crate::driver::RegisteredChannel {
             driver_id: usize::MAX,
-            binding: PieChannelEndpointBinding {
+            binding: ChannelBinding {
                 channel_id: writer.global_id,
                 mirror_base: mirror.as_ptr() as u64,
                 word_base: words.as_ptr() as u64,
@@ -1504,7 +1504,7 @@ mod tests {
 
         assert_eq!(
             writer.reserve_device_ticket(true, false),
-            (0, crate::driver::command::CHANNEL_TICKET_NONE)
+            (0, ::driver_api::CHANNEL_TICKET_NONE)
         );
         assert_eq!(writer.set(vec![1; 8]).unwrap_err(), ChannelError::InFlight);
         assert_eq!(mirror[0], 8, "an in-flight front is never overwritten");

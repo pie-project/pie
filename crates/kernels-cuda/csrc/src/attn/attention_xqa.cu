@@ -271,115 +271,12 @@ bool xqa_decode_bf16_supported(int num_q_heads,
     // those devices on the regular FlashInfer decode path.
     return current_device_major() >= 9;
 }
-
-void xqa_decode_bf16_gqa5_warmup_current_device() {
-    // Re-issue the smem-symbol read + per-kernel attribute set that
-    // FlashInfer's xqa csrc does in a static initializer. The static
-    // covers only one device; multi-GPU TP needs every rank's device to
-    // see the attribute or the captured kernel launch trips
-    // cudaErrorInvalidValue.
-    device::u32 size = 0;
-    CUDA_CHECK(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    CUDA_CHECK(cudaFuncSetAttribute(
-        kernel_mha,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(size)));
-}
-
-void xqa_decode_bf16_warmup_current_device(int head_group_ratio,
-                                           int page_size) {
-    switch (head_group_ratio) {
-        case 2:
-            if (page_size == 16) {
-                detail::xqa_decode_bf16_gqa2_p16_warmup_current_device();
-            } else {
-                detail::xqa_decode_bf16_gqa2_warmup_current_device();
-            }
-            return;
-        case 4:
-            detail::xqa_decode_bf16_gqa4_warmup_current_device();
-            return;
-        case 5:
-            xqa_decode_bf16_gqa5_warmup_current_device();
-            return;
-        case 8:
-            detail::xqa_decode_bf16_gqa8_warmup_current_device();
-            if (current_device_major() >= 9) {
-                detail::xqa_decode_bf16_gqa8_sm90_warmup_current_device();
-            }
-            return;
-        default:
-            return;
-    }
-}
-
 int xqa_decode_page_bucket(int max_pages_per_seq) {
     int bucket = 1;
     const int pages = std::max(1, max_pages_per_seq);
     while (bucket < pages && bucket < 4096) bucket <<= 1;
     return bucket;
 }
-
-device::u8 xqa_decode_graph_layout(int max_pages_per_seq) {
-    int bucket = xqa_decode_page_bucket(max_pages_per_seq);
-    int log2_bucket = 0;
-    while (bucket > 1) {
-        bucket >>= 1;
-        ++log2_bucket;
-    }
-    return static_cast<device::u8>(48 + std::min(log2_bucket, 15));
-}
-
-void attention_xqa_decode_bf16(
-    const void* q,
-    void* k_pages,
-    void* v_pages,
-    void* o,
-    const device::u32* kv_page_indices_d,
-    const device::u32* kv_page_indptr_d,
-    const device::u32* kv_last_page_lens_d,
-    int num_requests,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int page_size,
-    int max_pages_per_seq,
-    AttentionWorkspaceView workspace,
-    cudaStream_t stream,
-    float sm_scale)
-{
-    if (!xqa_decode_bf16_supported(
-            num_q_heads, num_kv_heads, head_dim, page_size,
-            /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale)) {
-        throw std::runtime_error("xqa decode: unsupported shape");
-    }
-    if (num_requests <= 0) return;
-
-    prepare_attention_xqa_decode_bf16(
-        kv_page_indices_d,
-        kv_page_indptr_d,
-        kv_last_page_lens_d,
-        num_requests,
-        page_size,
-        max_pages_per_seq,
-        workspace,
-        stream);
-    attention_xqa_decode_bf16_prepared(
-        q,
-        k_pages,
-        v_pages,
-        o,
-        num_requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        max_pages_per_seq,
-        workspace,
-        stream,
-        sm_scale);
-}
-
 void prepare_attention_xqa_decode_bf16(
     const device::u32* kv_page_indices_d,
     const device::u32* kv_page_indptr_d,

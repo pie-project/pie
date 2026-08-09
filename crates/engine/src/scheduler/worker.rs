@@ -894,7 +894,7 @@ impl PreLaunchCopy {
 /// A [`FrameSubmission`] in transit to the driver lane.
 ///
 /// SAFETY: the submission is `!Send` only through its
-/// `Vec<*mut PieTerminalCell>` — raw pointers into the driver's pinned
+/// `Vec<*mut TerminalCell>` — raw pointers into the driver's pinned
 /// terminal-cell slots, which are process-stable allocations with no thread
 /// affinity (the driver itself reads them from its own threads today). The
 /// submission is built complete on the worker, moved to the lane, and
@@ -1298,7 +1298,16 @@ impl DriverLane {
                     return LaneCommit::None;
                 }
                 let result = match driver.as_mut() {
-                    Some(driver) => driver.register_program(&plan),
+                    // The host-codegen splice happens HERE, on the layer that
+                    // holds the driver handle and can therefore ask which
+                    // backend the plan is bound for. It used to happen inside
+                    // the driver layer, which had to reach into
+                    // `crate::pipeline` to do it -- against its own header.
+                    Some(driver) => {
+                        let kind = driver.kind();
+                        let plan = crate::pipeline::program::with_host_codegen(&plan, kind);
+                        driver.register_program(&plan)
+                    }
                     None => Err(anyhow!("driver has no backend installed")),
                 };
                 match result {
@@ -1488,6 +1497,8 @@ impl DriverLane {
                 }
                 let program_registered = program.is_some();
                 if let Some(plan) = &program {
+                    let kind = driver.kind();
+                    let plan = &crate::pipeline::program::with_host_codegen(plan, kind);
                     match driver.register_program(plan) {
                         Ok(program_id) => bind.program_id = program_id,
                         Err(error) => {
@@ -2221,7 +2232,7 @@ struct SchedulerControl {
     /// handle and no driver id, and a `KvCopyPlan` they build has to name the
     /// right memory. See `scheduler::device_domain` for what naming the wrong
     /// one cost.
-    device_domain: ::driver_api::PieMemoryDomain,
+    device_domain: ::driver_api::DeviceDomain,
 }
 
 #[derive(Clone)]
@@ -2231,7 +2242,7 @@ pub(crate) struct SchedulerHandle {
 
 impl SchedulerHandle {
     /// The memory this scheduler's driver keeps its KV pages in.
-    pub(crate) fn device_domain(&self) -> ::driver_api::PieMemoryDomain {
+    pub(crate) fn device_domain(&self) -> ::driver_api::DeviceDomain {
         self.inner.device_domain
     }
 
@@ -4791,7 +4802,7 @@ impl Drop for BatchScheduler {
 
 struct TrackedInstance {
     pacing_wait_id: u64,
-    wait_slots: Arc<crate::driver::instance::BoundWaitSlots>,
+    wait_slots: Arc<::driver_api::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
 }

@@ -1,34 +1,35 @@
 #pragma once
 
-// Per-row argmax over [num_rows, vocab] bf16 logits → [num_rows] i32 token ids.
-// Used as the greedy sampler (temperature=0).
+// The three argmax launchers the ahead-of-time archive still needs.
+//
+// # What is NOT here any more, and why the list is short
+//
+// This header used to declare ten: `argmax_bf16`, `argmax_fp32`,
+// `argmax_bf16_compact_scatter`, `lm_head_gemv_argmax_bf16`,
+// `masked_embedding_argmax_bf16`, `topk_centroids_bf16` and
+// `masked_embedding_tile_argmax_pairs_bf16` among them. `new-horizon.md`
+// §41's transitive audit measured every one of them as reachable from no
+// root at all — no `pie_k_*` shim entry, no sibling `.cu`, no test — and §43
+// deleted them with their launchers. The JOBS did not go: they are device
+// rows in `kernels_cuda_new::families::sample`, NVRTC compiles them out of
+// `sample/argmax.cuh`, and `examples/unit_probe_*.rs` fires them there. A
+// device row consumes the header and never the launcher, which is exactly
+// why a launcher can be dead while its kernel is not.
+//
+// What remains is the half that has a consumer:
+//
+//   * `lm_head_gemv_argmax_int8` — `table::sample::KERNELS`' one row. Its
+//     grid comes from an occupancy query, which is the case a `LaunchRule`
+//     must not be invented for.
+//   * `argmax_accumulate_bf16` / `argmax_finalize_bf16` — no row, and held
+//     by `gemm/gemm.cpp`'s chunked LM-head argmax, which calls both. §10.10:
+//     a launcher goes when its WHOLE consumer set has gone, and a sibling
+//     translation unit is a consumer even when the row is not.
 
 #include <cstdint>
 #include <cuda_runtime.h>
 
 namespace pie_cuda_driver::kernels::sample {
-
-void argmax_bf16(
-    const void* logits,        // [num_rows, vocab] bf16
-    std::int32_t* token_ids,   // [num_rows]
-    int num_rows,
-    int vocab,
-    cudaStream_t stream);
-
-void argmax_bf16_compact_scatter(
-    const void* logits,                    // [num_rows, vocab] bf16
-    const std::int32_t* row_indices,       // [num_rows] original row ids
-    std::int32_t* token_ids,               // [original rows]
-    int num_rows,
-    int vocab,
-    cudaStream_t stream);
-
-// NOTE: a `launch_lm_head_argmax_bf16` used to live here — a fused
-// hidden@lm_head.T + argmax with grid=(num_rows, vocab/8). It had no call
-// sites and could not serve the sampler: every row re-read the whole weight
-// matrix, so at rows=512 it moved 512x the LM head weights. The chunked
-// accumulator below is the shape that works at batch. Deleted rather than
-// left as a trap for the next reader (§20.36).
 
 // ── Chunked (vocab-streaming) argmax ─────────────────────────────────
 // The sampler's read of a materialised [rows, vocab] logits tensor is pure
@@ -39,10 +40,9 @@ void argmax_bf16_compact_scatter(
 // rows=512, vocab=151936).
 //
 // `argmax_accumulate_bf16` folds one slab into a running per-warp
-// best; `argmax_finalize_bf16` collapses that to token ids. Results
-// are bit-identical to `argmax_bf16` over the concatenated slabs:
-// the ordering is a total order on (value, -index), so slab order and scan
-// order do not matter.
+// best; `argmax_finalize_bf16` collapses that to token ids. Slab order and
+// scan order do not matter: the ordering is a total order on (value, -index),
+// so the result is the argmax over the concatenated slabs.
 //
 // `acc_val` / `acc_idx` are caller-owned scratch of
 // `rows * kArgmaxAccumSlots` elements each.
@@ -66,65 +66,12 @@ void argmax_finalize_bf16(
     int rows,
     cudaStream_t stream);
 
-// Per-row argmax over [num_rows, vocab] fp32 logits → [num_rows] i32 token ids.
-void argmax_fp32(
-    const void* logits,        // [num_rows, vocab] fp32
-    std::int32_t* token_ids,   // [num_rows]
-    int num_rows,
-    int vocab,
-    cudaStream_t stream);
-
-// Gemma4 MTP ordered-embedding argmax. The assistant first selects top
-// centroids, then scores only the tokens assigned to those centroids.
-void masked_embedding_argmax_bf16(
-    const void* centroid_logits,       // [num_rows, num_centroids] bf16
-    const void* hidden_states,         // [num_rows, hidden] bf16
-    const void* lm_head_weight,        // [vocab, hidden] bf16
-    const std::int64_t* token_ordering, // [num_centroids * vocab_per_centroid]
-    std::int32_t* token_ids,           // [num_rows]
-    int num_rows,
-    int hidden,
-    int num_centroids,
-    int centroid_top_k,
-    int vocab_per_centroid,
-    cudaStream_t stream);
-
-void topk_centroids_bf16(
-    const void* centroid_logits,       // [num_rows, num_centroids] bf16
-    std::int32_t* top_centroids,       // [num_rows, centroid_top_k]
-    int num_rows,
-    int num_centroids,
-    int centroid_top_k,
-    cudaStream_t stream);
-
-void masked_embedding_tile_argmax_pairs_bf16(
-    const std::int32_t* top_centroids, // [num_rows, centroid_top_k]
-    const void* hidden_states,         // [num_rows, hidden] bf16
-    const void* lm_head_weight,        // [vocab, hidden] bf16
-    const std::int64_t* token_ordering, // [num_centroids * vocab_per_centroid]
-    std::uint64_t* partial_pairs,      // [num_tiles, num_rows]
-    int num_rows,
-    int hidden,
-    int centroid_top_k,
-    int vocab_per_centroid,
-    int num_tiles,
-    cudaStream_t stream);
-
 // Fused GEMV + argmax for MTP lm_head scoring. Returns greedy token IDs
 // without materializing logits.
 void lm_head_gemv_argmax_int8(
     const void* hidden_states,        // [num_rows, hidden] bf16
     const std::int8_t* lm_head_weight, // [vocab, hidden] int8
     const float* scale_inv,           // [vocab] fp32 per-channel
-    std::int32_t* token_ids,          // [num_rows]
-    int num_rows,
-    int hidden,
-    int vocab,
-    cudaStream_t stream);
-
-void lm_head_gemv_argmax_bf16(
-    const void* hidden_states,        // [num_rows, hidden] bf16
-    const void* lm_head_weight,       // [vocab, hidden] bf16
     std::int32_t* token_ids,          // [num_rows]
     int num_rows,
     int hidden,

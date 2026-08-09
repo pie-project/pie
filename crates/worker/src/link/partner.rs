@@ -262,9 +262,9 @@ impl PartnerLinkManager {
         let disconnect = remote.disconnect_handle();
         let driver_id = ::engine::driver::register_driver_backend(
             ::engine::driver::DriverSpec {
-                    // Overwritten by `register_driver_backend` from the
-                    // backend itself; see `DriverSpec::device_domain`.
-                    device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
+                // Overwritten by `register_driver_backend` from the
+                // backend itself; see `DriverSpec::device_domain`.
+                device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
                 num_kv_pages: hello.grant.num_pages as usize,
                 limits: ::engine::driver::SchedulerLimits {
                     max_forward_requests: hello.capabilities.max_forward_requests as usize,
@@ -273,7 +273,7 @@ impl PartnerLinkManager {
                 },
                 device_geometry_port_mask: hello.capabilities.device_geometry_port_mask,
             },
-            ::engine::driver::DriverBackend::Remote(remote),
+            Box::new(remote),
         );
 
         if let Err(error) = ::engine::offload::register_remote_store(

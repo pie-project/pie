@@ -146,6 +146,8 @@ fn options_struct(driver: DriverKind) -> &'static str {
     match driver {
         DriverKind::CudaNative => "CudaNativeDriverOptions",
         DriverKind::Metal => "MetalDriverOptions",
+        DriverKind::Vulkan => "VulkanDriverOptions",
+        DriverKind::Wgpu => "WgpuDriverOptions",
     }
 }
 
@@ -262,6 +264,8 @@ fn default_values(driver: DriverKind) -> toml::Value {
     let options = match driver {
         DriverKind::CudaNative => defaults_of::<crate::config::CudaNativeDriverOptions>(&empty),
         DriverKind::Metal => defaults_of::<crate::config::MetalDriverOptions>(&empty),
+        DriverKind::Vulkan => defaults_of::<crate::config::VulkanDriverOptions>(&empty),
+        DriverKind::Wgpu => defaults_of::<crate::config::WgpuDriverOptions>(&empty),
     };
     if let (Some(options), Some(driver_table)) = (
         options,
@@ -336,9 +340,24 @@ mod tests {
         // struct it parses into.
         let cuda = keys(DriverKind::CudaNative);
         let metal = keys(DriverKind::Metal);
+        let vulkan = keys(DriverKind::Vulkan);
+        let wgpu = keys(DriverKind::Wgpu);
         assert!(cuda.contains(&"driver.gpu_mem_utilization".to_string()));
         assert!(!metal.contains(&"driver.gpu_mem_utilization".to_string()));
         assert!(metal.contains(&"driver.total_pages".to_string()));
+        // The two portable shells are the pair worth separating, because they
+        // are the two whose tables overlap: both state `kv_pages` and only
+        // Vulkan states `kernels`. A wgpu listing that offered `kernels` would
+        // invite an operator to point this driver at a directory of SPIR-V it
+        // has no way to read -- its shaders are in the rlib.
+        assert!(vulkan.contains(&"driver.kv_pages".to_string()));
+        assert!(vulkan.contains(&"driver.kernels".to_string()));
+        assert!(wgpu.contains(&"driver.kv_pages".to_string()));
+        assert!(!wgpu.contains(&"driver.kernels".to_string()));
+        // And the knobs the configured drivers have that this one does not --
+        // see `WgpuDriverOptions` for what each would have meant.
+        assert!(!wgpu.contains(&"driver.kv_cache_dtype".to_string()));
+        assert!(!wgpu.contains(&"driver.total_pages".to_string()));
     }
 
     #[test]

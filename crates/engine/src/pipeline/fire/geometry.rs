@@ -511,7 +511,7 @@ impl ReqGeometry {
 pub(crate) enum FireAttnMask {
     Omitted,
     Host {
-        masks: Vec<crate::driver::command::EncodedMask>,
+        masks: Vec<::driver_api::EncodedMask>,
         mask_indptr: Vec<u32>,
     },
     Device,
@@ -601,7 +601,7 @@ pub(crate) fn lower_attn_mask_evaluated(
         .chunks_exact(stride)
         .map(|row| {
             let mask = RunMask::from_slice(row);
-            crate::driver::command::EncodedMask::new(mask.buffer, mask.total_size)
+            ::driver_api::EncodedMask::new(mask.buffer, mask.total_size)
         })
         .collect();
     Ok(FireAttnMask::Host {
@@ -1407,7 +1407,7 @@ mod tests {
         container
     }
 
-    fn expand_mask(mask: &crate::driver::command::EncodedMask) -> Vec<bool> {
+    fn expand_mask(mask: &::driver_api::EncodedMask) -> Vec<bool> {
         let mut values = Vec::new();
         for (run, &len) in mask.runs.iter().enumerate() {
             values.extend(std::iter::repeat_n(run % 2 == 1, len as usize));

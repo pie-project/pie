@@ -10,15 +10,38 @@
 // with BLOCK=512 that is ~6 dependent loads per thread per pass. This reads
 // each operand once into a tile and does all three passes in registers.
 //
-//     rows      tile      rmsnorm_rasr (scalar)
-//        1      2.41 us         4.33 us      1.80x
-//      128      3.44            5.46         1.59x
-//    2,048     12.86           24.71         1.92x
+//     rows     touched    tile        scalar      ratio
+//        1       0 MB     2.41 us      4.34 us     1.80x
+//       16       0.4      2.48         4.55        1.83x
+//      142       3        3.21         5.43        1.69x
+//    1,024      23        7.98        14.19        1.78x
+//    2,048      46       12.93        24.74        1.91x
+//    3,072      69       17.38        34.94        2.01x
+//    4,096      92       24.15        47.61        1.97x
+//    6,144     138      100.93       129.32        1.28x
+//    8,192     184      271.91       276.08        1.02x
+//   65,536   1,475     2172.84      2210.70        1.02x
 //
 // L40S sm_89, hidden 2816, bf16, BLOCK=512 for the scalar form. REG 106,
 // 16 bytes of shared -- against the scalar form's two `__shared__ float[512]`
 // reduction buffers and their barriers, which is the other half of why it
 // wins.
+//
+// **The win is 1.7-2.0x up to about 92 MB touched and then converges to
+// nothing**, which is the third independent sighting of the same line
+// `mlp/swiglu_tile.cuh` and `moe/topk_softmax_tile.cuh` draw: past the point
+// where the working set stops fitting cache, both kernels are at the memory
+// roofline and no programming model is faster than another there.
+//
+// It never goes BEHIND, which is why the predicate is still unconditional --
+// but a reader who quotes "1.8x" for a prefill-sized fire would be wrong,
+// and the sweep is here so they do not have to find that out.
+//
+// This table exists because a sibling predicate was got wrong exactly this
+// way: `moe_fused_tile_preferred` was published as "never" on the strength
+// of a ratio measured at one grid size, which turned out to be the
+// independent variable. A ratio measured at one point is a fact about that
+// point.
 //
 // # Numerics: identical, then reassociated, and the difference is located
 //

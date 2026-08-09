@@ -115,6 +115,8 @@ const ROPE_SCALING: crate::deployment::RopeScaling = crate::deployment::RopeScal
     beta_slow: 1.0,
     attention_factor: 1.207_944_2,
     original_max_position: 8_192,
+    // OMITTED by the config, which is HF's default.
+    truncate: true,
 };
 
 /// The generation's rows.
@@ -151,6 +153,8 @@ pub const VARIANTS: &[Olmo3] = &[
             fused_qkv: false,
             tied_embeddings: false,
             qkv_bias: false,
+            o_bias: false,
+            router_bias: false,
         },
         rope_theta: 500_000.0,
         norm_eps: 1e-6,
@@ -180,6 +184,8 @@ pub const VARIANTS: &[Olmo3] = &[
             fused_qkv: false,
             tied_embeddings: false,
             qkv_bias: false,
+            o_bias: false,
+            router_bias: false,
         },
         rope_theta: 500_000.0,
         norm_eps: 1e-6,

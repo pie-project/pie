@@ -1,24 +1,30 @@
-//! The thirteen `pie_cuda_*` exports — the cutover's door (retirement
-//! plan phase D).
+//! The shell's door: the verbs the engine calls, as methods.
 //!
-//! The engine consumes a driver through `pie_driver_abi.h`, whose Rust
-//! source of truth is `driver_api::local`. This module DEFINES the symbols
-//! that crate declares; a test resolving the declaration against these
-//! definitions makes the linker prove the contract, the same way the
-//! launch bridge's shim makes the C++ compiler prove the rows.
+//! # What these stopped being
 //!
-//! **One provider per binary.** The C++ shell this replaced exported the
-//! same thirteen names, so the `abi` feature could never be enabled in a
-//! build that also linked it — same symbols, duplicate-definition link
-//! error, by design rather than by accident. There is one provider now,
-//! and the rule survives it: nothing else may define these.
+//! Thirteen `pie_cuda_*` free functions, each taking a `*mut PieDriver` —
+//! an opaque `c_void` — and casting it back to a `Shell` on entry. The
+//! engine reached them through an `unsafe extern "C"` block that the linker
+//! resolved against this same crate, in this same workspace, in Rust.
+//!
+//! The declaration existed because the driver on the far side used to be
+//! C++, and it outlived the C++ by the length of the cutover. What it cost
+//! while it lived: no type checking across the call, no lifetimes, a
+//! `*mut PieDriver` where a `&mut Shell` would do, seven `#[repr(C)]`
+//! descriptors built by the engine purely to be taken apart again here, and
+//! a null check plus a validator call on every entry — 48 `unsafe` in this
+//! module's subtree against the Metal shell's 4, for the same work.
+//!
+//! They are methods on [`state::Shell`] now. The receiver is the handle, the
+//! descriptors are the owned `driver_api` types the engine already had, and
+//! the `i32` status they still answer is this crate's own convention rather
+//! than an ABI — `engine`'s seam turns it into the verb's name and a message.
 //!
 //! # What is in here, and what is next door
 //!
-//! This file is the DOOR: the thirteen entry points, the panic boundary
-//! every one of them crosses (`guard`), and the pointer validation they
-//! share (`checked`). The bodies live beside it, one module per thing the
-//! driver does:
+//! This file is the DOOR: the entry points and the panic boundary every one
+//! of them crosses (`guard`). The bodies live beside it, one module per
+//! thing the driver does:
 //!
 //! * [`state`] — the shell's nouns. A leaf; everything else calls in.
 //! * [`load`] — create, destroy, and the once-per-model work.
@@ -33,19 +39,12 @@
 
 // Error paths print to stderr with the C++ shell's own prefix — that IS
 // the behaviour being replaced (`abi.cpp` writes `[pie-driver-cuda]` to
-// cerr), and an ABI boundary has no tracing subscriber to rely on.
+// cerr), and a driver has no tracing subscriber to rely on.
 #![allow(clippy::print_stderr)]
-// Every export takes raw pointers by C-ABI necessity and null-checks them
-// before the deref — the same defensive shape the C++ shell has. The
-// caller-side contract is `driver_api::local`'s `unsafe extern` block;
-// marking the DEFINITIONS `unsafe fn` would change their ABI type for a
-// fact the boundary already states.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+use driver_api::completion::CompletionTarget;
 use driver_api::local::{
-    PIE_DRIVER_ABI_VERSION, PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED,
-    PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK, PieChannelDesc, PieChannelEndpointBinding,
-    PieCompletion, PieDriver, PieDriverCaps, PieDriverCreateDesc, PieFrameDesc, PieInstanceBinding,
-    PieInstanceDesc, PieModelLoadDesc, PieProgramDesc,
+    ChannelBinding, InstanceBinding, PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED,
+    PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK,
 };
 
 pub(crate) mod encode;
@@ -54,8 +53,7 @@ pub(crate) mod state;
 pub(crate) mod transfer;
 
 pub use crate::fire::launch::fire_class_of;
-pub use encode::pie_cuda_encode;
-pub use transfer::{pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_resize_pool};
+pub use state::Shell;
 
 /// The GQA group sizes THIS BUILD's decode instantiates.
 ///
@@ -80,62 +78,9 @@ pub use transfer::{pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_resize_pool};
 pub const DECODE_GQA_GROUPS: &[u32] = &[1, 2, 3, 4, 8];
 
 use crate::fire::launch::launch_impl;
-use load::{adopt_and_compile, create_impl, destroy_impl, load_impl};
-use state::{ChannelState, InstanceEntry, ProgramEntry, channel_dtype, shell, slice_of};
+use load::{adopt_and_compile, load_impl};
+use state::{ChannelState, InstanceEntry, ProgramEntry, Shell as ShellState, channel_dtype};
 
-/// A descriptor pointer, dereferenced ONLY through its validator.
-///
-/// North star rule 4 says a shared capability must not be optional: if it
-/// can be skipped, it will be. `driver-api` ships seventeen `validate_*`
-/// functions, and NOTHING calls them now: this shell called none of them,
-/// re-deriving similar checks by hand at 51 sites, and the one caller that
-/// did — `driver-dummy`, the interpreter backend — is deleted. The
-/// capability was built, shipped, and routed around by every
-/// implementation there was.
-///
-/// Calling them would not have fixed that, only postponed it: a helper
-/// that must be remembered is the same shape as a validator that must be
-/// remembered. So the dereference and the validation are ONE operation.
-/// There is no way to obtain a `&PieKvCopyDesc` in this file without
-/// having run `validate_kv_copy_desc` over it, because the only thing
-/// that turns the pointer into a reference is this function and it takes
-/// the validator as an argument.
-///
-/// `tests/entry_validation.rs` holds the other half — that no entry point
-/// reaches a descriptor any other way — because a rule the compiler
-/// cannot state is one a reviewer has to, and this one can at least be
-/// stated once rather than at every call.
-///
-/// # Why the validators are `unsafe` and this is not
-///
-/// Four of them (`frame`, `encode`, `instance`, `channel`) walk slices the
-/// descriptor points at, so they carry the same obligation this function
-/// does: the pointer is the caller's to vouch for. Wrapping the null test
-/// and the deref together is what discharges it — a non-null descriptor
-/// from the engine is a well-formed one, and a null is the error this
-/// returns rather than the fault it would otherwise be.
-#[cfg(feature = "abi")]
-pub(crate) fn checked<'a, T>(
-    p: *const T,
-    validate: impl FnOnce(&T) -> driver_api::local::PieAbiValidationResult,
-    what: &str,
-) -> Result<&'a T, i32> {
-    let Some(desc) = (unsafe { p.as_ref() }) else {
-        eprintln!("[driver-cuda] {what}: the descriptor pointer is null");
-        return Err(PIE_STATUS_INVALID_ARGUMENT);
-    };
-    match validate(desc) {
-        Ok(()) => Ok(desc),
-        Err(e) => {
-            // The MESSAGE is the point. A hand-rolled check returns
-            // `INVALID_ARGUMENT` and the caller learns which CALL failed;
-            // the validators say which FIELD, and that difference is most
-            // of what they are worth.
-            eprintln!("[driver-cuda] {what}: {}", e.message());
-            Err(e.status())
-        }
-    }
-}
 
 /// Run a driver entry point, turning a panic into a status rather than into
 /// the caller's problem.
@@ -179,165 +124,148 @@ pub(crate) fn guard<T>(what: &str, on_panic: T, body: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Create the driver. Refuses a null descriptor or a mismatched ABI
-/// version by returning null, as the C++ shell does.
-pub fn pie_cuda_create(
-    desc: *const PieDriverCreateDesc,
-    caps: *mut PieDriverCaps,
-) -> *mut PieDriver {
-    guard("create", std::ptr::null_mut(), || create_impl(desc, caps))
-}
+impl Shell {
+    /// Open the driver.
+    ///
+    /// Takes the boot bytes and the broker it will finish work through. It
+    /// used to take a `*const PieDriverCreateDesc` carrying an `abi_version`,
+    /// a `{ptr, len}` view of these same bytes, and a `{notify, ctx}` C
+    /// callback pair — and it answered a `*mut PieDriver` plus a JSON blob
+    /// through an out-parameter, because a C function that fails cannot
+    /// return two things.
+    ///
+    /// # Errors
+    ///
+    /// A boot config this driver refuses, or a device that would not open.
+    /// The reason is on stderr; the status is which class it was.
+    pub fn open(config_bytes: &[u8], broker: driver_api::CompletionBroker) -> Result<Self, i32> {
+        guard("create", Err(PIE_STATUS_DRIVER_ERROR), || {
+            load::create_impl(config_bytes, broker)
+        })
+    }
 
-/// Device bytes this driver holds — a DIAGNOSTIC, not one of the thirteen.
-///
-/// What a leak test should read. `cudaMemGetInfo` answers a question about
-/// the DEVICE, and a process sharing a GPU cannot answer that for itself:
-/// a second consumer allocating during the measurement is
-/// indistinguishable from a leak, and the fifty-step soak failed exactly
-/// that way against a concurrent agent on the same card.
-///
-/// This is a claim about the SHELL. Zero for a null driver or one whose
-/// fire allocator has not been made, which reads as "holds nothing" and
-/// is true of both.
-///
-/// Not `extern "C"` and not in `driver_api::local`: the engine has no
-/// reason to ask, and a fourteenth door would have to be a contract.
-#[must_use]
-pub fn live_device_bytes(driver: *mut PieDriver) -> usize {
-    let Some(shell) = (unsafe { driver.cast::<state::Shell>().as_ref() }) else {
-        return 0;
-    };
-    shell
-        .fire_alloc
-        .as_ref()
-        .map_or(0, crate::device::Allocator::live_bytes)
-}
+    /// Device bytes this driver holds — a DIAGNOSTIC, not one of the verbs.
+    ///
+    /// What a leak test should read. `cudaMemGetInfo` answers a question about
+    /// the DEVICE, and a process sharing a GPU cannot answer that for itself:
+    /// a second consumer allocating during the measurement is
+    /// indistinguishable from a leak, and the fifty-step soak failed exactly
+    /// that way against a concurrent agent on the same card.
+    ///
+    /// This is a claim about the SHELL. Zero for one whose fire allocator has
+    /// not been made, which reads as "holds nothing" and is true.
+    ///
+    /// Not on `Driver`: the engine has no reason to ask, and a fifteenth verb
+    /// would have to be a contract. It took a `*mut PieDriver` and answered
+    /// zero for null, which is the shape everything in this module had.
+    #[must_use]
+    pub fn live_device_bytes(&self) -> usize {
+        self.fire_alloc
+            .as_ref()
+            .map_or(0, crate::device::Allocator::live_bytes)
+    }
 
-/// Tear the driver down. Null is a no-op, as everywhere in the ABI.
-pub fn pie_cuda_destroy(driver: *mut PieDriver) {
-    guard("destroy", (), || destroy_impl(driver));
-}
-
-/// Load the model: one parse of the snapshot through the Rust loader,
-/// the `pie.model/1` descriptor (embedded meta, else the boot TOML's
-/// path), and every bf16 weight resident on the device — with the
-/// llama-like fused trace names built beside the checkpoint names, so the
-/// executor's resolver asks and receives.
-///
-/// Still awaited here: quantized encodings (refused, not mis-loaded),
-/// the memory plan, and KV materialization — those land with `launch`.
-pub fn pie_cuda_load_model(
-    driver: *mut PieDriver,
-    load: *const PieModelLoadDesc,
-    caps: *mut PieDriverCaps,
-) -> i32 {
-    guard("pie_cuda_load_model", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let load = match checked(
-            load,
-            driver_api::local::validate_model_load_desc,
+    /// Load the model: one parse of the snapshot through the Rust loader,
+    /// the `pie.model/1` descriptor (embedded meta, else the boot TOML's
+    /// path), and every bf16 weight resident on the device — with the
+    /// llama-like fused trace names built beside the checkpoint names, so the
+    /// executor's resolver asks and receives.
+    ///
+    /// Still awaited here: quantized encodings (refused, not mis-loaded),
+    /// the memory plan, and KV materialization — those land with `launch`.
+    ///
+    /// # Errors
+    ///
+    /// A checkpoint that will not parse, or one this device cannot run.
+    pub fn load_model(
+        &mut self,
+        desc: &driver_api::ModelLoadDesc,
+    ) -> Result<driver_api::DriverCapabilities, i32> {
+        guard(
             "load_model",
-        ) {
-            Ok(d) => d,
-            Err(status) => return status,
-        };
-        let snapshot = (!load.snapshot_dir.ptr.is_null())
-            .then(|| unsafe {
-                std::slice::from_raw_parts(load.snapshot_dir.ptr, load.snapshot_dir.len)
-            })
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(std::path::PathBuf::from);
-        let Some(snapshot) = snapshot else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        match load_impl(state, &snapshot) {
-            Ok(()) => {
-                let m = state.model.as_ref().expect("load_impl stored the model");
-                if let Some(out) = unsafe { caps.as_mut() } {
-                    out.json_bytes = m.load_caps.as_ptr();
-                    out.json_len = m.load_caps.len();
+            Err(PIE_STATUS_DRIVER_ERROR),
+            move || -> Result<driver_api::DriverCapabilities, i32> {
+                // A `PathBuf` where the descriptor carried a `{ptr, len}` of
+                // UTF-8 that this function turned back into one.
+                if desc.snapshot_dir.as_os_str().is_empty() {
+                    eprintln!("[driver-cuda] load_model: snapshot_dir is empty");
+                    return Err(PIE_STATUS_INVALID_ARGUMENT);
                 }
-                PIE_STATUS_OK
-            }
-            Err(code) => code,
-        }
-    })
-}
+                load_impl(self, &desc.snapshot_dir)?;
+                let model = self.model.as_ref().expect("load_impl stored the model");
+                // The JSON was handed back as `{ptr, len}` into shell-owned
+                // memory and parsed by the engine. Parsed here instead: the
+                // bytes never leave this crate, and the caller is handed the
+                // type it was going to build anyway.
+                serde_json::from_slice(&model.load_caps).map_err(|error| {
+                    eprintln!("[driver-cuda] load_model: capabilities JSON: {error}");
+                    PIE_STATUS_DRIVER_ERROR
+                })
+            },
+        )
+    }
 
-/// Register a program: adopt its launch package, compile its generated
-/// regions, and answer an id.
-///
-/// The C3 hash is the dedup key — re-registering answers the existing id
-/// without recompiling — which is what makes a program that is bound a
-/// thousand times compiled once.
-///
-/// # What a failure here means, and why it is not always one
-///
-/// Four outcomes, and only two of them are errors:
-///
-/// * The descriptor carries NO launch package — an empty stage list. That
-///   is a forward-only deployment: the model runs and the logits come
-///   back through the instance's reader channel, with no user program
-///   around the fire. An id is issued and nothing is adopted. `OK`.
-/// * The package adopts and every generated region compiles. `OK`.
-/// * The package adopts and the plan is UNEXECUTABLE — a per-layer tap
-///   stage, an op this driver does not implement. That is not a driver
-///   failure and not a registration failure either: the plan is recorded
-///   with its reason, and the refusal surfaces at the launch that needs
-///   it, where the caller can see which fire it lost.
-/// * A region NVRTC rejects, or an emitted table with a hole in it.
-///   `UNSUPPORTED`, and remembered: this driver carries no emitter, so a
-///   generated region with no host source has no slower path to fall
-///   back to.
-///
-/// A compile needs a device — the architecture comes from the GPU that
-/// will run the code, never a guess — so a shell with no model loaded has
-/// not bound one yet and defers the compile to the first launch rather
-/// than compiling for an architecture it made up.
-pub fn pie_cuda_register_program(
-    driver: *mut PieDriver,
-    program: *const PieProgramDesc,
-    program_id: *mut u64,
-) -> i32 {
-    guard(
-        "pie_cuda_register_program",
-        PIE_STATUS_DRIVER_ERROR,
-        move || {
-            let Some(state) = shell(driver) else {
-                return PIE_STATUS_INVALID_ARGUMENT;
-            };
-            let desc = match checked(
-                program,
-                driver_api::local::validate_program_desc,
-                "register_program",
-            ) {
-                Ok(d) => d,
-                Err(status) => return status,
-            };
-            if desc.abi_version != PIE_DRIVER_ABI_VERSION {
-                return PIE_STATUS_INVALID_ARGUMENT;
-            }
+    /// Register a program: adopt its launch package, compile its generated
+    /// regions, and answer an id.
+    ///
+    /// The C3 hash is the dedup key — re-registering answers the existing id
+    /// without recompiling — which is what makes a program that is bound a
+    /// thousand times compiled once.
+    ///
+    /// # What a failure here means, and why it is not always one
+    ///
+    /// Four outcomes, and only two of them are errors:
+    ///
+    /// * The descriptor carries NO launch package — an empty stage list. That
+    ///   is a forward-only deployment: the model runs and the logits come
+    ///   back through the instance's reader channel, with no user program
+    ///   around the fire. An id is issued and nothing is adopted. `OK`.
+    /// * The package adopts and every generated region compiles. `OK`.
+    /// * The package adopts and the plan is UNEXECUTABLE — a per-layer tap
+    ///   stage, an op this driver does not implement. That is not a driver
+    ///   failure and not a registration failure either: the plan is recorded
+    ///   with its reason, and the refusal surfaces at the launch that needs
+    ///   it, where the caller can see which fire it lost.
+    /// * A region NVRTC rejects, or an emitted table with a hole in it.
+    ///   `UNSUPPORTED`, and remembered: this driver carries no emitter, so a
+    ///   generated region with no host source has no slower path to fall
+    ///   back to.
+    ///
+    /// A compile needs a device — the architecture comes from the GPU that
+    /// will run the code, never a guess — so a shell with no model loaded has
+    /// not bound one yet and defers the compile to the first launch rather
+    /// than compiling for an architecture it made up.
+    ///
+    /// # Errors
+    ///
+    /// A package that will not adopt, or a region NVRTC rejects.
+    pub fn register_program(
+        &mut self,
+        program: &driver_api::ProgramRegistration,
+    ) -> Result<u64, i32> {
+        guard("register_program", Err(PIE_STATUS_DRIVER_ERROR), move || {
+            let state = self;
+            // No validate call: `validate_program_desc` stated an
+            // `abi_version` and two reserved words and nothing else, and a
+            // `ProgramRegistration` has none of the three.
+            let desc = program;
             if let Some(id) = state
                 .programs
                 .iter()
                 .find(|(_, p)| p.program_hash == desc.program_hash)
                 .map(|(&id, _)| id)
             {
-                if let Some(out) = unsafe { program_id.as_mut() } {
-                    *out = id;
-                }
-                return PIE_STATUS_OK;
+                return Ok(id);
             }
 
-            // SAFETY: the engine's contract for `register_program` is that every
-            // array reachable from the descriptor is live for the duration of the
-            // call. Adoption COPIES, so nothing here outlives that window --
-            // which is the reason it is done now rather than by holding the
-            // descriptor: `PieProgramDesc` is the caller's transient memory.
-            let package = unsafe { driver_api::adopt_package(&desc.launch) };
-            let kernels = unsafe { driver_api::adopt_emitted_kernels(desc.emitted_kernels) };
+            // NO ADOPTION. The package and the kernel table arrive owned, so
+            // the copy that used to turn `PieLaunchPackage` back into
+            // `LaunchPackage` -- 1,557 lines of field-for-field mapping whose
+            // whole job was to undo `engine`'s `launch_abi.rs` -- has nothing
+            // left to do. `driver::adopt_launch_package` below is a different
+            // thing and stays: it lowers the package into an ExecPlan.
+            let package = desc.launch.clone();
+            let kernels = desc.emitted_kernels.as_slice();
 
             let id = state.next_id;
             state.next_id += 1;
@@ -352,9 +280,7 @@ pub fn pie_cuda_register_program(
             // where the difference between "the host sent a broken program" and
             // "the host sent no program" is visible.
             if !package.stages.is_empty() {
-                if let Err(code) = adopt_and_compile(state, id, desc, package, &kernels) {
-                    return code;
-                }
+                adopt_and_compile(state, id, desc, package, kernels)?;
             }
 
             state.programs.insert(
@@ -364,54 +290,43 @@ pub fn pie_cuda_register_program(
                     emitter_version: desc.emitter_version,
                 },
             );
-            if let Some(out) = unsafe { program_id.as_mut() } {
-                *out = id;
-            }
-            PIE_STATUS_OK
-        },
-    )
-}
+            Ok(id)
+        })
+    }
 
-/// Register a channel endpoint: the C++ registry's binding contract —
-/// a pinned host MIRROR of `(capacity + 1)` wire cells and four pinned
-/// control words (head 0, tail 1, poison 2, closed 3), both zeroed, with
-/// the wire-cell math reproduced exactly (bool bit-packs, everything
-/// else is four bytes per element; `capacity + 1 ≤ 64`). Device-side
-/// rings and fire delivery ride with the launch integration.
-pub fn pie_cuda_register_channel(
-    driver: *mut PieDriver,
-    channel: *const PieChannelDesc,
-    binding: *mut PieChannelEndpointBinding,
-) -> i32 {
-    guard(
-        "pie_cuda_register_channel",
-        PIE_STATUS_DRIVER_ERROR,
-        move || {
+    /// Register a channel endpoint: the C++ registry's binding contract —
+    /// a pinned host MIRROR of `(capacity + 1)` wire cells and four pinned
+    /// control words (head 0, tail 1, poison 2, closed 3), both zeroed, with
+    /// the wire-cell math reproduced exactly (bool bit-packs, everything
+    /// else is four bytes per element; `capacity + 1 ≤ 64`). Device-side
+    /// rings and fire delivery ride with the launch integration.
+    ///
+    /// # Errors
+    ///
+    /// A shape this shell cannot place, or pinned memory it could not get.
+    pub fn register_channel(
+        &mut self,
+        plan: &driver_api::ChannelRegistrationPlan,
+    ) -> Result<ChannelBinding, i32> {
+        guard("register_channel", Err(PIE_STATUS_DRIVER_ERROR), move || {
             use crate::fire::attention_workspace::{LiveStagingOps, StagingOps};
 
             const MAX_RING: u64 = 64;
-            let Some(state) = shell(driver) else {
-                return PIE_STATUS_INVALID_ARGUMENT;
-            };
-            let desc = match checked(
-                channel,
-                |d| unsafe { driver_api::local::validate_channel_desc(d) },
-                "register_channel",
-            ) {
-                Ok(d) => d,
-                Err(status) => return status,
-            };
-            if desc.abi_version != PIE_DRIVER_ABI_VERSION
-                || state.channels.contains_key(&desc.channel_id)
+            let state = self;
+            // No `abi_version` and no `validate_channel_desc`: the plan is an
+            // owned `ChannelRegistrationPlan`, so the forty `ptr/len mismatch`
+            // rules that validator carried are rules about a representation
+            // that is gone. What is left is what a `Vec` still cannot state.
+            let desc = plan;
+            if state.channels.contains_key(&desc.channel_id)
                 || desc.dtype > driver_api::local::PIE_CHANNEL_DTYPE_ACT
             {
-                return PIE_STATUS_INVALID_ARGUMENT;
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
-            let shape = slice_of(desc.shape.ptr, desc.shape.len);
             let mut numel: u64 = 1;
-            for &d in shape {
+            for &d in &desc.shape {
                 let Some(next) = numel.checked_mul(u64::from(d)) else {
-                    return PIE_STATUS_INVALID_ARGUMENT;
+                    return Err(PIE_STATUS_INVALID_ARGUMENT);
                 };
                 numel = next;
             }
@@ -420,28 +335,28 @@ pub fn pie_cuda_register_channel(
             } else {
                 match numel.checked_mul(4) {
                     Some(b) => b,
-                    None => return PIE_STATUS_INVALID_ARGUMENT,
+                    None => return Err(PIE_STATUS_INVALID_ARGUMENT),
                 }
             };
             let ring = u64::from(desc.capacity) + 1;
             if wire_bytes == 0 || ring > MAX_RING {
-                return PIE_STATUS_INVALID_ARGUMENT;
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
             let Some(mirror_bytes) = wire_bytes.checked_mul(ring) else {
-                return PIE_STATUS_INVALID_ARGUMENT;
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
             let Ok(mirror_bytes) = usize::try_from(mirror_bytes) else {
-                return PIE_STATUS_INVALID_ARGUMENT;
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
 
             let mut ops = LiveStagingOps;
             let Some(mirror) = ops.malloc_host(mirror_bytes) else {
-                return PIE_STATUS_EXHAUSTED;
+                return Err(PIE_STATUS_EXHAUSTED);
             };
             let word_bytes = 4 * std::mem::size_of::<u64>();
             let Some(words) = ops.malloc_host(word_bytes) else {
                 ops.free_host(mirror);
-                return PIE_STATUS_EXHAUSTED;
+                return Err(PIE_STATUS_EXHAUSTED);
             };
             unsafe {
                 std::ptr::write_bytes(mirror.cast::<u8>(), 0, mirror_bytes);
@@ -466,53 +381,41 @@ pub fn pie_cuda_register_channel(
                     extern_dir: desc.extern_dir,
                 },
             );
-            if let Some(out) = unsafe { binding.as_mut() } {
-                *out = PieChannelEndpointBinding {
-                    channel_id: desc.channel_id,
-                    mirror_base: mirror as u64,
-                    word_base: words as u64,
-                    mirror_bytes: mirror_bytes as u64,
-                    word_bytes: word_bytes as u64,
-                    cell_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
-                    capacity: desc.capacity,
-                    head_word_index: 0,
-                    tail_word_index: 1,
-                    poison_word_index: 2,
-                    closed_word_index: 3,
-                };
-            }
-            PIE_STATUS_OK
-        },
-    )
-}
+            Ok(ChannelBinding {
+                channel_id: desc.channel_id,
+                mirror_base: mirror as u64,
+                word_base: words as u64,
+                mirror_bytes: mirror_bytes as u64,
+                word_bytes: word_bytes as u64,
+                cell_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
+                capacity: desc.capacity,
+                head_word_index: 0,
+                tail_word_index: 1,
+                poison_word_index: 2,
+                closed_word_index: 3,
+            })
+        })
+    }
 
-/// Bind an instance to a registered program: the id lifecycle, honoring
-/// a nonzero `requested_instance_id` and echoing the geometry class.
-/// KV-slot and adapter state ride in with the `launch` arm.
-pub fn pie_cuda_bind_instance(
-    driver: *mut PieDriver,
-    instance: *const PieInstanceDesc,
-    binding: *mut PieInstanceBinding,
-) -> i32 {
-    guard(
-        "pie_cuda_bind_instance",
-        PIE_STATUS_DRIVER_ERROR,
-        move || {
-            let Some(state) = shell(driver) else {
-                return PIE_STATUS_INVALID_ARGUMENT;
-            };
-            let desc = match checked(
-                instance,
-                |d| unsafe { driver_api::local::validate_instance_desc(d) },
-                "bind_instance",
-            ) {
-                Ok(d) => d,
-                Err(status) => return status,
-            };
-            if desc.abi_version != PIE_DRIVER_ABI_VERSION
-                || !state.programs.contains_key(&desc.program_id)
-            {
-                return PIE_STATUS_INVALID_ARGUMENT;
+    /// Bind an instance to a registered program: the id lifecycle, honoring
+    /// a nonzero `requested_instance_id` and echoing the geometry class.
+    /// KV-slot and adapter state ride in with the `launch` arm.
+    ///
+    /// # Errors
+    ///
+    /// No such program, an identity already bound, or an extern channel.
+    pub fn bind_instance(
+        &mut self,
+        plan: &driver_api::InstanceBindingPlan,
+    ) -> Result<InstanceBinding, i32> {
+        guard("bind_instance", Err(PIE_STATUS_DRIVER_ERROR), move || {
+            let state = self;
+            // No `abi_version` and no `validate_instance_desc`: an
+            // `InstanceBindingPlan` is owned, so the slice-walking that
+            // validator did has nothing to walk.
+            let desc = plan;
+            if !state.programs.contains_key(&desc.program_id) {
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
             // AN EXTERN CHANNEL IS NOT SERVABLE HERE, and the reason is on
             // `ChannelState::is_extern`: it needs ONE ring shared between the
@@ -521,8 +424,8 @@ pub fn pie_cuda_bind_instance(
             // ring that no one ever fills — a program that blocks forever, or
             // reads a zeroed cell and treats it as a value. Refusing at the
             // attach is the only point where the driver can still say so.
-            let attached = slice_of(desc.channel_ids.ptr, desc.channel_ids.len);
-            if let Some(&cid) = attached
+            if let Some(&cid) = desc
+                .channel_ids
                 .iter()
                 .find(|c| state.channels.get(c).is_some_and(ChannelState::is_extern))
             {
@@ -532,7 +435,7 @@ pub fn pie_cuda_bind_instance(
                  programs sharing it would not share cells or cursors. \
                  Refusing rather than binding a ring nobody fills."
                 );
-                return driver_api::PIE_STATUS_UNSUPPORTED;
+                return Err(driver_api::PIE_STATUS_UNSUPPORTED);
             }
             let id = if desc.requested_instance_id != 0 {
                 desc.requested_instance_id
@@ -542,63 +445,72 @@ pub fn pie_cuda_bind_instance(
                 id
             };
             if state.instances.contains_key(&id) {
-                return PIE_STATUS_INVALID_ARGUMENT;
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
+            // The plan states the class as a `GeometryClass`; the entry and
+            // the binding both carry the discriminant, which is what the
+            // fire path indexes with.
+            let geometry_class = desc.geometry_class as u32;
             state.instances.insert(
                 id,
                 InstanceEntry {
                     program_id: desc.program_id,
-                    geometry_class: desc.geometry_class,
-                    channel_ids: slice_of(desc.channel_ids.ptr, desc.channel_ids.len).to_vec(),
+                    geometry_class,
+                    channel_ids: desc.channel_ids.clone(),
                 },
             );
-            if let Some(out) = unsafe { binding.as_mut() } {
-                out.instance_id = id;
-                out.geometry_class = desc.geometry_class;
-                out.reserved0 = 0;
-            }
-            PIE_STATUS_OK
-        },
-    )
-}
+            Ok(InstanceBinding {
+                instance_id: id,
+                geometry_class,
+                reserved0: 0,
+            })
+        })
+    }
 
-/// Launch a frame: the executor's fire assembly, promoted from the
-/// smokes into the shell.
-///
-/// What runs today: SINGLE-step, single-sub-batch frames over the loaded
-/// llama-like model — the frame's own CSRs become the fire, the KV pools
-/// are driver-owned and persist across launches, write targets derive
-/// from the CSR tails, and every batch member's terminal cell is
-/// published (release) before the runtime is notified. Multi-step
-/// frames, device-geometry sub-batches and channel-delivered outputs
-/// refuse with UNSUPPORTED until their machinery lands — logits stay in
-/// the shell until channels exist to carry them out.
-pub fn pie_cuda_launch(
-    driver: *mut PieDriver,
-    frame: *const PieFrameDesc,
-    completion: PieCompletion,
-) -> i32 {
-    guard("pie_cuda_launch", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        // NOT `validate_frame_desc` YET, and the reason is written down
-        // rather than left as an omission. That validator requires
-        // `terminal_cells.len == roster_rows.len` and a
-        // `channel_ticket_indptr` whenever ticket values are present;
-        // this shell serves frames today that state neither, so adopting
-        // it here would refuse traffic that works. Which of the two is
-        // wrong — the frames or the rule — is a question for whoever owns
-        // the ticket path, and guessing is how a validator gets weakened
-        // instead of a caller fixed. See `validators-unskippable`.
-        let frame = match checked(
-            frame,
-            |d| unsafe { driver_api::local::validate_frame_desc(d) },
-            "launch",
-        ) {
-            Ok(d) => d,
-            Err(status) => return status,
-        };
+    /// Launch a frame: the executor's fire assembly, promoted from the
+    /// smokes into the shell.
+    ///
+    /// What runs today: SINGLE-step, single-sub-batch frames over the loaded
+    /// llama-like model — the frame's own CSRs become the fire, the KV pools
+    /// are driver-owned and persist across launches, write targets derive
+    /// from the CSR tails, and every batch member's terminal cell is
+    /// published (release) before the runtime is notified. Multi-step
+    /// frames, device-geometry sub-batches and channel-delivered outputs
+    /// refuse with UNSUPPORTED until their machinery lands — logits stay in
+    /// the shell until channels exist to carry them out.
+    ///
+    /// # Errors
+    ///
+    /// A malformed frame, or a device that failed after accepting it.
+    pub fn launch(
+        &mut self,
+        frame: &driver_api::submission::FrameSubmission,
+        completion: CompletionTarget,
+    ) -> Result<(), i32> {
+        guard("launch", Err(PIE_STATUS_DRIVER_ERROR), move || {
+            let state = self;
+        // THE FRAME IS VALIDATED, and the comment that used to sit here said
+        // it was not. That comment claimed `validate_frame_desc` was too
+        // strict to adopt ("this shell serves frames today that state
+        // neither"); the code under it had adopted it anyway, and
+        // `entry_validation::no_validator_is_deferred` records what doing so
+        // caught — fixtures whose `roster_rows` counted TOKENS, steps with no
+        // terminal cell, two steps sharing one. The claim had inverted and
+        // the note had not been rewritten.
+        //
+        // `FrameSubmission::validate` carries every rule that validator did:
+        // roster bounds, the distinctness of members and of cells (within a
+        // step and across them), one cell per member, the CSRs, the
+        // recurrent-state parallelism and flag bits, the ticket cover.
+        //
+        // What it does NOT carry is the forty-odd `ptr/len mismatch` checks,
+        // and those are not weakened rules -- a `Vec` cannot be a null
+        // pointer with a nonzero length, so they are rules about a
+        // representation that is gone.
+        if let Err(why) = frame.validate() {
+            eprintln!("[driver-cuda] launch: {why}");
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
+        }
         // THE CALL RETURNS WITH THE WORK STILL ON THE STREAM.
         //
         // Publishing the terminal cells and notifying used to happen here,
@@ -611,42 +523,36 @@ pub fn pie_cuda_launch(
         // (`retire_fire`), so an `Ok` here means ENQUEUED rather than DONE.
         // An error still returns synchronously: a fire that could not be
         // built owes nothing and the runtime must hear so on this thread.
-        match launch_impl(state, frame, completion) {
-            Ok(()) => PIE_STATUS_OK,
-            Err(code) => code,
-        }
-    })
-}
+        launch_impl(state, frame, completion)
+        })
+    }
 
-/// Close an instance — idempotently, the C++'s reading: closing what is
-/// not open is not an error.
-pub fn pie_cuda_close_instance(driver: *mut PieDriver, instance_id: u64) -> i32 {
-    guard(
-        "pie_cuda_close_instance",
-        PIE_STATUS_DRIVER_ERROR,
-        move || {
-            let Some(state) = shell(driver) else {
-                return PIE_STATUS_INVALID_ARGUMENT;
-            };
+    /// Close an instance — idempotently, the C++'s reading: closing what is
+    /// not open is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Never today.
+    pub fn close_instance(&mut self, instance_id: u64) -> Result<(), i32> {
+        guard("close_instance", Err(PIE_STATUS_DRIVER_ERROR), move || {
+            let state = self;
             state.instances.remove(&instance_id);
             // The rings go with it. They are the instance's, and holding them
             // past its close is a device allocation nothing can reach — the
             // channel ids that named it are gone with the entry above.
             state.ptir_sessions.remove(&instance_id);
-            PIE_STATUS_OK
-        },
-    )
-}
+            Ok(())
+        })
+    }
 
-/// Close a channel — idempotently, freeing its pinned endpoint.
-pub fn pie_cuda_close_channel(driver: *mut PieDriver, channel_id: u64) -> i32 {
-    guard(
-        "pie_cuda_close_channel",
-        PIE_STATUS_DRIVER_ERROR,
-        move || {
-            let Some(state) = shell(driver) else {
-                return PIE_STATUS_INVALID_ARGUMENT;
-            };
+    /// Close a channel — idempotently, freeing its pinned endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Never today.
+    pub fn close_channel(&mut self, channel_id: u64) -> Result<(), i32> {
+        guard("close_channel", Err(PIE_STATUS_DRIVER_ERROR), move || {
+            let state = self;
             if let Some(ch) = state.channels.remove(&channel_id) {
                 // UNREGISTERED NOW, FREED LATER. See `InFlight::closed_channels`:
                 // a queued fire's debt holds a copy of this state and will publish
@@ -660,9 +566,9 @@ pub fn pie_cuda_close_channel(driver: *mut PieDriver, channel_id: u64) -> i32 {
                     None => ch.free(),
                 }
             }
-            PIE_STATUS_OK
-        },
-    )
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]

@@ -63,58 +63,34 @@
 //! `kernels::check_plan` refuses any `OpKind::Launch` symbol no row declares,
 //! so a kernel cannot be stated by a model text without its contract.
 
-pub use kernels::{Cap, KernelSig, Prepare};
-
-/// The emitters, re-exported from where they are now authored.
-///
-/// `pub use` rather than `pub mod`: the file moved to `kernels-cuda-new` to
-/// sit beside the rows every one of its emitters reads. `driver-cuda`'s build
-/// script calls [`abi::emit_rust_bindings`] and [`abi::emit_rust_dispatch`]
-/// through THIS path and its `launch_abi` suite names [`abi::Record`], so the
-/// line below is the difference between a move and a flag day.
-pub use kernels_cuda_new::abi;
-
-pub mod norm_device;
-
-/// The layout-record builder, beside the [`abi::Record`] it builds.
-///
-/// A `#[macro_export]` macro lives at its crate's root, so moving the
-/// emitters moved this to `kernels_cuda_new::record!` — and `driver-cuda`'s
-/// `launch_abi` suite spells `kernels_cuda::record!` in five places. Re-exported
-/// rather than left to be renamed, for the reason every `use` above exists:
-/// the move is not supposed to be visible from here. The expansion names
-/// `kernels_cuda_new::abi::Record` and resolves at each call site, because a
-/// crate that reads this crate's table already depends on the crate that owns
-/// it.
-pub use kernels_cuda_new::record;
-
-/// Every kernel a lowered declaration may state, and the per-family tables it
-/// concatenates.
-///
-/// `kernels_cuda_new::table`'s, re-exported by name rather than with a glob:
-/// a family that appeared silently would be in [`KERNELS`] and absent from
-/// every reader that walks the modules, and there are three of those —
-/// `driver-cuda`'s build script, its `bind` module, and this crate's own
-/// shim generator.
-pub use kernels_cuda_new::table::{
-    KERNELS, adapter, attn, driver_internal, gemm, layout, mlp, moe, norm, quant, rope, sample,
-    ssm,
-};
-
-/// The `pie_k_*` entry points, for the rows any caller can state.
-///
-/// `native` builds `libpie_launch_shim.a`, which DEFINES these; this is the
-/// matching declaration, generated from the same rows in the same process, so
-/// a signature cannot drift from what the shim proves against the header.
-///
-/// Restricted to portable rows — see
-/// [`abi::emit_rust_bindings_portable`]. A row taking `KvCacheLayerView` or a
-/// FlashInfer plan is absent, because its declaration would name a
-/// `#[repr(C)]` mirror this crate does not hold. Those belong to the shell,
-/// which generates the full set against its own mirrors; nothing stops two
-/// crates from declaring one symbol, because a declaration is not a
-/// definition.
-#[cfg(feature = "native")]
-pub mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/ffi.rs"));
-}
+// NOTHING IS RE-EXPORTED FROM HERE ANY MORE, and the way that was
+// discovered is worth as much as the deletion.
+//
+// This file carried 66 lines of `pub use` — `kernels::{Cap, KernelSig,
+// Prepare}`, `kernels_cuda_new::{abi, record}`, the whole of
+// `kernels_cuda_new::table`, `norm_device`, and a `#[cfg(feature =
+// "native")] pub mod ffi` — each with a paragraph explaining which consumer
+// would break without it. The paragraph on `abi` said `driver-cuda`'s build
+// script reaches the emitters "through THIS path" and that its `launch_abi`
+// suite names `abi::Record`; the one on `record` said the same suite spells
+// `kernels_cuda::record!` "in five places", and called the re-export "the
+// difference between a move and a flag day".
+//
+// Measured: `launch_abi.rs` names `kernels_cuda_new::` **49 times** and
+// `kernels_cuda::` **zero**. Across the whole workspace there is not one
+// `use kernels_cuda`, not one `kernels_cuda::` outside a doc comment, and
+// `kernels_cuda::ffi` has no caller — `driver-cuda` generates its own `ffi`
+// module against its own `#[repr(C)]` mirrors.
+//
+// `build.rs` in this very crate already said so, in a doc comment written
+// two refactors ago: *"no crate in the workspace names `kernels_cuda:: any
+// more"*. Both statements were in the tree at once. The re-exports were kept
+// alive by their own justification — a reason that is written down, is
+// checkable, and is false is exactly the shape `new-horizon.md` §§34, 38 and
+// 41 found at three other levels, and this is the fourth: a wall in front of
+// a door nobody opens, spelled as a `pub use`.
+//
+// So the crate is now what its header already claimed it was: `csrc/` and
+// `build.rs`. Its Rust is a lib target Cargo requires and a `links` key that
+// carries `DEP_PIE_KERNELS_CUDA_LAUNCH_SHIM` to `driver-cuda`, which is the
+// only handoff with a reader.

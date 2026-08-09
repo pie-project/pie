@@ -344,7 +344,10 @@
 //     elementwise, L2-resident  swiglu_tile.cuh      1.53x FASTER
 //     elementwise, HBM-bound    swiglu_tile.cuh      4% slower, both at
 //                                                    ~77% of peak
-//     fused multi-stage         moe_fused_tile.cuh   1.5x slower
+//     fused multi-stage         moe_fused_tile.cuh   1.5x slower at 106
+//                                                    blocks, 2.3x FASTER at
+//                                                    1,696 -- the grid, not
+//                                                    the fusion
 //     scan / cross-lane         --                   not expressible
 //
 // The `topk_softmax_tile` row is the strongest of these, because its
@@ -367,8 +370,13 @@
 // are latency and occupancy wins, and they appear where the data is cached
 // — which at decode is everywhere.
 //
-// Fusing costs, and cuBLAS wins where cuBLAS is not handicapped. Those two
-// have not moved.
+// cuBLAS wins where cuBLAS is not handicapped. That one has not moved.
+//
+// "Fusing costs" HAS moved, and it was the third wrong explanation in this
+// file's history. It was measured at one grid -- 106 blocks on a 142-SM
+// part, under one block per SM -- where nothing is fusion-bound because
+// everything is latency-bound. Past 212 blocks the fused kernel wins, and at
+// 1,696 it is 2.3x ahead. `moe_fused_tile.cuh` carries the sweep.
 //
 // Also excluded, and not as a matter of taste: `cuda::tiles` has `sum`,
 // `prod`, `reduce_min/max`, `transpose`, `broadcast`, `iota`, `permute`,
@@ -494,6 +502,20 @@ constexpr int kTileK = PIE_TILE_K;
 ///     moe_grouped_gemm       0.858                  0.214
 ///     cuBLAS, captured       0.972                  0.449
 ///     cuBLAS, ideal          0.327                  0.177
+///
+/// Unconditional, and that is swept rather than assumed. Across four orders
+/// of magnitude of grid, at gate_up N=512 K=2048, it is ahead everywhere:
+///
+///     blocks       tile        wmma        ratio
+///          1     0.005 ms     0.017 ms     3.40x
+///         16     0.013        0.018        1.38x
+///        128     0.388        1.149        2.96x
+///        318     0.324        0.861        2.66x
+///      1,272     1.287        4.070        3.16x
+///      5,088     5.127       16.697        3.26x
+///
+/// Worst relative error 0 at every one. The dip in the middle is the grid
+/// crossing the SM count from below; it never crosses 1.0x.
 ///
 /// The divisibility conditions are the ones the kernel's `static_assert`s
 /// state; they are repeated here so a caller can ask before instantiating.

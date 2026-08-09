@@ -44,13 +44,35 @@
 // same template at the same type. Not one instruction that runs on the device
 // changed; what changed is who wrote the triple-chevron.
 //
-// The five `norm::rmsnorm_bf16` calls and the three `gemm::act_x_wt_bf16`
-// calls stay, and for different reasons. `rmsnorm_bf16` is not a grid: it
-// forwards to `rmsnorm_strided_bf16`, which reads six host values -- three
-// pointer alignments and three strides -- to choose between a vec8 kernel and
-// a scalar one. Copying that here would be a third copy of a decision that
-// already exists twice, in C++ and in the Rust `Select`. `act_x_wt_bf16` is a
-// cuBLAS call and has no `<<<>>>` to copy at all.
+// THE SIX `norm::rmsnorm_bf16` CALLS ARE GONE TOO, and the reason the
+// previous round gave for keeping them is recorded below with what was wrong
+// with it. It said: `rmsnorm_bf16` is not a grid -- it forwards to
+// `rmsnorm_strided_bf16`, which reads six host values (three pointer
+// alignments and three strides) to choose between a vec8 kernel and a scalar
+// one -- and copying that decision here would be a THIRD copy of something
+// that already exists twice, in C++ and in the Rust `Select`.
+//
+// Every clause of that is true and it is an argument about tidiness, which
+// §10.10 outranks: **a launcher goes when its whole consumer set has gone**,
+// and this file was one of exactly two members of `norm::rmsnorm_bf16`'s.
+// While it stayed, the row could not be routed however ready it was, and
+// `device.rs` had already recorded the cost of that -- the sentence naming
+// this file's consumption was allowed to go stale for months because a
+// consumer set nobody re-measures decays quietly. A third copy of six lines
+// is cheaper than a row that can never move.
+//
+// So `rms` below IS that copy, and it is a copy in the strict sense: the
+// predicate is `rmsnorm_vec8_ok`'s six clauses verbatim, the two launches are
+// `rmsnorm_strided_bf16`'s two `<<<>>>` expressions verbatim at the same
+// template arguments and the same block widths, and the strides are the
+// `hidden, hidden, hidden` that `rmsnorm_bf16` itself substituted. Byte
+// identity is not argued for here, it is MEASURED: the tower's whole output
+// is compared between the two builds over four shapes and two weight sets,
+// one shape degenerate, and the numbers are in `new-horizon.md` §42.
+//
+// The three `gemm::act_x_wt_bf16` calls stay. That one is a cuBLAS call with
+// no `<<<>>>` to copy at all -- there is no launcher behind it to free, and
+// `execution.rs` already calls it `Service::Cublas`.
 #include "vision/gemma4_vision.hpp"
 
 #include <algorithm>
@@ -64,7 +86,6 @@
 #include "mlp/swiglu.cuh"
 #include "norm/elementwise.cuh"
 #include "norm/rmsnorm.cuh"
-#include "norm/rmsnorm.hpp"
 #include "vision/gemma4_naive_kernels.cuh"
 #include "vision/gemma4_vision.cuh"
 
@@ -116,6 +137,36 @@ private:
 
 dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}
 
+// `norm::rmsnorm_strided_bf16`'s body, at the strides `norm::rmsnorm_bf16`
+// substituted (`hidden` for both) -- see the header block for why the copy is
+// here rather than a call.
+//
+// The predicate reads an ADDRESS, which is why no `LaunchRule` can state it
+// and why the JIT row for this kernel fires the scalar arm unconditionally:
+// `rmsnorm.cu`'s own header says so. Reproducing it is therefore the only way
+// to keep what this tower launches today unchanged, and keeping it unchanged
+// is the whole claim -- the two arms compute the same function and differ in
+// the last bit, which is exactly the difference a tolerance cannot see.
+inline bool rms_vec8_ok(const void* x,const void* y,const void* w,int hidden){
+    auto aligned=[](const void* p){
+        return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; };
+    return hidden%8==0 && aligned(x) && aligned(y) && aligned(w);
+}
+
+inline void rms(const bf* x,const bf* w,bf* y,int rows,int hidden,float eps,
+                cudaStream_t S){
+    dim3 grid(rows);
+    if(rms_vec8_ok(x,y,w,hidden)){
+        constexpr int VBLOCK=512;
+        nd::rmsnorm_vec8<VBLOCK,/*WEIGHT_PLUS_ONE=*/false>
+            <<<grid,VBLOCK,0,S>>>(D(x),D(w),D(y),nullptr,hidden,hidden,hidden,eps);
+        return;
+    }
+    constexpr int BLOCK=256;
+    nd::rmsnorm<bfd,BLOCK><<<grid,dim3(BLOCK),0,S>>>(
+        D(x),D(w),D(y),hidden,hidden,hidden,eps);
+}
+
 }  // namespace
 
 void run_gemma4_vision(const VisRawWeights& w,
@@ -144,19 +195,19 @@ void run_gemma4_vision(const VisRawWeights& w,
     vd::k_addpos_grid2d<bfd><<<G2(Hd,N),B2,0,S>>>(D(h),D(w.pos_table),pos,N,Hd,PT);
     int li=0;
     for(const auto& L:w.layers){
-        kernels::norm::rmsnorm_bf16(h,L.in_ln,hn,N,Hd,EPS,S);
+        rms(h,L.in_ln,hn,N,Hd,EPS,S);
         clin(hn,q,L.q,Hd,Hd);clin(hn,k,L.k,Hd,Hd);clin(hn,v,L.v,Hd,Hd);
-        kernels::norm::rmsnorm_bf16(q,L.q_norm,q,N*NH,64,EPS,S);kernels::norm::rmsnorm_bf16(k,L.k_norm,k,N*NH,64,EPS,S);nd::rmsnorm_no_scale<bfd,256><<<dim3(N*NH),dim3(256),0,S>>>(D(v),D(v),64,EPS);
+        rms(q,L.q_norm,q,N*NH,64,EPS,S);rms(k,L.k_norm,k,N*NH,64,EPS,S);nd::rmsnorm_no_scale<bfd,256><<<dim3(N*NH),dim3(256),0,S>>>(D(v),D(v),64,EPS);
         dim3 rg(1,NH,N);vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(q),pos,N,NH,THETA);vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(k),pos,N,NH,THETA);
         for(int hh=0;hh<NH;hh++){vd::k_qk<bfd><<<G2(N,N),B2,0,S>>>(D(q),D(k),scr,N,NH,hh,1.0f);vd::k_softmax<bfd><<<N,256,0,S>>>(scr,N);vd::k_av<bfd><<<G2(64,N),B2,0,S>>>(scr,D(v),D(attn),N,NH,hh);}
         clin(attn,tmp,L.o,Hd,Hd);
-        kernels::norm::rmsnorm_bf16(tmp,L.post_attn_ln,tmp,N,Hd,EPS,S);
+        rms(tmp,L.post_attn_ln,tmp,N,Hd,EPS,S);
         { const long n=(long)N*Hd; if(n) nd::residual_add<bfd><<<(unsigned)((n+255)/256),256,0,S>>>(D(h),D(tmp),n); }
-        kernels::norm::rmsnorm_bf16(h,L.pre_ff_ln,hn,N,Hd,EPS,S);
+        rms(h,L.pre_ff_ln,hn,N,Hd,EPS,S);
         clin(hn,gate,L.gate,Hd,IM);clin(hn,up,L.up,Hd,IM);
         { const int ge=(int)((long)N*IM); md::geglu_tanh<bfd><<<(ge+255)/256,256,0,S>>>(D(gate),D(up),D(act),ge); }
         clin(act,tmp,L.down,IM,Hd);
-        kernels::norm::rmsnorm_bf16(tmp,L.post_ff_ln,tmp,N,Hd,EPS,S);
+        rms(tmp,L.post_ff_ln,tmp,N,Hd,EPS,S);
         { const long n=(long)N*Hd; if(n) nd::residual_add<bfd><<<(unsigned)((n+255)/256),256,0,S>>>(D(h),D(tmp),n); }
         if(li++==0) tap("layer0",h,(long)N*Hd);
     }
@@ -170,57 +221,22 @@ void run_gemma4_vision(const VisRawWeights& w,
     VCK(cudaStreamSynchronize(S));
 }
 
-namespace {
-}  // namespace
-
-void scatter_gemma4_vision(const Gemma4VisionInputs& vin, bf* hidden,
-                           int /*n_rows*/, int text_hidden, cudaStream_t S){
-    if(vin.weights==nullptr || vin.num_images<=0) return;
-    const VisRawWeights& w=*vin.weights;
-    const int patch_dim = 3*16*16;            // 768 (Gemma patch 16, RGB)
-    const int pk2 = w.pool_kernel*w.pool_kernel;
-    long patch_off = 0;
-    for(int im=0; im<vin.num_images; ++im){
-        DeviceScratch scratch;
-        const long blo=vin.pixel_byte_indptr_h[im], bhi=vin.pixel_byte_indptr_h[im+1];
-        const int n_floats=(int)((bhi-blo)/4);
-        const int n_patch=n_floats/patch_dim;
-        if(n_patch<=0) continue;
-        const int out_len=n_patch/pk2;
-        const float* pix_h=vin.pixels_h + blo/4;
-        const std::uint32_t* pos_h=vin.patch_positions_h + patch_off*2;
-        const std::uint32_t anchor=vin.anchor_rows_h[im];
-
-        // pixels f32 (host) → device → bf16
-        float* pix_f32_d=scratch.alloc<float>(n_floats);
-        VCK(cudaMemcpyAsync(pix_f32_d,pix_h,(long)n_floats*4,cudaMemcpyHostToDevice,S));
-        bf* pix_bf_d=scratch.alloc<bf>(n_floats);
-        vd::k_f32_to_bf16<bfd><<<(n_floats+255)/256,256,0,S>>>(pix_f32_d,D(pix_bf_d),n_floats);
-
-        // positions u32 (host) → f32 device; pool groups (host) → int device
-        std::vector<float> posf(n_patch*2);
-        std::vector<int> grp(n_patch);
-        int maxx=0; for(int p=0;p<n_patch;++p) maxx=std::max(maxx,(int)pos_h[2*p]);
-        const int gx=(maxx+1)/w.pool_kernel;
-        for(int p=0;p<n_patch;++p){
-            posf[2*p]=(float)pos_h[2*p]; posf[2*p+1]=(float)pos_h[2*p+1];
-            grp[p]=((int)pos_h[2*p]/w.pool_kernel) + gx*((int)pos_h[2*p+1]/w.pool_kernel);
-        }
-        float* pos_d=scratch.alloc<float>((long)n_patch*2);
-        VCK(cudaMemcpyAsync(pos_d,posf.data(),(long)n_patch*2*4,cudaMemcpyHostToDevice,S));
-        int* grp_d=scratch.alloc<int>(n_patch);
-        VCK(cudaMemcpyAsync(grp_d,grp.data(),(long)n_patch*4,cudaMemcpyHostToDevice,S));
-
-        // encode → projected [out_len, text_hidden] → overwrite the anchor rows.
-        bf* proj_d=scratch.alloc<bf>((long)out_len*text_hidden);
-        run_gemma4_vision(w, pix_bf_d, pos_d, grp_d, n_patch, out_len, proj_d, S);
-        VCK(cudaMemcpyAsync(hidden + (long)anchor*text_hidden, proj_d,
-                            (long)out_len*text_hidden*sizeof(bf),
-                            cudaMemcpyDeviceToDevice, S));
-        VCK(cudaStreamSynchronize(S));
-        patch_off += n_patch;
-    }
-}
+// `scatter_gemma4_vision` WAS HERE, and it is deleted.
+//
+// It was the tower's other entry point -- encode each image and overwrite the
+// soft-token rows of a device `hidden` buffer in place, the in-fire shape
+// `qwen3vl_scatter` still has. `encode_gemma4_vision` below superseded it when
+// gemma-4's towers moved to the encode ABI (host rows out, anchor-segmented
+// CSR), and nothing was left calling it: not `gemma4_towers_c.cpp`, not the
+// shim, not a test, not another `.cu`. The transitive audit
+// (`scripts/csrc-reachability-audit.py`) reported it UNREACHABLE and a
+// repository-wide search for the name found its own declaration, its own
+// definition, and one mention in a `.cuh` comment.
+//
+// It carried one launch (`vd::k_f32_to_bf16`) and reached `run_gemma4_vision`,
+// which survives on `encode_gemma4_vision`'s consumption. §10.10, from the
+// other side: the launcher went because its whole consumer set had already
+// gone, and nobody had noticed.
 
 void encode_gemma4_vision(const Gemma4VisionInputs& vin,
                           std::uint16_t* output_rows_h,

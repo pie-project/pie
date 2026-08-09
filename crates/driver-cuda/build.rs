@@ -248,6 +248,181 @@ mod bridge {
             stray.len(),
             stray.join(", ")
         );
+
+        // A ROUTED ROW MUST HAVE SOMEWHERE TO GO.
+        //
+        // The two checks above look for a NAME with no definition. This one
+        // looks for the opposite and worse shape: a symbol in
+        // `JIT_DISPATCHED` that produced **no arm at all**.
+        //
+        // `emit_rust_dispatch` builds the JIT arm from the DEVICE row's
+        // operands, and `continue`s the whole row if any one of them has no
+        // `ArgValue` variant. That skip is silent and it is total: the row
+        // gets no JIT arm, and `emit_c_shim` has already skipped its shim
+        // entry because the same list named it. So the fire reaches a
+        // hand-written arm that does not exist and is diagnosed as
+        // `UnknownKernel` -- a lie about what went wrong, and the exact
+        // failure §22.1 names as a "fire-time lie".
+        //
+        // Neither check above sees it, because the failure is an ABSENCE of a
+        // name in both files at once. Only the list knows the row was meant
+        // to be there.
+        let armless: Vec<&str> = jit
+            .iter()
+            .map(|d| d.sig.symbol)
+            .filter(|symbol| !dispatch.contains(&format!("\"{symbol}\",")))
+            .collect();
+        assert!(
+            armless.is_empty(),
+            "{} symbol(s) are in `JIT_DISPATCHED` and got no arm in `rust_dispatch.rs`: {}. \
+             There are two ways to land here and both are fatal to a routed row. Either an \
+             operand carries `Source::Unbound`, in which case `emit_rust_dispatch` skipped \
+             the row WHOLE and a hand-written arm has been calling `ffi::pie_k_*` for it -- \
+             so dropping the shim entry breaks that arm at LINK time; or a device operand \
+             has no `ArgValue` variant, in which case only the JIT branch was skipped. \
+             `emit_c_shim` has already dropped the shim entry either way, so the first \
+             fails to link and the second reports `UnknownKernel`, blaming the statement \
+             for a gap in the row. State the missing source or operand, or take the symbol \
+             back out of the list.",
+            armless.len(),
+            armless.join(", ")
+        );
+
+        // A HAND-WRITTEN ARM IS A CONSUMER TOO.
+        //
+        // Everything above reads GENERATED text, and that is the blind spot:
+        // `driver-cuda` also calls `ffi::pie_k_*` by hand, from arms that no
+        // emitter knows about. A routed row loses its shim entry, so a hand
+        // arm naming it stops linking -- and the check that would have caught
+        // it reads `rust_dispatch.rs`, where the hand arm is not.
+        //
+        // §22.1 measured what that costs: 114 undefined symbols at once, and
+        // `rust-lld`'s `--error-limit=20` reporting a fifth of them, so the
+        // first four fixes each revealed twenty more.
+        let hand = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
+        let mut by_hand: Vec<String> = Vec::new();
+        for d in jit {
+            let entry = kernels_cuda_new::abi::entry_name(d.sig.symbol);
+            if grep_tree(Path::new(&hand), &entry) {
+                by_hand.push(format!("{} (as `{entry}`)", d.sig.symbol));
+            }
+        }
+        assert!(
+            by_hand.is_empty(),
+            "{} routed symbol(s) are still named by a HAND-WRITTEN arm under \
+             `driver-cuda/src`: {}. Routing drops the shim entry these link against, and \
+             no generated file mentions them -- so every check that reads generated text \
+             passes and the build fails at link. Move the hand arm to the JIT path first, \
+             then route.",
+            by_hand.len(),
+            by_hand.join(", ")
+        );
+    }
+
+    /// The probe file holds, arm for arm, what the dispatcher holds for every
+    /// ROUTED symbol.
+    ///
+    /// # What this is guarding, and why a comment would not do it
+    ///
+    /// The parity harness fires an unrouted row through the probe and calls
+    /// the result "what routing will do". That claim is only worth something
+    /// if the probe's arm IS the arm routing emits — same guard, same
+    /// staging, same `jit_dims` call, same operand expressions in the same
+    /// order. Both come out of one function in one mode-parameterised loop,
+    /// which is the structural half of the argument; this is the measured
+    /// half, and it is cheap because the two strings are right here.
+    ///
+    /// It can only be checked on the rows that are ALREADY routed — an
+    /// unrouted row has no arm in the dispatcher to compare against, which is
+    /// the whole reason the probe exists. So the check grows a row at a time
+    /// with the routed set, and every row it can see is one the harness
+    /// certified before the flip: if the two ever came apart, the harness
+    /// would have been proving something about a string nothing runs.
+    fn the_probe_is_the_arm_routing_emits(
+        dispatch: &str,
+        probe: &str,
+        jit: &[&'static kernels_cuda_new::device::DeviceKernel],
+    ) {
+        let mut checked = 0usize;
+        for row in jit {
+            let symbol = row.sig.symbol;
+            let (Some(shipped), Some(probed)) = (arm_of(dispatch, symbol), arm_of(probe, symbol))
+            else {
+                // A routed row with no arm in one of the two files is
+                // `routed_rows_have_an_arm`'s failure and is reported there,
+                // with the two causes named. Saying it twice here would put
+                // the worse message first.
+                continue;
+            };
+            assert!(
+                shipped == probed,
+                "`{symbol}`'s arm differs between the dispatcher and the parity probe. \
+                 They are emitted by one function and must be one string, or the harness \
+                 that fires a row through the probe before routing it is proving something \
+                 about text the dispatcher does not contain.\n--- dispatcher\n{shipped}\n\
+                 --- probe\n{probed}"
+            );
+            checked += 1;
+        }
+        // AND THE DENOMINATOR, because a comparison that found no pairs
+        // passes for the same reason it would pass on two empty files --
+        // §21's rule, and §39.2's instance of it, one layer down.
+        assert!(
+            checked > 0 || jit.is_empty(),
+            "{} row(s) are routed and NONE of them was found in both generated files. \
+             `arm_of` looks for a line starting `\"symbol\"`; if the emitter's arm \
+             preamble changed shape, this check is now reading nothing and passing.",
+            jit.len()
+        );
+    }
+
+    /// One arm's text, from the line whose pattern names `symbol` to the
+    /// closing brace at column zero.
+    ///
+    /// Textual, because the input is generated text and the alternative is
+    /// re-deriving the arm here — which would compare the emitter against a
+    /// second copy of itself. A pattern line is `"sym" => {` or
+    /// `"sym" | "alias" if guard => {`, always at column zero, and the arm
+    /// always closes with a `}` at column zero, because that is what
+    /// `emit_rust_dispatch` writes.
+    fn arm_of(text: &str, symbol: &str) -> Option<String> {
+        let head = format!("\"{symbol}\"");
+        let mut lines = text.lines().skip_while(|l| !l.starts_with(&head));
+        let first = lines.next()?;
+        let mut arm = String::from(first);
+        for line in lines {
+            arm.push('\n');
+            arm.push_str(line);
+            if line == "}" {
+                return Some(arm);
+            }
+        }
+        None
+    }
+
+    /// Whether any `.rs` under `dir` contains `needle`, comments included.
+    ///
+    /// Deliberately textual and deliberately over-eager: a mention in a
+    /// comment is a false positive that costs one edit, and a missed call is
+    /// a link error that costs an afternoon. The asymmetry is the whole
+    /// design — §21's rule that *a textual gate names what it looks at* is
+    /// satisfied by the panic message above, which says "named by", not
+    /// "called by".
+    fn grep_tree(dir: &Path, needle: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if grep_tree(&path, needle) {
+                    return true;
+                }
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && std::fs::read_to_string(&path).is_ok_and(|t| t.contains(needle))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The defined external symbols in a `!<arch>` archive, from its own
@@ -326,6 +501,20 @@ mod bridge {
         let dispatch = kernels_cuda_new::abi::emit_rust_dispatch(&tables, &jit);
         std::fs::write(out_dir.join("rust_dispatch.rs"), &dispatch).expect("write dispatch");
 
+        // AND THE SAME ARMS ONE STEP EARLY, for the harness that has to fire
+        // a row both ways BEFORE it is routed.
+        //
+        // Written unconditionally and included only under `jit-parity`: a
+        // string this build script already holds costs a `write` to produce
+        // and nothing to leave on disk, while making the file's existence
+        // depend on a feature would mean the check below only ran in the
+        // builds that least need it.
+        let hosted: Vec<&'static kernels_cuda_new::device::DeviceKernel> =
+            kernels_cuda_new::unit::rows().collect();
+        let probe = kernels_cuda_new::abi::emit_rust_dispatch_probe(&tables, &hosted);
+        std::fs::write(out_dir.join("rust_dispatch_probe.rs"), &probe).expect("write probe");
+        the_probe_is_the_arm_routing_emits(&dispatch, &probe, &jit);
+
         println!("cargo:rerun-if-env-changed=CUDA_HOME");
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
         let cuda_include = cuda_home().join("include");
@@ -355,6 +544,123 @@ mod bridge {
             .include(&cuda_include)
             .file(&supergraph)
             .compile("pie_supergraph");
+
+        // THE THREE MULTIMODAL TOWERS, moved here out of `kernels-cuda`.
+        //
+        // Same argument as the supergraph above, and it is measured rather
+        // than asserted. A tower's `.cu` includes exactly two kinds of thing:
+        // `.cuh` device headers, and `.hpp` host declarations. EVERY `.cuh`
+        // the three towers include -- `vision/gemma4_vision.cuh`,
+        // `gemma4_audio.cuh`, `gemma4_naive_kernels.cuh`,
+        // `qwen3_vl_tower.cuh`, `tower_naive_kernels.cuh`, plus
+        // `norm/rmsnorm.cuh`, `norm/elementwise.cuh`, `mlp/swiglu.cuh`,
+        // `ssm/causal_conv1d.cuh` -- already lived in the JIT tree, reached
+        // through `-iquote`. None of them was ever in the archive. So what
+        // `kernels-cuda` compiled for a tower was never device code: it was a
+        // HOST WALK over device code that belongs to `kernels-cuda-new`, and
+        // a host walk with a `cudaStream_t` in its signature is this crate's
+        // kind of object, not that one's.
+        //
+        // The walk is also not expressible as a kernel row. `Execution` has
+        // `Jit | Composed | Service`, and `Composed` is the near miss: it
+        // carries a `&'static [Step]`, a list fixed at compile time, and a
+        // tower is a data-dependent loop -- `for im in 0..num_images`, a
+        // per-layer body, and host-side position-embedding interpolation
+        // computed BETWEEN launches from a grid size only known at call
+        // time. A static step list cannot say that. The rows therefore stay
+        // `driver_internal` with `whole = true`, which is also what keeps
+        // the owner's constraint true: `model-compiler` cannot name these
+        // symbols at all, so it cannot tell what is behind them.
+        //
+        // The five `vision/*.hpp` stay in `kernels-cuda/csrc/src/vision/`.
+        // They are the launch shim's compile-time contract -- the shim is
+        // generated over there and forwards `pie_k_vision_*` into
+        // `kernels::vision::*` -- and a contract is a header. The
+        // DEFINITIONS are here, so the final link resolves shim -> towers,
+        // which is why `pie_vision_towers` is emitted between the shim and
+        // the kernel archive in the `-l` order below.
+        //
+        // Toolkit-free builds are unaffected: this is inside `bridge`, and
+        // `cargo check -p driver-cuda` with no features never reaches it.
+        let towers_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/vision");
+        let archive_src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kernels-cuda/csrc/src");
+        let jit_headers = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kernels-cuda-new/csrc/src");
+        println!("cargo:rerun-if-changed=csrc/vision");
+        let mut towers = cc::Build::new();
+        towers
+            .cuda(true)
+            .std("c++17")
+            .include(&cuda_include)
+            // `vision/*.hpp`, and the two host headers a tower still calls
+            // into: `gemm/gemm.hpp` (cuBLAS) and `attn/*.hpp` (FlashInfer).
+            .include(&archive_src)
+            // `-iquote`, NOT `-I`, and for the reason `kernels-cuda`'s
+            // CMakeLists spells out at length: this tree carries shims
+            // wearing NVIDIA's filenames (`cuda_bf16.h`) so NVRTC has
+            // something to answer with, and an `-I` would let one shadow the
+            // real toolkit header. `-iquote` answers only `#include "..."`.
+            .flag(&format!("-Xcompiler=-iquote,{}", jit_headers.display()))
+            .flag("-gencode")
+            .flag("arch=compute_89,code=sm_89")
+            .flag("--expt-relaxed-constexpr")
+            .flag("--extended-lambda")
+            // The `-l` is emitted BY HAND below, after the shim's, because
+            // `cc` would print it here and a static archive is scanned in
+            // place: the shim's `pie_k_vision_*` bodies CALL into these
+            // objects, so the caller has to precede the callee. Printing it
+            // at this point in the file would put the towers ahead of the
+            // shim and every tower symbol would be undefined.
+            .cargo_metadata(false)
+            .warnings(false);
+        let listing = std::fs::read_dir(&towers_dir).unwrap_or_else(|e| {
+            panic!(
+                "{towers_dir:?} does not read ({e}), and the `-l static=pie_vision_towers` \
+                 below names its archive unconditionally. The towers moved here out of \
+                 `kernels-cuda`; if that move is being reverted, the `-l` goes with the \
+                 directory."
+            )
+        });
+        let mut units = 0usize;
+        for entry in listing {
+            let path = entry.expect("csrc/vision entry").path();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("cu") | Some("cpp") => {
+                    towers.file(&path);
+                    units += 1;
+                }
+                _ => {}
+            }
+        }
+        // The floor 1832b170f argues for, applied to the scan two hundred
+        // lines from the one it fixed. This is a `read_dir` over a directory
+        // whose contents are landing in another agent's commits, and its
+        // result is an archive NAMED on the link line: zero translation units
+        // still produces a `libpie_vision_towers.a`, still satisfies the
+        // `-l`, and defines nothing. The failure then surfaces at the final
+        // link as undefined `kernels::vision::*` — which `rust-lld` reports
+        // twenty at a time under `--error-limit=20`, so a rename that drops
+        // one file reads as a fifth of a symbol list attached to whatever
+        // test target happened to link first. A count is the only thing
+        // between those two readings.
+        //
+        // The floor is 1 and not the 5 or 6 files the move will settle on,
+        // deliberately: a literal count would be a second place to edit
+        // every time a tower is split or `vis_helpers.cpp` is deleted, and a
+        // stale floor fails the build for a file that was correctly removed.
+        // What is not allowed to be true is that the scan found NOTHING and
+        // said so by succeeding.
+        assert!(
+            units > 0,
+            "{towers_dir:?} holds no .cu or .cpp, so `pie_vision_towers` would be an empty \
+             archive that the `-l` below still names and every `kernels::vision::*` the \
+             launch shim forwards into would be undefined at the final link, reported \
+             twenty at a time. Either the tower sources have not landed yet, or their \
+             extensions changed and this scan no longer recognises them."
+        );
+        towers.compile("pie_vision_towers");
+        let towers_out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
 
         // THE SHIM, which is what `rust_dispatch.rs` above actually calls.
         //
@@ -398,6 +704,14 @@ mod bridge {
         every_call_resolves_in_the_shim(&shim_archive, &dispatch, &bindings, &jit);
         println!("cargo:rustc-link-search=native={}", shim_dir.display());
         println!("cargo:rustc-link-lib=static=pie_launch_shim");
+
+        // ...and the towers immediately after it, before the kernel archive.
+        // The shim forwards `pie_k_vision_*` into `kernels::vision::*`, whose
+        // definitions are in `libpie_vision_towers.a`; those in turn still
+        // call `gemm::` and the FlashInfer wrappers, which are in
+        // `libpie_kernels_cuda.a`. Caller before callee, twice.
+        println!("cargo:rustc-link-search=native={}", towers_out.display());
+        println!("cargo:rustc-link-lib=static=pie_vision_towers");
 
         // The kernels archive the shim forwards into. Search paths come from
         // `kernels-cuda`'s own build script (the `native` feature this

@@ -144,6 +144,14 @@ const fn translate(value: ArgValue) -> kernels_cuda_new::ArgValue {
         ArgValue::U32(v) => kernels_cuda_new::ArgValue::U32(v),
         ArgValue::F32(v) => kernels_cuda_new::ArgValue::F32(v),
         ArgValue::Usize(v) => kernels_cuda_new::ArgValue::Usize(v),
+        // The two this driver's enum was missing until the parity probe
+        // compiled every hosted row's arm at once. The module header above
+        // says the JIT crate "adds `I64` and `Bool` for the batched SSM rows"
+        // — it did, and this side's absence made the emitter answer `Ptr` for
+        // both. Now the twin is here and the `match` is total in both
+        // directions again.
+        ArgValue::I64(v) => kernels_cuda_new::ArgValue::I64(v),
+        ArgValue::Bool(v) => kernels_cuda_new::ArgValue::Bool(v),
         ArgValue::U8(v) => kernels_cuda_new::ArgValue::U8(v),
     }
 }

@@ -356,6 +356,87 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
     global().lookup(hash)
 }
 
+/// Attach the host-generated kernels and region analysis a driver reads, if
+/// this driver reads them and the caller did not already supply them.
+///
+/// # Why this is here and not in the driver layer
+///
+/// It was `DriverBackend::register_program`'s first half — a `lookup` into
+/// this module from inside `engine::driver`, whose own header said "strictly
+/// leaf: no `crate::{store,scheduler,pipeline,...}` imports". Both statements
+/// were in the tree at once, and the one written as a rule was the false one.
+///
+/// The splice is not the driver layer's work in any case. It is a decision
+/// about a PROGRAM — which backend's source this program was compiled for,
+/// and whether this registry has it — and the registry is here. What the
+/// driver layer contributed was `driver.kind()`, which the caller passes.
+///
+/// Generation is memoised per program per backend, so a re-registration costs
+/// a lookup.
+///
+/// Borrowed back unchanged when there is nothing to attach, which is every
+/// registration on a driver that generates its own kernels or needs none.
+#[must_use]
+pub fn with_host_codegen<'a>(
+    plan: &'a ::driver_api::ProgramRegistration,
+    driver_kind: &str,
+) -> std::borrow::Cow<'a, ::driver_api::ProgramRegistration> {
+    // A REMOTE driver generates on the far side, so its kind is not a
+    // codegen backend even when the device behind it is a CUDA card. That is
+    // the same answer the `match` this replaced gave (`Self::Remote(_) =>
+    // None`), stated once instead of per verb.
+    let Some(backend) = Backend::parse(driver_kind).map(|_| driver_kind) else {
+        return std::borrow::Cow::Borrowed(plan);
+    };
+    let registered = lookup(plan.program_hash);
+
+    // The driver carries no emitter, so a fused region with no host source is
+    // a registration failure rather than a slower path.
+    let emitted = plan
+        .emitted_kernels
+        .is_empty()
+        .then(|| registered.as_ref()?.emitted(backend))
+        .flatten();
+
+    // The region analysis is the other half of the CUDA emitter's own
+    // contract -- which regions bind, and how the kernel's intrinsic side
+    // tables are laid out -- so it only means anything to a driver running
+    // those kernels.
+    let region_analysis = if plan.region_analysis.is_empty() && driver_kind == "cuda" {
+        registered
+            .as_ref()
+            .map(|program| program.region_analysis())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if emitted.is_none() && region_analysis.is_empty() {
+        return std::borrow::Cow::Borrowed(plan);
+    }
+
+    let mut next = plan.clone();
+    if let Some(emitted) = emitted {
+        next.emitter_version = emitted.emitter_version;
+        next.emitted_kernels = emitted
+            .kernels
+            .iter()
+            .map(|kernel| ::driver_api::EmittedKernel {
+                kind: kernel.kind,
+                stage_index: kernel.stage_index,
+                region_index: kernel.region_index,
+                entry_name: kernel.entry_name.clone(),
+                source: kernel.source.clone(),
+                error: kernel.error.clone(),
+            })
+            .collect();
+    }
+    if !region_analysis.is_empty() {
+        next.region_analysis = region_analysis;
+    }
+    std::borrow::Cow::Owned(next)
+}
+
 /// Build the bind-time [`ModelProfile`] from the loaded model (P2b: vocab +
 /// page-size + layer caps; model-gated intrinsics + second-party kernels default
 /// conservative until the model surfaces them).

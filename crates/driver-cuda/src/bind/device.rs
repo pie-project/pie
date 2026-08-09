@@ -54,6 +54,40 @@ pub enum ArgValue {
     F32(f32),
     /// A pointer-width unsigned scalar.
     Usize(usize),
+    /// A 64-bit signed scalar — `Ty::I64`, spelled `long long` in the
+    /// headers.
+    ///
+    /// **Added with [`ArgValue::Bool`] as one fix, because the emitter was
+    /// answering `Ptr` for both.** `kernels_cuda_new::abi::arg_value_variant`
+    /// ended in `_ => ArgValue::Ptr`, so every kind this enum did not name
+    /// crossed as an address; the two halves of that failed differently and
+    /// only one of them was visible. A `bool as *mut c_void` does not
+    /// compile, so a row carrying one could never be routed and the error —
+    /// when it finally came — was in a generated file. An `i64 as *mut
+    /// c_void` DOES compile: the row routes, the launch happens, and
+    /// `runtime::args::Args::bind` refuses it as *"declared I64 and was bound
+    /// a pointer"* once per fire, on a device, in a model text.
+    ///
+    /// Every batched SSM row carries one: `slot_stride_elems` is the stride
+    /// between two requests' recurrent states counted in ELEMENTS, widened to
+    /// 64 bits on purpose because `K_d * V_d` floats per head per slot cross
+    /// 2^31 at a modest slot count.
+    ///
+    /// Not folded into [`ArgValue::Usize`], for the JIT crate's reason: they
+    /// are one width and two types, and a stride is signed where a byte count
+    /// is not.
+    I64(i64),
+    /// A one-byte host flag — `Ty::Bool`, spelled `bool` in the headers.
+    ///
+    /// One byte and not four. See [`ArgValue::cell`]: this launch path hands
+    /// the driver one pointer per parameter and it copies `sizeof(param)`
+    /// bytes from each, so the low byte of this cell is the whole of the
+    /// argument and the other seven are never read.
+    ///
+    /// `moe::topk_softmax_bf16`'s `norm_topk`, the GDN steps' `write_state`
+    /// and `attn`'s `hnd_layout` are these — three families that could not be
+    /// routed at all while the emitter called them addresses.
+    Bool(bool),
     /// A one-byte host ENUMERATOR — `Ty::KvScheme` and `Ty::KvDType`, the
     /// `enum class … : ::std::uint8_t` mirrors `attn/attention_naive_paged.cuh`
     /// declares at `:141` and `:152`.
@@ -82,6 +116,8 @@ impl ArgValue {
             ArgValue::U32(_) => "a u32",
             ArgValue::F32(_) => "an f32",
             ArgValue::Usize(_) => "a usize",
+            ArgValue::I64(_) => "an i64",
+            ArgValue::Bool(_) => "a bool",
             ArgValue::U8(_) => "a u8 enumerator",
         }
     }
@@ -99,6 +135,9 @@ impl ArgValue {
             ArgValue::U32(v) => u64::from(v),
             ArgValue::F32(v) => u64::from(v.to_bits()),
             ArgValue::Usize(v) => v as u64,
+            #[allow(clippy::cast_sign_loss)]
+            ArgValue::I64(v) => v as u64,
+            ArgValue::Bool(v) => u64::from(v),
             ArgValue::U8(v) => u64::from(v),
         }
     }

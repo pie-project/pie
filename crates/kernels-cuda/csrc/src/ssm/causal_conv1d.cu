@@ -17,60 +17,14 @@
 
 namespace pie_cuda_driver::kernels::ssm {
 
-namespace {
-template <bool SILU>
-void prefill_dispatch(
-    const void* x, const void* weight, const void* bias,
-    void* y, void* state_out,
-    int N, int C, int K, cudaStream_t stream)
-{
-    if (N <= 0 || C <= 0 || K <= 0) return;
-    constexpr int BLOCK = 64;
-    dim3 grid(C);
-    dim3 block(BLOCK);
-    device::causal_conv1d_prefill<device::bf16, SILU><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(x),
-        static_cast<const device::bf16*>(weight),
-        static_cast<const device::bf16*>(bias),
-        static_cast<device::bf16*>(y),
-        static_cast<device::bf16*>(state_out),
-        N, C, K);
-}
-}  // namespace
-
-void causal_conv1d_prefill_bf16(
-    const void* x, const void* weight, const void* bias,
-    void* y, void* state_out,
-    int N, int C, int K, cudaStream_t stream)
-{
-    prefill_dispatch<true>(x, weight, bias, y, state_out, N, C, K, stream);
-}
-
-void causal_conv1d_prefill_noact_bf16(
-    const void* x, const void* weight, const void* bias,
-    void* y, void* state_out,
-    int N, int C, int K, cudaStream_t stream)
-{
-    prefill_dispatch<false>(x, weight, bias, y, state_out, N, C, K, stream);
-}
-
-void causal_conv1d_update_bf16(
-    const void* x, const void* weight, const void* bias,
-    void* state, void* y,
-    int C, int K, cudaStream_t stream)
-{
-    if (C <= 0 || K <= 0) return;
-    constexpr int BLOCK = 128;
-    dim3 grid((C + BLOCK - 1) / BLOCK);
-    dim3 block(BLOCK);
-    device::causal_conv1d_update<device::bf16><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(x),
-        static_cast<const device::bf16*>(weight),
-        static_cast<const device::bf16*>(bias),
-        static_cast<device::bf16*>(state),
-        static_cast<device::bf16*>(y),
-        C, K);
-}
+// `causal_conv1d_prefill_bf16`, `causal_conv1d_prefill_noact_bf16` and
+// `causal_conv1d_update_bf16` were deleted here by §43, and the
+// `prefill_dispatch<SILU>` template that existed only for the first two went
+// with them. `families::ssm` §28.9 had already measured all three as second
+// names for jobs the `_batched` launchers below do; §41 measured the rest of
+// the consumer set and found it empty. `driver-cuda/csrc/vision/gemma4_audio.cu`
+// used to call the noact form and now launches the template itself, which is
+// the last hold released.
 
 void causal_conv1d_update_batched_bf16(
     const void* x, const void* weight, const void* bias,

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use ::driver_api::PieTerminalCell;
+use ::driver_api::TerminalCell;
 
 use super::fire_plan;
 use super::stats::SchedulerStats;
@@ -16,7 +16,7 @@ use crate::driver::{FrameSubmission, LaunchPlan, SchedulerLimits, StepSubmission
 pub(crate) struct StepBuild {
     pub(crate) plan: LaunchPlan,
     pub(crate) instance_ids: Vec<u64>,
-    pub(crate) terminal_cells: Vec<*mut PieTerminalCell>,
+    pub(crate) terminal_cells: Vec<*mut TerminalCell>,
     pub(crate) kv_translation: Vec<u32>,
     pub(crate) kv_translation_indptr: Vec<u32>,
     pub(crate) program_row_indptr: Vec<u32>,
@@ -614,7 +614,7 @@ mod tests {
         two_lane.kv_last_page_lens = vec![1, 1];
         two_lane.sampling_indices = vec![0, 0];
         two_lane.sampling_indptr = vec![0, 1, 2];
-        two_lane.masks = vec![crate::driver::command::EncodedMask::new(vec![1], 1)];
+        two_lane.masks = vec![::driver_api::EncodedMask::new(vec![1], 1)];
         two_lane.mask_indptr = vec![0, 1];
 
         let message = accumulator
@@ -687,7 +687,7 @@ mod tests {
         let mut custom = wire_decode(11, 3);
         custom.has_user_mask = true;
         custom.single_token_mode = false;
-        custom.masks = vec![crate::driver::command::EncodedMask::new(vec![1], 1)];
+        custom.masks = vec![::driver_api::EncodedMask::new(vec![1], 1)];
         custom.mask_indptr = vec![0, 1];
         let requests = [
             pending(custom, 20, false),
@@ -714,7 +714,7 @@ mod tests {
         request.device_resolved_geometry = true;
         request.has_user_mask = true;
         request.single_token_mode = false;
-        request.masks = vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+        request.masks = vec![::driver_api::EncodedMask::new(vec![0, 1], 1)];
         request.mask_indptr = vec![0, 1];
 
         let requests = [pending(request, 12, false)];

@@ -51,44 +51,11 @@ void validate_row_select(
 
 }  // namespace
 
-void mxfp4_weight_to_gptq_w4(
-    const void* raw_mxfp4,
-    void*       gptq_w4_out,
-    int         source_rows,
-    int         source_row_offset,
-    int         selected_rows,
-    int         valid_rows,
-    int         source_stride_k,
-    int         source_col_offset,
-    int         source_k,
-    int         target_k,
-    Mxfp4RowSelect row_select,
-    cudaStream_t stream)
-{
-    validate_row_select(
-        "mxfp4_weight_to_gptq_w4",
-        source_rows, source_row_offset, selected_rows, valid_rows, row_select);
-    if (source_k <= 0 || target_k <= 0 || source_stride_k <= 0 ||
-        source_col_offset < 0 || source_k % 8 != 0 || target_k % 8 != 0 ||
-        source_stride_k % 8 != 0 || source_col_offset % 8 != 0 ||
-        target_k < source_k ||
-        static_cast<long long>(source_col_offset) + source_k > source_stride_k) {
-        throw std::runtime_error(
-            "mxfp4_weight_to_gptq_w4: source/target K, stride, "
-            "and column offset must be divisible by 8; target K must cover "
-            "source K; and the source slice must fit in the source stride");
-    }
-    const std::size_t total =
-        static_cast<std::size_t>(target_k / 8) *
-        static_cast<std::size_t>(selected_rows);
-    const int grid = static_cast<int>((total + BLOCK - 1) / BLOCK);
-    device::mxfp4_weight_to_gptq_w4<<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::u8*>(raw_mxfp4),
-        static_cast<device::u32*>(gptq_w4_out),
-        source_rows, source_row_offset, selected_rows, valid_rows,
-        source_stride_k, source_col_offset, source_k, target_k,
-        static_cast<int>(row_select));
-}
+// `mxfp4_weight_to_gptq_w4` was deleted here by §43: no shim entry, no row,
+// no C++ caller, no `ffi::` fire, no golden. The `__global__` stays in
+// `quant/mxfp4_marlin.cuh`, where the header records why it carries no launch
+// rule -- its `k_pack` arithmetic hard-codes eight -- and `attn`'s
+// `pack_dense_mask.cuh` still cites that refusal by name.
 
 void mxfp4_scales_to_marlin_e8m0(
     const void* raw_e8m0,
@@ -134,33 +101,9 @@ void mxfp4_scales_to_marlin_e8m0(
         target_groups, static_cast<int>(row_select));
 }
 
-void bf16_row_map_to_dense(
-    const void* raw_bf16,
-    void*       out_bf16,
-    int         batch,
-    int         source_rows,
-    int         source_row_offset,
-    int         selected_rows,
-    int         valid_rows,
-    Mxfp4RowSelect row_select,
-    cudaStream_t stream)
-{
-    validate_row_select(
-        "bf16_row_map_to_dense",
-        source_rows, source_row_offset, selected_rows, valid_rows, row_select);
-    if (batch <= 0) {
-        throw std::runtime_error(
-            "bf16_row_map_to_dense: batch must be positive");
-    }
-    const std::size_t total =
-        static_cast<std::size_t>(batch) *
-        static_cast<std::size_t>(selected_rows);
-    const int grid = static_cast<int>((total + BLOCK - 1) / BLOCK);
-    device::row_map_to_dense<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(raw_bf16),
-        static_cast<device::bf16*>(out_bf16),
-        batch, source_rows, source_row_offset, selected_rows, valid_rows,
-        static_cast<int>(row_select));
-}
+// `bf16_row_map_to_dense` was deleted here by §43. Its row survives it:
+// `families::quant` states it as a device row over `quant/mxfp4_marlin.cuh`,
+// so NVRTC still compiles the kernel and only the ahead-of-time launcher
+// went (§10.10 step 5).
 
 }  // namespace pie_cuda_driver::kernels::quant

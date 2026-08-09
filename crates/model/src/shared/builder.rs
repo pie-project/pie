@@ -617,13 +617,34 @@ impl<'a> Builder<'a> {
     }
 
     /// Keep a published declaration out of the driver's namespace.
-    pub fn mark_internal(&mut self, index: usize) {
-        self.contract.tensors[index].visibility = Visibility::Internal;
+    /// Keep a published declaration out of the driver's namespace.
+    ///
+    /// `index` is an `Option` for the same reason [`Self::set_scales`]'s is:
+    /// [`Self::define`] publishes nothing under an encode scope, so a pass
+    /// that marks what it just declared may be marking nothing. Seven call
+    /// sites used to write the same `if let Some` around this — and they
+    /// had to, because the function INDEXES the contract and a
+    /// never-handed-out index would panic rather than be skipped. The
+    /// decision is stated here instead, once, where it can be read.
+    pub fn mark_internal(&mut self, index: Option<usize>) {
+        if let Some(index) = index {
+            self.contract.tensors[index].visibility = Visibility::Internal;
+        }
     }
 
     /// Declare that entry `index` holds the scales for `of`.
-    pub fn set_scales(&mut self, index: usize, scales: Scales) {
-        self.contract.tensors[index].scales = Some(scales);
+    ///
+    /// `index` is an `Option` because [`Self::define`] returns one: an
+    /// encode-scoped load publishes only the towers, so a pass that pairs a
+    /// scale may find it published nothing. That is not an error and not a
+    /// case for the caller to spell out — a pairing for a tensor nobody
+    /// declared is simply nothing to state. Four passes used to write the
+    /// same `if let` around this call; they now state the pairing
+    /// unconditionally and read the decision here, once.
+    pub fn set_scales(&mut self, index: Option<usize>, scales: Scales) {
+        if let Some(index) = index {
+            self.contract.tensors[index].scales = Some(scales);
+        }
     }
 
     /// Add a grid of interchangeable tensor sets, written once.
@@ -1156,6 +1177,7 @@ mod tests {
     use super::*;
     use crate::catalog::LoadShape;
     use crate::encoding::Encoding as StoredEncoding;
+    use model_loader::types::BackendKind;
 
     /// A checkpoint with no tensors at all.
     ///
@@ -1174,6 +1196,431 @@ mod tests {
             preferred_alignment: 256,
             ..StorageTarget::default()
         }
+    }
+
+    /// An axis this rank cannot divide is left WHOLE, not rounded.
+    ///
+    /// `local_extent` states a declared shape, and the alternative to
+    /// stating the full width is stating a truncated one: eight heads over
+    /// three ranks would declare two apiece and the last two heads would
+    /// exist in no rank's contract at all. The loader rejects the
+    /// indivisible shard by name instead, which is a message; a quietly
+    /// short declaration is not.
+    #[test]
+    fn an_axis_that_does_not_divide_is_declared_whole() {
+        let meta = empty_checkpoint();
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let shape = LoadShape::dense(2, 64, false);
+        let t = |tp| StorageTarget::for_backend(BackendKind::Cuda, 0, tp);
+
+        let two = t(2);
+        let b = Builder::new(&meta, "x", shape, &enc, &two, &policy);
+        assert_eq!(
+            b.local_extent(8),
+            4,
+            "a divisible axis is this rank's share"
+        );
+        assert_eq!(
+            b.local_extent(9),
+            9,
+            "an indivisible one is left for the loader to refuse"
+        );
+
+        // And a single rank holds all of everything, divisible or not.
+        let one = t(1);
+        let b = Builder::new(&meta, "x", shape, &enc, &one, &policy);
+        assert_eq!(b.local_extent(9), 9);
+    }
+
+    /// A per-tensor scale follows its weight VACUOUSLY -- it has no axis of
+    /// its own to split.
+    ///
+    /// One number for a whole projection, so a shard of it is either the
+    /// number or nothing. Splitting it would hand rank 1 an empty scale and
+    /// rank 0 a scale for the whole tensor, and the weights each rank holds
+    /// would be divided by a factor meant for a different set of rows.
+    #[test]
+    fn a_scale_with_no_axis_of_its_own_is_not_split() {
+        let axis = Some(0);
+        // The weight itself splits whatever its shape.
+        assert_eq!(
+            Builder::splittable_axis("model.layers.0.mlp.down_proj.weight", &[8, 4], axis),
+            axis
+        );
+        // A companion scale with a real axis splits with it.
+        assert_eq!(
+            Builder::splittable_axis("model.layers.0.mlp.down_proj.weight_scale", &[8, 4], axis),
+            axis
+        );
+        // A companion scale that is ONE number does not.
+        assert_eq!(
+            Builder::splittable_axis("model.layers.0.mlp.down_proj.weight_scale", &[1, 4], axis),
+            None
+        );
+        // Nor one whose shape does not reach the axis at all.
+        assert_eq!(
+            Builder::splittable_axis("model.layers.0.mlp.down_proj.weight_scale", &[], axis),
+            None
+        );
+        // And nothing splits when there is no axis to begin with.
+        assert_eq!(
+            Builder::splittable_axis("model.layers.0.mlp.down_proj.weight_scale", &[8, 4], None),
+            None
+        );
+    }
+
+    /// The four reasons a fused join declines, each of which would
+    /// otherwise produce a bank whose rows are not what the GEMM reads.
+    #[test]
+    fn a_fused_join_declines_what_it_cannot_stack() {
+        let good = || vec![("q", bf16(vec![4, 8])), ("k", bf16(vec![2, 8]))];
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let shape = LoadShape::dense(1, 8, false);
+        let target = target();
+        let candidate = |rows: Vec<(&str, (Vec<i64>, Encoding))>, out: &str| {
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|(n, (shape, enc))| (n, shape, enc))
+                .collect();
+            let meta = checkpoint(&rows);
+            let b = Builder::new(&meta, "x", shape, &enc, &target, &policy);
+            b.fused_join_candidate(out.to_string(), &["q".into(), "k".into()])
+                .map(|c| (c.cols, c.parts.len()))
+        };
+
+        assert_eq!(candidate(good(), "qkv"), Some((8, 2)), "two stackable rows");
+
+        // ONE: the checkpoint already SHIPS the fused bank, so joining would
+        // declare the same output twice.
+        let mut shipped = good();
+        shipped.push(("qkv", bf16(vec![6, 8])));
+        assert_eq!(candidate(shipped, "qkv"), None);
+
+        // TWO: a part that is not there. A join of one half is not a join.
+        assert_eq!(candidate(vec![("q", bf16(vec![4, 8]))], "qkv"), None);
+
+        // THREE: a part that is not a matrix. Stacking rank-1 rows would
+        // concatenate along the only axis there is, which is the wrong one.
+        let mut flat = good();
+        flat[1] = ("k", bf16(vec![16]));
+        assert_eq!(candidate(flat, "qkv"), None);
+
+        // ... or not bf16, which a stacked bank has no way to say per part.
+        let mut mixed = good();
+        mixed[1] = ("k", (vec![2, 8], Encoding::Raw(DType::F32)));
+        assert_eq!(candidate(mixed, "qkv"), None);
+
+        // FOUR: parts of different WIDTHS. The stack is row-wise, so a
+        // narrower part would leave the bank ragged.
+        let mut ragged = good();
+        ragged[1] = ("k", bf16(vec![2, 4]));
+        assert_eq!(candidate(ragged, "qkv"), None);
+    }
+
+    /// Marking or pairing an entry that was never published is nothing,
+    /// not a panic.
+    ///
+    /// Both functions INDEX the contract, so before they took the `Option`
+    /// each of their eleven call sites had to guard -- and a site that
+    /// forgot would panic on an out-of-range index the moment an
+    /// encode-scoped load reached it. The decision belongs here, where it
+    /// is one statement and one test rather than eleven of each.
+    #[test]
+    fn marking_or_pairing_what_was_never_published_is_nothing() {
+        let meta = checkpoint(&[("w", vec![4, 8], Encoding::Raw(DType::BF16))]);
+        let enc = StoredEncoding::dense();
+        let target = target();
+        let shape = LoadShape::dense(1, 8, false);
+        let pairing = || Scales {
+            of: "w".into(),
+            granularity: QuantGranularity::PerGroup,
+            group_size: 32,
+            channel_axis: 0,
+            form: ScaleForm::F32Factors,
+        };
+
+        // An encode-scoped builder publishes nothing for a decoder weight,
+        // so `define` hands back `None` -- the case the guards were for.
+        let encode = Policy {
+            component: Component::Encode,
+            ..Policy::default()
+        };
+        let mut b = Builder::new(&meta, "x", shape, &enc, &target, &encode);
+        let index = b.define(
+            "w".into(),
+            Expr::src("w"),
+            Encoding::Raw(DType::BF16),
+            Some(vec![4, 8]),
+        );
+        assert_eq!(index, None, "an encode scope declared a decoder weight");
+        b.mark_internal(index);
+        b.set_scales(index, pairing());
+        assert!(b.contract.tensors.is_empty());
+
+        // And an entry that WAS published takes both.
+        let policy = Policy::default();
+        let mut b = Builder::new(&meta, "x", shape, &enc, &target, &policy);
+        let index = b.define(
+            "w".into(),
+            Expr::src("w"),
+            Encoding::Raw(DType::BF16),
+            Some(vec![4, 8]),
+        );
+        assert_eq!(index, Some(0));
+        b.mark_internal(index);
+        b.set_scales(index, pairing());
+        assert_eq!(b.contract.tensors[0].visibility, Visibility::Internal);
+        assert_eq!(
+            b.contract.tensors[0].scales.as_ref().map(|s| s.group_size),
+            Some(32)
+        );
+    }
+
+    /// A family whose tensors live under a prefix leaves everything OUTSIDE
+    /// it alone -- including the expert banks the MoE slicing walks.
+    ///
+    /// The prefix is how a multimodal checkpoint keeps its towers and its
+    /// language model apart in one file. A pass that ignored it would slice
+    /// the vision tower's banks into the text model's contract, under names
+    /// the text model's binder then looks up and does not find.
+    #[test]
+    fn the_moe_slicing_walks_only_what_the_prefix_admits() {
+        let rows = [
+            (
+                "language_model.layers.0.mlp.experts.gate_up_proj",
+                vec![4, 8, 16],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "vision_tower.layers.0.mlp.experts.gate_up_proj",
+                vec![4, 8, 16],
+                Encoding::Raw(DType::BF16),
+            ),
+        ];
+        let meta = checkpoint(&rows);
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let target = target();
+        let shape = LoadShape::dense(1, 16, false);
+        let mut b = Builder::new(&meta, "x", shape, &enc, &target, &policy);
+        b.source_prefix("language_model.");
+        b.fused_moe_gate_up_tp_slices(true).unwrap();
+        let names: Vec<&str> = b.contract.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("layers.0.mlp.experts")),
+            "the admitted bank was not sliced: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("vision_tower")),
+            "a bank outside the prefix was sliced anyway: {names:?}"
+        );
+    }
+
+    /// A checkpoint the loader RE-QUANTIZES is not also fused.
+    ///
+    /// The join stacks two bf16 matrices into one bank. Runtime quant turns
+    /// each source into a quantized tensor with its own scales, and a scale
+    /// is per-tensor: stacking two of them produces a bank whose rows want
+    /// two different scales and whose contract can state only one. So the
+    /// pass declines rather than producing a bank that is silently wrong in
+    /// half its rows.
+    #[test]
+    fn a_re_quantized_checkpoint_is_not_also_fused() {
+        let rows = [
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![4, 8],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                vec![2, 8],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![2, 8],
+                Encoding::Raw(DType::BF16),
+            ),
+        ];
+        let meta = checkpoint(&rows);
+        let enc = StoredEncoding::dense();
+        let target = target();
+        let shape = LoadShape::dense(1, 8, false);
+        let joined = |quant| {
+            let policy = Policy {
+                runtime_quant: quant,
+                ..Policy::default()
+            };
+            let mut b = Builder::new(&meta, "x", shape, &enc, &target, &policy);
+            b.allow_bf16_runtime_quant();
+            b.dense_fused_projection_joins().unwrap();
+            b.contract
+                .tensors
+                .iter()
+                .any(|t| t.name.contains("qkv_proj.fused"))
+        };
+        assert!(
+            joined(RuntimeQuant::None),
+            "an unquantized checkpoint joins"
+        );
+        assert!(
+            !joined(RuntimeQuant::Int8),
+            "a re-quantized one was fused anyway"
+        );
+    }
+
+    /// A join whose parts are distributed DIFFERENTLY is left unfused.
+    ///
+    /// A fused bank is ONE buffer, so it has one distribution. Parts that
+    /// disagree -- one row-sharded, one replicated -- have no single fused
+    /// layout, and picking either would give some rank rows it does not own
+    /// or rows it owns twice. The parts keep their own bind paths instead,
+    /// which is a slower model rather than a wrong one.
+    #[test]
+    fn a_join_of_differently_distributed_parts_is_declined() {
+        fn all_row_parallel(_: &str) -> Result<Option<u8>, Error> {
+            Ok(Some(0))
+        }
+        fn gate_alone(name: &str) -> Result<Option<u8>, Error> {
+            Ok(if name.contains("gate_proj") {
+                Some(0)
+            } else {
+                None
+            })
+        }
+        let rows = [
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![8, 4],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![8, 4],
+                Encoding::Raw(DType::BF16),
+            ),
+        ];
+        let meta = checkpoint(&rows);
+        let enc = StoredEncoding::dense();
+        let policy = Policy::default();
+        let shape = LoadShape::dense(1, 4, false);
+        let fused_under = |tp, rule: fn(&str) -> Result<Option<u8>, Error>| {
+            let target = StorageTarget::for_backend(BackendKind::Cuda, 0, tp);
+            let mut b = Builder::new(&meta, "x", shape, &enc, &target, &policy);
+            b.shard_axis_fn(rule);
+            b.dense_fused_projection_joins().unwrap();
+            b.contract
+                .tensors
+                .iter()
+                .any(|t| t.name.contains("gate_up_proj.fused"))
+        };
+        assert!(
+            fused_under(1, all_row_parallel),
+            "one rank shards nothing, so every part is replicated and they agree"
+        );
+        assert!(
+            fused_under(2, all_row_parallel),
+            "two row-parallel parts agree"
+        );
+        assert!(
+            !fused_under(2, gate_alone),
+            "a row-sharded part was fused with a replicated one"
+        );
+    }
+
+    /// A contract nobody authored is a refusal, not an empty contract.
+    ///
+    /// An empty contract binds nothing, so the driver would come up with no
+    /// weights and the first fire would read zeros -- a model that runs and
+    /// emits noise. The message names the row, because "which model" is the
+    /// question a reader has at that moment.
+    #[test]
+    fn a_contract_nobody_authored_is_refused() {
+        let meta = empty_checkpoint();
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let target = target();
+        let shape = LoadShape::dense(1, 8, false);
+        let b = Builder::new(&meta, "the-row", shape, &enc, &target, &policy);
+        let err = b.finish().unwrap_err().to_string();
+        assert!(err.contains("the-row"), "{err}");
+        assert!(err.contains("no contract"), "{err}");
+    }
+
+    /// An ENCODE-scoped load is refused unless the family said it can do
+    /// one.
+    ///
+    /// The component is a request from the caller: bind the towers alone.
+    /// A family whose bind path has no tower scope would answer it by
+    /// authoring the whole model, which is not what was asked for and is
+    /// the wrong shape for the buffer the caller sized. Two families opt
+    /// in; every other row has to say no.
+    #[test]
+    fn an_encode_scoped_load_is_refused_by_a_family_that_cannot_do_one() {
+        // A tower tensor, because an encode-scoped publish declares those
+        // and nothing else -- so a checkpoint of decoder weights would fail
+        // for the EMPTY-contract reason instead of the one under test.
+        let rows = [(
+            "model.vision_tower.blocks.0.w",
+            vec![4, 8],
+            Encoding::Raw(DType::BF16),
+        )];
+        let meta = checkpoint(&rows);
+        let enc = StoredEncoding::dense();
+        let target = target();
+        let shape = LoadShape::dense(1, 8, false);
+        let authored = |opt_in: bool| {
+            let policy = Policy {
+                component: Component::Encode,
+                ..Policy::default()
+            };
+            let mut b = Builder::new(&meta, "text-only-row", shape, &enc, &target, &policy);
+            if opt_in {
+                b.allow_encode_scope().unwrap();
+            }
+            b.publish_remaining().unwrap();
+            b.finish()
+        };
+        let err = authored(false).unwrap_err().to_string();
+        assert!(err.contains("text-only-row"), "{err}");
+        assert!(err.contains("encode-scoped"), "{err}");
+        let opted_in = authored(true).expect("a family that opted in is served");
+        assert_eq!(opted_in.tensors.len(), 1);
+    }
+
+    /// A view of a tensor the checkpoint does not have is `false`, not an
+    /// error and not a declaration.
+    ///
+    /// The distinction is the whole point of the `bool`: a family asks for
+    /// a runtime-quantized view of an OPTIONAL weight, and "absent" has to
+    /// be answerable without the family knowing in advance which rows ship
+    /// it. Declaring one anyway would name a source no file contains.
+    #[test]
+    fn a_quantized_view_of_a_missing_tensor_declares_nothing() {
+        let meta = checkpoint(&[("present", vec![4, 8], Encoding::Raw(DType::BF16))]);
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let target = target();
+        let mut b = Builder::new(
+            &meta,
+            "x",
+            LoadShape::dense(1, 8, false),
+            &enc,
+            &target,
+            &policy,
+        );
+
+        let scheme = QuantScheme::Int8Symmetric;
+        assert!(!b.quantized_view("absent", "out".into(), scheme).unwrap());
+        assert!(
+            b.contract.tensors.is_empty(),
+            "a decline that still declared something"
+        );
+        assert!(b.quantized_view("present", "out".into(), scheme).unwrap());
+        assert!(!b.contract.tensors.is_empty());
     }
 
     #[test]
@@ -1848,6 +2295,53 @@ mod tests {
         assert_eq!(paired.group_size, 128, "256 columns over 2 scales");
         assert_eq!(paired.granularity, QuantGranularity::PerGroup);
         assert_eq!(paired.form, ScaleForm::F32Factors);
+    }
+
+    /// A pair the contract never declared is never paired.
+    ///
+    /// An Encode-scoped load publishes the towers and drops everything
+    /// else, so `push_direct` on a decoder tensor comes back with no
+    /// index -- there is no `TensorContract` to hang a `scales` on. Every
+    /// other test here runs the FULL scope, where a direct push always
+    /// lands, so this is the one arm that can be reached only by scoping
+    /// the load down.
+    ///
+    /// Without the check the pairing walks a tensor list position that
+    /// belongs to some other tensor, or to nothing at all: an index into
+    /// a vector the drop just made shorter.
+    #[test]
+    fn a_scale_whose_weight_was_scoped_out_is_not_paired() {
+        let rows = [
+            (
+                "model.vision_tower.embeddings.weight",
+                vec![8, 8],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![64, 256],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight_scale_inv",
+                vec![64, 2],
+                Encoding::Raw(DType::F32),
+            ),
+        ];
+        let encode = Policy {
+            component: Component::Encode,
+            ..Policy::default()
+        };
+        let c = publish(&rows, &StoredEncoding::dense(), &encode, |b| {
+            b.allow_encode_scope().expect("one rank")
+        })
+        .unwrap();
+        let published: Vec<&str> = c.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            published,
+            vec!["model.vision_tower.embeddings.weight"],
+            "the decoder weight and its scale are both outside the scope"
+        );
     }
 
     /// The block size is a quotient, not a constant.

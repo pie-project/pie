@@ -421,7 +421,7 @@ fn resolved() -> BTreeSet<String> {
             "--edges",
             "normal",
             "--prefix",
-            "none",
+            "depth",
             "--format",
             "{p}",
             "--manifest-path",
@@ -434,14 +434,36 @@ fn resolved() -> BTreeSet<String> {
         "cargo tree failed, so the closure below is the unified one: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let names: BTreeSet<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .filter(|n| !n.is_empty())
-        .map(str::to_string)
-        .collect();
-    // A parse that produced nothing would make the intersection empty and every
-    // claim above vacuous.
+    // Depth-prefixed and not flat, so that `loom`'s subtree can be dropped
+    // whole. It is here for the same reason the walk above has to name it --
+    // `--target all` reports a `cfg(loom)` edge as if it were unconditional --
+    // and dropping the edge alone is not enough: everything BELOW it stays in
+    // this name set, and the set is what narrows the over-approximating walk.
+    // `tracing-subscriber` arriving under `loom` is what un-narrowed `tarpc`'s
+    // `windows-sys`, which no build of this crate has ever compiled.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names = BTreeSet::new();
+    let mut pruned: Option<usize> = None;
+    for line in text.lines() {
+        let digits = line.chars().take_while(char::is_ascii_digit).count();
+        let Ok(depth) = line[..digits].parse::<usize>() else {
+            continue;
+        };
+        let Some(name) = line[digits..].split_whitespace().next() else {
+            continue;
+        };
+        match pruned {
+            Some(at) if depth > at => continue,
+            _ => pruned = None,
+        }
+        if name == "loom" {
+            pruned = Some(depth);
+            continue;
+        }
+        names.insert(name.to_string());
+    }
+    // A parse that produced nothing would make the intersection empty and
+    // every claim above vacuous.
     assert!(
         names.contains(ROOT),
         "cargo tree's output does not name the crate it was asked about"

@@ -58,25 +58,9 @@ void launch(
 
 }  // namespace
 
-void launch_gather_tokens_bf16(
-    device::u16* k_pages, device::u16* v_pages,
-    const GatherTokenOp* ops, int num_ops,
-    int page_size, int num_kv_heads, int head_dim,
-    cudaStream_t stream)
-{
-    launch(k_pages, v_pages, ops, num_ops, /*num_layers=*/1,
-           /*layer_stride_elems=*/0, page_size, num_kv_heads, head_dim, stream);
-}
-
-void launch_gather_tokens_bf16_layers(
-    device::u16* k_pages, device::u16* v_pages,
-    const GatherTokenOp* ops, int num_ops,
-    int num_layers, device::i64 layer_stride_elems,
-    int page_size, int num_kv_heads, int head_dim,
-    cudaStream_t stream)
-{
-    launch(k_pages, v_pages, ops, num_ops, num_layers, layer_stride_elems,
-           page_size, num_kv_heads, head_dim, stream);
-}
+// `launch_gather_tokens_bf16` and `launch_gather_tokens_bf16_layers` were
+// deleted here by §43: two thin wrappers over `launch` above, with no
+// `<<<>>>` of their own, no row, no shim entry and no caller in any language.
+// `launch` itself stays -- `rope_write_kv_bf16` calls it four times.
 
 }  // namespace pie_cuda_driver::kernels::layout

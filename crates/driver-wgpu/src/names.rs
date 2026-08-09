@@ -31,7 +31,7 @@
 //! Metal's `Slice` and its `Resolver` trait, and depending on it would put
 //! `objc` in this crate's closure, which `tests/pure.rs` forbids. What is
 //! reproduced here is only the data, and only the roles the six texts this
-//! crate can lower actually bind -- measured, nineteen of them, rather than
+//! crate can lower actually bind -- measured, twenty-two of them, rather than
 //! every role that exists.
 //!
 //! # A role has SEVERAL spellings and the checkpoint picks
@@ -66,14 +66,25 @@ pub struct Naming {
     pub weight_suffix: &'static [&'static str],
     /// What the zero point the text spells `.zeros` is called.
     ///
-    /// `.biases` for MLX's affine quantisation, `.bias` for the MXFP4 expert
-    /// banks -- the same role one character apart. Both are right on their own
-    /// side, which is the whole reason this is a map rather than an argument
-    /// about who should have bent.
+    /// `.biases`, MLX's affine quantisation, and no checkpoint here spells it
+    /// otherwise.
+    ///
+    /// It used to also list `.bias` "for the MXFP4 expert banks -- the same
+    /// role one character apart". They are one character apart and they are
+    /// not the same role. `mlx-community/gpt-oss-20b-MXFP4-Q4` publishes an
+    /// expert `bias` of `[32, 2880]`, one per output row, and no `biases` at
+    /// all; the zero point beside `scales` would be `[32, 2880, 90]`, one per
+    /// group. `qmv_routed.comp` reads them at two different bindings, and
+    /// under `PIE_MXFP4` it does not declare the zero point's at all.
     pub zero_point_suffix: &'static [&'static str],
+    /// What the additive bias the text spells `.bias` is called.
+    ///
+    /// One per output row of a routed expert bank. `routed_qmv` is the only
+    /// site that names it, and only for the symbols that read one.
+    pub bias_suffix: &'static [&'static str],
 }
 
-/// The nineteen roles the six texts in `tests/arena.rs` bind, and no others.
+/// The twenty-two roles the six texts in `tests/arena.rs` bind, and no others.
 ///
 /// Measured, not guessed: a scratch pass over every `Arg::Weight` those texts
 /// state produced exactly this set. A role that no text this crate can lower
@@ -83,6 +94,13 @@ const ROLES: &[(&str, &[&str])] = &[
     ("k_proj", &["self_attn.k_proj"]),
     ("v_proj", &["self_attn.v_proj"]),
     ("o_proj", &["self_attn.o_proj"]),
+    // The Qwen-2 family's projection biases. A bias hangs under the
+    // PROJECTION rather than under a module of its own, so the path carries
+    // the `.bias` and the empty `weight_suffix` closes it -- the same shape
+    // `attn_sinks` has and for the same reason.
+    ("q_bias", &["self_attn.q_proj.bias"]),
+    ("k_bias", &["self_attn.k_proj.bias"]),
+    ("v_bias", &["self_attn.v_proj.bias"]),
     ("q_norm", &["self_attn.q_norm"]),
     ("k_norm", &["self_attn.k_norm"]),
     // One learned logit per head, and the one role whose tensor hangs under
@@ -171,7 +189,8 @@ impl Naming {
             // `.weight` first, then the bare name for a role that IS its
             // tensor.
             weight_suffix: &[".weight", ""],
-            zero_point_suffix: &[".biases", ".bias"],
+            zero_point_suffix: &[".biases"],
+            bias_suffix: &[".bias"],
         }
     }
 
@@ -208,6 +227,7 @@ impl Naming {
             // choose between.
             Sidecar::Scales => &[".scales"],
             Sidecar::Zeros => self.zero_point_suffix,
+            Sidecar::Bias => self.bias_suffix,
         };
         bases
             .iter()
@@ -223,6 +243,9 @@ enum Sidecar {
     Packed,
     Scales,
     Zeros,
+    /// The additive term a routed expert bank carries beside its codec's
+    /// planes — one value per output row, and not a zero point.
+    Bias,
 }
 
 /// What a traced name decomposes into.
@@ -243,6 +266,7 @@ fn decompose(name: &str) -> Option<Traced<'_>> {
     let (rest, sidecar) = match name.rfind('.') {
         Some(at) if &name[at..] == ".scales" => (&name[..at], Sidecar::Scales),
         Some(at) if &name[at..] == ".zeros" => (&name[..at], Sidecar::Zeros),
+        Some(at) if &name[at..] == ".bias" => (&name[..at], Sidecar::Bias),
         _ => (name, Sidecar::Packed),
     };
     if let Some(tail) = rest.strip_prefix("layer.") {
@@ -282,12 +306,25 @@ mod tests {
     fn the_zero_point_the_text_calls_zeros_is_the_loaders_biases() {
         // The disagreement this table exists for. The text says `.zeros`, MLX
         // writes `.biases`, and both are right on their own side.
+        //
+        // One spelling and not two: `.bias` used to sit beside it for the
+        // MXFP4 expert banks, until that was measured and found to be the
+        // additive term rather than the codec's zero point. It has its own
+        // row now, which the next test reads.
         assert_eq!(
             Naming::mlx().spellings("layer.0.down.zeros"),
-            [
-                "layers.0.mlp.down_proj.biases",
-                "layers.0.mlp.down_proj.bias"
-            ]
+            ["layers.0.mlp.down_proj.biases"]
+        );
+    }
+
+    #[test]
+    fn the_additive_bias_the_text_spells_bias_keeps_that_spelling() {
+        // The row `.zeros` gave up. A routed expert bank publishes one of
+        // these per output row beside its packed weight, which is a different
+        // plane from the codec's zero point and asks for its own name.
+        assert_eq!(
+            Naming::mlx().spellings("layer.0.down.bias"),
+            ["layers.0.mlp.down_proj.bias"]
         );
     }
 

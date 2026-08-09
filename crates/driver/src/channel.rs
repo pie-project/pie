@@ -122,7 +122,7 @@ impl ChannelState {
 
     /// The address of the ring's cell storage.
     ///
-    /// For the ABI's `PieChannelEndpointBinding`, which hands a host a base and
+    /// For the ABI's `ChannelBinding`, which hands a host a base and
     /// a length so it can read the ring without calling back. Stable for the
     /// life of the state: [`ChannelState::host`] allocates once and nothing
     /// resizes the vector, which is what makes an address worth handing out at

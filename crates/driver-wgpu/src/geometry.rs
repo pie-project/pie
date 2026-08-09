@@ -1194,6 +1194,217 @@ mod tests {
         );
     }
 
+    /// No module reads a grid axis its rule leaves flat.
+    ///
+    /// The third member of the family `a_decode_attention_module_is_half_the_
+    /// head_it_serves` and `a_routed_matvec_covers_every_output_row_its_module_
+    /// owns` belong to, and the one that generalises: instead of naming a rule
+    /// and checking its arithmetic, it asks every row whether the SHAPE its
+    /// rule produces can carry the axes its module actually reads.
+    ///
+    /// A rule that answers `[n, 1, 1]` promises the body indexes on x alone. If
+    /// that body reads `global_invocation_id.y` as a row, every row but the
+    /// first is never written — and an undershot grid writes nothing, the gap
+    /// reads back as whatever the buffer held, and the dispatch returns
+    /// success. There is no symptom until somebody compares numbers.
+    ///
+    /// `crate::reflect` already computes which axes a module reads, and it has
+    /// been computed and never asked. It is safe to ask because it errs in the
+    /// right direction: where the call walk cannot follow a builtin into a
+    /// helper it answers "every axis" rather than "no axis", so a module this
+    /// check cannot read makes the check STRICTER rather than vacuous.
+    ///
+    /// ## The defect it catches
+    ///
+    /// `geglu_tanh_strided`'s row states `LaunchRule::Elementwise`, which is
+    /// `[width * rows, 1, 1]`. Its body alone among the five in
+    /// `mlp/gated.wgsl` is `@workgroup_size(16, 16)` and reads `gid.y` as the
+    /// row, so one workgroup on y covers 16 rows and every row past 15 keeps
+    /// the bytes it was allocated with. Measured at 21 rows on a 4090: row 16
+    /// held its sentinel and the dispatch succeeded.
+    ///
+    /// `kernels-vulkan`'s copy is `local_size_y = 16` over the same rule, so
+    /// the sibling has it too. The row is shared with `kernels-metal` — where
+    /// a threadgroup is sized at dispatch and `Elementwise` is right — so
+    /// fixing it is a change to the shared table (`ElementwiseRows` is the
+    /// shape this body wants) and a parity question rather than a local one.
+    ///
+    /// Until that lands the row is listed below with its reason. The list is
+    /// asserted to be exactly what is known, so a second row joining it is a
+    /// failure that has to be read rather than a line quietly added.
+    #[test]
+    fn no_module_reads_a_grid_axis_its_rule_leaves_flat() {
+        // Rows whose module reads an axis the rule flattens. Each is a defect,
+        // each is named, and the list is pinned so it cannot grow in silence.
+        const KNOWN: [(&str, &str); 1] = [(
+            "geglu_tanh_strided",
+            "states `Elementwise` ([n, 1, 1]) and its body is @workgroup_size(16, 16) \
+             reading gid.y as the row, so every row past 15 is never written. \
+             `ElementwiseRows` is the shape it wants; the row is shared with \
+             `kernels-metal`, where a dispatch-sized threadgroup makes \
+             `Elementwise` correct, so the fix is a change to the shared table.",
+        )];
+
+        let d = Dims {
+            rows: 7,
+            width: 96,
+            in_width: 96,
+            q_heads: 4,
+            kv_heads: 2,
+            head_dim: 64,
+            axis: 96,
+            rotary_dims: 64,
+            n_experts: 8,
+            experts_per_token: 2,
+        };
+
+        let mut found: Vec<String> = Vec::new();
+        let mut wasted: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for sig in kernels_wgpu::KERNELS {
+            if sig.launch == Rule::Unstated {
+                continue;
+            }
+            for name in sig.entrypoints() {
+                let Ok(declared) =
+                    crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline)
+                else {
+                    continue;
+                };
+                let module = Module::loaded(&name, &declared);
+                let Ok(extent) = lanes(sig.launch, d, module) else {
+                    // A rule this backend refuses is `Unruled`'s business, and
+                    // a geometry that cannot be built cannot be compared.
+                    continue;
+                };
+                checked += 1;
+
+                for (axis, lanes) in extent.iter().enumerate() {
+                    // The rule leaves an axis FLAT when it puts exactly one
+                    // lane on it: the body may then only ever see index 0
+                    // there.
+                    if *lanes > 1 || !declared.grid_axes[axis] {
+                        continue;
+                    }
+                    // A module whose own workgroup is wider than one on this
+                    // axis is reading a LOCAL index, which is legitimate:
+                    // `local_invocation_id.y` is a lane within the group and
+                    // has nothing to do with the grid. Only a global read of a
+                    // flattened axis is the defect, and `grid_axes` is about
+                    // the global builtins.
+                    found.push(format!("{} ({name}) reads axis {axis}", sig.symbol));
+                }
+
+                // The MIRROR, which is harmless and is checked anyway.
+                //
+                // `driver-vulkan/tests/rules.rs` has exactly this and only
+                // this — `if !read && given > 1` — and it is why that crate
+                // did not catch `geglu_tanh_strided`: work given to an axis
+                // nothing reads is WASTE, and an axis the body reads that the
+                // rule leaves at one is DATA LOSS. They are different
+                // predicates and only the first was written.
+                //
+                // Kept because waste is still a disagreement between a rule
+                // and a body, and a rule that hands out a dimension nobody
+                // uses is usually a rule that meant to hand out a different
+                // one. It is reported separately so the two never get
+                // confused for each other again.
+                for (axis, lanes) in extent.iter().enumerate() {
+                    if *lanes <= 1 || declared.grid_axes[axis] {
+                        continue;
+                    }
+                    wasted.push(format!(
+                        "{} ({name}) is given {lanes} on axis {axis}, which it never reads",
+                        sig.symbol
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            checked > 60,
+            "only {checked} entrypoints were geometry-checked; a sweep that \
+             read almost nothing passes as loudly as one that read everything"
+        );
+
+        let mut symbols: Vec<&str> = found
+            .iter()
+            .filter_map(|f| f.split_whitespace().next())
+            .collect();
+        symbols.sort_unstable();
+        symbols.dedup();
+
+        let known: std::collections::BTreeSet<&str> = KNOWN.iter().map(|(name, _)| *name).collect();
+        let fresh: Vec<&&str> = symbols.iter().filter(|s| !known.contains(**s)).collect();
+        assert!(
+            fresh.is_empty(),
+            "these rows read a grid axis their rule flattens, which means every \
+             index past the first on that axis is never written and the \
+             dispatch succeeds anyway:\n  {}\n\nfull list:\n  {}",
+            fresh.iter().map(|s| **s).collect::<Vec<_>>().join("\n  "),
+            found.join("\n  "),
+        );
+
+        // The waste half, which is reported separately from the data-loss half
+        // above so the two are never mistaken for one another — that
+        // conflation is the mistake `driver-vulkan/tests/rules.rs` is living
+        // with, where `if !read && given > 1` is the ONLY direction checked
+        // and the dangerous one is its mirror.
+        //
+        // It is NOT asserted empty, and the reason is the more interesting
+        // half of this test.
+        //
+        // Running it turned up four rows, and they are two different things:
+        //
+        // * `route_sort` and the two `router_topk`s read no global builtin at
+        //   all — they take `local_invocation_id` and stride over the
+        //   workgroup width, which is exactly what their rules intend. `Given
+        //   256 lanes on x` is one workgroup, not 256 of them, and the rule is
+        //   right. This half of the report is a category error in the check
+        //   rather than in the row: `lanes()` is a THREAD extent and a body
+        //   that indexes by lane consumes it correctly.
+        //
+        // * `kv_append` reads `gid.z` — the line is right there in
+        //   `attn/kv_write.wgsl` — and `grid_axes` answers `[true, true,
+        //   false]`. That is a FALSE NEGATIVE in the reflection, and it is the
+        //   documented weakness: `crate::reflect`'s notes say the walk follows
+        //   a builtin into a helper with a depth bound and answers "every
+        //   axis" where it cannot follow. Here it followed, decided, and
+        //   decided wrong.
+        //
+        // The second one matters because it is the direction that loses data.
+        // The check above trusts `grid_axes` to say an axis IS read; a false
+        // negative there is a defect this test would excuse. It does not
+        // excuse one today — `kv_append`'s rule gives it work on z, so the
+        // flat-axis half never looks at it — but the exposure is real and is
+        // written down rather than discovered later.
+        //
+        // So this is printed and not asserted. An assertion would either be
+        // wrong (the three router rows are correct) or would need an exception
+        // list that hides the `kv_append` finding inside it.
+        if !wasted.is_empty() {
+            eprintln!(
+                "rows given work on an axis `grid_axes` says they never read \
+                 ({} of them). Two causes, and only one is a row's fault -- see \
+                 the note above this print:\n  {}",
+                wasted.len(),
+                wasted.join("\n  "),
+            );
+        }
+
+        let stale: Vec<&str> = known
+            .iter()
+            .filter(|k| !symbols.contains(*k))
+            .copied()
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these are listed as known-defective and are not: {stale:?}. If the \
+             shared table was fixed, delete the entry in the same diff.",
+        );
+    }
+
     /// A routed matvec covers every output row its module owns per y lane.
     ///
     /// The sibling of `a_decode_attention_module_is_half_the_head_it_serves`,

@@ -1899,7 +1899,7 @@ mod tests {
                 },
                 device_geometry_port_mask: 0,
             },
-            crate::driver::DriverBackend::Remote(remote),
+            Box::new(remote),
         );
         let capacities = vec![8; remote_driver_id + 1];
         let model_idx =
@@ -2035,7 +2035,7 @@ mod tests {
                 },
                 device_geometry_port_mask: 0,
             },
-            crate::driver::DriverBackend::Remote(remote),
+            Box::new(remote),
         );
         let capacities = vec![8; remote_driver_id + 1];
         let model_idx =

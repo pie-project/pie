@@ -84,26 +84,12 @@ void topk_softmax_bf16_form(
         num_experts, K, 0);
 }
 
-void router_topk_softmax_bf16(
-    const void* act,
-    const void* router_weight,
-    const void* router_bias,
-    device::i32* topk_idx,
-    float* topk_w,
-    int N, int num_experts, int K, int hidden,
-    cudaStream_t stream)
-{
-    if (N <= 0 || num_experts <= 0 || K <= 0 || hidden <= 0) return;
-    if (num_experts > device::kSoftmaxMaxExperts) {
-        throw std::runtime_error(
-            "router_topk_softmax_bf16: num_experts exceeds MAX_EXPERTS");
-    }
-    device::router_topk_softmax<device::bf16><<<N, device::kSoftmaxBlock, 0, stream>>>(
-        static_cast<const device::bf16*>(router_weight),
-        static_cast<const device::bf16*>(act),
-        static_cast<const device::bf16*>(router_bias),
-        topk_idx, topk_w, num_experts, K, hidden);
-}
+// `router_topk_softmax_bf16` and `topk_sigmoid_bias_bf16` were deleted here
+// by §43. Both are rows in `examples/unit_probe_moe.rs` -- an NVRTC probe
+// over `moe/topk_softmax.cuh` that fires nothing -- and `families::moe`
+// already records that `topk_sigmoid_bias_bf16` "exists in the `.cu` and in"
+// no plan. `runtime::launch.rs` cites this file for the router variant's
+// geometry; the geometry is unchanged, the `.cuh` still holds it.
 
 void apply_per_expert_scale_bf16(
     const device::i32* topk_idx,
@@ -121,54 +107,10 @@ void apply_per_expert_scale_bf16(
         total);
 }
 
-void topk_sigmoid_bias_bf16(
-    const void* logits,
-    const float* correction_bias,
-    device::i32* topk_idx,
-    float* topk_w,
-    int N,
-    int num_experts,
-    int K,
-    bool normalize,
-    float routed_scaling_factor,
-    cudaStream_t stream)
-{
-    if (N <= 0 || num_experts <= 0 || K <= 0) return;
-    device::topk_sigmoid_bias<device::bf16><<<N, device::kSoftmaxBlock, 0, stream>>>(
-        static_cast<const device::bf16*>(logits),
-        correction_bias,
-        topk_idx,
-        topk_w,
-        num_experts,
-        K,
-        normalize ? 1 : 0,
-        routed_scaling_factor);
-}
 
-void topk_sigmoid_bias_fp32(
-    const float* logits,
-    const float* correction_bias,
-    device::i32* topk_idx,
-    float* topk_w,
-    int N,
-    int num_experts,
-    int K,
-    bool normalize,
-    float routed_scaling_factor,
-    cudaStream_t stream)
-{
-    if (N <= 0 || num_experts <= 0 || K <= 0) return;
-    // The same kernel as above at a different element type -- the fp32 router
-    // was a second copy of it until this family became templates.
-    device::topk_sigmoid_bias<device::f32><<<N, device::kSoftmaxBlock, 0, stream>>>(
-        logits,
-        correction_bias,
-        topk_idx,
-        topk_w,
-        num_experts,
-        K,
-        normalize ? 1 : 0,
-        routed_scaling_factor);
-}
+// `topk_sigmoid_bias_fp32` was deleted here by §43: `device::JIT_DISPATCHED`
+// names the row, so the shim generates no entry and this ahead-of-time
+// launcher had no reachable caller in any language. The kernel is unchanged
+// in `moe/topk_softmax.cuh`, which is what the row fires through NVRTC.
 
 }  // namespace pie_cuda_driver::kernels::moe

@@ -536,6 +536,17 @@ pub enum RopeScaling {
         attention_factor: f32,
         /// The context the checkpoint was trained at.
         original_max_position: u32,
+        /// Whether the ramp's ends snap to whole channels.
+        ///
+        /// HF's `find_correction_range` floors and ceils by default and
+        /// takes the flag off the config. Most rows omit it and mean
+        /// `true`; every gpt-oss writes `truncate: false`, which moves the
+        /// ramp from `(8, 18)` to `(8.09, 17.40)` on its own numbers and
+        /// three percent of channel 12. A driver that assumed either
+        /// value would serve the other family a ladder nobody trained,
+        /// and the error is the kind that degrades fluently rather than
+        /// failing, so the row states it.
+        truncate: bool,
     },
 }
 
@@ -870,6 +881,30 @@ pub struct Advertised {
 }
 
 impl Deployment {
+    /// This plan, or the refusal its KV store draws.
+    ///
+    /// The four MLA generations each wrote this `match` out, which is one
+    /// duplication past the one [`KvStyle::store_refusal`] was hoisted to
+    /// end: that call removed four spellings of one SENTENCE and left
+    /// four spellings of what to DO with it. The four were identical, and
+    /// the arm that lets a load proceed was unreachable in every one of
+    /// them — every glm-5, deepseek-v4, kimi-k2 and kimi-k3 row plans an
+    /// `Mla` or a `CompressedPlane`, and this build provisions neither,
+    /// so the `Ok` was four copies of a line no row could take.
+    ///
+    /// Here it is reachable, because a `Deployment` with a paged layout
+    /// is one any dense family builds — which is the point: the arm 53 of
+    /// the 59 rows depend on is now walked by a test rather than by
+    /// nothing.
+    #[must_use = "the refusal is the whole result; dropping it deploys a \
+                  row whose store does not exist"]
+    pub fn provisioned(self) -> Result<Self, Refusal> {
+        match self.kv.store_refusal() {
+            Some(no_store) => Err(no_store),
+            None => Ok(self),
+        }
+    }
+
     /// A placeholder for a driver that must build its model value before
     /// it can derive one.
     ///
@@ -1399,6 +1434,44 @@ mod tests {
             "the pager allocates a k/v pair and a paged layout is that pair, \
              so a refusal here refuses every dense row in the catalog"
         );
+    }
+
+    /// A plan whose store exists is handed back whole.
+    ///
+    /// The arm four MLA families copied and none of them could take.
+    /// What it must NOT do is edit the plan on the way through -- a
+    /// caller reads the returned value, so a `provisioned` that
+    /// reconstructed rather than returned would be a second place for a
+    /// deployment to be assembled, and the four callers each hand it a
+    /// plan they built field by field.
+    #[test]
+    fn a_paged_plan_passes_through_provisioned_unchanged() {
+        let mut paged = Deployment::empty();
+        paged.layers = 3;
+        paged.kv = KvStyle::Paged;
+        assert_eq!(
+            paged.clone().provisioned(),
+            Ok(paged),
+            "a paged layout has a store, so the plan is the result"
+        );
+    }
+
+    /// A plan whose store does not exist draws the store's own sentence.
+    #[test]
+    fn an_mla_plan_is_refused_by_the_store_rather_than_by_the_family() {
+        let mut mla = Deployment::empty();
+        mla.kv = KvStyle::Mla {
+            kv_lora_rank: 512,
+            qk_rope_head_dim: 64,
+        };
+        let mut plane = Deployment::empty();
+        plane.kv = KvStyle::CompressedPlane { ratios: vec![8, 8] };
+        for (what, d) in [("MLA latent store", mla), ("compressed KV plane", plane)] {
+            let Err(Refusal::Unsupported(why)) = d.provisioned() else {
+                panic!("{what}: this build provisions none, so the plan is refused");
+            };
+            assert!(why.contains(what), "{why}");
+        }
     }
 
     /// Both refusals name the store they cannot provision.

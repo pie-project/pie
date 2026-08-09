@@ -95,17 +95,6 @@ void launch_envelope_merge_written_bf16(
 // `envelope_device.cuh`), so only their storage is narrow.
 // Pages `page >= live_pages` → `-inf`. Requires
 // `num_q_heads % num_kv_heads == 0` (GQA group).
-void launch_envelope_dot_f32(
-    const float* q,
-    const std::uint16_t* env_min,
-    const std::uint16_t* env_max,
-    float* score,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int p_max,
-    int live_pages,
-    cudaStream_t stream);
 
 // Maintenance: refresh the envelopes of exactly the pages a fire appended to,
 // deriving that set on-device from the same CSR arithmetic `write_kv_kernel`

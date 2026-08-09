@@ -22,18 +22,10 @@ void add_bias_bf16(
         dim);
 }
 
-void add_bias_bf16_strided(
-    void* out, const void* bias,
-    int num_rows, int dim, int stride,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || dim <= 0) return;
-    if (stride < dim) return;
-    constexpr int BLOCK = 256;
-    device::add_bias_strided<device::bf16><<<num_rows, BLOCK, 0, stream>>>(
-        static_cast<device::bf16*>(out),
-        static_cast<const device::bf16*>(bias),
-        dim, stride);
-}
+// `add_bias_bf16_strided` was deleted here by §43. `launch_abi.rs` carried it
+// as `NormNoRow::Orphaned` -- nothing calls it: not the driver, not a sibling
+// `.cu`, not `lower.rs`, which chooses the contiguous `add_bias_bf16` above.
+// Its stated last consumer was `sources.rs`' `<<<>>>` census, and a census is
+// not a consumer.
 
 }  // namespace pie_cuda_driver::kernels::norm

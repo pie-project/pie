@@ -31,16 +31,6 @@ namespace pie_cuda_driver::kernels::ssm {
 
 // Single-request prefill. `state_out` may be nullptr to skip persisting
 // the trailing K-window into a state buffer.
-void causal_conv1d_prefill_bf16(
-    const void* x,
-    const void* weight,
-    const void* bias,
-    void*       y,
-    void*       state_out,
-    int N,
-    int C,
-    int K,
-    cudaStream_t stream);
 
 // The same convolution with the silu left off.
 //
@@ -60,28 +50,9 @@ void causal_conv1d_prefill_bf16(
 // carry `ssm::causal_conv1d_*` through the kernel table, `dsl::cuda`, the
 // model emitters and their generated .inc, which is a wider change than
 // deleting a duplicate.
-void causal_conv1d_prefill_noact_bf16(
-    const void* x,
-    const void* weight,
-    const void* bias,
-    void*       y,
-    void*       state_out,
-    int N,
-    int C,
-    int K,
-    cudaStream_t stream);
 
 // Single-token decode update. Reads state, appends `x` (one row),
 // writes the conv output to `y` (one row), updates `state` in place.
-void causal_conv1d_update_bf16(
-    const void* x,
-    const void* weight,
-    const void* bias,
-    void*       state,
-    void*       y,
-    int C,
-    int K,
-    cudaStream_t stream);
 
 // Multi-request batched decode update. Replaces the host-loop of R
 // single-request `_update_bf16` calls with one kernel launch:

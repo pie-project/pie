@@ -275,6 +275,16 @@ driver-cuda = ["worker/driver-cuda"]
 # Metal driver at all: `worker`'s `driver-metal` is what links the archive,
 # and this is the only package that builds a binary.
 driver-metal = ["worker/driver-metal"]
+# Vulkan, anywhere there is a loader and an ICD. No vendor or platform
+# condition on it: `worker`'s `driver-vulkan` is what puts the driver in the
+# graph, and this is the only package that builds a binary.
+driver-vulkan = ["worker/driver-vulkan"]
+# The WebGPU shell, which needs neither. Vulkan builds anywhere and RUNS where
+# an ICD is installed; this one carries its own way to every API -- Vulkan,
+# Metal, D3D12 and WebGPU through one pure-Rust binary, shaders included. Same
+# forwarding, and the same reason it lives here: this is the only package that
+# builds a binary.
+driver-wgpu = ["worker/driver-wgpu"]
 # Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 

@@ -127,49 +127,17 @@ void attention_naive_paged_bf16(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void attention_naive_paged_decode(
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int num_requests,
-    int num_q_heads,
-    cudaStream_t stream,
-    int window_left,
-    float sm_scale,
-    float logits_soft_cap,
-    float* lse_out)
-{
-    if (num_requests <= 0) return;
-    check_head_dim_supported(kv_layer.head_dim, "attention_naive_paged_decode");
-    dim3 grid(num_requests, num_q_heads);
-    dim3 block(BLOCK);
-    const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);
-    device::naive_paged_decode<BLOCK><<<grid, block, smem, stream>>>(
-        static_cast<const device::bf16*>(q),
-        kv_layer.k_pages,
-        kv_layer.v_pages,
-        static_cast<const float*>(kv_layer.k_scales),
-        static_cast<const float*>(kv_layer.v_scales),
-        static_cast<device::bf16*>(o),
-        kv_page_indices_d,
-        kv_page_indptr_d,
-        kv_last_page_lens_d,
-        num_q_heads,
-        kv_layer.num_kv_heads,
-        kv_layer.head_dim,
-        kv_layer.page_size,
-        static_cast<device::KvScheme>(kv_layer.scheme),
-        static_cast<device::KvDType>(kv_layer.storage_dtype),
-        kv_layer.block_size,
-        window_left,
-        sm_scale,
-        logits_soft_cap,
-        lse_out);
-    CUDA_CHECK(cudaGetLastError());
-}
+// `attention_naive_paged_decode` WAS HERE, and it is deleted.
+//
+// It had no row, and `driver-cuda/tests/launch_abi.rs` recorded it as
+// `NoRow::KernelsInternal` -- "only sibling `.cu` files call it". The audit
+// measured which ones: none that anything reaches. Its geometry survives it
+// and is stated where it belongs, on
+// `families::attn::ATTENTION_NAIVE_PAGED_ROWS`' second row as
+// `LaunchRule::PagedScoresDecode`, so the kernel `naive_paged_decode` is
+// still compiled and still fireable -- through the JIT, by a caller with a
+// `Dims`, rather than through eleven arguments and a `KvCacheLayerView`
+// nothing hands it.
 
 void attention_naive_paged(
     const void* q,
@@ -222,55 +190,13 @@ void attention_naive_paged(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void attention_naive_paged_custom(
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t* mask_d,
-    const std::int32_t* mask_indptr_d,
-    int total_tokens,
-    int num_requests,
-    int num_q_heads,
-    cudaStream_t stream,
-    float sm_scale,
-    float logits_soft_cap,
-    float* lse_out)
-{
-    if (num_requests <= 0 || total_tokens <= 0) return;
-    check_head_dim_supported(kv_layer.head_dim, "attention_naive_paged_custom");
-    dim3 grid(num_requests, total_tokens, num_q_heads);
-    dim3 block(BLOCK);
-    const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);
-    device::naive_paged_attn<BLOCK><<<grid, block, smem, stream>>>(
-        static_cast<const device::bf16*>(q),
-        kv_layer.k_pages,
-        kv_layer.v_pages,
-        static_cast<const float*>(kv_layer.k_scales),
-        static_cast<const float*>(kv_layer.v_scales),
-        static_cast<device::bf16*>(o),
-        qo_indptr_d,
-        kv_page_indices_d,
-        kv_page_indptr_d,
-        kv_last_page_lens_d,
-        mask_d,
-        mask_indptr_d,
-        num_q_heads,
-        kv_layer.num_kv_heads,
-        kv_layer.head_dim,
-        kv_layer.page_size,
-        static_cast<device::KvScheme>(kv_layer.scheme),
-        static_cast<device::KvDType>(kv_layer.storage_dtype),
-        kv_layer.block_size,
-        /*window_left=*/-1,
-        sm_scale,
-        logits_soft_cap,
-        lse_out);
-    CUDA_CHECK(cudaGetLastError());
-}
+// `attention_naive_paged_custom` WAS HERE, and it is deleted for the same
+// reason and with the same survival: the masked prefill kernel it launched is
+// `naive_paged_attn`, which `ATTENTION_NAIVE_PAGED_ROWS`' first row states at
+// `LaunchRule::PagedScores` and which the DISPATCHED
+// `attention_naive_paged_bf16` above still reaches. What went is a second
+// spelling of one launch that differed only in taking a mask -- and the row
+// takes a mask.
 
 void attention_naive_paged(
     const void* q,

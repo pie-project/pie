@@ -455,6 +455,83 @@ mod tests {
         }
     }
 
+    /// The row `identify` picked is the row that gets compiled.
+    ///
+    /// `compile_load_plan` is four lines and one of them is a delegation,
+    /// so the whole of what it can get wrong is WHICH row it hands over.
+    /// Every test above it reaches only the refusals -- an empty
+    /// checkpoint, an unknown id, an override that still has to match --
+    /// because the interesting half of the work is on the other side of
+    /// the call and the other side is tested by handing a row over
+    /// directly. That left the join between the two halves untried, and
+    /// a join that passed the catalog's FIRST row to every load would
+    /// pass every one of those refusal tests.
+    ///
+    /// Asserted as an equality against the handed-over form rather than
+    /// against a plan written out here: what this function claims is not
+    /// "a plan comes back" but "the same plan the identified row would
+    /// have produced", and a literal expectation would restate the row's
+    /// contract in a module that has no business knowing it.
+    ///
+    /// The equality alone is weaker than it looks, and the identity
+    /// assertion above it is here because of that. A plan is authored
+    /// from the CHECKPOINT's tensors, so a synthetic one carries only
+    /// the names the manifest declares -- and handing this module's own
+    /// stub to a different llama-shaped row produces, measurably, the
+    /// same 18 declarations and the same 54 instructions. What the
+    /// equality catches is a wrapper that identifies against the wrong
+    /// OVERRIDE, which is the half that has a caller-visible answer;
+    /// what separates two rows given the same tensors is their manifest,
+    /// and `identify` is where that question already lives.
+    #[test]
+    fn the_wrapper_compiles_the_row_it_identified() {
+        let row = crate::catalog::catalog()
+            .iter()
+            .find(|r| r.id() == "gpt-oss-20b")
+            .expect("the catalog carries the row this test reads");
+        let metadata = crate::catalog::identify_tests::checkpoint_of(*row);
+        let scratch = Scratch::new("identified");
+        for f in &metadata.files {
+            scratch.write(&f.path, f.size_bytes);
+        }
+        let go = |chosen: Option<&Override>| match chosen {
+            Some(c) => compile_load_plan(
+                &scratch.0,
+                &metadata,
+                &StorageTarget::default(),
+                c,
+                &Encoding::dense(),
+                Binding::HF_FUSED,
+            ),
+            None => compile_load_plan_for(
+                &scratch.0,
+                &metadata,
+                &StorageTarget::default(),
+                *row,
+                &Encoding::dense(),
+                Binding::HF_FUSED,
+            ),
+        };
+        assert_eq!(
+            crate::catalog::identify(&metadata, &Override::None)
+                .expect("a row's own manifest identifies it")
+                .id(),
+            row.id(),
+            "the join's input: this is the row identification finds"
+        );
+        let direct = go(None).expect("the handed-over row compiles");
+        assert_eq!(
+            go(Some(&Override::None)).map_err(|e| e.to_string()),
+            Ok(direct.clone()),
+            "identification found this row, so the plan must be its plan"
+        );
+        assert_eq!(
+            go(Some(&Override::Id("gpt-oss-20b".to_string()))).map_err(|e| e.to_string()),
+            Ok(direct),
+            "naming the row identification would have found changes nothing"
+        );
+    }
+
     /// The whole path, end to end: policy, author, compile, file check.
     #[test]
     fn a_row_that_authors_and_a_file_that_is_there_produces_a_plan() {

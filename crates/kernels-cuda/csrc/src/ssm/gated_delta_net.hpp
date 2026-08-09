@@ -36,26 +36,6 @@ namespace pie_cuda_driver::kernels::ssm {
 //     out            : [B, V_h, V_d] fp32
 //
 // The kernel allocates K_d + V_d fp32 entries of shared memory.
-void recurrent_gated_delta_step(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    float*       state,
-    float*       out,
-    int B, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
-void recurrent_gated_delta_step_state_bf16(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    void*        state,
-    float*       out,
-    int B, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
 
 // Multi-request batched variant. Same per-(request, head) compute as
 // `_step` above; outer R dimension picks per-request inputs/outputs and
@@ -139,28 +119,6 @@ void recurrent_gated_delta_step_batched_gqa_state_bf16(
 // Single-request entry. Multi-request callers use
 // `chunk_gated_delta_prefill_batched` below — this one is kept
 // for the legacy parity entrypoint and as a single-request fast path.
-void chunk_gated_delta_prefill(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    float*       state,
-    float*       out,
-    int T, int V_h, int K_d, int V_d,
-    int chunk_size,
-    cudaStream_t stream);
-void chunk_gated_delta_prefill_state_bf16(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    void*        state,
-    float*       out,
-    int T, int V_h, int K_d, int V_d,
-    int chunk_size,
-    cudaStream_t stream);
 
 // Multi-request batched chunked prefill. One block per (request, head);
 // each block walks its T_r-token window from `qo_indptr` sequentially
@@ -303,18 +261,9 @@ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
 // to prep Q/K for the gated-delta step.
 //
 //     y[r, c] = (x[r, c] / sqrt(Σ x[r, .]^2 + eps)) * scale
-void l2norm_scale_bf16_to_fp32(
-    const void* x,        // [N, hidden] bf16
-    float*      y,        // [N, hidden] fp32
-    int N, int hidden,
-    float scale,
-    float eps,
-    cudaStream_t stream);
 
 // Helper: bf16 → fp32 widen (vec cast). For passing v_t to the kernel
 // when v lives in bf16 in workspace.
-void bf16_to_fp32(
-    const void* x, float* y, std::size_t n, cudaStream_t stream);
 
 // repeat_interleave on the head dimension: duplicate each of K_h heads
 // `repeat` times so the result has V_h = K_h * repeat heads. Mirrors
@@ -329,8 +278,6 @@ void repeat_interleave_heads_fp32(
 
 // fp32 → bf16 narrow. For shipping the recurrent kernel's fp32 output
 // into the bf16 workspace consumed by the post-norm + out_proj stage.
-void fp32_to_bf16(
-    const float* x, void* y, std::size_t n, cudaStream_t stream);
 
 // Compute per-step (g_log, beta) from the four small per-head inputs:
 //
@@ -342,15 +289,6 @@ void fp32_to_bf16(
 //     a       : [N, V_h] bf16   (per-token from in_proj_a)
 //     b       : [N, V_h] bf16   (per-token from in_proj_b)
 //     g_log_out, beta_out : [N, V_h] fp32
-void gated_delta_g_beta(
-    const void* a,
-    const void* b,
-    const void* A_log,
-    const void* dt_bias,
-    float*      g_log_out,
-    float*      beta_out,
-    int N, int V_h,
-    cudaStream_t stream);
 
 // Fused Qwen GDN post-conv prep:
 //   q/k split + L2 normalization, v bf16-to-fp32, and g/beta gating.

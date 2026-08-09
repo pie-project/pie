@@ -241,6 +241,33 @@ impl Programs {
         Ok(driver::check(&states, effects, tickets))
     }
 
+    /// Read one instance's device-resolved geometry off its channels.
+    ///
+    /// A PEEK, not a take: the ports that consume are consumed once, later,
+    /// by the interpreter's own port loop when the program fires. Reading
+    /// twice would drop a cell, and the symptom is a fire silently using the
+    /// fire-after-next's tokens.
+    ///
+    /// `page` is the KV page size, which the `kv_len` port's contract needs.
+    ///
+    /// # Errors
+    ///
+    /// [`Unregistered`] for an instance id the registry does not hold, or one
+    /// whose program has gone.
+    pub fn geometry(&self, instance: u64, page: u32) -> Result<driver::Resolution, Unregistered> {
+        let inst = self
+            .registry
+            .instance(instance)
+            .ok_or_else(|| Unregistered(format!("no instance {instance}")))?;
+        let program = self.registry.program(inst.program_id).ok_or_else(|| {
+            Unregistered(format!(
+                "instance {instance} names program {} which is gone",
+                inst.program_id
+            ))
+        })?;
+        Ok(driver::resolve(&program.plan, &inst.interp, page))
+    }
+
     /// Register a channel and hand back where its ring lives.
     ///
     /// The ring is HOST memory, as it is on Metal and on the dummy driver.
@@ -255,7 +282,7 @@ impl Programs {
     pub fn register_channel(
         &mut self,
         desc: &driver_api::ChannelRegistrationPlan,
-    ) -> Result<driver_api::PieChannelEndpointBinding, Unregistered> {
+    ) -> Result<driver_api::ChannelBinding, Unregistered> {
         let spec = ChannelSpec {
             id: desc.channel_id,
             dtype: desc.dtype,
@@ -270,7 +297,7 @@ impl Programs {
             .registry
             .register_channel(spec)
             .map_err(|e| Unregistered(format!("{e}")))?;
-        Ok(driver_api::PieChannelEndpointBinding {
+        Ok(driver_api::ChannelBinding {
             channel_id: endpoint.channel_id,
             mirror_base: endpoint.mirror_base,
             word_base: endpoint.word_base,
@@ -304,14 +331,14 @@ impl Programs {
         geometry_class: u32,
         channel_ids: &[u64],
         seeds: &[(u64, Vec<u8>)],
-    ) -> Result<driver_api::PieInstanceBinding, Unregistered> {
+    ) -> Result<driver_api::InstanceBinding, Unregistered> {
         let geometry =
             Geometry::from_wire(geometry_class).map_err(|e| Unregistered(format!("{e}")))?;
         let instance_id = self
             .registry
             .bind_instance(program_id, requested, geometry, channel_ids, seeds)
             .map_err(|e| Unregistered(format!("{e}")))?;
-        Ok(driver_api::PieInstanceBinding {
+        Ok(driver_api::InstanceBinding {
             instance_id,
             geometry_class,
             reserved0: 0,
@@ -480,6 +507,8 @@ mod tests {
             fired: crate::serve::Fired {
                 dispatches: 0,
                 submissions: 0,
+                blocks: 0,
+                parsed: 0,
             },
             rows: 3,
             // Request 0 answers from fire row 0 and request 1 from fire row

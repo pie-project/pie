@@ -268,8 +268,13 @@
 //!
 //! The GEMM gap closed — a previously recorded 1.9x is now 7% at the first
 //! census and **12%** at the second, where the island does five stages
-//! against two. The FUSION gap did not close: fusing the three stages into
-//! one kernel measures 0.984 ms, worse than not fusing, because
+//! against two. Fusing the three stages into one kernel measures 0.984 ms
+//! at this census, worse than not fusing — but that is a statement about
+//! the GRID and not about fusion: 106 blocks on a 142-SM part is under one
+//! block per SM. Past 212 blocks the fused kernel wins, and at 1,696 it is
+//! 2.3x ahead of the unfused pair. The island stays ahead of the best tile
+//! option at both ends, 1.13x here and 1.41x at 54,272 routed rows,
+//! because
 //! fewer experts over the same rows means more rows per expert, and this
 //! kernel reads `W[e]` once per block and round-trips the intermediate
 //! through HBM where the island reads each expert once and keeps fc1's

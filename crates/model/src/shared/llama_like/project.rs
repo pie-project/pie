@@ -321,6 +321,30 @@ pub const NO_METAL_ROUTED_ENCODING: &str = "this row's expert bank reached the d
      wrong offset and answers bf16 garbage, which is NaN more often than \
      not. Refused";
 
+/// A landing bias under a norm placement that lands through the shared
+/// closure.
+///
+/// The Metal text adds `o_bias` at two places: after the FUSED landing
+/// (`gemm_add`, the `Pre` arm), and it used to have a second copy inside
+/// the `land` closure the `Post` and `Sandwich` arms share. That second
+/// copy could not run -- gpt-oss is the only row in the catalog that
+/// publishes an `o_proj` bias and it norms `Pre` -- so it was a branch
+/// standing in for a decision nobody had made.
+///
+/// Deleting it alone would have made the pairing a SILENT DROP: the
+/// contract declares `o_bias`, the loader reads it off disk and stages
+/// it, and the text would never sum it. No shape error and no unbound
+/// symbol, just a per-channel offset missing from every layer. So the
+/// pairing is refused by name instead, and the day a checkpoint arrives
+/// with both, the refusal says which two facts it is holding rather
+/// than the model answering slightly wrong forever.
+pub const NO_METAL_NORMED_LANDING_BIAS: &str = "this row publishes a bias on its attention landing AND norms that \
+     landing's output, and the Metal text adds the landing bias only on \
+     the arm that fuses the residual into the projection. The normed \
+     arms land through a shared statement that has no bias in it, so \
+     this row would load the tensor, stage it, and never sum it. \
+     Refused rather than dropped";
+
 /// What this build's Metal kernels cannot run, asked of the FACTS.
 ///
 /// Three refusals, and none of them is about a row: they are about the
@@ -387,6 +411,11 @@ pub fn metal_kernel_refusal(
     }
     // MXFP4 banks take their own symbol at group 32, so the affine
     // point is not asked of them.
+    if f.o_bias && f.norm_placement != SpecNorm::Pre {
+        return Err(crate::deployment::Refusal::Unsupported(
+            NO_METAL_NORMED_LANDING_BIAS,
+        ));
+    }
     if f.n_experts > 0
         && !bind.moe_mxfp4
         && (bind.quant_group, bind.quant_bits) != METAL_ROUTED_AFFINE
@@ -550,10 +579,10 @@ pub struct RowScalars {
 /// NARROWS those extents, and the narrowed widths have to be stated
 /// somewhere the text will read instead of the row.
 ///
-/// So the four `false`s below are not the row's answers withheld:
+/// So the three `false`s below are not the row's answers withheld:
 /// each is a claim about what a checkpoint PUBLISHED, and the manifest
-/// is where this family makes that claim. `gate_up_fused` and
-/// `qkv_fused` are the load's binding, `v_from_k` is a manifest
+/// is where this family makes that claim. `gate_up_fused` is the load's
+/// binding, `v_from_k` is a manifest
 /// requirement, and `dense_beside_moe` is the routed/dense exclusion
 /// the manifest already enforces — a mixture's SHARED expert is a
 /// different structure, stated by `shared_intermediate` and emitted by
@@ -629,20 +658,6 @@ pub fn metal_facts(
         // Metal text refuses the packed arm at trace time for exactly
         // that reason.
         gate_up_fused: false,
-        // FALSE for the same reason and by the same evidence.
-        // `lowering::resolve` states it outright -- "`qkv` and `gate_up`
-        // are FUSED handles, and no Metal deployment has them" -- because
-        // `compile_load_plan` authors with `Projections::InPlace` and
-        // `dense_fused_projection_joins` returns before doing anything
-        // under that policy.
-        //
-        // The row's own `fused_qkv` says `true` on all eight llama-3 rows,
-        // and that is not wrong: its doc calls it "a *binding* fact, not
-        // an architecture fact", and the binding it was written against is
-        // CUDA's. A binding fact read off the row is a fact one backend
-        // stated for all of them, which is why the answer belongs here
-        // beside `gate_up_fused` and not there.
-        qkv_fused: false,
         // The row's epsilon and the row's rotary base, carried on
         // [`RowScalars`] because `LlamaLikeFacts` states neither — see
         // that struct for why a shape shared by twelve generations
@@ -843,6 +858,46 @@ mod tests {
     /// published configs by `tests/catalog_differential.rs`, which is
     /// where a transcribed number belongs.
     const NORM_EPS: f32 = 1e-6;
+
+    /// A landing bias the normed arms would have dropped is refused.
+    ///
+    /// Two facts that are individually fine and jointly unserviceable:
+    /// `o_bias` says the checkpoint publishes a bias on `o_proj`, and a
+    /// non-`Pre` placement says the landing's output is normed, which
+    /// routes it through the shared closure that has no bias in it. Only
+    /// the fused arm adds one.
+    ///
+    /// The whole point of the refusal is that the alternative is
+    /// SILENT: the tensor is declared, read, staged and never summed, so
+    /// the model answers with a per-channel offset missing from every
+    /// layer and nothing faults. No row in the catalog pairs them today
+    /// -- gpt-oss publishes the bias and norms `Pre` -- which is exactly
+    /// why the pairing needs a name now rather than a bug report later.
+    #[test]
+    fn a_landing_bias_under_a_normed_landing_is_refused_by_name() {
+        use crate::deployment::Refusal;
+        let bind = binding(64, 4);
+        let metal = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
+        let mut f = LlamaLikeFacts::qwen3_0_6b();
+        f.o_bias = true;
+        for placement in [SpecNorm::Post, SpecNorm::Sandwich] {
+            f.norm_placement = placement;
+            assert_eq!(
+                metal_kernel_refusal(&f, &metal, Deployed::metal(&bind), &bind),
+                Err(Refusal::Unsupported(NO_METAL_NORMED_LANDING_BIAS)),
+                "{placement:?} lands through the closure with no bias in it"
+            );
+        }
+        // Either fact alone is serviceable, which is what makes the
+        // pairing worth stating.
+        f.norm_placement = SpecNorm::Pre;
+        metal_kernel_refusal(&f, &metal, Deployed::metal(&bind), &bind)
+            .expect("the fused arm adds the bias it publishes");
+        f.o_bias = false;
+        f.norm_placement = SpecNorm::Sandwich;
+        metal_kernel_refusal(&f, &metal, Deployed::metal(&bind), &bind)
+            .expect("a normed landing with no bias to drop is fine");
+    }
 
     /// The build's instantiation set, as a rounding rule rather than a
     /// table each caller re-derives.
@@ -1190,6 +1245,65 @@ mod tests {
         // reads as the whole context rather than as a zero-width one.
         let full = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
         assert_eq!(full.window_left_at(0), -1);
+    }
+
+    /// The SECOND head width — the one only a two-geometry row has.
+    ///
+    /// `metal_kernel_refusal` is shared, and the sibling above only ever
+    /// reaches its first head-dim gate because every row this projection
+    /// serves states one attention shape. gemma-4 is the only caller
+    /// that arrives with a `global_head_dim` at all, and every gemma-4
+    /// row states 512, which the shader does instantiate — so the second
+    /// gate has never once answered.
+    ///
+    /// It is the gate that matters more, not less: a row whose SLIDING
+    /// layers are a compiled width and whose FULL layers are not would
+    /// pass the first check and be admitted, then die inside the trace
+    /// with `model-compiler`'s panic on an undeclared launch — a
+    /// backtrace two thirds of the way through a load rather than a
+    /// refusal naming the row.
+    ///
+    /// Asserted through `metal_kernel_refusal` directly because no
+    /// projection in this module can produce a nonzero `global_head_dim`
+    /// to feed it, which is the very reason the gate went untried.
+    #[test]
+    fn a_full_layer_width_no_metal_shader_compiled_is_refused_too() {
+        use super::super::forward::facts::LlamaLikeMetalFacts;
+        use crate::deployment::Refusal;
+        let bind = binding(64, 4);
+        let f = LlamaLikeFacts::qwen3_0_6b();
+        assert!(
+            METAL_SDPA_HEAD_DIMS.contains(&f.head_dim),
+            "the sliding width must PASS, or this would be the sibling's test"
+        );
+        let base = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
+        assert_eq!(
+            metal_kernel_refusal(&f, &base, Deployed::metal(&bind), &bind),
+            Ok(()),
+            "one attention shape is admitted"
+        );
+        for w in [96, 80, 192] {
+            let m = LlamaLikeMetalFacts {
+                global_head_dim: w,
+                ..base.clone()
+            };
+            assert_eq!(
+                metal_kernel_refusal(&f, &m, Deployed::metal(&bind), &bind),
+                Err(Refusal::Unsupported(NO_METAL_HEAD_DIM)),
+                "d_{w} full layers are not instantiated and must be refused"
+            );
+        }
+        for w in METAL_SDPA_HEAD_DIMS {
+            let m = LlamaLikeMetalFacts {
+                global_head_dim: *w,
+                ..base.clone()
+            };
+            assert_eq!(
+                metal_kernel_refusal(&f, &m, Deployed::metal(&bind), &bind),
+                Ok(()),
+                "d_{w} full layers are instantiated and must not be refused"
+            );
+        }
     }
 
     /// The gemma-shaped fields are STATED zero, one at a time.

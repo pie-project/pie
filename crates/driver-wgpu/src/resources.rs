@@ -134,6 +134,41 @@ impl Shape {
             FireNumber::KvSeqStride => u32::try_from(self.row()).ok(),
         }
     }
+
+    /// The most pages a cache of this shape could have if one of its buffers
+    /// may hold at most `bytes`.
+    ///
+    /// # Why a per-BUFFER budget and not a total
+    ///
+    /// A pool of this shape is `layers * 2` separate allocations, each holding
+    /// one layer's keys or one layer's values, and each spending
+    /// `page_size * row * bytes` on a page. So the layers do not multiply in
+    /// here: they are not competing for one allocation's size, they are
+    /// competing for memory, and memory is not what
+    /// [`crate::device::Device::budget`] can report. See its docs, and
+    /// [`Pool::ceiling`] for the one caller.
+    ///
+    /// Zero when a page costs more than the whole budget, which is a cache this
+    /// adapter cannot open at any size — the caller owes a refusal there and
+    /// not a clamp, since a pool of no pages cannot answer.
+    ///
+    /// Here rather than on [`Pool`] for the same reason [`Shape::number`] is: a
+    /// division that decides whether a scheduler waits forever should be
+    /// checkable without an adapter.
+    #[must_use]
+    pub fn pages_within(&self, bytes: u64) -> u32 {
+        let per_page = (self.page_size as u64)
+            .saturating_mul(self.row())
+            .saturating_mul(self.bytes as u64);
+        if per_page == 0 {
+            // A cache with no width holds every page in nothing. Degenerate
+            // rather than impossible, and answering zero here would report a
+            // model with no KV heads as unservable at the pool's expense
+            // instead of at the geometry's, which is where it is caught.
+            return u32::MAX;
+        }
+        u32::try_from(bytes / per_page).unwrap_or(u32::MAX)
+    }
 }
 
 /// One request in a fire: the rows it contributes and the pages it owns.
@@ -545,6 +580,57 @@ impl Pool {
         })
     }
 
+    /// The largest page count this pool could ever be grown to.
+    ///
+    /// # What it is for, and the only thing it is for
+    ///
+    /// Telling a demand that can never be met apart from one that cannot be
+    /// met now. A scheduler that waits on the first waits forever; one that
+    /// drops the second drops work it had correctly admitted.
+    /// [`crate::shell::Shell::launch`] is the one caller, and it answers
+    /// `Impossible` above this number and grows below it.
+    ///
+    /// # What bounds a pool here, and it is not the heap
+    ///
+    /// One page costs `page_size * row * bytes` in EACH of the `layers * 2`
+    /// cache buffers, and [`Self::open`] and [`Self::resize`] take those as
+    /// `layers * 2` separate allocations, each bound whole as a storage
+    /// buffer. So the ceiling divides [`Device::budget`] — a per-ALLOCATION
+    /// cap on this adapter, see its docs for why `wgpu` will state nothing
+    /// else — by what ONE buffer spends on a page, not by what the whole pool
+    /// spends. Dividing by the across-layers cost instead would answer
+    /// `Impossible` at a fifty-sixth of a pool this adapter would accept, and
+    /// the frames it refused were ones the engine had correctly admitted.
+    ///
+    /// # Why there is no halving, where `driver-vulkan` has one
+    ///
+    /// That crate halves because its budget is a HEAP and [`Self::resize`]
+    /// holds both sizes at once — deliberately, so a failed growth leaves the
+    /// pool intact — so a growth's peak is twice its result. This resize holds
+    /// both sizes too, and it does not move the number being divided: a new
+    /// buffer of `n` bytes is legal or not on its own, and how many others are
+    /// live at that moment does not enter into `max_buffer_size`. Halving here
+    /// would refuse half the pools this adapter states it can bind, as a
+    /// gesture at a heap size neither this method nor any other in `wgpu` can
+    /// see.
+    ///
+    /// # What it is not
+    ///
+    /// A promise, and less of one than its sibling's. That number at least
+    /// came from a heap; this one is a per-buffer cap, which on a discrete
+    /// card is reached long after the memory is — 2 GiB a buffer across
+    /// fifty-six buffers is past every consumer part. A growth well under this
+    /// number can and will fail, with [`Device::zeroed`]'s own refusal.
+    /// Generous is the safe direction: it turns a permanent refusal into a
+    /// retried one rather than the reverse.
+    #[must_use]
+    pub fn ceiling(&self, device: &Device) -> u32 {
+        // The division is [`Shape::pages_within`] so that it can be checked
+        // without an adapter; the only thing this adds is which number to
+        // divide.
+        self.shape.pages_within(device.budget())
+    }
+
     /// Grow or shrink the cache to `pages`, keeping what the pages that survive
     /// hold.
     ///
@@ -855,40 +941,35 @@ impl Pool {
     ///
     /// [`Failed::Wgpu`] naming which page, which cell, or which domain.
     ///
-    /// # A gap in `driver-api`, reported rather than papered over
+    /// # The domain, which this now checks as strictly as its siblings
     ///
     /// `driver-vulkan` refuses any domain that is not
     /// `PIE_MEMORY_DOMAIN_VULKAN_DEVICE` and `driver-metal` any that is not
-    /// `PIE_MEMORY_DOMAIN_METAL_SHARED`. **There is no
-    /// `PIE_MEMORY_DOMAIN_WEBGPU_DEVICE`**: `driver-api`'s list runs
-    /// host-pinned, CUDA, ROCm, two Metal arms and Vulkan, and this backend is
-    /// none of them — it may be RUNNING over Vulkan or Metal or D3D12, and
-    /// naming whichever one `wgpu` picked would be claiming a memory domain the
-    /// engine could then hand another driver's pages for.
+    /// `PIE_MEMORY_DOMAIN_METAL_SHARED`. This file used to record that there
+    /// was no `PIE_MEMORY_DOMAIN_WEBGPU_DEVICE` to be that strict about, and
+    /// checked only that both ends agreed and that neither was host memory.
     ///
-    /// So the check here is weaker than either sibling's and says so: both ends
-    /// must be the SAME domain, and it must not be host memory — a KV page in
-    /// this pool is device memory whatever is underneath, and a plan that
-    /// thinks otherwise is routed wrongly. What it cannot check is that the
-    /// domain is *ours*. `driver-api` growing the constant is what closes it.
+    /// The constant exists now — it arrived with the engine seam that selects
+    /// this backend, `crates/engine/src/driver/backend/wgpu.rs`, because
+    /// `DriverBackend::device_domain` has to answer something the OTHER
+    /// backends do not — and it is its own tag rather than the tag of whichever
+    /// API `wgpu` opened. A `wgpu` pool and a `driver-vulkan` pool on one
+    /// machine are two allocations neither driver can address in the other, so
+    /// answering `VULKAN_DEVICE` here would accept a plan naming somebody
+    /// else's pages, which is a prefix-cache hit reading another pool's
+    /// memory.
     pub fn copy_plan(
         &self,
         device: &Device,
         plan: &driver_api::KvCopyPlan,
     ) -> Result<usize, Failed> {
-        if plan.src_domain != plan.dst_domain {
+        let ours = driver_api::PIE_MEMORY_DOMAIN_WEBGPU_DEVICE;
+        if plan.src_domain != ours || plan.dst_domain != ours {
             return Err(Failed::Wgpu(format!(
                 "a copy from memory domain {} to domain {} is not a move within \
-                 one pool",
+                 this pool, whose pages are domain {ours}",
                 plan.src_domain, plan.dst_domain
             )));
-        }
-        if plan.src_domain == driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED {
-            return Err(Failed::Wgpu(
-                "the KV pages of this driver are device memory, and this plan \
-                 names host-pinned memory at both ends"
-                    .to_string(),
-            ));
         }
         if plan.src_page_ids.len() != plan.dst_page_ids.len() {
             return Err(Failed::Wgpu(format!(
@@ -1195,6 +1276,54 @@ mod tests {
             Some(shape.page_size),
             "the page size is the pool's and not the fire's"
         );
+    }
+
+    /// The pool's ceiling is a per-BUFFER division, and the layers do not
+    /// multiply into it.
+    ///
+    /// # Why this is the assertion and not a round number
+    ///
+    /// [`Shape::pages_within`] is what turns `Launched::Impossible` on and off,
+    /// and both directions of getting it wrong are silent. Dividing by the
+    /// across-layers cost — `layers * 2` times larger — would answer
+    /// `Impossible` for a pool this adapter states it can bind, and the engine
+    /// permanently drops frames it had correctly admitted. Multiplying instead
+    /// of dividing would admit a pool whose per-layer buffer `Device::zeroed`
+    /// then refuses, which turns a scheduling answer into a device error.
+    ///
+    /// So the claim is the exact page count, and it is asserted to be
+    /// independent of `layers` — the one term that must not appear.
+    #[test]
+    fn the_pools_ceiling_counts_one_buffers_pages_and_not_every_layers() {
+        let shape = shape();
+        // 16 rows a page, 3 heads of 10 elements, 2 bytes each: 960 bytes.
+        let per_page = 16 * 3 * 10 * 2;
+        assert_eq!(shape.pages_within(per_page * 100), 100);
+        // Not a multiple: the tail page does not fit, and a `div_ceil` here
+        // would admit a pool one page past what the adapter will bind.
+        assert_eq!(shape.pages_within(per_page * 100 + per_page - 1), 100);
+
+        let deeper = Shape {
+            layers: 64,
+            ..shape
+        };
+        assert_eq!(
+            deeper.pages_within(per_page * 100),
+            100,
+            "the ceiling fell with the layer count, so a deep model is refused \
+             at a pool a shallow one is admitted at -- and the layers are \
+             separate allocations, which is the whole reason they do not \
+             multiply in"
+        );
+
+        // A budget under one page is a cache that cannot be opened at all.
+        // Zero rather than one, because `Pool::resize` refuses zero by name and
+        // a clamp to one would hand it a size it cannot allocate.
+        assert_eq!(shape.pages_within(per_page - 1), 0);
+
+        // Past `u32::MAX` pages is clamped rather than wrapped: a wrap would
+        // report a huge budget as a tiny pool and refuse everything.
+        assert_eq!(shape.pages_within(u64::MAX), u32::MAX);
     }
 
     /// A page holding no slots is refused rather than rounded up to one.

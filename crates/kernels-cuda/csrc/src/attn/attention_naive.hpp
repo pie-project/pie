@@ -18,51 +18,11 @@
 
 namespace pie_cuda_driver::kernels::attn {
 
-void attention_naive_bf16(
-    const void* q, const void* k, const void* v,
-    void* o,
-    int num_tokens,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    cudaStream_t stream);
-
-void attention_mtp_history_bf16(
-    const void* q,
-    const void* k_history,
-    const void* v_history,
-    void* o,
-    int num_tokens,
-    int history_steps,
-    int history_stride,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    cudaStream_t stream);
-
-void attention_mtp_paged_history_bf16(
-    const void* q,
-    const void* k_pages,
-    const void* v_pages,
-    const void* k_history,
-    const void* v_history,
-    void* o,
-    const std::int32_t* position_ids,
-    const std::int32_t* request_ids,
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,
-    const std::uint32_t* kv_last_page_lens,
-    int num_tokens,
-    int history_steps,
-    int history_stride,
-    int max_global_tokens,
-    int page_size,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    bool hnd_layout,
-    bool global_cache_uses_prefix_position,
-    cudaStream_t stream);
+// `attention_naive_bf16`, `attention_mtp_history_bf16` and
+// `attention_mtp_paged_history_bf16` WERE declared here. All three launchers
+// are deleted -- the audit measured the cluster's consumer set as the
+// cluster, which is empty from outside. The `.cu` says what went and why the
+// device text stayed.
 
 void mtp_shift_hidden_bf16(
     const void* target_hidden,

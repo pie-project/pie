@@ -380,3 +380,69 @@ pub async fn run_inferlet(
 
     proc.wait_for_return().await
 }
+
+/// The standalone TOML for a Vulkan deployment.
+///
+/// `[driver] kernels` names the SPIR-V directory the seam reads at `create`
+/// and `kv_pages` sizes the pool. There is no `gpu_mem_utilization` here:
+/// this driver does not derive a pool from a fraction of the card, it is told
+/// how many pages to hold. `device` is stated because the config requires it
+/// and ignored because `Device::open` takes the first Vulkan device the
+/// loader reports -- a selector here would be a setting nothing acts on.
+pub fn vulkan_standalone_toml(artifact: &str, kernels: &str) -> String {
+    vulkan_standalone_toml_with_pages(artifact, kernels, 256)
+}
+
+/// The same, with the pool sized by the caller.
+///
+/// A test that wants the pool to RUN OUT needs this: 256 pages is four
+/// thousand tokens, which no gate here comes close to, so the driver's
+/// `Exhausted` answer and the engine's re-post are never taken at the default.
+#[must_use]
+pub fn vulkan_standalone_toml_with_pages(artifact: &str, kernels: &str, kv_pages: u32) -> String {
+    format!(
+        "         [server]\n\
+         port = 0\n\
+         \n\
+         [model]\n\
+         name = \"qwen3\"\n\
+         model = \"{artifact}\"\n\
+         \n\
+         [driver]\n\
+         type = \"vulkan\"\n\
+         device = [\"vulkan:0\"]\n\
+         kernels = \"{kernels}\"\n\
+         kv_pages = {kv_pages}\n"
+    )
+}
+
+/// Boot the embedded standalone with the real Vulkan driver.
+///
+/// `PIE_VULKAN_ARTIFACT` names a `.zt` that `pie model build --backend
+/// vulkan` authored -- an artifact rather than a snapshot because this driver
+/// reads its declared quantization out of the embedded `model/config`, and
+/// one carrying its tokenizer because the runtime parses one at boot
+/// unconditionally. `PIE_KERNELS_VULKAN_SPV_DIR` names the compiled modules.
+/// A colon-separated list is accepted and the first entry used: a deployment
+/// serves one model, and the engine's own tests take the list.
+pub async fn boot_vulkan() -> Result<pie::StandaloneHandle> {
+    boot_vulkan_with_pages(256).await
+}
+
+/// The same, with the pool sized by the caller. See
+/// [`vulkan_standalone_toml_with_pages`].
+pub async fn boot_vulkan_with_pages(kv_pages: u32) -> Result<pie::StandaloneHandle> {
+    let artifact = std::env::var("PIE_VULKAN_ARTIFACT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context("PIE_VULKAN_ARTIFACT names the built artifact")?;
+    let artifact = artifact.split(':').next().unwrap_or_default().to_string();
+    let kernels = std::env::var("PIE_KERNELS_VULKAN_SPV_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context("PIE_KERNELS_VULKAN_SPV_DIR names the compiled modules")?;
+    let (controller, gateway, worker) = derive_standalone(&vulkan_standalone_toml_with_pages(
+        &artifact, &kernels, kv_pages,
+    ))?;
+    run_standalone(controller, gateway, worker).await
+}

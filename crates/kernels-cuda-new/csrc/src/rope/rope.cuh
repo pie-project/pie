@@ -187,7 +187,48 @@ __global__ void rotate(
         }
     }
 
-    // The rotation angle depends only on (pos, dim_pair): every head of this
+    // # `__sincosf` and the context length, measured
+//
+// The angle below is `pos * theta^(-2 * dp / head_dim)`. At `dp = 0` that
+// exponent is 1, so **the largest angle this kernel evaluates IS the context
+// position** -- 4,096 radians at position 4,096. `__sincosf` is the fast
+// intrinsic and its accuracy degrades through argument reduction as the
+// angle grows, measured against fp64 on an L40S:
+//
+//     position       __sincosf err     sinf err
+//          1,024        4.06e-05        6.08e-10
+//          4,096        1.33e-04        4.10e-09
+//         16,384        5.48e-04        2.47e-08
+//         65,536        1.91e-03        2.35e-08
+//        262,144        1.05e-02        1.35e-09
+//      8,388,608        2.75e-01        2.69e-09
+//
+// bf16 resolution is 2^-8 = 3.9e-03, so **this is below the storage noise
+// floor up to about 64K and above it beyond**. `sinf`/`cosf` hold ~1e-08 at
+// every position.
+//
+// The fix is a two-word edit and it is not free. Both forms of this family,
+// same kernels otherwise:
+//
+//     tokens     rotate (hoisted)     rotate_partial (not hoisted)
+//          1     2.01 -> 2.12  +5.2%    6.63 -> 7.46  +12.5%
+//      1,024     3.20 -> 3.38  +5.6%   18.38 -> 21.60 +17.5%
+//      8,192     9.88 -> 11.12 +12.5% 126.28 -> 152.07 +20.4%
+//
+// The hoisting below is what makes the difference between those columns:
+// with the cache, a block evaluates `cache_pairs` transcendentals instead of
+// `total_heads * cache_pairs`, so making each one 3x dearer costs a third as
+// much.
+//
+// **This is a trade, not a bug, and it is stated rather than taken.** Below
+// 64K context the error does not survive bf16 storage and `__sincosf` is
+// free accuracy; above it the error is real and grows. Whoever owns the
+// numerics decides, and `rope/rope_tile.cuh` is a CuTile twin that already
+// uses the accurate form -- 1.2-1.4x FASTER than this kernel while being
+// three orders of magnitude closer to fp64 -- and is declined for exactly
+// this reason.
+//
+// The rotation angle depends only on (pos, dim_pair): every head of this
     // token shares it. Computing it inside the element loop ran a full-precision
     // `powf` plus a `__sincosf` once per (head, pair) -- for GLM's 65 QK heads
     // that is 65 evaluations of the same 32 transcendentals, and it made this

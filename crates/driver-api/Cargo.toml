@@ -33,5 +33,25 @@ rpc = ["dep:tarpc"]
 serde = { version = "1.0", features = ["derive"] }
 tarpc = { version = "0.37", features = ["serde1"], optional = true }
 
+# `Driver`'s verbs answer `Result<_, anyhow::Error>` for the same reason the
+# seams they replaced did: a driver failure is a message a human reads, not a
+# value the engine matches on. The one failure the engine DOES match on is
+# `Unsupported`, which is a type here rather than a string.
+anyhow = "1.0"
+# What a completion is made of.
+#
+# `waker` is the slot table a `SubmissionCompletion` parks on, and it has no
+# dependencies of its own; `crossbeam-queue` is the terminal-cell recycling
+# pool. Both are pure Rust, which is the property `driver-vulkan` and
+# `driver-wgpu` assert about this crate's closure in their `tests/pure.rs` --
+# adding a dependency here adds one to nine crates, so the bar is that test
+# rather than taste.
+waker = { path = "../waker" }
+crossbeam-queue = "0.3"
+
 [dev-dependencies]
 serde_json = "1.0"
+# `completion`'s tests await a `SubmissionCompletion`, which is a `Future`.
+# A DEV-dependency only: nothing in this crate's public surface is async, and
+# `driver-vulkan`/`driver-wgpu` assert its closure is pure Rust.
+tokio = { version = "1", features = ["rt", "macros", "time"] }

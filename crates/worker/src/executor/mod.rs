@@ -13,11 +13,11 @@ use anyhow::{Context, Result};
 use driver_api::{
     ExecutorRequest, ExecutorResponse, ExecutorRpc, ExecutorRpcRequest, ExecutorRpcResponse,
     HelloRequest, HelloResponse, InlineKvPayload, MemoryDomain, ModelIdentity,
-    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_PENDING, PIE_TERMINAL_OUTCOME_SUCCESS,
-    PieTerminalCell, PushKv, REMOTE_WIRE_VERSION, RemoteBindInstance, RemoteBindResponse,
-    RemoteChannelBinding, RemoteEncode, RemoteError, RemoteErrorKind, RemoteLaunch,
-    RemoteMediaBlob, RemoteMediaKind, RemotePeerConn, RemoteRegisterChannel, RemoteTerminal,
-    RemoteTransferKind, ScratchGrant, TerminalCellState,
+    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_SUCCESS, TerminalCell, PushKv,
+    REMOTE_WIRE_VERSION, RemoteBindInstance, RemoteBindResponse, RemoteChannelBinding,
+    RemoteEncode, RemoteError, RemoteErrorKind, RemoteLaunch, RemoteMediaBlob, RemoteMediaKind,
+    RemotePeerConn, RemoteRegisterChannel, RemoteTerminal, RemoteTransferKind, ScratchGrant,
+    TerminalCellState,
 };
 use futures::StreamExt;
 use tarpc::serde_transport::tcp;
@@ -1766,16 +1766,11 @@ impl ExecutorActor {
             }
         };
         let mut cells = (0..merged.terminal_count)
-            .map(|_| {
-                Box::new(PieTerminalCell {
-                    outcome: PIE_TERMINAL_OUTCOME_PENDING,
-                    reserved0: 0,
-                })
-            })
+            .map(|_| Box::new(TerminalCell::pending()))
             .collect::<Vec<_>>();
         let terminal_cells = cells
             .iter_mut()
-            .map(|cell| cell.as_mut() as *mut PieTerminalCell)
+            .map(|cell| cell.as_mut() as *mut TerminalCell)
             .collect();
         // The remote wire is per-step: each merged launch posts as a
         // single-step frame (the engine-side edge adapter decomposed the
@@ -3081,7 +3076,7 @@ fn append_plan(
 fn single_step_frame(
     plan: ::engine::driver::LaunchPlan,
     instance_ids: Vec<u64>,
-    terminal_cells: Vec<*mut PieTerminalCell>,
+    terminal_cells: Vec<*mut TerminalCell>,
     kv_translation: Vec<u32>,
     kv_translation_indptr: Vec<u32>,
     program_row_indptr: Vec<u32>,
@@ -3331,13 +3326,9 @@ fn validate_raw_encode_plan(
     Ok(())
 }
 
-fn read_terminal(cell: &PieTerminalCell) -> TerminalCellState {
-    let outcome = unsafe {
-        std::sync::atomic::AtomicU32::from_ptr(std::ptr::addr_of!(cell.outcome).cast_mut())
-            .load(Ordering::Acquire)
-    };
+fn read_terminal(cell: &TerminalCell) -> TerminalCellState {
     TerminalCellState {
-        outcome,
+        outcome: cell.load(),
         reserved0: cell.reserved0,
     }
 }
@@ -3368,4 +3359,3 @@ fn driver_error(error: impl std::fmt::Display) -> RemoteError {
 
 #[allow(dead_code)]
 fn _assert_tarpc_types(_: ExecutorRpcRequest, _: ExecutorRpcResponse) {}
-

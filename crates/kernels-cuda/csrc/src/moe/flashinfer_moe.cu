@@ -83,22 +83,6 @@ RunnerState& state() {
 
 constexpr bool log_enabled() { return false; }
 
-std::optional<ce::CutlassGemmConfig> select_first_profile(
-    const std::vector<ce::CutlassGemmConfig>& configs,
-    const char* name,
-    int* out_index) {
-    if (configs.empty()) return std::nullopt;
-    *out_index = 0;
-    if (log_enabled()) {
-        std::fprintf(
-            stderr,
-            "[pie-driver-cuda] FlashInfer MoE %s selected first profile "
-            "total=%zu\n",
-            name, configs.size());
-    }
-    return configs.front();
-}
-
 std::optional<ce::CutlassGemmConfig> first_supported(
     Runner& runner,
     const std::vector<ce::CutlassGemmConfig>& configs,
@@ -140,26 +124,6 @@ std::optional<ce::CutlassGemmConfig> first_supported(
         }
     }
     return selected;
-}
-
-std::optional<ce::CutlassGemmConfig> select_raw_profile(
-    const std::vector<ce::CutlassGemmConfig>& configs,
-    int raw_index,
-    const char* name,
-    int* out_index) {
-    if (configs.empty()) return std::nullopt;
-    const int index = std::min(
-        std::max(0, raw_index),
-        static_cast<int>(configs.size()) - 1);
-    *out_index = index;
-    if (log_enabled()) {
-        std::fprintf(
-            stderr,
-            "[pie-driver-cuda] FlashInfer MoE %s selected raw_index=%d "
-            "total=%zu\n",
-            name, index, configs.size());
-    }
-    return configs[static_cast<std::size_t>(index)];
 }
 
 const char* fusion_name(ce::CutlassGemmConfig::EpilogueFusionType fusion) {
@@ -719,7 +683,14 @@ int flashinfer_cutlass_moe_min_rows() {
     return v;
 }
 
-int moe_gemv_max_tokens(int fallback) { return fallback; }
+// `moe_gemv_max_tokens(int fallback) { return fallback; }` was deleted here
+// by §43: an identity function, declared in the header, called by no C++, no
+// shim entry, no `ffi::` fire and named in no golden. §43 kept
+// `flashinfer_cutlass_moe_enabled` beside it, which the audit also called
+// dead, because `model/src/qwen_3_5/forward/facts.rs` cites it by name as
+// the reason `moe_cutlass_max_rows` is non-zero -- a fact the Rust side
+// SHIPS. That citation is a claim about this function's body, so the body
+// stays until the claim moves.
 
 std::size_t flashinfer_cutlass_moe_workspace_bytes(
     MoeActivation activation,

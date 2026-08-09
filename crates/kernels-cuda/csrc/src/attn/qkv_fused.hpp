@@ -61,31 +61,8 @@ void qkv_decode_qk_norm_rope_write_kv_bf16(
 // START is this kernel's row count (the tail region starts where the
 // prefix ends). Grid spans the full `n_max` lanes; out-of-window rows
 // early-out, so a captured launch replays across row splits.
-void qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
-    const void* packed,
-    void* q_out,
-    void* k_pages,
-    void* v_pages,
-    const void* q_weight,
-    const void* k_weight,
-    const std::int32_t* positions,
-    const float* rope_table,
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,
-    const std::uint32_t* kv_last_page_lens,
-    const std::uint32_t* w_page,
-    const std::uint32_t* w_off,
-    const std::uint8_t* row_valid,
-    const std::uint32_t* win_d,
-    int n_max,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int page_size,
-    bool hnd_layout,
-    float theta,
-    float eps,
-    cudaStream_t stream);
+// `qkv_decode_qk_norm_rope_write_kv_bf16_devwin` WAS declared here; its
+// launcher is deleted. The `.cu` carries the evidence.
 
 // Gemma4 row-decode verifier fast path for packed [Q;K;V] projection output.
 // Each input row has a corresponding decode-style KV page table row. The

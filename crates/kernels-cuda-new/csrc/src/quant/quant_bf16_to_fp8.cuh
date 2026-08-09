@@ -7,8 +7,11 @@
 // copies that agree today drift tomorrow and `norm/altup_aux` shipped a
 // release proving it.
 //
-// `model-loader` calls `quantize_bf16_to_fp8_e4m3_per_tensor` and its
-// siblings directly from Rust. Nothing here deletes an entry point.
+// `model-loader` calls `quantize_bf16_to_fp8_e4m3_per_channel` directly from
+// Rust, through `tile.rs::CUDA_QUANTIZE_BF16_TO_FP8`. That is the ONE entry
+// point it names; §43 measured the rest and deleted the eight the sentence
+// above used to cover -- `_per_tensor` among them. The device text is
+// untouched.
 //
 // # Twelve kernels became nine, and the four that merged are the point
 //

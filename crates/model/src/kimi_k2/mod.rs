@@ -189,6 +189,8 @@ const ROPE_SCALING: crate::deployment::RopeScaling = crate::deployment::RopeScal
     beta_slow: 1.0,
     attention_factor: 1.0,
     original_max_position: 4_096,
+    // OMITTED by the config, which is HF's default.
+    truncate: true,
 };
 
 crate::rows_of!(KimiK2);
@@ -277,8 +279,14 @@ impl Variant for KimiK2 {
         if let crate::catalog::Backend::Metal(_) = load.backend {
             return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
         }
-        self.deployment(load)?;
-        Ok(project::trace(&self.shape, self.rope_yarn, class))
+        // The plan this row WOULD fire. It cannot run in this build --
+        // `deployment` refuses for a store nothing provisions -- and it is
+        // written anyway, because the alternative is a row that stops being
+        // able to serve the day one is. `tests/a_store_this_build_does_not
+        // _provision.rs` holds the refusal so the day it changes is a test
+        // failure naming this line rather than a silent revival.
+        self.deployment(load)
+            .map(|_| project::trace(&self.shape, self.rope_yarn, class))
     }
 
     /// Kimi's own `<|im_middle|>` protocol, which reads like ChatML and
@@ -388,6 +396,7 @@ mod tests {
                 beta_slow,
                 attention_factor,
                 original_max_position,
+                truncate,
             }) = d.rope_scaling
             else {
                 panic!("{}: K2 publishes `type: yarn`", v.id);
@@ -397,6 +406,12 @@ mod tests {
             // K2 states it, and HF takes a stated 1.0 as-is.
             assert_eq!((factor, beta_fast, beta_slow), (32.0, 1.0, 1.0), "{}", v.id);
             assert_eq!(original_max_position, 4_096, "{}", v.id);
+            // OMITTED by the config, so the row states HF's default. Unlike
+            // `attention_factor` above there is no second field to infer it
+            // from -- an absent `truncate` means the fallback and nothing
+            // else -- but writing it down is what keeps the row readable
+            // beside gpt-oss, which states the opposite.
+            assert!(truncate, "{}: K2's config omits `truncate`", v.id);
             // NOT `0.1 * ln(32) + 1`. That formula is HF's fallback for
             // a config that omits `mscale`/`mscale_all_dim`; K2 states
             // both as 1.0, so the inferred ratio is exactly one. Taking

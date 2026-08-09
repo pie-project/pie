@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    PIE_MEMORY_DOMAIN_HOST_PINNED, PieKvMoveCell, PieMemoryDomain, PiePoolRange, PieStateCopyRange,
+    PIE_MEMORY_DOMAIN_HOST_PINNED, KvMoveCell, DeviceDomain, PoolRange, StateCopyRange,
 };
 
 pub const CHANNEL_TICKET_NONE: u64 = u64::MAX;
@@ -33,6 +33,52 @@ impl EncodedMask {
     pub fn is_empty(&self) -> bool {
         self.total_size == 0
     }
+
+    /// Expand the runs into `dst`, setting one bit per true element.
+    ///
+    /// `dst` must be at least [`Self::words`] long; bits past [`Self::len`]
+    /// are never written, so a longer buffer keeps whatever it held.
+    fn expand_into(&self, dst: &mut [u32]) {
+        let total = self.len();
+        let mut at = 0usize;
+        for (index, &run) in self.runs.iter().enumerate() {
+            let end = at.saturating_add(run as usize).min(total);
+            if index % 2 == 1 {
+                for bit in at..end {
+                    dst[bit / 32] |= 1 << (bit % 32);
+                }
+            }
+            if end == total {
+                break;
+            }
+            at = end;
+        }
+    }
+
+    /// How many `u32` words [`Self::expand_into`] needs.
+    #[must_use]
+    pub fn words(&self) -> usize {
+        self.len().div_ceil(32)
+    }
+}
+
+/// [`LaunchPlan::masks`] expanded into the dense per-row bitmask a driver
+/// stages, with the two CSRs that index it.
+///
+/// # Why this is a type and not three returns
+///
+/// The three arrays are only meaningful together — `request_indptr` indexes
+/// `word_indptr`, which indexes `words` — and the mask consumer takes them as
+/// a triple. Naming the triple is what stops a caller from pairing one plan's
+/// words with another's CSR.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct MaskWords {
+    /// Per request row, into `word_indptr`. Always `requests + 1` entries.
+    pub request_indptr: Vec<u32>,
+    /// Per mask, into `words`. Always `masks + 1` entries.
+    pub word_indptr: Vec<u32>,
+    /// The bitmask words themselves, one run of [`EncodedMask::words`] each.
+    pub words: Vec<u32>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +185,46 @@ impl core::fmt::Display for Malformed {
 impl std::error::Error for Malformed {}
 
 impl LaunchPlan {
+    /// [`Self::masks`] as dense bitmask words, with the CSRs that index them.
+    ///
+    /// # Why this lives here
+    ///
+    /// [`EncodedMask`] is defined in this module, so its expansion is this
+    /// module's business — the same rule that put `adopt` beside the two
+    /// representations it converts between. It was in the engine
+    /// (`driver/abi.rs`, `MaskWordsStorage`) only because the C view was
+    /// built there and the CUDA driver read the result through a
+    /// `#[repr(C)]` descriptor. A driver that takes the owned plan needs the
+    /// expansion itself, and two drivers needing it would have meant two
+    /// copies of a bit loop.
+    ///
+    /// An empty [`Self::mask_indptr`] yields the all-zero request CSR, which
+    /// is the documented "no row names a mask" default rather than a defect.
+    #[must_use]
+    pub fn bitmask_words(&self) -> MaskWords {
+        let requests = self.qo_indptr.len().saturating_sub(1);
+        let request_indptr = if self.mask_indptr.is_empty() {
+            vec![0; requests + 1]
+        } else {
+            self.mask_indptr.clone()
+        };
+
+        let mut word_indptr = Vec::with_capacity(self.masks.len() + 1);
+        let mut words = Vec::new();
+        word_indptr.push(0);
+        for mask in &self.masks {
+            let start = words.len();
+            words.resize(start + mask.words(), 0);
+            mask.expand_into(&mut words[start..]);
+            word_indptr.push(u32::try_from(words.len()).unwrap_or(u32::MAX));
+        }
+        MaskWords {
+            request_indptr,
+            word_indptr,
+            words,
+        }
+    }
+
     /// Every CSR invariant a fire depends on, checked before anything is
     /// staged or written.
     ///
@@ -363,8 +449,7 @@ pub struct ProgramRegistration {
     pub reference_ptir: Vec<u8>,
 }
 
-/// **The launch package** — the owned counterpart of
-/// [`PieLaunchPackage`](crate::local::PieLaunchPackage).
+/// **The launch package** — what a driver registers a program AS.
 ///
 /// This is what a driver receives instead of PTIR. `stages` and `plans` are
 /// parallel arrays in attachment order.
@@ -379,8 +464,7 @@ pub struct LaunchPackage {
     pub plans: Vec<LaunchStagePlan>,
 }
 
-/// One declared SSA value. Owned counterpart of
-/// [`PieLaunchValue`](crate::local::PieLaunchValue).
+/// One declared SSA value.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchValue {
     pub id: u32,
@@ -394,8 +478,7 @@ pub struct LaunchValue {
     pub shape: Vec<u32>,
 }
 
-/// One op in a stage DAG. Owned counterpart of
-/// [`PieLaunchOp`](crate::local::PieLaunchOp).
+/// One op in a stage DAG.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchOp {
     /// `PTIR_OP_*`.
@@ -420,8 +503,7 @@ pub struct LaunchOp {
     pub shape: Vec<u32>,
 }
 
-/// One channel declaration. Owned counterpart of
-/// [`PieLaunchChannel`](crate::local::PieLaunchChannel).
+/// One channel declaration.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchChannel {
     pub id: u32,
@@ -437,8 +519,7 @@ pub struct LaunchChannel {
     pub extern_name: Vec<u8>,
 }
 
-/// One descriptor-port binding. Owned counterpart of
-/// [`PieLaunchPort`](crate::local::PieLaunchPort).
+/// One descriptor-port binding.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchPort {
     /// `PTIR_PORT_*`.
@@ -450,16 +531,14 @@ pub struct LaunchPort {
     pub const_data: Vec<u8>,
 }
 
-/// A `(channel, value)` pair. Owned counterpart of
-/// [`PieLaunchPut`](crate::local::PieLaunchPut).
+/// A `(channel, value)` pair.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchPut {
     pub channel: u32,
     pub value: u32,
 }
 
-/// One stage program. Owned counterpart of
-/// [`PieLaunchStage`](crate::local::PieLaunchStage).
+/// One stage program.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchStage {
     /// Prologue 0, OnAttnProj 1, OnAttn 2, Epilogue 3.
@@ -470,8 +549,7 @@ pub struct LaunchStage {
     pub reads: Vec<u32>,
 }
 
-/// One region. Owned counterpart of
-/// [`PieLaunchRegion`](crate::local::PieLaunchRegion).
+/// One region.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRegion {
     /// `PIE_REGION_GENERATED` or `PIE_REGION_LIBRARY`.
@@ -484,8 +562,7 @@ pub struct LaunchRegion {
     pub sinks: Vec<LaunchPut>,
 }
 
-/// One normalized value type. Owned counterpart of
-/// [`PieLaunchPlanValue`](crate::local::PieLaunchPlanValue).
+/// One normalized value type.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchPlanValue {
     pub dtype: u8,
@@ -495,16 +572,14 @@ pub struct LaunchPlanValue {
     pub dims: Vec<u32>,
 }
 
-/// One lane-binding rule. Owned counterpart of
-/// [`PieLaunchChannelRule`](crate::local::PieLaunchChannelRule).
+/// One lane-binding rule.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchChannelRule {
     pub value: u32,
     pub local: u32,
 }
 
-/// The per-program launch plan for one stage. Owned counterpart of
-/// [`PieLaunchStagePlan`](crate::local::PieLaunchStagePlan).
+/// The per-program launch plan for one stage.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchStagePlan {
     pub signature_hash: u64,
@@ -590,13 +665,13 @@ pub struct ChannelRegistrationPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCopyPlan {
-    pub src_domain: PieMemoryDomain,
+    pub src_domain: DeviceDomain,
     pub src_device_ordinal: u32,
-    pub dst_domain: PieMemoryDomain,
+    pub dst_domain: DeviceDomain,
     pub dst_device_ordinal: u32,
     pub src_page_ids: Vec<u32>,
     pub dst_page_ids: Vec<u32>,
-    pub cells: Vec<PieKvMoveCell>,
+    pub cells: Vec<KvMoveCell>,
 }
 
 impl Default for KvCopyPlan {
@@ -613,9 +688,44 @@ impl Default for KvCopyPlan {
     }
 }
 
+impl KvCopyPlan {
+    /// The two rules `validate_kv_copy_desc` stated that a `Vec` does not:
+    /// both domains name a real one, and the page lists are parallel.
+    ///
+    /// The rest of that validator was `ptr/len mismatch` and an
+    /// `abi_version`/`reserved0` check — a representation this plan does not
+    /// have.
+    ///
+    /// # Errors
+    ///
+    /// [`Malformed`], naming the member and the numbers that disagree.
+    pub fn validate(&self) -> Result<(), Malformed> {
+        if !crate::local::pie_memory_domain_is_valid(self.src_domain) {
+            return Err(Malformed(format!(
+                "src_domain names no memory domain: {}",
+                self.src_domain
+            )));
+        }
+        if !crate::local::pie_memory_domain_is_valid(self.dst_domain) {
+            return Err(Malformed(format!(
+                "dst_domain names no memory domain: {}",
+                self.dst_domain
+            )));
+        }
+        if self.src_page_ids.len() != self.dst_page_ids.len() {
+            return Err(Malformed(format!(
+                "src_page_ids has {} entries and dst_page_ids {}",
+                self.src_page_ids.len(),
+                self.dst_page_ids.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StateCopyPlan {
-    pub slot_ranges: Vec<PieStateCopyRange>,
+    pub slot_ranges: Vec<StateCopyRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -632,12 +742,453 @@ pub struct MediaEncodePlan {
     pub output_row_indptr: Vec<u32>,
 }
 
+impl MediaEncodePlan {
+    /// Every rule `validate_encode_desc` stated about a media payload.
+    ///
+    /// Unlike the transfer verbs, most of this validator was NOT about the C
+    /// shape: it checks that the image and audio planes describe the same
+    /// counts, that each byte payload is `f32`-aligned and exactly
+    /// partitioned by its CSR, and that a plane with no anchors carries no
+    /// payload either. All of it comes across.
+    ///
+    /// The two `output_*` members are the driver's out-params; only their
+    /// SHAPE is checked here, because their contents are what the call
+    /// produces.
+    ///
+    /// # Errors
+    ///
+    /// [`Malformed`], naming the member and the numbers that disagree.
+    pub fn validate(&self) -> Result<(), Malformed> {
+        const F32: usize = std::mem::size_of::<f32>();
+        const U16: usize = std::mem::size_of::<u16>();
+        let bad = |why: String| Err(Malformed(why));
+
+        let images = self.image_anchor_rows.len();
+        let clips = self.audio_anchor_rows.len();
+        if images + clips == 0 {
+            return bad("an encode carries no image and no audio anchor".into());
+        }
+        if self.output_row_indptr.len() != images + clips + 1 {
+            return bad(format!(
+                "output_row_indptr has {} entries for {images} images and {clips} clips",
+                self.output_row_indptr.len()
+            ));
+        }
+        if self.output_rows.is_empty() || !self.output_rows.len().is_multiple_of(U16) {
+            return bad(format!(
+                "output_rows is {} bytes, which is empty or not a whole number of u16",
+                self.output_rows.len()
+            ));
+        }
+
+        if images == 0 {
+            if !self.image_grids.is_empty()
+                || !self.image_pixels.is_empty()
+                || !self.image_pixel_indptr.is_empty()
+                || !self.image_patch_positions.is_empty()
+            {
+                return bad("an image payload arrived with no image anchor to attach it to".into());
+            }
+        } else {
+            if self.image_grids.len() != images.saturating_mul(3) {
+                return bad(format!(
+                    "image_grids has {} entries for {images} images",
+                    self.image_grids.len()
+                ));
+            }
+            if self.image_pixel_indptr.len() != images + 1 {
+                return bad(format!(
+                    "image_pixel_indptr has {} entries for {images} images",
+                    self.image_pixel_indptr.len()
+                ));
+            }
+            if self.image_pixels.is_empty() || !self.image_pixels.len().is_multiple_of(F32) {
+                return bad(format!(
+                    "image_pixels is {} bytes, which is empty or not a whole number of f32",
+                    self.image_pixels.len()
+                ));
+            }
+            if self.image_patch_positions.is_empty()
+                || !self.image_patch_positions.len().is_multiple_of(2)
+            {
+                return bad(format!(
+                    "image_patch_positions has {} entries, which is empty or not a whole number of pairs",
+                    self.image_patch_positions.len()
+                ));
+            }
+            partition(
+                &self.image_pixel_indptr,
+                "image_pixel_indptr",
+                self.image_pixels.len(),
+                F32,
+                false,
+            )?;
+        }
+
+        if clips == 0 {
+            if !self.audio_features.is_empty() || !self.audio_feature_indptr.is_empty() {
+                return bad("an audio payload arrived with no audio anchor to attach it to".into());
+            }
+        } else {
+            if self.audio_feature_indptr.len() != clips + 1 {
+                return bad(format!(
+                    "audio_feature_indptr has {} entries for {clips} clips",
+                    self.audio_feature_indptr.len()
+                ));
+            }
+            if self.audio_features.is_empty() || !self.audio_features.len().is_multiple_of(F32) {
+                return bad(format!(
+                    "audio_features is {} bytes, which is empty or not a whole number of f32",
+                    self.audio_features.len()
+                ));
+            }
+            // STRICT: an empty clip is not a clip, and the encoder would
+            // produce no row for it.
+            partition(
+                &self.audio_feature_indptr,
+                "audio_feature_indptr",
+                self.audio_features.len(),
+                F32,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A CSR that must EXACTLY partition `bytes`, on `align`-byte bounds.
+///
+/// `strict` makes every segment nonempty, which is what the audio plane
+/// requires and the image plane does not.
+fn partition(
+    indptr: &[u32],
+    name: &str,
+    bytes: usize,
+    align: usize,
+    strict: bool,
+) -> Result<(), Malformed> {
+    if indptr.first().copied() != Some(0) {
+        return Err(Malformed(format!(
+            "{name} starts at {:?}, not 0",
+            indptr.first()
+        )));
+    }
+    if indptr.last().copied() != Some(bytes as u32) {
+        return Err(Malformed(format!(
+            "{name} ends at {:?}, not the {bytes} bytes it partitions",
+            indptr.last()
+        )));
+    }
+    for w in indptr.windows(2) {
+        let ordered = if strict { w[0] < w[1] } else { w[0] <= w[1] };
+        if !ordered {
+            return Err(Malformed(format!(
+                "{name} segment {}..{} is empty or inverted",
+                w[0], w[1]
+            )));
+        }
+        if w[0] as usize % align != 0 || w[1] as usize % align != 0 {
+            return Err(Malformed(format!(
+                "{name} segment {}..{} is not {align}-byte aligned",
+                w[0], w[1]
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PoolResizePlan {
     pub pool_id: u64,
     pub target_pages: u64,
-    pub map_ranges: Vec<PiePoolRange>,
-    pub unmap_ranges: Vec<PiePoolRange>,
+    pub map_ranges: Vec<PoolRange>,
+    pub unmap_ranges: Vec<PoolRange>,
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    /// One image, one anchor, one soft token — the shape the rest perturb.
+    /// Ported from `local`'s `encode_layout_and_validation_are_stable`.
+    fn sound() -> MediaEncodePlan {
+        MediaEncodePlan {
+            image_grids: vec![1, 1, 1],
+            image_pixels: vec![0; 4],
+            image_pixel_indptr: vec![0, 4],
+            image_patch_positions: vec![0, 0],
+            image_anchor_rows: vec![0],
+            output_rows: vec![0; 2],
+            output_row_indptr: vec![0; 2],
+            ..MediaEncodePlan::default()
+        }
+    }
+
+    fn why(plan: &MediaEncodePlan) -> String {
+        plan.validate().expect_err("must be refused").to_string()
+    }
+
+    #[test]
+    fn the_sound_plan_is_not_refused() {
+        sound().validate().unwrap();
+    }
+
+    /// The case the original named: a pixel CSR whose last bound is not the
+    /// byte count it claims to partition.
+    #[test]
+    fn a_pixel_csr_that_does_not_reach_its_bytes_is_refused() {
+        let mut p = sound();
+        p.image_pixel_indptr = vec![0, 3];
+        assert!(why(&p).contains("image_pixel_indptr"), "{}", why(&p));
+    }
+
+    #[test]
+    fn an_unaligned_pixel_bound_is_refused() {
+        let mut p = sound();
+        p.image_pixels = vec![0; 8];
+        p.image_pixel_indptr = vec![0, 8];
+        p.image_anchor_rows = vec![0];
+        p.validate().expect("aligned is fine");
+        p.image_anchor_rows = vec![0, 1];
+        p.image_grids = vec![1, 1, 1, 1, 1, 1];
+        p.image_pixel_indptr = vec![0, 2, 8];
+        p.output_row_indptr = vec![0; 3];
+        assert!(why(&p).contains("4-byte aligned"), "{}", why(&p));
+    }
+
+    #[test]
+    fn a_payload_with_no_anchor_is_refused() {
+        let mut p = sound();
+        p.audio_features = vec![0; 4];
+        assert!(why(&p).contains("no audio anchor"), "{}", why(&p));
+    }
+
+    #[test]
+    fn an_encode_with_no_medium_at_all_is_refused() {
+        let p = MediaEncodePlan::default();
+        assert!(
+            why(&p).contains("no image and no audio anchor"),
+            "{}",
+            why(&p)
+        );
+    }
+
+    #[test]
+    fn an_output_csr_that_does_not_cover_the_media_is_refused() {
+        let mut p = sound();
+        p.output_row_indptr = vec![0; 3];
+        assert!(
+            why(&p).contains("output_row_indptr has 3 entries"),
+            "{}",
+            why(&p)
+        );
+    }
+
+    /// The audio plane's partition is STRICT: an empty clip is not a clip.
+    #[test]
+    fn an_empty_audio_segment_is_refused() {
+        let mut p = MediaEncodePlan {
+            audio_anchor_rows: vec![0, 1],
+            audio_features: vec![0; 8],
+            audio_feature_indptr: vec![0, 0, 8],
+            output_rows: vec![0; 2],
+            output_row_indptr: vec![0; 3],
+            ..MediaEncodePlan::default()
+        };
+        assert!(why(&p).contains("empty or inverted"), "{}", why(&p));
+        p.audio_feature_indptr = vec![0, 4, 8];
+        p.validate().expect("two nonempty clips are fine");
+    }
+}
+
+#[cfg(test)]
+mod kv_copy_tests {
+    use super::*;
+
+    /// Ported from `local`'s `kv_copy_validator_rejects_invalid_memory_domain`.
+    #[test]
+    fn a_domain_that_names_nothing_is_refused() {
+        let plan = KvCopyPlan {
+            src_domain: 99,
+            ..KvCopyPlan::default()
+        };
+        let why = plan.validate().expect_err("must be refused").to_string();
+        assert!(why.contains("src_domain"), "{why}");
+    }
+
+    #[test]
+    fn page_lists_that_are_not_parallel_are_refused() {
+        let plan = KvCopyPlan {
+            src_page_ids: vec![0, 1],
+            dst_page_ids: vec![2],
+            ..KvCopyPlan::default()
+        };
+        let why = plan.validate().expect_err("must be refused").to_string();
+        assert!(
+            why.contains("src_page_ids has 2 entries and dst_page_ids 1"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_parallel_device_to_device_move_is_accepted() {
+        KvCopyPlan {
+            src_domain: crate::local::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+            dst_domain: crate::local::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+            src_page_ids: vec![0],
+            dst_page_ids: vec![2],
+            ..KvCopyPlan::default()
+        }
+        .validate()
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    /// The reference expansion: the loop this replaced, in the engine's
+    /// `driver/abi.rs`, written against `grammar::bitmask`.
+    fn reference(plan: &LaunchPlan) -> MaskWords {
+        let requests = plan.qo_indptr.len().saturating_sub(1);
+        let request_indptr = if plan.mask_indptr.is_empty() {
+            vec![0; requests + 1]
+        } else {
+            plan.mask_indptr.clone()
+        };
+        let mut word_indptr = vec![0u32];
+        let mut words: Vec<u32> = Vec::new();
+        for mask in &plan.masks {
+            let word_count = mask.len().div_ceil(32);
+            let start = words.len();
+            words.resize(start + word_count, 0);
+            let mut run_start = 0usize;
+            for (index, &run_len) in mask.runs.iter().enumerate() {
+                let run_end = run_start.saturating_add(run_len as usize);
+                if index % 2 == 1 {
+                    for bit in run_start..run_end.min(mask.len()) {
+                        words[start + bit / 32] |= 1 << (bit % 32);
+                    }
+                }
+                run_start = run_end;
+            }
+            word_indptr.push(words.len() as u32);
+        }
+        MaskWords {
+            request_indptr,
+            word_indptr,
+            words,
+        }
+    }
+
+    fn plan_with(masks: Vec<EncodedMask>, mask_indptr: Vec<u32>, qo: Vec<u32>) -> LaunchPlan {
+        LaunchPlan {
+            qo_indptr: qo,
+            masks,
+            mask_indptr,
+            ..LaunchPlan::default()
+        }
+    }
+
+    #[test]
+    fn expansion_agrees_with_the_loop_it_replaced() {
+        let cases = vec![
+            // Empty: no mask, no row.
+            plan_with(Vec::new(), Vec::new(), vec![0, 2]),
+            // One row that starts false, then true, then false.
+            plan_with(
+                vec![EncodedMask::new(vec![3, 5, 2], 10)],
+                vec![0, 1],
+                vec![0, 1],
+            ),
+            // A row beginning with TRUE — the documented zero-length false run.
+            plan_with(
+                vec![EncodedMask::new(vec![0, 7], 7)],
+                vec![0, 1],
+                vec![0, 1],
+            ),
+            // Crossing a word boundary, and a run that overruns `total_size`.
+            plan_with(
+                vec![EncodedMask::new(vec![30, 40, 100], 64)],
+                vec![0, 1],
+                vec![0, 1],
+            ),
+            // Two masks over two requests, exercising both CSRs.
+            plan_with(
+                vec![
+                    EncodedMask::new(vec![1, 31], 32),
+                    EncodedMask::new(vec![0, 1, 62, 1], 64),
+                ],
+                vec![0, 1, 2],
+                vec![0, 1, 2],
+            ),
+            // Masks present but no `mask_indptr` — the all-zero default.
+            plan_with(
+                vec![EncodedMask::new(vec![2, 2], 4)],
+                Vec::new(),
+                vec![0, 1, 2, 3],
+            ),
+        ];
+        for (n, plan) in cases.iter().enumerate() {
+            assert_eq!(plan.bitmask_words(), reference(plan), "case {n} disagrees");
+        }
+    }
+
+    #[test]
+    fn a_row_that_begins_true_sets_its_first_bit() {
+        let plan = plan_with(
+            vec![EncodedMask::new(vec![0, 3], 3)],
+            vec![0, 1],
+            vec![0, 1],
+        );
+        assert_eq!(plan.bitmask_words().words, vec![0b111]);
+    }
+
+    /// Ported from `engine/src/driver/abi.rs`, which expanded these runs on
+    /// the way into the C descriptor.
+    #[test]
+    fn two_rows_expand_to_the_words_the_c_view_used_to_pack() {
+        let plan = plan_with(
+            vec![
+                EncodedMask::new(vec![0, 3, 1], 4),
+                EncodedMask::new(vec![1, 2, 1], 4),
+            ],
+            vec![0, 1, 2],
+            vec![0, 1, 2],
+        );
+        let got = plan.bitmask_words();
+        assert_eq!(got.request_indptr, vec![0, 1, 2]);
+        assert_eq!(got.word_indptr, vec![0, 1, 2]);
+        assert_eq!(got.words, vec![0b0111, 0b0110]);
+    }
+
+    /// Likewise: an omitted mask table is empty rows, not a refusal.
+    #[test]
+    fn omitted_mask_expands_as_empty_rows() {
+        let plan = plan_with(Vec::new(), Vec::new(), vec![0, 1, 2]);
+        let got = plan.bitmask_words();
+        assert_eq!(got.request_indptr, vec![0, 0, 0]);
+        assert_eq!(got.word_indptr, vec![0]);
+        assert!(got.words.is_empty());
+    }
+
+    #[test]
+    fn a_run_past_the_row_end_writes_no_bit_past_it() {
+        // 40 true elements declared over a 32-element row: the tail is not a
+        // reason to touch the next mask's words.
+        let plan = plan_with(
+            vec![
+                EncodedMask::new(vec![0, 40], 32),
+                EncodedMask::new(vec![32], 32),
+            ],
+            vec![0, 1, 2],
+            vec![0, 1, 2],
+        );
+        let got = plan.bitmask_words();
+        assert_eq!(got.words, vec![u32::MAX, 0]);
+        assert_eq!(got.word_indptr, vec![0, 1, 2]);
+    }
 }
 
 #[cfg(test)]

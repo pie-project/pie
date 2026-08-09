@@ -317,21 +317,31 @@ fn reference_taken_on(snapshot: &Path, model: &str) -> bool {
 ///
 /// It is one step now and it is worth naming what that step IS: the
 /// checkpoint's TENSORS pick a `model::catalog` row, and everything else is a
-/// projection of the row. No document is believed, because none is read for
-/// anything except the quantization — which a row genuinely cannot state,
-/// since `mlx-community` publishes the same weights at 4 bits group 64 and at
-/// 8 bits group 32 and the two pack to shapes no extent distinguishes.
+/// projection of the row. No document is believed at all now, the
+/// quantization included.
+///
+/// It used to be believed for exactly that, on the argument that a row
+/// genuinely cannot state it "since `mlx-community` publishes the same
+/// weights at 4 bits group 64 and at 8 bits group 32 and the two pack to
+/// shapes no extent distinguishes". The row still cannot state it — it is
+/// the checkpoint's and not the model's — but the second half is false, and
+/// twice: `scales` is `[rows, cols / group]`, so those two differ by 2x
+/// there, and the packed `weight` differs by 2x again. `LoadPlan` performs
+/// both divisions per tensor and `Loaded::affine_point` reads the answer,
+/// which is why the load moved ABOVE the projection here. `gpt-oss-20b`
+/// declares `g32/b4` and holds not one tensor at it.
 ///
 /// A refusal here PANICS rather than skipping. These are the A/B tests: they
 /// are the only place a real Metal device's numbers are compared against
 /// anything, and a skip that prints to stderr is how that comparison quietly
 /// stops happening.
 fn served(
+    context: &Context,
     snapshot: &Path,
 ) -> (
     &'static dyn model::catalog::Variant,
-    model::encoding::Encoding,
     driver_metal::batch::DecodeGeometry,
+    driver_metal::weights::load::Loaded,
 ) {
     let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(snapshot)
         .unwrap_or_else(|e| panic!("{} did not read as a checkpoint: {e:?}", snapshot.display()));
@@ -378,16 +388,25 @@ fn served(
     let deployment = row
         .deployment(model::catalog::Deployed::single())
         .unwrap_or_else(|e| panic!("`{}` does not deploy: {e}", row.id()));
-    let dg = driver_metal::batch::geometry_from_deployment(
-        &deployment,
-        row.load_shape(),
-        driver_metal::batch::AffineFormat {
-            bits: encoding.bits,
-            group: encoding.group_size,
-        },
-    )
-    .unwrap_or_else(|e| panic!("`{}` projects no decodable geometry: {}", row.id(), e.0));
-    (row, encoding, dg)
+    let loaded = load(context, snapshot, row, &encoding).expect("the checkpoint loads");
+    // THE SECOND PRE-STAGING GATE, and a panic for the reason the first one
+    // is: `load_model` refuses this snapshot at this exact question, so
+    // there is no version of this suite that checks anything on it.
+    //
+    // It is asked AFTER staging rather than before, because it is the only
+    // one of the two that the bytes answer and the documents cannot.
+    let quant = loaded.affine_point(row.id()).unwrap_or_else(|e| {
+        panic!(
+            "`{}` is `{}`: {e}. `load_model` refuses this snapshot at the same \
+             question, so nothing below could run against it — point \
+             PIE_METAL_SMOKE_CHECKPOINT at a checkpoint this build serves.",
+            snapshot.display(),
+            row.id()
+        )
+    });
+    let dg = driver_metal::batch::geometry_from_deployment(&deployment, row.load_shape(), quant)
+        .unwrap_or_else(|e| panic!("`{}` projects no decodable geometry: {}", row.id(), e.0));
+    (row, dg, loaded)
 }
 
 /// Every arena region the lowering states, each byte in exactly one of them.
@@ -741,8 +760,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     // Four lanes, one token each: the decode a scheduler posts.
@@ -768,16 +786,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         })
     };
 
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     let staged = stage_tables(&context, &step, shape.page_size, &freqs);
 
     let named = HashMap::new();
@@ -1300,8 +1309,7 @@ fn bisect(class: FireClass) {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     // The CHECKPOINT'S OWN token, when a reference names one. Posting
@@ -1347,16 +1355,7 @@ fn bisect(class: FireClass) {
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     let staged = if decode {
         stage_tables(&context, &step, shape.page_size, &freqs)
     } else {
@@ -1642,8 +1641,7 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     let step = Step {
@@ -1658,16 +1656,7 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
 
     let shape = pool_shape(&dg, 64);
     let pool = Pool::allocate(&context, shape).expect("a pool");
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     let staged = stage_tables(&context, &step, shape.page_size, &freqs);
     let named = HashMap::new();
 
@@ -2130,8 +2119,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     // ONE request, ONE token, position zero.
@@ -2156,16 +2144,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     let staged = stage_tables(&context, &step, shape.page_size, &freqs);
 
     let named = HashMap::new();
@@ -2401,8 +2380,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     // ONE request, TWO tokens: a prefill.
@@ -2433,16 +2411,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     // Both tokens are ONE request's, so `req_of_token` is all zeros and both
     // land in that request's first page at their own offsets. `stage_tables`
     // states one request per token, which is a decode's shape — so the tables
@@ -2568,8 +2537,7 @@ fn a_prefill_rotates_its_second_row() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     // The SAME token twice. Same embedding, same projection, so the two K rows
@@ -2595,16 +2563,7 @@ fn a_prefill_rotates_its_second_row() {
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     // This is the FREQS lane's fire; the base lane's twin below is the other.
     // A checkpoint whose ladder is not rescaled never reaches this kernel, so
     // running it would prove nothing about the shader under test.
@@ -2620,7 +2579,7 @@ fn a_prefill_rotates_its_second_row() {
     // from the tensors; it is read off the DEPLOYMENT's ladder now, which is
     // the same number one seam earlier and no longer a second opinion about
     // the checkpoint that could disagree with the text's.
-    if dg.rope_freq_factor <= 0.0 {
+    if dg.rope_rescale.is_none() {
         eprintln!(
             "SKIP: this checkpoint does not rescale its ladder, so the BASE \
              lane is the one it takes -- see the twin below."
@@ -2723,8 +2682,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     // The SAME token twice. Same embedding, same projection, so the two K rows
@@ -2738,7 +2696,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
     // This is the BASE lane's fire; the twin above is the FREQS one. See this
     // gate's doc for why the lane is the snapshot's to choose and not this
     // test's to force.
-    if dg.rope_freq_factor > 0.0 {
+    if dg.rope_rescale.is_some() {
         eprintln!(
             "SKIP: this checkpoint rescales its ladder, so the FREQS \
              lane is the one it takes -- see the twin above."
@@ -2760,16 +2718,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     let staged = stage_prefill(&context, &step, shape.page_size, &freqs);
 
     let named = HashMap::new();
@@ -2927,8 +2876,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     // ONE pool for the whole generation. That is the point: every fire after
@@ -2945,16 +2893,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
 
     const MLX: [u32; 4] = [0, 358, 2846, 12304];
@@ -3102,8 +3041,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     let step = Step {
@@ -3127,16 +3065,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     let staged = stage_tables(&context, &step, shape.page_size, &freqs);
     let geometry = dispatch_geometry(&dg);
     let (at, vocab, element) = {
@@ -3461,16 +3390,7 @@ fn prefill_logits_on(
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::frequencies(
-        dg.head_dim,
-        dg.rope_theta,
-        (dg.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
-            factor: dg.rope_freq_factor,
-            low: dg.rope_low_freq_factor,
-            high: dg.rope_high_freq_factor,
-            original_max: dg.rope_original_max_position as f32,
-        }),
-    );
+    let freqs = driver_metal::model::rope::table(&dg);
     let staged = stage_prefill_fleet(context, step, shape.page_size, &freqs);
 
     let named = HashMap::new();
@@ -3534,8 +3454,7 @@ fn a_request_prefills_the_same_way_beside_another_one() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     let rig = Rig {
@@ -3652,8 +3571,7 @@ fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, encoding, dg) = served(&snapshot);
-    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
+    let (row, dg, loaded) = served(&context, &snapshot);
     let binding = observed(&dg, &loaded);
 
     let rig = Rig {

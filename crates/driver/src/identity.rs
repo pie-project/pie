@@ -79,6 +79,22 @@ pub enum Backend {
     Vulkan = 2,
 }
 
+// THERE IS NO `Wgpu = 3`, AND THAT IS A DECISION.
+//
+// `driver-wgpu` was wired into the engine (`DriverBackend::Wgpu`) without one.
+// It compiles every pipeline through `naga` at open and keeps them in a
+// process-local `device::Pipelines`; it writes nothing to `$PIE_HOME/cache`,
+// reads nothing from it, and never calls into this module. A discriminant it
+// does not use would be a byte no key contains -- the opposite of the argument
+// above, which is about a shell that WOULD write and needs to be told apart.
+//
+// It becomes needed the moment that shell persists anything, and it is needed
+// BEFORE the first archive is written rather than after: a cache keyed under
+// somebody else's number is not fixed by adding the number later. `wgpu`
+// exposes `PipelineCache` on the native backends only, which is what such a
+// change would be built on, and it would need `BackendKind` to grow a `Wgpu`
+// arm too -- these discriminants are that enum's.
+
 /// The row bucket this shell compiles for.
 ///
 /// The C++ wrote a literal zero with the comment "generic row bucket". It is

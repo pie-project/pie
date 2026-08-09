@@ -282,6 +282,16 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
         // shared memory sized on a head width, and `Dims` here has no field
         // this side reads for it; `setThreadgroupMemoryLength` is the Metal
         // spelling and no rule in this file calls it.
+        // `Single`, `SingleWarp` and `PerRequest` are the newest three, and
+        // the first two are the only rules in the vocabulary whose grid is a
+        // LITERAL rather than a function of `Dims`. Metal could spell both —
+        // one threadgroup of 256, one of 32 — and neither is ported here for
+        // the reason `RouterSort` IS: a rule lands on this side when a Metal
+        // kernel exists to check it against, and the three kernels these
+        // reproduce (`layout::copy_if_valid_slot`, `attn`'s two paged-view
+        // builders, `attn::mtp_update_pending_hidden`) have no Metal twin.
+        // `PerRequest` also reads `Dims::requests`, which this side fills
+        // from nothing.
         rule @ (Rule::RecurrentScan
         | Rule::PerRow
         | Rule::PerChannel
@@ -302,14 +312,10 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
         | Rule::WarpPackedHeads
         | Rule::RoutedQmvTransposed
         | Rule::RoutedQmvQuad
-        | Rule::AltUpStreams
-        // The three CUDA launcher shapes: a grid over the request count, and
-        // the two literal one-block launches whose widths are a fact about a
-        // CUDA warp. Nothing in this file is a serial walk, and `Dims` has no
-        // request count.
-        | Rule::PerRequest
         | Rule::Single
-        | Rule::SingleWarp) => return Err(Ungeometric::Unported(rule)),
+        | Rule::SingleWarp
+        | Rule::PerRequest
+        | Rule::AltUpStreams) => return Err(Ungeometric::Unported(rule)),
     })
 }
 

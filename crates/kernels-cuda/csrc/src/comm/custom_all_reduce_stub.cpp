@@ -94,17 +94,4 @@ void CustomAllReduce::all_reduce_residual_rmsnorm_bf16(
         "custom_all_reduce: fused residual RMSNorm is unavailable");
 }
 
-void CustomAllReduce::all_reduce_residual_rmsnorm_bf16_exact(
-    const void*,
-    void*,
-    const void*,
-    void*,
-    int,
-    int,
-    float,
-    cudaStream_t) {
-    throw std::runtime_error(
-        "custom_all_reduce: exact fused residual RMSNorm is unavailable");
-}
-
 }  // namespace pie_cuda_driver::kernels::comm

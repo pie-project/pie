@@ -63,18 +63,88 @@ pub struct Loaded {
     /// the other side: `mxfp4` says which tensors are NOT affine, and this
     /// says how many affine points the ones that are arrived at.
     ///
-    /// `binding::observed` builds ONE kernel set, from the point the
-    /// checkpoint's `config.json` states. A checkpoint carrying two — an
-    /// `mlx_lm` routed stack at 4 bits whose ROUTER GATE is 8 — has a
-    /// tensor that will be dequantised at the other one's width, which is
-    /// not a fault but a fluent model routing to almost the right experts.
-    /// `DecodeGeometry::alt_quant` is the field a second point would ride
-    /// if this driver could run two kernel sets. It cannot, so what this
-    /// buys is the REFUSAL: `serve/load.rs` compares this against the
-    /// stated point and says so by name.
+    /// `binding::observed` builds ONE kernel set, and [`Self::affine_point`]
+    /// is where this is read to decide WHICH — the point the bytes actually
+    /// arrived at, rather than the one the config's top-level block
+    /// declares, which for an `mlx_lm` checkpoint is a default its per-tensor
+    /// overrides may supersede for every tensor in the file. That method
+    /// also owns the refusal when there is more than one.
     ///
     /// [`LoadPlan::affine_points`]: model_loader::plan::LoadPlan::affine_points
     pub affine_points: Vec<(u32, u32)>,
+}
+
+impl Loaded {
+    /// THE AFFINE POINT THE BYTES ARRIVED IN — measured, not declared.
+    ///
+    /// # Why this is not `Encoding::from_config_json`
+    ///
+    /// Three lanes built this value and all three built it the same wrong
+    /// way: off the `bits`/`group_size` at the TOP of `config.json`'s
+    /// quantization block. That block is a DEFAULT, and a checkpoint may
+    /// name any tensor and override it. `gpt-oss-20b-MXFP4-Q4` states
+    /// `g32/b4 mxfp4` at the top — which describes its EXPERT BANKS, the
+    /// only tensors that are not affine at all — and then overrides every
+    /// projection, the embedding and the head to `g64/b4 affine`, and every
+    /// `mlp.router` to `g64/b8`. The declared point matched not one tensor
+    /// in the file.
+    ///
+    /// Read at g32, a 64-wide group is walked as two 32-wide ones, so every
+    /// scale after the first comes off the wrong offset: 164,387 NaNs in the
+    /// first fire, which is what sent anyone looking.
+    ///
+    /// `Encoding`'s own doc argues the tensors cannot answer this, because
+    /// "a group size is not an extent of anything". They can, and this is
+    /// the counter-example: `scales` has shape `[rows, cols / group]`, so
+    /// the group is `cols / scales_cols` exactly, with nothing to guess.
+    /// That division is what [`LoadPlan::affine_points`] already performs,
+    /// per tensor, and what nothing was reading. Declared stays the
+    /// authority on METHOD — mxfp4 or affine is not an extent and the
+    /// tensors really cannot say — and that question is `Self::mxfp4`.
+    ///
+    /// # Errors
+    ///
+    /// More than one point. `binding::observed` instantiates ONE kernel
+    /// set, so the second point's tensors would be dequantised at the
+    /// first's width; for a router gate that is not a fault but a fluent
+    /// model routing to almost the right experts. [`DecodeGeometry`] has an
+    /// `alt_quant` field a second point would ride if this driver could run
+    /// two kernel sets. It cannot, so the honest answer is the refusal.
+    ///
+    /// A checkpoint with no affine tensors is not an error: it is a dense
+    /// one, and `{bits: 0, group: 0}` is how this driver spells that.
+    ///
+    /// [`LoadPlan::affine_points`]: model_loader::plan::LoadPlan::affine_points
+    /// [`DecodeGeometry`]: crate::batch::DecodeGeometry
+    pub fn affine_point(&self, row: &str) -> Result<crate::batch::AffineFormat> {
+        match self.affine_points.as_slice() {
+            [] => Ok(crate::batch::AffineFormat { bits: 0, group: 0 }),
+            [(group, bits)] => Ok(crate::batch::AffineFormat {
+                bits: *bits,
+                group: *group,
+            }),
+            many => {
+                let points = many
+                    .iter()
+                    .map(|(g, b)| format!("g{g}/b{b}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(crate::Error::Create {
+                    what: "checkpoint",
+                    message: format!(
+                        "`{row}` arrives at {} affine points ({points}) and this \
+                         driver instantiates ONE kernel set. Every tensor at the \
+                         other point would be dequantised at the first one's \
+                         width — scales read from the wrong offset, and for a \
+                         router gate that is not a fault but a mixture routing to \
+                         almost the right experts. Refused rather than served \
+                         wrongly",
+                        many.len()
+                    ),
+                })
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Loaded {

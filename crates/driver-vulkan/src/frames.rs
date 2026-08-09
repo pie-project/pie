@@ -130,7 +130,7 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
     if !plan.rs_slot_ids.is_empty() || !plan.rs_buffer_slot_ids.is_empty() {
         return Some("recurrent state: no model this driver serves holds any");
     }
-    if plan.has_user_mask || !plan.masks.is_empty() {
+    if plan.has_user_mask || !causal_only(plan) {
         return Some(
             "a user mask: attention here is causal, and a plan's mask \
                      would be dropped rather than applied",
@@ -154,16 +154,122 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
                      channel, which this driver does not resolve",
         );
     }
-    if !plan.image_pixels.is_empty() || !plan.image_indptr.is_empty() {
+    // The CONTENT, and the indptr's last boundary -- not whether the indptr
+    // exists. These are CSRs with one boundary per request, so a batch of two
+    // text-only requests carries `image_indptr = [0, 0, 0]`: present, and
+    // naming nothing. Reading the vector's emptiness refused every multi-
+    // request frame this driver was ever handed, with a message about images
+    // that a chat completion had none of. A single request never showed it,
+    // because the single-request path leaves the side-channels empty.
+    if !plan.image_pixels.is_empty() || carries(&plan.image_indptr) {
         return Some("images: this driver serves text-only models");
     }
-    if !plan.audio_features.is_empty() || !plan.audio_indptr.is_empty() {
+    if !plan.audio_features.is_empty() || carries(&plan.audio_indptr) {
         return Some("audio: this driver serves text-only models");
     }
-    if !plan.embed_rows.is_empty() || !plan.embed_indptr.is_empty() {
+    if !plan.embed_rows.is_empty() || carries(&plan.embed_indptr) {
         return Some("pre-embedded rows: this driver embeds from token ids");
     }
     None
+}
+
+/// Is every mask this plan carries the causal one this driver already
+/// applies?
+///
+/// # Why a plan carries a mask it did not ask for
+///
+/// A batch of one states no masks at all. A batch that MIXES a prefill with a
+/// device-resolved decode cannot, because the bridge's mask view is one
+/// flattened row per query row, so the engine SYNTHESISES a row for every
+/// request that had none: `RunMask::all_true(pos + 1)` -- attend everything up
+/// to and including yourself, which is the definition of causal and exactly
+/// what `turns.rs` does.
+///
+/// Refusing them because they were present refused every batch above two
+/// conversations, in the words of a feature nobody had asked for. Serving them
+/// because they were present would be worse: a real restriction would be
+/// dropped silently. So the runs are READ, and a mask is served when it says
+/// what this driver would have done anyway.
+///
+/// # Per request, not per row
+///
+/// `masks` is NOT one row per query row of the batch. The decode members are
+/// elided -- a device-resolved step states its own geometry -- so a frame that
+/// mixes one prefill with seven decodes carries the prefill's rows and nothing
+/// else, and `mask_indptr` is what says whose they are. Comparing the two
+/// lengths refused exactly the mixed frames and nothing else, which is why it
+/// looked like a flake: the same eight conversations pass or fail on whether
+/// the scheduler happened to put a prefill beside a decode.
+///
+/// # What is checked
+///
+/// A request states either NO mask rows, or one per query row. Each row it
+/// states must be causal in both halves, because either alone is satisfied by
+/// a mask that is not:
+///
+/// * no false run inside the row -- BRLE alternates starting FALSE, so the
+///   even-indexed runs must be empty;
+/// * the row's length is its own position plus one -- an all-true mask over a
+///   SHORTER span is a sliding window, which is a restriction this driver
+///   would silently ignore.
+fn causal_only(plan: &LaunchPlan) -> bool {
+    if plan.masks.is_empty() {
+        return true;
+    }
+    let requests = plan.qo_indptr.len().saturating_sub(1);
+    // The documented default: an absent table names no masks for anybody, and
+    // then the rows above belong to nobody, which is a shape this cannot speak
+    // for.
+    if plan.mask_indptr.len() != requests + 1 {
+        return false;
+    }
+    for request in 0..requests {
+        let rows = usize::try_from(plan.mask_indptr[request]).unwrap_or(usize::MAX)
+            ..usize::try_from(plan.mask_indptr[request + 1]).unwrap_or(usize::MAX);
+        if rows.is_empty() {
+            continue;
+        }
+        let queries = usize::try_from(plan.qo_indptr[request]).unwrap_or(usize::MAX)
+            ..usize::try_from(plan.qo_indptr[request + 1]).unwrap_or(usize::MAX);
+        if rows.len() != queries.len() || rows.end > plan.masks.len() {
+            return false;
+        }
+        for (row, query) in rows.zip(queries) {
+            let Some(&position) = plan.position_ids.get(query) else {
+                return false;
+            };
+            if !causal_row(&plan.masks[row], position) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// One mask row, against the position of the query it belongs to.
+fn causal_row(mask: &driver_api::plan::EncodedMask, position: u32) -> bool {
+    if mask.total_size != u64::from(position) + 1 {
+        return false;
+    }
+    let mut at = 0u64;
+    for (index, &run) in mask.runs.iter().enumerate() {
+        if at >= mask.total_size {
+            break;
+        }
+        if index % 2 == 0 && run > 0 {
+            return false;
+        }
+        at = at.saturating_add(u64::from(run));
+    }
+    at >= mask.total_size
+}
+
+/// Does this CSR name any rows at all?
+///
+/// Its LAST boundary is the total, so a table of any length whose total is
+/// zero holds nothing. An empty table holds nothing either.
+fn carries(indptr: &[u32]) -> bool {
+    indptr.last().is_some_and(|&total| total > 0)
 }
 
 /// A program pass that faulted: the instance, and what it said.
@@ -222,8 +328,9 @@ pub fn run_programs(
     sub: &driver_api::StepSubmission,
     step: &Step,
     faults: &mut Vec<Fault>,
-) -> Result<(), Unlaunched> {
+) -> Result<Vec<Ran>, Unlaunched> {
     let vocab = step.logits.vocab;
+    let mut ran = Vec::with_capacity(sub.roster_rows.len());
     for (member, &row) in sub.roster_rows.iter().enumerate() {
         let id = *instance_ids.get(row as usize).ok_or_else(|| {
             Unlaunched::Malformed(format!(
@@ -243,13 +350,17 @@ pub fn run_programs(
             // Early, and not wrong. The producer has not run, the consumer has
             // not drained, or another fire moved the ring: the member is
             // skipped, nothing about it changes, and the scheduler re-posts.
-            driver::Readiness::Retry { .. } => continue,
+            driver::Readiness::Retry { .. } => {
+                ran.push(Ran::Early);
+                continue;
+            }
             // Never runnable: a poisoned or closed ring. One instance's
             // problem, so it is a fault beside the others rather than the
             // whole frame's failure -- and a fault a waiter can see, since
             // the ring already carries the word the pipeline reads.
             driver::Readiness::Failed { channel, reason } => {
                 faults.push((id, format!("channel {channel:?}: {reason:?}")));
+                ran.push(Ran::Faulted);
                 continue;
             }
             // The frame's tables do not describe the instance they name.
@@ -286,12 +397,41 @@ pub fn run_programs(
             }
         };
         match programs.fire(id, &inputs) {
-            Ok(driver::StepOutcome::Committed | driver::StepOutcome::Blocked(_)) => {}
-            Ok(driver::StepOutcome::Faulted(why)) => faults.push((id, why)),
+            Ok(driver::StepOutcome::Committed | driver::StepOutcome::Blocked(_)) => {
+                ran.push(Ran::Fired);
+            }
+            Ok(driver::StepOutcome::Faulted(why)) => {
+                faults.push((id, why));
+                ran.push(Ran::Faulted);
+            }
             Err(e) => return Err(Unlaunched::Malformed(format!("{e}"))),
         }
     }
-    Ok(())
+    Ok(ran)
+}
+
+/// What one member of a step did, in roster order.
+///
+/// # Why the caller is told, rather than only the faults
+///
+/// Every member of a launched frame owns a TERMINAL CELL, and the engine
+/// resolves the request's work item by reading it: `Pending` is not "nothing
+/// happened", it is a failure -- `work item completion terminal outcome is
+/// still Pending` -- and a member that was skipped for being early has to say
+/// `Retry` or the scheduler turns a re-postable frame into a dead request.
+///
+/// So a fault list is not enough. It names the members that failed and cannot
+/// distinguish the two REMAINING outcomes from each other, and those two are
+/// the ones whose cells differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ran {
+    /// The member's program fired, committed or blocked on its own await.
+    Fired,
+    /// The member was not ready: its producer has not run or its ring has
+    /// moved. Nothing about it changed and the frame may be re-posted.
+    Early,
+    /// The member's program or one of its channels failed.
+    Faulted,
 }
 
 /// The head and tail this member's composer pinned, or `None` for a member it
@@ -677,5 +817,72 @@ mod tests {
                  leaves the caller to guess which field it was"
             );
         }
+
+        // Every side-channel names ONE boundary PER REQUEST, so a batch of two
+        // text-only requests carries three zeros in each of them. That is the
+        // shape of a table with nothing in it, and it was refused as images
+        // for as long as this driver only ever saw one request at a time --
+        // the first real two-conversation turn came back as `this driver does
+        // not serve images`, about a prompt that was entirely words.
+        let two = LaunchPlan {
+            image_indptr: vec![0, 0, 0],
+            audio_indptr: vec![0, 0, 0],
+            embed_indptr: vec![0, 0, 0],
+            ..base.clone()
+        };
+        assert!(
+            unserved_in(&two).is_none(),
+            "a text-only batch of two is refused for a side-channel that holds nothing"
+        );
+        // The frame the engine writes when a prefill and a decode land
+        // together: three mask rows for the prefill, NONE for the decode --
+        // which states its own geometry -- and a `mask_indptr` that says so.
+        let all_true = |n: u32| driver_api::plan::EncodedMask::new(vec![0, n], u64::from(n));
+        let mixed = LaunchPlan {
+            masks: vec![all_true(1), all_true(2), all_true(3)],
+            mask_indptr: vec![0, 3, 3],
+            qo_indptr: vec![0, 3, 4],
+            position_ids: vec![0, 1, 2, 9],
+            ..base.clone()
+        };
+        assert!(
+            unserved_in(&mixed).is_none(),
+            "the causal mask this driver already applies is refused as a user mask, \
+             which is what refused a frame that mixed a prefill with a decode"
+        );
+
+        // Each half of "causal" is load-bearing, and so is the CSR. A mask
+        // that is all-true over a SHORTER span is a sliding window; one with a
+        // hole hides a token; a request whose rows do not cover its queries is
+        // a shape this cannot speak for.
+        let mut window = mixed.clone();
+        window.masks[2] = all_true(2);
+        assert!(
+            unserved_in(&window).is_some(),
+            "a sliding window is served as though it were causal"
+        );
+        let mut holed = mixed.clone();
+        holed.masks[2] = driver_api::plan::EncodedMask::new(vec![1, 2], 3);
+        assert!(
+            unserved_in(&holed).is_some(),
+            "a mask that hides a token is served as though it were causal"
+        );
+        let mut short = mixed.clone();
+        short.mask_indptr = vec![0, 2, 3];
+        assert!(
+            unserved_in(&short).is_some(),
+            "a request whose mask rows do not cover its query rows is read anyway"
+        );
+
+        // And the boundary is still read: a table whose total is non-zero
+        // names rows, whatever its length.
+        assert_eq!(
+            unserved_in(&LaunchPlan {
+                image_indptr: vec![0, 1],
+                ..base.clone()
+            }),
+            Some("images: this driver serves text-only models"),
+            "an image the plan names only in its CSR is served silently"
+        );
     }
 }

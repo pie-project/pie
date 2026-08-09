@@ -18,9 +18,10 @@ crate-type = ["rlib"]
 # Binary half — the `pie` CLI. Parses argv via clap and dispatches into
 # the lib.
 [features]
-# Default = no embedded backend feature. Enable `driver-cuda`
-# (Linux/NVIDIA) or `driver-metal` (macOS) to reach a device; with neither,
-# this crate builds and serves nothing locally.
+# Default = no embedded backend feature. Enable `driver-cuda` (Linux/NVIDIA),
+# `driver-metal` (macOS), `driver-vulkan` (anywhere with a loader and an ICD)
+# or `driver-wgpu` (anywhere with an adapter) to reach a device; with none of
+# them, this crate builds and serves nothing locally.
 #
 # There used to be a third: an always-linked `driver-dummy` selected at
 # runtime, plus a `driver-dummy = []` no-op kept for older build commands.
@@ -31,6 +32,18 @@ default = []
 # that they be in the graph.
 driver-cuda = ["engine/driver-cuda"]
 driver-metal = ["engine/driver-metal"]
+# The pure-Rust Vulkan driver. Portable rather than vendor-specific, so it is
+# a flavor a machine can have alongside either of the two above -- and without
+# this line the `pie` binary could not reach it at all, however complete the
+# driver was.
+driver-vulkan = ["engine/driver-vulkan"]
+# The WebGPU shell, portable one step further than that. `driver-vulkan`
+# builds anywhere and needs a loader and an ICD to RUN; this one needs neither,
+# because its whole closure is pure Rust and `kernels-wgpu` ships the shaders
+# inside the rlib -- so turning it on cannot fail to build for want of a
+# toolchain on any host cargo runs on. It still wants an adapter to serve,
+# which is why it is opt-in like the other three.
+driver-wgpu = ["engine/driver-wgpu"]
 nixl = ["dep:transport", "transport/nixl"]
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's

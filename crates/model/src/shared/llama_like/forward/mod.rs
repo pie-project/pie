@@ -462,13 +462,18 @@ fn llama_like_metal_text(
             // gather writes this many and the matmuls read them, so the number
             // is stated once and threaded rather than recomputed.
             let padded = (f.n_experts * k).max(1);
-            let (ids, weights) = dsl::metal::router_topk(
-                &gemm(x, &w.router),
-                f.n_experts,
-                k,
-                false,
-                metal.norm_topk_prob,
-            );
+            // The router's logits, biased if the checkpoint publishes one.
+            // BEFORE the top-k, which is the whole point: this bias moves a
+            // ranking rather than an activation, so applying it afterwards
+            // -- or not at all -- picks different experts.
+            let logits = gemm(x, &w.router);
+            let logits = if f.router_bias && metal.add_bias {
+                dsl::metal::add_bias(&logits, &w.router_bias)
+            } else {
+                logits
+            };
+            let (ids, weights) =
+                dsl::metal::router_topk(&logits, f.n_experts, k, false, metal.norm_topk_prob);
             let (perm, _row_expert, _tile_expert, inv) =
                 dsl::metal::route_sort(&ids, f.n_experts, k, metal.qmm_tile.0, padded, f.hidden);
             let rows = dsl::metal::route_gather(
@@ -670,9 +675,29 @@ fn llama_like_metal_text(
                 at_w(&w.k_proj, kv_w),
                 at_w(&w.v_proj, kv_w),
             );
-            let (q, k, v) = if metal.qkv_fused {
-                dsl::metal::split_qkv(&gemm(&x, &at_w(&w.qkv, q_w + 2 * kv_w)), q_w, kv_w)
-            } else if shares_kv {
+            // THREE projections, never one packed bank, and not as a
+            // choice: `compile_load_plan` authors every Metal load with
+            // `Projections::InPlace`, so the MLX path publishes
+            // `self_attn.{q,k,v}_proj` separately and no Metal deployment
+            // has a `qkv` handle at all -- `lowering::resolve` says so in
+            // those words.
+            //
+            // This used to be a branch on a `qkv_fused` fact, and the
+            // fact cost a whole checkpoint. `driver-metal/src/model/text.rs`
+            // built `LlamaLikeFacts` itself and answered it from the staged
+            // tensors; deleting that in favour of the catalog left the
+            // ROW's answer reaching this text, and the row's answer is
+            // CUDA's -- `LlamaLikeFacts::fused_qkv` says `true` on all
+            // eight llama-3 rows and its own doc calls it "a *binding*
+            // fact, not an architecture fact". The text asked for
+            // `layer.0.qkv` and got `Unbound { symbol:
+            // "affine_qmv_fast_bfloat16_gs_64_b_4", why:
+            // UnknownWeight("layer.0.qkv") }` on llama-3.2-1B.
+            //
+            // The repair at the time was a second field that every
+            // projection stated `false`; a field only ever written one way
+            // is the same fact with a way to get it wrong still attached.
+            let (q, k, v) = if shares_kv {
                 // Q only. `k` and `v` stand for the source layer's pages,
                 // which the attention reads through the pool rather than as
                 // operands, so the values here are never consumed.
@@ -784,13 +809,19 @@ fn llama_like_metal_text(
             )
             .expect("a plain attention statement produces its value");
 
+            // The attention landing, and the bias the checkpoint may publish
+            // on it. Stated once and used by all three norm arms, because
+            // the arms differ in what they NORM and not in what they land.
+            //
+            // No bias here, and that is checked rather than assumed:
+            // only the FUSED arm below adds one, and a row that both
+            // publishes `o_bias` and reaches this closure is refused by
+            // `NO_METAL_NORMED_LANDING_BIAS` before any of this is
+            // traced. A branch used to stand here that no row in the
+            // catalog could take.
+            let land = |a: &Val| gemm(a, &w.o_proj);
             if post_norm {
-                let o = dsl::metal::rms_norm(
-                    &gemm(&a, &w.o_proj),
-                    &w.attn_norm,
-                    f.hidden,
-                    metal.rms_eps,
-                );
+                let o = dsl::metal::rms_norm(&land(&a), &w.attn_norm, f.hidden, metal.rms_eps);
                 y = dsl::metal::residual_add(&o, &y);
                 let h = gated(&y, &w);
                 let ffn = if owes_down { gemm(&h, &w.down) } else { h };
@@ -812,12 +843,7 @@ fn llama_like_metal_text(
                 // Nothing here can fuse the residual into the projection
                 // (`gemm_add`): a norm sits between them. That is arithmetic,
                 // not a missed optimisation.
-                let o = dsl::metal::rms_norm(
-                    &gemm(&a, &w.o_proj),
-                    &w.post_attn_norm,
-                    f.hidden,
-                    metal.rms_eps,
-                );
+                let o = dsl::metal::rms_norm(&land(&a), &w.post_attn_norm, f.hidden, metal.rms_eps);
                 y = dsl::metal::residual_add(&o, &y);
                 let x = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
                 let h = gated(&x, &w);
@@ -825,7 +851,15 @@ fn llama_like_metal_text(
                 let d = dsl::metal::rms_norm(&ffn, &w.post_mlp_norm, f.hidden, metal.rms_eps);
                 y = dsl::metal::residual_add(&d, &y);
             } else {
+                // The one arm that FUSES the residual into the landing, so
+                // the bias cannot ride the same gemm. Added afterwards, which
+                // is what the CUDA text does too (`y += matmul(...)` and then
+                // `add_bias`) -- three addends into one accumulator, and the
+                // two backends agree on the order.
                 y = gemm_add(&a, &w.o_proj, &y);
+                if f.o_bias && metal.add_bias {
+                    y = dsl::metal::add_bias(&y, &w.o_bias);
+                }
                 let x = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
                 let h = gated(&x, &w);
                 // Dense FUSES the down projection into the residual add, which
@@ -1644,6 +1678,376 @@ fn llama_like_cuda_text(
 mod tests {
     use super::*;
     use model_compiler::trace::{Dim, OpKind};
+
+    /// Every kernel symbol a Metal plan states, in order.
+    ///
+    /// A Metal text is a sequence of STATED launches -- `OpKind::Launch`
+    /// carries the driver's launcher symbol -- so "which kernel does this
+    /// deployment run" is a question the plan answers directly, and it is
+    /// the only question these facts exist to settle.
+    fn metal_kernels_at(plan: &ForwardPlan, layer: u32) -> Vec<String> {
+        plan.layer_ops(layer)
+            .filter_map(|op| match &op.kind {
+                OpKind::Launch { kernel, .. } => Some(kernel.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn metal_kernels(plan: &ForwardPlan) -> Vec<String> {
+        metal_kernels_at(plan, 0)
+    }
+
+    fn runs(plan: &ForwardPlan, kernel: &str) -> usize {
+        metal_kernels(plan).iter().filter(|k| *k == kernel).count()
+    }
+
+    /// The three activations are three different kernels, and the fact is
+    /// the only thing that picks between them.
+    ///
+    /// A wrong answer here is silent in the worst way: all three take a
+    /// gate and an up bank of the same extents and write a tensor of the
+    /// same shape, so nothing downstream can tell that the wrong curve was
+    /// applied. The model generates, fluently, through the wrong
+    /// non-linearity.
+    #[test]
+    fn each_metal_activation_names_its_own_kernel() {
+        let f = LlamaLikeFacts::qwen3_0_6b();
+        for (activation, kernel) in [
+            (Activation::SiluMul, "silu_mul_bfloat16"),
+            (
+                Activation::SwiGlu {
+                    limit: 7.0,
+                    alpha: 1.702,
+                },
+                "gptoss_swiglu_bfloat16",
+            ),
+            (Activation::Geglu, "geglu_tanh_bfloat16"),
+        ] {
+            let metal = LlamaLikeMetalFacts {
+                activation,
+                ..LlamaLikeMetalFacts::synthetic()
+            };
+            let plan = llama_like_metal(&f, &metal, FireClass::Decode);
+            let kernels = metal_kernels(&plan);
+            assert!(
+                kernels.iter().any(|k| k == kernel),
+                "{activation:?} did not state `{kernel}`; it stated {kernels:?}"
+            );
+            // And states no OTHER activation, which is what makes the
+            // three arms a choice rather than a list.
+            for other in [
+                "silu_mul_bfloat16",
+                "gptoss_swiglu_bfloat16",
+                "geglu_tanh_bfloat16",
+            ] {
+                if other != kernel {
+                    assert!(
+                        !kernels.iter().any(|k| k == other),
+                        "{activation:?} also stated `{other}`"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A layer that shares another's KV projects Q and NOTHING ELSE.
+    ///
+    /// The k and v it hands on stand for the SOURCE layer's pages, which
+    /// the attention reads through the pool rather than as operands. So a
+    /// shared layer that still projected its own would compute two banks
+    /// per layer and write neither anywhere the attention looks -- the
+    /// cost of a full KV projection for a result nothing reads.
+    #[test]
+    fn a_kv_sharing_metal_layer_projects_q_alone() {
+        let f = LlamaLikeFacts::qwen3_0_6b();
+        // The sharers are the LAST `kv_shared_layers` layers, so layer 0 is
+        // never one of them and the two plans below differ only at the tail.
+        let last = f.layers - 1;
+        let shared = LlamaLikeMetalFacts {
+            kv_shared_layers: 4,
+            ..LlamaLikeMetalFacts::synthetic()
+        };
+        let alone = LlamaLikeMetalFacts {
+            kv_shared_layers: 0,
+            ..LlamaLikeMetalFacts::synthetic()
+        };
+        let with_sharing = llama_like_metal(&f, &shared, FireClass::Decode);
+        let without = llama_like_metal(&f, &alone, FireClass::Decode);
+        assert!(
+            metal_kernels_at(&with_sharing, last).len() < metal_kernels_at(&without, last).len(),
+            "sharing KV did not remove any launch from the last layer:\n  \
+             shared: {:?}\n  own: {:?}",
+            metal_kernels_at(&with_sharing, last),
+            metal_kernels_at(&without, last)
+        );
+        // And the layers BEFORE the shared tail are untouched, which is what
+        // makes `kv_shared_layers` a count and not a switch.
+        assert_eq!(
+            metal_kernels_at(&with_sharing, 0),
+            metal_kernels_at(&without, 0)
+        );
+    }
+
+    /// A mixture with a dense expert beside it blends the two, and the
+    /// blend is a kernel of its own.
+    ///
+    /// Without it the routed output is returned as the layer's answer and
+    /// the shared expert's weights are loaded, bound, and never read. The
+    /// model runs at full speed and is missing a term.
+    #[test]
+    fn a_shared_expert_beside_a_mixture_is_blended_in() {
+        let mut f = LlamaLikeFacts::qwen3_0_6b();
+        f.n_experts = 4;
+        f.experts_per_token = 2;
+        f.shared_intermediate = 512;
+        let metal = LlamaLikeMetalFacts::synthetic();
+        let blended = llama_like_metal(&f, &metal, FireClass::Decode);
+        assert_eq!(
+            runs(&blended, "shared_expert_combine"),
+            1,
+            "a mixture with `shared_intermediate` did not blend its dense \
+             expert: {:?}",
+            metal_kernels(&blended)
+        );
+
+        // And a mixture WITHOUT one does not, so the blend is keyed on the
+        // width and not merely on being a mixture.
+        f.shared_intermediate = 0;
+        let routed_only = llama_like_metal(&f, &metal, FireClass::Decode);
+        assert_eq!(runs(&routed_only, "shared_expert_combine"), 0);
+    }
+
+    /// The attention biases are added only when the row says the weights
+    /// exist AND the driver says it still adds them.
+    ///
+    /// Two facts, because they are two different claims: `qkv_bias` is a
+    /// property of the checkpoint and `add_bias` is a property of this
+    /// build's Metal path. Either one alone must not produce the launches,
+    /// or a family whose checkpoint has no bias tensors would bind three
+    /// weights that are not there.
+    #[test]
+    fn the_attention_bias_launches_need_both_facts() {
+        let mut with_bias = LlamaLikeFacts::qwen3_0_6b();
+        with_bias.qkv_bias = true;
+        let mut without_bias = LlamaLikeFacts::qwen3_0_6b();
+        without_bias.qkv_bias = false;
+        let adds = LlamaLikeMetalFacts {
+            add_bias: true,
+            ..LlamaLikeMetalFacts::synthetic()
+        };
+        let does_not = LlamaLikeMetalFacts {
+            add_bias: false,
+            ..LlamaLikeMetalFacts::synthetic()
+        };
+        let both = llama_like_metal(&with_bias, &adds, FireClass::Decode);
+        assert_eq!(
+            runs(&both, "add_bias_bfloat16"),
+            3,
+            "q, k and v each take their own bias: {:?}",
+            metal_kernels(&both)
+        );
+        for (facts, metal, why) in [
+            (&with_bias, &does_not, "the driver does not add them"),
+            (&without_bias, &adds, "the checkpoint has none"),
+            (&without_bias, &does_not, "neither"),
+        ] {
+            let plan = llama_like_metal(facts, metal, FireClass::Decode);
+            assert_eq!(
+                runs(&plan, "add_bias_bfloat16"),
+                0,
+                "biases added when {why}"
+            );
+        }
+    }
+
+    /// All three norm arms LAND, whatever they norm.
+    ///
+    /// Two of the three land through a shared closure and the third
+    /// fuses the projection into the residual add, so "the attention
+    /// output is projected by `o_proj`" is stated three times in three
+    /// spellings. A closure that stopped projecting would leave the
+    /// attention output going straight into the norm at the wrong width
+    /// for every `Post` and `Sandwich` row -- and nothing in this module
+    /// asked, which is how the landing's deleted bias branch sat unread
+    /// for as long as it did.
+    #[test]
+    fn every_norm_arm_lands_through_the_output_projection() {
+        for placement in [
+            NormPlacement::Pre,
+            NormPlacement::Post,
+            NormPlacement::Sandwich,
+        ] {
+            let mut f = LlamaLikeFacts::qwen3_0_6b();
+            f.norm_placement = placement;
+            let plan = llama_like_metal(&f, &LlamaLikeMetalFacts::synthetic(), FireClass::Decode);
+            let lands = plan
+                .ops
+                .iter()
+                .filter(|op| match &op.kind {
+                    OpKind::Launch { weights, .. } => weights.iter().any(|w| w == "layer.0.o_proj"),
+                    _ => false,
+                })
+                .count();
+            assert_eq!(
+                lands, 1,
+                "{placement:?} does not project its attention output"
+            );
+        }
+    }
+
+    /// A mixture owes no `down` under ANY norm placement.
+    ///
+    /// `owes_down` is `n_experts == 0`: a dense MLP hands back the hidden
+    /// width and needs the down projection, a mixture already combined
+    /// its rows and does not. The text asks three times -- once per norm
+    /// arm -- and only the fused arm had ever been asked it as a mixture,
+    /// because every mixture this build ships norms `Pre`.
+    ///
+    /// Both mistakes are quiet and neither is a fault. A mixture that
+    /// took the dense arm binds `layer.0.down`, a tensor a routed
+    /// checkpoint does not publish, and the load fails naming a missing
+    /// weight -- which reads as a corrupt download. A dense row that took
+    /// the mixture arm skips the projection and feeds the intermediate
+    /// width into a residual add that expects the hidden one.
+    #[test]
+    fn a_mixture_owes_no_down_projection_under_any_norm_placement() {
+        for placement in [
+            NormPlacement::Pre,
+            NormPlacement::Post,
+            NormPlacement::Sandwich,
+        ] {
+            let mut dense = LlamaLikeFacts::qwen3_0_6b();
+            dense.norm_placement = placement;
+            let mut routed = LlamaLikeFacts::qwen3_30b_a3b();
+            routed.norm_placement = placement;
+            assert!(
+                dense.n_experts == 0 && routed.n_experts > 0,
+                "the two cases"
+            );
+
+            for (f, owed) in [(&dense, true), (&routed, false)] {
+                let plan =
+                    llama_like_metal(f, &LlamaLikeMetalFacts::synthetic(), FireClass::Decode);
+                let binds_down = plan.ops.iter().any(|op| match &op.kind {
+                    OpKind::Launch { weights, .. } => weights.iter().any(|w| w == "layer.0.down"),
+                    _ => false,
+                });
+                assert_eq!(
+                    binds_down, owed,
+                    "{placement:?} with {} experts binds layer.0.down",
+                    f.n_experts
+                );
+            }
+        }
+    }
+
+    /// gemma runs its mixture BESIDE the dense MLP, not instead of it.
+    ///
+    /// Every other family in this text runs one FFN or the other, so the
+    /// branch is easy to read as a variant spelling of the same thing. It
+    /// is not: both read the post-attention residual and both are added
+    /// back, and a build that took it for a variant would drop one of the
+    /// two terms the layer is defined as.
+    #[test]
+    fn gemmas_mixture_runs_beside_the_dense_mlp_rather_than_instead_of_it() {
+        let mut f = LlamaLikeFacts::qwen3_0_6b();
+        f.n_experts = 4;
+        f.experts_per_token = 2;
+        let beside = LlamaLikeMetalFacts {
+            dense_beside_moe: true,
+            ..LlamaLikeMetalFacts::synthetic()
+        };
+        let instead = LlamaLikeMetalFacts::synthetic();
+        let two = llama_like_metal(&f, &beside, FireClass::Decode);
+        let one = llama_like_metal(&f, &instead, FireClass::Decode);
+        assert_eq!(
+            runs(&two, "router_topk_bfloat16"),
+            2 * runs(&one, "router_topk_bfloat16"),
+            "the branch did not route a second time:\n  beside: {:?}",
+            metal_kernels(&two)
+        );
+        // A ROW WITH NO EXPERTS takes no branch however the fact reads, so
+        // `n_experts > 0` is load-bearing rather than a restatement.
+        f.n_experts = 0;
+        f.experts_per_token = 0;
+        assert_eq!(
+            metal_kernels(&llama_like_metal(&f, &beside, FireClass::Decode)),
+            metal_kernels(&llama_like_metal(&f, &instead, FireClass::Decode))
+        );
+    }
+
+    /// An unfused binding states TWO matmuls and the pair kernel; a
+    /// packed one states a single matmul and the chunked kernel.
+    ///
+    /// The doc above `mlp` records that until 2d the second reading was a
+    /// one-statement lie: the text stated the packed form either way and
+    /// the executor repaired it by firing two GEMMs into workspace buffers
+    /// no value described. So the thing to hold is that the two bindings
+    /// state DIFFERENT texts, which is exactly what a single statement
+    /// could not do.
+    #[test]
+    fn an_unfused_gate_up_binding_states_the_second_gemm() {
+        let f = LlamaLikeFacts::qwen3_0_6b();
+        let fused = LlamaLikeCudaFacts {
+            gate_up_fused: true,
+            ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
+        };
+        let unfused = LlamaLikeCudaFacts {
+            gate_up_fused: false,
+            ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
+        };
+        let matmuls = |cuda: &LlamaLikeCudaFacts| {
+            llama_like_cuda(&f, cuda, FireClass::Decode)
+                .layer_ops(0)
+                .filter(|op| matches!(op.kind, OpKind::Matmul { .. }))
+                .count()
+        };
+        assert_eq!(
+            matmuls(&unfused),
+            matmuls(&fused) + 1,
+            "an unfused binding did not state the second GEMM"
+        );
+    }
+
+    /// Post-norm under tensor parallel sums BOTH row-parallel projections
+    /// before their norms read them.
+    ///
+    /// `o_proj` and `down` are row-parallel, so each rank holds a PARTIAL
+    /// `[N, hidden]`. A norm reads across the hidden dimension, so norming
+    /// a partial is not a rescaling of the right answer -- it is a
+    /// different answer, and one no single rank can detect. The two
+    /// reductions are what make the ordering right, and they exist only on
+    /// this arm because the pre-norm arm lands its residual elsewhere.
+    #[test]
+    fn a_post_norm_layer_reduces_before_it_norms_under_tensor_parallel() {
+        let mut f = LlamaLikeFacts::qwen3_0_6b();
+        f.norm_placement = NormPlacement::Post;
+        let sharded = LlamaLikeCudaFacts {
+            tp_size: 2,
+            ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
+        };
+        let alone = LlamaLikeCudaFacts {
+            tp_size: 1,
+            ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
+        };
+        let reductions = |cuda: &LlamaLikeCudaFacts| {
+            llama_like_cuda(&f, cuda, FireClass::Decode)
+                .layer_ops(0)
+                .filter(|op| match &op.kind {
+                    OpKind::Launch { kernel, .. } => kernel.contains("all_reduce"),
+                    _ => false,
+                })
+                .count()
+        };
+        assert_eq!(
+            reductions(&sharded),
+            2,
+            "post-norm under TP states one reduction per row-parallel \
+             projection -- `o_proj` and `down`"
+        );
+        assert_eq!(reductions(&alone), 0);
+    }
 
     /// The traced form of one qwen3 layer, mapped op-by-op to the kernel
     /// sequence `llama_like_forward_paged` launches on the unfused path.

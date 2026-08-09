@@ -64,20 +64,22 @@ pub fn manifest(f: &GptOssFacts) -> Manifest {
         // The four biases the row's `attention_bias` states. They are an
         // expectation rather than a probe: the old derivation asked the
         // LOAD whether a bias was bound and branched on the answer.
-        .either(f.attention_bias, "layer.{}.self_attn.q_proj.bias", [q])
-        .either(f.attention_bias, "layer.{}.self_attn.k_proj.bias", [kv])
-        .either(f.attention_bias, "layer.{}.self_attn.v_proj.bias", [kv])
-        .either(f.attention_bias, "layer.{}.self_attn.o_proj.bias", [hidden])
+        .with(TensorSpec::required("layer.{}.self_attn.q_proj.bias", [q]))
+        .with(TensorSpec::required("layer.{}.self_attn.k_proj.bias", [kv]))
+        .with(TensorSpec::required("layer.{}.self_attn.v_proj.bias", [kv]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.o_proj.bias",
+            [hidden],
+        ))
         // ATTENTION SINKS: one learned logit per query head, appended to
         // the softmax denominator. It is the tensor that makes gpt-oss
         // gpt-oss — no other row in this build ships one — and the
         // reason the attention statement has to produce an LSE beside
         // its output.
-        .either(
-            f.attn_sinks,
+        .with(TensorSpec::required(
             "layer.{}.self_attn.sinks",
             [u64::from(f.q_heads)],
-        )
+        ))
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
         .with(TensorSpec::required(
             "layer.{}.post_attention_layernorm",
@@ -149,9 +151,10 @@ const GATE_ALPHA: f32 = 1.702;
 /// This row's deployment.
 ///
 /// The window table is the row's alternation rule expanded, not a list
-/// read back out of the CUDA facts: `is_sliding` is the statement, and
-/// `GptOssCudaFacts::window_left` carries the same answer to the tracer.
-/// Both come from here now, so the two cannot disagree.
+/// read back out of the CUDA facts: `is_sliding` is the statement and
+/// this table is its only expansion. The text states no window at all —
+/// the driver reads [`LayerAttention::window`] per layer — so there is
+/// no second copy left to disagree with this one.
 #[must_use]
 pub fn deployment(
     f: &GptOssFacts,
@@ -249,76 +252,228 @@ pub fn cuda_facts(f: &GptOssFacts, load: Deployed<'_>) -> super::forward::facts:
         mxfp4_decode_gemv: true,
         mxfp4_decode_max_routes: 32 * f.experts,
         streamed_experts: false,
-        window_left: (0..f.layers)
-            .map(|l| if f.is_sliding(l) { 128 } else { -1 })
-            .collect(),
     }
 }
 
-/// Why a gpt-oss row is refused on Metal.
+/// This row's ARCHITECTURE, in the shared llama-like vocabulary.
 ///
-/// A `const` so the test that asserts the refusal NAMES the missing
-/// thing compares against the same string the caller is shown, rather
-/// than against a paraphrase that can drift away from it — the shape
-/// `csm::project::NO_TRACE` set for the same reason.
+/// # What this replaces, and what its absence was mistaken for
 ///
-/// # This said the wrong thing was missing, and the wrong thing was a text
+/// There was a `NO_METAL` constant here, and for a long time it named the
+/// wrong missing thing. It read: `llama_like_metal` "takes a
+/// `LlamaLikeFacts` and this row is a `GptOssFacts`; a shape cast between
+/// them would be the tensor-sniffing this catalog replaced". A projection is
+/// not a cast — it states each field from the row's own facts, which is the
+/// opposite of the `facts_from_with` that read TENSORS.
 ///
-/// It read: `llama_like_metal` "takes a `LlamaLikeFacts` and this row is
-/// a `GptOssFacts`; a shape cast between them would be the tensor-
-/// sniffing this catalog replaced". A PROJECTION is not a cast. It
-/// states each field from the row's own facts, which is the opposite of
-/// `facts_from_with` — that read TENSORS. [`crate::gemma_4::project`]'s
-/// `metal_shape` and `metal_facts` are one, written for a row whose
-/// refusal made the same argument, and gemma-4-31b passes all twelve of
-/// `driver-metal`'s real-weight gates through `llama_like_metal`.
+/// Its second reading narrowed the gap correctly, to "no `metal_shape` /
+/// `metal_facts` projection is written for this row", and listed what was
+/// already present: the text states `attn_sinks`, states the clamped GLU as
+/// `Activation::SwiGlu` at gpt-oss's own 7.0 and 1.702, and `routed_qmv`
+/// picks `mxfp4_qmv_routed_bias` off `moe_repr`. All true.
 ///
-/// Everything that refusal implied was absent is present, and naming it
-/// here is what stops the next reader re-deriving it: the text states
-/// `attn_sinks`, states the clamped GLU as `Activation::SwiGlu { limit,
-/// alpha }` at gpt-oss's own 7.0 and 1.702, and reads an MXFP4 expert
-/// bank — `dsl::metal::routed_qmv` picks `mxfp4_qmv_routed_bias` off
-/// `moe_repr`, which is the fix for the 909,207 NaNs that leg once
-/// produced. `LlamaLikeMetalFacts::gpt_oss_20b()` is already written.
-/// The CUDA leg's "seven rectangles" is a FUSION, not a requirement;
-/// Metal computes the same routing as a sort and a gather.
+/// The list was still not complete, and what it left out was not small.
+/// gpt-oss biases its attention landing and its ROUTER, and the shared Metal
+/// text stated neither — because no Metal kernel added a bias at all until
+/// `norm/add_bias.metal`, and no binder resolved that kernel's width until
+/// `dispatch::derived`. A projection written before those would have traced
+/// a gpt-oss that routes every token to the wrong experts.
 ///
-/// # The NAME both halves needed is agreed now
+/// A projection and not a cast, which is the distinction the Metal refusal
+/// used to blur: every field below is stated from `GptOssFacts`, so the two
+/// structs never have to have the same layout and nothing here reads a
+/// tensor. [`crate::gemma_4::project::metal_shape`] is the same shape for
+/// the same reason.
+#[must_use]
+pub fn metal_shape(f: &GptOssFacts) -> crate::shared::llama_like::spec::LlamaLikeFacts {
+    use crate::shared::llama_like::spec::LlamaLikeFacts;
+    use model_compiler::facts::{NormPlacement, QkNorm};
+    use model_compiler::trace::{NormVariant, RopeKind};
+
+    LlamaLikeFacts {
+        hidden: f.hidden,
+        layers: f.layers,
+        q_heads: f.q_heads,
+        kv_heads: f.kv_heads,
+        head_dim: f.head_dim,
+        n_experts: f.experts,
+        experts_per_token: f.top_k,
+        // Every expert is one MLP of this width. `GptOssFacts::intermediate`
+        // warns that gpt-oss's happens to equal `hidden` and that no text may
+        // lean on the coincidence -- stating it in both places is how this
+        // projection declines to.
+        moe_intermediate: f.intermediate,
+        // No shared expert: gpt-oss routes every token to `top_k` of the 32
+        // and adds nothing dense alongside.
+        shared_intermediate: 0,
+        // And no DENSE MLP either. `intermediate` on the llama-like side is
+        // the dense branch's width, which this stack does not have -- the
+        // expert width above is where gpt-oss's `intermediate_size` goes.
+        intermediate: 0,
+        vocab: f.vocab,
+        // YaRN, which the shared side spells as a KIND. Stated here rather
+        // than read off the row: `the_branching_boolean_is_the_one_the_
+        // checkpoint_states` in `spec.rs` retired `rope_yarn_original`
+        // because every gpt-oss row answered it the same way, and a field
+        // two rows fill identically is a place for one of them to be wrong.
+        // Wrong here is not a crash: a silently unscaled rotation.
+        rope: RopeKind::Yarn,
+        norm_variant: NormVariant::Plain,
+        norm_placement: NormPlacement::Pre,
+        qk_norm: QkNorm::Off,
+        // The loader publishes `self_attn.{q,k,v}_proj` separately for every
+        // MLX checkpoint, gpt-oss included; see `LlamaLikeMetalFacts::
+        // qkv_fused` for why this is the driver's answer and not the row's.
+        fused_qkv: false,
+        tied_embeddings: f.tied_embeddings,
+        // All three biases, stated rather than asked. gpt-oss biases q/k/v/o,
+        // the router and the experts -- one publication decision every row
+        // answers the same way, which is why `attention_bias` is no longer a
+        // field and this projection states it three times instead.
+        //
+        // The expert banks' own biases are not here: they are not optional
+        // on an MXFP4 bank at all. `mxfp4_qmv_routed_bias` is the only routed
+        // MXFP4 symbol `qmv.metal` exports, so that leg reads a bias or it
+        // does not run.
+        qkv_bias: true,
+        o_bias: true,
+        router_bias: true,
+    }
+}
+
+/// This row's DEPLOYMENT facts for the Metal text.
 ///
-/// It was not. OpenAI's releases fuse the bank — `experts.gate_up_proj_
-/// blocks` (or a plain `gate_up_proj`) beside `gate_up_proj_bias` — and
-/// [`manifest`] pinned the BIAS for the reason it still says, that an
-/// encoding is not an identity. `driver-metal`'s `lowering::resolve`
-/// had no handle for that name: it names `mlp.experts.gate_proj` /
-/// `up_proj` / `down_proj`, which is MLX's. And an MLX gpt-oss splits
-/// the bias with the weight, so `mlx-community/gpt-oss-20b-MXFP4-Q4`
-/// matched NO ROW AT ALL. The manifest stated OpenAI's naming, `resolve`
-/// stated MLX's, and the checkpoint that satisfied one failed the other.
+/// The binding half comes from `bind` and the architecture half from the
+/// row, which is the split [`crate::catalog::MetalBinding`] exists to make.
+#[must_use]
+pub fn metal_facts(
+    f: &GptOssFacts,
+    bind: &crate::catalog::MetalBinding,
+) -> crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts {
+    use crate::shared::llama_like::forward::facts::{Activation, LlamaLikeMetalFacts};
+    use model_compiler::dsl::{ScaleLayout, WeightRepr};
+
+    LlamaLikeMetalFacts {
+        // Every gpt-oss layer carries a per-head sink; the row stopped
+        // holding a flag for a question with one answer.
+        attn_sinks: true,
+        // The clamp is a different kernel, so it is the SYMBOL that changes
+        // and not a scalar. Alpha is the activation's own constant; the limit
+        // is the row's `swiglu_limit`.
+        activation: Activation::SwiGlu {
+            limit: f.swiglu_limit,
+            alpha: 1.702,
+        },
+        // The base the ladder would use if it were geometric, and the fact
+        // that says it is NOT. A rescaled ladder -- llama-3's piecewise one,
+        // YaRN's -- is not expressible as a base, so the text takes the table
+        // form and the driver derives the table at load.
+        //
+        // `LlamaLikeMetalFacts::gpt_oss_20b()` said `false` here and called
+        // 150000 "a plain geometric ladder", which was true of nothing --
+        // the row has carried the YaRN block since it was written. That
+        // fixture is synthetic and this is the projection a real load reads,
+        // so this one was corrected first and the fixture followed; both say
+        // `true` now, and four backends' text tests fire the table form
+        // because of it. gpt-oss rescales by YaRN (factor 32 over an
+        // original 4096 context) and getting it wrong rotates by unscaled
+        // frequencies at every position but zero.
+        rope_theta: 150_000.0,
+        rope_freq_table: true,
+        rms_eps: 1e-5,
+        // Alternating: every other layer attends 128 tokens back and the rest
+        // attend everything. Built from `GptOssFacts::is_sliding` rather than
+        // from a second copy of the parity, so the two backends cannot come
+        // to different answers about which layers slide -- `cuda_facts`
+        // builds its `window_left` from the same accessor, right above.
+        window_left: (0..f.layers)
+            .map(|l| if f.is_sliding(l) { 128 } else { -1 })
+            .collect(),
+        // THE PROJECTIONS' encoding, which is not the banks'. MLX quantises
+        // gpt-oss's dense tensors affine/g64/b4 and leaves the expert banks
+        // to the top-level mxfp4/32 default; `MetalBinding` carries what the
+        // load observed rather than what this row assumes.
+        proj_repr: WeightRepr::Scaled {
+            layout: ScaleLayout::PerGroup,
+            group: bind.quant_group,
+            axis: 0,
+            zero_point: true,
+        },
+        affine_bits: bind.quant_bits,
+        // And the BANKS'. `binding::observed` probes one expert tensor at
+        // load and answers this; `EXPERT_BANK` is the tensor it asks, and the
+        // constant exists so the claim "one probe, and it decides an
+        // encoding" is checkable by reading a file.
+        //
+        // `None` is not "unknown", it is "THE SAME AS THE DENSE PROJECTIONS"
+        // -- the shared projection's word, and worth taking rather than
+        // paraphrasing. Restating it as an explicit `Scaled` built from
+        // `bind.quant_group` looks equivalent and is not: at the g128/b8
+        // encoding `a_row_is_served_the_same_way_at_every_encoding` walks,
+        // it named `affine_qmv_routed_bfloat16_gs_128_b_8`, which no
+        // `kernel!` signature declares, and the row stopped being servable at
+        // an encoding it must be servable at.
+        moe_repr: bind.moe_mxfp4.then_some(WeightRepr::Mxfp4Marlin),
+        // Four by the format's definition and read only when the repr above
+        // is `Some`, exactly as the shared projection states it.
+        moe_bits: 4,
+        fuse_residual_gemv: bind.fuse_residual_gemv,
+        paged_multi_batch: bind.paged_multi_batch,
+        qmm_multi_batch: bind.qmm_multi_batch,
+        add_bias: bind.add_bias,
+        // gpt-oss's config states no `norm_topk_prob` and the reference
+        // softmaxes the top-k scores, which is what normalising them means.
+        norm_topk_prob: true,
+        // YaRN's OTHER number, and the one a rope table cannot carry.
+        attn_scale: yarn_softmax_scale(f.head_dim),
+        ..LlamaLikeMetalFacts::synthetic()
+    }
+}
+
+/// The softmax temperature a YaRN deployment attends at.
 ///
-/// [`TensorSpec::instead`] is that agreement: the two expert-bias rows
-/// accept MLX's division as an alternative LAYOUT, whole or not at all.
-/// Measured against the real snapshot, those two names were the entire
-/// disagreement — the packed embedding, the packed head and a router
-/// MLX quantizes to `[32, 720]` all matched already. The MLX checkpoint
-/// identifies as this row today, and `a_split_expert_bank_is_a_third_
-/// publication_this_row_now_knows` holds the measurement.
+/// `RopeScaling::Yarn::attention_factor` compensates for the lengthened
+/// ladder, and HF applies it to `cos` and `sin` — which is to say to the
+/// ROTATED `q` and the rotated `k`, both. What reaches the softmax is
+/// therefore the dot product times the factor SQUARED, and then times
+/// `1/sqrt(head_dim)` as usual.
 ///
-/// # What is missing now is the projection
+/// Two consequences worth stating, because each is a place this could have
+/// gone wrong quietly:
 ///
-/// One thing, and it is the thing this doc always said was the smaller
-/// half: no `metal_shape` / `metal_facts` pair, so `Variant::trace`
-/// has no Metal text to hand back. Every ingredient named above is in
-/// place — the sinks reach the shader, the routed MXFP4 leg resolves,
-/// `LlamaLikeMetalFacts::gpt_oss_20b()` is written, and the checkpoint
-/// now arrives identified.
+///   * It cannot ride the frequency table. `Source::RopeFrequencies` carries
+///     inverse frequencies and the shader raises its own `cos`/`sin` from
+///     them, so an amplitude handed to `model::rope` would simply be dropped.
+///     CUDA does not have this problem — `bind::abi` passes all four YaRN
+///     numbers to the kernel — so the two backends reach the same product by
+///     different routes and this is Metal's.
+///   * The attention SINK must not be scaled by it, and is not: the sink is
+///     an additive logit the kernel appends after the temperature multiplies
+///     `q·k`, which is exactly HF's order. Folding the factor into the
+///     temperature keeps that distinction; folding it into `q` alone would
+///     not have.
 ///
-/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
-/// fine and CUDA serves it. What is missing is a text in this build.
-pub const NO_METAL: &str = "gpt-oss has no Metal text in this build: the checkpoint identifies and its \
-     tensors resolve — `TensorSpec::instead` settled the fused-versus-split \
-     expert-bias disagreement that used to stop it — but no `metal_shape` / \
-     `metal_facts` projection is written for this row, so there is no forward \
-     to trace; the CUDA backend serves this row";
+/// For gpt-oss: `1.3466² / 8` is `0.2266`, against the `0.125` a derived
+/// `1/sqrt(64)` gives. A 1.81x error in the softmax temperature does not
+/// fault — it sharpens every distribution in the stack and reads as a model
+/// that has become oddly confident.
+fn yarn_softmax_scale(head_dim: u32) -> f32 {
+    // Destructured in a CONST, so "gpt-oss rescales by YaRN" is checked by
+    // the compiler rather than by a branch. The runtime form of this had a
+    // fallback arm reading "unreachable while the const is what its name
+    // says" -- true, and a fallback is how an unreachable arm becomes a
+    // reachable one without anybody deciding to. Its value was the shared
+    // "derive `1/sqrt(head_dim)`", so a generation that stopped rescaling
+    // would have attended at 0.125 against this row's 0.2266 and nothing
+    // would have faulted.
+    const ATTENTION_FACTOR: f32 = match super::ROPE_SCALING {
+        crate::deployment::RopeScaling::Yarn {
+            attention_factor, ..
+        } => attention_factor,
+        _ => panic!("gpt-oss rescales by YaRN; this scale is that factor squared"),
+    };
+    ATTENTION_FACTOR * ATTENTION_FACTOR / (head_dim as f32).sqrt()
+}
 
 /// Trace this row's CUDA text for one fire class.
 #[must_use]
@@ -349,6 +504,118 @@ mod tests {
             .filter(|t| t.presence != Presence::Absent)
             .map(|t| (t.name.replace("{}", "0"), t.extents.clone()))
             .collect()
+    }
+
+    /// YaRN's `attention_factor` reaches the softmax, squared.
+    ///
+    /// Two independent evaluations of one number: `yarn_softmax_scale` reads
+    /// `ROPE_SCALING` and squares it, and this reads the config's formula
+    /// (`0.1 * ln(32) + 1`) and squares that. They agree because the const is
+    /// the formula, which is the claim
+    /// `the_yarn_numbers_are_the_configs_and_the_omitted_one_is_the_formula`
+    /// checks one seam earlier.
+    ///
+    /// A ZERO here is the failure mode worth naming: the shared `sdpa`
+    /// statement reads zero as "derive `1/sqrt(head_dim)`", so a text that
+    /// forgot this fact would attend at `0.125` instead of `0.2266` and
+    /// nothing would fault.
+    #[test]
+    fn the_yarn_attention_factor_reaches_the_metal_softmax_squared() {
+        let f = f20b();
+        let bind = crate::catalog::MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: true,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+            add_bias: true,
+        };
+        let m = metal_facts(&f, &bind);
+        let factor = 0.1f32.mul_add(32.0f32.ln(), 1.0);
+        let want = factor * factor / 8.0;
+        assert!(
+            (m.attn_scale - want).abs() < 1e-6,
+            "stated {}, the formula squared over sqrt(64) is {want}",
+            m.attn_scale
+        );
+        // And it is NOT the derived default, which is the whole point.
+        let derived = 1.0f32 / (f.head_dim as f32).sqrt();
+        assert!(
+            (m.attn_scale / derived - 1.813_26).abs() < 1e-3,
+            "the YaRN temperature is 1.81x the plain one, not {}",
+            m.attn_scale / derived
+        );
+    }
+
+    /// FOUR attention biases, not three: q, k, v and the LANDING.
+    ///
+    /// The shared Metal text adds the landing's bias behind `o_bias &&
+    /// add_bias`, and gpt-oss is the only row in the catalog that states
+    /// `o_bias` -- so the arm belongs to this row and had never been
+    /// traced. The sibling test on the shared text asserts three launches
+    /// against a qwen row, which is right for qwen and is exactly why it
+    /// could not see this one.
+    ///
+    /// The failure is quiet and the term is not small: `o_proj`'s bias is
+    /// added to the attention output before the residual, so dropping it
+    /// removes a per-channel offset from every layer of every token. No
+    /// shape error and no unbound symbol -- the tensor is declared by the
+    /// contract, read off disk, allocated, and never summed.
+    ///
+    /// Asserted by WEIGHT NAME rather than by count, because a count is
+    /// satisfied by any four launches and this row also biases its
+    /// router: the number would have been right with the landing missing
+    /// and something else doubled.
+    #[test]
+    fn the_attention_landing_takes_its_own_bias_beside_the_three_projections() {
+        use crate::shared::llama_like::forward::llama_like_metal;
+        use model_compiler::trace::{FireClass, OpKind};
+        let f = f20b();
+        let bind = crate::catalog::MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            moe_mxfp4: true,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+            add_bias: true,
+        };
+        let shape = metal_shape(&f);
+        assert!(shape.o_bias, "the row this test reads states one");
+        let biased = |m: &crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts| {
+            llama_like_metal(&shape, m, FireClass::Decode)
+                .ops
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::Launch {
+                        kernel, weights, ..
+                    } if kernel.contains("add_bias") => Some(weights.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|w| w.starts_with("layer.0."))
+                .collect::<Vec<_>>()
+        };
+        let on = biased(&metal_facts(&f, &bind));
+        assert!(
+            on.contains(&"layer.0.o_bias".to_string()),
+            "the attention landing's bias is never summed: {on:?}"
+        );
+        for projection in ["q_bias", "k_bias", "v_bias"] {
+            assert!(
+                on.contains(&format!("layer.0.{projection}")),
+                "{projection} went missing while the landing was added: {on:?}"
+            );
+        }
+
+        let mut off = metal_facts(&f, &bind);
+        off.add_bias = false;
+        assert!(
+            biased(&off).is_empty(),
+            "the checkpoint's biases and this build's Metal path are two \
+             facts, and either one alone must not produce a launch"
+        );
     }
 
     /// Every extent is the row's own arithmetic.
@@ -390,18 +657,34 @@ mod tests {
         assert_eq!(sinks.presence, Presence::Required);
         assert_eq!(sinks.extents, vec![u64::from(f.q_heads)]);
 
-        // And a row without them FORBIDS the tensor, so the fact is a
-        // presence rather than a branch inside one manifest.
-        let without = manifest(&GptOssFacts {
-            attn_sinks: false,
-            ..f
-        });
-        let sinks = without
-            .tensors
-            .into_iter()
-            .find(|t| t.name.ends_with("self_attn.sinks"))
-            .expect("stated either way");
-        assert_eq!(sinks.presence, Presence::Absent);
+        // Required rather than optional, which is what separates this row
+        // from every other MoE decoder of the same geometry: a mixtral
+        // that happens to match on width is refused HERE, by tensors it
+        // does not carry.
+        //
+        // The four attention biases are in the same list. The trace folds
+        // them into each projection's epilogue, so a checkpoint that
+        // matched this row without them would bind an epilogue to a
+        // tensor that is not there.
+        for absent in [
+            "self_attn.sinks",
+            "self_attn.q_proj.bias",
+            "self_attn.k_proj.bias",
+            "self_attn.v_proj.bias",
+            "self_attn.o_proj.bias",
+        ] {
+            let m = manifest(&f);
+            let without = Observed::from_pairs(
+                m.tensors
+                    .iter()
+                    .filter(|t| t.presence != Presence::Absent && !t.name.ends_with(absent))
+                    .map(|t| (t.name.clone(), t.extents.clone())),
+            );
+            assert!(
+                m.check(&without).is_err(),
+                "a decoder with no {absent} is not a gpt-oss, and this row said it was"
+            );
+        }
     }
 
     /// THE CLAIM: one row serves the MXFP4 build and the bf16 one.
@@ -629,15 +912,23 @@ mod tests {
         assert!(!d.shares_kv());
     }
 
-    /// The tracer's window list and the deployment's window table are
-    /// one rule expanded twice, so they agree by construction.
+    /// The window lives in ONE place: the deployment's table, expanded
+    /// from `is_sliding`. The tracer is handed no copy of it.
+    ///
+    /// It used to be handed one, and read it, and pass it to a dispatch
+    /// that ignores it -- gpt-oss takes the sink spelling on every layer,
+    /// and that spelling states no window because the driver reads
+    /// `window_left_by_layer` out of the deployment instead.
     #[test]
     fn the_binding_facts_carry_the_same_schedule() {
         let f = f20b();
         let cuda = cuda_facts(&f, Deployed::single());
         assert_eq!(
-            cuda.window_left,
-            deployment(&f, 150_000.0, 1e-5, 128).windows()
+            deployment(&f, 150_000.0, 1e-5, 128).windows(),
+            (0..f.layers)
+                .map(|l| if f.is_sliding(l) { 128 } else { -1 })
+                .collect::<Vec<_>>(),
+            "the deployment is the only place the alternation is written"
         );
         assert_eq!(cuda.mxfp4_decode_max_routes, 32 * f.experts);
         assert!(cuda.mxfp4_decode_gemv);

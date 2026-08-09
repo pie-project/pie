@@ -430,40 +430,59 @@ pub enum LaunchRule {
     /// build rather than slabbing `intermediate / k` columns at a fire and
     /// leaving the rest of every row unwritten.
     RoutedQmvQuad,
-    /// One block per REQUEST, 256 wide, no shared memory -- a launcher whose
-    /// grid is the batch's request count rather than its token rectangle.
+    /// **Exactly one block** of 256 threads, whatever the rectangle — the
+    /// grid is a literal `1` the host wrote and not a quotient.
     ///
-    /// `mtp_update_pending_hidden` is the row that made it: it records a
-    /// state store and NO result, so it names no rectangle of its own, and
-    /// the request count it needs for the grid is not a dimension of anything
-    /// it writes. Distinct from [`LaunchRule::PerRow`], which is the same
-    /// `<<<n, 256>>>` shape and means the fire's ROWS -- `page_compact` opens
-    /// `<<<num_requests, kBlock>>>` and stays on `PerRow` because its result
-    /// IS one entry per request. A launcher's shape and a fire's rectangle
-    /// are two different questions, and a rule that conflated them would put
-    /// a per-request scatter over a token rectangle the moment a fire carried
-    /// more than one token per request.
-    PerRequest,
-    /// Exactly ONE block, 256 wide -- a serial walk that no `ceil` may widen.
+    /// Three launchers in two families are this shape, and all three are
+    /// kernels whose ONE block owns a whole serial structure: a prefix over a
+    /// CSR (`attn/kv_paged.cu:516`'s `build_window_page_view`), a
+    /// single-slot byte copy (`layout/slot_ops.cu:61`'s
+    /// `copy_if_valid_slot`). The block strides its extent internally, so the
+    /// rectangle reaches the kernel as an OPERAND and never as a grid.
     ///
-    /// The page-view builders are the case: one block reads a whole page
-    /// table's CSR and writes a running sum. [`LaunchRule::RowsFlat`] was
-    /// checked and rejected as the near miss, because `ceil(rows / 256)` is 1
-    /// up to 256 rows and 2 at 257 -- a second block walking the same CSR
-    /// from `threadIdx.x == 0`, writing the same sums with no ordering
-    /// between them, on exactly the batches nobody tests. The literal `1` has
-    /// to be statable.
+    /// # Why the `1` may not be derived
+    ///
+    /// [`LaunchRule::RowsFlat`] answers `ceil(rows / 256)`, which equals `1`
+    /// for every rectangle of 256 rows or fewer and grows past it — so a row
+    /// that reached for it would be right on the fixtures and wrong in
+    /// production, which is the shape §22.7 measured twice. [`LaunchRule::RouteRows`]
+    /// and [`LaunchRule::PerRow`] open one block PER ROW: against
+    /// `copy_if_valid_slot` that is the same copy repeated `rows` times
+    /// (idempotent, so correct by accident), and against
+    /// `build_window_page_view` it is `rows` blocks racing to write one
+    /// output CSR.
+    ///
+    /// The alternative rejected here was a `Dims` field carrying the block
+    /// width, which fails §21.14's test outright: a block width is a property
+    /// of the LAUNCHER, so `Dims { block: 512 }` would be a well-formed
+    /// statement that no fire can make true or false. The two widths this
+    /// tree launches single blocks at are two variants, exactly as
+    /// [`LaunchRule::PerRow`] and [`LaunchRule::PerRowNarrow`] are.
     Single,
-    /// Exactly one block of ONE WARP, 32 wide.
+    /// [`LaunchRule::Single`] at ONE WARP — `<<<1, 32>>>`.
     ///
-    /// Two rules rather than one with a width, because the block is the
-    /// LAUNCHER's and not the fire's: `build_full_split_view`'s body is
-    /// `if (threadIdx.x != 0) return;` and a serial walk after it, so every
-    /// thread but one exits at once and the launch is one warp because a warp
-    /// is the smallest thing the hardware schedules. That 32 is a fact about
-    /// the DEVICE, which is why it is fixed here rather than taken from a
-    /// [`Dims`] field.
+    /// `attn/kv_paged.cu:533`'s `build_full_split_view` is the case and it is
+    /// the only one: the kernel's whole body is a serial walk over `splits`
+    /// on **thread zero** with the rest of the warp idle, and the launcher
+    /// picked 32 because a warp is the smallest block that does not waste a
+    /// scheduling slot. Stating [`LaunchRule::Single`] instead launches 256
+    /// threads where 32 are wanted — not a wrong answer for this kernel, and
+    /// still a rule that does not reproduce its launcher, which is the only
+    /// property a rule has.
     SingleWarp,
+    /// One block per REQUEST, 256 wide, nothing shared — [`LaunchRule::PerRow`]'s
+    /// launch over [`crate::LaunchRule`]'s other row-shaped axis.
+    ///
+    /// `attn/attention_naive.cu:174`, `attn/page_compact.cu:45` and `:48` are
+    /// the three, and the distinction from [`LaunchRule::PerRow`] is the one
+    /// `Dims::requests`' own doc is about: **a request count is not a row
+    /// count.** A prefill of 4 requests and 512 tokens has `rows == 512` and
+    /// `requests == 4`, so `PerRow` opens 128 times the blocks, and every
+    /// extra one indexes `qo_indptr[r]` and `slot_ids[r]` past their ends —
+    /// off a buffer with one slot per REQUEST. On a pure decode the two
+    /// numbers coincide, which is why the substitution survives every
+    /// single-token fixture.
+    PerRequest,
 }
 
 impl LaunchRule {
@@ -514,9 +533,9 @@ impl LaunchRule {
         Self::RoutedQmvTransposed,
         Self::AltUpStreams,
         Self::RoutedQmvQuad,
-        Self::PerRequest,
         Self::Single,
         Self::SingleWarp,
+        Self::PerRequest,
     ];
 
     /// A discriminant, used only to prove [`Self::ALL`] is complete.
@@ -559,9 +578,9 @@ impl LaunchRule {
             Self::RoutedQmvTransposed => 34,
             Self::AltUpStreams => 35,
             Self::RoutedQmvQuad => 36,
-            Self::PerRequest => 37,
-            Self::Single => 38,
-            Self::SingleWarp => 39,
+            Self::Single => 37,
+            Self::SingleWarp => 38,
+            Self::PerRequest => 39,
         }
     }
 }
@@ -1765,9 +1784,13 @@ pub struct KernelSig {
     /// What the launcher RETURNS, spelled as C++ spells it.
     ///
     /// `""` — the default — means `void`, which is what a launcher is
-    /// nearly always. Three are not: `gemv3_bf16`, `rmsnorm_bf16_tuned`
-    /// and `lm_head_argmax_chunked` return `bool`, and the bool means
+    /// nearly always. Three were not: `gemv3_bf16`, `rmsnorm_bf16_tuned`
+    /// and `lm_head_argmax_chunked` returned `bool`, and the bool meant
     /// "did the fused/tuned form run" rather than "did it succeed".
+    /// `new-horizon.md` §43 deleted `rmsnorm_bf16_tuned` — nothing in any
+    /// language reached it — so the tree carries two of the three today.
+    /// The field stays: the reason below is about the shim's types, not
+    /// about how many rows currently exercise them.
     ///
     /// It is on the ROW rather than inferred because the shim has to
     /// declare the forwarding pointer's full type: a `void` forward to a

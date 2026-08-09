@@ -36,17 +36,10 @@ void dequant_fp8_e4m3_to_bf16_per_channel(
         fp8_in, static_cast<device::bf16*>(bf16_out), scale_inv_dev, cols);
 }
 
-void dequant_fp8_e4m3_to_bf16_blocked(
-    const std::uint8_t* fp8_in, void* bf16_out,
-    const float* scale_dev, int rows, int cols,
-    int row_block, int col_block, cudaStream_t stream)
-{
-    if (rows == 0 || cols == 0) return;
-    const int scale_cols = (cols + col_block - 1) / col_block;
-    device::dequant_fp8_e4m3_blocked<device::bf16><<<rows, BLOCK, 0, stream>>>(
-        fp8_in, static_cast<device::bf16*>(bf16_out),
-        scale_dev, cols, row_block, col_block, scale_cols);
-}
+// `dequant_fp8_e4m3_to_bf16_blocked` was deleted here by §43. Alone of the
+// four in this file it had no C++ caller: `gemm.cpp`'s dequant-then-bf16
+// fallback fires the other three and never this one. Its row is a device row
+// in `families::quant` over `quant/dequant_fp8.cuh`, so the kernel stays.
 
 void dequant_fp8_e4m3_to_bf16_per_group(
     const std::uint8_t* fp8_in, void* bf16_out,

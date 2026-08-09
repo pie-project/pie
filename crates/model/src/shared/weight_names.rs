@@ -168,6 +168,9 @@ impl Names {
             ("q_bias", "self_attn.q_proj"),
             ("k_bias", "self_attn.k_proj"),
             ("v_bias", "self_attn.v_proj"),
+            // gpt-oss's landing bias, on the same module as `o_proj` for the
+            // reason the three above share theirs.
+            ("o_bias", "self_attn.o_proj"),
             // The DSL's own handle names (`Layer::gate_proj` / `up_proj`),
             // which is what the text spells.
             ("gate_proj", "mlp.gate_proj"),
@@ -185,6 +188,11 @@ impl Names {
             // qwen3-moe's `switch_mlp`, gemma4's `switch_glu`, gpt-oss's
             // plain `experts`.
             ("router", "mlp.gate|mlp.router"),
+            // The router's own bias, under whichever of the two spellings
+            // the checkpoint gave the router. One entry, both conventions,
+            // because a checkpoint that renamed the module renamed its bias
+            // with it.
+            ("router_bias", "mlp.gate|mlp.router"),
             (
                 "expert_gate",
                 "mlp.switch_mlp.gate_proj|experts.switch_glu.gate_proj|mlp.experts.gate_proj",
@@ -797,5 +805,124 @@ mod tests {
             bound(&post, "layer.0.mlp_norm").as_deref(),
             Some("model.layers.0.post_feedforward_layernorm.weight")
         );
+    }
+
+    /// Which trace names come back as a JOIN of several tensors.
+    fn joined(published: &[&str], trace: &str) -> Option<Vec<String>> {
+        let shape = LoadShape::dense(1, 128, false);
+        let set: std::collections::BTreeSet<String> =
+            published.iter().map(|s| (*s).to_string()).collect();
+        let has = |n: &str| set.contains(n);
+        let w = wire(shape, &has);
+        w.joins
+            .iter()
+            .find(|(t, _)| t == trace)
+            .map(|(_, parts)| parts.clone())
+    }
+
+    /// A join is recorded only when every part is there.
+    ///
+    /// The three legs abut in the arena, so `qkv` can be named as their
+    /// concatenation without a copy -- but only if all three were
+    /// published. A checkpoint missing one has no contiguous run to name,
+    /// and recording the join anyway would hand the binder a name that
+    /// resolves to two legs and whatever tensor the allocator put third.
+    /// That is not a load error; it is an attention block reading someone
+    /// else's weights.
+    ///
+    /// Nothing is put in its place, which is the honest state: the launch
+    /// asking for `layer.0.qkv` gets the resolver's refusal, naming the
+    /// tensor rather than producing numbers.
+    #[test]
+    fn a_join_needs_every_part_and_records_nothing_without_them() {
+        assert_eq!(
+            joined(&base(), "layer.0.qkv").as_deref(),
+            Some(
+                [
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "model.layers.0.self_attn.k_proj.weight",
+                    "model.layers.0.self_attn.v_proj.weight",
+                ]
+                .map(String::from)
+                .as_slice()
+            ),
+            "all three legs present names the run"
+        );
+
+        let no_v: Vec<&str> = base()
+            .into_iter()
+            .filter(|n| !n.ends_with("v_proj.weight"))
+            .collect();
+        assert_eq!(
+            joined(&no_v, "layer.0.qkv"),
+            None,
+            "two of three legs names nothing"
+        );
+        assert_eq!(
+            bound(&no_v, "layer.0.qkv"),
+            None,
+            "and no alias stands in for it either"
+        );
+        // The join that still has all its parts is unaffected.
+        assert!(joined(&no_v, "layer.0.gate_up").is_some());
+    }
+
+    /// gemma-4's tail attends an earlier layer's KV, so it states one leg.
+    ///
+    /// `kv_shared_layers` counts back from the END. A shared layer has no
+    /// K or V of its own -- no `k_norm`, and no q‖k‖v run to name -- so it
+    /// binds `q_proj` alone. Wiring it like an ordinary layer asks for
+    /// three tensors the checkpoint does not carry for those layers, and
+    /// the load fails naming a weight gemma-4 is not supposed to have.
+    ///
+    /// The count is read off the row rather than sniffed, so the layers
+    /// BELOW the cut must keep the ordinary wiring in the same
+    /// checkpoint; a boundary read one layer out is the failure this
+    /// pins.
+    #[test]
+    fn gemma4s_kv_shared_tail_states_only_its_q_leg() {
+        const P: &str = "model.language_model";
+        let mut published: Vec<String> = vec![
+            format!("{P}.embed_tokens_per_layer.weight"),
+            format!("{P}.embed_tokens.weight"),
+        ];
+        for i in 0..4 {
+            published.push(format!("{P}.layers.{i}.self_attn.q_proj.weight"));
+            published.push(format!("{P}.layers.{i}.self_attn.qkv_proj.fused.weight"));
+            published.push(format!("{P}.layers.{i}.self_attn.k_norm.weight"));
+        }
+        let set: std::collections::BTreeSet<String> = published.into_iter().collect();
+        let has = |n: &str| set.contains(n);
+
+        let shape = LoadShape {
+            layers: 4,
+            kv_shared_layers: 2,
+            ..LoadShape::dense(4, 128, false)
+        };
+        let w = wire(shape, &has);
+        let at = |t: &str| {
+            w.aliases
+                .iter()
+                .find(|(n, _)| n == t)
+                .map(|(_, c)| c.clone())
+        };
+
+        for i in 0..4 {
+            assert_eq!(
+                at(&format!("layer.{i}.q_proj")).is_some(),
+                i >= 2,
+                "layer {i} states its q leg alone only in the shared tail"
+            );
+            assert_eq!(
+                at(&format!("layer.{i}.k_norm")).is_some(),
+                i < 2,
+                "layer {i} has a k_norm only while it projects its own KV"
+            );
+            assert_eq!(
+                at(&format!("layer.{i}.qkv")).is_some(),
+                i < 2,
+                "layer {i} names a q‖k‖v run only while it has one"
+            );
+        }
     }
 }

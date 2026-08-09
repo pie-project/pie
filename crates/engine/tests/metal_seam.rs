@@ -7,15 +7,18 @@
 
 #![cfg(all(feature = "driver-metal", target_vendor = "apple"))]
 
-use engine::driver::DriverBackend;
+use engine::driver::backend::open;
 
 #[test]
 fn the_metal_backend_opens_a_device_and_states_what_it_is() {
-    let Ok((backend, facts)) = DriverBackend::metal_create(b"{}") else {
+    let Ok(backend) = open::metal(b"{}") else {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
     assert_eq!(backend.kind(), "metal");
+    // Off the CONTRACT rather than out of `create`'s second return value:
+    // a driver states its own facts, so there is one copy of them.
+    let facts = backend.device_facts().expect("a local driver knows its device");
     assert_eq!(facts.backend, "metal");
     assert!(
         facts.unified_memory,
@@ -35,7 +38,7 @@ fn the_verbs_that_need_the_kv_pool_refuse_by_name() {
     // The ordering, stated. Every one of these is above a pool that does not
     // exist until `load_model` allocates it, so the refusal names the backend
     // and the step that was skipped rather than reporting a generic failure.
-    let Ok((mut backend, _)) = DriverBackend::metal_create(b"{}") else {
+    let Ok(mut backend) = open::metal(b"{}") else {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
@@ -75,7 +78,7 @@ fn the_verbs_that_need_the_kv_pool_refuse_by_name() {
 fn media_encode_is_refused_rather_than_pretended() {
     // Unsupported on this backend and on CUDA both, and the seam says so
     // instead of returning a completion nothing will settle.
-    let Ok((backend, _)) = DriverBackend::metal_create(b"{}") else {
+    let Ok(backend) = open::metal(b"{}") else {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
@@ -90,7 +93,7 @@ fn load_model_takes_one_descriptor_because_this_backend_holds_one_model() {
     // The same shape the CUDA shell's `state.model` has, and the reason a
     // frame's instance roster is one family's — which is what makes
     // `lower(plan, rows, fire)`'s one-plan signature right.
-    let Ok((mut backend, _)) = DriverBackend::metal_create(b"{}") else {
+    let Ok(mut backend) = open::metal(b"{}") else {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
@@ -132,7 +135,7 @@ fn a_frame_that_cannot_fit_the_pool_is_impossible_rather_than_an_error() {
     // pool can never be made to fit by evicting, so it is `Impossible` and the
     // engine stops re-posting it; one that merely does not fit right now would
     // be `Exhausted`. Both are outcomes, and neither is an `Err`.
-    let Ok((mut backend, _)) = DriverBackend::metal_create(b"{}") else {
+    let Ok(mut backend) = open::metal(b"{}") else {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
@@ -164,7 +167,7 @@ fn a_program_a_channel_and_an_instance_all_register() {
     // The channel plane is HOST memory on this backend, exactly as it is on the
     // dummy driver — `ChannelState` holds the cells and four control words —
     // so the binding is their addresses and nothing about it needs a GPU.
-    let Ok((mut backend, _)) = DriverBackend::metal_create(b"{}") else {
+    let Ok(mut backend) = open::metal(b"{}") else {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
@@ -307,7 +310,7 @@ fn a_frame_reaches_the_device_through_the_seam() {
 
     // TOML, which is what the boot config is — `[model] config`.
     let config = format!("[model]\ndescriptor = \"{}\"\n", path.display());
-    let Ok((mut backend, _)) = DriverBackend::metal_create(config.as_bytes()) else {
+    let Ok(mut backend) = open::metal(config.as_bytes()) else {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };

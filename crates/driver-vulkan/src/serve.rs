@@ -125,6 +125,22 @@ pub struct Fired {
     /// is [`Self::dispatches`], and the difference between the two numbers is
     /// the only externally visible sign of which path ran.
     pub submissions: usize,
+    /// How many rectangles put their scalars in a storage block.
+    ///
+    /// Reported for the same reason as the other two: it is the number this
+    /// fire used to allocate a device buffer for, one each, and a caller that
+    /// cannot see it cannot tell one allocation from a hundred and fourteen.
+    /// Every one of them is bound out of a single buffer now, and this is
+    /// what a test compares [`Device::allocations`] against.
+    pub blocks: usize,
+    /// How many SPIR-V modules this fire read.
+    ///
+    /// One per distinct symbol, not one per rectangle: a qwen3 decode states
+    /// 452 rectangles over 9 symbols, and reading a module is a walk over a
+    /// few thousand words. The two versions dispatch identically and one of
+    /// them spent 22 milliseconds a fire doing it, so this number is the only
+    /// thing that tells them apart.
+    pub parsed: usize,
 }
 
 /// Why a fire did not run.
@@ -210,12 +226,12 @@ impl std::error::Error for Unfired {}
 
 /// Plan, build, record and submit a whole lowering, and wait for it.
 ///
-/// The blocks this allocates are freed before it returns, and they are freed
+/// The block buffer this allocates is freed before it returns, and it is freed
 /// AFTER the submission has completed rather than after it was recorded --
 /// [`Device::run_all`] waits on a fence, which is what makes that safe. A
 /// version of this that returned before the queue finished would have to hand
-/// the blocks back to the caller, and a caller that dropped them on the wrong
-/// side of the fence would be freeing memory the GPU is reading.
+/// it back to the caller, and a caller that dropped it on the wrong side of
+/// the fence would be freeing memory the GPU is reading.
 ///
 /// # Errors
 ///
@@ -238,39 +254,78 @@ pub fn fire<R: Resolve, M: Modules>(
         one_at_a_time,
     } = what;
 
-    // Pass one. Nothing here touches the device except to allocate the scalar
-    // blocks, which must outlive the submission.
+    // Pass one. Nothing here touches the device at all: the scalar blocks are
+    // gathered into ONE host buffer, allocated once after the walk.
+    //
+    // They used to be a buffer each. Measured on this card, a real decode of
+    // 452 rectangles states 114 of them and allocating them cost 30
+    // milliseconds -- 260 microseconds an allocation, which is what
+    // `vkCreateBuffer` plus `vkAllocateMemory` plus a map and an unmap costs
+    // when it is asked for 40 bytes. That was more than the recording of the
+    // whole fire.
+    //
+    // It was also a cliff rather than a slope: `maxMemoryAllocationCount` is
+    // a real limit -- 4096 on many devices -- and a fire is free to state
+    // more rectangles than that.
+    //
+    // The same decode's 114 blocks are 3624 bytes gathered here, and the one
+    // allocation that holds them costs 200 to 450 microseconds. The padding
+    // below is what the gathering costs: the spans are aligned to what the
+    // device addresses a storage buffer from, so 3624 bytes of scalars take
+    // rather more room than that. Room is not what was scarce.
     let mut planned = Vec::with_capacity(lowered.launches.len());
-    let mut blocks: Vec<Option<crate::device::Buffer>> = Vec::with_capacity(planned.capacity());
-    let give_back = |device: &Device, blocks: Vec<Option<crate::device::Buffer>>| {
-        for b in blocks.into_iter().flatten() {
+    let mut read: std::collections::BTreeMap<&str, crate::spirv::Declared> =
+        std::collections::BTreeMap::new();
+    // Counted where the parse happens rather than taken from `read.len()` at
+    // the end. The map's size is the number of distinct symbols whether the
+    // cache is consulted or not -- measured: a mutation that dropped every
+    // entry before looking it up reported the same number and passed the test
+    // that exists to catch it. This counts the walk.
+    let mut parsed = 0usize;
+    let mut spans: Vec<Option<(u64, u64)>> = Vec::with_capacity(planned.capacity());
+    let mut scalars: Vec<u8> = Vec::new();
+    let give_back = |device: &Device, block: Option<crate::device::Buffer>| {
+        if let Some(b) = block {
             device.free(b);
         }
     };
     for (at, launch) in lowered.launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
         let Some(code) = modules.code(symbol) else {
-            give_back(device, blocks);
             return Err(Unfired::NoModule {
                 at,
                 symbol: symbol.to_owned(),
             });
         };
-        // Read per launch rather than cached per symbol. Measured on a real
-        // plan of 3992 rectangles over 19 distinct symbols: reading the
-        // module is a walk over a few thousand words and does not show
-        // against the pipeline builds. Caching it would be a `BTreeMap` whose
-        // entries borrow from `modules`, which is a lifetime this signature
-        // does not need to carry.
-        let declared = match crate::spirv::words(code).and_then(|w| crate::spirv::declared(&w)) {
-            Ok(d) => d,
-            Err(why) => {
-                give_back(device, blocks);
-                return Err(Unfired::Unreadable {
-                    at,
-                    symbol: symbol.to_owned(),
-                    why,
-                });
+        // Read once per SYMBOL, not once per launch.
+        //
+        // This was the other way round, and the note here said that reading a
+        // module is a walk over a few thousand words which does not show
+        // against the pipeline builds. That was measured, and it stopped
+        // being true when the pipelines started being cached: a fire whose
+        // pipelines are all built spends its time here instead. Measured on a
+        // qwen3 decode, 452 rectangles over 9 distinct symbols, with the
+        // parse timed separately -- 22 milliseconds of the 24 this pass cost
+        // were the same nine modules being read four hundred and fifty-two
+        // times.
+        //
+        // The map is keyed by a borrow of the plan's own symbol, which is why
+        // it costs no lifetime the signature did not already have: `Declared`
+        // is owned, and `plan_one` borrows it only for the call.
+        let declared = match read.entry(symbol) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                parsed += 1;
+                match crate::spirv::words(code).and_then(|w| crate::spirv::declared(&w)) {
+                    Ok(d) => e.insert(d),
+                    Err(why) => {
+                        return Err(Unfired::Unreadable {
+                            at,
+                            symbol: symbol.to_owned(),
+                            why,
+                        });
+                    }
+                }
             }
         };
         let planned_one = crate::dispatch::plan_one(
@@ -282,7 +337,7 @@ pub fn fire<R: Resolve, M: Modules>(
                     symbol,
                     [declared.local[0], declared.local[1], declared.local[2]],
                 ),
-                declared: &declared,
+                declared,
             },
             Sources {
                 arena,
@@ -294,7 +349,6 @@ pub fn fire<R: Resolve, M: Modules>(
         let d = match planned_one {
             Ok(d) => d,
             Err(why) => {
-                give_back(device, blocks);
                 return Err(Unfired::Unplannable {
                     at,
                     symbol: symbol.to_owned(),
@@ -303,42 +357,75 @@ pub fn fire<R: Resolve, M: Modules>(
             }
         };
         match &d.params {
-            Params::Block { bytes, .. } => match device.buffer(bytes) {
-                Ok(b) => blocks.push(Some(b)),
-                Err(why) => {
-                    give_back(device, blocks);
-                    return Err(Unfired::Refused { at, why });
+            Params::Block { bytes, .. } => {
+                // Aligned to what the device will address a storage buffer
+                // from, because these are bound as sub-ranges and
+                // `Bound::at` refuses any other offset -- rightly, since an
+                // unaligned descriptor is invalid rather than slow.
+                let align = device.min_storage_offset();
+                let pad = scalars.len() as u64 % align;
+                if pad != 0 {
+                    scalars.resize(scalars.len() + (align - pad) as usize, 0);
                 }
-            },
-            _ => blocks.push(None),
+                spans.push(Some((scalars.len() as u64, bytes.len() as u64)));
+                scalars.extend_from_slice(bytes);
+            }
+            _ => spans.push(None),
         }
         planned.push((symbol.to_owned(), d));
     }
 
+    // One allocation, or none when no rectangle in this fire states a block.
+    let block = if scalars.is_empty() {
+        None
+    } else {
+        match device.buffer(&scalars) {
+            Ok(b) => Some(b),
+            Err(why) => return Err(Unfired::Refused { at: 0, why }),
+        }
+    };
+
     // Passes two and three are a separate function so that every borrow of
-    // `blocks` -- and `Bound::whole` takes one per scalar block -- ends before
-    // the frees below. Written inline, the borrow checker is right to refuse:
-    // the recorded buffers name that memory, and freeing it while they do is
-    // the exact defect this shape exists to prevent.
+    // the block buffer -- and `Bound::at` takes one per scalar block -- ends
+    // before the free below. Written inline, the borrow checker is right to
+    // refuse: the recorded buffers name that memory, and freeing it while
+    // they do is the exact defect this shape exists to prevent.
     //
-    // Measured, so this is not a guess: moving the `give_back` below to before
-    // this line does not compile, and the message is `borrow of moved value:
-    // blocks`. The one ordering rule in this module that Vulkan will not
-    // enforce is the one Rust does.
+    // Measured, so this is not a guess: moving the `give_back` below to
+    // before this line does not compile. The one ordering rule in this module
+    // that Vulkan will not enforce is the one Rust does.
     let outcome = record(
         device,
         pipelines,
         modules,
         &planned,
-        &blocks,
+        Blocks {
+            block: block.as_ref(),
+            spans: &spans,
+        },
         tier,
         one_at_a_time,
-    );
+    )
+    // Filled in here because `record` never sees pass one. See `Fired`.
+    .map(|f| Fired { parsed, ..f });
     // After the fence and not before: `run_all` waits, so by here the queue
-    // is done with every block. This is the whole reason the blocks are owned
-    // by this function rather than returned.
-    give_back(device, blocks);
+    // is done with every block in it. This is the whole reason the buffer is
+    // owned by this function rather than returned.
+    give_back(device, block);
     outcome
+}
+
+/// Every scalar block of one fire, in one buffer.
+///
+/// A pair rather than two arguments because they are one thing: a span is
+/// meaningless without the buffer it indexes, and a buffer whose spans came
+/// from a different fire would bind whatever is at those offsets -- which are
+/// scalars, so it would be plausible numbers rather than a fault.
+struct Blocks<'a> {
+    /// `None` when no rectangle in the fire states a block.
+    block: Option<&'a crate::device::Buffer>,
+    /// Offset and length per planned rectangle, `None` where it pushes.
+    spans: &'a [Option<(u64, u64)>],
 }
 
 /// Build every pipeline, record every dispatch, submit once and wait.
@@ -347,16 +434,18 @@ fn record<M: Modules>(
     pipelines: &mut Pipelines,
     modules: &M,
     planned: &[(String, crate::dispatch::Dispatch<'_>)],
-    blocks: &[Option<crate::device::Buffer>],
+    scalars: Blocks<'_>,
     tier: Capability,
     one_at_a_time: bool,
 ) -> Result<Fired, Unfired> {
     // Pass two: every distinct module gets a pipeline, so that pass three can
     // hold a reference to all of them at once.
     let mut buffers = Vec::with_capacity(planned.len());
-    for (at, ((symbol, d), block)) in planned.iter().zip(blocks).enumerate() {
+    let Blocks { block, spans } = scalars;
+    let blocks = spans.iter().filter(|s| s.is_some()).count();
+    for (at, ((symbol, d), span)) in planned.iter().zip(spans).enumerate() {
         let mut b = d.buffers.clone();
-        if let Some(buf) = block {
+        if let Some((offset, len)) = *span {
             let Some(slot) = d.block_at else {
                 return Err(Unfired::Impossible {
                     at,
@@ -364,7 +453,20 @@ fn record<M: Modules>(
                     what: "its scalars are a block and the planner named no slot for it",
                 });
             };
-            b.insert(slot, Bound::whole(buf));
+            let Some(buf) = block else {
+                return Err(Unfired::Impossible {
+                    at,
+                    symbol: symbol.clone(),
+                    what: "its scalars name a span of a block buffer that was not allocated",
+                });
+            };
+            // The span and not the whole buffer. Every block of the fire is
+            // in there, so `WHOLE_SIZE` -- or a length past this one's --
+            // would let a shader reading one word too far read the NEXT
+            // rectangle's scalars, which are plausible numbers.
+            let bound =
+                Bound::at(device, buf, offset, len).map_err(|why| Unfired::Refused { at, why })?;
+            b.insert(slot, bound);
         }
         let push = match &d.params {
             Params::Push(p) => p.len() as u32,
@@ -409,6 +511,10 @@ fn record<M: Modules>(
         return Ok(Fired {
             dispatches: run.len(),
             submissions: run.len(),
+            blocks,
+            // Pass one's, and this function is passes two and three. The
+            // caller fills it.
+            parsed: 0,
         });
     }
     device
@@ -417,6 +523,8 @@ fn record<M: Modules>(
     Ok(Fired {
         dispatches: run.len(),
         submissions: 1,
+        blocks,
+        parsed: 0,
     })
 }
 

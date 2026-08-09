@@ -243,6 +243,10 @@ name = "device_archive"
 required-features = ["metal-4"]
 
 [[test]]
+name = "device_add_bias"
+required-features = ["metal-4"]
+
+[[test]]
 name = "device_checkpoint_names"
 required-features = ["metal-4"]
 

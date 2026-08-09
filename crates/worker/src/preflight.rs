@@ -8,6 +8,10 @@ use anyhow::{Result, anyhow};
 use crate::config::CudaNativeDriverOptions;
 #[cfg(feature = "driver-metal")]
 use crate::config::MetalDriverOptions;
+#[cfg(feature = "driver-vulkan")]
+use crate::config::VulkanDriverOptions;
+#[cfg(feature = "driver-wgpu")]
+use crate::config::WgpuDriverOptions;
 use crate::config::{self, DriverKind};
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::DriverOptions;
@@ -72,9 +76,11 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
 /// flavor was not compiled into this binary.
 pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlavor> {
     match kind {
-        DriverKind::CudaNative | DriverKind::Metal => Flavor::from_kind(kind)
-            .map(ResolvedFlavor::Embedded)
-            .map_err(|msg| anyhow!("model {model_name:?}: {msg}")),
+        DriverKind::CudaNative | DriverKind::Metal | DriverKind::Vulkan | DriverKind::Wgpu => {
+            Flavor::from_kind(kind)
+                .map(ResolvedFlavor::Embedded)
+                .map_err(|msg| anyhow!("model {model_name:?}: {msg}"))
+        }
     }
 }
 
@@ -86,7 +92,12 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
 /// model's list as a placeholder — the per-group spawn loop overwrites
 /// it with the right device for each DP replica.
 #[cfg_attr(
-    not(any(feature = "driver-cuda", feature = "driver-metal")),
+    not(any(
+        feature = "driver-cuda",
+        feature = "driver-metal",
+        feature = "driver-vulkan",
+        feature = "driver-wgpu"
+    )),
     allow(
         unused_variables,
         unreachable_code,
@@ -122,6 +133,31 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
                 .try_into()
                 .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
             Ok(DriverOptions::Metal(p))
+        }
+        #[cfg(feature = "driver-vulkan")]
+        Flavor::Vulkan => {
+            let v: VulkanDriverOptions = m
+                .driver
+                .options
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
+            // `model.driver.device` is not consulted. `Device::open` takes
+            // the first Vulkan device the loader reports, so filling a
+            // selector in here would be a setting nothing acts on.
+            Ok(DriverOptions::Vulkan(v))
+        }
+        #[cfg(feature = "driver-wgpu")]
+        Flavor::Wgpu => {
+            let w: WgpuDriverOptions = m
+                .driver
+                .options
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
+            // Nor here, and for the reason one arm up: `wgpu` asks the
+            // platform for an adapter itself.
+            Ok(DriverOptions::Wgpu(w))
         }
     }
 }

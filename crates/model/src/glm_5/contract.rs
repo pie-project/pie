@@ -33,9 +33,11 @@ pub fn author_glm5(b: &mut Builder<'_>) -> Result<(), Error> {
     // flashinfer's CUTLASS grouped GEMM reads fc1 as. Stating it here is the
     // whole point: the alternative is a driver-side block swap over the
     // largest tensor in the model, done after the loader has already placed
-    // it. `glm5_moe_gate_up_swapped()` on the forward side is this same
-    // constant, and the two have to agree — a load that swaps and a matmul
-    // that does not is silently wrong output, not a load error.
+    // it. `moe/flashinfer_moe.hpp` is what this has to agree with — "the
+    // runner reads the gate half from the *second* half of the fc1 output
+    // ... the opposite of pie's chunked_swiglu" — and a load that swaps
+    // while the matmul does not is silently wrong output, not a load
+    // error.
     hf_moe_expert_stacks(b, /*gate_second=*/ true, /*float_only=*/ true)?;
     // The dense tail, stated rather than bundled: a family's contract is
     // its pass sequence, and hiding three of them behind a helper meant
@@ -117,14 +119,13 @@ fn bf16_kv_b_proj(b: &mut Builder<'_>) -> Result<(), Error> {
         // reading a factor that describes another rank's rows.
         let (scale_local, scale_shape) = b.shard(factor_expr, factor_shape, axis);
         let scale_name = b.output_name(&factors.name);
-        if let Some(declared) = b.define(
+        let declared = b.define(
             scale_name.clone(),
             scale_local,
             f32enc.clone(),
             Some(scale_shape),
-        ) {
-            b.mark_internal(declared);
-        }
+        );
+        b.mark_internal(declared);
 
         // Bits/group left at 0 — "the scheme's default" — exactly as the C++
         // `quant_spec` states them, so the two authors' contracts compare
@@ -461,6 +462,57 @@ mod tests {
             kv_b_proj(&scalar_factor),
             Some(fp8()),
             "a rank-0 factor states no blocking at all"
+        );
+    }
+
+    /// And the ranks have to be a pair, on either side.
+    ///
+    /// `scale_per_block` reads the blocking off the RATIO of a
+    /// `[rows, cols]` weight to a `[row_blocks, col_blocks]` factor, so
+    /// each side has to be two-dimensional for there to be a ratio. A
+    /// rank-1 factor is the one exception and is promoted to `[rows, 1]`
+    /// above; nothing else can be recovered, because a third dimension
+    /// names a blocking the other side does not have.
+    ///
+    /// Declining rather than refusing is the same stance
+    /// [`an_fp8_weight_with_no_factors_is_left_alone`] takes: the weight
+    /// is published as it shipped and a pass that knows what the extra
+    /// dimension means may still claim it.
+    #[test]
+    fn a_rank_the_term_cannot_pair_is_declined_on_either_side() {
+        let stacked_weight = author_over(vec![
+            tensor(
+                1,
+                "model.layers.0.self_attn.kv_b_proj.weight",
+                vec![2, HIDDEN, LATENT],
+                fp8(),
+            ),
+            tensor(
+                2,
+                "model.layers.0.self_attn.kv_b_proj.weight_scale_inv",
+                vec![HIDDEN / 128, LATENT / 128],
+                f32e(),
+            ),
+        ]);
+        assert_eq!(
+            kv_b_proj(&stacked_weight),
+            Some(fp8()),
+            "a rank-3 weight has no single set of rows for the factor to \
+             describe"
+        );
+
+        let stacked_factor = author_over(checkpoint(
+            fp8(),
+            Some((
+                "weight_scale_inv",
+                vec![1, HIDDEN / 128, LATENT / 128],
+                f32e(),
+            )),
+        ));
+        assert_eq!(
+            kv_b_proj(&stacked_factor),
+            Some(fp8()),
+            "a rank-3 factor blocks a dimension the weight does not have"
         );
     }
 }

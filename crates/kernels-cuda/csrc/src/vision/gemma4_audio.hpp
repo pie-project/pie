@@ -135,15 +135,6 @@ struct Gemma4AudioInputs {
     int num_clips = 0;
 };
 
-// Encode each audio clip (audio tower → output_proj → embedder) and overwrite
-// the soft-token rows of `hidden` (bf16 `[n_rows, text_hidden]`) at each clip's
-// anchor row. No-op if `in.weights == nullptr` or `in.num_clips == 0`.
-void scatter_gemma4_audio(const Gemma4AudioInputs& in,
-                          __nv_bfloat16* hidden,
-                          int n_rows,
-                          int text_hidden,
-                          cudaStream_t stream = 0);
-
 void encode_gemma4_audio(const Gemma4AudioInputs& in,
                          std::uint16_t* output_rows_h,
                          std::size_t output_bytes,

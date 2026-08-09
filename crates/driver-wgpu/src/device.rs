@@ -1055,6 +1055,66 @@ impl Device {
         u64::from(self.limits.storage_offset)
     }
 
+    /// The largest buffer this driver could take AND bind, in bytes.
+    ///
+    /// # This is not a memory budget, because WebGPU has none to give
+    ///
+    /// `driver-vulkan`'s method of this name reads
+    /// `VkPhysicalDeviceMemoryProperties` and answers with the size of the
+    /// largest host-visible heap — a capacity. **Nothing on `wgpu` 30 answers
+    /// that question**, and the absence is a design decision of the WebGPU
+    /// spec rather than a gap in this crate's binding: device memory size is a
+    /// fingerprinting vector, so the API does not report it. Concretely, of
+    /// everything an adapter or a device will say here:
+    ///
+    /// * `Adapter::{features, limits, get_info, get_downlevel_capabilities,
+    ///   get_texture_format_features}` — capabilities and identity, no bytes;
+    /// * `Device::generate_allocator_report` — `total_allocated_bytes` and
+    ///   `total_reserved_bytes`, which are what is ALREADY taken and not what
+    ///   remains. Usage is not capacity: a device holding 100 MB may have
+    ///   100 MB free or twenty gigabytes. It also answers `None` on any
+    ///   backend that does not sub-allocate, so a ceiling built on it would
+    ///   be backend-dependent as well as wrong;
+    /// * `Device::get_internal_counters` — zero unless `wgpu`'s `counters`
+    ///   feature is on, and counters of objects rather than of bytes.
+    ///
+    /// `Adapter::as_hal::<Vulkan>()` would reach the real memory properties,
+    /// and it is refused twice over: it is an `unsafe fn`, which
+    /// `#![forbid(unsafe_code)]` makes unavailable in this crate, and it names
+    /// one backend, which is the whole of what this crate exists not to do.
+    ///
+    /// # So what this returns instead, and why it is the right number here
+    ///
+    /// The smaller of `max_buffer_size` and `max_storage_buffer_binding_size`
+    /// — a per-ALLOCATION cap, not a heap. It is the one bound on the cache
+    /// this adapter actually states, and it is a hard one: the KV cache is
+    /// `layers * 2` buffers, each bound whole as a storage buffer, so a pool
+    /// whose per-layer buffer passes either number can never be created on
+    /// this adapter no matter how idle the device is. [`Device::zeroed`]
+    /// refuses the first and [`Device::check`] the second, both by name.
+    ///
+    /// Both halves are needed because they are different numbers and usually
+    /// unequal: a device may hold a buffer it will not bind the whole of.
+    /// Taking only `max_buffer_size` would admit a pool that allocates and
+    /// then cannot be bound, which is a refusal met halfway through the first
+    /// attention rather than at admission.
+    ///
+    /// # What it therefore does NOT bound
+    ///
+    /// How much memory the device has. A pool under this number can still fail
+    /// to allocate, and on a discrete card it usually will long before it
+    /// reaches it — 2 GiB per buffer times fifty-six buffers is past every
+    /// consumer part. That is the direction [`crate::resources::Pool::ceiling`]
+    /// wants to err in, and its docs say why: too generous turns a permanent
+    /// refusal into a retried one, and too stingy makes a scheduler
+    /// permanently drop work the pool would have held.
+    #[must_use]
+    pub fn budget(&self) -> u64 {
+        self.limits
+            .buffer_size
+            .min(self.limits.storage_binding_size)
+    }
+
     /// Whether this adapter shares memory with the host.
     ///
     /// `DeviceType::IntegratedGpu` and `Cpu`. What [`crate::facts::of`] reports

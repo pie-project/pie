@@ -315,6 +315,16 @@ mod tests {
         float_only: bool,
         tp_size: u32,
     ) -> Result<ModelContract, Error> {
+        stack_with(tensors, gate_second, float_only, tp_size, Policy::default())
+    }
+
+    fn stack_with(
+        tensors: Vec<RawTensor>,
+        gate_second: bool,
+        float_only: bool,
+        tp_size: u32,
+        policy: Policy,
+    ) -> Result<ModelContract, Error> {
         let meta = CheckpointMetadata {
             files: Vec::new(),
             tensors,
@@ -325,7 +335,6 @@ mod tests {
             ..StorageTarget::default()
         };
         let encoding = StoredEncoding::dense();
-        let policy = Policy::default();
         let mut b = Builder::new(
             &meta,
             "moe-test",
@@ -337,6 +346,15 @@ mod tests {
         hf_moe_expert_stacks(&mut b, gate_second, float_only)?;
         b.publish_remaining()?;
         b.finish()
+    }
+
+    /// The policy that sends a layer down the GROUP path instead of the
+    /// stacking one.
+    fn streaming() -> Policy {
+        Policy {
+            stream_routed_experts: true,
+            ..Policy::default()
+        }
     }
 
     fn refusal(result: Result<ModelContract, Error>) -> String {
@@ -444,6 +462,129 @@ mod tests {
             leading(&up_first)[0].ends_with("0.up_proj.weight"),
             "gate_second=true puts the up first: {:?}",
             leading(&up_first)[0]
+        );
+    }
+
+    /// The GROUP path has its own `gate_second`, and it had never been
+    /// asked the other way.
+    ///
+    /// `gate_second_swaps_which_half_leads` exercises the STACKING path.
+    /// The streaming path builds a different expression -- two sharded
+    /// `SrcIndexed` reads joined per instance rather than E slabs
+    /// concatenated -- and its `gate_second` is a second, independent
+    /// decision. Every family that streams today passes `true`, so the
+    /// `false` leg had no caller: a swap of the two would have been
+    /// invisible in a build where deepseek-v4 and gpt-oss are the only
+    /// streamers, and would silu the up projection on the first family
+    /// that streams with the checkpoint order.
+    #[test]
+    fn the_group_path_answers_gate_second_the_same_way_the_stack_does() {
+        for (gate_second, leader) in [(false, "gate_proj"), (true, "up_proj")] {
+            let c = stack_with(
+                per_expert(EXPERTS, bf16()),
+                gate_second,
+                false,
+                1,
+                streaming(),
+            )
+            .expect("the group path publishes");
+            let group = c
+                .groups
+                .iter()
+                .find(|g| g.name.ends_with("mlp.experts"))
+                .expect("a routed group is published");
+            assert_eq!(group.arity, EXPERTS as u32);
+            let fused = group
+                .tensors
+                .iter()
+                .find(|t| t.name == "gate_up_proj")
+                .expect("the group fuses the two halves");
+            let json = serde_json::to_value(&fused.expr).expect("an expression serializes");
+            let mut srcs = Vec::new();
+            collect(&json, &mut srcs);
+            assert!(
+                srcs[0].ends_with(&format!("{leader}.weight")),
+                "gate_second={gate_second} should lead with {leader}, reads {srcs:?}"
+            );
+        }
+    }
+
+    /// The group path refuses an incomplete expert too, and by index.
+    ///
+    /// It walks the same three members, but through its OWN loop -- the
+    /// stacking path's refusal is a different line and covers nothing
+    /// here. A group that skipped the walk would publish an `arity` of E
+    /// over a checkpoint that ships fewer, and the driver would stride
+    /// past the end of the bank on the expert the router picked.
+    #[test]
+    fn the_group_path_refuses_an_incomplete_expert_and_says_which() {
+        for member in ["gate_proj", "up_proj", "down_proj"] {
+            let mut ck = per_expert(EXPERTS, bf16());
+            ck.retain(|raw| !raw.name.ends_with(&format!("experts.2.{member}.weight")));
+            let message = refusal(stack_with(ck, true, false, 1, streaming()));
+            assert!(
+                message.contains("layer 0") && message.contains("expert 2"),
+                "a missing {member} locates the hole: {message}"
+            );
+        }
+    }
+
+    /// A sub-byte encoding is refused rather than stacked.
+    ///
+    /// A stack is byte-run addressing over a new leading axis, and that is
+    /// not meaningful when elements straddle byte boundaries. Without the
+    /// check the join produces a slab whose declared extents describe more
+    /// elements than its bytes hold, and the loader reports a byte count
+    /// about the wrong tensor -- so the message names the one it read.
+    ///
+    /// `float_only` does NOT save it: the skip above tests the LOGICAL
+    /// dtype, and every packed expert this tree ships declares a logical
+    /// `bf16`. Both settings reach this refusal, which is why it is asked
+    /// for both.
+    #[test]
+    fn a_sub_byte_expert_is_refused_rather_than_stacked() {
+        let packed = Encoding::Quant(model_loader::types::QuantSpec {
+            scheme: model_loader::types::QuantScheme::AwqInt4,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: None,
+        });
+        for float_only in [false, true] {
+            let message = refusal(stack(
+                per_expert(EXPERTS, packed.clone()),
+                false,
+                float_only,
+                1,
+            ));
+            assert!(
+                message.contains("non-affine packed encoding") && message.contains("experts.0"),
+                "float_only={float_only} should still refuse, naming the tensor: {message}"
+            );
+        }
+    }
+
+    /// `float_only` skips on the LOGICAL dtype, which is the only thing
+    /// the skip can see before the stack is built.
+    ///
+    /// An f32 expert is left in its per-expert layout rather than joined.
+    /// Skipping is a different answer from refusing, and the flag exists
+    /// for families that would rather bind E slabs than fail the load.
+    #[test]
+    fn float_only_leaves_a_non_half_expert_in_its_per_expert_layout() {
+        let f32s = Encoding::Raw(DType::F32);
+        let c = stack(per_expert(EXPERTS, f32s.clone()), false, true, 1)
+            .expect("float_only skips rather than refusing");
+        assert!(
+            shaped(&c, "mlp.experts.gate_up_proj").is_none(),
+            "a skipped layer publishes no stack"
+        );
+        // Without the flag the same checkpoint IS stacked, so the skip is
+        // the flag's doing and not the dtype's.
+        let c = stack(per_expert(EXPERTS, f32s), false, false, 1).expect("stacks");
+        assert_eq!(
+            shaped(&c, "mlp.experts.gate_up_proj"),
+            Some(vec![EXPERTS, 2 * INTER, HIDDEN])
         );
     }
 

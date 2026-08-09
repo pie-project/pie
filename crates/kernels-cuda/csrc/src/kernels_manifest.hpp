@@ -125,46 +125,27 @@ inline bool native_mxfp4_moe_opt_in() {
     return on;
 }
 
+// Always no, and the vendored trees that could once have said yes are gone.
+// Measured in §46: `third_party/marlin_moe`'s two exported functions had zero
+// callers anywhere, and the capability this function answers was the ONLY
+// stated reason the tree was still compiled -- 156 KB of CUDA on every default
+// build. The chain behind that answer had four hops and the last one is a
+// constant: this conjunct required `PIE_CUDA_HAS_MARLIN` as well, which
+// defaults OFF while `PIE_CUDA_HAS_MARLIN_MOE` defaults ON (the comment this
+// replaces explains that the conjunction was ADDED because the defaults
+// disagreeing made a default build "plan something it could not execute"); and
+// even with both ON, `model-loader/src/plan.rs:194` and `:214` hard-code
+// `native_mxfp4_moe: false` in BOTH constructors, with
+// `driver-cuda/src/weights/plan.rs:147` asserting it stays false because "the
+// native GEMM would want a Marlin repack no kernel here implements".
+//
+// So no configuration of this tree ever reached the lowering. The function
+// stays -- `:215` below still asks it, and a caller reading `false` from a
+// named question is clearer than a caller that stopped asking -- but it is now
+// the constant it always was in practice.
 constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
-// The expert-indexed MoE GEMM is only half of what this answer promises.
-// Saying yes makes the LOADER plan a marlin MXFP4 lowering, and that
-// lowering's repack lives behind `PIE_CUDA_HAS_MARLIN`
-// (`loader/transcode_engine.hpp`) with no MoE-specific alternative. The
-// two options default apart — `PIE_CUDA_BUILD_MARLIN_MOE` is ON,
-// `PIE_CUDA_BUILD_MARLIN` is OFF — so a DEFAULT build answered yes here
-// and then threw "MarlinMxfp4Weight Repack requires Marlin" at load,
-// which is to say it planned something it could not execute. Ask for
-// both, and a build with only the MoE half falls back to the routed
-// decode path instead of failing to load an MXFP4 checkpoint at all.
-#if defined(PIE_CUDA_HAS_MARLIN_MOE) && defined(PIE_CUDA_HAS_MARLIN)
-    // sm_80 stays IN, as it was, but note what that used to mean: until the two
-    // lowering bugs fixed alongside this comment, native MXFP4 was the DEFAULT
-    // on Ampere and it produced garbage there -- the same failure quarantined
-    // for sm_100 below, from the same two architecture-independent causes.
-    // With those fixed, sm_80 measures 0/64 degenerate requests at 32-wide and
-    // 0/16 at concurrency 1 under a per-request distinct-word gate.
-    //
-    // Which lowering is FASTER is a workload question, not a device one, and
-    // the answer is split. On gpt-oss-20b, A100:
-    //
-    //     single-stream (5 reps)   native 159.13   routed-dequant 201.93
-    //     throughput 64/32/256     native 626.91   routed-dequant 492.7
-    //
-    // matching `bench/moe_bench.cu`, where Marlin trails the per-route GEMV at
-    // N=1 (0.0395 vs 0.0316 ms) and only pulls ahead from about N=8 (3.44x at
-    // N=32, 6.58x at N=64). The two are mutually exclusive -- publishing the
-    // native slabs gives up the routed-dequant slabs for the life of the model
-    // -- so a latency-bound deployment on Ampere may well want
-    // `PIE_CUDA_NATIVE_MXFP4_MOE=0`. Left at the existing default rather than
-    // flipped, because that is a deployment policy call and not mine to make
-    // from a benchmark.
-    return cc_major >= 8;
-#elif defined(PIE_CUDA_HAS_MARLIN)
-    return cc_major >= 10;
-#else
     (void)cc_major;
     return false;
-#endif
 }
 
 // The Marlin MXFP4 MoE kernels produce WRONG VALUES on sm_100.

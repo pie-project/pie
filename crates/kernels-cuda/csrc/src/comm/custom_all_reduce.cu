@@ -1,7 +1,10 @@
 #include "comm/custom_all_reduce.hpp"
 
-#include <cstring>
-#include <cstdlib>
+// `<cstring>` and `<cstdlib>` were here for the three deleted `getenv`
+// helpers below -- `std::strtol`, `std::strcmp`, `std::getenv` -- and this
+// file uses neither header for anything else. The include going is the
+// selector going: an unused `<cstdlib>` is how the next `getenv` gets written
+// without anyone noticing a new dependency.
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -86,94 +89,53 @@ std::size_t align_up(std::size_t n, std::size_t a) {
     return ((n + a - 1) / a) * a;
 }
 
-int env_int_clamped(const char* name, int fallback, int lo, int hi) {
-    const char* v = std::getenv(name);
-    if (v == nullptr || *v == '\0') return fallback;
-    char* end = nullptr;
-    const long parsed = std::strtol(v, &end, 10);
-    if (end == v) return fallback;
-    if (parsed < lo) return lo;
-    if (parsed > hi) return hi;
-    return static_cast<int>(parsed);
-}
+// # Three `getenv` readers used to sit here, and NOTHING called them
+//
+// `env_int_clamped`, `env_warp_multiple_clamped` and `env_bool_default` took
+// the variable's NAME as a parameter, so unlike the rest of the audited sites
+// they did not even name a knob -- they were a knob mechanism with no knob
+// attached. Every caller had already gone: the only call anywhere in the
+// repository was `env_warp_multiple_clamped`'s own call to `env_int_clamped`,
+// so the three were a closed unreachable cycle, and `<cstdlib>` above stayed
+// only to serve them.
+//
+// Deleted rather than kept for a future caller, because a future caller is
+// exactly the failure: the next person to want a knob in this file would have
+// found a ready-made `getenv` helper sitting in the same anonymous namespace
+// as the all-reduce launchers and used it, which is how a comm path acquires
+// an unrecorded selector. Measured, since dead code deserves the same bar as
+// live code -- the translation unit rebuilt with the archive's own flags
+// (nvcc 13.0, sm_89, no `-g`, so DWARF line numbers cannot mask the
+// comparison) loses EXACTLY four symbols and gains none:
+//
+//   T …(anonymous namespace)::env_bool_default(char const*, bool)
+//   T …(anonymous namespace)::env_int_clamped(char const*, int, int, int)
+//   T …(anonymous namespace)::env_warp_multiple_clamped(char const*, int, int, int)
+//   U __isoc23_strtol            <- the only external they pulled in
+//
+// 11,336 -> 11,332 symbols, `.text` 45,872 -> 45,442 B, and the `.nv_fatbin`
+// -- every `__global__` this file compiles -- is BYTE-IDENTICAL at 1,118,208
+// bytes. The archive builds at `-O0`, so these were emitted rather than
+// dropped, which is the point: they were reachable to a linker and to a
+// reader, and to nothing else. §36 has the run.
 
-int env_warp_multiple_clamped(const char* name, int fallback, int lo, int hi) {
-    int value = env_int_clamped(name, fallback, lo, hi);
-    value = (value / 32) * 32;
-    if (value < lo) value = lo;
-    return value;
-}
-
-bool env_bool_default(const char* name, bool fallback) {
-    const char* v = std::getenv(name);
-    if (v == nullptr || *v == '\0') return fallback;
-    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
-        std::strcmp(v, "FALSE") == 0) {
-        return false;
-    }
-    return true;
-}
-
-template <int BLOCK>
-__global__ __launch_bounds__(BLOCK, 1)
-void cross_device_reduce_residual_rmsnorm_1stage_exact_bf16(
-    vllm::RankData* rank_data,
-    vllm::RankSignals signals,
-    vllm::Signal* self_signal,
-    __nv_bfloat16* __restrict__ hidden,
-    const __nv_bfloat16* __restrict__ gamma,
-    __nv_bfloat16* __restrict__ norm_out,
-    int rank,
-    int tokens,
-    int hidden_size,
-    float eps)
-{
-    const auto ptrs = *rank_data;
-    vllm::multi_gpu_barrier<2, true>(signals, self_signal, rank);
-
-    __shared__ float buf[BLOCK];
-    for (int row = blockIdx.x; row < tokens; row += gridDim.x) {
-        __nv_bfloat16* hr = hidden + row * hidden_size;
-        __nv_bfloat16* nr = norm_out + row * hidden_size;
-        const __nv_bfloat16* g = gamma;
-        const __nv_bfloat16* rank0 =
-            static_cast<const __nv_bfloat16*>(ptrs.ptrs[0]) +
-            row * hidden_size;
-        const __nv_bfloat16* rank1 =
-            static_cast<const __nv_bfloat16*>(ptrs.ptrs[1]) +
-            row * hidden_size;
-
-        float local = 0.f;
-        for (int i = threadIdx.x; i < hidden_size; i += BLOCK) {
-            const float reduced =
-                __bfloat162float(rank0[i]) + __bfloat162float(rank1[i]);
-            const __nv_bfloat16 reduced_bf16 = __float2bfloat16(reduced);
-            const float sum =
-                __bfloat162float(hr[i]) + __bfloat162float(reduced_bf16);
-            const __nv_bfloat16 rounded = __float2bfloat16(sum);
-            hr[i] = rounded;
-            const float v = __bfloat162float(rounded);
-            local += v * v;
-        }
-
-        buf[threadIdx.x] = local;
-        __syncthreads();
-        for (int off = BLOCK / 2; off > 0; off >>= 1) {
-            if (threadIdx.x < off) buf[threadIdx.x] += buf[threadIdx.x + off];
-            __syncthreads();
-        }
-
-        const float inv_rms =
-            rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
-        for (int i = threadIdx.x; i < hidden_size; i += BLOCK) {
-            nr[i] = __float2bfloat16(
-                __bfloat162float(hr[i]) * inv_rms * __bfloat162float(g[i]));
-        }
-        __syncthreads();
-    }
-
-    vllm::multi_gpu_barrier<2, false>(signals, self_signal, rank);
-}
+// # This file launches nothing now, and that is the finding
+//
+// `cross_device_reduce_residual_rmsnorm_1stage_exact_bf16` sat here -- the
+// only `__global__` this translation unit ever held, a one-stage TP=2
+// all-reduce fused with a residual add and an RMSNorm, "exact" because it
+// rounded to bf16 between the two adds where the TRT-LLM path keeps fp32
+// accumulation. Its only caller was
+// `CustomAllReduce::all_reduce_residual_rmsnorm_bf16_exact` below, and that
+// method's only caller was nothing at all: no shim entry, no row, no `.cu`,
+// no test. §41's transitive audit is what said so -- a one-hop check saw a
+// caller and stopped. Deleted with the method and its two declarations.
+//
+// What stays is the FUSED path that is reached:
+// `all_reduce_residual_rmsnorm_bf16` hands `AllReduceFusionPattern::
+// kARResidualRMSNorm` to flashinfer's own launcher, which brings its own
+// device text. So this file is a dispatcher over vendored kernels and holds
+// no `<<<>>>` of its own, which is what `sources.rs`' census now records.
 
 // ---- fused all-reduce dispatch -------------------------------------------
 // flashinfer's own allreduce_fusion_op() switches over every AllReduceFusion
@@ -697,62 +659,6 @@ void CustomAllReduce::all_reduce_residual_rmsnorm_bf16(
     constexpr bool use_fp32_acc = true;
     CUDA_CHECK((pie_allreduce_fusion_op<__nv_bfloat16>(
         params, /*launch_with_pdl=*/false, use_fp32_acc)));
-}
-
-void CustomAllReduce::all_reduce_residual_rmsnorm_bf16_exact(
-    const void* input,
-    void* residual_inout,
-    const void* rms_gamma,
-    void* norm_out,
-    int tokens,
-    int hidden,
-    float eps,
-    cudaStream_t stream)
-{
-    if (!can_fuse_residual_rmsnorm(tokens, hidden, stream)) {
-        throw std::runtime_error(
-            "custom_all_reduce: exact fused residual RMSNorm is unavailable");
-    }
-    if (world_size_ != 2) {
-        throw std::runtime_error(
-            "custom_all_reduce: exact fused residual RMSNorm requires TP=2");
-    }
-    if (input == norm_out) {
-        throw std::runtime_error(
-            "custom_all_reduce: exact fused residual RMSNorm requires "
-            "distinct input and norm output buffers");
-    }
-
-    vllm::RankData* ptrs = nullptr;
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
-    if (status == cudaStreamCaptureStatusActive) {
-        ptrs = impl_->d_rank_data_base_ + impl_->graph_unreg_buffers_.size();
-        impl_->graph_unreg_buffers_.push_back(const_cast<void*>(input));
-    } else {
-        auto it = impl_->buffers_.find(const_cast<void*>(input));
-        if (it == impl_->buffers_.end()) {
-            throw std::runtime_error(
-                "custom_all_reduce: exact fused residual RMSNorm input "
-                "buffer is not registered");
-        }
-        ptrs = it->second;
-    }
-
-    constexpr int kBlock = 256;
-    const int blocks = std::max(1, std::min(vllm::kMaxBlocks, tokens));
-    cross_device_reduce_residual_rmsnorm_1stage_exact_bf16<kBlock>
-        <<<blocks, kBlock, 0, stream>>>(
-            ptrs,
-            impl_->sg_,
-            impl_->self_sg_,
-            static_cast<__nv_bfloat16*>(residual_inout),
-            static_cast<const __nv_bfloat16*>(rms_gamma),
-            static_cast<__nv_bfloat16*>(norm_out),
-            rank_,
-            tokens,
-            hidden,
-            eps);
 }
 
 }  // namespace pie_cuda_driver::kernels::comm

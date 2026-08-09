@@ -40,37 +40,9 @@ bool gemv_bf16(
     // against 11.2 for the same bytes through this kernel.
     float beta = 0.f);
 
-// q/k/v in one launch: same activation, same K, three weights and three row
-// counts. Row-per-block with the warps splitting K, so the two small
-// projections inherit the grid of the large one instead of running alone.
-// Returns false and touches nothing if any argument is unsuitable.
-// Sweep entry point for the microbenchmark: selects the row-per-warp GEMV's
-// rows-per-block and unroll depth explicitly. Returns false for combinations
-// that were not instantiated. Not for engine use -- the shipping path is
-// gemv_bf16.
-bool gemv_bf16_tuned(
-    const void* weight, const void* act, const void* bias, void* out,
-    int N, int K, int warps, int unroll, cudaStream_t stream);
-
-// Sweep entry point for the split-K form's warps-per-block. Microbenchmark
-// only; the shipping path is gemv_bf16.
-bool gemv_splitk_tuned(
-    const void* weight, const void* act, const void* bias, void* out,
-    int N, int K, int warps, int unroll, cudaStream_t stream);
-
-// Sweep entry point for the microbenchmark.
-bool gemv3_bf16_tuned(
-    const void* w0, const void* w1, const void* w2,
-    const void* act, void* o0, void* o1, void* o2,
-    int n0, int n1, int n2, int K, int warps, int unroll,
-    cudaStream_t stream);
-
-bool gemv3_bf16(
-    const void* w0, const void* w1, const void* w2,
-    const void* b0, const void* b1, const void* b2,  // may be null
-    void* o0, void* o1, void* o2,
-    const void* act,
-    int n0, int n1, int n2, int K,
-    cudaStream_t stream);
+// `gemv3_bf16` and the three `_tuned` sweep entry points were declared here.
+// All four are deleted: no caller anywhere in the worktree, no table row, and
+// no harness -- `gemv.cu`'s tail records the per-name evidence. `gemv_bf16` is
+// the file's whole surface now, and `gemm/gemm.cpp` is its whole consumer set.
 
 }  // namespace pie_cuda_driver::kernels::gemm

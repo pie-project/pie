@@ -880,6 +880,8 @@ fn the_mxfp4_expert_bank_reads_a_bias_and_is_handed_one() {
 fn the_bias_add_is_handed_the_width_it_derives() {
     let facts = LlamaLikeFacts {
         qkv_bias: true,
+        o_bias: false,
+        router_bias: false,
         // qwen-2 has no q/k norm. Left on, a norm would sit between the
         // projection and the bias and this would prove nothing about either.
         qk_norm: model::shared::llama_like::spec::QkNorm::Off,

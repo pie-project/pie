@@ -110,15 +110,12 @@ public:
         int hidden,
         float eps,
         cudaStream_t stream);
-    void all_reduce_residual_rmsnorm_bf16_exact(
-        const void* input,
-        void* residual_inout,
-        const void* rms_gamma,
-        void* norm_out,
-        int tokens,
-        int hidden,
-        float eps,
-        cudaStream_t stream);
+    // `all_reduce_residual_rmsnorm_bf16_exact` was declared here: the same
+    // fusion with a bf16 round between the two adds, TP=2 only, carrying the
+    // one `__global__` this family ever compiled. Nothing called it -- no
+    // shim entry, no row, no `.cu`, no test -- and its own caller-set was
+    // empty rather than merely small, which is what `new-horizon.md` §41's
+    // transitive audit measured and a one-hop check could not.
 
 private:
     int rank_ = 0;

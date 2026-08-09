@@ -139,14 +139,36 @@ fn every_new_kind_renders_in_every_emitter() {
     // know the kind — `arg_value_variant` returning `None` would silently
     // drop the row's arm, and `runtime::args` refusing the kind would fail
     // the fire — which is why the same probe row is emitted twice.
+    //
+    // THE ADDRESS TYPE IS PART OF THE CLAIM. `ArgValue::Ptr` holds a
+    // `*mut c_void`, and every routed row until `layout::gather_bf16_rows`
+    // bound its pointers from `b.args[..].ptr`, which already is one — so
+    // the emitter got away with passing the expression through untouched and
+    // the first row reading a driver context field (`ctx.sampling_indices:
+    // *const i32`) produced `types differ in mutability` IN A GENERATED
+    // FILE. The cast is asserted here rather than left to whichever row
+    // happens to be routed, because that is exactly what went wrong: the
+    // property held by accident for three months and nothing said so.
     let jit = abi::emit_rust_dispatch(&[PROBE_TABLE], &[&PROBE_JIT]);
     for (kind, expr) in [
-        ("Bf16s", "crate::bind::device::ArgValue::Ptr(b.args[0].ptr)"),
-        ("F16s", "crate::bind::device::ArgValue::Ptr(b.args[1].ptr)"),
-        ("I8sMut", "crate::bind::device::ArgValue::Ptr(b.args[n_in + 0].ptr)"),
+        ("Bf16s", "crate::bind::device::ArgValue::Ptr((b.args[0].ptr) as *mut ::core::ffi::c_void)"),
+        ("F16s", "crate::bind::device::ArgValue::Ptr((b.args[1].ptr) as *mut ::core::ffi::c_void)"),
+        (
+            "I8sMut",
+            "crate::bind::device::ArgValue::Ptr((b.args[n_in + 0].ptr) as *mut ::core::ffi::c_void)",
+        ),
     ] {
         assert!(jit.contains(expr), "the JIT arm did not bind {kind} as a pointer:\n{jit}");
     }
+    // A `Ptr` THAT IS NOT AN ADDRESS is the failure the three pins above
+    // would miss if a fourth kind arrived: they name three operands, and a
+    // new one binds without them. This says the property about ALL of them.
+    assert!(
+        !jit.lines().any(|line| line.contains("ArgValue::Ptr(")
+            && !line.contains("as *mut ::core::ffi::c_void")),
+        "a `Ptr` operand reached the JIT arm without the address cast, so its \
+         Rust type is whatever the source expression happened to be:\n{jit}"
+    );
 
     // The device typecheck's function-pointer parameters, from a REAL row.
     // `elem` here is `device::f16` and the emitted `bf16` therefore cannot

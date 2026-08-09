@@ -1143,7 +1143,7 @@ mod tests {
 /// distinct names and indistinguishable manifests is precisely the
 /// defect `Unmatched::Ambiguous` exists to report.
 #[cfg(all(test, feature = "contract"))]
-mod identify_tests {
+pub(crate) mod identify_tests {
     use super::*;
     use crate::manifest::Presence;
     use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
@@ -1159,7 +1159,7 @@ mod identify_tests {
     /// `Absent` rows are dropped and `Optional` ones kept: an optional
     /// name matches either way, and including it exercises the arm that
     /// must not turn a match into a miss.
-    fn checkpoint_of(row: &dyn Variant) -> CheckpointMetadata {
+    pub(crate) fn checkpoint_of(row: &dyn Variant) -> CheckpointMetadata {
         let manifest = row.manifest();
         let tensors = manifest
             .tensors

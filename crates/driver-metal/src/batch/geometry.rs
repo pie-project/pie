@@ -229,25 +229,27 @@ pub struct DecodeGeometry {
     /// flag because they agree today is how the fold got read off the
     /// sandwich.
     pub v_norm: bool,
-    /// The rope RESCALING, when the config states one, or zero for a plain
+    /// The rope RESCALING, when the row states one, or `None` for a plain
     /// geometric ladder.
     ///
-    /// Four numbers rather than a kind string because they are what the
-    /// derivation needs and a `DecodeGeometry` is compared field for field. A
-    /// factor of zero is "no rescaling" and the other three are then unread.
+    /// No `rope_theta` expresses a rescaled ladder, which is why the driver
+    /// derives a TABLE and answers it as `Source::RopeFrequencies`; this is
+    /// the input to that derivation and [`crate::model::rope::frequencies`]
+    /// is the whole of it.
     ///
-    /// llama-3 rescales piecewise: frequencies whose wavelength exceeds
-    /// `original_max / low` are divided by the factor, those under
-    /// `original_max / high` are left alone, and the band between is
-    /// interpolated. No `rope_theta` expresses that, which is why the driver
-    /// derives a TABLE and answers it as `Source::RopeFrequencies`.
-    pub rope_freq_factor: f32,
-    /// See [`Self::rope_freq_factor`].
-    pub rope_low_freq_factor: f32,
-    /// See [`Self::rope_freq_factor`].
-    pub rope_high_freq_factor: f32,
-    /// See [`Self::rope_freq_factor`].
-    pub rope_original_max_position: u32,
+    /// It was FOUR SCALARS -- `factor`, `low`, `high`, `original_max` --
+    /// which is llama-3's recipe flattened, and llama-3's alone. The row has
+    /// stated a `RopeScaling` ENUM the entire time, so this field and the row
+    /// held two readings of one fact and only one of them could represent a
+    /// YaRN checkpoint. The other reading answered `Some(Yarn)` by refusing
+    /// the load: honest, and it meant every gpt-oss reached the last reader
+    /// of its config and was turned away there. The enum is the row's
+    /// reading and both kinds land in it.
+    ///
+    /// YaRN's `attention_factor` is NOT here, for the reason
+    /// [`crate::model::rope::Rescale`] gives: it scales the attention
+    /// logits, not the ladder, and travels as a fact of the TEXT.
+    pub rope_rescale: Option<crate::model::rope::Rescale>,
     /// GDN key heads.
     pub gdn_k_heads: u32,
     /// GDN value heads.
@@ -307,10 +309,7 @@ impl Default for DecodeGeometry {
             kv_shared_layers: 0,
             norm_unit_offset: true,
             v_norm: false,
-            rope_freq_factor: 0.0,
-            rope_low_freq_factor: 0.0,
-            rope_high_freq_factor: 0.0,
-            rope_original_max_position: 0,
+            rope_rescale: None,
             gdn_k_heads: 16,
             gdn_v_heads: 16,
             gdn_k_dim: 128,
@@ -932,34 +931,46 @@ pub fn geometry_from_deployment(
     // FAIL that way. It attends past its trained 8192 with the wrong
     // wavelengths and degrades fluently, which is the defect the catalog
     // exists to make unrepresentable. The row states it now.
-    let (rope_freq_factor, rope_low_freq_factor, rope_high_freq_factor, rope_original_max_position) =
-        match d.rope_scaling {
-            Some(RopeScaling::Piecewise {
-                factor,
-                low_freq_factor,
-                high_freq_factor,
-                original_max_position,
-            }) => (
-                factor,
-                low_freq_factor,
-                high_freq_factor,
-                original_max_position,
-            ),
-            // REFUSED rather than zeroed. The old reader took `kind ==
-            // "llama3"` and gave everything else a factor of zero, which is
-            // indistinguishable from a model that rescales nothing — so a
-            // YaRN checkpoint served silently wrong. This driver derives the
-            // piecewise table and no other, and the honest way to say that is
-            // to decline the load.
-            Some(RopeScaling::Yarn { .. }) => {
-                return refuse(
-                    "a YaRN-rescaled rope ladder: this driver derives only llama-3's \
-                     piecewise table (rope_type `llama3`), and zeroing YaRN's factor \
-                     would serve the model with an unrescaled ladder rather than refuse it",
-                );
-            }
-            None => (0.0, 0.0, 0.0, 0),
-        };
+    let rope_rescale = match d.rope_scaling {
+        Some(RopeScaling::Piecewise {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position,
+        }) => Some(crate::model::rope::Rescale::Piecewise {
+            factor,
+            low: low_freq_factor,
+            high: high_freq_factor,
+            original_max: original_max_position as f32,
+        }),
+        // A TRANSLATION now, and it was a refusal.
+        //
+        // The refusal was right for as long as it stood: the reader before
+        // it asked `kind == "llama3"` and gave everything else a factor of
+        // zero, which is indistinguishable from a model that rescales
+        // nothing, so a YaRN checkpoint was served silently wrong. Declining
+        // is better than that. But it named exactly one missing thing -- the
+        // YaRN derivation -- and `model::rope::Rescale::Yarn` is now it, so
+        // there is nothing left to decline.
+        //
+        // `attention_factor` is stated by the row and read nowhere here. It
+        // is not a property of the ladder; see the field's doc.
+        Some(RopeScaling::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max_position,
+            truncate,
+            attention_factor: _,
+        }) => Some(crate::model::rope::Rescale::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max: original_max_position as f32,
+            truncate,
+        }),
+        None => None,
+    };
 
     Ok(DecodeGeometry {
         n_layers,
@@ -984,10 +995,7 @@ pub fn geometry_from_deployment(
         rotary_dims: d.attention[0].rotary_dim,
         rope_theta: full_theta,
         rope_theta_sliding: sliding_theta,
-        rope_freq_factor,
-        rope_low_freq_factor,
-        rope_high_freq_factor,
-        rope_original_max_position,
+        rope_rescale,
         full_attn_every,
         sliding_window,
         full_attn_interval,
@@ -1700,42 +1708,56 @@ mod tests {
         });
         let g = geometry_from_deployment(&d, shape(4), AffineFormat::default())
             .expect("a rescaled llama-3 is an ordinary stack");
-        assert_eq!(g.rope_freq_factor, 32.0, "a zero here is `no rescaling`");
-        assert_eq!(g.rope_low_freq_factor, 1.0);
-        assert_eq!(g.rope_high_freq_factor, 4.0);
-        assert_eq!(g.rope_original_max_position, 8_192);
+        assert_eq!(
+            g.rope_rescale,
+            Some(crate::model::rope::Rescale::Piecewise {
+                factor: 32.0,
+                low: 1.0,
+                high: 4.0,
+                original_max: 8_192.0,
+            }),
+            "a `None` here is `no rescaling`"
+        );
         // The base is untouched by the rescaling: the table is derived FROM
         // the ladder this builds, not instead of it.
         assert_eq!(g.rope_theta, 500_000.0);
     }
 
-    /// A stack that states no rescaling gets zeroes, and that is a
+    /// A stack that states no rescaling gets `None`, and that is a
     /// STATEMENT rather than a gap.
+    ///
+    /// It used to be four zeroes, which is the same statement spelled so
+    /// that a gap could not be told from it: a field nobody wrote and a
+    /// field written with "nothing to do" both read `0.0`, and that is
+    /// exactly how every llama-3 nearly shipped with an unrescaled ladder.
+    /// An `Option` cannot be left unwritten.
     #[test]
-    fn an_unrescaled_ladder_is_four_zeroes_and_means_it() {
+    fn an_unrescaled_ladder_is_none_and_means_it() {
         let g = geometry_from_deployment(&dense(4), shape(4), AffineFormat::default())
             .expect("an unrescaled stack is ordinary");
-        assert_eq!(
-            (
-                g.rope_freq_factor,
-                g.rope_low_freq_factor,
-                g.rope_high_freq_factor
-            ),
-            (0.0, 0.0, 0.0)
-        );
-        assert_eq!(g.rope_original_max_position, 0);
+        assert_eq!(g.rope_rescale, None);
     }
 
-    /// YaRN is REFUSED, not zeroed.
+    /// YaRN reaches the geometry whole, and is not flattened to "no
+    /// rescaling".
     ///
-    /// The old reader asked `kind == "llama3"` and gave every other kind a
-    /// factor of zero — which this file cannot tell apart from a checkpoint
-    /// that rescales nothing, so a YaRN model served silently wrong. OLMo 3
-    /// is the row that reaches here: dense, paged, one head dim, one window,
-    /// ordinary by every other measure. The refusal names the kind and says
-    /// what this driver does derive.
+    /// THIS TEST DEMANDED A REFUSAL, and the refusal was the right answer
+    /// for as long as `DecodeGeometry` held llama-3's four scalars and
+    /// nothing else: the reader before that asked `kind == "llama3"` and
+    /// gave every other kind a factor of zero, which this file cannot tell
+    /// apart from a checkpoint that rescales nothing, so a YaRN model
+    /// served silently wrong. Declining beat that.
+    ///
+    /// What the refusal did NOT beat is deriving the ladder, and it named
+    /// the one missing piece itself. `model::rope::Rescale::Yarn` is that
+    /// piece, so the claim here is the stronger half of what was being
+    /// asked: the five numbers arrive, unflattened and unrounded, and the
+    /// thing still forbidden is the zeroing.
+    ///
+    /// OLMo 3's numbers, which is the row that reaches here: dense, paged,
+    /// one head dim, one window, ordinary by every other measure.
     #[test]
-    fn a_yarn_rescaled_ladder_is_refused_rather_than_flattened_to_no_rescaling() {
+    fn a_yarn_rescaled_ladder_reaches_the_geometry_rather_than_flattening_to_none() {
         let mut d = dense(4);
         d.rope_scaling = Some(RopeScaling::Yarn {
             factor: 8.0,
@@ -1743,19 +1765,33 @@ mod tests {
             beta_slow: 1.0,
             attention_factor: 1.207_944_2,
             original_max_position: 8_192,
+            truncate: true,
         });
-        let refused = geometry_from_deployment(&d, shape(4), AffineFormat::default())
-            .expect_err("this driver derives no YaRN table");
-        assert!(refused.0.contains("YaRN"), "{}", refused.0);
-        assert!(
-            refused.0.contains("llama3"),
-            "names what it DOES derive: {}",
-            refused.0
+        let g = geometry_from_deployment(&d, shape(4), AffineFormat::default())
+            .expect("a YaRN row is an ordinary stack");
+        assert_eq!(
+            g.rope_rescale,
+            Some(crate::model::rope::Rescale::Yarn {
+                factor: 8.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max: 8_192.0,
+                truncate: true,
+            }),
+            "a `None` here is the silent zeroing this refused for"
         );
-        // And it is not the shape that was objected to: the same stack
-        // without the rescaling projects.
-        d.rope_scaling = None;
-        assert!(geometry_from_deployment(&d, shape(4), AffineFormat::default()).is_ok());
+        // And the ladder it builds is NOT the unrescaled one, which is the
+        // defect the refusal existed to prevent. The slowest channel is the
+        // one the factor divides.
+        let plain = crate::model::rope::frequencies(g.head_dim, g.rope_theta, None);
+        let scaled = crate::model::rope::table(&g);
+        let last = plain.len() - 1;
+        assert!(
+            (scaled[last] - plain[last] / 8.0).abs() / (plain[last] / 8.0) < 1e-5,
+            "the slow end must divide by 8: {} vs {}",
+            scaled[last],
+            plain[last]
+        );
     }
 
     /// Every catalog row this driver's text serves reaches an answer, and

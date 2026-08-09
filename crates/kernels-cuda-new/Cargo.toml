@@ -163,10 +163,6 @@ required-features = ["_cuda"]
 name = "argform_probe"
 required-features = ["_cuda"]
 
-[[example]]
-name = "marlin_probe"
-required-features = ["_cuda"]
-
 # Measures whether three rows classified "no device text in this tree" would
 # vendor into `csrc/vendor/flashinfer/` and compile under NVRTC. It stages
 # upstream text in memory from the tree CPM already fetched -- it writes

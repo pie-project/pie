@@ -1114,12 +1114,18 @@ mod transcribed {
     use super::{Rule, dims};
     use kernels_cuda_new::runtime::{Dims, eval};
 
-    const VISION: &str = include_str!("../../kernels-cuda/csrc/src/vision/gemma4_vision.cu");
-    const AUDIO: &str = include_str!("../../kernels-cuda/csrc/src/vision/gemma4_audio.cu");
-    const QWEN: &str = include_str!("../../kernels-cuda/csrc/src/vision/qwen3_vl_tower.cu");
+    // The three towers moved to `driver-cuda/csrc/vision/`; a tower is a host
+    // walk over device text the JIT already owns, not a kernel the archive was
+    // holding. The transcriptions below still quote them, so this test follows
+    // the files rather than the crate.
+    const VISION: &str = include_str!("../../driver-cuda/csrc/vision/gemma4_vision.cu");
+    const AUDIO: &str = include_str!("../../driver-cuda/csrc/vision/gemma4_audio.cu");
+    const QWEN: &str = include_str!("../../driver-cuda/csrc/vision/qwen3_vl_tower.cu");
     const GDN: &str = include_str!("../../kernels-cuda/csrc/src/ssm/gated_delta_net.cu");
+    const GDN_CUH: &str = include_str!("../csrc/src/ssm/gated_delta_net.cuh");
     const WNA16: &str = include_str!("../../kernels-cuda/csrc/src/quant/dequant_wna16.cu");
     const FP4: &str = include_str!("../../kernels-cuda/csrc/src/quant/dequant_fp4.cu");
+    const FP4_CUH: &str = include_str!("../csrc/src/quant/dequant_fp4.cuh");
     const NAIVE: &str =
         include_str!("../../kernels-cuda/csrc/src/attn/attention_naive_paged.cu");
     const MLA: &str = include_str!("../../kernels-cuda/csrc/src/attn/mla_paged.cu");
@@ -1408,14 +1414,14 @@ mod transcribed {
     /// that mysteriously stopped agreeing.
     fn pins() {
         let g2b2 = "dim3 B2(16,16); inline dim3 G2(int X,int Y){return dim3((X+15)/16,(Y+15)/16);}";
-        pinned(VISION, "vision/gemma4_vision.cu", 117, g2b2, "`tile16`");
-        pinned(AUDIO, "vision/gemma4_audio.cu", 131, g2b2, "`tile16`");
-        pinned(QWEN, "vision/qwen3_vl_tower.cu", 139, g2b2, "`tile16`");
+        pinned(VISION, "driver-cuda csrc/vision/gemma4_vision.cu", 138, g2b2, "`tile16`");
+        pinned(AUDIO, "driver-cuda csrc/vision/gemma4_audio.cu", 131, g2b2, "`tile16`");
+        pinned(QWEN, "driver-cuda csrc/vision/qwen3_vl_tower.cu", 139, g2b2, "`tile16`");
 
         pinned(
             VISION,
-            "vision/gemma4_vision.cu",
-            144,
+            "driver-cuda csrc/vision/gemma4_vision.cu",
+            195,
             "vd::k_addpos_grid2d<bfd><<<G2(Hd,N),B2,0,S>>>(D(h),D(w.pos_table),pos,N,Hd,PT);",
             "`tile16`",
         );
@@ -1424,8 +1430,8 @@ mod transcribed {
         // quote would have failed.
         pinned(
             VISION,
-            "vision/gemma4_vision.cu",
-            150,
+            "driver-cuda csrc/vision/gemma4_vision.cu",
+            201,
             "dim3 rg(1,NH,N);vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(q),pos,N,NH,THETA);\
              vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(k),pos,N,NH,THETA);",
             "`axial_rope`",
@@ -1433,22 +1439,44 @@ mod transcribed {
 
         pinned(
             AUDIO,
-            "vision/gemma4_audio.cu",
+            "driver-cuda csrc/vision/gemma4_audio.cu",
             189,
             "vd::k_layernorm_relu<bfd><<<T1*F1,128,0,S>>>(D(c0cl),D(w.sscp0_norm),D(c0cl),T1*F1,C0,EPS);",
             "`per_row_narrow`",
         );
         pinned(
             AUDIO,
-            "vision/gemma4_audio.cu",
+            "driver-cuda csrc/vision/gemma4_audio.cu",
             196,
             "vd::k_layernorm_relu<bfd><<<T2*F2,128,0,S>>>(D(c1cl),D(w.sscp1_norm),D(c1cl),T2*F2,C1,EPS);",
             "`per_row_narrow`",
         );
 
-        pinned(GDN, "ssm/gated_delta_net.cu", 781, "dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);", "`warp_tiled_scan`");
-        pinned(GDN, "ssm/gated_delta_net.cu", 840, "dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);", "`warp_tiled_scan`");
-        pinned(GDN, "ssm/gated_delta_net.cu", 759, "constexpr int WARPS = 4;", "`warp_tiled_scan`");
+        // `warp_tiled_scan`'s two HOST LAUNCHERS ARE GONE (§43). Nothing
+        // called them, so the `.cu` no longer opens that grid at all, and a
+        // `pinned` here would be a citation to text that does not exist.
+        //
+        // The rule is still exercised below, so the transcription still needs
+        // a source — and the source is now the KERNEL rather than its
+        // launcher. Two assertions replace the three pins, and they are
+        // deliberately of opposite polarity:
+        //
+        //   * an ABSENCE, so that a launcher quietly coming back does not
+        //     leave this transcription reading a `.cuh` while the `.cu`
+        //     disagrees with it;
+        //   * a live `pinned` into the `.cuh`, so the block width the
+        //     arithmetic below divides by is still quoted from real text.
+        //
+        // Absence is the weaker claim of the two and that is exactly why it
+        // is written out: `pinned` can only ever assert presence, so a
+        // deleted line is the one thing it structurally cannot guard.
+        assert!(
+            !GDN.contains("dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);"),
+            "ssm/gated_delta_net.cu opens `warp_tiled_scan`'s grid again.\n\
+             The two launchers were deleted as unreached; if one is back, this\n\
+             transcription must be re-pinned to it rather than to the .cuh."
+        );
+        pinned(GDN_CUH, "ssm/gated_delta_net.cuh", 436, "constexpr int WARPS = 4;", "`warp_tiled_scan`");
 
         pinned(
             WNA16,
@@ -1499,7 +1527,7 @@ mod transcribed {
         pinned(
             FP4,
             "quant/dequant_fp4.cu",
-            156,
+            104,
             "(hidden + rows_per_block - 1) / rows_per_block);",
             "`routed_qmv_quad`",
         );
@@ -1507,14 +1535,26 @@ mod transcribed {
         // that makes one rule cover both. Pinned as two quotes of the same
         // text at two lines, because one quote read twice is not evidence
         // that two launchers agree.
-        for line in [69, 155] {
+        for line in [69, 103] {
             pinned(FP4, "quant/dequant_fp4.cu", line, "dim3 grid(num_tokens * top_k,", "`routed_qmv_quad`");
         }
-        // And the grouped sibling, pinned for what it is NOT: a `pairs_per_block`
-        // of `warps * 2`, half this rule's tile, on a grid whose `x` is an
-        // EXPERT count. `families/quant.rs` refuses it and this is the line
-        // the refusal rests on.
-        pinned(FP4, "quant/dequant_fp4.cu", 99, "const int pairs_per_block = warps * 2;", "`routed_qmv_quad` refusal");
+        // And the grouped sibling, which used to be pinned for what it is
+        // NOT: a `pairs_per_block` of `warps * 2`, half this rule's tile, on
+        // a grid whose `x` is an EXPERT count.
+        //
+        // ITS HOST LAUNCHER IS GONE (§43) — nothing called it — so the
+        // refusal no longer rests on a line of `.cu`. The kernel survives,
+        // so the refusal survives with it, and it is re-pinned to the
+        // instantiation constant that made the tile half-width in the first
+        // place. An absence guards the direction the pin cannot: a launcher
+        // coming back with the old grid and nobody noticing.
+        assert!(
+            !FP4.contains("const int pairs_per_block = warps * 2;"),
+            "quant/dequant_fp4.cu opens the grouped sibling's half-width tile\n\
+             again. The refusal in `families/quant.rs` is written against the\n\
+             kernel; if there is a launcher once more, re-pin it to the .cu."
+        );
+        pinned(FP4_CUH, "quant/dequant_fp4.cuh", 469, "constexpr int kPairs = 2;", "`routed_qmv_quad` refusal");
 
         // ── `paged_scores` and `paged_scores_decode` ──
         //
@@ -1523,7 +1563,9 @@ mod transcribed {
         // launchers that differ only in how they reach the cache, and a
         // transcription written from one of them is evidence for that one.
         pinned(NAIVE, "attn/attention_naive_paged.cu", 35, "constexpr int BLOCK = 128;", "`paged_scores`");
-        for line in [108, 195, 245] {
+        // Was three lines; one of the three prefill launchers has since been
+        // deleted as unreached (§43), so this is two.
+        for line in [108, 163] {
             pinned(
                 NAIVE,
                 "attn/attention_naive_paged.cu",
@@ -1539,7 +1581,7 @@ mod transcribed {
             "const std::size_t smem = (head_dim + BLOCK) * sizeof(float);",
             "`paged_scores`",
         );
-        for line in [197, 247] {
+        for line in [165] {
             pinned(
                 NAIVE,
                 "attn/attention_naive_paged.cu",
@@ -1555,26 +1597,16 @@ mod transcribed {
             "device::naive_paged_attn<BLOCK><<<grid, block, smem, stream>>>(",
             "`paged_scores`",
         );
-        pinned(
-            NAIVE,
-            "attn/attention_naive_paged.cu",
-            147,
-            "dim3 grid(num_requests, num_q_heads);",
-            "`paged_scores_decode`",
-        );
-        pinned(
-            NAIVE,
-            "attn/attention_naive_paged.cu",
-            149,
-            "const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);",
-            "`paged_scores_decode`",
-        );
-        pinned(
-            NAIVE,
-            "attn/attention_naive_paged.cu",
-            150,
-            "device::naive_paged_decode<BLOCK><<<grid, block, smem, stream>>>(",
-            "`paged_scores_decode`",
+        // `paged_scores_decode`'s LAUNCHER IS GONE (§43) — its three pins
+        // with it. The rule is still stated and still transcribed below; what
+        // is no longer true is that this `.cu` opens the grid. Asserted as an
+        // absence for the direction `pinned` cannot see, since a pin proves
+        // presence and can therefore never notice a deletion.
+        assert!(
+            !NAIVE.contains("device::naive_paged_decode<BLOCK><<<grid, block, smem, stream>>>("),
+            "attn/attention_naive_paged.cu launches `naive_paged_decode` again.\n\
+             `paged_scores_decode`'s transcription below was written from a\n\
+             launcher that was deleted; if it is back, re-pin it."
         );
 
         // ── `mla_prepare`: the grid AND the three lines that build its y ──
@@ -1583,37 +1615,37 @@ mod transcribed {
         // more, two of them a `?:` and a ceiling. All four are pinned, because
         // a rule that recomputed `heads_per_block` from a `half` that had
         // stopped being `rope / 2` would agree with a pin of the grid alone.
-        pinned(MLA, "attn/mla_paged.cu", 56, "constexpr int BS = 256;", "`mla_prepare`");
-        pinned(MLA, "attn/mla_paged.cu", 59, "const int half = rope / 2;", "`mla_prepare`");
+        pinned(MLA, "attn/mla_paged.cu", 50, "constexpr int BS = 256;", "`mla_prepare`");
+        pinned(MLA, "attn/mla_paged.cu", 53, "const int half = rope / 2;", "`mla_prepare`");
         pinned(
             MLA,
             "attn/mla_paged.cu",
-            64,
+            58,
             "const int heads_per_block = half >= BS ? 1 : (BS / half);",
             "`mla_prepare`",
         );
         pinned(
             MLA,
             "attn/mla_paged.cu",
-            65,
+            59,
             "const int q_blocks = (heads + heads_per_block - 1) / heads_per_block;",
             "`mla_prepare`",
         );
-        pinned(MLA, "attn/mla_paged.cu", 73, "dim3 grid(total_tokens, 1 + q_blocks);", "`mla_prepare`");
+        pinned(MLA, "attn/mla_paged.cu", 67, "dim3 grid(total_tokens, 1 + q_blocks);", "`mla_prepare`");
         pinned(
             MLA,
             "attn/mla_paged.cu",
-            74,
+            68,
             "device::mla_prepare<BS><<<grid, BS, 0, stream>>>(",
             "`mla_prepare`",
         );
 
         // ── the three `qkv_fused` grids ──
-        pinned(QKV, "attn/qkv_fused.cu", 245, "constexpr int BLOCK = 256;", "`rows_packed_heads`");
+        pinned(QKV, "attn/qkv_fused.cu", 221, "constexpr int BLOCK = 256;", "`rows_packed_heads`");
         pinned(
             QKV,
             "attn/qkv_fused.cu",
-            246,
+            222,
             "dim3 grid(num_rows, num_q_heads + num_kv_heads);",
             "`rows_packed_heads`",
         );
@@ -1778,21 +1810,21 @@ mod transcribed {
         pinned(
             DSV4,
             "attn/dsv4_compress.cu",
-            319,
+            202,
             "dim3 grid(static_cast<unsigned>(total_tokens),",
             "`paged_scores_decode`",
         );
         pinned(
             DSV4,
             "attn/dsv4_compress.cu",
-            322,
+            205,
             "(static_cast<std::size_t>(head_dim) + ATTN_BLOCK) * sizeof(float);",
             "`paged_scores_decode`",
         );
         pinned(
             DSV4,
             "attn/dsv4_compress.cu",
-            323,
+            206,
             "device::compressed_attn_paged<<<grid, ATTN_BLOCK, smem, stream>>>(",
             "`paged_scores_decode`",
         );
@@ -1820,14 +1852,14 @@ mod transcribed {
         pinned(
             FLASHINFER,
             "attn/attention_flashinfer.cu",
-            828,
+            782,
             "const dim3 grid(static_cast<unsigned>(num_requests), 64u);",
             "`attention_flashinfer.cuh`'s fold-heads refusal",
         );
         pinned(
             FLASHINFER,
             "attn/attention_flashinfer.cu",
-            829,
+            783,
             "device::attn_score_fold_heads<<<grid, 256, 0, stream>>>(",
             "`attention_flashinfer.cuh`'s fold-heads refusal",
         );
@@ -1842,28 +1874,28 @@ mod transcribed {
         pinned(
             SLOT_OPS,
             "layout/slot_ops.cu",
-            60,
+            39,
             "constexpr int kThreads = 256;",
             "`runtime::launch::single`",
         );
         pinned(
             SLOT_OPS,
             "layout/slot_ops.cu",
-            61,
+            40,
             "device::copy_if_valid_slot<<<1, kThreads, 0, stream>>>(",
             "`runtime::launch::single`",
         );
         pinned(
             KV_PAGED,
             "attn/kv_paged.cu",
-            516,
+            442,
             "device::build_window_page_view<<<1, 256, 0, stream>>>(",
             "`runtime::launch::single`",
         );
         pinned(
             KV_PAGED,
             "attn/kv_paged.cu",
-            533,
+            459,
             "device::build_full_split_view<<<1, 32, 0, stream>>>(",
             "`runtime::launch::single_warp`",
         );
@@ -1882,7 +1914,7 @@ mod transcribed {
         pinned(
             NAIVE_UNPAGED,
             "attn/attention_naive.cu",
-            174,
+            89,
             "device::mtp_update_pending_hidden<bf16><<<num_requests, BLOCK, 0, stream>>>(",
             "`runtime::launch::per_request`",
         );
@@ -2591,6 +2623,71 @@ mod transcribed {
             println!("{line}");
         }
         assert_eq!(lines.len(), 12, "every new rule is perturbed and its numbers printed");
+    }
+
+    /// `PIE_QWEN35_GDN_SMEM_STEP` is gone, and cannot come back quietly.
+    ///
+    /// `ssm::recurrent_gated_delta_step_batched_gqa_state_bf16` used to pick
+    /// between two kernels on `std::getenv("PIE_QWEN35_GDN_SMEM_STEP")`.
+    /// That is the failure this whole crate exists to remove: same trace,
+    /// same weights, same GPU, a different kernel, and NOTHING above the
+    /// launcher able to see which one ran. A plan cannot record it, a replay
+    /// cannot reproduce it, and no second backend can implement the same
+    /// semantics, because the selector was invisible to everything but the
+    /// process environment.
+    ///
+    /// §30 measured the two arms before moving them: byte-identical on the
+    /// state slab AND on `out` at eight shapes, `written > 0` on every one.
+    /// So the knob never chose semantics — only speed, and only downward
+    /// (1.48x slower at R=511). An identical-but-slower arm is bring-up
+    /// scaffolding, so the answer was DELETION, not relocation: no
+    /// `Specialisation` (the geometries disagree and `agrees()` would refuse
+    /// it), no `Choose` (there is nothing to choose between), no driver-side
+    /// fact (nothing is left to configure).
+    ///
+    /// What replaces it is a SHAPE the fire already carries —
+    /// `V_d == 128 && K_d == 128` — which costs zero vocabulary, is visible
+    /// to a table, and is the form §26.10(b)'s `Term::IntIs` will read
+    /// directly.
+    ///
+    /// This test is the ratchet. It is deliberately three assertions and not
+    /// one, because each names a different way the knob could return: the
+    /// call itself, its header, and the shape predicate that stands in its
+    /// place. Comment lines are excluded from the `getenv` scan on purpose —
+    /// the argument in the `.cu` has to be free to NAME the thing it
+    /// deleted, or the record of why it went is unwritable.
+    #[test]
+    fn the_bf16_gqa_decode_step_reads_no_environment_variable() {
+        let code: Vec<(usize, &str)> = GDN
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .map(|(i, l)| (i + 1, l))
+            .collect();
+
+        for (n, line) in &code {
+            assert!(
+                !line.contains("getenv"),
+                "ssm/gated_delta_net.cu:{n} reads the environment in code: {line}\n\
+                 a tuning knob is configuration; it is not a symbol and it is not\n\
+                 geometry. If configuration must reach a launch it arrives as a\n\
+                 fact the driver holds at load, never as a call inside a .cu."
+            );
+        }
+
+        assert!(
+            !GDN.contains("#include <cstdlib>"),
+            "ssm/gated_delta_net.cu includes <cstdlib>; the only thing it was \
+             ever pulled in for was `std::getenv`"
+        );
+
+        pinned(
+            GDN,
+            "ssm/gated_delta_net.cu",
+            246,
+            "if (!qwen_gdn_k_last_state_enabled() && V_d == 128 && K_d == 128) {",
+            "`the deleted PIE_QWEN35_GDN_SMEM_STEP`",
+        );
     }
 
     /// The pin's own two failure modes, fired.

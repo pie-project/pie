@@ -79,16 +79,6 @@ int current_device_sm_count() {
 }
 
 }  // namespace
-
-void xqa_decode_bf16_gqa2_warmup_current_device() {
-    device::u32 size = 0;
-    CUDA_CHECK(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    CUDA_CHECK(cudaFuncSetAttribute(
-        kernel_mha,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(size)));
-}
-
 void launch_attention_xqa_decode_bf16_gqa2_prepared(
     const void* q,
     void* k_pages,
@@ -103,61 +93,6 @@ void launch_attention_xqa_decode_bf16_gqa2_prepared(
     AttentionWorkspaceView workspace,
     cudaStream_t stream,
     float sm_scale);
-
-void launch_attention_xqa_decode_bf16_gqa2(
-    const void* q,
-    void* k_pages,
-    void* v_pages,
-    void* o,
-    const device::u32* kv_page_indices_d,
-    const device::u32* kv_page_indptr_d,
-    const device::u32* kv_last_page_lens_d,
-    int num_requests,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int page_size,
-    int max_pages_per_seq,
-    AttentionWorkspaceView workspace,
-    cudaStream_t stream,
-    float sm_scale)
-{
-    if (num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0 ||
-        num_q_heads / num_kv_heads != kXqaHeadGroupRatio ||
-        head_dim != kXqaHeadDim || page_size != kXqaPageSize ||
-        current_device_major() < 8) {
-        throw std::runtime_error("xqa gqa2 decode: unsupported shape");
-    }
-    const float default_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    if (sm_scale > 0.f && std::abs(sm_scale - default_scale) > 1.0e-6f) {
-        throw std::runtime_error("xqa gqa2 decode: unsupported scale");
-    }
-    if (num_requests <= 0) return;
-    kernels::attn::prepare_attention_xqa_decode_bf16(
-        kv_page_indices_d,
-        kv_page_indptr_d,
-        kv_last_page_lens_d,
-        num_requests,
-        page_size,
-        max_pages_per_seq,
-        workspace,
-        stream);
-    launch_attention_xqa_decode_bf16_gqa2_prepared(
-        q,
-        k_pages,
-        v_pages,
-        o,
-        num_requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        max_pages_per_seq,
-        workspace,
-        stream,
-        sm_scale);
-}
-
 void launch_attention_xqa_decode_bf16_gqa2_prepared(
     const void* q,
     void* k_pages,

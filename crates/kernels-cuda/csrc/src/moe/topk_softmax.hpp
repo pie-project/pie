@@ -49,17 +49,6 @@ void topk_softmax_bf16_form(
 // one block per token -- and folding the projection in drags it down to that
 // same one block, from the 32 the standalone GEMV gets. Trading 32 SMs for a
 // saved launch is not a trade. gpt-oss measured 291 -> 134 tok/s.
-void router_topk_softmax_bf16(
-    const void* act,            // [N, hidden] bf16
-    const void* router_weight,  // [num_experts, hidden] bf16
-    const void* router_bias,    // [num_experts] bf16, or null
-    std::int32_t* topk_idx,     // [N, K]
-    float* topk_w,              // [N, K]
-    int N,
-    int num_experts,
-    int K,
-    int hidden,
-    cudaStream_t stream);
 
 // Gemma-4 26B-A4B's router applies a per-expert scalar gain *after*
 // the renormalised top-K weights. Multiplies `topk_w[n, k] *=
@@ -80,28 +69,6 @@ void apply_per_expert_scale_bf16(
 //            routed_scaling_factor.
 //
 // This covers the published Nano-Omni config where n_group=topk_group=1.
-void topk_sigmoid_bias_bf16(
-    const void* logits,                  // [N, num_experts] bf16
-    const float* correction_bias,        // [num_experts] fp32
-    std::int32_t* topk_idx,              // [N, K]
-    float* topk_w,                       // [N, K]
-    int N,
-    int num_experts,
-    int K,
-    bool normalize,
-    float routed_scaling_factor,
-    cudaStream_t stream);
 
-void topk_sigmoid_bias_fp32(
-    const float* logits,                 // [N, num_experts] fp32
-    const float* correction_bias,        // [num_experts] fp32
-    std::int32_t* topk_idx,              // [N, K]
-    float* topk_w,                       // [N, K]
-    int N,
-    int num_experts,
-    int K,
-    bool normalize,
-    float routed_scaling_factor,
-    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels::moe

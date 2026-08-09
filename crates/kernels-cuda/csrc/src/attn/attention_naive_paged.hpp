@@ -53,20 +53,8 @@ void attention_naive_paged_bf16(
     float logits_soft_cap = 0.f,
     float* lse_out = nullptr);
 
-void attention_naive_paged_decode(
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int num_requests,
-    int num_q_heads,
-    cudaStream_t stream,
-    int window_left = -1,
-    float sm_scale = -1.f,
-    float logits_soft_cap = 0.f,
-    float* lse_out = nullptr);
+// `attention_naive_paged_decode` WAS declared here; its launcher is deleted.
+// The `.cu` says why, and says where its geometry went.
 
 void attention_naive_paged(
     const void* q,
@@ -86,23 +74,7 @@ void attention_naive_paged(
     float logits_soft_cap = 0.f,
     float* lse_out = nullptr);
 
-void attention_naive_paged_custom(
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t* mask_d,
-    const std::int32_t* mask_indptr_d,
-    int total_tokens,
-    int num_requests,
-    int num_q_heads,
-    cudaStream_t stream,
-    float sm_scale = -1.f,
-    float logits_soft_cap = 0.f,
-    float* lse_out = nullptr);
+// `attention_naive_paged_custom` WAS declared here; its launcher is deleted.
 
 void attention_naive_paged(
     const void* q,

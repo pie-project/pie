@@ -1,7 +1,7 @@
 //! Pie standalone server config — TOML schema mirror of `pie.config`.
 //!
 //! Same TOML the legacy Python server consumed. Embedded drivers
-//! ([`DriverKind::CudaNative`] / [`DriverKind::Metal`])
+//! ([`DriverKind::CudaNative`] / [`DriverKind::Metal`] / [`DriverKind::Wgpu`])
 //! are dispatched in [`crate::engine::start_engine`] via
 //! [`crate::preflight::resolve_flavor`].
 //!
@@ -934,8 +934,8 @@ fn default_frame_dispatch_depth() -> u32 {
 #[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
 // fields are read on the Rust side yet.
 pub struct DriverConfig {
-    /// Driver discriminator. Embedded drivers (`cuda_native`, `metal`)
-    /// run in-process.
+    /// Driver discriminator. Embedded drivers (`cuda_native`, `metal`,
+    /// `wgpu`) run in-process.
     #[serde(rename = "type")]
     pub kind: DriverKind,
     /// Single string or list of strings — both accepted on input.
@@ -986,9 +986,46 @@ impl DriverConfig {
                     })?;
                 validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
+            DriverKind::Vulkan => {
+                let opts: VulkanDriverOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [model.driver.options] for driver type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+                opts.validate()?;
+            }
+            DriverKind::Wgpu => {
+                let opts: WgpuDriverOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid [model.driver.options] for driver type {:?}: {e}",
+                        self.kind,
+                    )
+                })?;
+                opts.validate()?;
+            }
         }
         Ok(())
     }
+}
+
+/// The KV page count two option tables state and no driver can serve at zero.
+///
+/// A free function beside [`validate_kv_cache_dtype`], and for the same reason
+/// that one is: the invariant belongs to the setting rather than to either
+/// driver, and stating it twice is how the two spellings drift into saying
+/// different things about the same key.
+fn validate_kv_pages(pages: u32) -> Result<()> {
+    ensure!(
+        pages > 0,
+        "[model.driver.options] kv_pages must be at least 1; a cache of no \
+         pages cannot seat a conversation"
+    );
+    Ok(())
 }
 
 fn validate_kv_cache_dtype(value: &str) -> Result<()> {
@@ -1021,6 +1058,21 @@ pub enum DriverKind {
     /// Native MLX + Metal driver for Apple Silicon — embedded as a static
     /// lib in `worker` (requires `--features driver-metal`, macOS only).
     Metal,
+    /// Pure-Rust Vulkan driver — embedded in `worker` (requires
+    /// `--features driver-vulkan`). Portable rather than vendor-specific:
+    /// it runs on whatever Vulkan 1.3 device the machine exposes.
+    Vulkan,
+    /// The WebGPU shell — embedded in `worker` (requires
+    /// `--features driver-wgpu`).
+    ///
+    /// Portable in a second sense than [`Self::Vulkan`] is: that one runs on
+    /// any Vulkan 1.3 device, this one runs over Vulkan, Metal, D3D12 or
+    /// WebGPU, whichever the machine has, from one binary. It needs no SDK,
+    /// no loader and no shader directory to build — `wgpu` and `naga` are
+    /// pure Rust and `kernels-wgpu` ships the WGSL inside the rlib. What it
+    /// still needs at run time is an adapter, which is why the feature is
+    /// opt-in like the other three.
+    Wgpu,
 }
 
 impl DriverKind {
@@ -1028,6 +1080,8 @@ impl DriverKind {
         match self {
             DriverKind::CudaNative => "cuda_native",
             DriverKind::Metal => "metal",
+            DriverKind::Vulkan => "vulkan",
+            DriverKind::Wgpu => "wgpu",
         }
     }
 }
@@ -1191,6 +1245,115 @@ impl Default for MetalDriverOptions {
             ready_timeout: Duration::from_secs(120),
             shutdown_timeout: Duration::from_secs(5),
         }
+    }
+}
+
+/// `[model.driver.options]` for `type = "vulkan"` (the pure-Rust Vulkan
+/// driver) — where the compiled shaders are, and how much KV to hold.
+///
+/// Short, and deliberately so. Every other driver's options table grew from
+/// what its C++ reads; this one states exactly the two keys the Vulkan seam
+/// looks up in the boot TOML (`[model] kernels` and `[model] kv_pages`) plus
+/// the two timeouts the worker itself honours. A knob here that the driver
+/// does not read would be a setting an operator can spell and nothing obeys.
+///
+/// There is no `device` selector and no `model_id`: `Device::open` takes the
+/// first Vulkan device the loader reports, and the checkpoint is identified
+/// from its TENSORS with no override. Both are stated here so that an
+/// operator reading this file learns it rather than discovering it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VulkanDriverOptions {
+    /// Directory of compiled SPIR-V modules, as `kernels-vulkan`'s build
+    /// script wrote it.
+    ///
+    /// Absent, the driver falls back to `PIE_KERNELS_VULKAN_SPV_DIR` and
+    /// refuses if that is unset too. Nothing generates these at serve time:
+    /// a driver consumes modules rather than producing them.
+    pub kernels: Option<PathBuf>,
+    /// KV pages to allocate. Pages, not tokens: the page size is the text's.
+    pub kv_pages: u32,
+    /// How long to wait for the driver's caps handshake before giving up.
+    pub ready_timeout: Duration,
+    /// How long to wait for the driver to drain before abandoning it.
+    pub shutdown_timeout: Duration,
+}
+
+impl Default for VulkanDriverOptions {
+    fn default() -> Self {
+        Self {
+            kernels: None,
+            kv_pages: 1024,
+            ready_timeout: Duration::from_secs(120),
+            shutdown_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+impl VulkanDriverOptions {
+    fn validate(&self) -> Result<()> {
+        validate_kv_pages(self.kv_pages)?;
+        if let Some(dir) = &self.kernels {
+            ensure!(
+                dir.is_dir(),
+                "[model.driver.options] kernels = {dir:?} is not a directory. It \
+                 is where `kernels-vulkan`'s build script wrote the compiled \
+                 SPIR-V modules."
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[model.driver.options]` for `type = "wgpu"` (the WebGPU shell).
+///
+/// One key, where the Vulkan table above states four, and the difference is a
+/// description of the backend. There is no `kernels` directory because there
+/// is nothing to ship beside the binary — `kernels-wgpu` embeds the WGSL in
+/// its rlib and `naga` compiles it in this process — so `[model] kv_pages` is
+/// the whole of what `crates/engine/src/driver/backend/wgpu.rs`'s `create`
+/// reads.
+///
+/// What the siblings offer and this does not, each for its own reason:
+///
+/// * no `device`: `wgpu` picks its own adapter, as `Device::open` picks
+///   Vulkan's, and `[model.driver] device` is still required and still
+///   validated — so there is nowhere for a second selector to disagree;
+/// * no `kv_page_size`: it is 16, fixed by the tiled GEMM's `bm` and stated
+///   by `driver_wgpu::facts::PAGE_SIZE`. A settable one would be a number the
+///   engine believes and the kernels ignore;
+/// * no `kv_cache_dtype`: the cache is bf16 and `Deployment::bytes` is the
+///   only place that could change it. Offering the string would be offering a
+///   choice with one legal value;
+/// * no `model_id`: this seam identifies a checkpoint from its TENSORS
+///   (`catalog::Override::None`), so an id here would be read by nothing;
+/// * no `stream_routed_experts` or `expert_slab_bytes`: there is no expert
+///   paging path in this driver at all;
+/// * no `ready_timeout` or `shutdown_timeout`: those two bound a wait on a
+///   driver the worker starts and then watches. `wgpu_create` is a library
+///   call on this thread, which has either returned or not.
+///
+/// A key is added here when the seam reads it, and not before.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WgpuDriverOptions {
+    /// KV pages to allocate at boot.
+    ///
+    /// Used as given. The pool is resizable — the driver serves `resize_pool`
+    /// — so this is where it starts rather than where it stays, and 1024
+    /// pages of 16 tokens is a real default for a desktop card.
+    pub kv_pages: u32,
+}
+
+impl Default for WgpuDriverOptions {
+    fn default() -> Self {
+        Self { kv_pages: 1024 }
+    }
+}
+
+impl WgpuDriverOptions {
+    fn validate(&self) -> Result<()> {
+        validate_kv_pages(self.kv_pages)
     }
 }
 
@@ -1591,6 +1754,83 @@ device = ["cpu"]
         assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
         assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    /// Every driver kind's `as_str` is the word a config file spells it with.
+    ///
+    /// # What this is guarding
+    ///
+    /// The two spellings come from different places and nothing ties them
+    /// together: `as_str` is a hand-written match, and what a file parses is
+    /// serde's `rename_all = "snake_case"` over the variant name. They agree
+    /// today for every kind and there is no compiler error if one stops --
+    /// `config_schema::default_values` builds a config by INTERPOLATING
+    /// `as_str` into `type = "..."` and parsing it back, so a kind whose two
+    /// spellings differed would make the schema listing silently fall back to
+    /// an empty table, and `pie config set` would offer no driver keys at all.
+    ///
+    /// Written as a walk over an explicit list rather than one assertion per
+    /// kind, so that a kind added without a line here is a kind that fails
+    /// this test's own count.
+    #[test]
+    fn every_driver_kind_round_trips_through_its_config_string() {
+        const KINDS: &[(DriverKind, &str)] = &[
+            (DriverKind::CudaNative, "cuda_native"),
+            (DriverKind::Metal, "metal"),
+            (DriverKind::Vulkan, "vulkan"),
+            (DriverKind::Wgpu, "wgpu"),
+        ];
+        for (kind, spelled) in KINDS {
+            assert_eq!(kind.as_str(), *spelled, "{kind:?} names itself");
+            let toml = format!(
+                "[model]\nname = \"default\"\nhf_repo = \"Qwen/Qwen3-0.6B\"\n\n\
+                 [model.driver]\ntype = \"{spelled}\"\ndevice = [\"cpu\"]\n"
+            );
+            let cfg: Config = toml::from_str(&toml)
+                .unwrap_or_else(|e| panic!("`type = \"{spelled}\"` does not parse: {e}"));
+            assert_eq!(cfg.model.driver.kind, *kind);
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("a minimal `{spelled}` config does not validate: {e}"));
+            // And back out through serde, which is the direction
+            // `config_schema::default_values` relies on.
+            let round = toml::Value::try_from(*kind).expect("a kind serializes");
+            assert_eq!(round.as_str(), Some(*spelled));
+        }
+        assert_eq!(
+            KINDS.len(),
+            4,
+            "a driver kind was added without a line here, so nothing checks its \
+             config spelling"
+        );
+    }
+
+    /// The wgpu driver's option table is exactly one key, and an unknown one
+    /// is refused rather than dropped.
+    ///
+    /// `deny_unknown_fields` is the whole of `DriverConfig::validate`'s wgpu
+    /// arm, and it is what stops a config that sets `total_pages` -- Metal's
+    /// name for very nearly this quantity -- from booting a pool of 1024 while
+    /// the operator believes they asked for 64.
+    #[test]
+    fn the_wgpu_options_refuse_a_key_this_driver_does_not_read() {
+        let with = |options: &str| {
+            let toml = format!(
+                "[model]\nname = \"default\"\nhf_repo = \"Qwen/Qwen3-0.6B\"\n\n\
+                 [model.driver]\ntype = \"wgpu\"\ndevice = [\"cpu\"]\n\n\
+                 [model.driver.options]\n{options}\n"
+            );
+            toml::from_str::<Config>(&toml)
+                .expect("the options table is untyped until validate reads it")
+                .validate()
+        };
+        with("kv_pages = 64").expect("the one key this driver reads");
+        let err = with("total_pages = 64")
+            .expect_err("a key this driver does not read is a key nobody honours")
+            .to_string();
+        assert!(
+            err.contains("total_pages"),
+            "the refusal names the key: {err}"
+        );
     }
 
     /// `model` is the name now, `hf_repo` still parses.

@@ -453,6 +453,98 @@ fn a_call_that_does_not_match_the_module_is_refused() {
     cache.clear(&device);
 }
 
+/// A grid past what this device dispatches is refused, and one exactly at the
+/// limit is not.
+///
+/// `maxComputeWorkGroupCount` is the limit with the widest spread in Vulkan
+/// and the one this crate had never read. The card measured here answers
+/// 2147483647 on x and exactly the specification's floor, 65535, on y and z
+/// -- so the refusal is not hypothetical even on a 4090, and a device that
+/// answers the floor on all three is common.
+///
+/// What makes it worth a refusal rather than a comment is what a card does
+/// with a grid past the limit: nothing defined. It may dispatch the part that
+/// fits and return success, which is an output computed for some of its rows
+/// and stale for the others -- fluent, plausible and wrong, which is the
+/// class of defect this crate is built against.
+///
+/// The control is the point of the test. A limit check that refused
+/// everything, or that was off by one, would pass the first half; so the
+/// second half dispatches a grid of EXACTLY the limit and requires it
+/// through. 65535 workgroups of a row norm is real work this card does in
+/// under a millisecond, and every workgroup past the four rows the buffer
+/// holds writes outside its bound range, which `robustBufferAccess` discards
+/// -- the same behaviour the overrun test measures.
+#[test]
+fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_not() {
+    let (device, dir) = gpu!();
+    let mut cache = Pipelines::new();
+    let entrypoint = "rms_single_row_bfloat16";
+    let code = module(dir, entrypoint);
+    let pipeline = cache
+        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .expect("the pipeline builds");
+
+    let axis = 256usize;
+    let limits = device.max_groups();
+    let x: Vec<f32> = (0..axis * 4).map(|i| 1.0 + (i % 7) as f32).collect();
+    let w = vec![1.0f32; axis];
+    let mut params = Vec::new();
+    params.extend_from_slice(&1e-5f32.to_le_bytes());
+    params.extend_from_slice(&(axis as u32).to_le_bytes());
+    params.extend_from_slice(&1u32.to_le_bytes());
+    params.extend_from_slice(&0u32.to_le_bytes());
+    params.extend_from_slice(&1.0f32.to_le_bytes());
+    let xb = device.buffer(&bf16_bytes(&x)).expect("x");
+    let wb = device.buffer(&bf16_bytes(&w)).expect("w");
+    let ob = device.buffer(&vec![0u8; axis * 4 * 2]).expect("out");
+    let pb = device.buffer(&params).expect("params");
+    let bound = [
+        Bound::whole(&xb),
+        Bound::whole(&wb),
+        Bound::whole(&ob),
+        Bound::whole(&pb),
+    ];
+
+    // Every axis, because they are three different limits and a check that
+    // compared them all against the first would pass on a card whose x is
+    // the widest.
+    for axis_of in 0..3 {
+        let Some(past) = limits[axis_of].checked_add(1) else {
+            // A limit of `u32::MAX` cannot be exceeded by a number that fits
+            // in the dispatch call, so there is nothing to refuse.
+            continue;
+        };
+        let mut groups = [1u32; 3];
+        groups[axis_of] = past;
+        let refused = device.run(pipeline, &bound, &[], groups);
+        assert!(
+            matches!(
+                refused,
+                Err(Failed::Grid { axis, groups, limit })
+                    if axis as usize == axis_of
+                        && groups == past
+                        && limit == limits[axis_of]
+            ),
+            "a grid of {past} on axis {axis_of} against a limit of {} was answered \
+             with {refused:?}",
+            limits[axis_of]
+        );
+    }
+
+    // The control, on the narrowest axis this card states, so that the
+    // dispatch is one it will really run.
+    let at = limits[1].min(65_535);
+    device
+        .run(pipeline, &bound, &[], [1, at, 1])
+        .expect("a grid of exactly the limit is legal and must not be refused");
+
+    for b in [xb, wb, ob, pb] {
+        device.free(b);
+    }
+    cache.clear(&device);
+}
+
 /// A row that lists a buffer its shader never reads still gets a layout for it.
 ///
 /// `layer_scalar_mul_bfloat16` is one of the eleven entrypoints where the two
@@ -1591,11 +1683,15 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
     // interleave driver numbers among the statement's scalars, and the only
     // rows that put anything on the grid's third dimension.
     //
-    // Equality rather than a floor: twenty-one is all of them, so this number
+    // Then twenty-two, when a rescaled deployment reached these texts:
+    // `neox_freqs_mb` is the rotation whose ladder is handed over as a buffer
+    // rather than raised from a base, and `rope.rs` builds that buffer.
+    //
+    // Equality rather than a floor: twenty-two is all of them, so this number
     // moving in either direction is news.
     assert_eq!(
         ran,
-        21,
+        22,
         "a different number of distinct symbols reached the device: {}",
         seen.iter().cloned().collect::<Vec<_>>().join(", ")
     );
@@ -2456,6 +2552,7 @@ fn whole_plan(
         tier: Capability::Baseline,
         one_at_a_time: false,
     };
+    let before = device.allocations();
     let fired = driver_vulkan::serve::fire(device, &mut cache, &modules, &low, firing)
         .unwrap_or_else(|e| panic!("{e}"));
     // Every launch the plan states, in one command buffer. Without this a
@@ -2465,8 +2562,57 @@ fn whole_plan(
         fired,
         driver_vulkan::serve::Fired {
             dispatches: low.launches.len(),
-            submissions: 1
+            submissions: 1,
+            blocks: fired.blocks,
+            parsed: fired.parsed,
         }
+    );
+    // One device allocation for all of them. `blocks` is what this fire used
+    // to ask the device for, one buffer each -- 114 of them in a qwen3 decode
+    // and over a thousand in a prefill of the 30B mixture -- at a measured
+    // 260 microseconds apiece, against a `maxMemoryAllocationCount` that is
+    // 4096 on a good many cards. A fire is free to state more rectangles than
+    // that, so this was a ceiling and not only a cost.
+    //
+    // Stated as a comparison against `blocks` rather than as a constant so it
+    // says the same thing for every text and both fire classes here, and with
+    // a floor so that a lowering which stopped stating blocks could not make
+    // it vacuously true.
+    assert!(
+        fired.blocks > 20,
+        "{name}: only {} rectangles state a scalar block, so the count below \
+         proves little",
+        fired.blocks
+    );
+    assert_eq!(
+        device.allocations() - before,
+        1,
+        "{name}: a fire of {} scalar blocks made more than one allocation",
+        fired.blocks
+    );
+    // And one module read per distinct symbol, not one per rectangle. The
+    // plan states hundreds of rectangles over a handful of symbols, and
+    // reading a module is a walk over a few thousand words: measured at 22
+    // milliseconds of a 24-millisecond planning pass before the read was
+    // cached, against 17 milliseconds of GPU for the whole fire.
+    //
+    // Against the plan's own count of distinct kernels rather than a
+    // constant, so it says the same thing for every text and both classes.
+    let symbols: std::collections::BTreeSet<u16> = low.launches.iter().map(|l| l.kernel).collect();
+    assert_eq!(
+        fired.parsed,
+        symbols.len(),
+        "{name}: {} rectangles over {} symbols read {} modules",
+        fired.dispatches,
+        symbols.len(),
+        fired.parsed
+    );
+    assert!(
+        fired.dispatches > 4 * symbols.len(),
+        "{name}: {} rectangles over {} symbols is too flat for the line above \
+         to mean anything",
+        fired.dispatches,
+        symbols.len()
     );
     let recorded = device.read(&arena_buffer).expect("the arena reads back");
     // Read HERE and not at the end, because the slow run below overwrites the
@@ -2516,7 +2662,9 @@ fn whole_plan(
             slow,
             driver_vulkan::serve::Fired {
                 dispatches: low.launches.len(),
-                submissions: low.launches.len()
+                submissions: low.launches.len(),
+                blocks: slow.blocks,
+                parsed: slow.parsed,
             }
         );
         let one_at_a_time = device.read(&arena_buffer).expect("the arena reads back");
@@ -4538,25 +4686,25 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
 ///
 /// The symbol withheld is the LAST distinct one the plan reaches -- launch 450
 /// of 452 -- so the refusal happens after four hundred rectangles have been
-/// planned and their scalar blocks allocated. Withholding the first would
-/// refuse at launch 0, which is the only case that cannot have taken anything.
+/// planned and their scalars gathered. Withholding the first would refuse at
+/// launch 0, which is the only case that cannot have taken anything.
 ///
-/// # What this does NOT check, and why
+/// # The free, and how it came to be checked here
 ///
-/// That the blocks are freed. `serve::fire` allocates one buffer per dispatch
-/// whose scalars live in a storage block and every early return frees them,
-/// which is the kind of claim a test should carry -- and it could not be made
-/// to fail. Replacing the free on this path with `std::mem::forget` and firing
-/// fifty refusals still left the device allocating a 64 MiB buffer afterwards;
-/// the blocks are tens of bytes each and this card has twenty-four gigabytes.
-/// Finding the ceiling directly was worse: allocating small buffers in a loop
-/// until one is refused did not finish in ten minutes, because each is its own
-/// device allocation.
+/// That the block buffer is given back on the refusing path used to be stated
+/// in the code and asserted nowhere, because it could not be made to fail.
+/// Replacing the free with `std::mem::forget` and firing fifty refusals still
+/// left the device able to allocate 64 MiB afterwards; the blocks are small
+/// and this card has twenty-four gigabytes. Finding the ceiling directly was
+/// worse: allocating small buffers in a loop until one was refused did not
+/// finish in ten minutes.
 ///
-/// So the free is stated in the code and its ordering is enforced by the borrow
-/// checker -- moving it one line earlier does not compile -- and no test here
-/// asserts it. A control that cannot be made to fire is not a control, and the
-/// alternative was an assertion that passes whatever the code does.
+/// What was missing was not a bigger leak but a witness. `Device` now counts
+/// what it hands out and what it takes back, so the claim is one subtraction
+/// -- see the assertion after the successful fire -- and `std::mem::forget`
+/// fails it immediately. The ordering of the free against the recorded
+/// buffers is still the borrow checker's: moving it one line earlier does not
+/// compile.
 #[test]
 fn a_fire_that_cannot_run_says_which_launch() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
@@ -4672,6 +4820,10 @@ fn a_fire_that_cannot_run_says_which_launch() {
     };
 
     let mut cache = Pipelines::new();
+    // What the device holds before any of this, so the three fires below can
+    // be asked whether they gave back what they took. See the module note on
+    // why this could not be stated until the device counted.
+    let held = device.live_buffers();
     match driver_vulkan::serve::fire(&device, &mut cache, &absent, &low, what) {
         Err(driver_vulkan::serve::Unfired::NoModule { at, symbol }) => {
             assert_eq!(symbol, late);
@@ -4696,6 +4848,25 @@ fn a_fire_that_cannot_run_says_which_launch() {
     let fired = driver_vulkan::serve::fire(&device, &mut cache, &whole, &low, what)
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(fired.dispatches, low.launches.len());
+
+    // Two refusals deep in the plan and one whole fire, and the device is
+    // holding exactly what it held before them. A `fire` that kept its block
+    // buffer would pass every assertion above -- this card has twenty-four
+    // gigabytes and the block is tens of kilobytes, so nothing downstream
+    // would ever notice. Measured: `std::mem::forget` in place of the free
+    // fails this line by one buffer.
+    //
+    // The two refusals here are pass-one refusals, which return before the
+    // allocation happens and so have nothing to give back; it is the
+    // successful fire that takes and returns. Both are under the same claim
+    // on purpose, because which refusals come before the allocation is a
+    // property of the code and not of the plan, and this line does not have
+    // to be revisited when that moves.
+    assert_eq!(
+        device.live_buffers(),
+        held,
+        "two refusals and a fire left buffers behind"
+    );
 
     cache.clear(&device);
     device.free(arena_buffer);
@@ -6399,11 +6570,18 @@ fn continued(
     // should want is `PERIOD[2]`.
     prompt.push(PERIOD[0]);
     prompt.push(PERIOD[1]);
-    // THIRTY-TWO, and the length is not free. A prefill of twenty was refused
-    // with `20 rows is not a whole number of 16-row tiles` -- the tiled GEMM
-    // is compiled at `bm = 16` and a driver may not pad a fire it did not
-    // author. So a caller above this crate owes the batching, and this records
-    // the constraint rather than working around it.
+    // THIRTY-TWO, and the length is deliberate for a reason that has changed.
+    // It used to be the only length that ran: a prefill of twenty was refused
+    // with `20 rows is not a whole number of 16-row tiles`, and this said a
+    // caller above this crate owed the batching. No caller did, so
+    // `Serving::tiled` now splits a partial fire into fires the tile covers --
+    // measured by
+    // `a_prompt_that_is_not_whole_tiles_is_answered_the_way_the_decode_answers_it`.
+    //
+    // The length stays whole because this test is about something else: three
+    // ways of feeding the SAME rows must agree, and a prompt that split would
+    // compare a split fire against a decode instead of the prefill against the
+    // decode. So this is the unsplit path, kept unsplit on purpose.
     assert_eq!(
         prompt.len() % 16,
         0,
@@ -6635,6 +6813,114 @@ fn a_conversation_is_answered_the_same_however_it_reaches_the_driver() {
         batched, alone,
         "a second conversation in the batch changed this one's answer"
     );
+}
+
+/// A prompt whose length is not a whole number of GEMM tiles.
+///
+/// # The fire the driver could not run
+///
+/// `affine_qmm_t` is compiled at row tiles of 16, 32 and 64, it reads its
+/// tile from the grid, and `geometry::eval` refuses a fire whose rows are not
+/// a multiple of one -- `PartialTile`. `continued` above records the
+/// consequence in its own prompt length: it keeps to 32 tokens and says a
+/// caller above this crate owes the batching.
+///
+/// No caller does. "The capital of France is" is 29 tokens, and a real
+/// `pie serve` on this driver refused it at the first projection. So
+/// `Serving::tiled` splits such a fire into fires the tile covers, and this
+/// is the measurement that the split computes the same model.
+///
+/// # Why one-at-a-time is the reference
+///
+/// The single-row path is the one every decode of every conversation takes,
+/// it goes through a different plan (`affine_qmv_fast`, not the tiled GEMM),
+/// and it cannot be split because there is nothing to split. If the 29-row
+/// fire agrees with 29 one-row fires to the last token, the split kept the
+/// arithmetic; and the two paths share no launch shape, so they cannot agree
+/// by making the same mistake.
+///
+/// The mutation that matters is the OVERLAP. 29 rows is fired as rows 0..16
+/// and rows 13..29, and the second fire's first three rows are rows the first
+/// already answered. Keeping them would shift every distribution after row 16
+/// by three, so the row a caller reads would be row 25's answer. Measured:
+/// passing `0` for the overlap makes the step report THIRTY-TWO rows for a
+/// 29-token prompt, which this test names before it reads a distribution --
+/// which is why the row count is asserted at all, rather than being taken as
+/// obvious from the prompt.
+#[test]
+fn a_prompt_that_is_not_whole_tiles_is_answered_the_way_the_decode_answers_it() {
+    use driver_vulkan::turns::Turn;
+
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the partial tile is unmeasured");
+        return;
+    };
+    // Four whole repeats and five tokens of a fifth: 29 rows, which is one
+    // 16-row tile and thirteen rows over.
+    let mut prompt: Vec<u32> = Vec::new();
+    for _ in 0..4 {
+        prompt.extend_from_slice(&PERIOD);
+    }
+    prompt.extend_from_slice(&PERIOD[..5]);
+    assert_eq!(prompt.len(), 29);
+    assert_ne!(prompt.len() % 16, 0, "the whole point of the prompt");
+
+    let argmax = |v: &[f32]| -> u32 {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .expect("a non-empty distribution")
+            .0 as u32
+    };
+
+    let mut shell = shelled(dir, &REALS[0], real, 8);
+    let step = shell
+        .step(&[Turn {
+            who: 1,
+            tokens: prompt.clone(),
+        }])
+        .unwrap_or_else(|e| panic!("the partial-tile prefill: {e}"));
+    assert_eq!(step.rows, 29, "the split answered a different fire");
+    assert_eq!(
+        step.logits.rows, 29,
+        "every row samples, so there is one distribution a row"
+    );
+    let vocab = step.logits.vocab;
+    let split = step.logits.values[28 * vocab..29 * vocab].to_vec();
+
+    // The same tokens, one fire each, on a cache of its own.
+    let mut apart = shelled(dir, &REALS[0], real, 8);
+    let mut row: Vec<f32> = Vec::new();
+    for t in &prompt {
+        let one = apart
+            .step(&[Turn {
+                who: 1,
+                tokens: vec![*t],
+            }])
+            .unwrap_or_else(|e| panic!("the decode: {e}"));
+        row = one.logits.values[..one.logits.vocab].to_vec();
+    }
+
+    assert_eq!(
+        argmax(&split),
+        argmax(&row),
+        "the split prefill and the decode want different tokens"
+    );
+    assert_eq!(
+        argmax(&split),
+        PERIOD[5],
+        "the model was shown the pattern and did not continue it"
+    );
+    // Not bit-exact and not asked to be: the two paths run different kernels
+    // over the same weights. Close is the claim -- a shifted row is not close.
+    let worst = split
+        .iter()
+        .zip(&row)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < 0.25, "the two paths disagree by {worst}");
 }
 
 /// A second real model is served correctly, biases and all.
@@ -7476,7 +7762,7 @@ fn the_engine_s_copy_plan_moves_what_it_names_and_nothing_when_it_is_refused() {
         src_page_ids: vec![0],
         dst_page_ids: vec![5],
         cells: vec![
-            driver_api::PieKvMoveCell {
+            driver_api::KvMoveCell {
                 src_page_id: 1,
                 src_token_offset: 3,
                 dst_page_id: 4,
@@ -7487,7 +7773,7 @@ fn the_engine_s_copy_plan_moves_what_it_names_and_nothing_when_it_is_refused() {
             // for the cell above -- its offsets are 3 and 1, so "the rest of
             // the page" is one row anyway. This one leaves three rows behind
             // it to be clobbered, and the rows-around assertion sees it.
-            driver_api::PieKvMoveCell {
+            driver_api::KvMoveCell {
                 src_page_id: 1,
                 src_token_offset: 0,
                 dst_page_id: 3,

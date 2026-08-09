@@ -386,14 +386,14 @@ fn packed_expert_views(b: &mut Builder<'_>) -> Result<(), Error> {
 /// unpackable bank is still a loadable one: the experts stay as themselves
 /// and only the fused GEMM's slab is missing. So each `return` is silent,
 /// and the tests pin the absence of the slab rather than an error.
+///
+/// The banks are non-empty by the caller's construction:
+/// `packed_expert_views` returns at `n_experts == 0` and calls here only
+/// when the walk reached every expert. That is stated by indexing rather
+/// than guarded, because a guard for it is a branch no checkpoint can
+/// take and no test can reach.
 fn layer_packed_experts(b: &mut Builder<'_>, base: &str, up: &[&RawTensor], down: &[&RawTensor]) {
-    // Unreachable as called: `packed_expert_views` returns early at
-    // `n_experts == 0` and only calls here when the walk reached all of
-    // them, so both slices hold at least one. Written as a `let else`
-    // because the two `Option`s have to be opened somehow, not as a check.
-    let (Some(first_up), Some(first_down)) = (up.first(), down.first()) else {
-        return;
-    };
+    let (first_up, first_down) = (up[0], down[0]);
     if first_up.shape.len() != 2
         || first_down.shape.len() != 2
         || !is_raw(&first_up.encoding, DType::BF16)

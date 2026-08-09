@@ -20,12 +20,6 @@
 #include "rope_device.cuh"
 
 namespace pie_cuda_driver::kernels::attn {
-
-bool mla_prepare_supported(int qk_rope_head_dim) {
-    return qk_rope_head_dim > 0 && qk_rope_head_dim % 2 == 0 &&
-           qk_rope_head_dim / 2 <= device::kMaxRopePairs;
-}
-
 void mla_prepare_bf16(
     MlaCacheLayerView layer,
     const void* kv_a,

@@ -298,7 +298,7 @@ fn resolved() -> BTreeSet<String> {
             "--edges",
             "normal",
             "--prefix",
-            "none",
+            "depth",
             "--format",
             "{p}",
             "--manifest-path",
@@ -311,12 +311,34 @@ fn resolved() -> BTreeSet<String> {
         "cargo tree failed, so the closure below is the unified one: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let names: BTreeSet<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .filter(|n| !n.is_empty())
-        .map(str::to_string)
-        .collect();
+    // Depth-prefixed and not flat, so that `loom`'s subtree can be dropped
+    // whole. It is here for the same reason the walk above has to name it --
+    // `--target all` reports a `cfg(loom)` edge as if it were unconditional --
+    // and dropping the edge alone is not enough: everything BELOW it stays in
+    // this name set, and the set is what narrows the over-approximating walk.
+    // `tracing-subscriber` arriving under `loom` is what un-narrowed `tarpc`'s
+    // `windows-sys`, which no build of this crate has ever compiled.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names = BTreeSet::new();
+    let mut pruned: Option<usize> = None;
+    for line in text.lines() {
+        let digits = line.chars().take_while(char::is_ascii_digit).count();
+        let Ok(depth) = line[..digits].parse::<usize>() else {
+            continue;
+        };
+        let Some(name) = line[digits..].split_whitespace().next() else {
+            continue;
+        };
+        match pruned {
+            Some(at) if depth > at => continue,
+            _ => pruned = None,
+        }
+        if name == "loom" {
+            pruned = Some(depth);
+            continue;
+        }
+        names.insert(name.to_string());
+    }
     // A parse that produced nothing would make the intersection empty and
     // every claim above vacuous.
     assert!(
@@ -366,9 +388,21 @@ fn closure<'a>(
             // OTHER crate is that crate's business -- what matters here is
             // whether the crate itself runs a build script, which is checked
             // per package above.
-            let normal = dep["dep_kinds"]
-                .as_array()
-                .is_some_and(|ks| ks.iter().any(|k| k["kind"].is_null()));
+            //
+            // An edge that exists only under `--cfg loom` is dropped with
+            // them, and for the same reason. `waker` takes `loom` that way so
+            // its register/commit race can be model-checked, and the closure
+            // walked here is unfiltered by platform -- `--target all` turns
+            // OFF cfg evaluation rather than answering it, so a cfg no build
+            // ever sets reads as one every build sets. Nothing a user builds
+            // passes that flag, and the alternative to naming it is filtering
+            // the walk to this host, which would drop the cross-compile half
+            // of the claim this test exists to make.
+            let normal = dep["dep_kinds"].as_array().is_some_and(|ks| {
+                ks.iter().any(|k| {
+                    k["kind"].is_null() && !k["target"].as_str().is_some_and(|t| t.contains("loom"))
+                })
+            });
             if !normal {
                 continue;
             }

@@ -3308,3 +3308,62 @@ mod plain_kernels {
         );
     }
 }
+
+/// EVERY SPECIALISATION'S ARM NAMES THE SYMBOL ITS BASE DOES.
+///
+/// `Specialisation` points at its arm by INDEX into a family's row list, and
+/// an index is the one reference that can be silently wrong. It was:
+/// `families::norm::RMSNORM_STRIDED_VEC8` said `RMSNORM_ROWS[4]`, five
+/// `RowsPerHead` rows were appended, and `[4]` became `norm::rmsnorm_bf16` —
+/// a different kernel with a different geometry.
+///
+/// `agrees()` caught it, which is the good half of the story: seven tests in
+/// this file failed, each naming the mismatch — *"arm `vec8` states
+/// RowsPerHead where the base states Rms; a specialisation chooses an
+/// instantiation, not a geometry"*. That check is why the defect could not
+/// ship.
+///
+/// But it caught it as a RULE mismatch, which is a coincidence of this case.
+/// Two rows with the same `LaunchRule` would have swapped silently, and
+/// `agrees()` would have had nothing to say — the arm would fire the wrong
+/// kernel with the right geometry, and §21.14's measurements say what that
+/// looks like: a wrong arm that is 99.83% of the right answer, or one that
+/// moves 34,273 of 55,200 cells while writing the same number of non-zero
+/// values. **A permutation, which no count or norm would flag.**
+///
+/// So this asserts the property `agrees()` cannot: an arm's row must name the
+/// base's symbol, with only a `#suffix` between them. That is checkable
+/// without knowing anything about geometry, and it holds however the list is
+/// reordered.
+#[test]
+fn an_arm_names_a_variant_of_its_own_base() {
+    use kernels_cuda_new::device;
+
+    let mut checked = 0_u32;
+    let mut wrong: Vec<String> = Vec::new();
+    for spec in device::SPECIALISED.iter().flat_map(|f| f.iter()) {
+        for arm in spec.arms {
+            checked += 1;
+            let named = arm.row.sig.symbol;
+            // A `#` variant of the base, or the base itself.
+            let stem = named.split('#').next().unwrap_or(named);
+            if stem != spec.base {
+                wrong.push(format!(
+                    "`{}` arm `{}` points at `{named}`, whose stem `{stem}` is not the base -- \
+                     an index into a row list moved under it",
+                    spec.base, arm.name
+                ));
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "no specialisation has an arm, so this test verified the empty set"
+    );
+    assert!(
+        wrong.is_empty(),
+        "an arm names a kernel that is not a variant of its base:\n  {}",
+        wrong.join("\n  ")
+    );
+    eprintln!("{checked} specialisation arm(s) name a variant of their own base");
+}

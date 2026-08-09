@@ -797,7 +797,7 @@ impl LoraFireState {
             unsafe {
                 let a_ptrs = x_ptrs.add(n);
                 let xa_ptrs = x_ptrs.add(2 * n);
-                ffi::pie_k_gemm_grouped_act_x_wt_bf16(
+                crate::bind::service::gemm_grouped_act_x_wt_bf16(
                     cublas,
                     x_ptrs,
                     a_ptrs,
@@ -810,7 +810,7 @@ impl LoraFireState {
                 );
                 if g.nq > 0 {
                     let base = x_ptrs.add(3 * n);
-                    ffi::pie_k_gemm_grouped_act_x_wt_bf16(
+                    crate::bind::service::gemm_grouped_act_x_wt_bf16(
                         cublas,
                         base,
                         base.add(g.nq as usize),
@@ -824,7 +824,7 @@ impl LoraFireState {
                 }
                 if g.nv > 0 {
                     let base = x_ptrs.add(3 * n + 3 * g.nq as usize);
-                    ffi::pie_k_gemm_grouped_act_x_wt_bf16(
+                    crate::bind::service::gemm_grouped_act_x_wt_bf16(
                         cublas,
                         base,
                         base.add(g.nv as usize),

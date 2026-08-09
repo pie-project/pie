@@ -59,32 +59,10 @@ void write_kv_to_pages(
 // replays across row splits (the host form bakes the split as
 // `first_token` + a split-dependent grid). Indexing stays absolute.
 // Native-bf16 cache only; envelope maintenance not wired (throws).
-void write_kv_to_pages_bf16_devwin(
-    KvCacheLayerView layer,
-    const void* k_curr,                            // [n_max, h_kv, d]
-    const void* v_curr,
-    const std::uint32_t* qo_indptr,                // [R+1]
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,           // [R+1]
-    const std::uint32_t* kv_last_page_lens,        // [R]
-    const std::uint32_t* win_d,                    // device {start, len}
-    int n_max,
-    int num_requests,
-    cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr);
-
-void write_kv_to_pages_at_positions_bf16(
-    KvCacheLayerView layer,
-    const void* k_curr,                            // [total_tokens, h_kv, d]
-    const void* v_curr,
-    const std::int32_t* positions,                 // [total_tokens], absolute positions
-    int position_delta,
-    const std::uint32_t* qo_indptr,                // [R+1]
-    const std::uint32_t* kv_page_indices,
-    const std::uint32_t* kv_page_indptr,           // [R+1]
-    int total_tokens,
-    int num_requests,
-    cudaStream_t stream);
+// `write_kv_to_pages_bf16_devwin` and `write_kv_to_pages_at_positions_bf16`
+// WERE declared here. Both launchers are deleted: nothing reachable called
+// either, and the kernels they fired are `attn/kv_paged.cuh`'s and are still
+// compiled. The `.cu` carries the evidence for each separately.
 
 void dequant_kv_cache_layer_to_bf16_active(
     KvCacheLayerView layer,

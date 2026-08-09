@@ -10,12 +10,13 @@ use crate::serve::load::ptir_target;
 use crate::serve::state::{
     ChannelState, FireDebt, FireScratch, GdnState, InFlight, InstanceEntry, KvState, LoadedModel,
     LoweredFire, LoweringKey, RUNAHEAD_DEPTH, Shell, digest_rows, instance_ring_shapes, retire,
-    retire_fire, slice_of,
+    retire_fire,
 };
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED, PIE_STATUS_INVALID_ARGUMENT,
-    PIE_STATUS_UNSUPPORTED, PieCompletion, PieFrameDesc,
+    PIE_STATUS_UNSUPPORTED,
 };
+use driver_api::submission::FrameSubmission;
 
 /// The loaded model's facts, family-dispatched: the qwen3_5 hybrid by
 /// its `linear_*` geometry + layer schedule, else the llama-like
@@ -165,7 +166,7 @@ fn supergraph_enabled() -> bool {
 /// window class is `GuardPred::WindowOne` now, so the two surviving
 /// values pick nothing the trace does not already guard. See §4.1.
 pub fn fire_class_of(
-    _step: &driver_api::local::PieStepDesc,
+    _step: &driver_api::StepSubmission,
     rows: usize,
     requests: usize,
 ) -> Result<model_compiler::trace::FireClass, i32> {
@@ -387,10 +388,10 @@ fn capture_or_replay<R: crate::bind::Resolver>(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn launch_impl(
     state: &mut Shell,
-    frame: &PieFrameDesc,
-    completion: PieCompletion,
+    frame: &FrameSubmission,
+    completion: driver_api::completion::CompletionTarget,
 ) -> Result<(), i32> {
-    let steps = slice_of(frame.steps.ptr, frame.steps.len);
+    let steps = frame.steps.as_slice();
     if steps.is_empty() {
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
@@ -403,7 +404,7 @@ pub(crate) fn launch_impl(
     // completion the runtime waits on. Only it enqueues an asynchronous
     // retire, because a frame completes once.
     let step = steps.last().expect("nonempty");
-    let cells = slice_of(step.terminal_cells.ptr, step.terminal_cells.len).to_vec();
+    let cells = step.terminal_cells.as_slice().to_vec();
     step_impl(state, frame, step, Some((completion, cells)))
 }
 
@@ -540,7 +541,7 @@ struct Admitted {
 #[cfg(feature = "abi")]
 fn admit(
     state: &Shell,
-    step: &driver_api::local::PieStepDesc,
+    step: &driver_api::StepSubmission,
 ) -> Result<(Admitted, &'static dyn model::catalog::Variant), i32> {
     use model_compiler::trace::FireClass;
 
@@ -563,7 +564,7 @@ fn admit(
     // `element_mask::from_words`. It REFUSES a table that does not
     // describe this fire rather than falling back, for the same reason
     // the whole entry used to refuse.
-    let sub_batches = slice_of(step.sub_batch_indptr.ptr, step.sub_batch_indptr.len);
+    let sub_batches = step.sub_batch_indptr.as_slice();
     if sub_batches.len() > 2 {
         eprintln!("[driver-cuda] launch: one sub-batch per step today");
         return Err(PIE_STATUS_UNSUPPORTED);
@@ -592,11 +593,11 @@ fn admit(
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     };
 
-    let token_ids = slice_of(step.token_ids.ptr, step.token_ids.len);
-    let position_ids = slice_of(step.position_ids.ptr, step.position_ids.len);
-    let kv_indptr = slice_of(step.kv_page_indptr.ptr, step.kv_page_indptr.len);
-    let kv_lens = slice_of(step.kv_last_page_lens.ptr, step.kv_last_page_lens.len);
-    let qo_indptr = slice_of(step.qo_indptr.ptr, step.qo_indptr.len);
+    let token_ids = step.plan.token_ids.as_slice();
+    let position_ids = step.plan.position_ids.as_slice();
+    let kv_indptr = step.plan.kv_page_indptr.as_slice();
+    let kv_lens = step.plan.kv_last_page_lens.as_slice();
+    let qo_indptr = step.plan.qo_indptr.as_slice();
     if token_ids.is_empty()
         || token_ids.len() != position_ids.len()
         || kv_indptr.len() < 2
@@ -613,10 +614,10 @@ fn admit(
     // is one region of the default point — and not a refusal.
     let mut fire_rows = model_compiler::lower::rows_from_regions(
         rows,
-        slice_of(step.sampling_indices.ptr, step.sampling_indices.len),
-        slice_of(step.region_row_indptr.ptr, step.region_row_indptr.len),
-        slice_of(step.region_sig.ptr, step.region_sig.len),
-        slice_of(step.region_k.ptr, step.region_k.len),
+        step.plan.sampling_indices.as_slice(),
+        step.region_row_indptr.as_slice(),
+        step.region_sig.as_slice(),
+        step.region_k.as_slice(),
     )
     .map_err(|drift| {
         eprintln!(
@@ -647,7 +648,7 @@ fn admit(
     // last row a request contributes, `qo_indptr[r + 1] - 1`. Not the
     // fire's last row, which is what a shape that knows no request
     // boundaries can say and is only right at one request.
-    if step.sampling_indices.len == 0 {
+    if step.plan.sampling_indices.is_empty() {
         for r in &mut fire_rows {
             r.samples = false;
         }
@@ -947,7 +948,7 @@ fn deliver_logits(
     channels: &std::collections::BTreeMap<u64, ChannelState>,
     logits_staging: &mut Option<crate::device::PinnedBuf>,
     retired_staging: &mut Vec<crate::device::PinnedBuf>,
-    frame: &PieFrameDesc,
+    frame: &FrameSubmission,
     model: &LoadedModel,
     lowered: &model_compiler::lower::Lowered,
     dplan: &crate::bind::DispatchPlan,
@@ -982,7 +983,7 @@ fn deliver_logits(
             Arg::Arena { .. } | Arg::Weight(_) => None,
         })
     });
-    let instance_ids = slice_of(frame.instance_ids.ptr, frame.instance_ids.len);
+    let instance_ids = frame.instance_ids.as_slice();
     let vocab = model.deployment.shape.vocab as usize;
 
     // EVERY REQUEST, each its OWN reader channel and its OWN row.
@@ -1191,7 +1192,7 @@ fn gdn_context(
     // baked them.
     epoch: &mut crate::fire::recordings::PlanEpoch,
     dep: &model::deployment::Deployment,
-    step: &driver_api::local::PieStepDesc,
+    step: &driver_api::StepSubmission,
     requests: usize,
     alloc: &crate::device::Allocator,
     stream: &crate::device::OwnedStream,
@@ -1256,8 +1257,8 @@ fn gdn_context(
         // zeroes a slot before the fire; BUFFER_WRITE routes the pass's
         // state into a buffer slot instead of the live one; FOLD copies
         // the accepted prefix back afterwards. See the fold below.
-        let rs_slot_ids = slice_of(step.rs_slot_ids.ptr, step.rs_slot_ids.len);
-        let rs_flags = slice_of(step.rs_slot_flags.ptr, step.rs_slot_flags.len);
+        let rs_slot_ids = step.plan.rs_slot_ids.as_slice();
+        let rs_flags = step.plan.rs_slot_flags.as_slice();
         if rs_slot_ids.len() != requests {
             eprintln!("[driver-cuda] launch: hybrid fire without rs_slot_ids");
             return Err(PIE_STATUS_INVALID_ARGUMENT);
@@ -1278,12 +1279,9 @@ fn gdn_context(
         // `FrozenVerify` is "prefill plus a verify-stash store" — the
         // buffer IS the stash. `CommitAdvance` is "replay the confirmed
         // prefix" — the fold length IS that prefix.
-        let rs_fold_lens = slice_of(step.rs_fold_lens.ptr, step.rs_fold_lens.len);
-        let rs_buffer_slot_ids = slice_of(step.rs_buffer_slot_ids.ptr, step.rs_buffer_slot_ids.len);
-        let rs_buffer_indptr = slice_of(
-            step.rs_buffer_slot_indptr.ptr,
-            step.rs_buffer_slot_indptr.len,
-        );
+        let rs_fold_lens = step.plan.rs_fold_lens.as_slice();
+        let rs_buffer_slot_ids = step.plan.rs_buffer_slot_ids.as_slice();
+        let rs_buffer_indptr = step.plan.rs_buffer_slot_indptr.as_slice();
         let need_slots = rs_slot_ids.iter().copied().max().map_or(1, |m| m + 1);
         gdn_state.ensure_slots(need_slots, epoch, &alloc, &stream)?;
         // RESET, asked of the cache rather than written out. `reset_slot`
@@ -1923,7 +1921,7 @@ fn publish_seam_pins(
     stream: &crate::device::OwnedStream,
     dep: &model::deployment::Deployment,
     model: &LoadedModel,
-    step: &driver_api::local::PieStepDesc,
+    step: &driver_api::StepSubmission,
     named_widths: &std::collections::BTreeMap<model_compiler::trace::ValueId, u32>,
     geom: PlanGeometry<'_>,
     rows: usize,
@@ -2005,15 +2003,16 @@ fn publish_seam_pins(
     // this fire, because a fire asked to attend over a supplied mask and
     // served causally returns an answer that looks exactly like a correct
     // one. That was the whole reason `admit` used to turn the frame away.
-    let staged = (step.has_user_mask != 0).then(|| {
+    let staged = step.plan.has_user_mask.then(|| {
+        let masks = step.plan.bitmask_words();
         crate::fire::page_mask::element_mask::from_words(
             qo_indptr,
             kv_indptr,
             kv_lens,
             page_size,
-            slice_of(step.masks.request_indptr.ptr, step.masks.request_indptr.len),
-            slice_of(step.masks.word_indptr.ptr, step.masks.word_indptr.len),
-            slice_of(step.masks.words.ptr, step.masks.words.len),
+            &masks.request_indptr,
+            &masks.word_indptr,
+            &masks.words,
         )
         .ok_or_else(|| {
             eprintln!(
@@ -2248,7 +2247,7 @@ fn run_sampling_programs(
     model: &LoadedModel,
     lowered: &model_compiler::lower::Lowered,
     dplan: &crate::bind::DispatchPlan,
-    frame: &PieFrameDesc,
+    frame: &FrameSubmission,
     alloc: &crate::device::Allocator,
     stream: &crate::device::OwnedStream,
     qo_indptr: &[u32],
@@ -2293,7 +2292,7 @@ fn run_sampling_programs(
     // Still one lane per fire — `program::run`'s grouping is unbuilt — so
     // this is N single-lane fires rather than one N-lane fire. Slower and
     // correct, which is the right order.
-    let instance_ids = slice_of(frame.instance_ids.ptr, frame.instance_ids.len);
+    let instance_ids = frame.instance_ids.as_slice();
     // Which requests still need raw logits: the ones whose program did
     // not publish. A frame can be MIXED — one request bound to a sampling
     // program and another not — and each half has to be served, which is
@@ -2350,7 +2349,7 @@ fn run_sampling_programs(
 /// to deliver; refusing here would turn a missing sampler into a dead
 /// request. `run_program` finds no session and declines, which is the
 /// path it already had.
-fn ensure_sessions(state: &mut Shell, frame: &PieFrameDesc) {
+fn ensure_sessions(state: &mut Shell, frame: &FrameSubmission) {
     // The stream and the allocator are separate FIELDS on purpose — see
     // the north star §7: grouping them into one struct collapses a
     // disjoint borrow the fire path depends on.
@@ -2358,7 +2357,7 @@ fn ensure_sessions(state: &mut Shell, frame: &PieFrameDesc) {
     else {
         return;
     };
-    let ids: Vec<u64> = slice_of(frame.instance_ids.ptr, frame.instance_ids.len).to_vec();
+    let ids: Vec<u64> = frame.instance_ids.as_slice().to_vec();
     for id in ids {
         if state.ptir_sessions.contains_key(&id) {
             continue;
@@ -2401,7 +2400,7 @@ fn lora_phase(
     scratch: &mut crate::fire::scratch::Scratch,
     lora_arena: &mut crate::fire::lora::LoraStageArena,
     tp_size: u32,
-    frame: &PieFrameDesc,
+    frame: &FrameSubmission,
     qo_indptr: &[u32],
     stream: crate::device::StreamRef<'_>,
     raw_stream: *mut core::ffi::c_void,
@@ -2422,24 +2421,25 @@ fn lora_phase(
     // ONE LANE PER INSTANCE, and the token span is the request's own —
     // `qo_indptr[r]..qo_indptr[r+1]`, which is what makes an adapter
     // apply to the rows that asked for it and no others.
-    let lora_lanes: Vec<crate::fire::lora::LoraLaneView> =
-        slice_of(frame.instance_ids.ptr, frame.instance_ids.len)
-            .iter()
-            .enumerate()
-            .filter_map(|(r, &iid)| {
-                let start = *qo_indptr.get(r)?;
-                let end = *qo_indptr.get(r + 1)?;
-                crate::fire::lora::lane_for_instance(
-                    programs,
-                    sessions,
-                    instances,
-                    iid,
-                    start,
-                    end.saturating_sub(start),
-                    stream,
-                )
-            })
-            .collect();
+    let lora_lanes: Vec<crate::fire::lora::LoraLaneView> = frame
+        .instance_ids
+        .as_slice()
+        .iter()
+        .enumerate()
+        .filter_map(|(r, &iid)| {
+            let start = *qo_indptr.get(r)?;
+            let end = *qo_indptr.get(r + 1)?;
+            crate::fire::lora::lane_for_instance(
+                programs,
+                sessions,
+                instances,
+                iid,
+                start,
+                end.saturating_sub(start),
+                stream,
+            )
+        })
+        .collect();
     // THE ROWS THE STAGING READS, from the correction's own operand
     // join — the same read `attention_pins` makes, and false under
     // `Union` if it were positional.
@@ -2898,8 +2898,8 @@ fn peel_tail_ctx(
 
 pub(crate) fn step_impl(
     state: &mut Shell,
-    frame: &PieFrameDesc,
-    step: &driver_api::local::PieStepDesc,
+    frame: &FrameSubmission,
+    step: &driver_api::StepSubmission,
     // `owes` is the debt this step carries when it is the frame's LAST:
     // `None` for the earlier steps, which owe nothing because a frame
     // completes once. A step handed one enqueues an asynchronous
@@ -2907,7 +2907,10 @@ pub(crate) fn step_impl(
     // synchronizes, because the next step's work depends on it and the
     // producer→consumer ordering inside a frame is what makes steps
     // sequential in the first place.
-    owes: Option<(PieCompletion, Vec<*mut driver_api::local::PieTerminalCell>)>,
+    owes: Option<(
+        driver_api::completion::CompletionTarget,
+        Vec<*mut driver_api::local::TerminalCell>,
+    )>,
 ) -> Result<(), i32> {
     use crate::bind::{AttnCtx, AttnRegions, DispatchCtx, Frame, Resolver, run};
     use model_compiler::lower::Arg;
@@ -2944,12 +2947,12 @@ pub(crate) fn step_impl(
     let model = state.model.as_ref().ok_or(PIE_STATUS_INVALID_ARGUMENT)?;
     // Derived at load, read here. See `LoadedModel::deployment`.
     let dep = &model.deployment;
-    let token_ids = slice_of(step.token_ids.ptr, step.token_ids.len);
-    let position_ids = slice_of(step.position_ids.ptr, step.position_ids.len);
-    let kv_indices = slice_of(step.kv_page_indices.ptr, step.kv_page_indices.len);
-    let kv_indptr = slice_of(step.kv_page_indptr.ptr, step.kv_page_indptr.len);
-    let kv_lens = slice_of(step.kv_last_page_lens.ptr, step.kv_last_page_lens.len);
-    let qo_indptr = slice_of(step.qo_indptr.ptr, step.qo_indptr.len);
+    let token_ids = step.plan.token_ids.as_slice();
+    let position_ids = step.plan.position_ids.as_slice();
+    let kv_indices = step.plan.kv_page_indices.as_slice();
+    let kv_indptr = step.plan.kv_page_indptr.as_slice();
+    let kv_lens = step.plan.kv_last_page_lens.as_slice();
+    let qo_indptr = step.plan.qo_indptr.as_slice();
 
     sg_trace(|| format!("  head {:?}", t_head.elapsed()));
     let t_low = std::time::Instant::now();
@@ -3593,8 +3596,7 @@ pub(crate) fn step_impl(
         vocab: model.deployment.shape.vocab as usize,
         cells,
         completion,
-        notify: state.notify,
-        notify_ctx: state.notify_ctx,
+        broker: state.broker.clone(),
     });
 
     // ── Sampling: the instance's PROGRAM, if it has one. ──

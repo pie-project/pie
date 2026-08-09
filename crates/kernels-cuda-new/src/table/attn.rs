@@ -316,14 +316,16 @@ pub static KERNELS: &[KernelSig] = &[
             ),
             stream: Stream <- Source::Ctx("stream"),
         ]),
-    // The KV-split's other half: it merges `num_index_sets` partials whose
-    // boundaries are the split's, not a row range's.
-    kernel!(merge_attention_states "attn::merge_attention_states_bf16", whole = true,
-        operands = operands![
-            v: Buf, s: F32s, v_merged: BufMut, s_merged: F32sMut,
-            num_index_sets: I32, seq_len: I32, num_heads: I32, head_dim: I32,
-            stream: Stream,
-        ]),
+    // `attn::merge_attention_states_bf16` WAS HERE — the KV-split's other
+    // half. Deleted by `new-horizon.md` §38: its whole consumer set was
+    // `dsl::cuda::merge_attention_states`, which nothing called. The
+    // launcher (`attn/attention_merge_states.cu:31`) stays — it holds no
+    // `<<<>>>` at all, it dispatches into the vendored
+    // `flashinfer/attention/cascade.cuh`, and `examples/vendor_probe.rs:199`
+    // cites it by file and line as the proof that that text compiles here
+    // (96,176 B, 8 of 8 symbols). §31.4's precedent exactly: the probe is
+    // what makes re-adding this row cheap, and the row was never how to get
+    // there.
     // Rewrites `[R+1]` indptr arrays, so a row window would compact the wrong
     // requests' page lists.
     kernel!(compact_page_csr "attn::compact_page_csr", whole = true,
@@ -351,7 +353,10 @@ pub static KERNELS: &[KernelSig] = &[
     // result does not carry it.
     kernel!(mla_absorb_q_to_latent "gemm::mla_absorb_q_to_latent_bf16",
         operands = operands![
-            handle: CublasHandle <- Source::Ctx("cublas"),
+            // NO `handle: CublasHandle` — §45. `execution::RUST_SERVED`
+            // names both absorbs, so their bodies are `driver-cuda`'s
+            // `bind::service::gemm_mla_absorb_*` and the handle comes off
+            // the dispatch context rather than out of the row.
             q_nope: Buf <- Source::In(0),
             kv_b_proj: Buf <- Source::Weight(0),
             q_latent: BufMut <- Source::Out(0),
@@ -365,7 +370,6 @@ pub static KERNELS: &[KernelSig] = &[
     // `qk_nope_dim` is the param this direction lacks a shape for.
     kernel!(mla_absorb_latent_to_v "gemm::mla_absorb_latent_to_v_bf16",
         operands = operands![
-            handle: CublasHandle <- Source::Ctx("cublas"),
             attn_latent: Buf <- Source::In(0),
             kv_b_proj: Buf <- Source::Weight(0),
             attn_v: BufMut <- Source::Out(0),
@@ -379,18 +383,16 @@ pub static KERNELS: &[KernelSig] = &[
     // needs an attention that sees a HISTORY buffer beside the pages (the
     // drafted tokens are not committed -- committing them before acceptance
     // is the thing MTP must not do) and a per-slot pending-hidden shuffle.
-    // All four address through `slot_ids` or `qo_indptr`.
-    kernel!(attention_mtp_paged_history "attn::attention_mtp_paged_history_bf16",
-        whole = true, lacks = &[Cap::Scores],
-        operands = operands![
-            q: Buf, k_pages: Buf, v_pages: Buf, k_history: Buf, v_history: Buf,
-            o: BufMut, position_ids: I32s, request_ids: I32s,
-            kv_page_indices: U32s, kv_page_indptr: U32s, kv_last_page_lens: U32s,
-            num_tokens: I32, history_steps: I32, history_stride: I32,
-            max_global_tokens: I32, page_size: I32, num_q_heads: I32,
-            num_kv_heads: I32, head_dim: I32, hnd_layout: Bool,
-            global_cache_uses_prefix_position: Bool, stream: Stream,
-        ]),
+    // All three address through `slot_ids` or `qo_indptr`.
+    //
+    // `attn::attention_mtp_paged_history_bf16` WAS the fourth. Deleted by
+    // `new-horizon.md` §38: its whole consumer set was
+    // `dsl::cuda::attention_mtp_paged_history`, which nothing called. The
+    // launcher stays, and the reason is arithmetic rather than caution --
+    // `attention_naive.cu:80`'s three-way host choice is the ONLY caller of
+    // `attention_mtp_history_bf16` (`:52`), so deleting it would orphan two
+    // launchers and two `<<<>>>`, not one, and move `EXPECTED` off 401.
+    // Both are `NoRow` entries in `driver-cuda/tests/launch_abi.rs`.
     // Both walk `src_indptr[R+1]`. The window view is how sliding-window
     // attention is expressed without a second cache -- the window is a VIEW
     // over the same pages.

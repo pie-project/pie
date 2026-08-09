@@ -230,9 +230,12 @@ impl Variant for Dsv4 {
         load: Deployed<'_>,
     ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
         let _ = load;
-        let mut deployment = project::deployment(&self.shape, self.rope_theta, self.norm_eps)?;
-        deployment.advertised = self.advertised();
-        Ok(deployment)
+        project::deployment(
+            &self.shape,
+            self.rope_theta,
+            self.norm_eps,
+            self.advertised(),
+        )
     }
 
     /// # Errors
@@ -287,8 +290,14 @@ impl Variant for Dsv4 {
         if let crate::catalog::Backend::Metal(_) = load.backend {
             return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
         }
-        self.deployment(load)?;
-        Ok(project::trace(&self.shape, class))
+        // The plan this row WOULD fire. It cannot run in this build --
+        // `deployment` refuses for a store nothing provisions -- and it is
+        // written anyway, because the alternative is a row that stops being
+        // able to serve the day one is. `tests/a_store_this_build_does_not
+        // _provision.rs` holds the refusal so the day it changes is a test
+        // failure naming this line rather than a silent revival.
+        self.deployment(load)
+            .map(|_| project::trace(&self.shape, class))
     }
 
     /// DeepSeek's own template, with the FULLWIDTH role delimiters.

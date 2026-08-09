@@ -163,10 +163,7 @@ pub fn deployment(
     advertised: Advertised,
 ) -> Result<Deployment, Refusal> {
     let planned = plan(f, rope_theta, norm_eps, rope_yarn, advertised);
-    match planned.kv.store_refusal() {
-        Some(no_store) => Err(no_store),
-        None => Ok(planned),
-    }
+    planned.provisioned()
 }
 
 /// The projection itself, which is TOTAL: a row's deployment is a fact

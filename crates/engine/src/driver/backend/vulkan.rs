@@ -56,15 +56,11 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::driver::FrameLaunchOutcome;
-use crate::driver::channel::RegisteredChannel;
-use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
-    StateCopyPlan,
+use ::driver_api::{
+    BoundInstance, ChannelRegistrationPlan, CompletionBroker, Driver, FrameLaunchOutcome,
+    FrameSubmission, InstanceBindingPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan,
+    ProgramRegistration, RegisteredChannel, StateCopyPlan, SubmissionCompletion,
 };
-use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
-use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::submission::FrameSubmission;
 
 /// How many KV pages a shell is opened with.
 ///
@@ -114,38 +110,15 @@ impl VulkanDriver {
     /// conditions rather than runtime ones, and both are worth failing at
     /// boot: a server that started without kernels would refuse its first
     /// request instead of its first configuration.
-    pub fn create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
+    pub fn create(config_bytes: &[u8]) -> Result<Self> {
         // The boot TOML is the ENGINE's format, read here for the same reason
         // the Metal seam reads it here: a driver that parsed it would be the
         // second thing entitled to an opinion about the file's shape.
-        let boot = std::str::from_utf8(config_bytes)
-            .ok()
-            .and_then(|text| text.parse::<toml::Table>().ok());
-        let key = |k: &str| {
-            boot.as_ref()
-                .and_then(|v| Some(v.get("model")?.get(k)?.as_str()?.to_string()))
-        };
-        // The directory `kernels-vulkan`'s build script wrote, which reaches
-        // this crate only if it is asked for. It is NOT a dependency of this
-        // one: the engine linking a shader compiler to run a driver would be
-        // the build-time equivalent of loading a checkpoint format, and a
-        // driver consumes modules rather than producing them.
-        let module_dir = key("kernels")
-            .or_else(|| std::env::var("PIE_KERNELS_VULKAN_SPV_DIR").ok())
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| {
-                anyhow!(
-                    "driver-vulkan: no SPIR-V module directory. Set `[model] kernels` in the \
-                     boot config or PIE_KERNELS_VULKAN_SPV_DIR to the directory \
-                     `kernels-vulkan` built."
-                )
-            })?;
+        let Boot {
+            module_dir,
+            kv_pages,
+        } = boot_of(config_bytes)?;
         let modules = read_modules(&module_dir)?;
-        let kv_pages = boot
-            .as_ref()
-            .and_then(|v| v.get("model")?.get("kv_pages")?.as_integer())
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(DEFAULT_KV_PAGES);
 
         // Opened and dropped: the facts are all `create` owes, and holding a
         // device open until `load_model` would hold the whole GPU against a
@@ -155,30 +128,15 @@ impl VulkanDriver {
                 .map_err(|e| anyhow!("driver-vulkan: no device: {e}"))?;
             driver_vulkan::facts::of(&device)
         };
-        Ok((
-            Self {
-                shell: None,
-                facts: facts.clone(),
-                modules,
-                module_dir,
-                kv_pages,
-                broker: CompletionBroker::new(),
-                programs: driver_vulkan::programs::Programs::new(),
-            },
+        Ok(Self {
+            shell: None,
             facts,
-        ))
-    }
-
-    /// The device's stated facts.
-    #[must_use]
-    pub fn device_facts(&self) -> &::driver_api::DeviceFacts {
-        &self.facts
-    }
-
-    /// Vulkan exports no KV handle: there is no cross-process sharing path.
-    #[must_use]
-    pub fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
-        None
+            modules,
+            module_dir,
+            kv_pages,
+            broker: CompletionBroker::new(),
+            programs: driver_vulkan::programs::Programs::new(),
+        })
     }
 
     /// The shell, or a message saying which verb was called before a load.
@@ -191,6 +149,28 @@ impl VulkanDriver {
             )
         })
     }
+}
+
+impl Driver for VulkanDriver {
+    fn kind(&self) -> &'static str {
+        "vulkan"
+    }
+
+    fn device_domain(&self) -> ::driver_api::DeviceDomain {
+        ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE
+    }
+
+    /// The device's stated facts.
+    #[must_use]
+    fn device_facts(&self) -> Option<&::driver_api::DeviceFacts> {
+        Some(&self.facts)
+    }
+
+    /// Vulkan exports no KV handle: there is no cross-process sharing path.
+    #[must_use]
+    fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
+        None
+    }
 
     /// Identify the checkpoint, assemble its text, open a shell, and stage
     /// every weight the decode plan binds.
@@ -199,7 +179,7 @@ impl VulkanDriver {
     ///
     /// More than one descriptor, a snapshot no catalog row matches, a plan
     /// that will not compile or execute, or a device that will not allocate.
-    pub fn load_model(
+    fn load_model(
         &mut self,
         descs: Vec<::driver_api::ModelLoadDesc>,
     ) -> Result<::driver_api::DriverCapabilities> {
@@ -287,7 +267,7 @@ impl VulkanDriver {
             has_attn_page_mask: false,
             has_lora: false,
             model_site_summary: ::driver_api::ModelSiteSummary::default(),
-            device_geometry_port_mask: 0,
+            device_geometry_port_mask: ::driver_api::PIE_DECODE_ENVELOPE_PORTS,
             // The ceilings a batch is formed under, and they are the arena's:
             // `Shell::open` sizes one fire's scratch, and a fire wider than
             // this has nothing to run in.
@@ -323,7 +303,7 @@ impl VulkanDriver {
     ///
     /// A launch package the registry refuses -- no stages, a channel shape it
     /// cannot serve, a stage it cannot read.
-    pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
+    fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
         self.programs
             .register_program(desc)
             .map_err(|e| anyhow!("driver-vulkan: {e}"))
@@ -338,10 +318,7 @@ impl VulkanDriver {
     /// # Errors
     ///
     /// A shape the registry will not serve, or a duplicate id.
-    pub fn register_channel(
-        &mut self,
-        desc: &ChannelRegistrationPlan,
-    ) -> Result<RegisteredChannel> {
+    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
         let binding = self
             .programs
             .register_channel(desc)
@@ -366,7 +343,7 @@ impl VulkanDriver {
     ///
     /// An unknown program or channel, a geometry class this build has no name
     /// for, or a binding that does not match what was asked.
-    pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
+    fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
         // `requested_instance_id` is 0 for "any", which the registry spells
         // as `None`.
         let requested = (desc.requested_instance_id != 0).then_some(desc.requested_instance_id);
@@ -409,44 +386,99 @@ impl VulkanDriver {
     /// failure. Admission is NOT an error: a frame that does not fit reports
     /// [`FrameLaunchOutcome::Exhausted`], which the engine re-posts, or
     /// `Impossible` when no growth could ever make room.
-    pub fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
-        match self.shell("launch")?.launch(frame) {
-            Ok(driver_vulkan::frames::Launched::Exhausted) => Ok(FrameLaunchOutcome::Exhausted),
-            Ok(driver_vulkan::frames::Launched::Impossible) => Ok(FrameLaunchOutcome::Impossible),
-            Ok(driver_vulkan::frames::Launched::Ran(steps)) => {
-                // The distributions do not come back through this return, and
-                // that is the seam's shape rather than a loss: a step's answer
-                // is read by the frame's own PROGRAMS, which put it on the
-                // channels the engine reads. Firing them is this seam's job
-                // because the registry is this seam's -- it is alive from
-                // `create`, before there is a shell -- so the driver hands
-                // back the steps and the two halves are joined here.
-                let mut faults = Vec::new();
-                for (step, sub) in steps.iter().zip(&frame.steps) {
-                    driver_vulkan::frames::run_programs(
-                        &mut self.programs,
-                        &frame.instance_ids,
-                        sub,
-                        step,
-                        &mut faults,
-                    )
-                    .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
-                }
-                // Logged and not returned, as Metal logs them: a fault kills
-                // the one instance that faulted, and the requests batched
-                // with it ran. The guest behind the dead one is not left
-                // waiting -- `driver::Registry::fire` publishes the fault on
-                // the rings that instance's host READS, and the pipeline
-                // turns that poison word into the guest's error -- so this
-                // line is an operator's record rather than the only report.
-                for (instance, why) in faults {
-                    tracing::warn!(instance, %why, "vulkan: program faulted");
-                }
-                let (_raw, completion) = self.broker.launch_completion(1);
-                Ok(FrameLaunchOutcome::Launched(completion))
+    fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
+        let page = driver_vulkan::facts::PAGE_SIZE;
+        match self.shell("launch")?.admit(frame) {
+            Ok(Some(driver_vulkan::frames::Launched::Exhausted)) => {
+                return Ok(FrameLaunchOutcome::Exhausted);
             }
-            Err(e) => Err(anyhow!("driver-vulkan: {e}")),
+            Ok(Some(driver_vulkan::frames::Launched::Impossible)) => {
+                return Ok(FrameLaunchOutcome::Impossible);
+            }
+            Ok(Some(driver_vulkan::frames::Launched::Ran(_)) | None) => {}
+            Err(e) => return Err(anyhow!("driver-vulkan: {e}")),
         }
+        // A step at a time, because a DEVICE-RESOLVED step's tokens are what
+        // the step before it PUT on a channel: they do not exist until that
+        // step has both fired and had its program run. The stronger order --
+        // convert every step before firing any -- is kept for a frame of
+        // ordinary host-wire steps by `Shell::launch`, which this path does
+        // not call; here the two halves are interleaved, and a step that
+        // cannot be prepared has fired nothing of its own.
+        let mut faults = Vec::new();
+        for sub in &frame.steps {
+            let filled = driver_vulkan::envelope::fill(&self.programs, frame, sub, page)
+                .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
+            let plan = match filled {
+                driver_vulkan::envelope::Filled::Ready(plan) => plan,
+                // Nothing to fire and nothing wrong: the producer has not
+                // run. Every member of this step is told to come back, which
+                // is what the scheduler's re-post is for.
+                driver_vulkan::envelope::Filled::Early { channel } => {
+                    tracing::debug!(
+                        channel,
+                        "vulkan: a step's geometry channel is not filled yet"
+                    );
+                    let early = vec![driver_vulkan::frames::Ran::Early; sub.roster_rows.len()];
+                    publish_terminals(&sub.terminal_cells, &early)?;
+                    break;
+                }
+            };
+            let (requests, tokens) = self
+                .shell("launch")?
+                .prepare(&plan)
+                .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
+            let step = self
+                .shell("launch")?
+                .serve(&requests, &tokens)
+                .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
+            // The distributions do not come back through this return, and
+            // that is the seam's shape rather than a loss: a step's answer is
+            // read by the frame's own PROGRAMS, which put it on the channels
+            // the engine reads. Firing them is this seam's job because the
+            // registry is this seam's -- it is alive from `create`, before
+            // there is a shell -- so the driver hands back the step and the
+            // two halves are joined here.
+            let ran = driver_vulkan::frames::run_programs(
+                &mut self.programs,
+                &frame.instance_ids,
+                sub,
+                &step,
+                &mut faults,
+            )
+            .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
+            publish_terminals(&sub.terminal_cells, &ran)?;
+        }
+        // Logged and not returned, as Metal logs them: a fault kills the one
+        // instance that faulted, and the requests batched with it ran. The
+        // guest behind the dead one is not left waiting --
+        // `driver::Registry::fire` publishes the fault on the rings that
+        // instance's host READS, and the pipeline turns that poison word into
+        // the guest's error -- so this line is an operator's record rather
+        // than the only report.
+        for (instance, why) in faults {
+            tracing::warn!(instance, %why, "vulkan: program faulted");
+        }
+        // Settled here, because it is already settled. A completion is a
+        // promise that the frame's work has finished, and the asynchronous
+        // backends keep it by notifying from wherever the work actually lands
+        // -- `remote` from its RPC task, CUDA from its stream. This driver has
+        // nowhere to notify FROM: `Shell::serve` waits on the fence itself and
+        // everything the frame asked for has happened by the time it returns.
+        //
+        // Handing back an unnotified completion is not a smaller version of
+        // that. It is a promise nobody keeps: the scheduler parks the lane on
+        // it and re-reports the same frame forever --
+        //
+        //     [pie-sched] driver 0 stalled for 1690s (no progress, work
+        //     queued or in flight) ... batch of 1 (settled=false, age=1690s)
+        //
+        // -- which is what a real `pie serve` on this backend did, for every
+        // turn, after a fire that had already computed the right answer in
+        // 563 milliseconds.
+        let (_raw, completion) = self.broker.launch_completion(1);
+        self.broker.notify(completion.wait_id(), 1);
+        Ok(FrameLaunchOutcome::Launched(completion))
     }
 
     /// # Errors
@@ -454,7 +486,7 @@ impl VulkanDriver {
     /// Always. There is no separate encode step in this driver: a fire records
     /// and submits in one call, so there is no encoded frame to hand back.
     /// CUDA and Metal refuse the same verb.
-    pub fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+    fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
         bail!("driver-vulkan: media encode is unsupported on this backend")
     }
 
@@ -467,18 +499,18 @@ impl VulkanDriver {
     /// # Errors
     ///
     /// A call before `load_model`, or a plan that leaves a layer's region.
-    pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
+    fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
         self.shell("copy_kv")?
             .copy_kv(desc)
             .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
-        let (_raw, completion) = self.broker.pie_completion(1);
+        let (_raw, completion) = self.broker.control_completion(1);
         Ok(completion)
     }
 
     /// # Errors
     ///
     /// Always: no model this backend serves has recurrent state.
-    pub fn copy_state(&mut self, _desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
+    fn copy_state(&mut self, _desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
         bail!("driver-vulkan: no model this driver serves holds a recurrent state")
     }
 
@@ -488,13 +520,13 @@ impl VulkanDriver {
     ///
     /// A call before `load_model`, a shrink that would strand a conversation,
     /// or a device that will not allocate the new size.
-    pub fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
+    fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
         self.shell("resize_pool")?
             .resize_pool(desc)
             .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
         // Settled already: the resize returns with the new buffers allocated
         // and the old ones freed, and there is nothing left in flight.
-        let (_raw, completion) = self.broker.pie_completion(1);
+        let (_raw, completion) = self.broker.control_completion(1);
         Ok(completion)
     }
 
@@ -502,7 +534,7 @@ impl VulkanDriver {
     ///
     /// Never; the registry accepts a close of an id it does not hold, because
     /// a close is idempotent from the scheduler's side.
-    pub fn close_instance(&mut self, id: u64) -> Result<()> {
+    fn close_instance(&mut self, id: u64) -> Result<()> {
         // A close BEFORE a load is answered rather than refused, and so is a
         // close of an id the registry does not hold: teardown races both ways
         // and a fault logged per conversation would be noise about a verb
@@ -514,10 +546,64 @@ impl VulkanDriver {
     /// # Errors
     ///
     /// As [`Self::close_instance`].
-    pub fn close_channel(&mut self, id: u64) -> Result<()> {
+    fn close_channel(&mut self, id: u64) -> Result<()> {
         self.programs.close_channel(id);
         Ok(())
     }
+}
+
+/// What the boot TOML says, and nothing that needs a device to find out.
+///
+/// Its own type and its own function so that the file's shape is testable
+/// where no Vulkan device exists. This is a CONTRACT with the worker, which
+/// writes the file (`write_vulkan_startup_toml`), and a contract with one
+/// reader and no test is one that gets discovered broken by a server booting
+/// with the wrong pool size and saying nothing about it.
+struct Boot {
+    /// Where the compiled SPIR-V modules are.
+    module_dir: std::path::PathBuf,
+    /// How many KV pages the shell allocates.
+    kv_pages: u32,
+}
+
+/// Read the boot TOML.
+///
+/// # Errors
+///
+/// No module directory, from either the file or the environment.
+fn boot_of(config_bytes: &[u8]) -> Result<Boot> {
+    // The boot TOML is the ENGINE's format, read here for the same reason
+    // the Metal seam reads it here: a driver that parsed it would be the
+    // second thing entitled to an opinion about the file's shape.
+    let boot = std::str::from_utf8(config_bytes)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok());
+    // The directory `kernels-vulkan`'s build script wrote, which reaches
+    // this crate only if it is asked for. It is NOT a dependency of this
+    // one: the engine linking a shader compiler to run a driver would be
+    // the build-time equivalent of loading a checkpoint format, and a
+    // driver consumes modules rather than producing them.
+    let module_dir = boot
+        .as_ref()
+        .and_then(|v| Some(v.get("model")?.get("kernels")?.as_str()?.to_string()))
+        .or_else(|| std::env::var("PIE_KERNELS_VULKAN_SPV_DIR").ok())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            anyhow!(
+                "driver-vulkan: no SPIR-V module directory. Set `[model] kernels` in the \
+                 boot config or PIE_KERNELS_VULKAN_SPV_DIR to the directory \
+                 `kernels-vulkan` built."
+            )
+        })?;
+    let kv_pages = boot
+        .as_ref()
+        .and_then(|v| v.get("model")?.get("kv_pages")?.as_integer())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(DEFAULT_KV_PAGES);
+    Ok(Boot {
+        module_dir,
+        kv_pages,
+    })
 }
 
 /// Every `.spv` in `dir`, by file stem.
@@ -645,6 +731,69 @@ fn stage(
         out.push((traced.clone(), bytes.clone()));
     }
     Ok(out)
+}
+
+/// Tell each member's work item what became of it.
+///
+/// # What a terminal cell is, and why a launched frame must write one
+///
+/// The scheduler hands every request in a frame a `PieTerminalCell` and
+/// resolves that request's work item by READING it. Success commits, Failed
+/// fails the one request, Retry re-posts it -- and `Pending`, which is what an
+/// untouched cell holds, is none of those: `resolve_from_terminal` turns it
+/// into `work item completion terminal outcome is still Pending`, which the
+/// guest sees as `channel is poisoned: pipeline: forward failed`.
+///
+/// So this is not bookkeeping the asynchronous backends do for their own
+/// reasons. It is the only channel a frame has for saying that it ran. CUDA
+/// writes these cells from its stream callback and `remote` writes them from
+/// the executor's reply; a host-side driver writes them here, because by the
+/// time `Shell::launch` has returned every one of them is already decided.
+///
+/// # Errors
+///
+/// A frame that names fewer cells than the step had members, or a null one:
+/// both would have this write past what the scheduler owns, and the pointer
+/// is not something a later layer can check.
+fn publish_terminals(
+    cells: &[*mut ::driver_api::TerminalCell],
+    ran: &[driver_vulkan::frames::Ran],
+) -> Result<()> {
+    use driver_vulkan::frames::Ran;
+
+    if cells.is_empty() {
+        // A step with no cells is one the scheduler is not waiting on -- the
+        // driver's own tests build frames this way -- and writing nothing is
+        // the whole of the right answer.
+        return Ok(());
+    }
+    if cells.len() != ran.len() {
+        bail!(
+            "driver-vulkan: this frame names {} terminal cells for {} members",
+            cells.len(),
+            ran.len()
+        );
+    }
+    for (&cell, outcome) in cells.iter().zip(ran) {
+        if cell.is_null() {
+            bail!("driver-vulkan: a member of this frame has a null terminal cell");
+        }
+        let word = match outcome {
+            Ran::Fired => ::driver_api::PIE_TERMINAL_OUTCOME_SUCCESS,
+            // Not a failure and not a success: the member was skipped without
+            // being touched, and the scheduler's answer to that is to post it
+            // again. Writing SUCCESS here would answer a request whose program
+            // never ran.
+            Ran::Early => ::driver_api::PIE_TERMINAL_OUTCOME_RETRY,
+            Ran::Faulted => ::driver_api::PIE_TERMINAL_OUTCOME_FAILED,
+        };
+        // `publish` releases, so the reader that observes the outcome also
+        // observes everything the fire wrote before it.
+        unsafe {
+            (*cell).publish(word);
+        }
+    }
+    Ok(())
 }
 
 /// Every weight name this model's decode plan binds.
@@ -866,6 +1015,48 @@ mod tests {
         }
     }
 
+    /// The boot file the worker writes is the boot file this seam reads.
+    ///
+    /// Two crates, one file, and no shared type between them: `worker`'s
+    /// `write_vulkan_startup_toml` puts `kernels` and `kv_pages` under
+    /// `[model]`, and this reads them from there. Nothing in the compiler
+    /// connects the two -- a key moved to `[batching]`, which is where the
+    /// Metal writer keeps its page geometry and so the obvious thing to
+    /// copy, would boot with this driver's own defaults and no complaint.
+    /// An operator who asked for a bigger cache would get 1024 pages and no
+    /// sign the number was ignored.
+    ///
+    /// The literal TOML here is that file's shape written out by hand on
+    /// purpose. Calling the worker's writer would be the same mistake as
+    /// sharing a type: the point is that the two agree, and a test that
+    /// derives one from the other cannot say so.
+    #[test]
+    fn the_boot_file_the_worker_writes_is_the_one_this_seam_reads() {
+        let boot = r#"
+[model]
+hf_path = "/tmp/snap"
+kernels = "/tmp/spv"
+kv_pages = 4096
+"#;
+        let read = super::boot_of(boot.as_bytes()).expect("the boot config reads");
+        assert_eq!(read.module_dir, std::path::PathBuf::from("/tmp/spv"));
+        assert_eq!(read.kv_pages, 4096);
+
+        // And the default, which is the other half of the contract: the
+        // worker omits `kernels` when the operator did not set one, and this
+        // seam is then entitled to the environment. `kv_pages` is always
+        // written, so an absent one is a file this driver did not get from
+        // the worker at all -- a hand-written config, or an older one -- and
+        // it gets the driver's own number rather than zero pages.
+        let read = super::boot_of(
+            br#"[model]
+kernels = "/tmp/spv"
+"#,
+        )
+        .expect("the boot config reads");
+        assert_eq!(read.kv_pages, super::DEFAULT_KV_PAGES);
+    }
+
     /// A model this build has no text for is refused in the ROW's words.
     ///
     /// Phi-3-mini's heads are 96 wide and the Metal text names
@@ -1011,7 +1202,7 @@ mod tests {
         assert_eq!(channel.binding.channel_id, 9);
 
         let instance = driver
-            .bind_instance(&crate::driver::instance::InstanceBindingPlan {
+            .bind_instance(&::driver_api::instance::InstanceBindingPlan {
                 driver_id: 4,
                 program_id: program,
                 // Zero is "any", not instance zero.
@@ -1033,5 +1224,102 @@ mod tests {
 
         driver.close_instance(instance.instance_id).expect("closes");
         driver.close_channel(9).expect("closes");
+    }
+
+    /// The seam's own staging is the driver's, measured by the answer.
+    ///
+    /// `driver-vulkan`'s device suite already serves these weights and gets
+    /// the pattern right, but it stages them ITSELF: it reads a raw MLX
+    /// snapshot and holds the bytes. This path is a different one end to end
+    /// -- a `.zt` artifact `pie model build` authored, `catalog::identify`
+    /// on already-lowered names, `compile_load_plan_for`, the streaming
+    /// executor, and `Naming::mlx()` -- and every one of those steps could
+    /// deliver a tensor that is transposed, half a row short, or another
+    /// layer's. None of that is a crash on this card: `robustBufferAccess`
+    /// returns zero past the end, so wrong staging is FLUENT.
+    ///
+    /// So the claim is the numbers. The prompt is five repeats of a
+    /// six-token period plus two more, and four greedy steps must continue
+    /// it exactly. The numpy CPU reference over the same checkpoint answers
+    /// the same four, and a model that had lost a weight would still answer
+    /// something.
+    ///
+    /// Skips without `PIE_VULKAN_ARTIFACT` and `PIE_KERNELS_VULKAN_SPV_DIR`.
+    #[test]
+    fn the_artifact_this_seam_stages_answers_what_the_checkpoint_answers() {
+        let (Ok(modules), Ok(artifacts)) = (
+            std::env::var("PIE_KERNELS_VULKAN_SPV_DIR"),
+            std::env::var("PIE_VULKAN_ARTIFACT"),
+        ) else {
+            eprintln!("SKIP: PIE_KERNELS_VULKAN_SPV_DIR and PIE_VULKAN_ARTIFACT name the inputs");
+            return;
+        };
+        let boot = format!("[model]\nkernels = \"{modules}\"\nkv_pages = 64\n");
+        // Every artifact named, because one model cannot tell a conversion
+        // from a table that happens to spell one model's names -- the same
+        // reason `driver-vulkan/tests/checkpoint.rs` takes a list.
+        let mut served = 0usize;
+        for artifact in artifacts.split(':').filter(|a| !a.is_empty()) {
+            let Ok((mut backend, _facts)) = VulkanDriver::create(boot.as_bytes()) else {
+                eprintln!("SKIP: no Vulkan device");
+                return;
+            };
+            backend
+                .load_model(vec![::driver_api::ModelLoadDesc {
+                    snapshot_dir: std::path::PathBuf::from(artifact),
+                    runtime_quant: String::new(),
+                    mxfp4_moe: ::driver_api::Mxfp4MoeRequest::Auto,
+                    component: ::driver_api::ModelComponent::Text,
+                }])
+                .unwrap_or_else(|e| panic!("{artifact} loads: {e}"));
+            let shell = backend.shell.as_mut().expect("a shell after load_model");
+
+            // The period `driver-vulkan/tests/device.rs` uses, and the same
+            // reason: a repeating prompt makes a wrong answer visible without a
+            // tokenizer, because the right one is the next term.
+            const PERIOD: [u32; 6] = [15339, 1723, 88204, 6100, 41777, 2930];
+            let mut prompt: Vec<u32> = Vec::new();
+            for _ in 0..5 {
+                prompt.extend_from_slice(&PERIOD);
+            }
+            prompt.push(PERIOD[0]);
+            prompt.push(PERIOD[1]);
+            // Thirty-two: the tiled GEMM takes whole 16-row tiles and a driver
+            // may not pad a fire it did not author.
+            assert_eq!(prompt.len() % 16, 0);
+
+            let mut got = Vec::new();
+            let mut turn = driver_vulkan::turns::Turn {
+                who: 1,
+                tokens: prompt,
+            };
+            for _ in 0..4 {
+                let rows = turn.tokens.len();
+                let step = shell
+                    .step(std::slice::from_ref(&turn))
+                    .unwrap_or_else(|e| panic!("the step ran: {e}"));
+                assert_eq!(step.rows, rows, "the fire answered a different width");
+                let vocab = step.logits.vocab;
+                // The last row is the one that has seen the whole prompt.
+                let at = (rows - 1) * vocab;
+                let row = &step.logits.values[at..at + vocab];
+                let next = row
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .expect("a non-empty distribution")
+                    .0 as u32;
+                got.push(next);
+                turn.tokens = vec![next];
+            }
+            assert_eq!(
+                got,
+                vec![PERIOD[2], PERIOD[3], PERIOD[4], PERIOD[5]],
+                "the artifact this seam staged from {artifact} does not continue \
+             the pattern the same weights continue on the CPU"
+            );
+            served += 1;
+        }
+        assert!(served > 0, "PIE_VULKAN_ARTIFACT named nothing");
     }
 }

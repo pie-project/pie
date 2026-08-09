@@ -88,6 +88,16 @@
 //! guard buys that the write is not a RACE — a memory-model property, which no
 //! comparison against a reference can see. A test says what a device returned;
 //! it does not say the return was well-defined.
+//!
+//! # How much of the table this file answers for
+//!
+//! `every_stated_row_is_dispatched_or_named` is the assertion, and [`COVERAGE`]
+//! is the list it holds. All 44 STATED rows are dispatched; the other 56 carry
+//! axes and a name and no operands, so no layout can be derived from them and
+//! this harness cannot bind one. The count is pinned in both directions — the
+//! list must be exactly the table's stated set, every name in it must still
+//! appear in this file, and [`run`] refuses to dispatch a row the list does
+//! not claim — so the number shrinking is a failure rather than a silence.
 
 #![allow(clippy::print_stdout)]
 
@@ -1379,6 +1389,16 @@ fn run(gpu: &Gpu, entrypoint: &str, buffers: &[&wgpu::Buffer], uniform: &[u8], g
          `over()` exists to make impossible",
     );
     let limit = gpu.limits.max_compute_workgroups_per_dimension;
+    // The other half of `every_stated_row_is_dispatched_or_named`. That test
+    // says every stated row is claimed; this says every dispatch is one the
+    // list knows about, so the two cannot drift in either direction.
+    assert!(
+        is_claimed(sig.symbol),
+        "`{entrypoint}` is row `{}`, which `COVERAGE` does not claim this \
+         suite dispatches. Classify it there in the same edit that dispatches \
+         it, or the count that test pins stops meaning anything",
+        sig.symbol,
+    );
     assert!(
         groups.iter().all(|n| *n <= limit),
         "`{entrypoint}`'s grid {groups:?} is past this adapter's {limit} \
@@ -1603,6 +1623,10 @@ fn every_grid_here_is_ragged() {
         ("residual_add / silu_mul / geglu / gptoss, words", 2990, 256),
         ("row_gather, words of a row", 22, 16),
         ("row_gather, gathered rows", 11, 16),
+        ("split_qkv, channel pairs", 54, 256),
+        ("geglu_tanh_strided, words of an output row", 23, 16),
+        ("embed_gather, output words of one row", 192, 256),
+        ("embed_gather_mb, rows", 13, 16),
         ("add_bias at an even width, words", 230, 256),
         ("add_bias at an odd width, words", 231, 256),
         ("affine_qmv_fast, output rows over a 8-row group", 13, 8),
@@ -2094,19 +2118,28 @@ fn rotate(x1: f32, x2: f32, theta: f32, gain: f32) -> (f32, f32) {
 
 /// The shape one `rope/neox.wgsl` launch runs over.
 ///
-/// A struct rather than seven arguments, because six of the seven are counts
-/// and a caller that transposed two of them would still compile. `pairs` is
-/// the ROTATED half-count and `head_dim` is the whole head; when they
-/// disagree the rotary is partial, which is the only case that separates
-/// `neox_prop_decode` from `neox_decode`.
+/// A struct rather than eight arguments, because most of them are counts and a
+/// caller that transposed two would still compile. `pairs` is the ROTATED
+/// half-count and `head_dim` is the whole head; when they disagree the rotary
+/// is partial, which is the only case that separates `neox_prop_decode` from
+/// `neox_decode`.
+///
+/// `freqs` selects the third spelling: a non-empty table is the `_freqs` rows,
+/// where the angle comes from a BUFFER rather than from an exponent — llama-3's
+/// piecewise interpolation and YaRN's are tables, not bases, so no exponent can
+/// express them — and `mscale` is YaRN's attention-temperature correction,
+/// which rides here because rotation is linear and scaling before or after is
+/// the same thing.
 #[derive(Clone, Copy)]
-struct Neox {
+struct Neox<'a> {
     heads: usize,
     head_dim: usize,
     pairs: usize,
     scale: f32,
     base: f32,
     prop: bool,
+    freqs: &'a [f32],
+    mscale: f32,
 }
 
 /// What `rope/neox.wgsl` leaves in `x`, from the bf16 the device was given.
@@ -2121,7 +2154,7 @@ struct Neox {
 /// rather than across `pairs`. That is the ONLY thing separating
 /// `neox_prop_decode` from `neox_decode`, and it separates them only when the
 /// rotary is PARTIAL.
-fn neox_reference(x: &[f32], positions: &[i32], shape: Neox) -> Vec<f32> {
+fn neox_reference(x: &[f32], positions: &[i32], shape: Neox<'_>) -> Vec<f32> {
     let Neox {
         heads,
         head_dim,
@@ -2129,10 +2162,15 @@ fn neox_reference(x: &[f32], positions: &[i32], shape: Neox) -> Vec<f32> {
         scale,
         base,
         prop,
+        freqs,
+        mscale,
     } = shape;
     let mut out = x.to_vec();
     let dist = if prop { head_dim / 2 } else { pairs };
     let theta = |i: usize, pos: f32| -> f32 {
+        if !freqs.is_empty() {
+            return scale * pos * freqs[i];
+        }
         let e = if prop {
             2.0 * i as f32 / head_dim as f32
         } else {
@@ -2153,12 +2191,12 @@ fn neox_reference(x: &[f32], positions: &[i32], shape: Neox) -> Vec<f32> {
                 let at = row * heads * head_dim + h * head_dim + i0;
                 let (a0, a1) = (x[at], x[at + 1]);
                 let (b0, b1) = (x[at + dist], x[at + dist + 1]);
-                let (r0x, r0y) = rotate(a0, b0, theta(i0, pos), 1.0);
+                let (r0x, r0y) = rotate(a0, b0, theta(i0, pos), mscale);
                 // The odd tail of a partial rotary: channel `i0 + 1` is past
                 // the rotated range, so it keeps its value — and is rewritten
                 // with it, because the word is stored whole.
                 let (r1x, r1y) = if i0 + 1 < pairs {
-                    rotate(a1, b1, theta(i0 + 1, pos), 1.0)
+                    rotate(a1, b1, theta(i0 + 1, pos), mscale)
                 } else {
                     (a1, b1)
                 };
@@ -2225,6 +2263,8 @@ fn a_rope_rotates_against_the_tensor_it_is_overwriting() {
             scale,
             base,
             prop: false,
+            freqs: &[],
+            mscale: 1.0,
         },
     );
     agrees(&got, &want, "the rotated tensor").expect("neox_decode rotates");
@@ -2287,6 +2327,8 @@ fn a_proportional_rope_turns_only_its_own_slice() {
         scale,
         base,
         prop: true,
+        freqs: &[],
+        mscale: 1.0,
     };
     let want = neox_reference(&x_seen, &positions, partial);
     agrees(&got, &want, "the partially rotated tensor").expect("neox_prop_decode rotates");
@@ -4804,5 +4846,1672 @@ fn a_strided_shared_expert_combine_reads_its_gate_a_full_pitch_apart() {
         "element {n} is the pad half of the pad word and holds {} rather than \
          the zero the overshot row computes over a zero pad",
         tail[n],
+    );
+}
+
+/// D32. `split_qkv_bf16` writes three tensors, and the failure is a stride.
+///
+/// One packed row in, three rows out at three different offsets and TWO
+/// different widths. So Q gets five heads and K and V get two — a body that
+/// used the query head count for the key write is the defect this row has, and
+/// equal counts cannot see it, because then every stride in the kernel is the
+/// same number.
+///
+/// The two widths ride in `SplitQkvParams`, a STORAGE struct at binding 4:
+/// the row states `params: Buf`, so there is no `@group(1)` here at all and
+/// this test hands it none. `dump_layout` prints "0 bytes of uniform block".
+///
+/// The x extent is in channel PAIRS — 54 of them over a 256-wide workgroup —
+/// so plain division dispatches nothing at all.
+#[test]
+fn a_qkv_split_gives_each_projection_its_own_width() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let head_dim = 12usize;
+    let q_heads = 5usize;
+    let kv_heads = 2usize;
+    let q_width = q_heads * head_dim;
+    let kv_width = kv_heads * head_dim;
+    let packed_width = q_width + 2 * kv_width;
+    let rows = ROWS as usize;
+    assert_ne!(
+        q_width, kv_width,
+        "equal widths make every stride in this kernel the same number",
+    );
+
+    let (packed, packed_seen) = bf16s(gpu, &spread(rows * packed_width, 2001));
+    let q = sentinelled(gpu, (rows * q_width).div_ceil(2));
+    let k = sentinelled(gpu, (rows * kv_width).div_ceil(2));
+    let v = sentinelled(gpu, (rows * kv_width).div_ceil(2));
+    let params = storage(
+        gpu,
+        &[
+            (q_width as u32).to_le_bytes(),
+            (kv_width as u32).to_le_bytes(),
+        ]
+        .concat(),
+    );
+
+    // `LaunchRule::SplitPacked` is `[in_width, rows, 1]` in ELEMENTS; this body
+    // owns a pair, so half that many lanes do the work and the rest exit at the
+    // guard. Dispatched at the minimum, where an undershoot is visible.
+    run(
+        gpu,
+        "split_qkv_bf16",
+        &[&packed, &q, &k, &v, &params],
+        &[],
+        [over(packed_width.div_ceil(2) as u32, 256), rows as u32, 1],
+    );
+
+    let got_q = unpack(&read(gpu, &q), rows * q_width);
+    let got_k = unpack(&read(gpu, &k), rows * kv_width);
+    let got_v = unpack(&read(gpu, &v), rows * kv_width);
+    // Exact: the body widens to f32 and repacks, which is a lossless round trip
+    // for every finite bf16, so a split moves BITS.
+    for row in 0..rows {
+        for c in 0..packed_width {
+            let from = packed_seen[row * packed_width + c];
+            let (which, got, at) = if c < q_width {
+                ("q", &got_q, row * q_width + c)
+            } else if c < q_width + kv_width {
+                ("k", &got_k, row * kv_width + (c - q_width))
+            } else {
+                ("v", &got_v, row * kv_width + (c - q_width - kv_width))
+            };
+            assert_eq!(
+                got[at].to_bits(),
+                from.to_bits(),
+                "row {row} packed channel {c} belongs to {which}[{at}] and \
+                 holds {} rather than {from}. q is {q_width} wide and k and v \
+                 are {kv_width}, so a stride taken from the wrong projection \
+                 lands inside another one",
+                got[at],
+            );
+        }
+    }
+
+    // The control: a reference that gave K the QUERY width must disagree, or
+    // the two head counts chosen here cannot tell them apart.
+    let mut by_q_width = vec![0.0f32; rows * kv_width];
+    for row in 0..rows {
+        for c in 0..kv_width {
+            // What a body striding K by `q_width` would have written.
+            let at = row * q_width + c;
+            if at < rows * kv_width {
+                by_q_width[at] = packed_seen[row * packed_width + q_width + c];
+            }
+        }
+    }
+    assert!(
+        got_k
+            .iter()
+            .zip(&by_q_width)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "the key tensor also satisfies a reference strided by the query width, \
+         so this shape is not separating them",
+    );
+}
+
+/// D33. `logit_softcap` saturates rather than running away.
+///
+/// `cap * tanh(x / cap)`, and the interesting inputs are the ones a spread of
+/// activations never produces: values well past the cap in both directions,
+/// and one large enough that `x / cap` is 2.4e37 — where the answer must be
+/// exactly the cap and not a NaN.
+///
+/// `SoftcapParams` is a STORAGE struct at binding 2 and its second field is
+/// bound-and-unread, exactly as `GegluParams::unused` is. So it is filled with
+/// a number that would be catastrophic as a bound — 3, against 5980 elements —
+/// and every element is still required to be right. A future edit that started
+/// reading it fails here rather than returning a tensor whose first three
+/// elements are capped.
+#[test]
+fn a_logit_softcap_saturates_at_its_cap() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let n = (ROWS * WIDTH) as usize;
+    let cap = 12.5f32;
+
+    let mut values = spread(n, 2101);
+    // Past the cap, both ways, at several magnitudes.
+    values[3] = 40.0;
+    values[4] = -40.0;
+    values[5] = 512.0;
+    values[6] = -512.0;
+    // `x / cap` is 2.4e37 here: `tanh` must saturate to one and the product
+    // must be the cap, not an infinity and not a NaN.
+    values[7] = 3.0e38;
+    values[8] = -3.0e38;
+    let (logits, logits_seen) = bf16s(gpu, &values);
+    let out = sentinelled(gpu, n / 2);
+    // `cap`, then a field the body does not read — filled with a number that
+    // would be a catastrophic bound.
+    let params = storage(
+        gpu,
+        &[cap.to_bits().to_le_bytes(), 3u32.to_le_bytes()].concat(),
+    );
+
+    run(
+        gpu,
+        "logit_softcap_bfloat16",
+        &[&logits, &out, &params],
+        &[],
+        [over(n as u32 / 2, 256), 1, 1],
+    );
+
+    let got = unpack(&read(gpu, &out), n);
+    let want: Vec<f32> = logits_seen
+        .iter()
+        .map(|x| rounded(cap * (x / cap).tanh()))
+        .collect();
+    agrees(&got, &want, "the capped logits").expect("the softcap agrees");
+    refuses_a_perturbed_reference(&got, &want, "the capped logits");
+
+    // The saturation, named rather than folded into the comparison: a NaN and
+    // a slightly wrong number are both "not the reference" and only one of
+    // them is arithmetic.
+    for at in [7usize, 8] {
+        assert!(
+            got[at].is_finite(),
+            "element {at} was fed {} and came back {}, which is not a number",
+            logits_seen[at],
+            got[at],
+        );
+        assert_eq!(
+            got[at].abs(),
+            cap,
+            "element {at} was fed {}, so `x / cap` is {} and `tanh` of it is \
+             one: the answer must be exactly the cap",
+            logits_seen[at],
+            logits_seen[at] / cap,
+        );
+    }
+    assert!(
+        got.iter().all(|v| v.abs() <= cap),
+        "a softcap that lets any logit past its cap has not capped anything",
+    );
+    // And every element is right, including the ones past the unread `n` = 3.
+    assert!(
+        n > 3,
+        "the unread field is set to a number that would be a catastrophic \
+         bound, which only means something if the tensor is longer than it",
+    );
+}
+
+/// D34. `ple_combine` is `(proj + token) * inv_sqrt2`, in that order.
+///
+/// gemma's two per-layer-embedding streams, averaged in the root-mean-square
+/// sense. The scale is the JOIN's and not a deployment's, so it arrives in
+/// `PleCombineParams` — a STORAGE struct at binding 3 — beside an `n` the body
+/// does not read.
+///
+/// # The trap, which is the rounding and not the addition
+///
+/// The add is in f32 and the multiply is in f32 and there is exactly ONE bf16
+/// round, on the store. A body that rounded the sum first — which is what
+/// `pie_bf16_to_f32(pie_f32_to_bf16(a + b)) * s` would be, and which is what
+/// the two fused matmul epilogues in this tree deliberately DO — is a
+/// different number, and at `inv_sqrt2` it is a different number by up to half
+/// a bf16 ulp on every element. So the reference is checked against that
+/// alternative too, and has to refuse it.
+///
+/// `n` is filled with 3 for the same reason `logit_softcap`'s unread field is.
+#[test]
+fn a_ple_combine_rounds_once_and_at_the_end() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let n = (ROWS * WIDTH) as usize;
+    // Not 1.0 and not 0.5: a body that dropped the scale, or that used the
+    // other obvious constant, has to be visible.
+    let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+
+    let (proj, proj_seen) = bf16s(gpu, &spread(n, 2201));
+    let (token, token_seen) = bf16s(gpu, &spread(n, 2203));
+    let out = sentinelled(gpu, n / 2);
+    let params = storage(
+        gpu,
+        &[inv_sqrt2.to_bits().to_le_bytes(), 3u32.to_le_bytes()].concat(),
+    );
+
+    run(
+        gpu,
+        "ple_combine_bfloat16",
+        &[&proj, &token, &out, &params],
+        &[],
+        [over(n as u32 / 2, 256), 1, 1],
+    );
+
+    let got = unpack(&read(gpu, &out), n);
+    let want: Vec<f32> = proj_seen
+        .iter()
+        .zip(&token_seen)
+        .map(|(a, b)| rounded((a + b) * inv_sqrt2))
+        .collect();
+    agrees(&got, &want, "the combined embedding").expect("the combine agrees");
+    refuses_a_perturbed_reference(&got, &want, "the combined embedding");
+
+    // The alternative rounding, and the unscaled sum. Both are things a port
+    // produces by accident and both are wrong.
+    let rounded_first: Vec<f32> = proj_seen
+        .iter()
+        .zip(&token_seen)
+        .map(|(a, b)| rounded(rounded(a + b) * inv_sqrt2))
+        .collect();
+    let moved = got
+        .iter()
+        .zip(&rounded_first)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert!(
+        moved > 0,
+        "rounding the sum before the scale is supposed to be a DIFFERENT \
+         number on this data; if it is not, these inputs cannot see the \
+         difference and the claim about the single round is untested",
+    );
+    let unscaled: Vec<f32> = proj_seen
+        .iter()
+        .zip(&token_seen)
+        .map(|(a, b)| rounded(a + b))
+        .collect();
+    agrees(&got, &unscaled, "the combine without its scale")
+        .expect_err("a body that dropped `inv_sqrt2` would satisfy this");
+}
+
+/// D35. `layer_scalar_mul` reads its scalar from a BUFFER.
+///
+/// Which layer is running is the FIRE's business, so gemma4's per-layer scale
+/// is a resident `[1]` tensor rather than a number the statement carries — and
+/// that makes the operand a `Buf` at binding 1, between `x` and `out`.
+///
+/// The scalar is 0.375, which is neither 1.0 (a body that ignored the buffer)
+/// nor `x[0]` (a body that read the wrong binding). Element 1 of the same
+/// buffer is -2.75, so a body that took the word's HIGH half — the other
+/// obvious half-index slip — is wrong by a sign as well as a magnitude.
+///
+/// `LayerScalarParams.hidden` is bound and not read, and that is the Metal
+/// port's finding kept rather than tidied away: the field is ONE ROW's width
+/// while `LaunchRule::Elementwise` dispatches `width * rows`, so reading it as
+/// a bound returned every row after the first holding whatever the arena had.
+/// It is filled with 7 here.
+#[test]
+fn a_layer_scalar_multiply_reads_its_scale_from_the_buffer() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let n = (ROWS * WIDTH) as usize;
+    let scale = 0.375f32;
+    let (x, x_seen) = bf16s(gpu, &spread(n, 2301));
+    assert_ne!(
+        x_seen[0], scale,
+        "the scale must not be a value `x` also holds at index zero",
+    );
+    let (scalar, scalar_seen) = bf16s(gpu, &[scale, -2.75]);
+    let out = sentinelled(gpu, n / 2);
+    let params = storage(gpu, &7u32.to_le_bytes());
+
+    run(
+        gpu,
+        "layer_scalar_mul_bfloat16",
+        &[&x, &scalar, &out, &params],
+        &[],
+        [over(n as u32 / 2, 256), 1, 1],
+    );
+
+    let got = unpack(&read(gpu, &out), n);
+    let want: Vec<f32> = x_seen.iter().map(|v| rounded(v * scalar_seen[0])).collect();
+    agrees(&got, &want, "the scaled layer").expect("the layer scalar agrees");
+    refuses_a_perturbed_reference(&got, &want, "the scaled layer");
+
+    // The three ways to get the scalar wrong, all refused.
+    let unscaled: Vec<f32> = x_seen.iter().map(|v| rounded(*v)).collect();
+    agrees(&got, &unscaled, "the layer without its scale")
+        .expect_err("a body that ignored binding 1 would satisfy this");
+    let high_half: Vec<f32> = x_seen.iter().map(|v| rounded(v * scalar_seen[1])).collect();
+    agrees(&got, &high_half, "the layer scaled by the word's high half")
+        .expect_err("`pie_bf16_at(scalar[0], 0u)` is the LOW half of word zero");
+    // And every element past the unread `hidden` = 7 is right, which the
+    // comparison above already covers and this names.
+    assert!(
+        n > 7 && got.len() == n,
+        "the unread field is 7 against {n} elements, so a body that read it as \
+         a bound would leave everything after element 7 untouched",
+    );
+}
+
+/// D36. `vnorm_single_row` normalizes an AXIS that is not the row.
+///
+/// The weightless RMSNorm: the row divided by its own RMS and nothing else, so
+/// the absence of a gain buffer is the whole difference from `rms_single_row`
+/// and the operand list is three long rather than four.
+///
+/// # Why the axis is 92 and the width is 460
+///
+/// The row states `grid_param = Some(1)` — `VNormParams.axis_size` — and that
+/// was a real gap on the Vulkan side, caught by the parity test on its first
+/// run. A value norm's axis is the HEAD and its row is every head, so a launch
+/// that took the fire's width for the axis reduces the whole row as one, which
+/// is not a coarser normalization but a different number in every channel.
+/// Five heads of 92 to a row is that case; one head per row could not see it.
+///
+/// 92 is not a multiple of the 1024-element chunk the body walks a row in, and
+/// 46 words is not a multiple of its 256-lane store loop.
+#[test]
+fn a_vector_norm_reduces_over_its_axis_and_not_over_its_row() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let axis = 92usize;
+    let width = WIDTH as usize;
+    let rows = ROWS as usize;
+    assert_eq!(width % axis, 0, "five heads to a row");
+    assert_ne!(
+        axis, width,
+        "an axis equal to the width is the case that proves nothing"
+    );
+    let n = rows * width;
+    let eps = 1e-6f32;
+
+    let (x, x_seen) = bf16s(gpu, &spread(n, 2401));
+    let out = sentinelled(gpu, n / 2);
+    let params = storage(
+        gpu,
+        &[eps.to_bits().to_le_bytes(), (axis as u32).to_le_bytes()].concat(),
+    );
+
+    // `LaunchRule::Rms` is one workgroup per AXIS, not per row: `width / axis`
+    // axes to a row and `rows` rows.
+    let axes = (width / axis) * rows;
+    run(
+        gpu,
+        "vnorm_single_row_bfloat16",
+        &[&x, &out, &params],
+        &[],
+        [axes as u32, 1, 1],
+    );
+
+    let norm_over = |span: &[f32]| -> Vec<f32> {
+        let total: f32 = span.iter().map(|v| v * v).sum();
+        let inv = (total / span.len() as f32 + eps).sqrt().recip();
+        span.iter().map(|v| rounded(v * inv)).collect()
+    };
+    let got = unpack(&read(gpu, &out), n);
+    let mut want = Vec::with_capacity(n);
+    for a in 0..axes {
+        want.extend(norm_over(&x_seen[a * axis..(a + 1) * axis]));
+    }
+    agrees(&got, &want, "the value norm").expect("the value norm agrees");
+    refuses_a_perturbed_reference(&got, &want, "the value norm");
+
+    // The gap this shape exists for: a launch that took the fire's WIDTH for
+    // the axis reduces five heads as one. Every channel then moves, so the
+    // count claim refuses it as well as the per-element bound.
+    let mut by_row = Vec::with_capacity(n);
+    for row in 0..rows {
+        by_row.extend(norm_over(&x_seen[row * width..(row + 1) * width]));
+    }
+    agrees(&got, &by_row, "the value norm reduced over the whole row").expect_err(
+        "`axis_size` is the row's `grid_param` and a launch that used the \
+         width instead normalizes five heads as one",
+    );
+    // And there IS a gain-free claim here: multiplying by anything would move
+    // the answer, so a body that grew a weight buffer is visible.
+    assert!(
+        want.iter().any(|v| v.abs() > 0.5),
+        "a norm with no gain leaves values of order one; if every element is \
+         tiny the comparison has nothing to bite on",
+    );
+}
+
+/// D37. `embed_gather` in all four of its corners, at the two quantization
+/// points that pack IN STEP.
+///
+/// Four rows over 24 entrypoints: `{,_scaled}` x `{,_mb}` x `gs_{32,64,128}` x
+/// `b_{4,8}`. The corners are the `_scaled`/`_mb` combinations, because those
+/// are what change which buffers are read and which grid axis carries the row.
+///
+/// # Why `gs_64/b_8` and `gs_128/b_4` are the pair to choose
+///
+/// `common/affine.inc.wgsl` says the two numbers are one fact: `PIE_GROUP /
+/// PIE_CODES_PER_WORD` is 16 for BOTH of them, so the two walk the packed plane
+/// and the scale plane in exact step and a module compiled for the wrong one
+/// does not fail — it reads the scales against the wrong weights and returns
+/// fluent nonsense.
+///
+/// So both points are handed the SAME `w`, `scales` and `biases` bytes, sized
+/// for the larger of the two readings, and each answer is required to satisfy
+/// its own decode and to be REFUSED by the other's. That is the coordinate
+/// claim done on hardware rather than argued about: nothing about the buffers
+/// says which pair they were packed for.
+///
+/// # Why the MB x extent is not ragged, and cannot be made so
+///
+/// One invocation owns the output WORD, so the x extent is `hidden / 2`; and
+/// `hidden` is a whole number of groups of at least 32 or the checkpoint would
+/// not pack, so `hidden / 2` is always a multiple of 16 and the `_mb` body's
+/// 16-wide x axis always divides. The ROW axis is where the round-up is real —
+/// 13 over 16 — and that is the axis an undershoot loses whole tokens on. The
+/// non-MB corners run at 192 words over 256, where plain division dispatches
+/// nothing at all.
+#[test]
+fn an_embedding_gather_decodes_in_all_four_corners_at_two_packings() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let hidden = 384usize;
+    let vocab = 20usize;
+    let rows = ROWS as usize;
+    let embed_scale = 19.593_75f32;
+
+    // The two readings. Same words per group — 16 — which is what makes them
+    // indistinguishable from the buffers alone.
+    let points = [(64usize, 8u32), (128, 4)];
+    for (group, bits) in points {
+        assert_eq!(
+            group / (32 / bits as usize),
+            16,
+            "this pair was chosen because both walk 16 words to a group",
+        );
+        assert_eq!(hidden % group, 0, "a row is a whole number of groups");
+    }
+
+    // Raw planes, sized for the WIDER reading of each, so one set of bytes
+    // serves both modules.
+    let mut state = 0xbeef_1234u32;
+    let words_per_row = hidden / (32 / 8); // the b_8 reading, which is the larger
+    let mut packed = vec![0u32; vocab * words_per_row];
+    for w in &mut packed {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *w = state;
+    }
+    let groups_per_row = hidden / 64; // the gs_64 reading, which is the larger
+    let scale_values: Vec<f32> = positives(vocab * groups_per_row, 2501)
+        .iter()
+        .map(|v| v * 0.02)
+        .collect();
+    let bias_values: Vec<f32> = spread(vocab * groups_per_row, 2503)
+        .iter()
+        .map(|v| v * 0.1)
+        .collect();
+    let w = storage(
+        gpu,
+        &packed
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let (scales, scale_seen) = bf16s(gpu, &scale_values);
+    let (biases, bias_seen) = bf16s(gpu, &bias_values);
+    // Scrambled, and none of them its own index, so a gather that ignored the
+    // id list is wrong everywhere rather than right by accident.
+    let ids: Vec<i32> = vec![17, 3, 19, 0, 11, 8, 15, 2, 13, 6, 9, 1, 4];
+    assert_eq!(ids.len(), rows);
+    let id = i32s(gpu, &ids);
+
+    // One decoded element under one reading of the pair.
+    let decode = |group: usize, bits: u32, row: usize, k: usize| -> f32 {
+        let codes_per_word = 32 / bits as usize;
+        let word = packed[row * (hidden / codes_per_word) + k / codes_per_word];
+        let code = (word >> ((k % codes_per_word) as u32 * bits)) & ((1u32 << bits) - 1);
+        let g = row * (hidden / group) + k / group;
+        scale_seen[g] * code as f32 + bias_seen[g]
+    };
+
+    let mut covered = 0usize;
+    for (scaled, mb) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut answers = Vec::new();
+        for (group, bits) in points {
+            let entrypoint = format!(
+                "embed_gather{}{}_4bit_bfloat16_gs_{group}_b_{bits}",
+                if scaled { "_scaled" } else { "" },
+                if mb { "_mb" } else { "" },
+            );
+            // Allocated for every row either way, so the single-row corners
+            // have somewhere to be wrong: rows 1.. must keep their sentinel.
+            let out = sentinelled(gpu, (rows * hidden).div_ceil(2));
+            let mut block =
+                Block::of(&entrypoint).i32("hidden", i32::try_from(hidden).expect("fits"));
+            if scaled {
+                block = block.f32("embed_scale", embed_scale);
+            }
+            let grid = if mb {
+                // `LaunchRule::ElementwiseRows`, in output WORDS on x.
+                [over(hidden as u32 / 2, 16), over(rows as u32, 16), 1]
+            } else {
+                // `LaunchRule::Elementwise`, one row, in output WORDS.
+                [over(hidden as u32 / 2, 256), 1, 1]
+            };
+            run(
+                gpu,
+                &entrypoint,
+                &[&w, &scales, &biases, &id, &out],
+                &block.done(),
+                grid,
+            );
+            answers.push((entrypoint, unpack(&read(gpu, &out), rows * hidden)));
+            covered += 1;
+        }
+
+        let sentinel = from_bf16((SENTINEL & 0xffff) as u16);
+        for (at, (group, bits)) in points.iter().enumerate() {
+            let want: Vec<f32> = (0..rows * hidden)
+                .map(|i| {
+                    let m = i / hidden;
+                    if !mb && m > 0 {
+                        // The single-row corners read `id[0]` and write one
+                        // row; everything after it was never theirs.
+                        return sentinel;
+                    }
+                    let row = usize::try_from(ids[m]).expect("an embedding row");
+                    let v = decode(*group, *bits, row, i % hidden);
+                    rounded(if scaled { v * embed_scale } else { v })
+                })
+                .collect();
+            let (name, got) = &answers[at];
+            agrees(got, &want, name).expect("the gather decodes its own packing");
+            refuses_a_perturbed_reference(got, &want, name);
+
+            // The coordinate: the OTHER reading of the same bytes.
+            let (other_group, other_bits) = points[1 - at];
+            let other: Vec<f32> = (0..rows * hidden)
+                .map(|i| {
+                    let m = i / hidden;
+                    if !mb && m > 0 {
+                        return sentinel;
+                    }
+                    let row = usize::try_from(ids[m]).expect("an embedding row");
+                    let v = decode(other_group, other_bits, row, i % hidden);
+                    rounded(if scaled { v * embed_scale } else { v })
+                })
+                .collect();
+            agrees(
+                got,
+                &other,
+                &format!("{name} read as gs_{other_group}/b_{other_bits}"),
+            )
+            .expect_err(
+                "these two packings walk 16 words to a group either way, \
+                     so nothing about the buffers says which one they are. If \
+                     one module's answer satisfies the other's decode, the \
+                     entrypoint's `_gs_.._b_..` suffix is a label rather than \
+                     a coordinate",
+            );
+
+            // And the scale is IN the answer, or out of it.
+            let unscaled: Vec<f32> = (0..rows * hidden)
+                .map(|i| {
+                    let m = i / hidden;
+                    if !mb && m > 0 {
+                        return sentinel;
+                    }
+                    let row = usize::try_from(ids[m]).expect("an embedding row");
+                    rounded(decode(*group, *bits, row, i % hidden))
+                })
+                .collect();
+            if scaled {
+                agrees(got, &unscaled, &format!("{name} without its embed_scale")).expect_err(
+                    "gemma multiplies its embeddings by a number the statement \
+                     carries; an answer that satisfies the unscaled decode \
+                     never read `embed_scale`",
+                );
+            }
+        }
+    }
+    assert_eq!(covered, 8, "four corners at two packings");
+}
+
+/// D38. `neox_mb` rotates a BATCH, one position per row.
+///
+/// The decode arms compile `row = 0` and read `position[0]`; the multi-batch
+/// ones take the row from `workgroup_id.z` and index the position list with
+/// it. So the three positions here are all different, and a body that read
+/// `position[0]` for every row would turn rows 1 and 2 by row 0's angle —
+/// which is a plausible tensor and the wrong one.
+#[test]
+fn a_batched_rope_gives_every_row_its_own_position() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let head_dim = 12usize;
+    let heads = 5usize;
+    let pairs = head_dim / 2;
+    let rows = 3usize;
+    let n = rows * heads * head_dim;
+    let scale = 0.75f32;
+    let base = 13.287_712_f32;
+    let positions = [7i32, 2, 11];
+
+    let (x, x_seen) = bf16s(gpu, &spread(n, 2601));
+    let position = i32s(gpu, &positions);
+    let block = Block::of("neox_mb_bfloat16")
+        .f32("scale", scale)
+        .f32("base", base)
+        .i32("head_dim", head_dim as i32)
+        .done();
+    // `LaunchRule::Rope` is `[rotary / 2, heads, rows]`, and the module is
+    // `@workgroup_size(1)` so the grid is EXACT — the body reads
+    // `num_workgroups.x` as the pair count it strides each partner by.
+    run(
+        gpu,
+        "neox_mb_bfloat16",
+        &[&x, &position],
+        &block,
+        [pairs as u32, heads as u32, rows as u32],
+    );
+
+    let shape = Neox {
+        heads,
+        head_dim,
+        pairs,
+        scale,
+        base,
+        prop: false,
+        freqs: &[],
+        mscale: 1.0,
+    };
+    let got = unpack(&read(gpu, &x), n);
+    let want = neox_reference(&x_seen, &positions, shape);
+    agrees(&got, &want, "the batched rotation").expect("neox_mb rotates");
+    refuses_a_perturbed_reference(&got, &want, "the batched rotation");
+
+    // Every row turned by row 0's position: what reading `position[0]` gives.
+    let by_first = neox_reference(&x_seen, &[positions[0]; 3], shape);
+    agrees(&got, &by_first, "the batch turned by row 0's position").expect_err(
+        "the three positions here are 7, 2 and 11; if the device's answer also \
+         satisfies a reference that used 7 for all of them, the row axis is \
+         not being read",
+    );
+}
+
+/// D39. `neox_freqs_decode` and `neox_freqs_mb` — a table, and a REORDERED
+/// uniform block.
+///
+/// This is the ABI half of the rope family and the reason it is worth a test
+/// of its own. The geometric rows state `scale, base, head_dim`; these state
+/// `scale, head_dim, mscale` and bind `inv_freq` as a THIRD storage buffer.
+/// So `head_dim` moves from byte 8 to byte 4 and a shader — or a shell — that
+/// transcribed Metal's numbering, where `inv_freq` is buffer 3 and `head_dim`
+/// is 4, reads the frequency table's address as its head width.
+///
+/// [`Block`] refuses a field the row does not state, so writing `base` here
+/// would panic rather than land somewhere plausible. The angles come from the
+/// table and the rotation carries YaRN's `mscale`, which is 1.0 in every
+/// deployment that has none — so it is 1.375 here, where dropping it is
+/// visible.
+#[test]
+fn a_frequency_table_rope_reads_a_reordered_block() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let head_dim = 12usize;
+    let heads = 5usize;
+    let pairs = head_dim / 2;
+    let scale = 0.75f32;
+    let mscale = 1.375f32;
+    // A ladder no exponent produces: llama-3's piecewise interpolation and
+    // YaRN's are tables for exactly this reason.
+    let inv_freq_values: Vec<f32> = vec![1.0, 0.61, 0.27, 0.089, 0.0201, 0.00374];
+    assert_eq!(inv_freq_values.len(), pairs);
+
+    for (entrypoint, positions) in [
+        ("neox_freqs_decode_bfloat16", vec![7i32]),
+        ("neox_freqs_mb_bfloat16", vec![7i32, 2, 11]),
+    ] {
+        let rows = positions.len();
+        let n = rows * heads * head_dim;
+        let (x, x_seen) = bf16s(gpu, &spread(n, 2701));
+        let position = i32s(gpu, &positions);
+        let inv_freq = storage(
+            gpu,
+            &inv_freq_values
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        // No `base`: this row does not state one, and `Block` refuses a name
+        // the row does not have.
+        let block = Block::of(entrypoint)
+            .f32("scale", scale)
+            .i32("head_dim", head_dim as i32)
+            .f32("mscale", mscale)
+            .done();
+        run(
+            gpu,
+            entrypoint,
+            &[&x, &position, &inv_freq],
+            &block,
+            [pairs as u32, heads as u32, rows as u32],
+        );
+
+        let shape = Neox {
+            heads,
+            head_dim,
+            pairs,
+            scale,
+            // Unused when a table is present, and set to a value that would be
+            // catastrophic if it were: a body that fell through to the
+            // geometric arm turns nothing at all.
+            base: 0.0,
+            prop: false,
+            freqs: &inv_freq_values,
+            mscale,
+        };
+        let got = unpack(&read(gpu, &x), n);
+        let want = neox_reference(&x_seen, &positions, shape);
+        agrees(&got, &want, entrypoint).expect("the frequency-table rope rotates");
+        refuses_a_perturbed_reference(&got, &want, entrypoint);
+
+        // Without the gain, which is the other half of this row's block.
+        let ungained = neox_reference(
+            &x_seen,
+            &positions,
+            Neox {
+                mscale: 1.0,
+                ..shape
+            },
+        );
+        agrees(&got, &ungained, &format!("{entrypoint} without its mscale")).expect_err(
+            "`mscale` is YaRN's attention-temperature correction and it is \
+             1.375 here; an answer that satisfies a reference without it never \
+             read the block's third field",
+        );
+    }
+}
+
+/// D40. `rms_residual` and `rms_residual_scaled` — the fold, and the buffer
+/// that arrives AFTER the params struct.
+///
+/// The residual is `@binding(4)` and the per-layer gain `@binding(5)`, both
+/// after `params` at 3, because the row's operand order is
+/// `x, w, out, params, r[, s]` and the buffer run is dense in that order. This
+/// is the shape `.wiki/new-driver/vulkan.md` §3 names: "a residual buffer that
+/// sits at descriptor five because the two scalars before it moved to push
+/// constants". Here there are no scalars at all — every one of this row's
+/// operands is a buffer — so the numbering is the row's and Metal's is not.
+///
+/// The epilogue is `(gain * (x * inv) + r) * post`, with ONE bf16 round on the
+/// store, so the residual is added in float and the scaled form's per-layer
+/// gain multiplies the sum rather than the norm.
+#[test]
+fn a_norm_folds_its_residual_and_its_layer_gain() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let eps = 1e-6f32;
+    let n = (ROWS * WIDTH) as usize;
+    let (x, x_seen) = bf16s(gpu, &spread(n, 2801));
+    let (w, w_seen) = bf16s(gpu, &spread(WIDTH as usize, 2803));
+    let (r, r_seen) = bf16s(gpu, &spread(n, 2807));
+    // One number for the whole launch, read by every lane as a broadcast. Not
+    // 1.0, so dropping it is visible.
+    let post = 1.25f32;
+    let (s, s_seen) = bf16s(gpu, &[post, -3.5]);
+    let params = storage(gpu, &rms_params(eps, WIDTH, 1, 0, 1.0));
+
+    let plain = sentinelled(gpu, n / 2);
+    run(
+        gpu,
+        "rms_residual_bfloat16",
+        &[&x, &w, &plain, &params, &r],
+        &[],
+        [ROWS, 1, 1],
+    );
+    let got_plain = unpack(&read(gpu, &plain), n);
+
+    let scaled = sentinelled(gpu, n / 2);
+    run(
+        gpu,
+        "rms_residual_scaled_bfloat16",
+        &[&x, &w, &scaled, &params, &r, &s],
+        &[],
+        [ROWS, 1, 1],
+    );
+    let got_scaled = unpack(&read(gpu, &scaled), n);
+
+    let fold = |gain: f32| -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        for row in 0..ROWS as usize {
+            let span = &x_seen[row * WIDTH as usize..(row + 1) * WIDTH as usize];
+            let total: f32 = span.iter().map(|v| v * v).sum();
+            let inv = (total / WIDTH as f32 + eps).sqrt().recip();
+            for i in 0..WIDTH as usize {
+                let at = row * WIDTH as usize + i;
+                out.push(rounded((w_seen[i] * (span[i] * inv) + r_seen[at]) * gain));
+            }
+        }
+        out
+    };
+    let want_plain = fold(1.0);
+    let want_scaled = fold(s_seen[0]);
+
+    agrees(&got_plain, &want_plain, "rms_residual").expect("the folded norm agrees");
+    agrees(&got_scaled, &want_scaled, "rms_residual_scaled").expect("the scaled fold agrees");
+    refuses_a_perturbed_reference(&got_plain, &want_plain, "rms_residual");
+    refuses_a_perturbed_reference(&got_scaled, &want_scaled, "rms_residual_scaled");
+
+    // The residual is IN the answer: a norm that never read binding 4 would
+    // satisfy `rms_single_row`'s reference instead.
+    let unfolded: Vec<f32> = (0..ROWS as usize)
+        .flat_map(|row| {
+            let span = &x_seen[row * WIDTH as usize..(row + 1) * WIDTH as usize];
+            rms_reference(span, &w_seen, 1, false, 1.0, eps)
+        })
+        .collect();
+    agrees(&got_plain, &unfolded, "rms_residual without its residual")
+        .expect_err("binding 4 is the residual and it is not zeros");
+    // And the two arms differ by the gain, both ways.
+    agrees(
+        &got_scaled,
+        &want_plain,
+        "the scaled fold against the plain one",
+    )
+    .expect_err("`s[0]` is 1.25, so the two arms cannot agree");
+    let by_high_half = fold(s_seen[1]);
+    agrees(
+        &got_scaled,
+        &by_high_half,
+        "the scaled fold with the word's high half",
+    )
+    .expect_err("`pie_bf16_at(s[0], 0u)` is the LOW half of word zero");
+}
+
+/// D41. `geglu_tanh_strided` — three pitches, and only one of them the width.
+///
+/// gemma4's per-layer-embedding GeGLU reads a NARROW gate out of a WIDE table:
+/// the PLE table is `[rows, n_layers * ple_dim]`, so layer L's slice is
+/// `ple_dim` wide with `n_layers * ple_dim` between rows, while the gate and
+/// the output are densely `[rows, ple_dim]`. A byte offset cannot express
+/// that, and the flat kernel reading one walks into the NEXT layers' slices
+/// after the first row — not a crash and not even implausible numbers, since
+/// those slices are the same table.
+///
+/// So all three pitches are DIFFERENT and none of them is the width. The
+/// useless case to test is the production one where they are equal.
+///
+/// The output pitch is ODD, which is the only thing that reaches `store_half`:
+/// a row then begins in the upper half of a word whose lower half is the
+/// previous row's last element, written by a different workgroup at the same
+/// moment, and the compare-exchange is what keeps both.
+///
+/// # Two things this dispatch is deliberately NOT doing, both measured
+///
+/// **The grid below is not the one this row's launch rule gives.** The row
+/// states `LaunchRule::Elementwise`, which is `[width * rows, 1, 1]` LANES —
+/// everything on x — while this variant alone is `@workgroup_size(16, 16)` and
+/// reads `gid.y` as the ROW. Divided by a 16-high workgroup that is ONE group
+/// on y, so only rows 0..15 ever launch. Dispatched that way at 21 rows on an
+/// RTX 4090, row 16 column 0 comes back holding the sentinel it was born with
+/// and the dispatch succeeds. `ElementwiseRows` is the shape this body wants
+/// and is what is dispatched here; changing the row is a table edit and a
+/// parity question, so it is reported rather than made.
+///
+/// **The header's stated x extent is one short at an odd `out_pitch`.**
+/// `mlp/gated.wgsl` says "`gid.x` counts words of the output row, so the host's
+/// x extent is `ceil(width / 2)`". At an odd pitch an ODD row's span starts in
+/// a word's upper half and therefore straddles `ceil(width / 2) + 1` words.
+/// Measured: at `width = 64` — where `ceil(width / 2)` is exactly two 16-wide
+/// workgroups, so the round-up hides nothing — with pitches 89/71/67, row 1's
+/// element 63 comes back as the sentinel. The shape below is saved only
+/// because 23 rounds up to 32. That is the case `store_half` exists for, so
+/// the extent that cannot cover it is the interesting half.
+#[test]
+fn a_strided_geglu_reads_three_different_pitches() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let width = 46usize;
+    let rows = ROWS as usize;
+    // Three pitches, all different, all wider than the width, and the output's
+    // is odd.
+    let gate_pitch = 79usize;
+    let up_pitch = 53usize;
+    let out_pitch = 61usize;
+    for (a, b) in [
+        (gate_pitch, up_pitch),
+        (up_pitch, out_pitch),
+        (gate_pitch, out_pitch),
+    ] {
+        assert_ne!(a, b, "equal pitches are the case that proves nothing");
+    }
+    assert_eq!(
+        out_pitch % 2,
+        1,
+        "an odd output pitch is what reaches store_half"
+    );
+
+    let (gate, gate_seen) = bf16s(gpu, &spread(rows * gate_pitch, 2901));
+    let (up, up_seen) = bf16s(gpu, &spread(rows * up_pitch, 2903));
+    let out = sentinelled(gpu, (rows * out_pitch).div_ceil(2));
+    // `GegluStridedParams { width, rows, gate_pitch, up_pitch, out_pitch }`,
+    // a STORAGE struct at binding 3 — the row states `params: Buf`.
+    let params = storage(
+        gpu,
+        &[width, rows, gate_pitch, up_pitch, out_pitch]
+            .iter()
+            .flat_map(|v| u32::try_from(*v).expect("fits").to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+
+    // The body is `@workgroup_size(16, 16)` and `gid.x` counts WORDS of the
+    // output row, so the x extent is `ceil(width / 2)`.
+    run(
+        gpu,
+        "geglu_tanh_strided_bfloat16",
+        &[&gate, &up, &out, &params],
+        &[],
+        [over(width.div_ceil(2) as u32, 16), over(rows as u32, 16), 1],
+    );
+
+    let sentinel = from_bf16((SENTINEL & 0xffff) as u16);
+    let got = unpack(&read(gpu, &out), rows * out_pitch);
+    for row in 0..rows {
+        let base = row * out_pitch;
+        let want: Vec<f32> = (0..width)
+            .map(|k| {
+                geglu_tanh_reference(gate_seen[row * gate_pitch + k], up_seen[row * up_pitch + k])
+            })
+            .collect();
+        let what = format!("row {row}");
+        agrees(&got[base..base + width], &want, &what).expect("the strided geglu agrees");
+        if row == rows - 1 {
+            refuses_a_perturbed_reference(&got[base..base + width], &want, &what);
+        }
+        // Between the width and the pitch is nobody's, and at an odd pitch the
+        // boundary word is shared with the next row — so the compare-exchange
+        // has to leave the padding exactly as it found it.
+        for c in width..out_pitch {
+            assert_eq!(
+                got[base + c].to_bits(),
+                sentinel.to_bits(),
+                "row {row} column {c} is between the width ({width}) and the \
+                 output pitch ({out_pitch}) and was written anyway",
+            );
+        }
+    }
+
+    // A body that read the gate and the up with the OUTPUT's pitch — the flat
+    // kernel's mistake — must disagree.
+    let mut by_out_pitch = Vec::with_capacity(rows * width);
+    let mut flat = Vec::with_capacity(rows * width);
+    for row in 0..rows {
+        for k in 0..width {
+            let at = row * out_pitch + k;
+            by_out_pitch.push(geglu_tanh_reference(
+                gate_seen[at.min(gate_seen.len() - 1)],
+                up_seen[at.min(up_seen.len() - 1)],
+            ));
+            flat.push(got[at]);
+        }
+    }
+    agrees(&flat, &by_out_pitch, "the strided geglu read at one pitch").expect_err(
+        "three pitches that disagree is the whole point of this variant; if \
+         reading all three at the output's also satisfies the device, the \
+         shape is not separating them",
+    );
+}
+
+/// A softmax attention with gpt-oss's learned SINK folded into the
+/// denominator.
+///
+/// The sink is a per-head logit that joins the softmax with NO VALUE behind
+/// it: it moves the running maximum and the denominator and contributes
+/// nothing to the numerator. So it can only ever SHRINK the output, and by a
+/// factor that is the same for every channel of a head — which is what makes a
+/// body that divided by it instead of adding it to the denominator visible.
+fn softmax_attention_with_sink(
+    scores: &[f32],
+    values: &[&[f32]],
+    head_dim: usize,
+    sink: f32,
+) -> Vec<f32> {
+    let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let merged = m.max(sink);
+    let weights: Vec<f32> = scores.iter().map(|s| (s - merged).exp()).collect();
+    let z: f32 = weights.iter().sum::<f32>() + (sink - merged).exp();
+    (0..head_dim)
+        .map(|d| {
+            let acc: f32 = weights.iter().zip(values).map(|(w, v)| w * v[d]).sum();
+            rounded(acc / z)
+        })
+        .collect()
+}
+
+/// D42. `sdpa_paged_decode_sink` — the sink's value AND its direction.
+///
+/// The row is `sdpa_paged_decode`'s with one define, so every binding and
+/// every offset is the same and the only difference is that `sinks` — bound
+/// and unread by the no-sink arm — is now read. Both arms are dispatched over
+/// identical inputs, so the comparison between them is exactly the sink's
+/// contribution.
+///
+/// The DIRECTION is checked as well as the value, which rules out a body that
+/// divided by the sink instead of adding its exponential to the denominator: a
+/// sink can only shrink an output, by one factor per head, and never move it
+/// away from zero.
+#[test]
+fn a_paged_decode_folds_its_sink_into_the_denominator() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let head_dim = 64usize;
+    let q_heads = 6usize;
+    let gqa = 3usize;
+    let kv_heads = q_heads / gqa;
+    let rows = 3usize;
+    let page_size = 3usize;
+    let pages = 7usize;
+    let scale = 0.125f32;
+    let window = 4i32;
+    let mask_stride = 12u32;
+
+    let positions = [6i32, 2, 9];
+    let requests = [0i32, 1, 0];
+    let indptr = [0u32, 4, 7];
+    let indices = [6u32, 4, 2, 0, 5, 3, 1];
+
+    let (queries, q_seen) = bf16s(gpu, &spread(rows * q_heads * head_dim, 3001));
+    let pool = pages * page_size * kv_heads * head_dim;
+    let (k_pages, k_seen) = bf16s(gpu, &spread(pool, 3009));
+    let (v_pages, v_seen) = bf16s(gpu, &spread(pool, 3019));
+    let position_ids = i32s(gpu, &positions);
+    let req_of_token = i32s(gpu, &requests);
+    let kv_page_indices = u32s(gpu, &indices);
+    let kv_page_indptr = u32s(gpu, &indptr);
+    let mask_bytes = vec![1u8; rows * mask_stride as usize];
+    let attention_mask = storage(gpu, &mask_bytes);
+    let attention_mask_enabled = storage(gpu, &[0u8; 4]);
+    // One per HEAD, and spread wide enough that the shrink differs head to
+    // head: a sink far below the scores changes almost nothing and one above
+    // them halves the output.
+    let sink_values: Vec<f32> = vec![-4.0, -1.0, 0.0, 0.75, 1.5, 3.0];
+    let (sinks, sink_seen) = bf16s(gpu, &sink_values);
+
+    let mut answers = Vec::new();
+    for entrypoint in [
+        "sdpa_paged_decode_bfloat16_d_64",
+        "sdpa_paged_decode_sink_bfloat16_d_64",
+    ] {
+        let out = sentinelled(gpu, rows * q_heads * head_dim / 2);
+        let block = Block::of(entrypoint)
+            .i32("gqa_factor", gqa as i32)
+            .i32("page_size", page_size as i32)
+            .i32("n_kv_heads", kv_heads as i32)
+            .f32("scale", scale)
+            .u32("attention_mask_stride", mask_stride)
+            .i32("window", window)
+            .done();
+        run(
+            gpu,
+            entrypoint,
+            &[
+                &queries,
+                &k_pages,
+                &v_pages,
+                &out,
+                &position_ids,
+                &req_of_token,
+                &kv_page_indices,
+                &kv_page_indptr,
+                &attention_mask,
+                &attention_mask_enabled,
+                &sinks,
+            ],
+            &block,
+            [q_heads as u32, rows as u32, 1],
+        );
+        answers.push(unpack(&read(gpu, &out), rows * q_heads * head_dim));
+    }
+
+    let slot_of = |req: usize, kp: usize| -> usize {
+        let phys = indices[indptr[req] as usize + kp / page_size] as usize;
+        phys * page_size + kp % page_size
+    };
+    for row in 0..rows {
+        let req = requests[row] as usize;
+        let q_pos = positions[row];
+        let start = if window > 0 && q_pos >= window {
+            q_pos - window + 1
+        } else {
+            0
+        };
+        let keeps: Vec<usize> = (start..=q_pos).map(|kp| kp as usize).collect();
+        for (q_head, sink) in sink_seen.iter().enumerate().take(q_heads) {
+            let kv_head = q_head / gqa;
+            let q_base = (row * q_heads + q_head) * head_dim;
+            let scores: Vec<f32> = keeps
+                .iter()
+                .map(|kp| {
+                    let base = (slot_of(req, *kp) * kv_heads + kv_head) * head_dim;
+                    (0..head_dim)
+                        .map(|d| scale * q_seen[q_base + d] * k_seen[base + d])
+                        .sum()
+                })
+                .collect();
+            let planes: Vec<&[f32]> = keeps
+                .iter()
+                .map(|kp| {
+                    let base = (slot_of(req, *kp) * kv_heads + kv_head) * head_dim;
+                    &v_seen[base..base + head_dim]
+                })
+                .collect();
+            let plain = softmax_attention(&scores, &planes, head_dim);
+            let want = softmax_attention_with_sink(&scores, &planes, head_dim, *sink);
+            let what = format!("row {row} head {q_head} at sink {sink}");
+            agrees(&answers[1][q_base..q_base + head_dim], &want, &what)
+                .expect("the sunk decode attends");
+            agrees(&answers[0][q_base..q_base + head_dim], &plain, &what)
+                .expect("and the no-sink arm is unchanged by the same buffer");
+            if row == rows - 1 && q_head == q_heads - 1 {
+                refuses_a_perturbed_reference(&answers[1][q_base..q_base + head_dim], &want, &what);
+            }
+
+            // The DIRECTION. A sink adds a positive term to the denominator
+            // and nothing to the numerator, so every channel shrinks toward
+            // zero by ONE factor per head — never away from it, and never by a
+            // different factor per channel.
+            for d in 0..head_dim {
+                let with = answers[1][q_base + d];
+                let without = answers[0][q_base + d];
+                assert!(
+                    with.abs() <= without.abs() + (without.abs() / 64.0).max(1e-6),
+                    "row {row} head {q_head} channel {d}: the sink moved {without} \
+                     to {with}, which is AWAY from zero. A sink joins the \
+                     softmax with no value behind it, so it can only shrink",
+                );
+            }
+        }
+    }
+    // The largest sink must have shrunk its head noticeably, or this test is
+    // comparing two tensors that were always going to agree.
+    let hot = (q_heads - 1) * head_dim;
+    let shrunk = (0..head_dim)
+        .filter(|d| answers[1][hot + d].to_bits() != answers[0][hot + d].to_bits())
+        .count();
+    assert!(
+        shrunk > head_dim / 2,
+        "the head with the largest sink ({}) moved only {shrunk} of {head_dim} \
+         channels; pick a sink comparable with the scores or this proves \
+         nothing",
+        sink_seen[q_heads - 1],
+    );
+}
+
+/// D43. `sdpa_vector_decode_swa` — a window, two row pitches, and a causal end
+/// that moves per row.
+///
+/// Three things this row has that `sdpa_vector_decode` does not, and one
+/// dispatch reaches all three. The causal end is `n - (n_rows - 1 - row)`, so
+/// a batch of query rows against one cache each stops at its OWN position
+/// rather than at the last one; the window then moves the start forward, but
+/// only where the row's history is longer than it; and `q_row_stride` and
+/// `o_row_stride` are separate operands because gemma reads its query out of a
+/// wider buffer than it writes.
+///
+/// So the window is 9 against ends of 9, 10 and 11: row 0 is UNCLAMPED and
+/// rows 1 and 2 start one and two keys in. Three distinct key ranges, one of
+/// which does not take the window branch at all.
+///
+/// The two pitches are 1600 and 1664 against a packed width of 1536, and both
+/// differ from each other — a body that used one for the other stays in bounds
+/// and reads the wrong row. The padding between the width and the output pitch
+/// must keep its sentinel.
+///
+/// The block is 64 bytes, the widest in the table: two `i32`s, four
+/// `vec2<u32>` strides that align to eight, then four more four-byte fields.
+#[test]
+fn a_sliding_window_decode_ends_each_row_at_its_own_position() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let entrypoint = "sdpa_vector_decode_swa_bfloat16_d_256";
+    let head_dim = 256usize;
+    let q_heads = 6usize;
+    let gqa = 3usize;
+    let kv_heads = q_heads / gqa;
+    let n = 11usize;
+    let rows = 3usize;
+    let scale = 0.0625f32;
+    let window = 9i32;
+    let packed = q_heads * head_dim;
+    let q_row_stride = packed + 64;
+    let o_row_stride = packed + 128;
+    assert_ne!(
+        q_row_stride, o_row_stride,
+        "one pitch for two tensors proves nothing"
+    );
+
+    let (queries, q_seen) = bf16s(gpu, &spread(rows * q_row_stride, 3101));
+    // `[head][seq][channel]` for the keys.
+    let k_head_stride = (n * head_dim) as u64;
+    let k_seq_stride = head_dim as u64;
+    let (keys, k_seen) = bf16s(gpu, &spread(kv_heads * n * head_dim, 3107));
+    // `[seq][head][channel]` for the values — a different shape holding the
+    // same count, so a body reading it with the key strides stays in bounds.
+    let v_seq_stride = (kv_heads * head_dim) as u64;
+    let v_head_stride = head_dim as u64;
+    let (values, v_seen) = bf16s(gpu, &spread(n * kv_heads * head_dim, 3109));
+    let out = sentinelled(gpu, (rows * o_row_stride).div_ceil(2));
+
+    let block = Block::of(entrypoint)
+        .i32("gqa_factor", gqa as i32)
+        .i32("n", i32::try_from(n).expect("fits"))
+        .wide("k_head_stride", k_head_stride)
+        .wide("k_seq_stride", k_seq_stride)
+        .wide("v_head_stride", v_head_stride)
+        .wide("v_seq_stride", v_seq_stride)
+        .f32("scale", scale)
+        .i32("window", window)
+        .i32("q_row_stride", i32::try_from(q_row_stride).expect("fits"))
+        .i32("o_row_stride", i32::try_from(o_row_stride).expect("fits"))
+        .done();
+    assert_eq!(
+        block.len(),
+        64,
+        "two i32s, four vec2<u32>s and four more words"
+    );
+    run(
+        gpu,
+        entrypoint,
+        &[&queries, &keys, &values, &out],
+        &block,
+        [q_heads as u32, rows as u32, 1],
+    );
+
+    let sentinel = from_bf16((SENTINEL & 0xffff) as u16);
+    let got = unpack(&read(gpu, &out), rows * o_row_stride);
+    let mut ranges = Vec::new();
+    for row in 0..rows {
+        let n_row = n as i32 - (rows as i32 - 1 - row as i32);
+        let kv_start = if window > 0 && n_row > window {
+            n_row - window
+        } else {
+            0
+        };
+        ranges.push((kv_start, n_row));
+        for q_head in 0..q_heads {
+            let kv_head = q_head / gqa;
+            let q_base = row * q_row_stride + q_head * head_dim;
+            let o_base = row * o_row_stride + q_head * head_dim;
+            let keeps: Vec<usize> = (kv_start..n_row).map(|i| i as usize).collect();
+            let scores: Vec<f32> = keeps
+                .iter()
+                .map(|i| {
+                    let k_base = kv_head * k_head_stride as usize + i * k_seq_stride as usize;
+                    (0..head_dim)
+                        .map(|d| scale * q_seen[q_base + d] * k_seen[k_base + d])
+                        .sum()
+                })
+                .collect();
+            let planes: Vec<&[f32]> = keeps
+                .iter()
+                .map(|i| {
+                    let at = kv_head * v_head_stride as usize + i * v_seq_stride as usize;
+                    &v_seen[at..at + head_dim]
+                })
+                .collect();
+            let want = softmax_attention(&scores, &planes, head_dim);
+            let what = format!("row {row} head {q_head} over keys [{kv_start}, {n_row})");
+            agrees(&got[o_base..o_base + head_dim], &want, &what)
+                .expect("the sliding decode attends");
+            if row == rows - 1 && q_head == q_heads - 1 {
+                refuses_a_perturbed_reference(&got[o_base..o_base + head_dim], &want, &what);
+            }
+        }
+        // Between the packed width and the output pitch is nobody's.
+        for c in packed..o_row_stride {
+            assert_eq!(
+                got[row * o_row_stride + c].to_bits(),
+                sentinel.to_bits(),
+                "row {row} column {c} is past the packed width ({packed}) and \
+                 inside the output pitch ({o_row_stride}), so no head owns it",
+            );
+        }
+    }
+    assert_eq!(
+        ranges,
+        vec![(0, 9), (1, 10), (2, 11)],
+        "one dispatch is supposed to cover three DIFFERENT key ranges, one of \
+         them UNCLAMPED — row 0's history is exactly the window, so it does \
+         not take the branch at all. If they coincide, this is one case run \
+         three times",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The assertion that stops this suite quietly rotting.
+// ---------------------------------------------------------------------------
+
+/// This file, read back at compile time.
+///
+/// `tests/entrypoints.rs` scrapes `kernels-metal`'s SOURCE to hold two tables
+/// against each other; this is the same trick turned inward. A list of "rows
+/// this suite covers" that nothing checks is a list that keeps claiming
+/// coverage after the test that provided it is deleted — so every claim below
+/// names a string that must still BE here, and deleting a test deletes it.
+const THIS_FILE: &str = include_str!("gpu.rs");
+
+/// This file with every list that MENTIONS an entrypoint without dispatching
+/// one cut out.
+///
+/// Searching the whole file is what the first draft did and it was worth
+/// nothing. Two regions name entrypoints for reasons that are not a dispatch,
+/// and both were enough on their own to make `contains` true whatever the rest
+/// of the file said:
+///
+/// * [`COVERAGE`] itself, where every claimed name is a literal;
+/// * the `let entrypoints = [...]` arrays of the four `*_modules_parse` tests,
+///   which run `naga` over a module and never touch a device.
+///
+/// Deleting the value norm's dispatch left the check green against either of
+/// them. With both cut it fails, which is what the check is for.
+///
+/// What remains is a dispatch or a mention in prose, and prose is a hole this
+/// cannot close: a name written into a doc comment would stand in for the
+/// dispatch it describes. That is not hypothetical — this very paragraph named
+/// the entrypoint it was describing and had to stop. Said rather than hidden:
+/// the check catches a deletion, not every possible way of lying about one, so
+/// do not spell entrypoint names in the prose here.
+fn body_without_the_lists() -> &'static str {
+    /// Everything between `open` and the next `close`, removed, however many
+    /// times it occurs.
+    fn cut(text: &str, open: &str, close: &str, least: usize) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            let Some(from) = rest.find(open) else {
+                out.push_str(rest);
+                return out;
+            };
+            out.push_str(&rest[..from]);
+            let tail = &rest[from..];
+            let to = tail.find(close).unwrap_or_else(|| {
+                panic!("`{open}` is never closed by `{close}`; fix these markers")
+            });
+            assert!(
+                to >= least,
+                "the cut for `{open}` ran only {to} bytes before `{close}`, \
+                 which is not the whole list — the search below would be \
+                 reading the thing it is checking",
+            );
+            rest = &tail[to..];
+        }
+    }
+
+    let without_table = cut(
+        THIS_FILE,
+        "const COVERAGE: &[(&str, Reached)] = &[",
+        "\n];\n",
+        2000,
+    );
+    // Leaked so the answer is `'static` like the input; a test binary owns it
+    // until it exits, and this runs once.
+    Box::leak(cut(&without_table, "    let entrypoints = [", "\n    ];\n", 100).into_boxed_str())
+}
+
+/// How this suite reaches one stated row.
+enum Reached {
+    /// Dispatched under a literal entrypoint name, which must appear in this
+    /// file and must resolve to the row.
+    By(&'static str),
+    /// Dispatched under a `format!` template, because the row is a grid of
+    /// entrypoints rather than one. The first string is the template's literal
+    /// text, which must appear here; the second is one entrypoint it produces,
+    /// which must resolve to the row.
+    ByTemplate(&'static str, &'static str),
+    /// Not dispatched, with the reason. There are none, and the variant stays
+    /// because a row that genuinely cannot be dispatched should be NAMED
+    /// rather than absent — an empty exclusion list is a claim, and a missing
+    /// one is a silence.
+    #[expect(dead_code, reason = "no stated row is currently unreachable")]
+    Not(&'static str),
+}
+
+/// Every stated row, and where this file dispatches it.
+///
+/// The ORDER is the table's. A row added to `kernels-wgpu` and not classified
+/// here fails `every_stated_row_is_dispatched_or_named` immediately, which is
+/// the point: the failure mode this list exists for is a table that grows
+/// while the suite does not.
+const COVERAGE: &[(&str, Reached)] = &[
+    ("add_bias", Reached::By("add_bias_bfloat16")),
+    (
+        "affine_qmm_t",
+        Reached::ByTemplate(
+            "affine_qmm_t_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}",
+            "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
+        ),
+    ),
+    (
+        "affine_qmm_t_residual",
+        Reached::ByTemplate(
+            "affine_qmm_t_residual_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}",
+            "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
+        ),
+    ),
+    (
+        "affine_qmv_fast",
+        Reached::By("affine_qmv_fast_bfloat16_gs_64_b_4"),
+    ),
+    (
+        "affine_qmv_fast_residual",
+        Reached::ByTemplate(
+            "affine_qmv_fast_residual_bfloat16_gs_{group}_b_{bits}",
+            "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
+        ),
+    ),
+    (
+        "affine_qmv_routed",
+        Reached::By("affine_qmv_routed_bfloat16_gs_64_b_4"),
+    ),
+    (
+        "affine_qmv_routed_bias",
+        Reached::By("affine_qmv_routed_bias_bfloat16_gs_64_b_4"),
+    ),
+    ("combine_sorted", Reached::By("combine_sorted")),
+    (
+        "embed_gather_4bit",
+        Reached::ByTemplate(
+            "embed_gather{}{}_4bit_bfloat16_gs_{group}_b_{bits}",
+            "embed_gather_4bit_bfloat16_gs_64_b_8",
+        ),
+    ),
+    (
+        "embed_gather_mb_4bit",
+        Reached::ByTemplate(
+            "embed_gather{}{}_4bit_bfloat16_gs_{group}_b_{bits}",
+            "embed_gather_mb_4bit_bfloat16_gs_64_b_8",
+        ),
+    ),
+    (
+        "embed_gather_scaled_4bit",
+        Reached::ByTemplate(
+            "embed_gather{}{}_4bit_bfloat16_gs_{group}_b_{bits}",
+            "embed_gather_scaled_4bit_bfloat16_gs_128_b_4",
+        ),
+    ),
+    (
+        "embed_gather_scaled_mb_4bit",
+        Reached::ByTemplate(
+            "embed_gather{}{}_4bit_bfloat16_gs_{group}_b_{bits}",
+            "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_4",
+        ),
+    ),
+    ("geglu_tanh", Reached::By("geglu_tanh_bfloat16")),
+    (
+        "geglu_tanh_strided",
+        Reached::By("geglu_tanh_strided_bfloat16"),
+    ),
+    ("gptoss_swiglu", Reached::By("gptoss_swiglu_bfloat16")),
+    ("kv_append", Reached::By("kv_append_bfloat16")),
+    ("kv_append_paged", Reached::By("kv_append_paged_bfloat16")),
+    ("layer_scalar_mul", Reached::By("layer_scalar_mul_bfloat16")),
+    ("logit_softcap", Reached::By("logit_softcap_bfloat16")),
+    (
+        "mxfp4_qmv_routed_bias",
+        Reached::By("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4"),
+    ),
+    ("neox_decode", Reached::By("neox_decode_bfloat16")),
+    (
+        "neox_freqs_decode",
+        Reached::By("neox_freqs_decode_bfloat16"),
+    ),
+    ("neox_freqs_mb", Reached::By("neox_freqs_mb_bfloat16")),
+    ("neox_mb", Reached::By("neox_mb_bfloat16")),
+    ("neox_prop_decode", Reached::By("neox_prop_decode_bfloat16")),
+    ("ple_combine", Reached::By("ple_combine_bfloat16")),
+    ("residual_add", Reached::By("residual_add_bfloat16")),
+    ("rms_residual", Reached::By("rms_residual_bfloat16")),
+    (
+        "rms_residual_scaled",
+        Reached::By("rms_residual_scaled_bfloat16"),
+    ),
+    ("rms_single_row", Reached::By("rms_single_row_bfloat16")),
+    ("route_gather", Reached::By("route_gather")),
+    ("route_sort", Reached::By("route_sort")),
+    ("router_topk", Reached::By("router_topk_bfloat16")),
+    (
+        "router_topk_scaled",
+        Reached::By("router_topk_scaled_bfloat16"),
+    ),
+    ("row_gather", Reached::By("row_gather_bfloat16")),
+    (
+        "sdpa_paged_decode",
+        Reached::By("sdpa_paged_decode_bfloat16_d_64"),
+    ),
+    (
+        "sdpa_paged_decode_sink",
+        Reached::By("sdpa_paged_decode_sink_bfloat16_d_64"),
+    ),
+    (
+        "sdpa_vector_decode",
+        Reached::By("sdpa_vector_decode_bfloat16_d_64"),
+    ),
+    (
+        "sdpa_vector_decode_swa",
+        Reached::By("sdpa_vector_decode_swa_bfloat16_d_256"),
+    ),
+    (
+        "shared_expert_combine",
+        Reached::By("shared_expert_combine"),
+    ),
+    (
+        "shared_expert_combine_strided",
+        Reached::By("shared_expert_combine_strided"),
+    ),
+    ("silu_mul", Reached::By("silu_mul_bfloat16")),
+    ("split_qkv_bf16", Reached::By("split_qkv_bf16")),
+    ("vnorm_single_row", Reached::By("vnorm_single_row_bfloat16")),
+];
+
+/// Whether [`COVERAGE`] says this suite dispatches `symbol`.
+///
+/// Called by [`run`] as well as by the test below, which is what closes the
+/// other direction: a dispatch of a row nobody classified fails at the
+/// dispatch, so the list cannot fall behind the file either way.
+fn is_claimed(symbol: &str) -> bool {
+    COVERAGE
+        .iter()
+        .any(|(row, how)| *row == symbol && !matches!(how, Reached::Not(_)))
+}
+
+/// D44. Every stated row is dispatched, or is named with a reason.
+///
+/// The number this suite covers has to be an ASSERTION and not a paragraph, or
+/// it shrinks in silence: a test deleted in a refactor takes its row's coverage
+/// with it and nothing says so. Four claims, and each catches a different way
+/// for that to happen.
+///
+/// 1. [`COVERAGE`]'s rows are EXACTLY the table's stated rows, both directions.
+///    A row added to `kernels-wgpu` fails here until somebody classifies it; a
+///    row that lost its operands fails here too.
+/// 2. Every entrypoint named resolves through `kernels_wgpu::sig` to the row it
+///    is filed under. A copy-paste that filed `neox_freqs_mb` under `neox_mb`
+///    is then a failure rather than a duplicate.
+/// 3. Every name — or the `format!` template that builds it — still APPEARS in
+///    this file. Deleting the test that dispatches a row deletes its string,
+///    which is what makes this more than a list of intentions.
+/// 4. The count, pinned. It is 44 of 44 with no exclusions; a row that
+///    genuinely could not be dispatched would be `Reached::Not` with a reason,
+///    and the count would have to move in the same edit.
+///
+/// Needs no adapter: it is a claim about the SUITE, and it should fail on the
+/// build box too.
+#[test]
+fn every_stated_row_is_dispatched_or_named() {
+    let mut stated: Vec<&str> = kernels_wgpu::KERNELS
+        .iter()
+        .filter(|row| !row.operands.is_empty())
+        .map(|row| row.symbol)
+        .collect();
+    stated.sort_unstable();
+    stated.dedup();
+
+    let mut claimed: Vec<&str> = COVERAGE.iter().map(|(row, _)| *row).collect();
+    claimed.sort_unstable();
+    let mut once = claimed.clone();
+    once.dedup();
+    assert_eq!(claimed, once, "a row is classified twice");
+    assert_eq!(
+        claimed, stated,
+        "this list and the table's stated rows have to be the same set. A row \
+         that grew operands is a row this suite can now dispatch and does not; \
+         a row that lost them is one it cannot",
+    );
+
+    let body = body_without_the_lists();
+    let mut dispatched = Vec::new();
+    let mut excluded = Vec::new();
+    for (row, how) in COVERAGE {
+        let (named, must_appear) = match how {
+            Reached::By(entrypoint) => (*entrypoint, *entrypoint),
+            Reached::ByTemplate(template, sample) => (*sample, *template),
+            Reached::Not(why) => {
+                excluded.push((*row, *why));
+                continue;
+            }
+        };
+        let sig = kernels_wgpu::sig(named)
+            .unwrap_or_else(|| panic!("`{row}` names `{named}`, which is no entrypoint"));
+        assert_eq!(
+            sig.symbol, *row,
+            "`{named}` belongs to row `{}` and is filed under `{row}`",
+            sig.symbol,
+        );
+        assert!(
+            body.contains(must_appear),
+            "`{row}` is dispatched as `{must_appear}`, and that string appears \
+             NOWHERE in this file outside the coverage table and the \
+             parse-only lists — so whatever dispatched it has been deleted \
+             and this list is the only thing still claiming coverage",
+        );
+        dispatched.push(*row);
+    }
+
+    assert!(
+        excluded.is_empty(),
+        "{} stated rows are not dispatched: {excluded:?}",
+        excluded.len(),
+    );
+    assert_eq!(
+        dispatched.len(),
+        44,
+        "this suite dispatches {} of the table's {} stated rows. The number is \
+         pinned so that it SHRINKING is a failure rather than a silence — if a \
+         row genuinely cannot be dispatched, say so with `Reached::Not` and a \
+         reason, and change this number in the same edit",
+        dispatched.len(),
+        stated.len(),
+    );
+    // The other 56 rows of the table are UNSTATED: they carry axes and a name
+    // and no operands, so no layout can be derived from them and this harness
+    // cannot bind one. That is not a gap in the testing, it is a row with no
+    // ABI — see `.wiki/new-driver/vulkan.md` §13.
+    assert_eq!(
+        kernels_wgpu::KERNELS.len() - stated.len(),
+        56,
+        "the unstated rows are the ones this suite structurally cannot reach, \
+         and there are supposed to be 56 of them",
     );
 }

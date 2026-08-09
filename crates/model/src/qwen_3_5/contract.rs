@@ -51,8 +51,9 @@ pub fn author_qwen3_5_moe(b: &mut Builder<'_>) -> Result<(), Error> {
     // The MoE decode runs through flashinfer's CUTLASS grouped GEMM, which
     // reads fc1's output as [linear|gate]; the checkpoint stores [gate|up].
     // Both the pre-fused and the per-expert stacking paths publish in the
-    // order the bound driver expects — `qwen35_moe_gate_up_swapped()` on the
-    // forward side is this same constant, and the two have to agree.
+    // order the bound driver expects. `moe/flashinfer_moe.hpp` is where
+    // that order is written down — "fc1 weights must be stacked as
+    // [up; gate], not pie's usual [gate; up]" — and the two have to agree.
     const GATE_SECOND: bool = true;
     b.fused_moe_gate_up_tp_slices(GATE_SECOND)?;
     shared_expert_gate_up_joins(b);
@@ -855,6 +856,84 @@ mod tests {
                 None,
                 "{skipped}"
             );
+        }
+    }
+
+    /// The mixture members the Metal schema renames, and the one it keeps.
+    ///
+    /// MLX stacks the routed experts under `mlp.switch_mlp`; the Metal
+    /// schema binds them as `mlp.experts`. The shared expert and its gate
+    /// keep their names, because this row HAS a shared expert -- the same
+    /// names on a row without one are refused, which is why the flag is
+    /// passed rather than assumed.
+    ///
+    /// Untested, the failure is quiet in the worst way: a routed member
+    /// left under `switch_mlp` is a name the kernel never binds, so the
+    /// shared expert generates alone and the model is a fraction of
+    /// itself rather than a load error.
+    #[test]
+    fn the_routed_experts_are_renamed_and_the_shared_one_is_kept() {
+        for (raw, want) in [
+            (
+                "model.language_model.layers.3.mlp.switch_mlp.gate_proj.weight",
+                "layers.3.mlp.experts.gate_proj.weight",
+            ),
+            (
+                "model.language_model.layers.3.mlp.switch_mlp.down_proj.scales",
+                "layers.3.mlp.experts.down_proj.scales",
+            ),
+            (
+                "model.language_model.layers.3.mlp.shared_expert.up_proj.weight",
+                "layers.3.mlp.shared_expert.up_proj.weight",
+            ),
+            (
+                "model.language_model.layers.3.mlp.shared_expert_gate.weight",
+                "layers.3.mlp.shared_expert_gate.weight",
+            ),
+        ] {
+            assert_eq!(
+                qwen3_5_mlx_name(raw, false).expect("a declared name"),
+                Some(want.to_string()),
+                "{raw}"
+            );
+        }
+    }
+
+    /// The two spellings the stacked schema cannot serve are refused
+    /// HERE rather than at the bind.
+    ///
+    /// `routed_expert_member` refuses two shapes and this text carries
+    /// the refusal out with a `?`. That `?` had never fired, which
+    /// matters because the two shapes it rejects are exactly the two a
+    /// real checkpoint arrives in:
+    ///
+    /// * the PLURAL `mlp.shared_experts.` -- deepseek's spelling. It is
+    ///   not qwen-3.5's, and the singular is, so the two differ by one
+    ///   letter and the load must not read one as the other.
+    /// * PER-EXPERT numbering, `mlp.experts.0.gate_proj`, which is what
+    ///   an unstacked MLX conversion produces. The Metal routed matvec
+    ///   reads ONE tensor per layer, expert-major on axis 0, so a
+    ///   per-expert name has no bank to land in.
+    ///
+    /// Both would otherwise reach the builder as unknown names and be
+    /// reported against a symbol instead of against the conversion.
+    #[test]
+    fn the_two_expert_spellings_this_schema_cannot_serve_are_refused_by_name() {
+        for (raw, needle) in [
+            (
+                "model.language_model.layers.3.mlp.shared_experts.gate_proj.weight",
+                "no shared expert",
+            ),
+            (
+                "model.language_model.layers.3.mlp.experts.0.gate_proj.weight",
+                "per-expert",
+            ),
+        ] {
+            let err = qwen3_5_mlx_name(raw, false)
+                .expect_err("the stacked schema cannot serve this spelling")
+                .to_string();
+            assert!(err.contains(needle), "{raw}: {err}");
+            assert!(err.contains(raw), "the refusal names the tensor: {err}");
         }
     }
 

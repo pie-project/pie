@@ -50,11 +50,6 @@ struct MlaPlanCache {
 void MlaPlanCacheDeleter::operator()(MlaPlanCache* p) const noexcept {
     delete p;
 }
-
-MlaPlanCachePtr make_mla_plan() {
-    return MlaPlanCachePtr(new MlaPlanCache{});
-}
-
 namespace {
 
 bool mla_use_naive_backend() {
@@ -69,78 +64,6 @@ bool mla_use_naive_backend() {
 }
 
 }  // namespace
-
-void plan_attention_mla_bf16(
-    MlaPlanCache& cache,
-    const std::uint32_t* qo_indptr_h,
-    const std::uint32_t* kv_page_indptr_h,
-    const std::uint32_t* kv_last_page_lens_h,
-    int total_tokens,
-    int num_requests,
-    int num_heads,
-    int kv_lora_rank,
-    int qk_rope_head_dim,
-    int page_size,
-    AttentionWorkspaceView workspace,
-    cudaStream_t stream,
-    bool causal,
-    float sm_scale)
-{
-    if (kv_lora_rank != 512 || qk_rope_head_dim != 64) {
-        throw std::runtime_error(
-            "flashinfer MLA: this build currently instantiates only "
-            "kv_lora_rank=512, qk_rope_head_dim=64");
-    }
-    // The naive/mma backend reads the geometry straight off the device
-    // indptr arrays and never touches `plan_info`, so on that path the whole
-    // FlashInfer scheduler is dead work — and it is not cheap: `MLAPlan`
-    // measured 2.5ms of host CPU per decode step at 128 requests (`enq.attn_plan`
-    // under PIE_STEP_PROFILE), which is longer than the entire GPU wave and
-    // was the single largest host item in the engine.
-    if (!mla_use_naive_backend()) {
-        cache.qo_h_buf.resize(num_requests + 1);
-        cache.kv_h_buf.resize(num_requests + 1);
-        cache.kv_len_h_buf.resize(num_requests);
-        for (int r = 0; r <= num_requests; ++r) {
-            cache.qo_h_buf[r] = static_cast<IdType>(qo_indptr_h[r]);
-            cache.kv_h_buf[r] = static_cast<IdType>(kv_page_indptr_h[r]);
-        }
-        for (int r = 0; r < num_requests; ++r) {
-            const int pages = static_cast<int>(kv_page_indptr_h[r + 1] -
-                                               kv_page_indptr_h[r]);
-            cache.kv_len_h_buf[r] =
-                static_cast<IdType>((pages - 1) * page_size +
-                                    static_cast<int>(kv_last_page_lens_h[r]));
-        }
-
-        CUDA_CHECK(::flashinfer::MLAPlan<IdType>(
-            workspace.float_buffer, workspace.float_bytes,
-            workspace.int_buffer, workspace.page_locked_int,
-            workspace.int_bytes,
-            cache.plan_info,
-            cache.qo_h_buf.data(),
-            cache.kv_h_buf.data(),
-            cache.kv_len_h_buf.data(),
-            static_cast<std::uint32_t>(num_requests),
-            static_cast<std::uint32_t>(num_heads),
-            static_cast<std::uint32_t>(kv_lora_rank),
-            causal,
-            stream));
-    }
-
-    cache.total_tokens = total_tokens;
-    cache.num_requests = num_requests;
-    cache.num_heads = num_heads;
-    cache.kv_lora_rank = kv_lora_rank;
-    cache.qk_rope_head_dim = qk_rope_head_dim;
-    cache.page_size = page_size;
-    cache.causal = causal;
-    cache.sm_scale = sm_scale > 0.f
-        ? sm_scale
-        : 1.0f / std::sqrt(static_cast<float>(kv_lora_rank + qk_rope_head_dim));
-    cache.valid = true;
-}
-
 namespace {
 
 template <::flashinfer::MaskMode MASK>

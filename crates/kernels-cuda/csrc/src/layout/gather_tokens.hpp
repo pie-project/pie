@@ -43,29 +43,9 @@ using device::GatherTokenOp;
 // stream off the decode path (the copies ride behind the grace period). A
 // per-layer call; the caller loops layers (or batches them via `num_layers` +
 // `layer_stride_elems` below).
-void launch_gather_tokens_bf16(
-    std::uint16_t* k_pages,
-    std::uint16_t* v_pages,
-    const GatherTokenOp* ops,
-    int num_ops,
-    int page_size,
-    int num_kv_heads,
-    int head_dim,
-    cudaStream_t stream);
 
 // Multi-layer variant: `k_pages`/`v_pages` point at layer 0; layer L starts at
 // `layer_stride_elems * L` elements (typically `num_pages · page_size ·
 // num_kv_heads · head_dim`). One launch copies every op for every layer.
-void launch_gather_tokens_bf16_layers(
-    std::uint16_t* k_pages,
-    std::uint16_t* v_pages,
-    const GatherTokenOp* ops,
-    int num_ops,
-    int num_layers,
-    std::int64_t layer_stride_elems,
-    int page_size,
-    int num_kv_heads,
-    int head_dim,
-    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels::layout

@@ -10,15 +10,11 @@ use ::driver_api::{
 };
 use anyhow::{Context, Result, anyhow, ensure};
 
-use crate::driver::FrameLaunchOutcome;
-use crate::driver::channel::RegisteredChannel;
-use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
-    StateCopyPlan,
+use ::driver_api::{
+    BoundInstance, ChannelRegistrationPlan, CompletionBroker, Driver, FrameLaunchOutcome,
+    FrameSubmission, InstanceBindingPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan,
+    ProgramRegistration, RegisteredChannel, StateCopyPlan, SubmissionCompletion,
 };
-use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
-use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::submission::FrameSubmission;
 
 const RPC_DEADLINE: Duration = Duration::from_secs(300);
 
@@ -94,9 +90,6 @@ impl RemoteDriver {
         }
     }
 
-    pub fn disconnect(&self, message: impl Into<String>) {
-        self.disconnect_handle().disconnect(message);
-    }
 
     fn ensure_connected(&self) -> Result<()> {
         ensure!(
@@ -137,7 +130,7 @@ impl RemoteDriver {
         match result {
             Ok(response) => Ok(response),
             Err(error) => {
-                self.disconnect(format!("executor transport lost: {error}"));
+                self.disconnect(&format!("executor transport lost: {error}"));
                 Err(error)
             }
         }
@@ -152,7 +145,7 @@ impl RemoteDriver {
             Ok(response) => Ok(response),
             Err(error) => {
                 if error.kind == RemoteErrorKind::Disconnected {
-                    self.disconnect(error.to_string());
+                    self.disconnect(&error.to_string());
                 }
                 Err(anyhow!("executor rejected {expected}: {error}"))
             }
@@ -200,11 +193,13 @@ impl RemoteDriver {
         );
         for (&address, state) in pointers.iter().zip(states) {
             ensure!(address != 0, "local terminal cell pointer is null");
-            let cell = address as *mut ::driver_api::PieTerminalCell;
+            let cell = address as *mut ::driver_api::TerminalCell;
+            // The dereference stays unsafe -- the executor hands back an
+            // address -- but the publication no longer re-derives an atomic
+            // view of a non-atomic field: `outcome` IS the atomic.
             unsafe {
                 (*cell).reserved0 = state.reserved0;
-                std::sync::atomic::AtomicU32::from_ptr(std::ptr::addr_of_mut!((*cell).outcome))
-                    .store(state.outcome, Ordering::Release);
+                (*cell).publish(state.outcome);
             }
         }
         Ok(())
@@ -265,7 +260,38 @@ impl RemoteDriver {
         });
     }
 
-    pub fn load_model(
+
+
+
+
+
+
+
+
+
+
+}
+
+impl Driver for RemoteDriver {
+    fn kind(&self) -> &'static str {
+        "remote"
+    }
+
+    fn device_domain(&self) -> ::driver_api::DeviceDomain {
+        ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE
+    }
+
+    /// The one backend this means anything for.
+    ///
+    /// `&str` and not `impl Into<String>`: a generic parameter would make
+    /// `Driver` non-dyn-safe, and the registry holds `Box<dyn Driver>`. The
+    /// four in-process backends take the trait's default, which does nothing
+    /// -- they have no connection to drop.
+    fn disconnect(&self, message: &str) {
+        self.disconnect_handle().disconnect(message);
+    }
+
+    fn load_model(
         &mut self,
         _descs: Vec<::driver_api::ModelLoadDesc>,
     ) -> Result<::driver_api::DriverCapabilities> {
@@ -273,7 +299,7 @@ impl RemoteDriver {
         Ok(self.capabilities.clone())
     }
 
-    pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
+    fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
         if let Some(&program_id) = self.programs.get(&desc.program_hash) {
             return Ok(program_id);
         }
@@ -290,7 +316,7 @@ impl RemoteDriver {
         Ok(program_id)
     }
 
-    pub fn register_channel(
+    fn register_channel(
         &mut self,
         desc: &ChannelRegistrationPlan,
     ) -> Result<RegisteredChannel> {
@@ -324,7 +350,7 @@ impl RemoteDriver {
         );
         self.channels
             .insert(desc.channel_id, binding.executor_channel_id);
-        let native = ::driver_api::PieChannelEndpointBinding {
+        let native = ::driver_api::ChannelBinding {
             channel_id: desc.channel_id,
             ..Default::default()
         };
@@ -336,7 +362,7 @@ impl RemoteDriver {
         })
     }
 
-    pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
+    fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
         self.ensure_connected()?;
         let local_instance_id = self.next_local_instance_id(desc.requested_instance_id)?;
         let remote_channel_ids = desc
@@ -397,7 +423,7 @@ impl RemoteDriver {
         Ok(BoundInstance::new(
             desc.driver_id,
             desc.program_id,
-            ::driver_api::PieInstanceBinding {
+            ::driver_api::InstanceBinding {
                 instance_id: local_instance_id,
                 geometry_class: binding.geometry_class as u32,
                 reserved0: 0,
@@ -412,7 +438,7 @@ impl RemoteDriver {
     /// and fold the per-step RPC completions into the frame's single
     /// completion. Each step ships the frame-union page translation (a
     /// superset of the step's frontier; write bounds still guard writes).
-    pub fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
+    fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         self.ensure_connected()?;
         let mut step_completions = Vec::with_capacity(frame.steps.len());
         for step in &frame.steps {
@@ -462,15 +488,15 @@ impl RemoteDriver {
         )))
     }
 
-    pub fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+    fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
         Err(anyhow!(
             "nested media encode through a remote driver is unsupported"
         ))
     }
 
-    pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
+    fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
         self.ensure_connected()?;
-        let (raw, completion) = self.broker.pie_completion(1);
+        let (raw, completion) = self.broker.control_completion(1);
         self.spawn_launch_rpc(
             ExecutorRequest::CopyKv(desc.clone()),
             vec![raw.terminal_cell as usize],
@@ -479,19 +505,19 @@ impl RemoteDriver {
         Ok(completion)
     }
 
-    pub fn copy_state(&mut self, _desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
+    fn copy_state(&mut self, _desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
         Err(anyhow!(
             "remote driver does not support recurrent-state copies"
         ))
     }
 
-    pub fn resize_pool(&mut self, _desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
+    fn resize_pool(&mut self, _desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
         Err(anyhow!(
             "remote executor pools are fixed for the lease lifetime"
         ))
     }
 
-    pub fn close_instance(&mut self, local_id: u64) -> Result<()> {
+    fn close_instance(&mut self, local_id: u64) -> Result<()> {
         let remote_id = *self
             .instances
             .get(&local_id)
@@ -506,7 +532,7 @@ impl RemoteDriver {
         Ok(())
     }
 
-    pub fn close_channel(&mut self, local_id: u64) -> Result<()> {
+    fn close_channel(&mut self, local_id: u64) -> Result<()> {
         let remote_id = *self
             .channels
             .get(&local_id)

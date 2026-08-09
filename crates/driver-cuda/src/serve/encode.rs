@@ -10,12 +10,11 @@
 
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK, PIE_STATUS_UNSUPPORTED,
-    PieCompletion, PieDriver, PieEncodeDesc,
 };
 use model::shared::tower_names::{Slot, VISION_SLOTS_PER_LAYER, vision_head, vision_layers};
 
-use super::state::{LoadedModel, Shell, shell};
-use super::{checked, guard};
+use super::state::{LoadedModel, Shell};
+use super::guard;
 
 /// Awaits: the MULTIMODAL encoders — image/audio features to embedding
 /// rows (the vision/audio towers, which stayed hand-written C++). The
@@ -33,7 +32,7 @@ use super::{checked, guard};
 /// neither. What stood here spelled some fifty paths inline.
 fn encode_audio_arm(
     model: &LoadedModel,
-    desc: &PieEncodeDesc,
+    desc: &driver_api::MediaEncodePlan,
     out_ptr: *mut std::ffi::c_void,
     out_bytes: usize,
     indptr_ptr: *mut u32,
@@ -133,10 +132,10 @@ fn encode_audio_arm(
             ac.logit_cap,
             ac.residual_weight,
             ac.norm_eps,
-            desc.audio_features.ptr.cast(),
-            desc.audio_feature_indptr.ptr,
-            desc.audio_anchor_rows.ptr,
-            i32::try_from(desc.audio_anchor_rows.len).unwrap_or(0),
+            desc.audio_features.as_ptr().cast(),
+            desc.audio_feature_indptr.as_ptr(),
+            desc.audio_anchor_rows.as_ptr(),
+            i32::try_from(desc.audio_anchor_rows.len()).unwrap_or(0),
             out_ptr.cast(),
             out_bytes,
             indptr_ptr,
@@ -152,64 +151,62 @@ fn encode_audio_arm(
 /// The MULTIMODAL encode: image/audio media in, embedding rows out —
 /// the towers behind `vision::gemma4_*_encode`. One media kind per call
 /// today; mixed batches await the offset plumbing.
-pub fn pie_cuda_encode(
-    driver: *mut PieDriver,
-    encode: *const PieEncodeDesc,
-    completion: PieCompletion,
-) -> i32 {
-    guard("pie_cuda_encode", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let desc = match checked(
-            encode,
-            |d| unsafe { driver_api::local::validate_encode_desc(d) },
-            "encode",
-        ) {
-            Ok(d) => d,
-            Err(status) => return status,
-        };
-        let Some(model) = state.model.as_ref() else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let num_images = desc.image_anchor_rows.len;
-        let num_clips = desc.audio_anchor_rows.len;
-        if num_images == 0 && num_clips == 0 {
-            return PIE_STATUS_INVALID_ARGUMENT;
+impl Shell {
+    /// Encode media into the model's embedding space.
+    ///
+    /// # Errors
+    ///
+    /// No encode tower for this model, or a device failure.
+    pub fn encode(
+        &mut self,
+        encode: &mut driver_api::MediaEncodePlan,
+        completion: driver_api::completion::CompletionTarget,
+    ) -> Result<(), i32> {
+        guard("encode", Err(PIE_STATUS_DRIVER_ERROR), move || {
+        let state = self;
+        // Most of `validate_encode_desc` was NOT about the C shape: the
+        // plane counts, the `f32` alignment, the exact partitions. All of it
+        // is `MediaEncodePlan::validate`.
+        if let Err(why) = encode.validate() {
+            eprintln!("[driver-cuda] encode: {why}");
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         }
-        if desc.output_row_indptr.len < num_images + num_clips + 1 {
-            return PIE_STATUS_INVALID_ARGUMENT;
+        // The out-params, taken as raw pointers ONCE. The encode towers
+        // write through them from the device side, and holding them as raw
+        // is what lets the read side stay a shared borrow of the same plan.
+        let out_ptr: *mut u8 = encode.output_rows.as_mut_ptr();
+        let out_bytes = encode.output_rows.len();
+        let out_indptr: *mut u32 = encode.output_row_indptr.as_mut_ptr();
+        let desc = &*encode;
+        let Some(model) = state.model.as_ref() else {
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
+        };
+        let num_images = desc.image_anchor_rows.len();
+        let num_clips = desc.audio_anchor_rows.len();
+        if num_images == 0 && num_clips == 0 {
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
+        }
+        if desc.output_row_indptr.len() < num_images + num_clips + 1 {
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         }
         let notify_done = |state: &Shell| {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            if let Some(notify) = state.notify {
-                unsafe {
-                    notify(
-                        state.notify_ctx,
-                        completion.wait_id,
-                        completion.target_epoch,
-                    )
-                };
-            }
+            state
+                .broker
+                .notify(completion.wait_id, completion.target_epoch);
         };
         if num_images == 0 {
             // Audio only: the helper writes the whole CSR itself.
-            let st = encode_audio_arm(
-                model,
-                desc,
-                desc.output_rows.ptr.cast(),
-                desc.output_rows.len,
-                desc.output_row_indptr.ptr,
-            );
+            let st = encode_audio_arm(model, desc, out_ptr.cast(), out_bytes, out_indptr);
             if st != PIE_STATUS_OK {
-                return st;
+                return Err(st);
             }
             notify_done(state);
-            return PIE_STATUS_OK;
+            return Err(PIE_STATUS_OK);
         }
         let Some(vc) = model.deployment.towers.vision.as_ref() else {
             eprintln!("[driver-cuda] encode: this deployment carries no vision tower");
-            return PIE_STATUS_UNSUPPORTED;
+            return Err(PIE_STATUS_UNSUPPORTED);
         };
         // The vision table, in the stride-41 layout the launcher indexes,
         // built per call from the loaded weights — name lookups, no stored
@@ -244,18 +241,18 @@ pub fn pie_cuda_encode(
         for s in &head {
             match bind(s) {
                 Ok(p) => heads.push(p),
-                Err(e) => return e,
+                Err(e) => return Err(e),
             }
         }
         let [patch_w, pos_table, embed_proj] = heads[..] else {
-            return PIE_STATUS_UNSUPPORTED;
+            return Err(PIE_STATUS_UNSUPPORTED);
         };
         let slots = vision_layers(vp, vc.layers);
         let mut table: Vec<*const std::ffi::c_void> = Vec::with_capacity(slots.len());
         for s in &slots {
             match bind(s) {
                 Ok(p) => table.push(p),
-                Err(e) => return e,
+                Err(e) => return Err(e),
             }
         }
         debug_assert_eq!(table.len(), vc.layers as usize * VISION_SLOTS_PER_LAYER);
@@ -272,7 +269,7 @@ pub fn pie_cuda_encode(
             .map_or(0, |b| b.bytes / (hidden * 2));
 
         let Ok(stream) = crate::device::OwnedStream::new(0) else {
-            return PIE_STATUS_DRIVER_ERROR;
+            return Err(PIE_STATUS_DRIVER_ERROR);
         };
         let mut vis_bounds = vec![0u32; num_images + 1];
         unsafe {
@@ -290,24 +287,24 @@ pub fn pie_cuda_encode(
                 vc.pooling_kernel as i32,
                 vc.norm_eps,
                 vc.rope_theta,
-                desc.image_pixels.ptr.cast(),
-                desc.image_pixel_indptr.ptr,
-                desc.image_patch_positions.ptr,
-                desc.image_anchor_rows.ptr,
+                desc.image_pixels.as_ptr().cast(),
+                desc.image_pixel_indptr.as_ptr(),
+                desc.image_patch_positions.as_ptr(),
+                desc.image_anchor_rows.as_ptr(),
                 i32::try_from(num_images).unwrap_or(0),
-                desc.output_rows.ptr.cast(),
-                desc.output_rows.len,
+                out_ptr.cast(),
+                out_bytes,
                 vis_bounds.as_mut_ptr(),
                 stream.as_ref().as_raw().cast(),
             );
         }
         if stream.as_ref().synchronize().is_err() {
-            return PIE_STATUS_DRIVER_ERROR;
+            return Err(PIE_STATUS_DRIVER_ERROR);
         }
         // Compose the shared CSR the C++ `Context::encode` writes: the
         // vision segment's boundaries verbatim, then the audio segment's
         // shifted by the vision row count.
-        let indptr = desc.output_row_indptr.ptr;
+        let indptr = out_indptr;
         unsafe {
             for (i, b) in vis_bounds.iter().enumerate() {
                 *indptr.add(i) = *b;
@@ -316,19 +313,19 @@ pub fn pie_cuda_encode(
         if num_clips > 0 {
             let row_offset = *vis_bounds.last().unwrap_or(&0) as usize;
             let consumed = row_offset * text_hidden * 2;
-            if consumed > desc.output_rows.len {
-                return PIE_STATUS_INVALID_ARGUMENT;
+            if consumed > out_bytes {
+                return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
             let mut audio_bounds = vec![0u32; num_clips + 1];
             let st = encode_audio_arm(
                 model,
                 desc,
-                unsafe { desc.output_rows.ptr.add(consumed) }.cast(),
-                desc.output_rows.len - consumed,
+                unsafe { out_ptr.add(consumed) }.cast(),
+                out_bytes - consumed,
                 audio_bounds.as_mut_ptr(),
             );
             if st != PIE_STATUS_OK {
-                return st;
+                return Err(st);
             }
             unsafe {
                 for c in 0..num_clips {
@@ -338,6 +335,7 @@ pub fn pie_cuda_encode(
             }
         }
         notify_done(state);
-        PIE_STATUS_OK
+        Ok(())
     })
+    }
 }

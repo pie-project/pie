@@ -213,14 +213,14 @@ impl Shell {
         // pool of no layers.
         //
         // The affine point is passed separately because it is the
-        // CHECKPOINT's and not the row's; everything else comes off the
-        // projection. `geometry_from_deployment` refuses rather than
-        // defaulting, which is what makes this arithmetic over a value rather
-        // than a second model definition.
-        let quant = crate::batch::AffineFormat {
-            bits: encoding.bits,
-            group: encoding.group_size,
-        };
+        // CHECKPOINT's and not the row's — and it is asked of the BYTES,
+        // not of `config.json`, which states a default its per-tensor
+        // overrides may supersede for every tensor in the file. See
+        // `Loaded::affine_point`, which also owns the refusal when the
+        // checkpoint arrives at more than one. `geometry_from_deployment`
+        // refuses rather than defaulting, which is what makes this
+        // arithmetic over a value rather than a second model definition.
+        let quant = loaded.affine_point(row.id())?;
         let geometry = crate::batch::geometry_from_deployment(&deployment, row.load_shape(), quant)
             .map_err(Error::from)?;
 
@@ -265,68 +265,22 @@ impl Shell {
         // left in the checkpoint's own format. It decides an ENCODING, not a
         // fact — a checkpoint need not quantize uniformly, and reading an
         // expert bank with the dense format is NaNs rather than a near miss.
-        // ONE KERNEL SET, SO ONE AFFINE POINT — asked rather than assumed.
+        // ONE KERNEL SET, SO ONE AFFINE POINT — asked rather than assumed,
+        // and asked of the bytes. `Loaded::affine_point` above states the
+        // whole argument and owns the refusal; what mattered here is that
+        // `observed` takes `geometry.quant`, so the point the kernels are
+        // built at and the point the scales were written at are now one
+        // value with one source.
         //
-        // `observed` below builds a single kernel set from `geometry.quant`,
-        // which is the point the checkpoint's `config.json` states. The
-        // TENSORS need not agree with it and need not agree with each other:
-        // `mlx_lm` publishes a routed stack at 4 bits and its router gate at
-        // 8, because the gate is small and the whole mixture inherits its
-        // error. Every tensor is then dequantised at the stated width, the
-        // gate included, and the failure is not a fault — it is every token
-        // routed to almost the right experts, measured at cosine 0.84
-        // against the reference logits.
-        //
-        // `DecodeGeometry::alt_quant` is the field that second point would
-        // ride if this driver could instantiate two kernel sets. It cannot,
-        // and inventing one here would put a guess where a fact belongs. So
-        // the honest answer is the refusal, and what makes it possible is
-        // that the LOAD PLAN knew all along: `QuantSpec` carries a
-        // `group_size` and a `bits_per_element` per tensor, and nothing was
-        // asking.
-        //
-        // MXFP4 banks are not in this set. They take their own kernel at
+        // MXFP4 banks are not in that set. They take their own kernel at
         // their own group and are never read at an affine point, which is
         // exactly the case `Loaded::mxfp4` already carries.
-        if loaded.affine_points.len() > 1 {
-            let points = loaded
-                .affine_points
-                .iter()
-                .map(|(g, b)| format!("g{g}/b{b}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(Error::Create {
-                what: "checkpoint",
-                message: format!(
-                    "`{}` arrives at {} affine points ({points}) and this driver \
-                     instantiates ONE kernel set, at the g{}/b{} its config \
-                     states. Every tensor at another point would be dequantised \
-                     at that width — scales read from the wrong offset, and for \
-                     a router gate that is not a fault but a mixture routing to \
-                     almost the right experts. Refused rather than served wrongly",
-                    row.id(),
-                    loaded.affine_points.len(),
-                    geometry.quant.group,
-                    geometry.quant.bits
-                ),
-            });
-        }
-
         self.text_row = Some((
             row,
             crate::model::binding::observed(geometry.quant, |name| loaded.mxfp4.contains(name)),
         ));
-        self.inv_freq = crate::model::rope::frequencies(
-            geometry.head_dim,
-            geometry.rope_theta,
-            (geometry.rope_freq_factor > 0.0).then_some(crate::model::rope::Rescale {
-                factor: geometry.rope_freq_factor,
-                low: geometry.rope_low_freq_factor,
-                high: geometry.rope_high_freq_factor,
-                original_max: geometry.rope_original_max_position as f32,
-            }),
-        )
-        .iter()
+        self.inv_freq = crate::model::rope::table(&geometry)
+            .iter()
         .map(|f| f.to_bits())
         .collect();
         // Which buffer each weight address belongs to, so a fire can be

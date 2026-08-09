@@ -91,24 +91,8 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
     const GROUP: i64 = 32;
     const CODES_PER_WORD: i64 = 8;
 
-    // `[up | gate]` is what flashinfer's fused grouped GEMM reads fc1 as,
-    // and choosing the order here costs nothing — it is which `concat` leg
-    // goes first. Undoing it later would cost a copy of the whole slab.
-    // Kimi's grouped GEMM does not take that path, so the halves stay in
-    // checkpoint order; `kimi_moe_gate_up_swapped()` on the forward side is
-    // this same constant, and the two have to agree.
-    const GATE_SECOND: bool = false;
-
     for layer in 0..b.shape().layers {
         let mlp = format!("model.layers.{layer}.mlp.");
-        // Kimi's leading layers are dense, and a dense layer simply has no
-        // expert names — which is why the loop probes rather than reading
-        // `first_k_dense_replace`.
-        if b.find(&b.source_name(&format!("{mlp}experts.0.gate_proj.weight_packed")))
-            .is_none()
-        {
-            continue;
-        }
         let mut gate_up = Vec::new();
         let mut gate_up_scales = Vec::new();
         let mut down = Vec::new();
@@ -217,22 +201,18 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
             let up = packed(b, &parts[2].name, vec![1, inter_full, h], 1);
             let gate_s = factors(b, &parts[1].name, vec![1, inter_full, h / GROUP], 1);
             let up_s = factors(b, &parts[3].name, vec![1, inter_full, h / GROUP], 1);
-            gate_up.push(Expr::concat(
-                1,
-                if GATE_SECOND {
-                    vec![up, gate]
-                } else {
-                    vec![gate, up]
-                },
-            ));
-            gate_up_scales.push(Expr::concat(
-                1,
-                if GATE_SECOND {
-                    vec![up_s, gate_s]
-                } else {
-                    vec![gate_s, up_s]
-                },
-            ));
+            // `[gate | up]` — the order `mlp::chunked_swiglu_bf16` reads
+            // when its `gate_second` argument is left at its default, which
+            // is what the trace's `dsl::cuda::swiglu` records: it states no
+            // params, so the launch takes the default. `y[n,i] =
+            // silu(packed[n,i]) * packed[n,I+i]`, so the LEADING half is
+            // the one that gets the silu. Swapping the legs here without
+            // teaching the trace to pass `gate_second` would silu the up
+            // projection and multiply by the gate — no shape error, no NaN,
+            // a different model. Undoing it later would cost a copy of the
+            // whole slab, so it is decided here, once.
+            gate_up.push(Expr::concat(1, vec![gate, up]));
+            gate_up_scales.push(Expr::concat(1, vec![gate_s, up_s]));
             down.push(packed(
                 b,
                 &parts[4].name,
@@ -247,6 +227,11 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
             ));
             expert += 1;
         }
+        // Kimi's leading layers are dense, and a dense layer simply has no
+        // expert names — which is why the pass walks rather than reading
+        // `first_k_dense_replace`. The walk finding nothing at expert 0 IS
+        // that answer; probing for expert 0 before the walk would ask the
+        // same question twice and make this line unreachable.
         if gate_up.is_empty() {
             continue;
         }
@@ -298,22 +283,20 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
         // for.
         let gu_scale = format!("{mlp}experts.gate_up.scale");
         let dn_scale = format!("{mlp}experts.down.scale");
-        if let Some(gu) = b.define(
+        let gu = b.define(
             gu_scale.clone(),
             Expr::concat(0, gate_up_scales),
             Encoding::Raw(DType::BF16),
             Some(vec![experts, 2 * local_inter, hidden / GROUP]),
-        ) {
-            b.mark_internal(gu);
-        }
-        if let Some(dn) = b.define(
+        );
+        b.mark_internal(gu);
+        let dn = b.define(
             dn_scale.clone(),
             Expr::concat(0, down_scales),
             Encoding::Raw(DType::BF16),
             Some(vec![experts, hidden, local_inter / GROUP]),
-        ) {
-            b.mark_internal(dn);
-        }
+        );
+        b.mark_internal(dn);
         b.define(
             format!("{mlp}experts.gate_up.weight"),
             Expr::concat(0, gate_up).scale_per_block(Expr::out(&gu_scale)),
@@ -474,6 +457,25 @@ mod tests {
         name: &str,
     ) -> Option<&'a model_loader::contract::TensorContract> {
         c.tensors.iter().find(|t| t.name == name)
+    }
+
+    /// `(bank, first row, row count)` for an expression that is a slice of
+    /// another declared tensor, and `None` for anything else — a part read
+    /// straight from the checkpoint gives `None`, which is the answer that
+    /// distinguishes a join from a pass-through.
+    fn band(e: &Expr) -> Option<(String, i64, i64)> {
+        match e {
+            Expr::Slice {
+                src,
+                axis: model_loader::types::Axis(0),
+                start,
+                len,
+            } => match src.as_ref() {
+                Expr::Out(name) => Some((name.clone(), *start, *len)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     const GU: &str = "model.layers.0.mlp.experts.gate_up.weight";
@@ -794,6 +796,40 @@ mod tests {
         }
     }
 
+    /// The two halves are stacked GATE FIRST, and nothing else in this file
+    /// reads the order.
+    ///
+    /// `mlp::chunked_swiglu_bf16` computes `y[n,i] = silu(packed[n,i]) *
+    /// packed[n,I+i]` when its `gate_second` argument is left at its
+    /// default, and the trace's `dsl::cuda::swiglu` records no params, so
+    /// the launch takes that default. The LEADING half is therefore the one
+    /// that gets the silu. Stacking `[up|gate]` here would silu the up
+    /// projection and multiply by the gate: same shapes, same dtypes, no
+    /// NaN, a different model — which is why the order is asserted rather
+    /// than left to the concat's argument order to keep.
+    ///
+    /// The scales ride the same stack, so their order has to match the
+    /// weights' or every column is dequantized by its neighbour's factor.
+    #[test]
+    fn the_gate_leads_the_stack_and_the_scales_ride_in_the_same_order() {
+        let c = stack(&experts(EXPERTS));
+        for (name, first, second) in [
+            (GU, "gate_proj.weight_packed", "up_proj.weight_packed"),
+            (GU_S, "gate_proj.weight_scale", "up_proj.weight_scale"),
+        ] {
+            let t = find(&c, name).expect("stacked");
+            let srcs = t.expr.sources();
+            // Expert 0's two legs are the first two names the axis-1 concat
+            // reads; every later expert repeats the pair.
+            assert!(
+                srcs[0].ends_with(first) && srcs[1].ends_with(second),
+                "{name} stacks {:?} first, but the leading half is the one \
+                 chunked_swiglu applies silu to",
+                &srcs[..2.min(srcs.len())]
+            );
+        }
+    }
+
     /// The author itself runs the pass, and under kimi's source prefix.
     ///
     /// Every test above calls `bf16_expert_stacks` directly, so deleting
@@ -836,5 +872,112 @@ mod tests {
             "the author published no slab, so either it does not run the \
              pass or it does not set the prefix the pass probes through"
         );
+    }
+
+    /// The MLA joins fuse TWO pairs, and only one of them had ever run.
+    ///
+    /// `mla_fused_projection_joins` joins `q_a_proj + kv_a_proj_with_mqa`
+    /// (which share `norm_x`) and the shared expert's `gate_proj +
+    /// up_proj` (which share `norm_y`). Every other test in this file
+    /// builds a checkpoint of routed experts only, so the second join saw
+    /// no candidate and its arm never ran — and kimi-k2 rides a shared
+    /// expert on every MoE layer, which `spec.rs` asserts of the row.
+    ///
+    /// A join is a fusion, not a rename: the two source weights become one
+    /// `[2I, H]` tensor under a `.fused.` name and are consumed. Losing the
+    /// second arm would leave `gate_proj` and `up_proj` published
+    /// separately, which is not a load error — it is one extra GEMM launch
+    /// per layer per step, over the widest matrices in the shared MLP,
+    /// binding names the fused forward does not ask for.
+    #[test]
+    fn the_shared_experts_gate_and_up_are_joined_the_same_way_the_mla_pair_is() {
+        let mut tensors = Vec::new();
+        // The two pairs the pass joins, under kimi's source prefix.
+        for (id, (name, shape)) in [
+            ("self_attn.q_a_proj.weight", vec![INTER, HIDDEN]),
+            ("self_attn.kv_a_proj_with_mqa.weight", vec![INTER, HIDDEN]),
+            ("mlp.shared_experts.gate_proj.weight", vec![INTER, HIDDEN]),
+            ("mlp.shared_experts.up_proj.weight", vec![INTER, HIDDEN]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tensors.push(tensor(
+                100 + id as u32,
+                &format!("language_model.model.layers.0.{name}"),
+                shape,
+                bf16(),
+            ));
+        }
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors,
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let encoding = StoredEncoding::dense();
+        let policy = Policy::default();
+        let mut b = Builder::new(
+            &meta,
+            "kimi-test",
+            LoadShape::mixture(1, 128, EXPERTS, false),
+            &encoding,
+            &target,
+            &policy,
+        );
+        author_kimi(&mut b).expect("the author does not refuse");
+        let c = b.finish().expect("finish");
+
+        for (fused, parts) in [
+            (
+                "model.layers.0.self_attn.q_kv_a_proj.fused.weight",
+                [
+                    "model.layers.0.self_attn.q_a_proj.weight",
+                    "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                ],
+            ),
+            (
+                "model.layers.0.mlp.shared_experts.gate_up_proj.fused.weight",
+                [
+                    "model.layers.0.mlp.shared_experts.gate_proj.weight",
+                    "model.layers.0.mlp.shared_experts.up_proj.weight",
+                ],
+            ),
+        ] {
+            let t = find(&c, fused).unwrap_or_else(|| {
+                panic!(
+                    "the pass published no {fused}; tensors: {:?}",
+                    c.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(
+                t.shape,
+                Some(vec![2 * INTER, HIDDEN]),
+                "{fused} is the two legs stacked on the output axis"
+            );
+            // The parts stay published, as VIEWS into the bank: a binder
+            // that reads them by name still finds them, and the offset of
+            // each leg is stated once here rather than recomputed. Asserting
+            // their presence would pass on a pass that never joined at all,
+            // so read the band each one names.
+            for (leg, part) in parts.iter().enumerate() {
+                let p = find(&c, part).unwrap_or_else(|| panic!("no {part}"));
+                assert_eq!(
+                    (band(&p.expr), p.shape.clone()),
+                    (
+                        Some((fused.to_string(), leg as i64 * INTER, INTER)),
+                        Some(vec![INTER, HIDDEN])
+                    ),
+                    "{part} should be rows [{}, {}) of {fused}, not a tensor of \
+                     its own — a part read from the checkpoint instead of the \
+                     bank means the join did not happen and the forward binds \
+                     both forms",
+                    leg as i64 * INTER,
+                    (leg as i64 + 1) * INTER
+                );
+            }
+        }
     }
 }

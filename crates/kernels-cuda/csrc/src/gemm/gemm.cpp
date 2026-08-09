@@ -27,10 +27,6 @@
 #include "norm/residual_add.hpp"
 #include "tuning_cache.hpp"
 
-#ifdef PIE_CUDA_HAS_MARLIN
-#include "marlin_wrapper.hpp"
-#endif
-
 namespace pie_cuda_driver::kernels::gemm {
 
 namespace {
@@ -1027,35 +1023,14 @@ void gemm_bf16_impl(
     }
 }
 
-void gemm_bf16_out_fp32_impl(
-    cublasHandle_t handle,
-    const void* act,
-    const void* W,
-    float* y,
-    int M,
-    int N,
-    int K)
-{
-    const float alpha = 1.f;
-    const float beta = 0.f;
-    const auto status = cublasGemmEx(
-        handle,
-        /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
-        /*m=*/N, /*n=*/M, /*k=*/K,
-        &alpha,
-        /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
-        /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
-        &beta,
-        /*C=*/y,   CUDA_R_32F, /*ldc=*/N,
-        bf16_compute_type(),
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(
-            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
-            "): cublasGemmEx[bf16->fp32] M=" + std::to_string(M) +
-            " N=" + std::to_string(N) + " K=" + std::to_string(K));
-    }
-}
+// `gemm_bf16_out_fp32_impl` WAS HERE -- one `cublasGemmEx`, bf16 in and fp32
+// out, and nothing else in the body. It is Rust now:
+// `driver-cuda/src/bind/service.rs::gemm_act_x_wt_bf16_out_fp32`, issued
+// through cudarc's dynamically-loaded cuBLAS. See `new-horizon.md` §45.
+//
+// Note what is NOT deleted below: `gemm_bf16_to_fp32_impl` is a DIFFERENT
+// function with a nearly identical name, reached from `act_x_w`'s live
+// fp32-output arm, and it stays.
 
 void gemm_bf16_to_fp32_impl(
     cublasHandle_t handle,
@@ -1083,31 +1058,9 @@ void gemm_bf16_to_fp32_impl(
     }
 }
 
-void gemm_bf16_cublas_impl(
-    cublasHandle_t handle,
-    const void* act, const void* W, void* y,
-    int M, int N, int K,
-    float beta)
-{
-    const float alpha = 1.f;
-    const auto status = cublasGemmEx(
-        handle,
-        /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
-        /*m=*/N, /*n=*/M, /*k=*/K,
-        &alpha,
-        /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
-        /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
-        &beta,
-        /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
-        bf16_compute_type(),
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(
-            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
-            "): cublasGemmEx[bf16:cublas] M=" + std::to_string(M) +
-            " N=" + std::to_string(N) + " K=" + std::to_string(K));
-    }
-}
+// `gemm_bf16_cublas_impl` WAS HERE. Not moved -- DELETED. Its whole consumer
+// set was `act_x_wt_bf16_cublas` (one call), which was itself reachable from
+// nothing. §10.10: a launcher goes when its whole consumer set has gone.
 
 // Whether `cublasGemmGroupedBatchedEx` can serve a given shape is only
 // discoverable by calling it and looking at the status. That is fine on a plain
@@ -1239,60 +1192,13 @@ void gemm_batched_bf16_impl(
     }
 }
 
-void gemm_grouped_bf16_impl(
-    cublasHandle_t handle,
-    const void* const* act_ptrs_host,
-    const void* const* W_ptrs_host,
-    void* const*       y_ptrs_host,
-    const int*         M_array_host,
-    int group_count,
-    int N,
-    int K,
-    float beta)
-{
-    if (group_count <= 0) return;
-
-    std::vector<cublasOperation_t> transa(group_count, CUBLAS_OP_T);
-    std::vector<cublasOperation_t> transb(group_count, CUBLAS_OP_N);
-    std::vector<int> m(group_count, N);
-    std::vector<int> n(group_count);
-    std::vector<int> k(group_count, K);
-    std::vector<int> lda(group_count, K);
-    std::vector<int> ldb(group_count, K);
-    std::vector<int> ldc(group_count, N);
-    std::vector<int> group_size(group_count, 1);
-    std::vector<float> alpha(group_count, 1.f);
-    std::vector<float> beta_values(group_count, beta);
-
-    for (int i = 0; i < group_count; ++i) {
-        n[i] = M_array_host[i];
-    }
-
-    auto run = [&](cublasComputeType_t compute) {
-        return cublasGemmGroupedBatchedEx(
-            handle,
-            transa.data(), transb.data(),
-            m.data(), n.data(), k.data(),
-            alpha.data(),
-            W_ptrs_host,   CUDA_R_16BF, lda.data(),
-            act_ptrs_host, CUDA_R_16BF, ldb.data(),
-            beta_values.data(),
-            y_ptrs_host,   CUDA_R_16BF, ldc.data(),
-            group_count,
-            group_size.data(),
-            compute);
-    };
-    // No FAST_16BF attempt first: it has no algorithm for these shapes, and a
-    // failed call inside a graph capture invalidates the capture.
-    const cublasStatus_t status = run(bf16_compute_type());
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(
-            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
-            "): cublasGemmGroupedBatchedEx[bf16] groups=" +
-            std::to_string(group_count) + " N=" + std::to_string(N) +
-            " K=" + std::to_string(K));
-    }
-}
+// `gemm_grouped_bf16_impl` WAS HERE -- one `cublasGemmGroupedBatchedEx` over
+// arrays every entry of which is filled from one scalar, except `n[]` which
+// is the caller's `M_array`. It is Rust now:
+// `driver-cuda/src/bind/service.rs::gemm_grouped_act_x_wt_bf16`, with the
+// "no FAST_16BF attempt first" comment carried across verbatim because the
+// reason (a failed call invalidates a graph capture) is not visible in the
+// code. See `new-horizon.md` §45.
 
 [[noreturn]] void unsupported(const char* api,
                               DType act_dtype, DType w_dtype, DType y_dtype) {
@@ -1398,62 +1304,6 @@ struct LtMatmulPref {
         LT_CHECK(cublasLtMatmulPreferenceSetAttribute(d, attr, &value, sizeof(T)));
     }
 };
-
-#ifdef PIE_CUDA_HAS_MARLIN
-// Per-DEVICE marlin workspace. Marlin's split-K reduce uses one int32
-// per SM as a barrier counter; we allocate generously (16 KiB) to cover
-// every realistic SM count without per-call allocation. Lazy-init on
-// first INT4_PACKED dispatch. Keyed by device so an in-process TP rank
-// never barriers through another rank's memory.
-struct MarlinWorkspace {
-    void* ptr = nullptr;
-    std::size_t bytes = 0;
-};
-struct MarlinBarrierWs : MarlinWorkspace {};
-struct MarlinReduceWs : MarlinWorkspace {};
-struct MarlinResidualWs : MarlinWorkspace {};
-
-void* marlin_workspace_() {
-    auto& ws = per_device_singleton<MarlinBarrierWs>();
-    if (!ws.ptr) {
-        ws.bytes = 16 * 1024;
-        if (cudaMalloc(&ws.ptr, ws.bytes) != cudaSuccess) {
-            throw std::runtime_error("marlin: cudaMalloc workspace failed");
-        }
-        cudaMemset(ws.ptr, 0, ws.bytes);
-    }
-    return ws.ptr;
-}
-
-void* marlin_fp32_reduce_scratch_() {
-    auto& ws = per_device_singleton<MarlinReduceWs>();
-    if (!ws.ptr) {
-        ws.bytes = 32 * 1024 * 1024;
-        if (cudaMalloc(&ws.ptr, ws.bytes) != cudaSuccess) {
-            throw std::runtime_error(
-                "marlin: cudaMalloc fp32 reduce scratch failed");
-        }
-    }
-    return ws.ptr;
-}
-
-// Per-device bf16 residual scratch — used when the INT4 dispatcher is
-// called with beta=1 (the residual-add fusion the bf16/fp8 paths handle
-// natively via cuBLAS's beta param). Marlin overwrites C, so we run it
-// into a scratch and add into y in a second pass. Grows monotonically.
-void* marlin_residual_scratch_(std::size_t bytes) {
-    auto& ws = per_device_singleton<MarlinResidualWs>();
-    if (bytes <= ws.bytes) return ws.ptr;
-    if (ws.ptr) cudaFree(ws.ptr);
-    if (cudaMalloc(&ws.ptr, bytes) != cudaSuccess) {
-        throw std::runtime_error(
-            "marlin: cudaMalloc residual scratch failed (" +
-            std::to_string(bytes) + " bytes)");
-    }
-    ws.bytes = bytes;
-    return ws.ptr;
-}
-#endif
 
 // Per-process cuBLASLt handle + workspace. One forward thread per rank
 // makes a thread-local unnecessary; lazy-init at first FP8 GEMM.
@@ -1629,21 +1479,11 @@ void reserve_runtime_quant_scratch(
     }
 }
 
-void grouped_act_x_wt_bf16(
-    cublasHandle_t handle,
-    const void* const* act_ptrs_host,
-    const void* const* W_ptrs_host,
-    void* const*       y_ptrs_host,
-    const int*         M_array_host,
-    int group_count,
-    int N,
-    int K,
-    float beta)
-{
-    gemm_grouped_bf16_impl(
-        handle, act_ptrs_host, W_ptrs_host, y_ptrs_host, M_array_host,
-        group_count, N, K, beta);
-}
+// `grouped_act_x_wt_bf16` WAS HERE -- the one-line entry point onto
+// `gemm_grouped_bf16_impl`, both of them Rust now. Its consumer was never the
+// generated shim: `driver-cuda/src/fire/lora.rs` calls it three times by hand
+// from a graph-captured staged LoRA apply, and those three calls now name
+// `crate::bind::service::gemm_grouped_act_x_wt_bf16` instead. See §45.
 
 namespace {
 
@@ -2198,42 +2038,21 @@ void act_x_w(
     }
     if (act_dtype == DType::BF16 && w.dtype == DType::INT4_PACKED &&
         y_dtype == DType::BF16) {
-#ifdef PIE_CUDA_HAS_MARLIN
-        // Marlin W4A16 GEMM. Per-group bf16 scales, no zero-points (GPTQ
-        // symmetric), no act-order. The dispatcher relies on the loader
-        // having pre-repacked the weight into marlin's tile layout (via
-        // `gptq_marlin_repack`) and stored the per-group scales as the
-        // QuantMeta side-tensor.
-        cudaStream_t stream = nullptr;
-        cublasGetStream(handle, &stream);
-        // marlin always overwrites C. For the beta=1 residual-add
-        // pattern (o_proj / down_proj fusion), we redirect marlin into
-        // a scratch [M, N] bf16 buffer then run the residual-add
-        // kernel. Two passes cost ~one extra read/write of MN bf16,
-        // which is negligible vs. the matmul.
-        const std::size_t mn_bytes =
-            static_cast<std::size_t>(M) * static_cast<std::size_t>(N) * 2;
-        void* dst = (beta == 0.f) ? y : marlin_residual_scratch_(mn_bytes);
-        marlin::launch_gptq_gemm_w4a16_bf16(
-            act, w.data, w.scale_data, w.zero_point_data, dst,
-            marlin_workspace_(),
-            M, N, K, w.group_size,
-            /*use_fp32_reduce=*/false,
-            stream);
-        if (beta != 0.f) {
-            kernels::norm::residual_add_bf16(
-                y, dst,
-                static_cast<std::size_t>(M) * static_cast<std::size_t>(N),
-                stream);
-        }
-        return;
-#else
+        // GPTQ/AWQ W4A16 was the vendored marlin tree's only caller in this
+        // repository, and it was never reachable: `WeightRepr` (model-compiler
+        // `dsl.rs:92`) has three variants -- `Bf16`, `Scaled`, `Mxfp4Marlin` --
+        // and none of them is INT4, so nothing can construct a weight whose
+        // dtype arrives here as INT4_PACKED. `QuantScheme::{GptqInt4, AwqInt4}`
+        // appear only inside `#[cfg(test)]` bodies asserting that such a
+        // checkpoint is REFUSED, and `loader/transcode_engine.hpp` -- named by
+        // `kernels_manifest.hpp` as the home of the marlin repack -- does not
+        // exist. `third_party/marlin` went in §46 with its two repack entry
+        // points, which had no callers either.
         throw std::runtime_error(
-            "act_x_w[INT4_PACKED]: GPTQ/AWQ W4A16 needs the vendored "
-            "marlin kernels, which are not built by default because they "
-            "dominate CUDA build time. Reconfigure with "
-            "-DPIE_CUDA_BUILD_MARLIN=ON (or PIE_CUDA_BUILD_MARLIN=1).");
-#endif
+            "act_x_w[INT4_PACKED]: GPTQ/AWQ W4A16 has no kernel here. The "
+            "vendored marlin tree that served it was removed once measurement "
+            "showed no representation in this driver can express an INT4 "
+            "weight; see .wiki/driver/new-horizon.md §46.");
     }
     if (act_dtype == DType::BF16 && w.dtype == DType::MXFP4_PACKED &&
         y_dtype == DType::BF16) {
@@ -2324,75 +2143,34 @@ bool lm_head_argmax_chunked(
     return true;
 }
 
-void act_x_wt_bf16_out_fp32(
-    cublasHandle_t handle,
-    const void* act,
-    const void* W,
-    float* y,
-    int M,
-    int N,
-    int K)
-{
-    gemm_bf16_out_fp32_impl(handle, act, W, y, M, N, K);
-}
-
-void act_x_wt_bf16_cublas(
-    cublasHandle_t handle,
-    const void* act, const void* W, void* y,
-    int M, int N, int K,
-    float beta)
-{
-    // The reason callers pin this entry is that cuBLASLt's heuristic loses on
-    // their *batched* shapes -- the note beside each of them names an N in the
-    // hundreds. None of that reasoning reaches M=1: a single activation row
-    // has no reuse for any tiled GEMM to exploit, Lt or classic, and the
-    // warp-per-row GEMV roughly doubles the bandwidth either of them reach
-    // (see `launch_gemv_bf16`). Without this, enabling gemma-4's fused
-    // gate/up bank moved its decode MLP onto a kernel tiled for an M it does
-    // not have -- 1.28 ms/token against 0.32 ms of weights.
-    cudaStream_t gemv_stream = nullptr;
-    if (M == 1 && beta == 0.f &&
-        cublas_stream(handle, gemv_stream) &&
-        kernels::gemm::gemv_bf16(W, act, nullptr, y, N, K, gemv_stream)) {
-        return;
-    }
-    gemm_bf16_cublas_impl(handle, act, W, y, M, N, K, beta);
-}
-
-void act_x_wt_bias_bf16(
-    cublasHandle_t handle,
-    const void* act, const void* W, const void* bias, void* y,
-    int M, int N, int K,
-    cudaStream_t stream,
-    float beta)
-{
-    // Ask the tuner the same question `gemm_bf16_impl` would, rather than
-    // peeking at what it has already decided: a shape is seen for the first
-    // time *during graph capture*, and a peek would miss then and bake the
-    // unfused pair into the graph forever.
-    if (bias != nullptr && M == 1) {
-        cudaStream_t s = nullptr;
-        cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
-        const Bf16LtPlan* plan = nullptr;
-        DenseTactic tactic{};
-        // `run_dense_tactic` declines any tactic that cannot absorb a bias,
-        // so a shape where cuBLAS beats the GEMV is never forced onto the
-        // GEMV just to save a launch -- it falls through below.
-        if (cublas_stream(handle, s) &&
-            cudaStreamIsCapturing(s, &capturing) == cudaSuccess &&
-            dense_tactic_for(handle, W, M, N, K, beta, capturing,
-                             &plan, &tactic) &&
-            run_dense_tactic(handle, tactic, plan, act, W, y, M, N, K,
-                             beta, nullptr, 0, bias)) {
-            return;
-        }
-        cudaGetLastError();
-    }
-    gemm_bf16_impl(handle, act, W, y, M, N, K, beta);
-    if (bias != nullptr) {
-        kernels::norm::add_bias_bf16(y, bias, M, N, stream);
-    }
-}
+// THREE ENTRY POINTS WERE HERE. Two moved and one was already dead.
+//
+// `act_x_wt_bf16_out_fp32` -- a one-line forwarder onto
+//   `gemm_bf16_out_fp32_impl`, which is Rust. Gone with it.
+//
+// `act_x_wt_bias_bf16` -- gone to `driver-cuda`'s
+//   `bind::service::gemm_act_x_wt_bias_bf16`, which is the composition
+//   `kernels_cuda_new::execution::COMPOSED` had already STATED for this
+//   symbol: a `gemm::act_x_wt_bf16` (still C++, still here) and then a
+//   `norm::add_bias_bf16`. THAT SECOND CALL IS WHY IT MOVED. It was a C++
+//   translation unit calling a migrated kernel of ours, which no Rust
+//   dispatch can intercept, so `norm::add_bias_bf16` could not be routed and
+//   `norm/add_bias.cuh` could not be its only copy while this body existed.
+//
+//   What went with it: the `M == 1` fused-bias arm, which asked
+//   `dense_tactic_for` whether the tuner's tactic could absorb a bias.
+//   `run_dense_tactic` declines every tactic but the warp-per-row GEMV, and
+//   `gemv.hpp` states that the GEMV's fold -- `out[n] = bf16(bf16(dot) +
+//   bias[n])`, the double rounding deliberate -- is BIT-IDENTICAL to running
+//   `add_bias_bf16` afterwards. So the composition writes the same bytes and
+//   costs one extra launch per biased M=1 projection. That is the whole
+//   price and it is paid knowingly; see §45.
+//
+// `act_x_wt_bf16_cublas` -- DEAD, and separately verified so before removal:
+//   declared in `gemm.hpp:396`, defined here, and called from nowhere in any
+//   `.cu/.cpp/.hpp/.cuh/.rs` in the worktree. It held the file's third and
+//   last call into `gemv.cu`, and `gemm_bf16_cublas_impl` -- whose only
+//   caller it was -- went with it.
 
 void batched_act_x_w(
     cublasHandle_t handle,
@@ -2416,55 +2194,11 @@ void batched_act_x_w(
 }
 
 
-void mla_absorb_q_to_latent_bf16(
-    cublasHandle_t handle,
-    const void* q_nope, const void* kv_b_proj, void* q_latent,
-    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank)
-{
-    if (tokens <= 0 || heads <= 0) return;
-    const float alpha = 1.f, beta = 0.f;
-    // Row-major C[T, kv_lora] = A[T, nope] @ B[nope, kv_lora] per head, written
-    // column-major as C^T = B^T @ A^T.
-    const auto status = cublasGemmStridedBatchedEx(
-        handle, CUBLAS_OP_N, CUBLAS_OP_N,
-        /*m=*/kv_lora_rank, /*n=*/tokens, /*k=*/qk_nope_dim,
-        &alpha,
-        /*A=*/kv_b_proj, CUDA_R_16BF, /*lda=*/kv_lora_rank,
-        /*strideA=*/static_cast<long long>(qk_nope_dim + v_head_dim) * kv_lora_rank,
-        /*B=*/q_nope, CUDA_R_16BF, /*ldb=*/heads * qk_nope_dim,
-        /*strideB=*/qk_nope_dim,
-        &beta,
-        /*C=*/q_latent, CUDA_R_16BF, /*ldc=*/heads * kv_lora_rank,
-        /*strideC=*/kv_lora_rank,
-        /*batchCount=*/heads,
-        bf16_compute_type(), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    check(status, "mla_absorb_q_to_latent_bf16");
-}
-
-void mla_absorb_latent_to_v_bf16(
-    cublasHandle_t handle,
-    const void* attn_latent, const void* kv_b_proj, void* attn_v,
-    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank)
-{
-    if (tokens <= 0 || heads <= 0) return;
-    const float alpha = 1.f, beta = 0.f;
-    const auto* wv = static_cast<const __nv_bfloat16*>(kv_b_proj) +
-                 static_cast<long long>(qk_nope_dim) * kv_lora_rank;
-    // Row-major C[T, v_dim] = A[T, kv_lora] @ W[v_dim, kv_lora]^T per head.
-    const auto status = cublasGemmStridedBatchedEx(
-        handle, CUBLAS_OP_T, CUBLAS_OP_N,
-        /*m=*/v_head_dim, /*n=*/tokens, /*k=*/kv_lora_rank,
-        &alpha,
-        /*A=*/wv, CUDA_R_16BF, /*lda=*/kv_lora_rank,
-        /*strideA=*/static_cast<long long>(qk_nope_dim + v_head_dim) * kv_lora_rank,
-        /*B=*/attn_latent, CUDA_R_16BF, /*ldb=*/heads * kv_lora_rank,
-        /*strideB=*/kv_lora_rank,
-        &beta,
-        /*C=*/attn_v, CUDA_R_16BF, /*ldc=*/heads * v_head_dim,
-        /*strideC=*/v_head_dim,
-        /*batchCount=*/heads,
-        bf16_compute_type(), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    check(status, "mla_absorb_latent_to_v_bf16");
-}
+// MLA'S ABSORB PAIR WAS HERE -- two `cublasGemmStridedBatchedEx` calls over
+// the head axis, one `OP_N/OP_N` and one `OP_T/OP_N` against the second half
+// of each head's `kv_b_proj` bank. Both are Rust now:
+// `driver-cuda/src/bind/service.rs::gemm_mla_absorb_{q_to_latent,latent_to_v}_bf16`,
+// sharing one argument-assembly helper because they differ in four numbers
+// and a transpose. See `new-horizon.md` §45.
 
 }  // namespace pie_cuda_driver::kernels::gemm

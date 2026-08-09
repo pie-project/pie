@@ -219,6 +219,16 @@ pub enum Unstageable {
     ///
     /// Not an error the shaders could survive: both would append to it and
     /// each would read the other's rows as its own history.
+    ///
+    /// It is the right refusal for two INDEPENDENT conversations, and it is
+    /// the wrong one for a grafted prefix cache, where the shared pages are
+    /// read by both and written by neither. The engine can do that graft
+    /// (`KvStore::adopt_cached_prefix`) but does not yet reach for it -- the
+    /// probe, `pipeline::fire::kv::match_prefix`, is not wired into the live
+    /// path -- so no frame this driver has been shown names a page twice.
+    /// `tests/gpu/tests/vulkan_shared_prefix.rs` is the gate that will go red
+    /// when that changes, and the fix then is to compare WRITE pages rather
+    /// than named ones.
     SharedPage {
         /// The page both named.
         page: u32,

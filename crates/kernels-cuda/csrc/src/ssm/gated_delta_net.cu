@@ -25,17 +25,29 @@
 // still the only path for the sixteen kernels no `LaunchRule` can state.
 //
 // The dispatch POLICY stays here too — the `constexpr bool ..._enabled()`
-// toggles, the env-var read, and `gdn_raise_shmem_cap`. They are host
-// decisions about which kernel to fire and how much shared memory to ask a
-// device for, not device text; `cudaFuncSetAttribute` and `std::getenv` do not
-// exist on the other side of a `<<<>>>`.
+// toggles and `gdn_raise_shmem_cap`. They are host decisions about which
+// kernel to fire and how much shared memory to ask a device for, not device
+// text; `cudaFuncSetAttribute` does not exist on the other side of a `<<<>>>`.
+//
+// # What is NOT policy, and is gone
+//
+// `PIE_QWEN35_GDN_SMEM_STEP` used to pick, at fire time, which of two
+// `__global__`s served ONE stated symbol
+// (`recurrent_gated_delta_step_batched_gqa_state_bf16`). That is not a
+// tuning knob in the shape a knob may take: the same trace, the same
+// weights and the same GPU ran different code, and nothing in the plan
+// recorded which — so a replay could not reproduce a run and no other
+// backend could implement the symbol, because the selector was invisible to
+// everything above this file. §30 of `new-horizon.md` measured what it
+// selected between: **the two arms are byte-identical**, at eight shapes, on
+// both results, including the two the gate excludes. It is deleted, and with
+// it the `<cstdlib>` this file included for exactly one call.
 #include "ssm/gated_delta_net.hpp"
 #include "ssm/gated_delta_net.cuh"
 #include "ssm/gated_delta_net_prep.cuh"
 
 #include <cuda_bf16.h>
 #include <cstdint>
-#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -61,15 +73,15 @@ constexpr bool qwen_gdn_fused_step_enabled() { return false; }
 // writes the updated state straight to HBM (no SMEM writebacks). In a
 // standalone microbench at R=511 saturated decode this drops the
 // per-call wall from 2406 us (legacy bf16 v-last) to 1579 us — 34%
-// faster. fp32 accumulate, rounded to BF16 once (same scheme as the
-// FLA chunked-prefill default), so strictly less quantization than
-// the legacy per-element-round kernel.
+// faster, and +32% end-to-end throughput on Qwen/Qwen3.5-4B
+// (6924 -> 9166 tok/s).
 //
-// Default ON: +32% end-to-end throughput on Qwen/Qwen3.5-4B
-// (6924 -> 9166 tok/s). The launcher only routes here for the GQA
-// bf16 V-last decode shape (V_d==K_d==128, !k_last); everything else
-// falls back to the legacy kernel. Set PIE_QWEN35_GDN_SMEM_STEP=0 to
-// force the fallback.
+// It rounds where the legacy kernel rounds, on purpose and not by luck —
+// `gated_delta_net.cuh`'s phase 2 says why — so the two are the SAME
+// FUNCTION and the choice between them is a choice of speed only. Which is
+// why there is no toggle for it any more: see the gate in
+// `recurrent_gated_delta_step_batched_gqa_state_bf16` below.
+//
 // `cudaFuncSetAttribute` configures a kernel's dynamic shared-memory cap
 // PER DEVICE. A process-global "already configured" flag therefore lies to
 // every device but the first: under tensor parallelism rank 0 raises the
@@ -95,86 +107,33 @@ bool gdn_raise_shmem_cap(const void* func, int shmem_bytes) {
     return true;
 }
 
-bool qwen_gdn_smem_step_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_SMEM_STEP");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
 // 9x speedup over the legacy per-token HBM kernel, bit-identical at
 // production shapes (V_d=128, K_d<=128).
 constexpr bool qwen_gdn_fla_prefill_enabled() { return true; }
 
-constexpr bool qwen_gdn_fla_step_enabled() { return false; }
-
 }  // namespace
 
-void bf16_to_fp32(
-    const void* x, float* y, std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return;
-    constexpr int BLOCK = 256;
-    const std::size_t grid = (n + BLOCK - 1) / BLOCK;
-    device::widen<device::bf16><<<(int)grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(x), y, n);
-}
+// §43 deleted `bf16_to_fp32`, `fp32_to_bf16` and `l2norm_scale_bf16_to_fp32`
+// here. All three are named by `device::JIT_DISPATCHED`, so the shim
+// generates no entry for them and nothing in any language reached these
+// ahead-of-time launchers. The kernels are unchanged in
+// `ssm/gated_delta_net.cuh`, which is what the rows fire through NVRTC.
+// `repeat_interleave_heads_fp32` below is NOT routed and stays.
+//
+// The anonymous-namespace helper `qwen_gdn_smem_step_enabled` is also gone,
+// but NOT with them, and the difference matters to anyone reading this for
+// what is safe to delete. §30 removed it, and its only caller was
+// `recurrent_gated_delta_step_batched_gqa_state_bf16` at `:201` — which is
+// live, is what Qwen3.5 decode calls, and is still here. It went because a
+// `std::getenv` may not pick a kernel, not because its caller went; the
+// argument is at `:213-246`.
 
-void fp32_to_bf16(
-    const float* x, void* y, std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return;
-    constexpr int BLOCK = 256;
-    const std::size_t grid = (n + BLOCK - 1) / BLOCK;
-    device::narrow<device::bf16><<<(int)grid, BLOCK, 0, stream>>>(
-        x, static_cast<device::bf16*>(y), n);
-}
+// `repeat_interleave_heads_fp32` was deleted by §43.9 — it is now routed, and
+// the note above (written when it was not) is superseded.
 
-void repeat_interleave_heads_fp32(
-    const float* in, float* out,
-    int N, int K_h, int V_h, int D,
-    cudaStream_t stream)
-{
-    if (N <= 0 || K_h <= 0 || V_h <= 0 || D <= 0) return;
-    const int repeat = V_h / K_h;
-    const int block = (D < 128) ? 64 : 128;
-    dim3 grid(N, V_h);
-    device::repeat_interleave_heads_fp32<device::f32><<<grid, block, 0, stream>>>(
-        in, out, K_h, V_h, D, repeat);
-}
-
-void l2norm_scale_bf16_to_fp32(
-    const void* x, float* y,
-    int N, int hidden,
-    float scale, float eps,
-    cudaStream_t stream)
-{
-    if (N <= 0 || hidden <= 0) return;
-    constexpr int BLOCK = 128;
-    dim3 grid(N);
-    dim3 block(BLOCK);
-    device::l2norm_scale<device::bf16, BLOCK><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(x), y, hidden, scale, eps);
-}
-
-void gated_delta_g_beta(
-    const void* a, const void* b,
-    const void* A_log, const void* dt_bias,
-    float* g_log_out, float* beta_out,
-    int N, int V_h, cudaStream_t stream)
-{
-    if (N <= 0 || V_h <= 0) return;
-    constexpr int BLOCK = 64;
-    dim3 grid(N, (V_h + BLOCK - 1) / BLOCK);
-    dim3 block(BLOCK);
-    device::g_beta<device::bf16><<<grid, block, 0, stream>>>(
-        static_cast<const device::bf16*>(a),
-        static_cast<const device::bf16*>(b),
-        static_cast<const float*>(A_log),
-        static_cast<const device::bf16*>(dt_bias),
-        g_log_out, beta_out, N, V_h);
-}
+// `gated_delta_g_beta` was deleted here by §43. `families::ssm` names it
+// as the one launcher in the tree a row "would name a kernel no trace can
+// ask for" -- and §41 confirmed the other half: nothing asks for it at all.
 
 void qwen_gdn_post_conv_prep_bf16(
     const void* qkv_post,
@@ -208,213 +167,36 @@ void qwen_gdn_post_conv_prep_bf16(
         K_h, V_h, K_d, V_d, conv_dim);
 }
 
-// ── Recurrent step kernel ──────────────────────────────────────────
+// `recurrent_gated_delta_step` and `recurrent_gated_delta_step_state_bf16`
+// were deleted here by §43 -- the unbatched pair, superseded by the four
+// `_batched` launchers below, which `families::ssm` records as doing the same
+// job. Their last caller was `chunk_gated_delta_prefill`, itself unreachable:
+// orphaned at one remove, which is §41's whole shape.
 
-void recurrent_gated_delta_step(
-    const float* q_norm, const float* k_norm, const float* v,
-    const float* g_log, const float* beta,
-    float* state, float* out,
-    int B, int V_h, int K_d, int V_d,
-    cudaStream_t stream)
-{
-    if (B <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    constexpr int BLOCK = 128;
-    dim3 grid(B, V_h);
-    dim3 block(BLOCK);
-    const int shmem_bytes = 2 * K_d * sizeof(float);
-    if (qwen_gdn_k_last_state_enabled()) {
-        device::recurrent_step<float, true><<<grid, block, shmem_bytes, stream>>>(
-            q_norm, k_norm, v, g_log, beta, state, out, V_h, K_d, V_d);
-    } else {
-        device::recurrent_step<float, false><<<grid, block, shmem_bytes, stream>>>(
-            q_norm, k_norm, v, g_log, beta, state, out, V_h, K_d, V_d);
-    }
-}
+// `recurrent_gated_delta_step_batched` was deleted by §43.9 — routed, no shim
+// entry, no C++ caller. **It was a four-arm selector and the row inherits all
+// of it**: `fused = qwen_gdn_fused_step_enabled() && K_d <= 256` picks
+// `recurrent_step_batched_fused` over `recurrent_step_batched`, and
+// `qwen_gdn_k_last_state_enabled()` picks the `KLast` template argument.
+// Shared memory is `(2 * K_d + (fused ? 1 : 0)) * sizeof(float)` — the fused
+// kernel needs the sq+sk arrays plus one float for the `sum_sk_sq` broadcast.
+// The 256 bound is a dispatch on the MAXIMUM K_d, not the actual: the kernel
+// iterates `[0, K_d)` so unused slots are dead code, and the bound keeps the
+// per-thread `state_cache` in registers without spilling. K_d up to 256 covers
+// every qwen3_5 GDN config in production (the E4B family is K_d=128).
 
-void recurrent_gated_delta_step_state_bf16(
-    const float* q_norm, const float* k_norm, const float* v,
-    const float* g_log, const float* beta,
-    void* state, float* out,
-    int B, int V_h, int K_d, int V_d,
-    cudaStream_t stream)
-{
-    if (B <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    constexpr int BLOCK = 128;
-    dim3 grid(B, V_h);
-    dim3 block(BLOCK);
-    const int shmem_bytes = 2 * K_d * sizeof(float);
-    if (qwen_gdn_k_last_state_enabled()) {
-        device::recurrent_step<__nv_bfloat16, true><<<
-            grid, block, shmem_bytes, stream>>>(
-            q_norm, k_norm, v, g_log, beta,
-            static_cast<__nv_bfloat16*>(state), out, V_h, K_d, V_d);
-    } else {
-        device::recurrent_step<__nv_bfloat16, false><<<
-            grid, block, shmem_bytes, stream>>>(
-            q_norm, k_norm, v, g_log, beta,
-            static_cast<__nv_bfloat16*>(state), out, V_h, K_d, V_d);
-    }
-}
+// `recurrent_gated_delta_step_batched_state_bf16` was deleted by §43.9 —
+// routed, no shim entry, no C++ caller. Same four-arm selector as the fp32
+// form above, with `__nv_bfloat16` as the state type.
 
-void recurrent_gated_delta_step_batched(
-    const float* q_norm, const float* k_norm, const float* v,
-    const float* g_log, const float* beta,
-    float* state_base,
-    const std::int32_t* slot_ids,
-    long long slot_stride_elems,
-    float* out,
-    int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream)
-{
-    if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    constexpr int BLOCK = 128;
-    dim3 grid(R, V_h);
-    dim3 block(BLOCK);
-    // Fused kernel needs the existing sq+sk shmem plus one float
-    // scalar (sum_sk_sq broadcast); legacy kernel only needs the
-    // first two arrays.
-    const bool fused = qwen_gdn_fused_step_enabled() && K_d <= 256;
-    const int shmem_bytes = (2 * K_d + (fused ? 1 : 0)) * sizeof(float);
-    if (fused) {
-        // K_d up to 256 covers every qwen3_5 GDN config currently in
-        // production (E4B family is K_d=128). Dispatch on the bound
-        // so the per-thread state_cache array is small enough to fit
-        // in registers without spilling. We dispatch on the maximum
-        // K_d, not the actual: the kernel only iterates [0, K_d) so
-        // unused slots are dead code.
-        if (qwen_gdn_k_last_state_enabled()) {
-            device::recurrent_step_batched_fused<float, true, 256><<<
-                grid, block, shmem_bytes, stream>>>(
-                q_norm, k_norm, v, g_log, beta, state_base,
-                slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
-        } else {
-            device::recurrent_step_batched_fused<float, false, 256><<<
-                grid, block, shmem_bytes, stream>>>(
-                q_norm, k_norm, v, g_log, beta, state_base,
-                slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
-        }
-        return;
-    }
-    if (qwen_gdn_k_last_state_enabled()) {
-        device::recurrent_step_batched<float, true><<<
-            grid, block, shmem_bytes, stream>>>(
-            q_norm, k_norm, v, g_log, beta, state_base,
-            slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
-    } else {
-        device::recurrent_step_batched<float, false><<<
-            grid, block, shmem_bytes, stream>>>(
-            q_norm, k_norm, v, g_log, beta, state_base,
-            slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
-    }
-}
-
-void recurrent_gated_delta_step_batched_state_bf16(
-    const float* q_norm, const float* k_norm, const float* v,
-    const float* g_log, const float* beta,
-    void* state_base,
-    const std::int32_t* slot_ids,
-    long long slot_stride_elems,
-    float* out,
-    int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream)
-{
-    if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    constexpr int BLOCK = 128;
-    dim3 grid(R, V_h);
-    dim3 block(BLOCK);
-    const bool fused = qwen_gdn_fused_step_enabled() && K_d <= 256;
-    const int shmem_bytes = (2 * K_d + (fused ? 1 : 0)) * sizeof(float);
-    if (fused) {
-        if (qwen_gdn_k_last_state_enabled()) {
-            device::recurrent_step_batched_fused<__nv_bfloat16, true, 256><<<
-                grid, block, shmem_bytes, stream>>>(
-                q_norm, k_norm, v, g_log, beta,
-                static_cast<__nv_bfloat16*>(state_base),
-                slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
-        } else {
-            device::recurrent_step_batched_fused<__nv_bfloat16, false, 256><<<
-                grid, block, shmem_bytes, stream>>>(
-                q_norm, k_norm, v, g_log, beta,
-                static_cast<__nv_bfloat16*>(state_base),
-                slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
-        }
-        return;
-    }
-    if (qwen_gdn_k_last_state_enabled()) {
-        device::recurrent_step_batched<__nv_bfloat16, true><<<
-            grid, block, shmem_bytes, stream>>>(
-            q_norm, k_norm, v, g_log, beta,
-            static_cast<__nv_bfloat16*>(state_base),
-            slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
-    } else {
-        device::recurrent_step_batched<__nv_bfloat16, false><<<
-            grid, block, shmem_bytes, stream>>>(
-            q_norm, k_norm, v, g_log, beta,
-            static_cast<__nv_bfloat16*>(state_base),
-            slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
-    }
-}
-
-void recurrent_gated_delta_step_batched_gqa(
-    const float* q_norm_kh, const float* k_norm_kh, const float* v,
-    const float* g_log, const float* beta,
-    float* state_base,
-    const std::int32_t* slot_ids,
-    long long slot_stride_elems,
-    float* out,
-    int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream)
-{
-    if (R <= 0 || K_h <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    if (V_h % K_h != 0) return;
-    // FLA-style fast path (opt-in via PIE_QWEN35_GDN_FLA_STEP=1).
-    // Requires KLast=false (the production default) and K_d <= 128.
-    constexpr int BK_MAX_FLA = 128;
-    constexpr int BV_FLA     = 64;
-    if (qwen_gdn_fla_step_enabled() &&
-        !qwen_gdn_k_last_state_enabled() &&
-        K_d <= BK_MAX_FLA && V_d % BV_FLA == 0) {
-        const int NV = V_d / BV_FLA;
-        dim3 grid_fla(NV, R, V_h);
-        dim3 block_fla(BV_FLA);
-        const int shmem_bytes = 2 * BK_MAX_FLA * sizeof(float);
-        device::recurrent_step_batched_gqa_fla<float, BV_FLA, BK_MAX_FLA><<<
-            grid_fla, block_fla, shmem_bytes, stream>>>(
-            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-            slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
-        return;
-    }
-    constexpr int BLOCK = 128;
-    dim3 grid(R, V_h);
-    dim3 block(BLOCK);
-    const bool fused = qwen_gdn_fused_step_enabled() && K_d <= 256;
-    const int shmem_bytes = (2 * K_d + (fused ? 1 : 0)) * sizeof(float);
-    if (fused) {
-        if (qwen_gdn_k_last_state_enabled()) {
-            device::recurrent_step_batched_gqa_fused<float, true, 256><<<
-                grid, block, shmem_bytes, stream>>>(
-                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-                slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
-        } else {
-            device::recurrent_step_batched_gqa_fused<float, false, 256><<<
-                grid, block, shmem_bytes, stream>>>(
-                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-                slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
-        }
-        return;
-    }
-    if (qwen_gdn_k_last_state_enabled()) {
-        device::recurrent_step_batched_gqa<float, true><<<
-            grid, block, shmem_bytes, stream>>>(
-            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-            slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
-    } else {
-        device::recurrent_step_batched_gqa<float, false><<<
-            grid, block, shmem_bytes, stream>>>(
-            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-            slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
-    }
-}
+// `recurrent_gated_delta_step_batched_gqa` was deleted by §43.9 — routed, no
+// shim entry, no C++ caller. **Five arms, and the row inherits every one.**
+// Beyond the fused/KLast pair above there is an FLA-style fast path, opt-in
+// via `PIE_QWEN35_GDN_FLA_STEP=1` and currently `constexpr false`, taken only
+// when `!KLast && K_d <= 128 && V_d % 64 == 0`; it launches a THREE-axis grid
+// `(V_d / 64, R, V_h)` with a 64-wide block and `2 * 128 * sizeof(float)` of
+// shared memory, where every other arm launches `(R, V_h)` with 128 threads.
+// It also guarded `V_h % K_h != 0` by returning without launching.
 
 void recurrent_gated_delta_step_batched_gqa_state_bf16(
     const float* q_norm_kh, const float* k_norm_kh, const float* v,
@@ -431,9 +213,37 @@ void recurrent_gated_delta_step_batched_gqa_state_bf16(
     // SMEM-only fast path — wins on the saturated decode shape used by
     // Qwen3.5. Requires KLast=false (V-last) state storage, which is
     // the default since the KLast bool flip.
-    if (qwen_gdn_smem_step_enabled() &&
-        !qwen_gdn_k_last_state_enabled() &&
-        V_d == 128 && K_d == 128) {
+    //
+    // # The predicate is the SHAPE, and it used to be the environment
+    //
+    // This gate read `qwen_gdn_smem_step_enabled() && ...`, which read
+    // `std::getenv("PIE_QWEN35_GDN_SMEM_STEP")` — one stated symbol, two
+    // `__global__`s, and the selector nowhere in the plan. What survives is
+    // `V_d == 128 && K_d == 128`: a fact about the fire, which the model
+    // already states, a table can already carry (`new-horizon.md` §26.10(b)),
+    // and any backend can read. The env var is deleted rather than moved,
+    // because the measurement says there was nothing to move:
+    //
+    //   arm A  recurrent_step_batched_gqa_smem<128>       (this one)
+    //   arm B  recurrent_step_batched_gqa<__nv_bfloat16, false>
+    //
+    // are BYTE-IDENTICAL — state slab and `out`, zero differing bytes, at
+    // R = 1, 7, 13 (with a `slot_ids[r] < 0` hole and a reversed slot map),
+    // 64, 511, at a 2-byte-aligned slab that takes the scalar staging path
+    // instead of the `uint4` one, and at the two shapes this gate EXCLUDES.
+    // §30 of `new-horizon.md` has the run, and the controls that say the
+    // comparison can see a difference: a permutation moved 88.92% of the slab
+    // with `out` unchanged, a truncation left half the v axis at its input.
+    //
+    // That is not a coincidence to be re-measured on every edit: the SMEM
+    // kernel rounds `state*g` to bf16 before adding delta for no reason but
+    // to land where the legacy kernel's HBM round trip lands, and
+    // `gated_delta_net.cuh` says so at the line that does it. The two arms
+    // are one function with two speeds. A switch between them could only
+    // ever choose the slower one (1.48x at R=511, measured on an L40S), and
+    // a switch whose reachable effect is "identical, but later" is bring-up
+    // scaffolding, not configuration.
+    if (!qwen_gdn_k_last_state_enabled() && V_d == 128 && K_d == 128) {
         constexpr int BV = 128;
         dim3 grid_smem((V_d + BV - 1) / BV, R, V_h);
         dim3 block_smem(BV);
@@ -482,72 +292,13 @@ void recurrent_gated_delta_step_batched_gqa_state_bf16(
     }
 }
 
-// Chunked prefill — for now, implemented as a sequential per-token
-// loop over `recurrent_gated_delta_step`. Mathematically
-// identical to the chunked algorithm, just leaves chunk-parallelism
-// on the table. Each recurrent step is a single grid launch of
-// (1, V_h) blocks, so a T-token prefill costs T launches plus the
-// state-dependent recurrence chain — roughly the same FLOPs as the
-// fast chunked path but no chunk-level parallelism.
-//
-// TODO(perf): replace with the chunked algorithm from
-// `torch_chunk_gated_delta_rule` once the recurrent path is parity-
-// validated. The chunked version exposes per-chunk parallelism via
-// (Schur-expanded) triangular inverse + batched GEMMs, which on
-// 2k+ token prefills is the difference between launch-bound and
-// SM-bound.
-void chunk_gated_delta_prefill(
-    const float* q_norm, const float* k_norm, const float* v,
-    const float* g_log, const float* beta,
-    float* state, float* out,
-    int T, int V_h, int K_d, int V_d,
-    int chunk_size,
-    cudaStream_t stream)
-{
-    (void)chunk_size;  // unused in the sequential implementation
-    if (T <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    const long long stride_qk = (long long)V_h * K_d;
-    const long long stride_v  = (long long)V_h * V_d;
-    const long long stride_h  = (long long)V_h;
-    for (int t = 0; t < T; ++t) {
-        recurrent_gated_delta_step(
-            q_norm + t * stride_qk,
-            k_norm + t * stride_qk,
-            v      + t * stride_v,
-            g_log  + t * stride_h,
-            beta   + t * stride_h,
-            state,
-            out    + t * stride_v,
-            /*B=*/1, V_h, K_d, V_d, stream);
-    }
-}
-
-void chunk_gated_delta_prefill_state_bf16(
-    const float* q_norm, const float* k_norm, const float* v,
-    const float* g_log, const float* beta,
-    void* state, float* out,
-    int T, int V_h, int K_d, int V_d,
-    int chunk_size,
-    cudaStream_t stream)
-{
-    (void)chunk_size;
-    if (T <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    const long long stride_qk = (long long)V_h * K_d;
-    const long long stride_v  = (long long)V_h * V_d;
-    const long long stride_h  = (long long)V_h;
-    auto* state_bf16 = static_cast<__nv_bfloat16*>(state);
-    for (int t = 0; t < T; ++t) {
-        recurrent_gated_delta_step_state_bf16(
-            q_norm + t * stride_qk,
-            k_norm + t * stride_qk,
-            v      + t * stride_v,
-            g_log  + t * stride_h,
-            beta   + t * stride_h,
-            state_bf16,
-            out    + t * stride_v,
-            /*B=*/1, V_h, K_d, V_d, stream);
-    }
-}
+// `chunk_gated_delta_prefill` and `chunk_gated_delta_prefill_state_bf16` were
+// deleted here by §43. They were the sequential per-token loop the comment
+// above described as a placeholder for the chunked algorithm -- and the
+// chunked algorithm arrived: `chunk_gated_delta_prefill_batched` below is it.
+// `families::ssm` had already measured both as second names for a job a
+// `_batched` row does, and §41 measured what was left: no shim entry, no row,
+// no caller in any language.
 
 void chunk_gated_delta_prefill_batched(
     const float* q_norm, const float* k_norm, const float* v,
@@ -738,122 +489,16 @@ void chunk_gated_delta_prefill_batched_cached_state_bf16(
 
 
 
-void chunk_gated_delta_prefill_batched_warp_tiled_gqa(
-    const float* q_norm_kh, const float* k_norm_kh, const float* v,
-    const float* g_log, const float* beta,
-    float* state_base,
-    const std::int32_t* slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long slot_stride_elems,
-    float* out,
-    int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state,
-    const std::uint8_t* write_state_mask)
-{
-    if (R <= 0 || K_h <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    if (K_d > 256 || V_h % K_h != 0) {
-        throw std::runtime_error(
-            "chunk_gated_delta_prefill_batched_warp_tiled_gqa: "
-            "unsupported GQA dimensions");
-    }
-    constexpr int WARPS = 4;
-    constexpr int BLOCK = WARPS * 32;
-    const bool k_last = qwen_gdn_k_last_state_enabled();
-    if (qwen_gdn_gqa_ilp2_enabled()) {
-        constexpr int TILE_V = WARPS * 2;
-        dim3 grid(R, V_h, (V_d + TILE_V - 1) / TILE_V);
-        dim3 block(BLOCK);
-        if (k_last) {
-            device::chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2<float, true><<<
-                grid, block, 0, stream>>>(
-                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-                slot_ids, qo_indptr, slot_stride_elems,
-                out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
-        } else {
-            device::chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2<float, false><<<
-                grid, block, 0, stream>>>(
-                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-                slot_ids, qo_indptr, slot_stride_elems,
-                out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
-        }
-        return;
-    }
-    dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
-    dim3 block(BLOCK);
-    if (k_last) {
-        device::chunk_gated_delta_prefill_batched_warp_tiled_gqa<float, true><<<
-            grid, block, 0, stream>>>(
-            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-            slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
-    } else {
-        device::chunk_gated_delta_prefill_batched_warp_tiled_gqa<float, false><<<
-            grid, block, 0, stream>>>(
-            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-            slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
-    }
-}
+// `chunk_gated_delta_prefill_batched_warp_tiled_gqa` was deleted by §43.9 —
+// routed, no shim entry, no C++ caller. Three host facts the row inherits:
+// it THREW `std::runtime_error("unsupported GQA dimensions")` when
+// `K_d > 256 || V_h % K_h != 0` rather than returning quietly;
+// `qwen_gdn_gqa_ilp2_enabled()` selected an `_ilp2` kernel whose third grid
+// axis divides `V_d` by `WARPS * 2 = 8` instead of `WARPS = 4`; and
+// `qwen_gdn_k_last_state_enabled()` picked the `KLast` template argument.
 
-void chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
-    const float* q_norm_kh, const float* k_norm_kh, const float* v,
-    const float* g_log, const float* beta,
-    void* state_base,
-    const std::int32_t* slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long slot_stride_elems,
-    float* out,
-    int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state,
-    const std::uint8_t* write_state_mask)
-{
-    if (R <= 0 || K_h <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
-    if (K_d > 256 || V_h % K_h != 0) {
-        throw std::runtime_error(
-            "chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16: "
-            "unsupported GQA dimensions");
-    }
-    constexpr int WARPS = 4;
-    constexpr int BLOCK = WARPS * 32;
-    const bool k_last = qwen_gdn_k_last_state_enabled();
-    if (qwen_gdn_gqa_ilp2_enabled()) {
-        constexpr int TILE_V = WARPS * 2;
-        dim3 grid(R, V_h, (V_d + TILE_V - 1) / TILE_V);
-        dim3 block(BLOCK);
-        if (k_last) {
-            device::chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2<__nv_bfloat16, true><<<
-                grid, block, 0, stream>>>(
-                q_norm_kh, k_norm_kh, v, g_log, beta,
-                static_cast<__nv_bfloat16*>(state_base),
-                slot_ids, qo_indptr, slot_stride_elems,
-                out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
-        } else {
-            device::chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2<__nv_bfloat16, false><<<
-                grid, block, 0, stream>>>(
-                q_norm_kh, k_norm_kh, v, g_log, beta,
-                static_cast<__nv_bfloat16*>(state_base),
-                slot_ids, qo_indptr, slot_stride_elems,
-                out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
-        }
-        return;
-    }
-    dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
-    dim3 block(BLOCK);
-    if (k_last) {
-        device::chunk_gated_delta_prefill_batched_warp_tiled_gqa<__nv_bfloat16, true><<<
-            grid, block, 0, stream>>>(
-            q_norm_kh, k_norm_kh, v, g_log, beta,
-            static_cast<__nv_bfloat16*>(state_base),
-            slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
-    } else {
-        device::chunk_gated_delta_prefill_batched_warp_tiled_gqa<__nv_bfloat16, false><<<
-            grid, block, 0, stream>>>(
-            q_norm_kh, k_norm_kh, v, g_log, beta,
-            static_cast<__nv_bfloat16*>(state_base),
-            slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
-    }
-}
+// `chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16` was deleted by
+// §43.9 — routed, no shim entry, no C++ caller. Same three host facts as the
+// fp32 form above, with `__nv_bfloat16` as the state type.
 
 }  // namespace pie_cuda_driver::kernels::ssm

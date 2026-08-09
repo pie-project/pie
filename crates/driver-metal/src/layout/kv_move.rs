@@ -14,7 +14,7 @@
 //! whose memmove semantics are not incidental — a compaction slides rows
 //! toward the front of the pool, and source and destination overlap.
 
-/// One row move. Field order is the wire order (`PieKvMoveCell`):
+/// One row move. Field order is the wire order (`KvMoveCell`):
 /// destination first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvMoveCell {

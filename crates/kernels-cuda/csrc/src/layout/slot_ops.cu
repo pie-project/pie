@@ -19,34 +19,13 @@
 
 namespace pie_cuda_driver::kernels::layout {
 
-void zero_slots_if_fresh(
-    device::u8* base,
-    device::usize slot_bytes,
-    device::usize layer_stride_bytes,
-    device::usize layer_count,
-    const device::i32* slot_ids,
-    const device::u8* is_fresh,
-    device::usize request_count,
-    cudaStream_t stream)
-{
-    if (base == nullptr || slot_bytes == 0 || layer_count == 0 ||
-        request_count == 0) {
-        return;
-    }
-    constexpr int kThreads = 256;
-    device::zero_slots_if_fresh<<<
-        dim3(
-            static_cast<unsigned int>(request_count),
-            static_cast<unsigned int>(layer_count)),
-        kThreads, 0, stream>>>(
-        base,
-        slot_bytes,
-        layer_stride_bytes,
-        slot_ids,
-        is_fresh,
-        request_count);
-    CUDA_CHECK(cudaGetLastError());
-}
+// `zero_slots_if_fresh` was deleted here by §43. It is the clearest
+// mentions-versus-fires case in the tree: `layout/slot_ops.cuh` still holds
+// the `__global__`, `families::layout` documents its grid at length, and
+// `driver-cuda`'s `StateOp::ZeroSlotsIfFresh` is built twice in
+// `pools/recurrent_state_cache.rs` -- but `serve/state.rs` matches that
+// variant with `=> continue` and resets from the host instead. Four channels
+// name it and none fires it, so the launcher reached nothing.
 
 void copy_if_valid_slot(
     const device::u8* src,

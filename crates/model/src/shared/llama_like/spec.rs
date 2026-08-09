@@ -75,6 +75,32 @@ pub struct LlamaLikeFacts {
     /// pre-bias facts JSON reads back unchanged (append-only discipline).
     #[serde(default)]
     pub qkv_bias: bool,
+    /// The ATTENTION LANDING's bias: the checkpoint ships `o_proj.bias` and
+    /// the forward adds it after the landing, residual and all.
+    ///
+    /// gpt-oss's. Separate from [`Self::qkv_bias`] because the two are
+    /// separate publications -- Qwen-2 ships the first three and no fourth,
+    /// and a single flag would make a text state a tensor its checkpoint
+    /// does not have. `GptOssCudaFacts::attention_bias` is the same claim on
+    /// the other backend.
+    ///
+    /// After the residual and not before, which is not a rounding detail
+    /// worth being casual about: the CUDA text folds the residual into the
+    /// landing (`beta=1`) and then adds the bias, so a Metal text that added
+    /// the bias first would accumulate in a different order than the
+    /// reference this is checked against.
+    #[serde(default)]
+    pub o_bias: bool,
+    /// The ROUTER's bias: one number per expert, added to the logits before
+    /// the top-k.
+    ///
+    /// The most consequential bias a mixture publishes and the least
+    /// forgiving. The others shift an activation that a norm largely
+    /// absorbs; this one shifts a RANKING. A text that drops it does not
+    /// compute a slightly different answer -- it sends each token to
+    /// different experts, and every number after that is unrelated.
+    #[serde(default)]
+    pub router_bias: bool,
 }
 
 impl LlamaLikeFacts {
@@ -151,6 +177,8 @@ impl LlamaLikeFacts {
             fused_qkv: true,
             tied_embeddings: true,
             qkv_bias: true,
+            o_bias: false,
+            router_bias: false,
         }
     }
 
@@ -178,6 +206,8 @@ impl LlamaLikeFacts {
             fused_qkv: true,
             tied_embeddings: true,
             qkv_bias: false,
+            o_bias: false,
+            router_bias: false,
         }
     }
 
@@ -231,6 +261,8 @@ impl LlamaLikeFacts {
             fused_qkv: false,
             tied_embeddings: false,
             qkv_bias: false,
+            o_bias: false,
+            router_bias: false,
         }
     }
 
@@ -266,6 +298,8 @@ impl LlamaLikeFacts {
             tied_embeddings: false,
             // `attention_bias: true` — every projection carries one.
             qkv_bias: true,
+            o_bias: false,
+            router_bias: false,
         }
     }
 
@@ -292,6 +326,8 @@ impl LlamaLikeFacts {
             fused_qkv: false,
             tied_embeddings: false,
             qkv_bias: false,
+            o_bias: false,
+            router_bias: false,
         }
     }
 
@@ -336,6 +372,8 @@ impl LlamaLikeFacts {
             fused_qkv: true,
             tied_embeddings: false,
             qkv_bias: false,
+            o_bias: false,
+            router_bias: false,
         }
     }
 
@@ -391,6 +429,8 @@ impl LlamaLikeFacts {
             fused_qkv: false,
             tied_embeddings: false,
             qkv_bias: false,
+            o_bias: false,
+            router_bias: false,
         }
     }
 }

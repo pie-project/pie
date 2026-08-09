@@ -67,28 +67,11 @@ void concat_bf16_rows(
 
 // Inverse of `concat_bf16_rows`:
 //   src: [N, left_dim + right_dim] -> left [N, left_dim], right [N, right_dim]
-void split_bf16_rows(
-    const void* src,
-    void*       left,
-    void*       right,
-    int N, int left_dim, int right_dim,
-    cudaStream_t stream);
 
 // Split just Qwen GDN's tiny fused b/a projection:
 //   ba: [N, 2 * v_h] -> b [N, v_h], a [N, v_h]
-void split_qwen_gdn_ba_bf16(
-    const void* ba,
-    void*       b_out,
-    void*       a_out,
-    int N, int v_h,
-    cudaStream_t stream);
 
 // Repeat-interleave KV heads to query heads for the one-token attention
 // case used by MTP. `out[n, qh] = in[n, qh / repeat]`.
-void repeat_interleave_heads_bf16(
-    const void* in,    // bf16 [N, kv_heads, head_dim]
-    void*       out,   // bf16 [N, q_heads, head_dim]
-    int N, int kv_heads, int q_heads, int head_dim,
-    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels::layout

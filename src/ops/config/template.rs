@@ -1,7 +1,8 @@
 //! Default `config.toml` emitted by `pie config init`.
 //!
-//! The highest-priority compiled flavor (cuda → metal → dummy) picks the
-//! `[driver]` block, so the generated file works without a follow-up edit.
+//! The highest-priority compiled flavor (cuda → metal → vulkan → wgpu →
+//! dummy) picks the `[driver]` block, so the generated file works without a
+//! follow-up edit.
 //!
 //! Five live sections, plus a commented `[cluster]` for distributed
 //! deployments. What the file no longer has is as much the point as what it
@@ -19,6 +20,10 @@ pub fn default_config_content() -> String {
         Some(driver_ffi::Flavor::Cuda) => CUDA_DRIVER_BLOCK,
         #[cfg(feature = "driver-metal")]
         Some(driver_ffi::Flavor::Metal) => METAL_DRIVER_BLOCK,
+        #[cfg(feature = "driver-vulkan")]
+        Some(driver_ffi::Flavor::Vulkan) => VULKAN_DRIVER_BLOCK,
+        #[cfg(feature = "driver-wgpu")]
+        Some(driver_ffi::Flavor::Wgpu) => WGPU_DRIVER_BLOCK,
         // `default_flavor` answers `None` when this binary carries no driver,
         // and `worker` may compile `Flavor::Cuda`/`Metal` while this crate's
         // matching `driver-*` arm is cfg'd off (workspace feature-unification
@@ -31,6 +36,12 @@ pub fn default_config_content() -> String {
         // imports fine and then cannot bind at load. A default has to run.
         #[cfg(feature = "driver-metal")]
         Some(driver_ffi::Flavor::Metal) => METAL_MODEL_BLOCK,
+        // Both portable shells load through `Binding::MLX_IN_PLACE`, so both
+        // want the quantized default for one reason. See `MLX_MODEL_BLOCK`.
+        #[cfg(feature = "driver-vulkan")]
+        Some(driver_ffi::Flavor::Vulkan) => MLX_MODEL_BLOCK,
+        #[cfg(feature = "driver-wgpu")]
+        Some(driver_ffi::Flavor::Wgpu) => MLX_MODEL_BLOCK,
         _ => DEFAULT_MODEL_BLOCK,
     };
     format!("{HEADER}{model_block}{driver_block}{TAIL}")
@@ -69,6 +80,26 @@ name = "default"
 # `.biases`, and there is no unquantized kernel to fall back to. So the default
 # is an MLX-quantized checkpoint -- a raw bf16 repo (e.g. `Qwen/Qwen3-0.6B`)
 # imports fine and then fails to bind at load.
+model = "mlx-community/Qwen3-0.6B-4bit"
+# weight_cache_dir = ""       # empty derives $PIE_HOME/models
+"#;
+
+/// The default both portable shells need, and they need it for ONE reason
+/// rather than two: each seam compiles its load plan through
+/// `model::boot::Binding::MLX_IN_PLACE`, so every projection binds
+/// `.weight`/`.scales`/`.biases` and a raw bf16 repo is refused at load with
+/// the remedy named in the refusal.
+///
+/// Shared between them and NOT with `METAL_MODEL_BLOCK` above, which names the
+/// same repo for a different reason -- that driver has no unquantized matvec
+/// at all. Two reasons, two blocks; one reason, one block.
+#[cfg(any(feature = "driver-vulkan", feature = "driver-wgpu"))]
+const MLX_MODEL_BLOCK: &str = r#"[model]
+name = "default"
+# This driver loads through MLX in-place binding: every projection wants
+# `.weight`/`.scales`/`.biases`, so the default is an MLX-quantized checkpoint.
+# A raw bf16 repo (e.g. `Qwen/Qwen3-0.6B`) imports fine and is then refused at
+# load, saying it needs quantized weights.
 model = "mlx-community/Qwen3-0.6B-4bit"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/models
 "#;
@@ -144,6 +175,39 @@ total_pages = 1024
 # stream_routed_experts   = false  # page MoE experts from the checkpoint
 "#;
 
+#[cfg(feature = "driver-vulkan")]
+const VULKAN_DRIVER_BLOCK: &str = r#"
+[driver]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named driver accepts. A key it does not know is a parse error
+# naming the driver that rejected it.
+type = "vulkan"
+# Not a selector this driver reads: it opens the first Vulkan device the
+# loader reports. Written because `device` is required of every driver.
+device = ["vulkan:0"]
+activation_dtype = "bfloat16"
+kv_pages = 1024
+# kernels = "/path/to/spv"  # else PIE_KERNELS_VULKAN_SPV_DIR
+"#;
+
+#[cfg(feature = "driver-wgpu")]
+const WGPU_DRIVER_BLOCK: &str = r#"
+[driver]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named driver accepts. A key it does not know is a parse error
+# naming the driver that rejected it.
+type = "wgpu"
+# Not a selector this driver reads either, and for a different reason than the
+# Vulkan block's: `wgpu` asks the platform for an adapter itself. Written
+# because `device` is required of every driver.
+device = ["gpu:0"]
+activation_dtype = "bfloat16"
+# The one knob this backend reads. No `kv_page_size` (16, fixed by the
+# kernels), no `kv_cache_dtype` (bf16, the only one it stores), and no
+# `kernels` -- the shaders are inside the binary.
+kv_pages = 1024
+"#;
+
 const DUMMY_DRIVER_BLOCK: &str = r#"
 [driver]
 # Which keys are valid here depends on `type`: the common ones below, plus
@@ -181,6 +245,10 @@ mod tests {
             Some(driver_ffi::Flavor::Cuda) => "cuda_native",
             #[cfg(feature = "driver-metal")]
             Some(driver_ffi::Flavor::Metal) => "metal",
+            #[cfg(feature = "driver-vulkan")]
+            Some(driver_ffi::Flavor::Vulkan) => "vulkan",
+            #[cfg(feature = "driver-wgpu")]
+            Some(driver_ffi::Flavor::Wgpu) => "wgpu",
             _ => "dummy",
         };
         let content = default_config_content();

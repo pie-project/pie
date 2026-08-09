@@ -388,6 +388,49 @@ mod tests {
         }
     }
 
+    /// A false start on the end marker restarts the match at the token
+    /// that broke it.
+    ///
+    /// `</` `</` `think>` ends the reasoning. The second `</` does two
+    /// things at once: it proves the first was content, and it is itself
+    /// the first token of the real marker. The sibling test above breaks
+    /// a partial match with a token that is NOT `end_ids[0]`, which is
+    /// the easy half -- flush and reset. This is the half where the
+    /// reset has to be immediately undone.
+    ///
+    /// Getting it wrong loses the terminator entirely: the decoder would
+    /// consume `</` as content with `match_pos` at zero, then see
+    /// `think>` where it expects `</`, and the reasoning block would run
+    /// to the end of generation with the marker sitting inside it as
+    /// text. The model looks like it never stopped thinking.
+    #[test]
+    fn a_false_start_on_the_end_marker_restarts_the_match_at_its_first_token() {
+        let tok = make_tok(&["</", "think>", "hi"]);
+        let mut dec = ThinkingDecoder::new(tok, vec![], vec![0, 1]);
+        match dec.feed(&[2]) {
+            ReasoningEvent::Delta(text) => assert_eq!(text, "hi"),
+            other => panic!("expected reasoning content, got {other:?}"),
+        }
+        // Held: it MIGHT be the marker.
+        match dec.feed(&[0]) {
+            ReasoningEvent::Delta(text) => assert!(text.is_empty(), "emitted {text:?} early"),
+            other => panic!("expected a held delimiter, got {other:?}"),
+        }
+        // It was not. The held token becomes content and this one opens a
+        // fresh match rather than being consumed as content too.
+        match dec.feed(&[0]) {
+            ReasoningEvent::Delta(text) => assert_eq!(text, "</"),
+            other => panic!("expected the false start flushed, got {other:?}"),
+        }
+        match dec.feed(&[1]) {
+            ReasoningEvent::Complete(text) => assert_eq!(
+                text, "hi</",
+                "the restarted match must still terminate the block"
+            ),
+            other => panic!("the marker was lost: {other:?}"),
+        }
+    }
+
     #[test]
     fn thinking_partial_end_mismatch_becomes_content() {
         let tok = make_tok(&["</", "x", "</think>"]);

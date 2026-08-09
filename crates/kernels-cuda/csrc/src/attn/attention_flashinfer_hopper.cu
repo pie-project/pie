@@ -1,4 +1,3 @@
-#include <cstdlib>
 #include "attn/attention_flashinfer_hopper.hpp"
 
 #include <cmath>
@@ -136,12 +135,51 @@ cudaError_t dispatch_hopper_prefill_dim_mask(HopperParams& params,
 // decode-shaped fires. On by default -- measured on gemma-4-26B-A4B at 1k
 // context, routing the sliding layers' decode here takes attention from
 // 4.19 to 2.73 ms and the model from 122.5 to 144.1 tok/s, output unchanged.
-// The escape hatch is for bisecting a regression against the FA2 decode path.
-bool hopper_extended_shapes_enabled() {
-    static const bool off =
-        std::getenv("PIE_CUDA_DISABLE_HOPPER_EXTENDED") != nullptr;
-    return !off;
-}
+//
+// # This was `getenv("PIE_CUDA_DISABLE_HOPPER_EXTENDED")`, read per call
+//
+// It answers a CAPABILITY -- "does this deployment serve head_dim 256, a
+// sliding window, a decode-shaped prefill" -- and a capability answered per
+// launch is answered too late. A deployment either supports the path or it
+// does not; that is a fact about the deployment, settled before the first
+// fire, and a refusal is only visible if it is settled somewhere a refusal
+// can be reported from.
+//
+// So the environment read is gone and the fact is stated instead: the choice
+// NAMES ITS DEFAULT. `true` is precisely `getenv(...) == nullptr`, and nothing
+// in this repository has ever set the variable, so every deployment that
+// exists today gets the identical answer from the identical predicate below.
+//
+// # Why there is no setter here yet
+//
+// The load-time shape wants a seam -- the driver holds the fact, states it
+// once at load, and a refusal is reportable at the place that can report it.
+// A `void set_hopper_extended_shapes(bool)` was written, and then withdrawn,
+// because it had no caller: the driver's bridge does not reach this header,
+// and its one plausible home (`driver-cuda`'s `Boot`, "every boot knob this
+// driver reads, parsed once") is a separate change in a separate crate.
+// `driver-cuda`'s `launch_abi.rs` refuses a `void` in an `attn` header that
+// is neither a table row nor a decided exception, and it was right to: a
+// symbol added ahead of its caller is not a decision, it is a backlog entry
+// wearing a signature. When `Boot` grows the fact, the constant below becomes
+// that seam and the exception becomes `DriverInternal`. Until then the
+// override mechanism is an edit, which is at least an edit a replay can see.
+//
+// The measurement this did NOT get, said plainly rather than implied: the box
+// this was audited on is an L40S, sm_89. `PIE_HAS_SM90` is false there, so
+// CMake compiles `attention_flashinfer_hopper_stub.cpp` in place of this file
+// and `hopper_prefill_supported` is the stub's `return false` -- the variable
+// is not merely unreachable on that hardware, it is not in the binary. The
+// two arms it chose between are an FA3 dispatch and the FA2 decode path, and
+// neither can be fired here. This file was compiled for sm_90 to check the
+// change -- SASS identical before and after -- and that is all the evidence
+// there is for it; the fold is deliberately behaviour-preserving because it
+// could not be anything else. §36 has the reasoning and the compile.
+namespace {
+constexpr bool kHopperExtendedShapes = true;
+}  // namespace
+
+bool hopper_extended_shapes_enabled() { return kHopperExtendedShapes; }
 
 bool hopper_prefill_supported(int head_dim,
                               int window_left,
@@ -161,21 +199,6 @@ bool hopper_prefill_supported(int head_dim,
     if (total_tokens < num_requests) return false;
     return head_dim == 128 || head_dim == 256;
 }
-
-std::uint8_t hopper_prefill_graph_layout(const HopperPrefillPlan& plan) {
-    if (!plan.valid) return 0;
-    std::uint8_t dim_class = 0;
-    switch (plan.head_dim) {
-        case 128: dim_class = 2; break;
-        case 256: dim_class = 4; break;
-        default: dim_class = 0; break;
-    }
-    return static_cast<std::uint8_t>(
-        96u | dim_class |
-        (plan.same_schedule_for_all_heads ? 8u : 0u) |
-        (plan.causal ? 16u : 0u));
-}
-
 void plan_attention_flashinfer_prefill_sm90_bf16(
     HopperPrefillPlan& plan,
     const std::uint32_t* qo_indptr_h,

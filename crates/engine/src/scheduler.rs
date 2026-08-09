@@ -487,7 +487,7 @@ fn rs_state_copy_plan(
         .into_iter()
         .zip(dst_slots)
         .map(
-            |(src_slot_id, dst_slot_id)| ::driver_api::PieStateCopyRange {
+            |(src_slot_id, dst_slot_id)| ::driver_api::StateCopyRange {
                 src_slot_id,
                 dst_slot_id,
                 src_token_offset: 0,
@@ -541,7 +541,7 @@ pub fn submit_async(
 /// rather than accepted as one of its own. The call sites cannot return an
 /// error from inside a struct literal, and the id they hold has already been
 /// used to reach a scheduler handle on the next line.
-pub(crate) fn device_domain(driver_idx: usize) -> ::driver_api::PieMemoryDomain {
+pub(crate) fn device_domain(driver_idx: usize) -> ::driver_api::DeviceDomain {
     crate::driver::get_spec(driver_idx).map_or(::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED, |s| {
         s.device_domain
     })

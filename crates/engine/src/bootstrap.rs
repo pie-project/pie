@@ -627,7 +627,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                             |kv| kv.committed_high_water_pages().max(1),
                         );
                         let capacity = capacities[ordinal] as u32;
-                        let unmap_ranges = vec![::driver_api::PiePoolRange {
+                        let unmap_ranges = vec![::driver_api::PoolRange {
                             page_index: u64::from(target),
                             page_count: u64::from(capacity - target),
                         }];

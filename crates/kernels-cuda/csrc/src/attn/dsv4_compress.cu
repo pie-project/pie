@@ -38,60 +38,21 @@ constexpr int ATTN_BLOCK = 128;
 
 }  // namespace
 
-void average_pool_bf16(
-    const void* input,
-    void* output,
-    int N,
-    int dim,
-    int ratio,
-    cudaStream_t stream)
-{
-    const int out_tokens = N / ratio;
-    if (out_tokens <= 0 || dim <= 0) return;
-    const int total = out_tokens * dim;
-    const int grid = (total + BLOCK - 1) / BLOCK;
-    device::average_pool<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(input),
-        static_cast<device::bf16*>(output),
-        N, dim, ratio);
-}
-
-void add_ape_f32(
-    void* data,
-    const float* ape,
-    int N_compressed,
-    int dim,
-    int ratio,
-    cudaStream_t stream)
-{
-    if (N_compressed <= 0 || dim <= 0) return;
-    const int total = N_compressed * dim;
-    const int grid = (total + BLOCK - 1) / BLOCK;
-    device::add_ape<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<device::bf16*>(data),
-        ape,
-        N_compressed, dim, ratio);
-}
-
-void gated_softmax_pool_bf16(
-    const void* kv,
-    const void* score,
-    void* output,
-    int N,
-    int dim,
-    int ratio,
-    cudaStream_t stream)
-{
-    const int out_tokens = N / ratio;
-    if (out_tokens <= 0 || dim <= 0) return;
-    const int total = out_tokens * dim;
-    const int grid = (total + BLOCK - 1) / BLOCK;
-    device::gated_softmax_pool<device::bf16><<<grid, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(kv),
-        static_cast<const device::bf16*>(score),
-        static_cast<device::bf16*>(output),
-        N, dim, ratio);
-}
+// FOUR LAUNCHERS WERE DELETED HERE: `average_pool_bf16`, `add_ape_f32`,
+// `gated_softmax_pool_bf16` and (below) `dsv4_compress_gather_bf16` and
+// `attention_compressed_bf16`. Five, then.
+//
+// All five are the UNPAGED half of DSv4 compression, and the paged half is
+// what the model actually runs: `dsv4_compress_gather_paged_bf16` and
+// `attention_compressed_paged_bf16` are reached and stay. The unpaged five
+// had no row and were recorded as `NoRow::KernelsInternal` -- "only sibling
+// `.cu` files call it" -- and the sibling that called them was
+// `attention_compressed_bf16`, which is itself one of the five.
+// `csrc-reachability-audit.py` reports the whole cluster unreachable, which
+// is what a closed cycle of dead callers looks like from outside.
+//
+// The device text is untouched: `attn/dsv4_compress.cuh` still carries all
+// nine `__global__`s and `families::attn::DSV4_COMPRESS` still compiles them.
 
 void combine_attn_outputs_bf16(
     const void* o1, const float* lse1,
@@ -131,88 +92,10 @@ void combine_attn_outputs_bf16(
         num_heads, head_dim);
 }
 
-void attention_compressed_bf16(
-    const void* q,
-    const void* comp_kv,
-    void* o,
-    float* lse_out,
-    const int* qo_indptr,
-    const int* comp_offsets,
-    const int* comp_lens,
-    const int* comp_ratios,
-    int total_tokens,
-    int num_requests,
-    int num_q_heads,
-    int head_dim,
-    float sm_scale,
-    cudaStream_t stream)
-{
-    if (num_requests <= 0 || total_tokens <= 0) return;
-
-    // Build params on host, upload to device
-    std::vector<device::CompressedAttnParams> params_h(static_cast<std::size_t>(num_requests));
-    for (int r = 0; r < num_requests; ++r) {
-        params_h[r].qo_lo = qo_indptr[r];
-        params_h[r].qo_hi = qo_indptr[r + 1];
-        params_h[r].comp_offset = comp_offsets[r];
-        params_h[r].comp_len = comp_lens[r];
-        params_h[r].comp_ratio = comp_ratios[r];
-    }
-
-    // Allocate device memory for params
-    device::CompressedAttnParams* params_d = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&params_d,
-        sizeof(device::CompressedAttnParams) * num_requests, stream));
-    CUDA_CHECK(cudaMemcpyAsync(params_d, params_h.data(),
-        sizeof(device::CompressedAttnParams) * num_requests,
-        cudaMemcpyHostToDevice, stream));
-
-    dim3 grid(num_requests, total_tokens, num_q_heads);
-    dim3 block(ATTN_BLOCK);
-    const std::size_t smem = (static_cast<std::size_t>(head_dim) + ATTN_BLOCK) * sizeof(float);
-
-    device::compressed_attn<<<grid, block, smem, stream>>>(
-        static_cast<const device::bf16*>(q),
-        static_cast<const device::bf16*>(comp_kv),
-        static_cast<device::bf16*>(o),
-        lse_out,
-        params_d,
-        num_q_heads, head_dim, sm_scale);
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaFreeAsync(params_d, stream));
-}
-
-
-void dsv4_compress_gather_bf16(
-    const void* kv_proj,
-    const void* score_proj,
-    const float* ape,
-    const device::i32* boundary_tok,
-    const device::i32* boundary_pos,
-    const device::i32* window_lo,
-    void* out,
-    int num_entries,
-    int head_dim,
-    int ratio,
-    int coff,
-    cudaStream_t stream) {
-    if (num_entries <= 0 || head_dim <= 0 || ratio <= 0 || coff <= 0) return;
-    const int threads = head_dim < BLOCK ? ((head_dim + 31) / 32) * 32 : BLOCK;
-    device::dsv4_compress_gather<device::bf16><<<num_entries, threads, 0, stream>>>(
-        static_cast<const device::bf16*>(kv_proj),
-        static_cast<const device::bf16*>(score_proj),
-        ape,
-        boundary_tok,
-        boundary_pos,
-        window_lo,
-        static_cast<device::bf16*>(out),
-        head_dim,
-        ratio,
-        coff);
-    CUDA_CHECK(cudaGetLastError());
-}
-
+// `attention_compressed_bf16` and `dsv4_compress_gather_bf16` WERE HERE.
+// See the note above: they are the last two of the unpaged five, and
+// `attention_compressed_bf16` was the caller that made the other four look
+// `KernelsInternal` rather than orphaned.
 
 void dsv4_compress_gather_paged_bf16(
     const void* state_kv,

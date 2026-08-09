@@ -34,9 +34,6 @@ bool hopper_prefill_supported(int head_dim,
                               int window_left,
                               int total_tokens,
                               int num_requests);
-
-std::uint8_t hopper_prefill_graph_layout(const HopperPrefillPlan& plan);
-
 void plan_attention_flashinfer_prefill_sm90_bf16(
     HopperPrefillPlan& plan,
     const std::uint32_t* qo_indptr_h,

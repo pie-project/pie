@@ -39,26 +39,6 @@ struct PrefillPlanCacheDeleter {
 using PrefillPlanCachePtr = std::unique_ptr<PrefillPlanCache, PrefillPlanCacheDeleter>;
 
 PrefillPlanCachePtr make_prefill_plan();
-
-// Compact graph-layout class for the most recent decode plan. CUDA graph
-// replay records the host-side dispatch branch, so split-KV and non-split
-// plans need distinct graph keys.
-std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache);
-std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
-
-// Whether the plan ran in graph mode, i.e. whether its launch geometry is a
-// pure function of (total_tokens, num_requests) rather than of the KV content
-// it was planned against. Reads `PrefillPlanCache::graph_capturable`, which
-// only the `.cuh` defining the struct can see -- the callers that need the
-// answer are plain `.cpp` translation units.
-bool prefill_plan_graph_capturable(const PrefillPlanCache& cache);
-
-// Whether this plan's schedule is independent of the page counts it was
-// planned against, and therefore whether the launch may be handed a different
-// (compacted) page list than the plan saw. Only the static non-split decode
-// plan qualifies. See `DecodePlanCache::page_count_independent`.
-bool decode_plan_is_page_count_independent(const DecodePlanCache& cache);
-
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
 // Place this plan's descriptor `bytes` into the shared int workspace. Callers
@@ -85,27 +65,6 @@ void plan_attention_flashinfer_decode_bf16(
     // and can be planned per step cheaply. Pass the layer's window to let the
     // planner split; -1 keeps the unsplit static plan.
     int window_left = -1);
-
-inline void plan_attention_flashinfer_decode(
-    DecodePlanCache& cache,
-    const std::uint32_t* kv_page_indptr_h,
-    int num_requests,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int page_size,
-    AttentionWorkspaceView workspace,
-    cudaStream_t stream,
-    bool enable_cuda_graph = true,
-    bool full_attention_variant = false,
-    bool hnd_layout = false,
-    int window_left = -1) {
-    plan_attention_flashinfer_decode_bf16(
-        cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
-        head_dim, page_size, workspace, stream, enable_cuda_graph,
-        full_attention_variant, hnd_layout, window_left);
-}
-
 void plan_attention_flashinfer_prefill_bf16(
     PrefillPlanCache& cache,
     const std::uint32_t* qo_indptr_h,
@@ -419,58 +378,7 @@ void attention_flashinfer_prefill(
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
     float* lse_out = nullptr);
-
-// Same prefill, with a custom packed-bit mask per request. `mask_d` is the
-// concatenation of all per-request bitmaps; `mask_indptr_d[r]` is the byte
-// offset of request r's mask. Each request's mask is `qo_len_r × kv_len_r`
-// bits, row-major (qo_idx × kv_len + kv_idx).
-void attention_flashinfer_prefill_custom_bf16(
-    const void* q,
-    void* k_pages, void* v_pages,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t*  mask_d,                   // device, packed bitmap
-    const std::int32_t*  mask_indptr_d,            // device, [R+1] byte offsets
-    const std::uint32_t* qo_indptr_h,
-    const std::uint32_t* kv_page_indptr_h,
-    int total_tokens,
-    int num_requests,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int page_size,
-    AttentionWorkspaceView workspace,
-    cudaStream_t stream,
-    int window_left = -1,
-    float logits_soft_cap = 0.f,
-    float sm_scale = -1.f,
-    // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
-    float* lse_out = nullptr,
-    bool hnd_layout = false);
-
-void attention_flashinfer_prefill_custom(
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t*  mask_d,
-    const std::int32_t*  mask_indptr_d,
-    const std::uint32_t* qo_indptr_h,
-    const std::uint32_t* kv_page_indptr_h,
-    int total_tokens,
-    int num_requests,
-    int num_q_heads,
-    AttentionWorkspaceView workspace,
-    cudaStream_t stream,
-    int window_left = -1,
-    float logits_soft_cap = 0.f,
-    float sm_scale = -1.f,
-    float* lse_out = nullptr);
+// `attention_flashinfer_prefill_custom` WAS declared here; deleted, and the
+// `.cu` says why. The `_bf16` form above is the reached one.
 
 }  // namespace pie_cuda_driver::kernels::attn

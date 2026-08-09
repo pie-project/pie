@@ -29,29 +29,27 @@ constexpr std::size_t ROW_REDUCE_SHMEM = (BLOCK / 32) * sizeof(float);
 
 }  // namespace
 
-void launch_absmax_bf16(
-    const void* W_bf16, float* absmax_dev,
-    std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return;
-    CUDA_CHECK(cudaMemsetAsync(absmax_dev, 0, sizeof(float), stream));
-    // Cap grid at 1024 blocks — enough parallelism for >256k elements
-    // and keeps the atomic contention bounded.
-    const unsigned blocks_full = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    const unsigned blocks = blocks_full < 1024u ? blocks_full : 1024u;
-    device::absmax_bf16<<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(W_bf16), absmax_dev, n);
-}
-
-void launch_quant_bf16_to_fp8_e4m3(
-    const void* W_bf16, device::u8* W_fp8,
-    float scale_inv, std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    device::quant_flat<device::fp8_e4m3><<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(W_bf16), W_fp8, scale_inv, n);
-}
+// # Eight launchers went, and one of them is the file's stale-prose case
+//
+// §43 deleted `quantize_bf16_to_fp8_e4m3_per_tensor` and the two launchers
+// that existed only to serve it -- `launch_absmax_bf16` and
+// `launch_quant_bf16_to_fp8_e4m3` -- plus `launch_absmax_to_scale_inv_int8`,
+// `launch_cast_bf16_to_int8_per_channel`, `launch_absmax_per_row_bf16`,
+// `launch_absmax_to_scale_inv` and `launch_cast_bf16_to_fp8_e4m3_per_channel`.
+//
+// `quant/quant_bf16_to_fp8.cuh` still says "`model-loader` calls
+// `quantize_bf16_to_fp8_e4m3_per_tensor` and its siblings directly from
+// Rust". `model-loader` calls ONE of them, `_per_channel`, through
+// `api::quant_quantize_bf16_to_fp8_e4m3_per_channel` and
+// `tile.rs::CUDA_QUANTIZE_BF16_TO_FP8` -- and `families::quant` already
+// records the per-tensor entry as excluded. A sweep that counted the `.cuh`
+// sentence as a consumer would have kept a launcher no caller has: a MENTION
+// read as a FIRE, which is the §28 trap in its purest form.
+//
+// Everything still fired stays: the per-channel quantisers (fp8 and int8),
+// the per-token and per-token-group forms, the int8 dequantisers and the
+// w8a8 accumulator narrowing -- all of them reached from `gemm/gemm.cpp` or
+// from `model-loader`.
 
 void quantize_bf16_to_fp8_e4m3_per_channel(
     const void* W_bf16, device::u8* W_fp8,
@@ -87,24 +85,6 @@ void quantize_bf16_to_int8_per_token(
         act_bf16, act_int8, act_scale_inv, n_tokens, k, stream);
 }
 
-void launch_absmax_to_scale_inv_int8(
-    float* absmax_inout, int rows, cudaStream_t stream)
-{
-    if (rows == 0) return;
-    const int blocks = (rows + BLOCK - 1) / BLOCK;
-    device::absmax_to_scale_inv<device::int8_sym><<<blocks, BLOCK, 0, stream>>>(
-        absmax_inout, rows);
-}
-
-void launch_cast_bf16_to_int8_per_channel(
-    const void* W_bf16, device::i8* W_int8,
-    const float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
-{
-    if (rows == 0 || cols == 0) return;
-    device::cast_per_channel<device::int8_sym><<<rows, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(W_bf16),
-        W_int8, scale_inv_dev, cols);
-}
 
 void launch_dequant_int8_to_bf16_per_channel(
     const device::i8* W_int8, void* W_bf16,
@@ -132,73 +112,7 @@ void dequant_int32_w8a8_to_bf16(
         static_cast<device::bf16*>(out_bf16), M, N);
 }
 
-void launch_absmax_per_row_bf16(
-    const void* W_bf16, float* absmax_dev,
-    int rows, int cols, cudaStream_t stream)
-{
-    if (rows == 0 || cols == 0) return;
-    device::absmax_per_row<device::bf16>
-        <<<rows, BLOCK, ROW_REDUCE_SHMEM, stream>>>(
-            static_cast<const device::bf16*>(W_bf16), absmax_dev, cols);
-}
 
-void launch_absmax_to_scale_inv(
-    float* absmax_inout, int rows, cudaStream_t stream)
-{
-    if (rows == 0) return;
-    const auto blocks = static_cast<unsigned>((rows + BLOCK - 1) / BLOCK);
-    device::absmax_to_scale_inv<device::fp8_e4m3><<<blocks, BLOCK, 0, stream>>>(
-        absmax_inout, rows);
-}
-
-void launch_cast_bf16_to_fp8_e4m3_per_channel(
-    const void* W_bf16, device::u8* W_fp8,
-    const float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
-{
-    if (rows == 0 || cols == 0) return;
-    device::cast_per_channel<device::fp8_e4m3><<<rows, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(W_bf16),
-        W_fp8, scale_inv_dev, cols);
-}
-
-float quantize_bf16_to_fp8_e4m3_per_tensor(
-    const void* W_bf16, device::u8* W_fp8,
-    std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return 1.f;
-    // 1) absmax → tmp scalar
-    float* tmp = nullptr;
-    CUDA_CHECK(cudaMalloc(&tmp, sizeof(float)));
-    launch_absmax_bf16(W_bf16, tmp, n, stream);
-
-    // 2) Pull absmax to host (one sync per quant call — load-time
-    // operation, not the hot path).
-    float absmax = 0.f;
-    CUDA_CHECK(cudaMemcpyAsync(&absmax, tmp, sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(tmp));
-
-    // Degenerate weights (all-zero) — pick scale=1.0 and let the cast
-    // produce zeros. Returns weight_scale_inv = 1.0 (caller stores this
-    // in the QuantMeta scale tensor; cuBLASLt treats it as a no-op).
-    if (absmax == 0.f) {
-        launch_quant_bf16_to_fp8_e4m3(W_bf16, W_fp8, 1.f, n, stream);
-        return 1.f;
-    }
-
-    // We pick `weight_scale_inv` such that bf16 ≈ fp8 * weight_scale_inv,
-    // i.e. weight_scale_inv = absmax / fp8_max. The cast multiplies by
-    // the reciprocal:  fp8 = round(bf16 * (fp8_max / absmax)).
-    //
-    // The saturation point comes from the format tag rather than a local
-    // constant, so the host's scale and the device's clamp cannot disagree.
-    const float fp8_max = device::fp8_e4m3::max_abs();
-    const float weight_scale_inv = absmax / fp8_max;
-    const float scale_inv        = fp8_max / absmax;
-    launch_quant_bf16_to_fp8_e4m3(W_bf16, W_fp8, scale_inv, n, stream);
-    return weight_scale_inv;
-}
 
 void quantize_bf16_to_fp8_e4m3_per_token_group(
     const void*    act_bf16,

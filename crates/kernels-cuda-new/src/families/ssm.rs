@@ -58,11 +58,19 @@
 //! `RowsPerHead`, `Tile16`, `AxialRope` and `RoutedQmv` have no launcher of
 //! their shape in `ssm/*.cu`. Every remaining entry below stands, and one of
 //! them deserves its name said twice because it is the easiest thing here to
-//! get wrong: `recurrent_gated_delta_step_batched_gqa_state_bf16` is
-//! selected by `std::getenv("PIE_QWEN35_GDN_SMEM_STEP")`, which picks a
-//! DIFFERENT KERNEL and not a different grid. **An environment variable is
-//! not geometry**, and no rule — of 21, of 28, or of any number — can make
-//! it one.
+//! get wrong: `recurrent_gated_delta_step_batched_gqa_state_bf16` picks a
+//! DIFFERENT KERNEL and not a different grid.
+//!
+//! It used to pick it on `std::getenv("PIE_QWEN35_GDN_SMEM_STEP")`. **An
+//! environment variable is not geometry**, and no rule — of 21, of 28, or of
+//! any number — can make it one; but the fix was not to find the rule that
+//! could. §30 measured the two arms first, and they are **byte-identical**
+//! on the state slab and on `out` at eight shapes, including the two where
+//! the gate is off. A knob whose arms never differ chose only speed, and
+//! only downward, so it was DELETED rather than relocated. What is left is
+//! `V_d == 128 && K_d == 128` — a shape the fire already carries, which
+//! costs this vocabulary nothing and which §26.10(b)'s `Term::IntIs` reads
+//! directly. The residue below is now honestly geometric.
 //!
 //! * **A grid no ported rule computes — HALF RETIRED.** `mamba_split` is a
 //!   row now. That bullet said *"`Elementwise` sizes on the OUTPUT width
@@ -145,7 +153,7 @@
 //!   objection was never that a block width appears in the algebra; it was
 //!   that a rule fixing a DIFFERENT one silently changes the answer. See
 //!   [`GATED_DELTA_NET_PREP_SIGS`]`[5]`, which cites
-//!   `ssm/gated_delta_net.cu:147-159`.
+//!   `ssm/gated_delta_net.cu:152-164`.
 //! * **A block width derived from an operand that only coincidentally equals
 //!   the template's.** `qwen_gdn_qk_norm<T, BLOCK>` is named in
 //!   `runtime::launch`'s own refusal: it reduces through
@@ -166,8 +174,8 @@
 //!   `gated_delta_net`'s fourteen recurrence kernels, and it survived both
 //!   the arity finding and the `<cstdint>` fix. Their launchers read
 //!   `dim3 grid(B, V_h); dim3 block(128); shmem = 2 * K_d *
-//!   sizeof(float)` — `gated_delta_net.cu:221-224`, `:242-245`, `:322-326`
-//!   and the `_fla` forms' `dim3 grid_fla(NV, R, V_h)` at `:378-380` —
+//!   sizeof(float)` — `gated_delta_net.cu:227-230`, `:248-251`, `:328-332`
+//!   and the `_fla` forms' `dim3 grid_fla(NV, R, V_h)` at `:383-385` —
 //!   which [`kernels::LaunchRule::RecurrentScan`] states and five rows now
 //!   take. Three OTHER ported rules set a non-zero `smem` and not one of them
 //!   computes that expression: `SdpaVector` answers `(rows + 256) · 4`,
@@ -193,9 +201,9 @@
 //!   naming separately, because it is the one the arity note warns about and
 //!   it does NOT look like a host choice from the call site.
 //!   `qwen_gdn_k_last_state_enabled()` and `qwen_gdn_fused_step_enabled()`
-//!   are `constexpr bool ... { return false; }` at `gated_delta_net.cu:50`
-//!   and `:57` — build-time switches, so nvcc folds the four-way dispatch at
-//!   `:276-308` down to one `recurrent_step_batched<float, false>` and folds
+//!   are `constexpr bool ... { return false; }` at `gated_delta_net.cu:62`
+//!   and `:69` — build-time switches, so nvcc folds the four-way dispatch at
+//!   `:282-314` down to one `recurrent_step_batched<float, false>` and folds
 //!   `+ (fused ? 1 : 0)` out of the `smem` expression. A row could therefore
 //!   spell `"device::bf16, device::false_type::value"` and be right TODAY.
 //!   It would also be a copy of a constant living in a file the row cannot
@@ -544,7 +552,7 @@ static GATED_DELTA_NET_PREP_SIGS: [KernelSig; 6] = [
         ]),
     // THE ROW THE BLOCK WIDTH USED TO REFUSE.
     //
-    // `ssm/gated_delta_net.cu:147-159`:
+    // `ssm/gated_delta_net.cu:152-164`:
     //
     // ```text
     // if (N <= 0 || hidden <= 0) return;
@@ -1212,16 +1220,33 @@ static GATED_DELTA_NET_SIGS: [KernelSig; 5] = [
     // sizeof(float)` -- the rule's -- rather than to the `+ 1` float the
     // fused arm would have wanted.
     //
-    // **Its bf16 twin is NOT a row and cannot be.**
+    // **Its bf16 twin is NOT a row yet, and two things are missing.**
     // `recurrent_gated_delta_step_batched_gqa_state_bf16` routes to
     // `recurrent_step_batched_gqa_smem<128>` -- a three-axis grid at a
-    // different block and a staged state slab -- when
-    // `qwen_gdn_smem_step_enabled()` is true, and that function reads
-    // `std::getenv("PIE_QWEN35_GDN_SMEM_STEP")`. An environment variable is
-    // not a value any fire holds: `crate::device::Fact` is
-    // `Address | Int | Opaque` precisely so a predicate over one is
-    // unspellable rather than merely discouraged. That symbol keeps its
-    // launcher, and it is the only one of the five decode steps that does.
+    // staged state slab -- on `V_d == 128 && K_d == 128`.
+    //
+    // Until 2025-06 the predicate was `std::getenv`, and the refusal written
+    // here was that an environment variable is not a value any fire holds:
+    // `crate::device::Fact` is `Address | Int | Opaque` precisely so a
+    // predicate over one is unspellable rather than merely discouraged. That
+    // refusal was right and is now moot, because §30 did the measurement the
+    // refusal skipped. The two arms are **byte-identical at eight shapes**,
+    // on the state slab and on `out`, with `written > 0` on every one -- so
+    // the variable was never choosing an operation, and the honest fix was
+    // to delete it rather than to find it a home in this vocabulary. That is
+    // the cheaper outcome and it is worth naming: a knob that survives
+    // measurement needs a `Choose`; a knob that does not needs an editor.
+    //
+    // What is left is a real refusal and a smaller one. (a) The predicate is
+    // an INTEGER COMPARISON on two operands, and `Term` has no `IntIs` --
+    // §26.10(b). (b) The arm it selects has no row and no `LaunchRule`: it
+    // opens `grid((V_d + 127) / 128, R, V_h)` on `K_d * 128 *
+    // sizeof(__nv_bfloat16) + 2 * K_d * sizeof(float)`, which `RecurrentScan`
+    // matches in neither axis count nor smem. So this is a `Choose` over TWO
+    // rows once both exist -- not a `Specialisation`, because `agrees()`
+    // refuses an arm whose `LaunchRule` differs from the base's, and these
+    // two differ in exactly that. The launcher stays until then, and it is
+    // the only one of the five decode steps that does.
     //
     // `K_h` stays an operand and `V_h` is the rule's. The kernel computes
     // `repeat = V_h / K_h` and `h_k = h / repeat` from `blockIdx.y`, so the
@@ -1251,7 +1276,7 @@ static GATED_DELTA_NET_SIGS: [KernelSig; 5] = [
     // THE WARP-TILED GQA PREFILL, and the third grid axis this file said no
     // rule produced.
     //
-    // `ssm/gated_delta_net.cu:759-794`, the shipped arm:
+    // `ssm/gated_delta_net.cu:792-829`, the shipped arm:
     //
     // ```text
     // constexpr int WARPS = 4;
@@ -1297,7 +1322,7 @@ static GATED_DELTA_NET_SIGS: [KernelSig; 5] = [
     // **The two fast paths in front of this one are dead code, and the
     // second is why `KLast` is `false` rather than merely unshipped.**
     // `qwen_gdn_gqa_ilp2_enabled()` is a file-scope
-    // `constexpr bool ... { return false; }` at `gated_delta_net.cu:48`, so
+    // `constexpr bool ... { return false; }` at `gated_delta_net.cu:62`, so
     // the `_ilp2` kernel and its `dim3 grid(R, V_h, ceil(V_d / 8))` are never
     // launched -- `runtime::launch::warp_tiled_scan`'s own doc names that
     // grid as the one it does NOT serve, and stating it would be a rule for
@@ -1336,7 +1361,7 @@ static GATED_DELTA_NET_SIGS: [KernelSig; 5] = [
             write_state: Bool <- Source::Gdn("write_state"),
             write_state_mask: U8s <- Source::Lit(Lit::Null),
         ]),
-    // The same launch over a bf16 state slab: `gated_delta_net.cu:816-855`,
+    // The same launch over a bf16 state slab: `gated_delta_net.cu:849-890`,
     // the same five lines over `__nv_bfloat16`.
     //
     // `elem`'s first argument is `ssm::device::state_bf16` and NOT

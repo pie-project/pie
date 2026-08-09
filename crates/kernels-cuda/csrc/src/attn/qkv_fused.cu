@@ -184,40 +184,16 @@ void qkv_decode_qk_norm_rope_write_kv_bf16(
         page_size, hnd_layout, theta, eps, stream);
 }
 
-void qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
-    const void* packed,
-    void* q_out,
-    void* k_pages,
-    void* v_pages,
-    const void* q_weight,
-    const void* k_weight,
-    const device::i32* positions,
-    const float* rope_table,
-    const device::u32* kv_page_indices,
-    const device::u32* kv_page_indptr,
-    const device::u32* kv_last_page_lens,
-    const device::u32* w_page,
-    const device::u32* w_off,
-    const device::u8* row_valid,
-    const device::u32* win_d,
-    int n_max,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int page_size,
-    bool hnd_layout,
-    float theta,
-    float eps,
-    cudaStream_t stream)
-{
-    qkv_decode_fused_dispatch(
-        packed, q_out, k_pages, v_pages, q_weight, k_weight,
-        positions, rope_table,
-        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        w_page, w_off, row_valid, win_d,
-        n_max, num_q_heads, num_kv_heads, head_dim,
-        page_size, hnd_layout, theta, eps, stream);
-}
+// `qkv_decode_qk_norm_rope_write_kv_bf16_devwin` WAS HERE, and it is
+// deleted -- the `Backlog` keeper in `driver-cuda/tests/launch_abi.rs`
+// closed.
+//
+// That entry said in full: "Nothing holds them. They are deletions waiting
+// for their evidence." The evidence is that `Backlog` was already the
+// checked claim -- the test asserts a `Backlog` body holds no `<<<>>>`, and
+// this one held none -- plus the audit finding no caller on any channel. A
+// `Backlog` that stays a `Backlog` is an exception list doing the thing it
+// exists to stop.
 
 void qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
     const void* packed,

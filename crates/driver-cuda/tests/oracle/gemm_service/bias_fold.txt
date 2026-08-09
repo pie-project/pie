@@ -1,0 +1,8 @@
+fold n=32 k=2048 fused=40fed13144c1db28 split=40fed13144c1db28 differing=0 of 32
+fold n=2048 k=4096 fused=5c59eede28e0499d split=5c59eede28e0499d differing=0 of 2048
+fold n=4096 k=2048 fused=a5cd27ff63f3befc split=a5cd27ff63f3befc differing=0 of 4096
+fold n=8192 k=2048 fused=7ec8144958155be8 split=7ec8144958155be8 differing=0 of 8192
+fold n=1 k=8 fused=090fb807b5a79b14 split=090fb807b5a79b14 differing=0 of 1
+fold n=5 k=7 REFUSED-BOTH
+fold n=33 k=129 REFUSED-BOTH
+fold n=128 k=64 fused=80670fd6db7148ef split=80670fd6db7148ef differing=0 of 128

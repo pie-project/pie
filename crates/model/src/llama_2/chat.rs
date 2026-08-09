@@ -122,6 +122,7 @@ impl Instruct for LlamaInstruct {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instruct::{ChatEvent, ReasoningEvent, ToolEvent};
     use std::sync::Arc;
     use tokenizer::Tokenizer;
 
@@ -187,6 +188,85 @@ mod tests {
              Hello</s>\
              [INST] Hello [/INST]"
         );
+    }
+
+    /// What ends a turn is the SAME tokens whichever way the turn ends.
+    ///
+    /// `assistant` closes a turn the caller supplies; `seal` closes one the
+    /// model generated. Two spellings of the stop sequence would mean a
+    /// replayed conversation and a live one carry different bytes at the
+    /// turn boundary, and the model would see a context that no training
+    /// example looks like -- at exactly the position it is deciding whether
+    /// to keep going.
+    #[test]
+    fn a_turn_ends_the_same_way_whether_the_caller_or_the_model_closed_it() {
+        let inst = llama2();
+        let sealed = inst.seal();
+        assert!(!sealed.is_empty(), "a seal that stops nothing");
+        assert_eq!(inst.tokenizer.decode(&sealed, false), "</s>");
+        assert_eq!(
+            inst.assistant("Hello"),
+            [inst.tokenizer.encode("Hello"), sealed].concat(),
+            "the turn the caller closes and the one the model closes differ"
+        );
+    }
+
+    /// The chat decoder stops at the same token `seal` writes.
+    ///
+    /// The decoder is the READING half of the template the rest of this
+    /// file writes. If it stopped at a different token the model would keep
+    /// generating past its own end -- into text it has no turn structure
+    /// for -- and the caller would receive it as part of the answer.
+    #[test]
+    fn the_chat_decoder_stops_where_the_template_says_a_turn_ends() {
+        let inst = llama2();
+        let mut decoder = inst.chat_decoder();
+        let hello = inst.tokenizer.encode("Hello");
+        assert!(
+            matches!(decoder.feed(&hello), ChatEvent::Delta(text) if text == "Hello"),
+            "ordinary text is not a stop"
+        );
+        let done = decoder.feed(&inst.seal());
+        assert!(
+            matches!(&done, ChatEvent::Done(text) if text == "Hello"),
+            "the decoder did not stop at the template's own stop token: \
+             {done:?}"
+        );
+
+        // And `reset` really returns it to the start, rather than leaving
+        // the finished text to be prepended to the next request's answer.
+        decoder.reset();
+        assert!(matches!(decoder.feed(&hello), ChatEvent::Delta(text) if text == "Hello"));
+    }
+
+    /// Llama 2 has no reasoning protocol and no tool protocol, and the two
+    /// decoders say so on every token.
+    ///
+    /// This is not an omission to be filled in later. `equip` returns
+    /// nothing, so the model is never TOLD how to call a tool; a decoder
+    /// that nevertheless reported a call would be reporting one the model
+    /// was never taught to make, from text that happens to look like one.
+    /// The same for a reasoning block: `<think>` in a llama-2 answer is
+    /// prose the user asked for.
+    #[test]
+    fn llama_2_has_no_reasoning_and_no_tools_on_any_token() {
+        let inst = llama2();
+        let mut reasoning = inst.reasoning_decoder();
+        let mut tools = inst.tool_decoder();
+        // Text that a family WITH either protocol would react to.
+        for chunk in ["<think>", "Hello", "</think>", "[TOOL_CALLS]", "</s>"] {
+            let tokens = inst.tokenizer.encode(chunk);
+            assert!(
+                matches!(reasoning.feed(&tokens), ReasoningEvent::Delta(text) if text.is_empty()),
+                "`{chunk}` was read as reasoning"
+            );
+            assert!(
+                matches!(tools.feed(&tokens), ToolEvent::Start),
+                "`{chunk}` was read as a tool call"
+            );
+        }
+        reasoning.reset();
+        tools.reset();
     }
 
     #[test]

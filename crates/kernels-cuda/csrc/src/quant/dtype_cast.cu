@@ -1,6 +1,6 @@
 //===-- dtype_cast.cu - the ahead-of-time entry points -------------------===//
 //
-// Eleven launchers and no device text. Every `__global__` this file fires
+// Two launchers and no device text. Every `__global__` this file fires
 // lives in `dtype_cast.cuh`, which the JIT compiles from the same bytes --
 // see the header for why the split exists, what each `<<<>>>` became, and
 // which four have no launch rule.
@@ -19,22 +19,29 @@ namespace {
 
 constexpr int BLOCK = 256;
 
-// Marlin requires N to be a multiple of the 64-wide tile, which is also the
-// permutation's period.
-constexpr int MARLIN_GROUP_PERM_LEN = 64;
 
 }  // namespace
 
-void cast_fp16_to_bf16(
-    const void* src_fp16, void* dst_bf16,
-    std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    device::cast_f16_to<device::bf16><<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const device::f16*>(src_fp16),
-        static_cast<device::bf16*>(dst_bf16), n);
-}
+// # Nine of eleven launchers went, and only two entry points were ever used
+//
+// §43 deleted `cast_fp16_to_bf16`, `cast_bf16_to_fp32`, `cast_e8m0_to_fp32`,
+// `scale_bf16`, `scale_fp32`, `scale_fp16`, `marlin_permute_scales_bf16`,
+// `awq_dequant_to_bf16` and `gptq_dequant_to_bf16`. `MARLIN_GROUP_PERM_LEN`
+// went with the permute launcher, its only reader.
+//
+// The header above used to say "none of these entry points is going away"
+// because `model-loader` names two of them. It names exactly two:
+// `pie_k_quant_cast_fp32_to_bf16` and `scale_rows_bf16`, and those two stay.
+// The sentence was true about the file and false about the other nine -- the
+// §28 error at file granularity.
+//
+// Four of the nine are still jobs: `cast_bf16_to_fp32`, `cast_e8m0_to_fp32`,
+// `scale_bf16` and `scale_fp32` have rows in `families::quant`, which fires
+// the templates in `quant/dtype_cast.cuh` under NVRTC. The other five --
+// `cast_fp16_to_bf16`, `scale_fp16`, the Marlin permute and the AWQ/GPTQ
+// dequantisers -- have no row and no caller in any language; the AWQ and
+// GPTQ templates stay in the `.cuh`, where `families::quant` documents their
+// two-dimensional blocks as the reason they carry no rule.
 
 void cast_fp32_to_bf16(
     const void* src_fp32, void* dst_bf16,
@@ -47,129 +54,6 @@ void cast_fp32_to_bf16(
         static_cast<device::bf16*>(dst_bf16), n);
 }
 
-void cast_bf16_to_fp32(
-    const void* src_bf16, void* dst_fp32,
-    std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    device::cast_to_f32<device::bf16><<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(src_bf16),
-        static_cast<float*>(dst_fp32), n);
-}
-
-void cast_e8m0_to_fp32(
-    const void* src_e8m0, void* dst_fp32,
-    std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    device::cast_e8m0_to<device::f32><<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const device::u8*>(src_e8m0),
-        static_cast<float*>(dst_fp32), n);
-}
-
-void scale_bf16(
-    const void* src_bf16, void* dst_bf16,
-    std::size_t n, float factor, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    device::scale<device::bf16><<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const device::bf16*>(src_bf16),
-        static_cast<device::bf16*>(dst_bf16), n, factor);
-}
-
-void scale_fp32(
-    const void* src_fp32, void* dst_fp32,
-    std::size_t n, float factor, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    device::scale<device::f32><<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const float*>(src_fp32),
-        static_cast<float*>(dst_fp32), n, factor);
-}
-
-void scale_fp16(
-    const void* src_fp16, void* dst_fp16,
-    std::size_t n, float factor, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    device::scale<device::f16><<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const device::f16*>(src_fp16),
-        static_cast<device::f16*>(dst_fp16), n, factor);
-}
-
-void marlin_permute_scales_bf16(
-    void* bf16_scales,
-    int groups, int size_n, int group_size, int size_k,
-    cudaStream_t stream)
-{
-    if (groups == 0 || size_n == 0) return;
-    if (size_n % MARLIN_GROUP_PERM_LEN != 0) {
-        // Marlin requires N multiple of 64 (tile_n_size). Caller
-        // should have validated.
-        return;
-    }
-    const std::size_t total = static_cast<std::size_t>(groups) * size_n;
-    if (total % MARLIN_GROUP_PERM_LEN != 0) return;
-    const int total64 = static_cast<int>(total / MARLIN_GROUP_PERM_LEN);
-
-    if (group_size > 0 && group_size < size_k) {
-        // Per-group case (group_size=128 etc).
-        device::marlin_permute_scales_per_group<<<total64, 64, 0, stream>>>(
-            static_cast<device::bf16*>(bf16_scales), total64);
-    }
-    // Per-channel uses a different perm — skip until needed.
-}
-
-void awq_dequant_to_bf16(
-    const void* qweight_in,
-    const void* qzeros_in,
-    const void* scales_in,
-    void*       bf16_out,
-    int         size_k,
-    int         size_n,
-    int         group_size,
-    cudaStream_t stream)
-{
-    if (size_k == 0 || size_n == 0 || group_size == 0) return;
-    constexpr int BX = 32, BY = 8;
-    const dim3 block(BX, BY);
-    const dim3 grid((size_n + BX - 1) / BX, (size_k + BY - 1) / BY);
-    device::awq_dequant_to_bf16<<<grid, block, 0, stream>>>(
-        static_cast<const device::u32*>(qweight_in),
-        static_cast<const device::u32*>(qzeros_in),
-        static_cast<const device::bf16*>(scales_in),
-        static_cast<device::bf16*>(bf16_out),
-        size_k, size_n, group_size);
-}
-
-void gptq_dequant_to_bf16(
-    const void* qweight_in,
-    const void* qzeros_in,
-    const void* scales_in,
-    const void* g_idx_in,
-    void*       bf16_out,
-    int         size_k,
-    int         size_n,
-    int         group_size,
-    cudaStream_t stream)
-{
-    if (size_k == 0 || size_n == 0 || group_size == 0) return;
-    constexpr int BX = 32, BY = 8;
-    const dim3 block(BX, BY);
-    const dim3 grid((size_n + BX - 1) / BX, (size_k + BY - 1) / BY);
-    device::gptq_dequant_to_bf16<<<grid, block, 0, stream>>>(
-        static_cast<const device::u32*>(qweight_in),
-        static_cast<const device::u32*>(qzeros_in),
-        static_cast<const device::bf16*>(scales_in),
-        static_cast<const device::i32*>(g_idx_in),
-        static_cast<device::bf16*>(bf16_out),
-        size_k, size_n, group_size);
-}
 
 void scale_rows_bf16(
     void*         buf_bf16,

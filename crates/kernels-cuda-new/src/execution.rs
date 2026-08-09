@@ -568,12 +568,15 @@ pub static SERVED: &[(&str, Service, &str)] = &[
     // ours from three places (`:544`, `:962`, `:2356` reach `gemv.cu`;
     // `:1814`, `:1855`, `:1912`, `:2085`, `:2122`, `:2263` reach `quant::`;
     // `:2130`, `:2224` reach `norm::residual_add_bf16`; `:2393` reaches
-    // `norm::add_bias_bf16`). The five below are the entry points whose
+    // `norm::add_bias_bf16`). The four below are the entry points whose
     // bodies reach NONE of them.
     ("gemm::act_x_wt_bf16_out_fp32",       Service::Cublas,
      "one `cublasGemmEx`, bf16 in / fp32 out; `gemm.cpp:1030-1058` is the whole body"),
-    ("gemm::batched_act_x_wt_bf16",        Service::Cublas,
-     "`cublasGemmGroupedBatchedEx`, falling back to `cublasGemmBatchedEx` when the grouped entry has no algorithm for the shape; `gemm.cpp:1145-1241`. Both arms are the library's"),
+    // `gemm::batched_act_x_wt_bf16` WAS HERE. The service was real --
+    // `gemm.cpp:1145-1241` is `cublasGemmGroupedBatchedEx` falling back to
+    // `cublasGemmBatchedEx`, both arms the library's -- and the row is gone
+    // anyway (`new-horizon.md` §38), because nothing asked for it. A true
+    // statement about a launcher is not a statement that anything calls it.
     ("gemm::grouped_act_x_wt_bf16",        Service::Cublas,
      "one `cublasGemmGroupedBatchedEx`; `gemm.cpp:1242-1294`. Measured, not read: it is CLASSIC cuBLAS, not the cuBLASLt the previous entry claimed"),
     ("gemm::mla_absorb_q_to_latent_bf16",  Service::Cublas,
@@ -611,9 +614,9 @@ pub static SERVED: &[(&str, Service, &str)] = &[
     // in-repo copy of `flashinfer/comm/vllm_custom_all_reduce.cuh` or
     // `flashinfer/comm/trtllm_allreduce_fusion.cuh`.
     ("comm::all_reduce_bf16",                   Service::CustomAllReduce,
-     "`car->all_reduce_bf16` -> `impl_->allreduce<__nv_bfloat16>`, vLLM's one/two-shot NVLink kernel; `custom_all_reduce.cu:641-658`, header fetched not vendored. A null `car` is a REFUSAL, not a fallback (`custom_all_reduce.hpp:167-177`)"),
+     "`car->all_reduce_bf16` -> `impl_->allreduce<__nv_bfloat16>`, vLLM's one/two-shot NVLink kernel; `custom_all_reduce.cu:603-621`, header fetched not vendored. A null `car` is a REFUSAL, not a fallback (`custom_all_reduce.hpp:167-177`)"),
     ("comm::all_reduce_residual_rmsnorm_bf16",  Service::CustomAllReduce,
-     "`flashinfer::trtllm_allreduce_fusion`'s `kARResidualRMSNorm` pattern; `custom_all_reduce.cu:661-700`. Throws when `can_fuse_residual_rmsnorm` is false -- the fused landing IS this kernel and there is no other way to spell it"),
+     "`flashinfer::trtllm_allreduce_fusion`'s `kARResidualRMSNorm` pattern; `custom_all_reduce.cu:623-662`. Throws when `can_fuse_residual_rmsnorm` is false -- the fused landing IS this kernel and there is no other way to spell it"),
 
     // ── the driver itself ─────────────────────────────────────────────────
     //
@@ -628,6 +631,75 @@ pub static SERVED: &[(&str, Service, &str)] = &[
      "the load half of the same trio, moving the stash back into the workspace"),
     ("pie_lora_qkv_correction",   Service::DriverOp,
      "the driver's own arm: `bind/mod.rs:1895` calls `(*state).apply(ctx.cublas, ...)`, a staged LoRA apply built out of grouped GEMM calls the driver already had. With no adapters staged it does NOTHING, which is an answer a `__global__` could not give"),
+];
+
+/// **The rows the DRIVER executes, in Rust — the consumer side of the
+/// classification above.**
+///
+/// [`SERVED`] and [`COMPOSED`] are *findings*: they say what a body IS. This
+/// list is an *instruction*: it says what the driver has taken over. Until
+/// §45 the two were the same size as each other and zero as an effect,
+/// because every one of those bodies was still called from `gemm/gemm.cpp`
+/// — and a C++ translation unit calling a C++ launcher is a composition no
+/// Rust dispatch can intercept.
+///
+/// # What being on this list does
+///
+/// Exactly what being in `JIT_DISPATCHED` does, one door over:
+///
+/// * [`crate::abi::emit_c_shim`] SKIPS the row, so no `pie_k_*` entry is
+///   generated for it, so **the C++ body can be deleted**. That is the whole
+///   mechanism; everything else follows from it.
+/// * `emit_rust_bindings` skips it too, so `launch_bindings.rs` does not
+///   declare an entry point the archive no longer defines —
+///   `driver-cuda/build.rs`'s "a declaration with no definition is only
+///   legitimate for a routed row" check would otherwise fire, correctly.
+/// * [`crate::abi::emit_rust_dispatch`] writes the row's arm against
+///   `driver-cuda`'s `bind::service` instead of against `bind::abi::ffi`,
+///   from the SAME operand list, with the same guard and the same staging.
+///
+/// # What it must not do
+///
+/// **The model compiler must not be able to tell whether a symbol is cuBLAS
+/// or a JIT'd kernel.** Nothing reads this list above the dispatcher: not a
+/// lowering, not a `Ty`, not a `KernelSig`. A row moving onto it changes
+/// which module the generated arm names and nothing else, which is why the
+/// four cuBLAS rows below kept their operand lists verbatim when they moved
+/// — minus the `handle`, because a handle is the SERVICE's, not the
+/// statement's, and `Ty::CublasHandle` in a row is the vocabulary leaking
+/// one backend's library into a table two backends share.
+///
+/// # Why it is a separate list and not `service(sym).is_some()`
+///
+/// Because most of [`SERVED`] must NOT be skipped. `comm::all_reduce_bf16`
+/// and `comm::all_reduce_residual_rmsnorm_bf16` are `Service::CustomAllReduce`
+/// and their shim entries are live; `moe::flashinfer_cutlass_moe_bf16` is
+/// CUTLASS in a C++ file this crate compiles. Dropping their entries because
+/// the classification is true of them would delete the only path they have.
+/// A finding is not a plan.
+///
+/// # The invariant
+///
+/// Every symbol here is in [`SERVED`] or [`COMPOSED`] — you may not take over
+/// a row whose execution has not been classified — and `tests::` below
+/// asserts it. The other half of the invariant, that `driver-cuda` actually
+/// spells a function for each, is asserted in `driver-cuda`'s own
+/// `bind::service`, which is the crate that would fail to compile.
+pub static RUST_SERVED: &[&str] = &[
+    // The four pure-cuBLAS bodies. Each is one library call and argument
+    // assembly; `bind/service.rs` is that assembly in Rust, ~130 lines of
+    // C++ for ~120 of Rust and no third place for the transposes to live.
+    "gemm::act_x_wt_bf16_out_fp32",
+    "gemm::grouped_act_x_wt_bf16",
+    "gemm::mla_absorb_q_to_latent_bf16",
+    "gemm::mla_absorb_latent_to_v_bf16",
+    // The composition [`COMPOSED`] already stated, executed. This one is
+    // here for a reason the other four are not: `gemm.cpp:2393` called
+    // `norm::add_bias_bf16`, a row of OURS that is already migrated, and
+    // while that call existed the row could not be routed and
+    // `norm/add_bias.cuh` could not be its only copy. Taking the composition
+    // over is what frees it.
+    "gemm::act_x_wt_bias_bf16",
 ];
 
 /// The service that executes a symbol, if a service does.
@@ -1005,5 +1077,46 @@ mod tests {
         // The real one: an op whose steps reach a service is still an op.
         let composed = super::composition("gemm::act_x_wt_bias_bf16").expect("the demonstration case");
         assert_eq!(Execution::Composed(composed.steps).kind(), Kind::Op);
+    }
+
+    /// A ROW MAY NOT BE TAKEN OVER BEFORE IT IS CLASSIFIED.
+    ///
+    /// [`RUST_SERVED`] is what drops a shim entry, and dropping one is what
+    /// lets the C++ body be deleted. Doing that to a row whose execution
+    /// nobody has written down is deleting a body on a hunch — precisely the
+    /// move `SERVED`'s own header refuses ("a finding is not a plan", and
+    /// neither is a plan a finding). Every symbol on the list must appear in
+    /// [`SERVED`] or [`COMPOSED`] first, with its citation.
+    #[test]
+    fn every_taken_over_row_was_classified_first() {
+        for symbol in super::RUST_SERVED {
+            assert!(
+                super::service(symbol).is_some() || super::composition(symbol).is_some(),
+                "`RUST_SERVED` names `{symbol}`, which is in neither `SERVED` nor `COMPOSED`. \
+                 The list drops the row's shim entry, so the C++ body goes -- state what the \
+                 body IS, with the file and line, before taking it over."
+            );
+        }
+    }
+
+    /// A ROW TAKEN OVER MUST HAVE HAD SOMETHING TO TAKE.
+    ///
+    /// `emit_c_shim` only ever emitted entries for STATED rows — those with
+    /// operands. Naming an unstated row here would drop nothing, generate
+    /// nothing, and read like a migration that happened. It is a typo in a
+    /// string literal, which is the failure mode a list of symbols has.
+    #[test]
+    fn every_taken_over_row_is_stated() {
+        for symbol in super::RUST_SERVED {
+            let sig = crate::table::sig(symbol).unwrap_or_else(|| {
+                panic!("`RUST_SERVED` names `{symbol}`, which is in no family table")
+            });
+            assert!(
+                !sig.operands.is_empty(),
+                "`RUST_SERVED` names `{symbol}`, whose row states no operands. `emit_c_shim` \
+                 never emitted an entry for it, so taking it over drops nothing and the C++ \
+                 -- if any exists -- stays."
+            );
+        }
     }
 }
