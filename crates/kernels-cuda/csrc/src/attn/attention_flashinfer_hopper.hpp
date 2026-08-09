@@ -69,6 +69,25 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
     // the outputs stay per-request, only the input is shared.
     bool broadcast_q = false);
 
+// DECLARED HERE AND DEFINED NOWHERE, as of the pass that emptied this
+// directory of everything but XQA and MLA.
+//
+// `attention_merge_states.cu` held the only definition — one call to
+// flashinfer's cascade `MergeStates` — and it is deleted, because
+// `attn::merge_attention_states_bf16` lost its `table::attn` row to §38 and
+// the body had been unreachable ever since. The declaration is kept, and
+// kept HERE rather than moved, for two reasons: it is the argument list a
+// re-added row has to match, and `attention_flashinfer_common.cuh` still
+// includes this header (it has no compiler now, but it is the anchor forty
+// Rust doc comments cite by line).
+//
+// A declaration with no definition is legal until something ODR-uses it, and
+// nothing does. If you are re-adding this: the row wants a RUST body over
+// `flashinfer/attention/cascade.cuh`, which `kernels-cuda-new/csrc/vendor`
+// already carries, and it must not be arch-gated — the decode KV-split path
+// reaches a merge on every architecture, which is the sm_100 defect the
+// deleted file's header recorded at length.
+//
 // Folds `num_index_sets` partial attention outputs and their log-sum-exps into
 // one. Wraps flashinfer's cascade `MergeStates`; `v` is
 // [num_index_sets, seq_len, num_heads, head_dim] bf16 and `s` the matching

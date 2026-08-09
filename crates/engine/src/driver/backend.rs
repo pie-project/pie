@@ -152,6 +152,51 @@ pub mod open {
     }
 }
 
+/// Settle a control op that has already finished by the time it returns.
+///
+/// A host-side driver -- one whose memory is coherent, so `copy_kv` is a
+/// `memmove` and `resize_pool` is an allocation -- has done the work before
+/// the verb returns. The asynchronous seams hand the whole `CompletionTarget`
+/// to whoever finishes: CUDA to its shell, `remote` to its RPC task. There is
+/// nobody here to hand it to, so this seam must do both halves itself.
+///
+/// BOTH, and in this order. `control_completion` mints a completion carrying
+/// a TERMINAL CELL, and the engine resolves the op by reading it, so a notify
+/// without a publish trips the engine's own check on the way out ("driver
+/// callback published before terminal outcome settled"). A publish without a
+/// notify is the failure this function exists for: a fork hung a real
+/// `pie run` for 850 seconds, and the scheduler's watchdog named it
+/// `in_flight_control: KV copy pipeline Some(..) settled=false`.
+///
+/// Free rather than a method because nothing in it needs a device, which is
+/// what lets a test check the order of two writes without building an
+/// adapter.
+///
+/// Three seams share it. The Metal one is the last to take it and had the
+/// defect in all three of its control verbs -- `copy_kv`, `copy_state` and
+/// `resize_pool` each minted a completion and dropped the target -- which is
+/// the same shape the Vulkan seam's own doc records having fixed.
+#[cfg(any(
+    feature = "driver-vulkan",
+    feature = "driver-wgpu",
+    all(feature = "driver-metal", target_vendor = "apple")
+))]
+pub(crate) fn settle_control(
+    broker: &driver_api::CompletionBroker,
+) -> driver_api::SubmissionCompletion {
+    let (raw, completion) = broker.control_completion(1);
+    if !raw.terminal_cell.is_null() {
+        // SAFETY: the broker owns this cell for the life of the completion it
+        // was minted with, and `publish` is a release store into an
+        // `AtomicU32` the engine only ever reads.
+        unsafe {
+            (*raw.terminal_cell).publish(driver_api::PIE_TERMINAL_OUTCOME_SUCCESS);
+        }
+    }
+    broker.notify(completion.wait_id(), raw.target_epoch);
+    completion
+}
+
 #[cfg(feature = "driver-cuda")]
 mod cuda;
 #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
@@ -245,6 +290,60 @@ pub fn unregister_driver(driver_id: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "driver-vulkan", feature = "driver-wgpu"))]
+    use super::settle_control;
+
+    /// A control op that has already happened settles its completion here.
+    ///
+    /// Lives beside [`super::settle_control`] rather than in a seam, because
+    /// both host-side seams call it and either feature alone should run it.
+    ///
+    /// # The two ways to get this wrong, both measured
+    ///
+    /// A `control_completion` carries a TERMINAL CELL and the engine resolves
+    /// the op by reading it -- unlike `launch_completion`, which carries none
+    /// because a frame answers per member. The asynchronous backends hand the
+    /// whole target to whatever finishes the work; a host-side driver has
+    /// nobody to hand it to, so it publishes and notifies itself.
+    ///
+    /// * Neither: a fork hung a real `pie run` for 850 s, with the scheduler's
+    ///   watchdog naming it exactly -- `in_flight_control: KV copy ...
+    ///   settled=false`.
+    /// * Notify without publishing: the engine catches the ordering on the way
+    ///   out -- `driver callback published before terminal outcome settled` --
+    ///   which is how the order became legible at all.
+    ///
+    /// So the test asserts the STATE, not the call: after `settled_control`
+    /// the completion answers `is_settled`, and its cell holds SUCCESS rather
+    /// than `Pending`. Either omission fails it.
+    #[test]
+    #[cfg(any(feature = "driver-vulkan", feature = "driver-wgpu"))]
+    fn a_control_op_that_already_happened_publishes_then_notifies() {
+        let broker = ::driver_api::CompletionBroker::new();
+        let completion = settle_control(&broker);
+        assert!(
+            completion.is_settled(),
+            "an op whose work is already done must hand back a settled \
+             completion; an unsettled one parks the scheduler forever"
+        );
+        assert!(
+            completion.check().is_some_and(|r| r.is_ok()),
+            "and it settled as a success, not as a failure"
+        );
+        let cell = completion
+            .terminal_cell_ptr()
+            .expect("a control completion carries a terminal cell");
+        // SAFETY: the broker owns the cell for the life of the completion,
+        // which this frame holds.
+        let outcome = unsafe { (*cell).load() };
+        assert_eq!(
+            outcome,
+            ::driver_api::PIE_TERMINAL_OUTCOME_SUCCESS,
+            "the cell the engine reads must say the op ran; `Pending` is what \
+             an untouched cell holds and it is a failure, not a silence"
+        );
+    }
+
     /// Every verb of the wgpu seam is reachable through `dyn Driver`, with no
     /// adapter, and each one either serves or refuses in words.
     ///

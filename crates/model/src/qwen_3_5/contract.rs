@@ -77,8 +77,8 @@ fn gdn_kkv_blocked(b: &Builder<'_>, raw: &RawTensor, k_dim: i64, v_dim: i64) -> 
 
 /// Shard the Gated DeltaNet tensors whose leading axis stacks `[K | K | V]`.
 ///
-/// `linear_attn.in_proj_qkv.weight`, `conv1d.weight` and `conv1d.bias` all
-/// stack two key blocks and one value block on axis 0. Take each block's
+/// `linear_attn.in_proj_qkv.weight` and `conv1d.weight` both stack two key
+/// blocks and one value block on axis 0. Take each block's
 /// band and join them: every rank gets its own `[K/T | K/T | V/T]`, which is
 /// what the GDN kernels address. Without this the loader has no shard axis
 /// for these names and leaves them replicated, so every rank loads the whole
@@ -108,7 +108,7 @@ fn gdn_kkv_blocked_shards(b: &mut Builder<'_>) -> Result<(), Error> {
             continue;
         }
         let k_dim = (conv_dim - v_dim) / 2;
-        for leaf in ["in_proj_qkv.weight", "conv1d.weight", "conv1d.bias"] {
+        for leaf in ["in_proj_qkv.weight", "conv1d.weight"] {
             let Some(raw) = b.find(&b.source_name(&format!("{la}{leaf}"))) else {
                 continue;
             };
@@ -374,7 +374,6 @@ mod tests {
             .push(&format!("{LA}in_proj_qkv.weight"), &[conv, HIDDEN], bf16())
             .push(&format!("{LA}in_proj_z.weight"), &[V, HIDDEN], bf16())
             .push(&format!("{LA}conv1d.weight"), &[conv, 1, 4], bf16())
-            .push(&format!("{LA}conv1d.bias"), &[conv], bf16())
             .push(&format!("{LA}A_log"), &[V], f32e())
             .push(&format!("{LA}norm.weight"), &[V], bf16())
             .push(&format!("{LA}dt_bias"), &[V], bf16())
@@ -451,7 +450,6 @@ mod tests {
         for (name, trailing) in [
             (format!("{LA}in_proj_qkv.weight"), vec![HIDDEN]),
             (format!("{LA}conv1d.weight"), vec![1, 4]),
-            (format!("{LA}conv1d.bias"), Vec::new()),
         ] {
             let mut expected = vec![K + V / 2];
             expected.extend(trailing);
@@ -522,12 +520,12 @@ mod tests {
         let ck = Ck::new()
             .push(&format!("{LA}in_proj_qkv.weight"), &[conv, HIDDEN], bf16())
             .push(&format!("{LA}in_proj_z.weight"), &[V, HIDDEN], bf16())
-            .push(&format!("{LA}conv1d.bias"), &[conv + 8], bf16())
+            .push(&format!("{LA}conv1d.weight"), &[conv + 8, 1, 4], bf16())
             .push("model.norm.weight", &[HIDDEN], bf16());
         let contract = dense(ck, 2).expect("the fixture authors");
         assert_eq!(
-            shape_of(&contract, &format!("{LA}conv1d.bias")),
-            Some(&vec![conv + 8]),
+            shape_of(&contract, &format!("{LA}conv1d.weight")),
+            Some(&vec![conv + 8, 1, 4]),
             "left to the generic rule"
         );
     }

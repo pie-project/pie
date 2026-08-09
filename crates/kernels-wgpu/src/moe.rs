@@ -31,6 +31,13 @@ pub static KERNELS: &[KernelSig] = &[
     ]),
     kernel!(route_gather "route_gather", file = Some("moe/route.wgsl"),
     launch = kernels::LaunchRule::RouteRows,
+    // This statement's rows are the SORTED STACK, not the fire's tokens --
+    // `MoeRouteParams::padded`, the fifth word. It shares `RouteRows` with
+    // `combine_sorted`, whose rows ARE the fire's, which is why the extent is
+    // stated on the row and not decided by the rule. Given the fire's count
+    // the gather ran over a quarter of its own output at `top_k = 4` and left
+    // the rest whatever the arena held.
+    rows_param = Some(4),
     operands = kernels::operands![
         x: Buf <- kernels::Source::In(0),
         out: BufMut <- kernels::Source::Out(0),
@@ -87,6 +94,11 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(mxfp4_qmv_routed_bias "mxfp4_qmv_routed_bias",
     file = Some("quant/qmv.wgsl"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The matvec's row axis is `out_vec_size`, the second word, and not the
+    // output rectangle's width: a routed projection writes a whole token's
+    // `k` results end to end, so the value is `k` times as wide as one
+    // result. See `dsl::metal::routed_qmv`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
@@ -124,6 +136,11 @@ pub static KERNELS: &[KernelSig] = &[
     // shader compiler.
     kernel!(qmv_routed "affine_qmv_routed", file = Some("quant/qmv.wgsl"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The matvec's row axis is `out_vec_size`, the second word, and not the
+    // output rectangle's width: a routed projection writes a whole token's
+    // `k` results end to end, so the value is `k` times as wide as one
+    // result. See `dsl::metal::routed_qmv`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
@@ -145,6 +162,11 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in quantized_qmv.wgsl
     kernel!(qmv_routed_bias "affine_qmv_routed_bias", file = Some("quant/qmv.wgsl"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The matvec's row axis is `out_vec_size`, the second word, and not the
+    // output rectangle's width: a routed projection writes a whole token's
+    // `k` results end to end, so the value is `k` times as wide as one
+    // result. See `dsl::metal::routed_qmv`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),

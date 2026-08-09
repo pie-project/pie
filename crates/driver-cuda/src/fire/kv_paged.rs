@@ -201,7 +201,7 @@ pub unsafe fn write_kv_explicit_bf16_devwin(
     // host-window form." The host-window form is
     // `attn::write_kv_explicit_bf16`, which calls
     // `kernels::layout::launch_envelope_merge_written_bf16` after its append
-    // and which `families::layout` refuses a row for.
+    // and which `x::layout::envelope` refuses a row for.
     assert!(
         !layer.has_envelopes(),
         "attn::write_kv_explicit_bf16_devwin: envelope maintenance not yet \
@@ -762,8 +762,8 @@ pub unsafe fn copy_kv_cells_bf16(
 /// nothing measures it** — blocks past a request's real page span early out
 /// in the kernel — which is exactly why no `LaunchRule` states the grid it
 /// feeds. It is public because it is the whole reason
-/// [`super::envelope::update_appended`] takes a `max_touched` it cannot
-/// derive.
+/// [`kernels_cuda_new::x::layout::envelope_update_appended`] takes a
+/// `max_touched` it cannot derive.
 ///
 /// Returns zero when `page_size <= 0`, which is a layer the callers below
 /// have already declined on.
@@ -914,14 +914,14 @@ pub unsafe fn write_kv_to_pages_bf16(
     // ordered behind the pages it describes.
     if layer.has_envelopes() && !layer.hnd_layout && total_tokens > 0 {
         let _ = unsafe {
-            super::envelope::update_appended(
+            kernels_cuda_new::x::layout::envelope_update_appended(
                 layer.k_pages.cast(),
                 qo_indptr,
                 kv_page_indices,
                 kv_page_indptr,
                 kv_last_page_lens,
-                layer.k_env_min,
-                layer.k_env_max,
+                layer.k_env_min.cast(),
+                layer.k_env_max.cast(),
                 num_requests,
                 max_touched_pages(total_tokens, num_requests, layer.page_size),
                 layer.page_size,
@@ -1040,8 +1040,10 @@ pub unsafe fn write_kv_to_pages(
 ///
 /// `kv_paged.cu:339-347`. **The CSR-derived path cannot be reused** — there
 /// is no page list here — so this one calls
-/// [`super::envelope::merge_written`] with the per-row descriptor instead of
-/// [`super::envelope::update_appended`] with the page CSR. That is the whole
+/// [`kernels_cuda_new::x::layout::envelope_merge_written`] with the per-row
+/// descriptor instead of
+/// [`kernels_cuda_new::x::layout::envelope_update_appended`] with the page
+/// CSR. That is the whole
 /// reason the envelope tier has two merge points and not one.
 ///
 /// # Panics
@@ -1106,13 +1108,13 @@ pub unsafe fn write_kv_explicit_bf16(
     // `w_page`/`w_off` say where each one landed.
     if layer.has_envelopes() && !layer.hnd_layout {
         let _ = unsafe {
-            super::envelope::merge_written(
+            kernels_cuda_new::x::layout::envelope_merge_written(
                 k_curr.cast(),
                 w_page,
                 w_off,
-                row_valid,
-                layer.k_env_min,
-                layer.k_env_max,
+                kernels_cuda_new::x::abi::MaybeConst::new(row_valid),
+                layer.k_env_min.cast(),
+                layer.k_env_max.cast(),
                 b,
                 layer.num_kv_heads,
                 layer.head_dim,

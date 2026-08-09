@@ -1549,3 +1549,294 @@ fn a_frame_the_engine_built_answers_what_the_drivers_own_turns_do() {
          says {why} instead of naming the field"
     );
 }
+
+/// A fork gives the new seat the old one's history, byte for byte.
+///
+/// # Why this is the test forking wants
+///
+/// `Shell::fork` is two halves in two places: `Book::fork` decides which pages
+/// move, and `Pool::copy_page` moves them. Neither half can be checked by
+/// itself -- the book's answer is a list of numbers and the pool's is bytes in
+/// a buffer nobody reads -- and the failure they produce together is the one
+/// this crate is written against: a seat whose pages hold SOME of another
+/// conversation's history answers, fluently, with a blend of two.
+///
+/// So the check is behavioural and needs no oracle. Feed a prompt to seat 1,
+/// fork it to seat 2, then feed BOTH the same next token. Two seats holding
+/// the same history over the same token must produce the same distribution,
+/// EXACTLY -- not within a tolerance, because this is the same arithmetic over
+/// the same bytes on the same device, and anything that makes it differ is a
+/// difference in what was read.
+///
+/// The control is the other direction, and it is what makes the equality mean
+/// something: a seat that was NOT forked, fed only that one token, must
+/// DISAGREE. Without it a fork that copied nothing at all would pass -- two
+/// empty seats also agree.
+#[test]
+fn a_forked_seat_reads_the_history_it_was_given() {
+    let Some(_guard) = gpu() else {
+        return;
+    };
+    let Some(real) = weights() else {
+        return;
+    };
+    // FOUR seats over sixteen pages: the original, its fork, a fork of that
+    // fork, and the control. Sixteen and not eight because a fork here COPIES
+    // -- there is no copy-on-write in this driver -- so every seat costs the
+    // prompt's pages again, and eight of them ran out at the third fork with
+    // `NoPages { wanted: 3, spare: 2 }`.
+    let mut shell = shelled(real, 16);
+    let prompt = prompt();
+
+    let row_of = |step: &driver_wgpu::turns::Step, at: usize| -> Vec<f32> {
+        step.logits
+            .row(step.readout_of[at])
+            .expect("the fire read out the turn it was asked for")
+            .to_vec()
+    };
+
+    // Seat 1 hears the whole prompt.
+    let first = shell
+        .step(&[Turn {
+            who: 1,
+            tokens: prompt.clone(),
+        }])
+        .expect("the prompt fires");
+    let next = argmax(&row_of(&first, 0));
+
+    // Seat 2 is given seat 1's history. The count is asserted because a fork
+    // that moved NOTHING is the failure this whole test is about, and it would
+    // otherwise be indistinguishable from a fork that worked until the
+    // distributions were compared.
+    let moved = shell.fork(1, 2).expect("seat 1 has a history to give");
+    assert!(
+        moved > 0,
+        "a fork of a {}-token conversation moved no pages",
+        prompt.len()
+    );
+
+    // A FORK OF A FORK, taken BEFORE anyone hears the next token so all three
+    // seats hold exactly the same history. `prefix-tree-kv-cache` builds two
+    // levels -- root, two children, four leaves -- so its first leaf is the
+    // first fork taken FROM a seat that was itself a fork, and a book that
+    // handed out a child's pages without noticing they were already shared
+    // would show up there and nowhere else.
+    let deeper = shell.fork(2, 4).expect("a forked seat can be forked");
+    assert!(deeper > 0, "a fork of a fork moved no pages");
+
+    // All three seats hear the same next token, in ONE fire, so any difference
+    // is the cache and not the fire.
+    let both = shell
+        .step(&[
+            Turn {
+                who: 1,
+                tokens: vec![next],
+            },
+            Turn {
+                who: 2,
+                tokens: vec![next],
+            },
+            Turn {
+                who: 4,
+                tokens: vec![next],
+            },
+        ])
+        .expect("all three seats fire");
+    let original = row_of(&both, 0);
+    let forked = row_of(&both, 1);
+    let grandchild = row_of(&both, 2);
+    assert_eq!(
+        original.len(),
+        forked.len(),
+        "two seats of one fire read rows of different widths"
+    );
+    let differing = original
+        .iter()
+        .zip(&forked)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing,
+        0,
+        "the forked seat disagrees with the seat it was forked from in {differing} \
+         of {} channels; argmax {} against {}",
+        original.len(),
+        argmax(&forked),
+        argmax(&original),
+    );
+
+    let differing_again = original
+        .iter()
+        .zip(&grandchild)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing_again,
+        0,
+        "a seat forked FROM a fork disagrees with the seat both came from in \
+         {differing_again} of {} channels",
+        original.len()
+    );
+
+    // THE CONTROL. Seat 3 was never forked, so it hears `next` with no history
+    // at all and must answer something else. If it agrees, this test cannot
+    // tell a copied cache from an ignored one.
+    let alone = shell
+        .step(&[Turn {
+            who: 3,
+            tokens: vec![next],
+        }])
+        .expect("an empty seat fires");
+    let empty = row_of(&alone, 0);
+    let same = empty
+        .iter()
+        .zip(&forked)
+        .filter(|(a, b)| a.to_bits() == b.to_bits())
+        .count();
+    assert!(
+        same < empty.len(),
+        "a seat with NO history answered exactly what the forked seat did, so \
+         this test is comparing the fire with itself rather than the cache"
+    );
+}
+
+/// The prefix tree this driver is asked for, built seat by seat, against a
+/// seat that was never forked at all.
+///
+/// # What this reproduces
+///
+/// `prefix-tree-kv-cache` prefills a common root, forks it, APPENDS to the
+/// fork, forks THAT, and appends again — then generates from the leaves. Its
+/// run through a real `pie serve` dies after the fourth append, which is the
+/// first leaf: the first fork taken from a seat that has itself been forked
+/// AND written to since. `a_forked_seat_reads_the_history_it_was_given` covers
+/// the fork and the fork-of-a-fork; neither of them writes to a seat between
+/// the two forks, and writing is what makes a copied page diverge from the one
+/// it was copied from.
+///
+/// # The reference is not another fork
+///
+/// Seat D hears `root ++ child ++ leaf` in one fire and was never forked, so
+/// it shares no page with anybody. If the tree's leaf agrees with it, every
+/// page the leaf reads holds what the tokens that wrote it put there —
+/// whichever seat wrote them and whichever copy it wrote into. That is the
+/// whole claim, and no oracle is needed for it.
+#[test]
+fn a_two_level_prefix_tree_reads_what_a_seat_that_never_forked_reads() {
+    let Some(_guard) = gpu() else {
+        return;
+    };
+    let Some(real) = weights() else {
+        return;
+    };
+    // A fork COPIES here, so five seats over a 21-token history want room for
+    // five copies of it. Twenty-four pages is that with margin.
+    let mut shell = shelled(real, 24);
+
+    let row_of = |step: &driver_wgpu::turns::Step, at: usize| -> Vec<f32> {
+        step.logits
+            .row(step.readout_of[at])
+            .expect("the fire read out the turn it was asked for")
+            .to_vec()
+    };
+
+    // Three segments of the tree, all different, none a prefix of another.
+    let root: Vec<u32> = prompt().into_iter().take(11).collect();
+    let child: Vec<u32> = (0..5).map(|i| 6_000 + i * 13).collect();
+    let leaf: Vec<u32> = (0..5).map(|i| 7_000 + i * 29).collect();
+
+    // Seat 1 hears the root.
+    shell
+        .step(&[Turn {
+            who: 1,
+            tokens: root.clone(),
+        }])
+        .expect("the root fires");
+
+    // Fork it, and WRITE to the fork. This is the step the other fork test
+    // does not take.
+    assert!(shell.fork(1, 2).expect("the root can be forked") > 0);
+    shell
+        .step(&[Turn {
+            who: 2,
+            tokens: child.clone(),
+        }])
+        .expect("the child fires");
+
+    // Fork the written-to fork, and write to that.
+    assert!(
+        shell.fork(2, 3).expect("the child can be forked") > 0,
+        "a fork of a written-to fork moved no pages"
+    );
+    shell
+        .step(&[Turn {
+            who: 3,
+            tokens: leaf.clone(),
+        }])
+        .expect("the leaf fires");
+
+    // Seat 4 hears the whole path at once and was never forked.
+    let mut whole = root.clone();
+    whole.extend(&child);
+    whole.extend(&leaf);
+    shell
+        .step(&[Turn {
+            who: 4,
+            tokens: whole.clone(),
+        }])
+        .expect("the unforked seat fires");
+
+    // Both hear the same next token, in ONE fire.
+    let next = 1234u32;
+    let both = shell
+        .step(&[
+            Turn {
+                who: 3,
+                tokens: vec![next],
+            },
+            Turn {
+                who: 4,
+                tokens: vec![next],
+            },
+        ])
+        .expect("the leaf and the unforked seat fire");
+    let tree = row_of(&both, 0);
+    let flat = row_of(&both, 1);
+    let differing = tree
+        .iter()
+        .zip(&flat)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing,
+        0,
+        "a leaf of a two-level fork tree disagrees with a seat that heard the \
+         same {} tokens and was never forked, in {differing} of {} channels; \
+         argmax {} against {}",
+        whole.len(),
+        tree.len(),
+        argmax(&tree),
+        argmax(&flat),
+    );
+
+    // THE CONTROL. A seat that heard only the ROOT must disagree, or the
+    // comparison above is insensitive to what the appends wrote.
+    assert!(shell.fork(1, 5).expect("the root can be forked again") > 0);
+    let short = shell
+        .step(&[Turn {
+            who: 5,
+            tokens: vec![next],
+        }])
+        .expect("the short seat fires");
+    let rooted = row_of(&short, 0);
+    let same = rooted
+        .iter()
+        .zip(&tree)
+        .filter(|(a, b)| a.to_bits() == b.to_bits())
+        .count();
+    assert!(
+        same < rooted.len(),
+        "a seat holding only the root answered exactly what the leaf did, so \
+         this test cannot see what the appends wrote"
+    );
+}

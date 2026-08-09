@@ -574,56 +574,82 @@ fn the_five_rows_are_stated_and_hosted() {
 /// naming — five independent witnesses to one grid became two, and three of
 /// the rows below now rest on the two that remain plus the `.cuh`. The
 /// device text those three rows fire is pinned where it now lives, by
-/// `families::norm` and `examples/unit_probe_norm.rs`.
+/// `x::norm` and `examples/unit_probe_norm.rs`.
+///
+/// # This read a function body until §5 step 5, and now it reads a quote
+///
+/// It was `include_str!("../../driver-cuda/src/fire/rmsnorm.rs")`, and it
+/// worked by FINDING a launcher's signature, taking the text to the next
+/// `\n}\n`, and asserting on the body between. That was possible because
+/// `fire/rmsnorm.rs` carried the deleted `norm/rmsnorm.cu`'s launcher bodies
+/// verbatim in its doc comments — it was the archive of a file that was
+/// already gone (`58b31cf1b`).
+///
+/// **`fire/rmsnorm.rs` is deleted too now**, by §5 step 5, and its host
+/// programs are `x::norm`'s. THE MEASUREMENTS SURVIVED; THE BODIES DID NOT.
+/// `x::norm` cites the `<<<>>>` each host program was ported from, line by
+/// line, but it cites the two or three lines that decide the geometry rather
+/// than transcribing whole C++ functions — so there is no `\n}\n` to find and
+/// the extraction cannot be ported.
+///
+/// What is asserted instead is that those citations are still there, one
+/// assertion per measurement, each naming what its loss would cost. A weaker
+/// test than the one it replaces: it proves the number is written down, not
+/// that it is written down inside the right function. The stronger claim now
+/// has a stronger home than a text scan — `x::norm`'s host programs BUILD the
+/// launch, so `both_arms_are_the_launchers_grid` below runs the rule against
+/// the same numbers and a mutation shows up as a wrong `Launch`.
 #[test]
 fn the_launcher_text_is_the_one_these_rows_were_written_from() {
-    const CU: &str = include_str!("../../driver-cuda/src/fire/rmsnorm.rs");
+    const HOST: &str = include_str!("../src/x/norm.rs");
 
-    // `(launcher, the device template it launches)`.
-    const LAUNCHERS: [(&str, &str); 2] = [
-        // `rmsnorm_bf16` is a forward, so its grid is this one's.
-        ("void rmsnorm_strided_bf16(", "device::rmsnorm<device::bf16, BLOCK>"),
-        ("void rmsnorm_gated_fp32_in_bf16(", "device::rmsnorm_gated_f32_in<device::bf16, BLOCK>"),
+    // `(the quoted line, what the row loses if it goes)`.
+    const CITED: [(&str, &str); 5] = [
+        (
+            "`constexpr int BLOCK = 256;`",
+            "`Rule::RowsPerHead`'s `block` is written from that literal, and \
+             `x::norm::BLOCK` is the same 256",
+        ),
+        (
+            "dim3 grid(num_rows);",
+            "`Rule::RowsPerHead`'s whole content is where `num_rows` comes from",
+        ),
+        (
+            "device::rmsnorm<device::bf16, BLOCK><<<grid, block, 0, stream>>>",
+            "`norm::rmsnorm_strided_bf16` and `norm::rmsnorm_bf16` are both \
+             this launch, and the second is the first with `hidden` for both \
+             strides",
+        ),
+        (
+            "device::rmsnorm_gemma<device::bf16, BLOCK><<<grid, block, 0, stream>>>(",
+            "`norm::rmsnorm_gemma_bf16` is the same grid with different \
+             arithmetic, which is the second witness to the 256",
+        ),
+        (
+            "device::rmsnorm_gated_f32_in<device::bf16, 256>",
+            "`norm::rmsnorm_gated_fp32_in_bf16`'s 256 is the launcher's and \
+             not the rule's -- it is the third witness",
+        ),
     ];
 
-    for (launcher, template) in LAUNCHERS {
-        let start = CU
-            .find(launcher)
-            .unwrap_or_else(|| panic!("{launcher} is in driver-cuda/src/fire/rmsnorm.rs"));
-        let body = &CU[start..];
-        let end = body.find("\n}\n").expect("the launcher has an end") + 3;
-        let body = &body[..end];
+    for (line, why) in CITED {
         assert!(
-            body.contains("constexpr int BLOCK = 256;"),
-            "{launcher} no longer launches 256-wide blocks; `Rule::RowsPerHead`'s \
-             `block` is written from that literal"
-        );
-        assert!(
-            body.contains("dim3 grid(num_rows);"),
-            "{launcher} no longer opens `num_rows` blocks; `Rule::RowsPerHead`'s \
-             whole content is where `num_rows` comes from"
-        );
-        assert!(
-            body.contains(&format!("{template}<<<grid, block, 0, stream>>>")),
-            "{launcher} no longer launches {template} over that grid"
+            HOST.contains(line),
+            "`{line}` is no longer quoted in `x/norm.rs`, so {why}"
         );
     }
 
     // The forward the first row cites, so that `rmsnorm_bf16` naming
-    // `rmsnorm_strided_bf16`'s grid is witnessed and not asserted.
-    let start = CU
-        .find("void rmsnorm_bf16(")
-        .expect("`rmsnorm_bf16` is in driver-cuda/src/fire/rmsnorm.rs");
-    let body = &CU[start..];
-    let end = body.find("\n}\n").expect("the launcher has an end") + 3;
-    let forward: String = body[..end].split_whitespace().collect::<Vec<_>>().join(" ");
-    assert_eq!(
-        forward,
-        "void rmsnorm_bf16( const void* x, const void* weight, void* y, int num_rows, \
-         int hidden, float eps, cudaStream_t stream) { rmsnorm_strided_bf16( x, weight, y, \
-         num_rows, hidden, hidden, hidden, eps, stream); }",
-        "`rmsnorm_bf16` is no longer a forward with the width for both strides, which is \
-         what `families::norm`'s first RowsPerHead row states"
+    // `rmsnorm_strided_bf16`'s grid is witnessed and not asserted. The
+    // launcher body that proved it is deleted; what proves it now is that
+    // `x::norm` states the identity as an identity, in the doc comment of
+    // the host program that IS the forward.
+    assert!(
+        HOST.contains("rmsnorm_bf16(…) ==")
+            && HOST.contains("rmsnorm_strided_bf16(…, hidden, hidden, …)"),
+        "`x::norm::unstrided_bf16` no longer states that it is \
+         `rmsnorm_strided_bf16` with the width for both strides, which is what \
+         the first RowsPerHead row was written from"
     );
 }
 

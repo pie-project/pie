@@ -54,16 +54,34 @@ fn tables() -> Vec<&'static [KernelSig]> {
         // as ARMLESS-by-design here rather than as a row awaiting a
         // `Source`. Kept in the walk so the census still sees them.
         kernels_cuda_new::x::rope::SIGS,
-        table::norm::KERNELS,
-        table::mlp::KERNELS,
-        table::gemm::KERNELS,
+        // `norm`'s twenty-eight, from `x::norm::SIGS`, for `x::rope::SIGS`'
+        // reason above. `table::norm::KERNELS` stood here until §5 step 5.
+        kernels_cuda_new::x::norm::SIGS,
+        // `mlp`'s twelve and `quant`'s eleven, from their `contract!`
+        // blocks, for `x::rope::SIGS`' reason above.
+        kernels_cuda_new::x::mlp::SIGS,
+        // `gemm`'s twelve, from `x::gemm::SIGS`, for `x::rope::SIGS`' reason
+        // above. `table::gemm::KERNELS` stood here until §5 step 5.
+        kernels_cuda_new::x::gemm::SIGS,
         table::moe::KERNELS,
-        table::ssm::KERNELS,
-        table::quant::KERNELS,
-        table::layout::KERNELS,
-        table::sample::KERNELS,
-        table::adapter::KERNELS,
-        table::driver_internal::DRIVER_KERNELS,
+        // `ssm`'s twenty-seven, from `x::ssm::SIGS`, for `x::rope::SIGS`'
+        // reason above. `table::ssm::KERNELS` stood here until §5 step 5.
+        kernels_cuda_new::x::ssm::SIGS,
+        kernels_cuda_new::x::quant::SIGS,
+        // `layout`'s seven, `sample`'s one and `adapter`'s one, from their
+        // `contract!` blocks, for `x::rope::SIGS`' reason above.
+        kernels_cuda_new::x::layout::SIGS,
+        kernels_cuda_new::x::sample::SIGS,
+        kernels_cuda_new::x::adapter::SIGS,
+        // THE SECOND TABLE IS GONE, and there is nothing to append in its
+        // place. It was `table::driver_internal::DRIVER_KERNELS` — launchers
+        // the driver fires with no DSL statement — and §5 step 5 took its six
+        // rows to `x::driver_internal` as plain `fn`s with **no `contract!`**,
+        // so there is no `SIGS` either: a family with no contract declares no
+        // signatures, and the launchers are called directly and need no entry
+        // point. `driver-cuda/build.rs`'s `tables()` — the list this one
+        // mirrors — records the same deletion in the same words, which is
+        // what keeps the two in step.
     ]
 }
 
@@ -469,6 +487,36 @@ fn main() {
     let (arm_ready, arm_less): (Vec<&str>, Vec<&str>) =
         ready.iter().partition(|s| armed(s));
 
+    // ARMLESS IS TWO POPULATIONS NOW, AND ONLY ONE OF THEM IS WORK.
+    //
+    // The line below used to read `<- needs a Source or an ArgValue first`
+    // for the whole of `arm_less`, and that was the truth for as long as
+    // every row was a row. §5 step 5 broke it: a ported family's rows are
+    // derived by `Contract::sig` and state NO `operands`, so
+    // `emit_rust_dispatch` writes no arm for any of them — not because a
+    // `Source` is missing, but because there is no arm to want. Its host
+    // program is a Rust `fn` and a generated `match` arm would be a second
+    // way to fire it.
+    //
+    // Counted together, those two make this report say the opposite of what
+    // happened: every family that crosses moves its rows from ARMED into
+    // ARMLESS, so the number the countdown exists to drive DOWN goes UP on
+    // exactly the change that is progress. That is the denominator failing
+    // in the form this file already names twice — the set was never "rows
+    // with no arm", it was "rows still owed an arm" — so it is split rather
+    // than the number being argued with.
+    //
+    // The test is the row's own operand list, read back through
+    // `table::sig`: the third shim-dropping mechanism is an empty
+    // `operands`, and it is the one every ported row is carried by, so a
+    // stated row is a row world row and an unstated one is fn-world's. It
+    // asks the same table `aot` was built from rather than a second list of
+    // ported families, because a hand-kept list of who has crossed is the
+    // shape §21 keeps catching.
+    let by_design = |symbol: &str| table::sig(symbol).is_some_and(|row| row.operands.is_empty());
+    let (arm_less_fn, arm_less_row): (Vec<&str>, Vec<&str>) =
+        arm_less.iter().partition(|s| by_design(s));
+
     println!("stated rows (AOT tables)     {}", aot.len());
     println!("migrated rows (units)        {}", migrated.len());
     println!("  of those, with an AOT twin {}", ready.len() + held.len() + already.len());
@@ -477,7 +525,14 @@ fn main() {
     println!("HELD by a C++ caller         {:3}", held.len());
     println!("READY, unproven              {:3}   <- the countdown", ready.len());
     println!("  of those, ARMED            {:3}   <- routable today", arm_ready.len());
-    println!("  of those, ARMLESS          {:3}   <- needs a Source or an ArgValue first", arm_less.len());
+    println!(
+        "  of those, ARMLESS          {:3}   <- needs a Source or an ArgValue first",
+        arm_less_row.len()
+    );
+    println!(
+        "  of those, IN FN-WORLD      {:3}   <- no arm to want; a `fn` fires it",
+        arm_less_fn.len()
+    );
     println!();
 
     println!("== held ==");
@@ -506,7 +561,12 @@ fn main() {
             println!("      {s}");
         }
         for s in &l {
-            println!("      {s}   [ARMLESS]");
+            // The same split the summary makes, so a unit whose family has
+            // crossed does not read as a unit with `n` rows of outstanding
+            // work. `[FN-WORLD]` is a finished row; `[ARMLESS]` is an owed
+            // one.
+            let tag = if by_design(s) { "[FN-WORLD]" } else { "[ARMLESS]" };
+            println!("      {s}   {tag}");
         }
     }
 

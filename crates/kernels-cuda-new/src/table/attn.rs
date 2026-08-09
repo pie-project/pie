@@ -20,10 +20,14 @@ const KV_BANKS: Source = Source::Mul(
     &Source::Mul(&Source::KvLayerField("num_kv_heads"), &HEAD_DIM),
 );
 
-const PACKED_HEADS_IN: Source =
-    Source::Div(&Source::Width(&Source::In(0)), &Source::CtxNonZero("head_dim"));
-const PACKED_HEADS_OUT: Source =
-    Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim"));
+// `PACKED_HEADS_IN` and `PACKED_HEADS_OUT` WERE HERE, and went with the two
+// rows that read them: `attn::pad_head_dim_bf16` and
+// `attn::strip_head_dim_bf16` crossed into `crate::x::attn`. They were two
+// constants and not one expression written twice because the pad and the
+// strip read them off OPPOSITE ends, and a copy that drifted would count
+// heads on the padded side — where the divisor is `head_dim_padded`, so the
+// count comes out short and the launch covers a prefix of the heads. The two
+// divisions are now the `PAD_HEAD_DIM` and `STRIP_HEAD_DIM` bind bodies.
 
 pub static KERNELS: &[KernelSig] = &[
     kernel!(flashinfer_decode "attn::dispatch_attention_flashinfer_decode",
@@ -283,101 +287,121 @@ pub static KERNELS: &[KernelSig] = &[
             layer: KvCacheLayerView, k_curr: Buf, v_curr: Buf, w_page: U32s,
             w_off: U32s, win_d: U32s, n_max: I32, stream: Stream, row_valid: U8s,
         ]),
-    // The pair is what `head_dim_padded` COSTS; stating it turns
-    // `if (c.head_dim_padded)` in the model body into a fact the trace
-    // carries. Row-shaped -- each token's heads pad independently.
-    // THE PACKED SIDE IS WHICHEVER END IS `head_dim` WIDE, which is the
-    // input on the way in and the output on the way out. The head count
-    // divides out of the packed side either way, and the padded head dim
-    // is the other side over that count.
-    kernel!(pad_head_dim "attn::pad_head_dim_bf16",
-        operands = operands![
-            packed: Buf <- Source::In(0),
-            padded: BufMut <- Source::Out(0),
-            num_tokens: I32 <- Source::Rows,
-            num_heads: I32 <- PACKED_HEADS_IN,
-            head_dim: I32 <- Source::CtxNonZero("head_dim"),
-            head_dim_padded: I32 <- Source::Div(
-                &Source::Width(&Source::Out(0)),
-                &PACKED_HEADS_IN,
-            ),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
-    kernel!(strip_head_dim "attn::strip_head_dim_bf16",
-        operands = operands![
-            padded: Buf <- Source::In(0),
-            packed: BufMut <- Source::Out(0),
-            num_tokens: I32 <- Source::Rows,
-            num_heads: I32 <- PACKED_HEADS_OUT,
-            head_dim: I32 <- Source::CtxNonZero("head_dim"),
-            head_dim_padded: I32 <- Source::Div(
-                &Source::Width(&Source::In(0)),
-                &PACKED_HEADS_OUT,
-            ),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
+    // `attn::pad_head_dim_bf16` and `attn::strip_head_dim_bf16` CROSSED INTO
+    // FN-WORLD — `crate::x::attn`'s `PAD_HEAD_DIM` and `STRIP_HEAD_DIM`.
+    // Stating the pair still turns `if (c.head_dim_padded)` in the model body
+    // into a fact the trace carries; what the contracts no longer state is
+    // the binding instruction, because the `fn` binds its own arguments.
     // `attn::merge_attention_states_bf16` WAS HERE — the KV-split's other
     // half. Deleted by `new-horizon.md` §38: its whole consumer set was
-    // `dsl::cuda::merge_attention_states`, which nothing called. The
-    // launcher (`attn/attention_merge_states.cu:31`) stays — it holds no
-    // `<<<>>>` and no `__global__` at all, it dispatches into
-    // `flashinfer/attention/cascade.cuh`, and `examples/vendor_probe.rs:199`
-    // cites it by file and line as the proof that that text compiles here
-    // (96,176 B, 8 of 8 symbols). §31.4's precedent exactly: the probe is
-    // what makes re-adding this row cheap, and the row was never how to get
-    // there.
+    // `dsl::cuda::merge_attention_states`, which nothing called.
     //
-    // NOT the vendored `cascade.cuh`, which this comment used to claim. This
-    // crate does carry `csrc/vendor/flashinfer/attention/cascade.cuh`, but no
-    // `-I` anywhere in the repository puts it in front of a C++ compiler:
+    // THE TABLE ROW STAYS DELETED AND THE DEVICE TEXT CAME BACK. Those are
+    // two different things and this block is the record of both, because for
+    // one pass the tree behaved as though they were one.
+    //
+    // `dsl::cuda::merge_attention_states` (`model-compiler/src/dsl.rs:3532`)
+    // still exists and is still called by nothing — `tests/consumer.rs:63`
+    // and `examples/migration_status.rs:926` both say so, in the same words:
+    // zero callers, zero goldens, zero `pie_k_*`, zero `lower.rs` arms, no
+    // peel stem, no fact gate. §38's argument about the CONSUMER SET was
+    // correct and nothing here revises it. A table row is a thing
+    // `model-compiler` can name in a statement; nothing names this one, so
+    // there is no row.
+    //
+    // What §38 could not see is that the FA2 lattice's split path calls this
+    // fold from INSIDE upstream's dispatch (`prefill.cuh:4350-4352`,
+    // `decode.cuh:822-824`) rather than through the DSL. The C++ that ran was
+    // compiled into `driver-cuda/csrc/attn/attention_flashinfer.cu`, and
+    // closing the FA2 seams deleted that file — so
+    // `fire/flashinfer_fa2.rs` had to set `disable_split_kv: true` and
+    // split-KV prefill was off for a pass. That was a real performance
+    // regression on short prompts and small batches.
+    //
+    // IT IS BACK, as `crate::families::cascade` — one unit,
+    // `csrc/src/cascade/merge_states.cuh`, ten rows over the VENDORED
+    // `cascade.cuh` — and `driver-cuda/src/fire/merge_states.rs`, the Rust
+    // host program. `unit.rs`'s `DEMANDS` names it `Headers::LibraryAndVendor`,
+    // the second of two entries.
+    //
+    // NOT the vendored `cascade.cuh`, which this comment used to claim, AND
+    // THAT IS STILL A LIVE DISTINCTION. This crate carries
+    // `csrc/vendor/flashinfer/attention/cascade.cuh`, but no `-I` anywhere in
+    // the repository puts it in front of a C++ compiler:
     // `kernels-cuda/csrc/CMakeLists.txt`'s include list names
     // `${flashinfer_SOURCE_DIR}` — the CPM checkout — and never `csrc/vendor`.
-    // The launcher reads the fetched copy; the vendored copy is NVRTC's alone,
-    // reachable only through `Headers::LibraryAndVendor`, which `unit.rs`'s
-    // `DEMANDS` table asks for zero times. The two copies being
-    // byte-for-byte the same upstream text is what has kept the distinction
-    // invisible, and it is the distinction that decides whether deleting
-    // `kernels-cuda` frees `csrc/vendor` — it does not.
+    // The deleted launcher read the fetched copy; the vendored copy is
+    // NVRTC's alone, reachable only through `Headers::LibraryAndVendor`. The
+    // two copies being byte-for-byte the same upstream text is what has kept
+    // the distinction invisible, and it is the distinction that decides
+    // whether deleting `kernels-cuda` frees `csrc/vendor` — it does not. The
+    // new unit points at the VENDORED copy, which is the whole point of the
+    // return trip: no include path, no CPM, `carried.rs` hands NVRTC the
+    // bytes.
     //
-    // WHAT THE RUST FORM NEEDS, if this row is ever re-added (`new-horizon.md`
-    // §50.3 in full). Fires exactly one of `MergeStatesLargeNumIndexSetsKernel`
-    // or `MergeStatesKernel` (`cascade.cuh:644-664`), never both and never in
-    // sequence, so there is no intermediate buffer. The host decides an
-    // empty-work guard and one arm — `num_index_sets >= seq_len` picks the
-    // large-index-set kernel. Shared memory is 8,704 B at head dim 64/128/256
-    // and 16,896 B at 512, all under 48 KB, so the `cudaFuncSetAttribute` at
-    // `:656` is a no-op nothing has to express.
+    // TWO CORRECTIONS TO THE SPECIFICATION THIS BLOCK USED TO BE.
     //
-    // MISSING VOCABULARY: none. That is a retraction of two entries. The arm
-    // was written down as unstateable because it compares TWO operands while
-    // every `Term` is unary and `Source`'s combinators stop at `Ne`; and the
-    // geometry was written down as unstateable because both arms take a
-    // computed 2-D block `(HEAD_DIM / vec_size, bdy)`. Neither survives the
-    // rule that host composition is Rust: the comparison is host control flow,
-    // so the Rust reads both operands and picks which row to fire, and
-    // `Launch { grid, block, smem }` is a plain struct a composer fills in.
-    // A `LaunchRule` is for a table-driven row, not for a Rust walk.
+    // FIRST, IT NAMED THE WRONG LAUNCHER. The spec described `MergeStates`
+    // (`cascade.cuh:637-668`) and its `num_index_sets >= seq_len` arm. That
+    // launcher is real, it is ported (`fire/merge_states.rs::merge_states`),
+    // and it is NOT the one the FA2 split path calls. Both batched dispatches
+    // call `VariableLengthMergeStates` (`cascade.cuh:686-736`);
+    // `MergeStates` is reached only from the SINGLE-request paths
+    // (`prefill.cuh:2559`, `decode.cuh:739`), where every row was split into
+    // the same number of chunks. The difference is correctness, not speed:
+    // `MergeStatesKernel` folds one `num_index_sets` for every row
+    // (`:221`), while `PersistentVariableLengthMergeStatesKernel` reads each
+    // row's own count as `indptr[pos + 1] - indptr[pos]` (`:401`). A batch of
+    // unequal KV lengths folded with a uniform count reads another row's
+    // partials. Implementing only what this block specified and flipping
+    // `disable_split_kv` would have been silent corruption.
     //
-    // It is also the only one of the four FlashInfer host programs that does
-    // NOT hit the by-value aggregate gap — `MergeStates` takes four pointers
-    // and four `uint32_t`, every one of which `ArgValue` binds today. That
-    // makes it the cheapest available proof that the whole shape works.
+    // SECOND, IT WAS RIGHT ABOUT THE MISSING VOCABULARY AND THE MEASUREMENTS,
+    // AND ALL OF THAT SURVIVES:
     //
-    // AND IT CLEARS THE HEADER GATE, which is what actually orders this work.
-    // NVRTC sees only the vendored tree (`Headers::LibraryAndVendor`); the CPM
-    // checkout is a C++ compiler include path and is on no NVRTC path.
-    // `csrc/vendor/flashinfer/attention/cascade.cuh` IS vendored, so this
-    // launcher's device text is carryable today — unlike the sm90 prefill and
-    // `comm/custom_all_reduce.cu`, whose headers are CPM-only and for which
-    // `csrc/vendor` has no `attention/hopper/` and no `comm/` directory at
-    // all. Combined with needing no aggregate, that leaves this the ONLY one
-    // of the four FlashInfer host programs blocked on nothing but demand:
-    // unit, row, Rust, in that order, with no prerequisite outside this crate.
+    //   * Exactly one kernel fires, never both and never in sequence, so
+    //     there is no intermediate buffer. The host decides an empty-work
+    //     guard and one arm — `num_index_sets >= seq_len` (`:644`) picks the
+    //     large-index-set kernel.
+    //   * Shared memory is 8,704 B at head dim 64/128/256 and 16,896 B at
+    //     512, all under 48 KB, so the `cudaFuncSetAttribute` at `:656` and
+    //     `:715` is a no-op nothing has to express.
+    //     `families::cascade::smem_bytes` re-derives both figures and a test
+    //     pins them.
+    //   * MISSING VOCABULARY: none, and that was a retraction of two
+    //     entries. The arm had been written down as unstateable because it
+    //     compares TWO operands while every `Term` is unary and `Source`'s
+    //     combinators stop at `Ne`; the geometry had been written down as
+    //     unstateable because both arms take a computed 2-D block
+    //     `(HEAD_DIM / vec_size, bdy)`. Neither survived the rule that host
+    //     composition is Rust. Both are now written: the comparison is an
+    //     `if` in `fire/merge_states.rs` and the block is a `Launch` literal.
+    //     A `LaunchRule` is for a table-driven row, not for a Rust walk.
+    //   * Nothing crosses by value. `MergeStatesKernel` takes four pointers
+    //     and three `uint32_t` (`:213-216`), the large one four and two
+    //     (`:275-281`), the persistent one five and two plus a nullable
+    //     device `uint32_t*` (`:366-371`) — every one of which `ArgValue`
+    //     binds today. That made it, as this block predicted, the cheapest
+    //     available proof that the whole shape works, and it needed no
+    //     `params_layout.py` probe.
+    //   * The header gate was the thing that ordered the work, and it was
+    //     already clear. NVRTC sees only the vendored tree; the CPM checkout
+    //     is on no NVRTC path. `csrc/vendor/flashinfer/attention/cascade.cuh`
+    //     IS vendored — unlike the sm90 prefill and
+    //     `comm/custom_all_reduce.cu`, whose headers are CPM-only and for
+    //     which `csrc/vendor` has no `attention/hopper/` and no `comm/`
+    //     directory at all.
+    //   * `examples/vendor_probe.rs`' `MERGE` candidate compiled this header
+    //     to 96,176 B with 8 of 8 symbols resolving, and that measurement is
+    //     what made the return trip cheap. §31.4's precedent exactly: the
+    //     probe is how you get there, and the row was never how.
     //
-    // Which is also the argument for NOT re-adding it speculatively. §38
-    // deleted the row because the consumer set was empty and that is still
-    // true; `vendor_probe.rs` is what keeps the return trip cheap. This note
-    // records that the trip is short, not that it should be taken.
+    // The one claim in the old block that has decayed: it cited
+    // `attn/attention_merge_states.cu:31` as a surviving launcher. That file
+    // is gone with the rest of `kernels-cuda/csrc/src/attn/`.
+    // `examples/vendor_probe.rs:200` cites it too and is stale for the same
+    // reason; the probe still runs, because it reads the vendored header and
+    // never that file.
     // Rewrites `[R+1]` indptr arrays, so a row window would compact the wrong
     // requests' page lists.
     // ── `attn::split_qkv_bf16_devwin`, MOVED HERE FROM
@@ -568,41 +592,13 @@ pub static KERNELS: &[KernelSig] = &[
             head_dim: I32 <- Source::Param(1),
             stream: Stream <- Source::Ctx("stream"),
         ]),
-    // FlashInfer publishes its LSE in log2 and the combine works in ln. A
-    // unit conversion, stated so a reader never has to guess which base an
-    // LSE is in.
-    // The rebase is in place on the value it names: `Out(0)` is the
-    // statement's result and `In(0)` is the same buffer, so the element
-    // count is the result's own extent.
-    kernel!(lse_log2_to_ln "attn::lse_log2_to_ln",
-        operands = operands![
-            lse: F32sMut <- Source::Out(0),
-            n: I32 <- Source::OutElements(0),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
-    // UNSOURCED, and `B` is the whole reason: how many blocks the prefix
-    // holds is the BLOCKS operand's row width over the RESULT's -- an
-    // operand-over-operand ratio, where every `*WidthOver` variant
-    // divides by a CONTEXT field. A row that guessed a param would launch
-    // the right kernel over the wrong rectangle.
-    kernel!(attn_res_blend "attn::attn_res_blend_bf16",
-        operands = operands![
-            prefix: Buf <- Source::In(0),
-            blocks: Buf <- Source::In(1),
-            norm_weight: Buf <- Source::In(2),
-            proj_weight: Buf <- Source::In(3),
-            out: BufMut <- Source::Out(0),
-            T: I32 <- Source::Rows,
-            // AN OPERAND OVER AN OPERAND, not a plan dimension. `B` is
-            // how many blocks the packed input holds, which is its width
-            // divided by the output's — the two are in the same
-            // statement, so the row can say it.
-            B: I32 <- Source::Div(&Source::Width(&Source::In(1)), &Source::Width(&Source::Out(0))),
-            H: I32 <- Source::OutWidth(0),
-            block_rows: I32 <- Source::Rows,
-            eps: F32 <- Source::Ctx("eps"),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
+    // `attn::lse_log2_to_ln` and `attn::attn_res_blend_bf16` CROSSED INTO
+    // FN-WORLD — `crate::x::attn`'s `LSE_LOG2_TO_LN` and `ATTN_RES_BLEND`.
+    // The rebase is still in place on the value it names, which is what
+    // `in_place` says and what the contract keeps. `attn_res_blend`'s `B` is
+    // still AN OPERAND OVER AN OPERAND and not a plan dimension — the blocks
+    // operand's row width over the result's, two widths of one statement —
+    // and the bind reads exactly that, `in_width(1) / out_width(0)`.
     // The unfused counterpart of `mla_prepare`. `tokens` is their only
     // extent, so unlike the fused prepare they are NOT `whole` -- which is
     // the reason a deployment might bind them instead.
@@ -756,21 +752,16 @@ pub static KERNELS: &[KernelSig] = &[
             kv_page_indptr_d: U32s, kv_last_page_lens_d: U32s, index_mask: U8s,
             index_mask_stride: I32,
         ]),
-    // Caps the logits WHERE THEY LIE — one buffer, no destination. Which
+    // `attn::logit_softcap_bf16` CROSSED INTO FN-WORLD as
+    // `crate::x::attn::LOGIT_SOFTCAP`, once `Facts::final_logit_softcap()`
+    // landed to source its cap. The row's argument travelled with it: it caps
+    // the logits WHERE THEY LIE — one buffer, no destination, which
     // `Buffers::assign` was already relying on ("the logit softcap
-    // accumulates into the logits it was handed", where it widens a
-    // seam's pin over an alias set) while this row said nothing, so the
-    // set had one member and the widening reached nothing. The head
-    // wrote the logits into the arena and the cap ran over `ws.logits`,
-    // which is where the sampler then read an uncapped previous fire.
-    kernel!(logit_softcap "attn::logit_softcap_bf16",
-        in_place = &[(0, 0)],
-        operands = operands![
-            x: BufMut <- Source::Out(0),
-            cap: F32 <- Source::CtxNonZero("final_logit_softcap"),
-            n: Usize <- Source::OutElements(0),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
+    // accumulates into the logits it was handed", where it widens a seam's
+    // pin over an alias set) while this row said nothing, so the set had one
+    // member and the widening reached nothing. The head wrote the logits into
+    // the arena and the cap ran over `ws.logits`, which is where the sampler
+    // then read an uncapped previous fire. `in_place` is on the contract.
     // Six statements in one launch; the only value that survives is q.
     kernel!(qkv_packed_post "attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
         sink = Some("kv.pages"),
@@ -801,23 +792,12 @@ pub static KERNELS: &[KernelSig] = &[
             eps: F32 <- Source::Ctx("eps"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
-    // Rescales the attention output IN PLACE against the per-head sink
-    // logit; the LSE is read-only. gpt-oss's sink layers state it right
-    // after the dispatch, so `attn.out` observes the RESCALED result.
-    // The LSE is the dispatch's second RESULT, which only a sink layer
-    // declares — so it is operand 1 here and traced, not a scratch the
+    // `attn::attention_sink_rescale_bf16` CROSSED INTO FN-WORLD —
+    // `crate::x::attn`'s `ATTENTION_SINK_RESCALE`. gpt-oss's sink layers
+    // still state it right after the dispatch, so `attn.out` observes the
+    // RESCALED result, and the LSE is still the dispatch's SECOND result —
+    // operand 1, a value only a sink layer declares, and not a scratch the
     // executor remembers handing the dispatch.
-    kernel!(attention_sink_rescale "attn::attention_sink_rescale_bf16",
-        in_place = &[(0, 0)],
-        operands = operands![
-            o: BufMut <- Source::Out(0),
-            lse: F32s <- Source::In(1),
-            sinks: Buf <- Source::Weight(0),
-            N: I32 <- Source::Rows,
-            num_q_heads: I32 <- Source::Ctx("num_q_heads"),
-            head_dim: I32 <- Source::Ctx("head_dim"),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
     kernel!(mtp_shift_hidden "attn::mtp_shift_hidden_bf16", whole = true,
         operands = operands![
             target_hidden: Buf, pending_hidden: Buf, qo_indptr: U32s,

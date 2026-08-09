@@ -221,9 +221,15 @@ impl LoraOps for LiveLoraOps {
         // SAFETY: the caller holds `self.stream` live across the launch —
         // the same assertion this method made when it handed the stream to
         // `ffi::pie_k_quant_cast_fp32_to_bf16`, which put it in a `<<<>>>`.
-        unsafe {
-            super::dtype_cast::cast_fp32_to_bf16(src, dst, elems, self.stream);
-        }
+        let fired = unsafe {
+            kernels_cuda_new::x::quant::cast_fp32_to_bf16(
+                src.cast::<f32>(),
+                dst.cast::<kernels_cuda_new::x::abi::bf16>(),
+                elems,
+                self.stream,
+            )
+        };
+        empty_or_panic("quant::cast_fp32_to_bf16", fired);
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
@@ -805,7 +811,7 @@ impl LoraFireState {
             unsafe {
                 let a_ptrs = x_ptrs.add(n);
                 let xa_ptrs = x_ptrs.add(2 * n);
-                crate::bind::service::gemm_grouped_act_x_wt_bf16(
+                grouped_or_panic(
                     cublas,
                     x_ptrs,
                     a_ptrs,
@@ -818,7 +824,7 @@ impl LoraFireState {
                 );
                 if g.nq > 0 {
                     let base = x_ptrs.add(3 * n);
-                    crate::bind::service::gemm_grouped_act_x_wt_bf16(
+                    grouped_or_panic(
                         cublas,
                         base,
                         base.add(g.nq as usize),
@@ -832,7 +838,7 @@ impl LoraFireState {
                 }
                 if g.nv > 0 {
                     let base = x_ptrs.add(3 * n + 3 * g.nq as usize);
-                    crate::bind::service::gemm_grouped_act_x_wt_bf16(
+                    grouped_or_panic(
                         cublas,
                         base,
                         base.add(g.nv as usize),
@@ -862,25 +868,104 @@ impl LoraFireState {
             // `ffi::pie_k_quant_scale_rows_bf16`.
             unsafe {
                 if v.sites_bits & LORA_SITE_Q != 0 {
-                    super::dtype_cast::scale_rows_bf16(
-                        bf16_row(q_out.cast_const(), v.token_start, hq).cast_mut(),
-                        l_l,
-                        t,
-                        i32::try_from(v.d_out).unwrap_or(0),
-                        stream,
+                    empty_or_panic(
+                        "quant::scale_rows_bf16",
+                        kernels_cuda_new::x::quant::scale_rows_bf16(
+                            bf16_row(q_out.cast_const(), v.token_start, hq)
+                                .cast_mut()
+                                .cast::<kernels_cuda_new::x::abi::bf16>(),
+                            l_l.cast::<kernels_cuda_new::x::abi::bf16>(),
+                            t,
+                            i32::try_from(v.d_out).unwrap_or(0),
+                            stream,
+                        ),
                     );
                 }
                 if v.sites_bits & LORA_SITE_V != 0 {
-                    super::dtype_cast::scale_rows_bf16(
-                        bf16_row(v_out.cast_const(), v.token_start, hk).cast_mut(),
-                        l_l,
-                        t,
-                        i32::try_from(v.d_out).unwrap_or(0),
-                        stream,
+                    empty_or_panic(
+                        "quant::scale_rows_bf16",
+                        kernels_cuda_new::x::quant::scale_rows_bf16(
+                            bf16_row(v_out.cast_const(), v.token_start, hk)
+                                .cast_mut()
+                                .cast::<kernels_cuda_new::x::abi::bf16>(),
+                            l_l.cast::<kernels_cuda_new::x::abi::bf16>(),
+                            t,
+                            i32::try_from(v.d_out).unwrap_or(0),
+                            stream,
+                        ),
                     );
                 }
             }
         }
+    }
+}
+
+/// An empty extent is a no-op; every other decline is a bug.
+///
+/// `fire::dtype_cast` stood between this file and the two `quant` casts and
+/// returned `()`, because a `bind::jit::fire` returns `()` and swallows its
+/// own refusals. `x::quant::{cast_fp32_to_bf16, scale_rows_bf16}` return
+/// `#[must_use] Fired` instead, and the two outcomes they can produce are not
+/// the same outcome:
+///
+///   * `Declined(Empty)` is `dtype_cast.cu:50`'s `if (n == 0) return;` and
+///     `:65`'s `if (rows == 0 || width == 0) return;`, moved from the C++ into
+///     the host program unchanged. Callers relied on it — a LoRA lane with no
+///     tokens reaches here — so it must stay a no-op HERE, on the caller's
+///     side, which is where the loader's no-op lived all along.
+///   * Anything else means the host program refused an argument this file
+///     built, which the C++ had no way to say and this file has no way to
+///     handle.
+///
+/// So the arm is named and the second case aborts with the symbol, in
+/// [`grouped_or_panic`]'s idiom below and for its reason: `let _ =` would
+/// spell "it declined" like "it ran".
+fn empty_or_panic(symbol: &str, fired: kernels_cuda_new::x::Fired) {
+    if let kernels_cuda_new::x::Fired::Declined(why) = fired
+        && !matches!(why, kernels_cuda_new::x::Refusal::Empty { .. })
+    {
+        panic!("{symbol} declined: {why:?}");
+    }
+}
+
+/// `x::gemm::grouped_act_x_wt_bf16` returns `#[must_use] Fired`, and a
+/// staged LoRA apply has nowhere to put a `Declined`.
+///
+/// The three call sites below are inside a fire that has already resolved
+/// its shapes: `group_count` is `n`, `g.nq` or `g.nv`, each guarded above,
+/// so the one refusal the host program can return -- `Refusal::Empty` on a
+/// non-positive `group_count` -- is unreachable here. Unreachable is not the
+/// same as unspellable, though, and `let _ =` would spell "it declined" like
+/// "it ran", which is the whole reason [`Fired`] is `#[must_use]`. So the
+/// arm is named and a decline aborts with the symbol, which is exactly what
+/// `bind::service::gemm_grouped_act_x_wt_bf16` did before it moved.
+#[allow(clippy::too_many_arguments)]
+unsafe fn grouped_or_panic(
+    handle: *mut c_void,
+    a: *const *const c_void,
+    b: *const *const c_void,
+    c: *mut *mut c_void,
+    m: *const i32,
+    group_count: i32,
+    n: i32,
+    k: i32,
+    beta: f32,
+) {
+    let fired = unsafe {
+        kernels_cuda_new::x::gemm::grouped_act_x_wt_bf16(
+            handle,
+            a,
+            b,
+            c,
+            m,
+            group_count,
+            n,
+            k,
+            beta,
+        )
+    };
+    if let kernels_cuda_new::x::Fired::Declined(why) = fired {
+        panic!("gemm::grouped_act_x_wt_bf16 declined: {why:?}");
     }
 }
 

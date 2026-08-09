@@ -210,45 +210,89 @@ fn the_selection_agrees_with_rmsnorm_vec8_ok() {
 /// # THE PREDICATE THIS PINS NO LONGER EXISTS AS C++, AND THAT IS A FINDING
 ///
 /// `fire/rmsnorm.rs` did not carry `rmsnorm_vec8_ok` across as text. It
-/// TRANSLITERATED it, into `fn vec8_ok` at `:65-79`, and cites the original
+/// TRANSLITERATED it, into `fn vec8_ok` at `:65-79`, and cited the original
 /// in prose at `:54` (`` `rmsnorm.cu:26` — `rmsnorm_vec8_ok` ``). The six
-/// clauses are all there and all in the C++'s own order — the module says so
+/// clauses were all there and all in the C++'s own order — the module said so
 /// deliberately, *"The order is the C++'s own so the two read as one list"* —
-/// but they are spelled `aligned16(x)` where the C++ spelled a `reinterpret_cast`
-/// lambda, so `PINNED` below is not a substring of anything in this tree and
-/// `CU.find` fails.
+/// but they were spelled `aligned16(x)` where the C++ spelled a
+/// `reinterpret_cast` lambda, so `PINNED` below was not a substring of
+/// anything in the tree and `CU.find` failed.
 ///
-/// **So this test panics, and the panic is the finding.** What it proved was
-/// that a hand transliteration in `families::norm::RMSNORM_STRIDED_VEC8` and
-/// a hand transliteration in this file's `rmsnorm_vec8_ok` oracle were both
-/// checked against ONE ORIGINAL. There are now three transliterations and no
-/// original. That is a real loss of a witness, it is not repaired by pointing
-/// `PINNED` at the Rust — which would be checking two transliterations
-/// against each other — and re-deriving what should replace it is a decision
-/// about the oracle, not about the include path.
+/// **So this test panicked, and the panic was the finding.** What it proved
+/// was that a hand transliteration in `families::norm::RMSNORM_STRIDED_VEC8`
+/// and a hand transliteration in this file's `rmsnorm_vec8_ok` oracle were
+/// both checked against ONE ORIGINAL. There were three transliterations and
+/// no original.
+///
+/// # §5 step 5 removed the panic and did not restore the original
+///
+/// `fire/rmsnorm.rs` IS DELETED, so the `include_str!` no longer resolves and
+/// a panic became a build failure — which is worse, because a build failure
+/// takes the whole test binary and says nothing. `families/norm.rs` is
+/// deleted with it, so `RMSNORM_STRIDED_VEC8` is gone and there are TWO
+/// transliterations now: `x::norm::vec8_ok` (which is `fire/rmsnorm.rs`'s,
+/// moved and renamed from `rmsnorm_vec8_ok`) and this file's oracle.
+///
+/// **`PINNED` below is now the last copy of the C++ in the tree.** It is kept
+/// verbatim for that reason and for no other: it is an ARCHIVE, not a pin,
+/// and nothing can check it because the thing it was a copy of is deleted.
+/// The `assert_eq!` against a found body is therefore gone, and what remains
+/// is the honest half — that the surviving transliteration still SAYS which
+/// line it came from and still spells the six clauses in the C++'s order, so
+/// a reader who wants to re-derive the predicate knows where to start and a
+/// silent reordering is still caught.
+///
+/// Re-deriving a real oracle is a decision about the oracle, not about the
+/// include path, and it is still open.
 #[test]
 fn the_cpp_predicate_is_the_one_this_file_was_written_from() {
-    const CU: &str = include_str!("../../driver-cuda/src/fire/rmsnorm.rs");
-
-    let start = CU
-        .find("inline bool rmsnorm_vec8_ok")
-        .expect("`rmsnorm_vec8_ok` is in driver-cuda/src/fire/rmsnorm.rs");
-    let body = &CU[start..];
-    let end = body.find("\n}\n").expect("the predicate has an end") + 3;
-    let normalised: String = body[..end].split_whitespace().collect::<Vec<_>>().join(" ");
-
     const PINNED: &str = "inline bool rmsnorm_vec8_ok(const void* x, const void* y, const void* weight, \
          int hidden, int x_row_stride, int y_row_stride) { auto aligned = [](const void* p) { \
          return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; }; return hidden % 8 == 0 && \
          x_row_stride % 8 == 0 && y_row_stride % 8 == 0 && aligned(x) && aligned(y) && \
          aligned(weight); }";
-
-    assert_eq!(
-        normalised, PINNED,
-        "\n`rmsnorm_vec8_ok` has changed. `families::norm::RMSNORM_STRIDED_VEC8`'s terms and \
-         this file's `rmsnorm_vec8_ok` transliteration were written from the previous text and \
-         are now a DIFFERENT DECISION wearing the same name. Update all three together."
+    assert!(
+        PINNED.contains("rmsnorm_vec8_ok"),
+        "the archive is the archive; this reads it so the constant is not dead"
     );
+
+    const HOST: &str = include_str!("../src/x/norm.rs");
+
+    assert!(
+        HOST.contains("`rmsnorm.cu:26` — `rmsnorm_vec8_ok`"),
+        "`x::norm::vec8_ok` no longer cites the line it was transliterated \
+         from, so the last thread back to the deleted C++ is cut and `PINNED` \
+         above is unattached text"
+    );
+
+    // The six clauses, in the C++'s order. `find` from the previous match so
+    // a reordering fails even though every clause is still present -- which
+    // is the mutation the sweep in this file cannot see.
+    let start = HOST.find("fn vec8_ok").expect("`x::norm::vec8_ok` is the transliteration");
+    let body = &HOST[start..];
+    let end = body.find("\n}\n").expect("the predicate has an end") + 3;
+    let body = &body[..end];
+
+    const CLAUSES: [&str; 6] = [
+        "hidden % 8 == 0",
+        "x_row_stride % 8 == 0",
+        "y_row_stride % 8 == 0",
+        "aligned16(x)",
+        "aligned16(y)",
+        "aligned16(weight)",
+    ];
+    let mut at = 0usize;
+    for clause in CLAUSES {
+        let found = body[at..].find(clause).unwrap_or_else(|| {
+            panic!(
+                "`{clause}` is not in `x::norm::vec8_ok` after the clause \
+                 before it. The six clauses are the C++'s six, IN THE C++'S \
+                 ORDER; `PINNED` above is the text they were written from and \
+                 it is the only copy left."
+            )
+        });
+        at += found + clause.len();
+    }
 }
 
 /// The arm's terms are the C++'s six clauses, one for one.

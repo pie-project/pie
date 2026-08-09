@@ -633,7 +633,7 @@ use cudarc::runtime::sys::{
 ///
 /// Sized by the wire vocabulary below, not by a guess: eight `GuardPred`
 /// wire numbers plus the two Peel endpoint bits.
-pub const PRED_SLOTS: usize = 10;
+pub const PRED_SLOTS: usize = 11;
 
 /// `GuardPred::HasWriteDesc` — wire 0.
 pub const SLOT_HAS_WRITE_DESC: u32 = 0;
@@ -660,6 +660,14 @@ pub const SLOT_WINDOW_ONE: u32 = 7;
 pub const SLOT_PEEL_ALL_FAST: u32 = 8;
 /// A Peel whose whole fire took the hooked endpoint (`fast_rows == 0`).
 pub const SLOT_PEEL_ALL_HOOKED: u32 = 9;
+/// `GuardPred::TokensMultipleOf(k)` — wire 10.
+///
+/// ABOVE the two Peel slots, and deliberately. They were placed "above the
+/// GuardPred wire range" when that range ended at 7, so the next guard could
+/// not simply take 8: it would have shared a byte with `SLOT_PEEL_ALL_FAST`
+/// and been read as one. The range is no longer contiguous and the slot map
+/// is the only thing that has to know it.
+pub const SLOT_TOKENS_MULTIPLE: u32 = 10;
 
 /// The device-resident predicate word: one byte per slot.
 ///
@@ -1314,6 +1322,15 @@ mod tests_2 {
         assert_eq!(GuardPred::HasWriteDesc.wire().0, SLOT_HAS_WRITE_DESC);
         assert_eq!(GuardPred::TokensLE(0).wire().0, SLOT_TOKENS_LE);
         assert_eq!(GuardPred::TokensGT(0).wire().0, SLOT_TOKENS_GT);
+        assert_eq!(
+            GuardPred::TokensMultipleOf(0).wire().0,
+            SLOT_TOKENS_MULTIPLE
+        );
+        // Every slot the map names has to fit the word, and the new one is
+        // above the Peel pair rather than beside the guards it belongs with.
+        assert!((SLOT_TOKENS_MULTIPLE as usize) < PRED_SLOTS);
+        assert_ne!(SLOT_TOKENS_MULTIPLE, SLOT_PEEL_ALL_FAST);
+        assert_ne!(SLOT_TOKENS_MULTIPLE, SLOT_PEEL_ALL_HOOKED);
         assert_eq!(GuardPred::WantsAttnScore.wire().0, SLOT_WANTS_ATTN_SCORE);
         assert_eq!(GuardPred::HasCustomMask.wire().0, SLOT_HAS_CUSTOM_MASK);
         assert_eq!(GuardPred::HasStageHooks.wire().0, SLOT_HAS_STAGE_HOOKS);

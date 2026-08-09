@@ -94,6 +94,12 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(mxfp4_qmv_routed_bias "mxfp4_qmv_routed_bias",
     file = Some("moe/qmv_routed.comp"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The row axis is `out_vec_size`, the second word, and NOT the output
+    // rectangle's width: a routed projection writes a whole token's `k`
+    // results end to end, so the width is `k` times as wide as one result.
+    // Stated here because the geometry that read the width instead had to
+    // guess `k`, and guessed four. See `geometry::lanes`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
@@ -123,6 +129,12 @@ pub static KERNELS: &[KernelSig] = &[
     // SPIR-V module lookup.
     kernel!(qmv_routed "affine_qmv_routed", file = Some("moe/qmv_routed.comp"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The row axis is `out_vec_size`, the second word, and NOT the output
+    // rectangle's width: a routed projection writes a whole token's `k`
+    // results end to end, so the width is `k` times as wide as one result.
+    // Stated here because the geometry that read the width instead had to
+    // guess `k`, and guessed four. See `geometry::lanes`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
@@ -144,6 +156,12 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in moe/qmv_routed.comp
     kernel!(qmv_routed_bias "affine_qmv_routed_bias", file = Some("moe/qmv_routed.comp"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The row axis is `out_vec_size`, the second word, and NOT the output
+    // rectangle's width: a routed projection writes a whole token's `k`
+    // results end to end, so the width is `k` times as wide as one result.
+    // Stated here because the geometry that read the width instead had to
+    // guess `k`, and guessed four. See `geometry::lanes`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),

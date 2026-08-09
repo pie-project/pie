@@ -470,16 +470,93 @@ pie_cuda_has_arch(PIE_HAS_SM90 90)
 pie_cuda_has_arch(PIE_HAS_SM100 100)
 pie_cuda_has_arch(PIE_HAS_SM120 120)
 
-# Hopper/FA3 attention + the SM90 XQA GQA8 kernel are SM90-only; every other
-# arch gets the stub.
+# The SM90 XQA GQA8 kernel is SM90-only; every other arch gets the stub.
+#
+# `src/attn/attention_flashinfer_hopper.cu` WAS THE OTHER HALF OF THIS
+# VARIABLE AND IS DELETED — 392 lines, the FA3/Hopper paged prefill: a
+# five-level template funnel (`dispatch_hopper_prefill` ->
+# `_schedule` -> `_dim` -> `_dim_window` -> `_dim_mask`) over
+# `::flashinfer::BatchPrefillWithPagedKVCacheDispatched`, plus the scheduler
+# call that fills `HopperPrefillPlan`.
+#
+# UNREACHABLE BY CALL GRAPH, NOT MERELY BY A FLAG, and §44.7 makes the
+# distinction load-bearing — every sm_90 claim in this migration is argued
+# from the call graph and none from a run. Both readings are true here and
+# they are not the same claim:
+#
+#   BY FLAG.  `driver-cuda/src/fire/flashinfer_fa2.rs:1120-1121` writes
+#             `cache.use_sm90 = false` and `cache.sm90_plan = None`
+#             unconditionally, and `flashinfer_fa2_dispatch.rs:955` is the
+#             only `if cache.use_sm90`, returning `Decline::Sm90Unported`.
+#             That makes the Rust decline unreachable BY CONSTRUCTION. On its
+#             own this would justify nothing: a flag can be turned back on,
+#             and deleting a body because a caller currently declines is how
+#             a path becomes unrecoverable.
+#
+#   BY CALL GRAPH.  The three functions `attn/attention_flashinfer_hopper.hpp`
+#             declares — `hopper_prefill_supported`,
+#             `plan_attention_flashinfer_prefill_sm90_bf16`,
+#             `dispatch_attention_flashinfer_prefill_sm90_bf16` — have NO
+#             table row, so `abi::emit_c_shim` has never generated a `pie_k_*`
+#             entry and no Rust `ffi` arm exists to call.
+#             `driver-cuda/tests/launch_abi.rs` records both by name:
+#             `plan_…` as `NoRow::Prepare`, `dispatch_…` as
+#             `NoRow::KernelsInternal`. Their one C++ caller was
+#             `driver-cuda/csrc/attn/attention_flashinfer.cu`, deleted with
+#             the whole of `driver-cuda/csrc/`. The only remaining `#include`
+#             of the header outside this directory is
+#             `kernels-cuda-new/csrc/src/attn/attention_flashinfer_common.cuh`,
+#             which DECLARES state (`HopperPrefillPlan sm90_plan;`,
+#             `bool use_sm90 = false;`) and calls none of the three — and
+#             which, with the four `attention_flashinfer_hd*.cu` gone, has no
+#             compiler in the tree at all.
+#
+# It is the SECOND reading that justifies the deletion without a replacement.
+# The stub below still defines all three for non-sm90 builds; on an sm90 build
+# they are now declared and undefined, which is legal exactly because nothing
+# ODR-uses them, and which is the loudest possible signal if a caller ever
+# comes back.
+#
+# THE MEASUREMENT IT CARRIED IS NOT LOST. Its extended-shapes constant — head
+# dim 256, sliding windows and decode-shaped fires routed to FA3, on by
+# default — was justified by a real run: **gemma-4-26B-A4B at 1k context,
+# routing the sliding layers' decode there takes attention from 4.19 ms to
+# 2.73 ms and the model from 122.5 to 144.1 tok/s, output unchanged.** That
+# number, the `getenv("PIE_CUDA_DISABLE_HOPPER_EXTENDED")`-to-named-constant
+# argument, the withdrawn `set_hopper_extended_shapes(bool)` seam and §36's
+# "compiled for sm_90, SASS identical before and after" are transcribed onto
+# `fire/flashinfer_fa2_dispatch.rs`'s `Decline::Sm90Unported`, which is the
+# one place in the tree that still has to explain why this path is refused.
+#
+# `src/attn/attention_flashinfer_hopper_stub.cpp` STAYS, AND IT IS SWEPT, not
+# taken on report. It was called the non-sm90 definition of a live XQA arm; the
+# sweep confirms that and names the line. `src/attn/attention_xqa_gqa8.cu:156`
+# calls `detail::launch_attention_xqa_decode_bf16_gqa8_sm90_prepared(...)`
+# UNCONDITIONALLY inside `if (current_device_major() >= 9)`, and the branch is
+# a RUNTIME test on a compile-time-selected translation unit: on a non-sm90
+# build `PIE_CUDA_FLASHINFER_HOPPER_SOURCE` is this `.cpp` (the `else()` arm
+# eleven lines below), so the stub is the ONLY definition of that symbol and
+# dropping it is an unresolved external, not a dead-code removal. The other
+# three bodies it defines (`hopper_prefill_supported`,
+# `plan_attention_flashinfer_prefill_sm90_bf16`,
+# `dispatch_attention_flashinfer_prefill_sm90_bf16`) are dead by the paragraph
+# above -- no row, no `pie_k_*`, no `ffi` arm -- but a file is deleted whole.
+# So it is CHAINED to the six `attention_xqa*.cu`: it can go in the same pass
+# they do and not one pass earlier, which is the ordering claim, now checked.
+#
+# `src/attn/attention_flashinfer_hopper.hpp`, the header, IS NOT CHAINED TO IT
+# and must outlive it -- `kernels-cuda-new/csrc/src/attn/
+# attention_flashinfer_common.cuh:79` `#include`s it and
+# `driver-cuda/tests/launch_abi.rs:1534` names it. This is the `kv_paged.hpp`
+# distinction: the stub's consumer set is empty on the symbol half and closed
+# on the existence half; its header's is the reverse.
 if(PIE_HAS_SM90)
   set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE
-    src/attn/attention_flashinfer_hopper.cu
     src/attn/attention_xqa_gqa8_sm90.cu)
-  message(STATUS "Enabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+  message(STATUS "Enabling SM90 XQA GQA8 decode for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
 else()
   set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/attn/attention_flashinfer_hopper_stub.cpp)
-  message(STATUS "Disabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+  message(STATUS "Disabling SM90 XQA GQA8 decode for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
 # FlashInfer's Mamba SSU vertical/horizontal kernels need TMA + memcpy_async_tx
@@ -530,7 +607,8 @@ set(PIE_CUDA_GRAPH_KERNEL_SOURCES
   # Its four launchers -- `hc_pre_postprocess_bf16`, `hc_post_bf16`,
   # `hc_head_postprocess_bf16`, `hc_rmsnorm_to_f32` -- are
   # `execution::RUST_SERVED`, so `abi::emit_c_shim` emits no entry for any of
-  # them; the host programs are `driver-cuda/src/fire/dsv4_hc.rs` and the
+  # them; the host programs are `kernels-cuda-new/src/x/norm.rs`'s (they
+  # were `driver-cuda/src/fire/dsv4_hc.rs` until §5 step 5) and the
   # `__global__`s are unmoved in `kernels-cuda-new/csrc/src/norm/dsv4_hc.cuh`.
   # `src/moe/dsv4_routing.cu` was here and IS DELETED with
   # `moe/dsv4_routing.hpp`. Its one surviving launcher, `hash_route_lookup`,
@@ -581,6 +659,62 @@ set(PIE_CUDA_GRAPH_KERNEL_SOURCES
   # and `execution::RUST_SERVED` is what took the row and the shim entry.
   # This was the only file in the tree that reached into CCCL; the CUB
   # measurement travels in the Rust module header.
+  # `src/attn/attention_mla.cu` STAYS, and it is the one on this list whose
+  # blocker is not `x::Abi`. Its row `attn::dispatch_attention_mla_bf16` is
+  # live under both tokens -- `table/attn.rs:750` with `operands`,
+  # `model-compiler/src/dsl.rs:5800`, `driver-cuda/tests/executor_bind.rs:1538`
+  # -- so the mechanism would have to be `execution::RUST_SERVED`, and that
+  # needs a `bind::service` body, which needs the device text carried. It is
+  # not: `families/fa2.rs`' header names FA3 AND MLA as the two whose headers
+  # are CPM-only -- *"`csrc/vendor` has no `attention/hopper/` at all, so NVRTC
+  # cannot see them and this port is not evidence that the next one is cheap."*
+  # So MLA needs a vendored closure computed and copied the way `vendor/xqa/`'s
+  # fifteen files were, and that is the work, not the launcher.
+  #
+  # `driver-cuda/src/fire/mla_paged.rs` exists and is NOT the host half of this
+  # file -- it serves `attn/mla_paged.cu`, a different translation unit with a
+  # different row. Reading the name as a head start is the mistake to avoid.
+  #
+  # BOTH CLAUSES ABOVE HAVE MOVED, in opposite directions, and the file still
+  # STAYS. Corrected rather than rewritten, in this file's idiom.
+  #
+  # THE VENDORING IS DONE. `csrc/vendor/flashinfer/attention/mla.cuh`,
+  # `attention/scheduler.cuh` and `fastdiv.cuh` are all on disk in
+  # `kernels-cuda-new`, so the sentence borrowed from `families/fa2.rs`
+  # applies to FA3 only; `table::attn`'s own note on this row says the same
+  # and draws the consequence -- *"its device text is carryable today, which
+  # is not true of the sm90 prefill"*. Vendoring is no longer the work.
+  #
+  # `x::Abi` IS NOW THIS FILE'S BLOCKER TOO, which is the direction the first
+  # sentence got wrong. `driver-cuda/src/fire/mla_naive.rs` states it from the
+  # other side: *"`attn::dispatch_attention_mla_bf16` is one row with TWO arms
+  # ... A row loses its shim entry whole or not at all, so both arms must be
+  # Rust before either can be. The FA2 arm passes ONE `MLAParams<DTypeQ,
+  # DTypeKV, DTypeO, IdType>` by value ... That is the identical blocker XQA's
+  # `KVCacheList` has, in a different family, and one `Abi` capability clears
+  # both."* That capability landed (`kernels-cuda-new/src/x/xqa.rs`), so what
+  # is left is not a floor gap -- it is a `by_value!` mirror for `MLAParams`
+  # MEASURED the way `KvCacheList`'s five offsets were, then a `unit!` over
+  # `attention/mla.cuh`, a `contract!`, a `bind!`, and the FA2 dispatch itself
+  # in Rust. All of that is in `kernels-cuda-new/src/x/`.
+  #
+  # `MLAParams` IS THE HARDER MIRROR OF THE TWO, and the reason is recorded in
+  # `x/xqa.rs`: `KVCacheList<true>` is four pointers and a `uint32_t` with NO
+  # NESTED AGGREGATE, which is why reading it and measuring it agreed.
+  # `MLAParams` holds two `::flashinfer::uint_fastdiv` members (`block_size`,
+  # `num_heads`), and `uint_fastdiv` is the first of the three transcription
+  # traps that file tabulates -- *"one `u32`" that is 24 BYTES, shifting
+  # everything after it by twenty*. A mirror written from the declaration here
+  # is wrong in the interior and right in the name, which is the failure mode
+  # `northstar.md` §5.1 names: a launch with a garbage struct, not a type
+  # error.
+  #
+  # UNTIL THEN THIS FILE HOLDS THE TREE'S LAST TWO `<<<>>>` (`:110` and
+  # `:181`), and they are not what holds the file: their Rust is written and
+  # cited line by line in `driver-cuda/src/fire/mla_naive.rs`, and
+  # `attention_mla_naive.cuh` is two `__global__` and zero launches. What
+  # holds the file is the other arm. `tests/sources.rs`' `EXPECTED = 2` is the
+  # floor with this file named as its holder.
   src/attn/attention_mla.cu)
 # `src/ssm/flashinfer_mamba.cu` was here and the file is DELETED, which
 # re-lands `new-horizon.md` §43. The row `ssm::flashinfer_mamba_ssu_bf16` went
@@ -607,33 +741,73 @@ set(PIE_CUDA_GRAPH_KERNEL_SOURCES
 # The kernel archive. `driver-cuda` links it; nothing else does. Every
 # translation unit under src/ is listed exactly once.
 
-# One attention translation unit per head_dim in kernels.def. These cannot be
-# generated -- a macro cannot expand to a source file -- so they are checked in
-# next to the primary TU and verified here instead.
-set(PIE_ATTENTION_HEAD_DIM_SOURCES)
-foreach(_pie_hd IN LISTS PIE_ATTN_HEAD_DIMS)
-  set(_pie_hd_src "src/attn/attention_flashinfer_hd${_pie_hd}.cu")
-  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_pie_hd_src}")
-    message(FATAL_ERROR
-      "kernels.def declares PIE_ATTN_HEAD_DIM(${_pie_hd}) but ${_pie_hd_src} "
-      "is missing. Copy an existing attention_flashinfer_hd*.cu and change the "
-      "explicit instantiation to AttnHd<${_pie_hd}>.")
-  endif()
-  list(APPEND PIE_ATTENTION_HEAD_DIM_SOURCES "${_pie_hd_src}")
-endforeach()
-# ...and the reverse: a stub with no kernels.def entry would silently compile
-# nothing, since the header only declares the head_dims kernels.def lists.
-# CONFIGURE_DEPENDS so that dropping in a new stub re-runs the check instead of
-# passing until someone happens to reconfigure.
-file(GLOB _pie_hd_stubs CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/attn/attention_flashinfer_hd*.cu")
-foreach(_pie_hd_src IN LISTS _pie_hd_stubs)
-  if(NOT _pie_hd_src IN_LIST PIE_ATTENTION_HEAD_DIM_SOURCES)
-    message(FATAL_ERROR
-      "${_pie_hd_src} has no matching PIE_ATTN_HEAD_DIM entry in "
-      "${PIE_KERNELS_DEF}; add one or delete the file.")
-  endif()
-endforeach()
+# THE PER-HEAD_DIM TRANSLATION UNITS ARE DELETED, AND SO IS THE TWO-WAY CHECK
+# THAT KEPT THEM IN STEP WITH kernels.def.
+#
+# What stood here was a pair of loops with `PIE_ATTENTION_HEAD_DIM_SOURCES`
+# between them. Forward: every `PIE_ATTN_HEAD_DIM(N)` in kernels.def must have
+# a `src/attn/attention_flashinfer_hd${N}.cu`, or configure stops with
+# "copy an existing stub and change the explicit instantiation to AttnHd<N>".
+# Reverse, over a `file(GLOB ... CONFIGURE_DEPENDS)`: every stub on disk must
+# have an entry, because the header only DECLARES the head_dims kernels.def
+# lists (`extern template struct AttnHd<HD>;`), so a stub with no entry
+# instantiated nothing and compiled to an empty object with no diagnostic.
+#
+# All four files are deleted:
+#
+#   `src/attn/attention_flashinfer_hd64.cu`    template struct AttnHd<64>;
+#   `src/attn/attention_flashinfer_hd128.cu`   template struct AttnHd<128>;
+#   `src/attn/attention_flashinfer_hd256.cu`   template struct AttnHd<256>;
+#   `src/attn/attention_flashinfer_hd512.cu`   template struct AttnHd<512>;
+#
+# Thirteen lines each and nothing else. Their whole job was to make nvcc run
+# FlashInfer's host derivations ahead of time and emit every instantiation a
+# run-time arm might select, and that job now belongs to
+# `kernels-cuda-new/src/families/fa2.rs`: 56 units, 460 rows, one root, all
+# NVRTC. That file's header names these four by name as what it replaces, so
+# this deletion is the other end of a written list rather than a search.
+#
+# THE BACKTICKS ON THOSE FOUR PATHS ARE LOAD-BEARING, which is worth one line
+# because it is invisible and it is why every evidence block in this file uses
+# them. `kernels-cuda/tests/sources.rs::cu_in_cmake` is a substring scan, not
+# a cmake evaluation: it splits this whole file on whitespace, trims `"()`
+# and counts any token starting `src/` and ending `.cu` as NAMED — comments
+# included, deliberately, because "a path in a branch not taken still counts".
+# A bare deleted path in a comment is therefore reported by
+# `every_cu_in_the_build_is_on_disk` as a dangling entry. A backtick is not in
+# the trim set, so a quoted path is not a token. Write them quoted.
+#
+# RETIRED RATHER THAN LEFT COMPARING AN EMPTY SET, and the distinction is not
+# cosmetic. Left in place, the FORWARD loop does not become vacuous -- it
+# becomes a FATAL_ERROR, because kernels.def still declares all four head dims
+# and none of the four files exists any more. A check whose subject has been
+# deleted does not go quiet; it fails, and it fails naming a remedy ("copy an
+# existing stub") that is now exactly the wrong thing to do.
+#
+# kernels.def KEEPS its `PIE_ATTN_HEAD_DIM` block, and the block keeps its
+# argument. Two consumers remain and neither is a translation unit:
+#
+#   * `src/kernels_manifest.hpp` -- `head_dim_instantiated()` and the
+#     diagnostic string, both `constexpr` over the same X-macro. That is what
+#     keeps "96 is deliberately absent" checkable: the prefill dispatch never
+#     had a 96 case, so a checkpoint that truly reached the kernels with 96
+#     would fail there, which is what made the decode side's <96>
+#     instantiations detectable as dead.
+#   * `kernels-cuda-new/src/families/fa2.rs` -- `HEAD_DIMS` is this list in
+#     Rust, in its order, and `fire/flashinfer_fa2.rs:1307` asserts
+#     `!head_dim_instantiated(96)` against it.
+#
+# The 318s-versus-79s measurement in kernels.def:47-50 survives in BOTH
+# places, and `families/fa2.rs` §3 records the part this deletion changes:
+# the number was about `make -j`, where four TUs compile on four cores and the
+# wall clock is the longest rather than the sum. A JIT has no `-j`. The split
+# survives and its beneficiary does not -- units are split so that a fire
+# compiles only the instantiations it can select, and 4 was right for `make`
+# where 56 is right for a JIT. They are not the same four.
+#
+# CMake still reads kernels.def, for `PIE_MOE_ACTIVATIONS`. `PIE_ATTN_HEAD_DIMS`
+# is now read only to be reported in the configure log, which is worth keeping:
+# it is the one line that shows the manifest was found and parsed.
 
 
 # The custom P2P all-reduce WAS arch-gated here, and both of its files are
@@ -701,12 +875,87 @@ add_library(pie_kernels_cuda STATIC
   # `driver-cuda/src/fire/`. Its `AttnHd<HD>::dispatch_decode_capture` is a
   # host `cudaError_t` static member that NVRTC cannot compile, which is an
   # argument for rewriting the host half, not for relocating it.
-  ${PIE_ATTENTION_HEAD_DIM_SOURCES}
+  # `${PIE_ATTENTION_HEAD_DIM_SOURCES}` expanded here, and all four files it
+  # named ARE DELETED: `src/attn/attention_flashinfer_hd{64,128,256,512}.cu`.
+  # Thirteen lines each, `template struct AttnHd<N>;` and nothing else. The
+  # loop that built the variable, and the two-way kernels.def agreement check
+  # around it, are retired above with their reasoning.
+  #
+  # `kernels-cuda-new/src/families/fa2.rs` is the replacement, and it names
+  # these four files by name in its own header as what it replaces — 56 units,
+  # 460 rows, one root, all NVRTC, with `#[repr(C)]` param mirrors carrying 61
+  # offset assertions. Each stub existed to make nvcc run FlashInfer's host
+  # derivations ahead of time and emit every instantiation a run-time arm might
+  # select; that is what a lattice declaration is, and the lattice is now data.
+  #
+  # CONSUMER SET, swept: no shim entry (`AttnHd` is a class template, not a
+  # table symbol, so `abi::emit_c_shim` never had a row to write); no
+  # `ffi::pie_k_*` arm; nothing in `crates/model/src`, `model-compiler/src/dsl.rs`
+  # or `lower.rs::semantic()` — a model text states a KERNEL, and `AttnHd` is
+  # the C++ vehicle a kernel arrived in. The only remaining mentions in the
+  # tree are `families/fa2.rs`'s replacement list, `flashinfer_fa2_dispatch.rs`'s
+  # citations of the member templates it transcribes, and
+  # `driver-cuda/build.rs`'s comment about the `cc::Build` that is itself gone.
+  #
+  # THE OTHER HALF OF THIS DELETION, worth stating because nothing else says
+  # it: `kernels-cuda-new/csrc/src/attn/attention_flashinfer_common.cuh` was
+  # included by these four files AND BY NOTHING ELSE IN THE TREE. With them
+  # gone it has no compiler at all — it stays on disk as the anchor forty-odd
+  # Rust doc comments cite by line, and as text NVRTC carries, but no
+  # translation unit reads it. That is what makes the sm90 prefill's
+  # unreachability a call-graph fact below rather than a flag's.
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
-  # Unconditional, and not part of PIE_CUDA_FLASHINFER_HOPPER_SOURCE above:
-  # the decode KV-split path reaches the state merge on every architecture,
-  # so it cannot ride the sm90 prefill's stub/real switch.
-  src/attn/attention_merge_states.cu
+  # `src/attn/attention_merge_states.cu` was here and IS DELETED. It was the
+  # definition of `kernels::attn::merge_attention_states_bf16` — the whole of
+  # it, one function wrapping `::flashinfer::MergeStates<__nv_bfloat16,
+  # __nv_bfloat16>` from `flashinfer/attention/cascade.cuh`.
+  #
+  # ITS ROW WENT FIRST AND THE DEFINITION OUTLIVED IT, which is the unusual
+  # part and the part worth recording. `attn::merge_attention_states_bf16` was
+  # removed from `kernels-cuda-new/src/table/attn.rs` by §38 (the line
+  # "`attn::merge_attention_states_bf16` WAS HERE — the KV-split's other half"
+  # is still there), so `abi::emit_c_shim` has written no `pie_k_*` entry for
+  # it since. This file has therefore been compiled into the archive and
+  # reachable by nothing for several passes: a definition with no declaration
+  # the driver can call.
+  #
+  # CONSUMER SET, swept both ways as the rule requires. The SYMBOL string
+  # `attn::merge_attention_states_bf16` appears in no table; the DSL WRAPPER
+  # `dsl::merge_attention_states` (`model-compiler/src/dsl.rs:3537`) exists and
+  # is CALLED BY NOTHING — and that is not an inference, it is asserted:
+  # `kernels-cuda-new/tests/consumer.rs:62` pins the symbol in
+  # `REACHED_BY_NOTHING`, and `:197 a_dead_symbol_marked_consumed_is_caught`
+  # uses it as the fixture for a fabricated consumer precisely because
+  # "`merge_attention_states` is in no file under `crates/model/src`" —
+  # a claim that test opens the files and checks. No C++ caller either: the
+  # only `#include` of `attn/attention_flashinfer_hopper.hpp` outside this
+  # directory is `attention_flashinfer_common.cuh`, which as noted above no
+  # longer has a compiler.
+  #
+  # WHAT IS OWED IS THE ROW, NOT THE FILE. `driver-cuda/src/fire/flashinfer_fa2.rs:1022`
+  # records that split-KV prefill is disabled BECAUSE this symbol has no row;
+  # `examples/migration_status.rs:926` classifies it `Structural(HostChoice)`
+  # over a two-geometry host `if`; `examples/vendor_probe.rs:199` cites it by
+  # file and line as one of the vendored-call rows. Deleting the C++ does not
+  # make split-KV any more disabled than it already is — the row is what
+  # brings it back, and a re-added row wants a Rust body over
+  # `flashinfer/attention/cascade.cuh`, which `csrc/vendor/flashinfer` already
+  # carries. The file-and-line citations above will need repointing to git
+  # history when that happens; they are recorded here so the repoint is a list.
+  #
+  # The two-paragraph argument this file carried at its head is NOT lost and
+  # is the reason it was unconditional rather than inside
+  # PIE_CUDA_FLASHINFER_HOPPER_SOURCE: it used to sit in
+  # `attention_flashinfer_hopper.cu`, on the reasoning that the KV split
+  # producing its inputs was the sm90 prefill's, so nothing could reach it on
+  # an architecture where that unit is stubbed. True on sm_80 and sm_90, FALSE
+  # on sm_100, where the DECODE KV-split path (`use_full_split` in mixtral.cpp,
+  # the two sliding-window sites in gemma4.cpp) calls a decode dispatch built
+  # on every architecture and then merges — so on Blackwell the dispatch
+  # succeeded and the merge threw, poisoning the driver on the first fire and
+  # taking gpt-oss and gemma-4 down with it. That is a statement about where a
+  # merge's CALLERS live, it outlives both files, and whatever serves the row
+  # next must not be arch-gated.
   # `src/attn/attention_naive.cu` was here and IS DELETED, with
   # `attn/attention_naive.hpp`. Two `<<<>>>` left in it -- the MTP state
   # pair, `mtp_shift_hidden<bf16>` at `<<<total_tokens, 256>>>` and
@@ -718,7 +967,137 @@ add_library(pie_kernels_cuda STATIC
   # change (§60.6), because §52.11 forbids walking a symbol a unit hosts.
   # The deleted three launchers' host `if` on `max_global_tokens +
   # history_steps > 8192` is restated in the Rust module header.
-  src/attn/attention_naive_paged.cu
+  # `src/attn/attention_naive_paged.cu` was here and IS DELETED. It held no
+  # launcher, no launch and no `__global__`; its entire content was two
+  # `static_assert` blocks comparing the host `KvCacheScheme`/`DType` against
+  # the device `device::KvScheme`/`KvDType` NVRTC reads, plus one head-dim
+  # assert. It is the only file in this archive deleted with NO host program
+  # to name, because it had none: what replaces it is a CHECK.
+  #
+  # THE DELETION CONDITION IS THE ONE THE FILE WROTE FOR ITSELF, verbatim:
+  # *"a test in `driver-cuda` that reads `attn/attention_naive_paged.cuh` and
+  # asserts each `device::KvScheme`/`device::KvDType` enumerator against
+  # `bind::abi::KvCacheScheme`/`dtype::DType`. A text scan, in the idiom
+  # `kernels-cuda/tests/sources.rs` already uses."* That is
+  # `crates/driver-cuda/tests/enum_mirrors.rs`, three tests, and it checks the
+  # LIVE pair -- Rust (1) against device (3) -- where these `static_assert`s
+  # checked host C++ (2) against device (3) with (2) a bystander in its own
+  # test. Writing it found the gap it was written to find: Rust's `DType` had
+  # twelve enumerators and `device::KvDType` had ten, `MXFP4_PACKED` and
+  # `E8M0` never mirrored, against the device header's own rule that *"every
+  # enumerator is mirrored and asserted: a partial mirror is a renumbering
+  # waiting to happen."* Fixed by completing the mirror, not by relaxing the
+  # test -- which is the whole argument for replacing a check rather than
+  # dropping one.
+  #
+  # WHAT THE REPLACEMENT DOES NOT COVER, stated rather than glossed. The file
+  # also held `static_assert(MAX_HEAD_DIM == BLOCK * 8)`, whose message read
+  # *"acc[] in the kernels is sized (kMaxHeadDim + BLOCK - 1) / BLOCK and was
+  # written as a literal 8 at BLOCK = 128"*. Its premise expired before this
+  # deletion: `attention_naive_paged.cuh:450` and `:593` spell that extent as
+  # `acc[(kMaxHeadDim + BLOCK - 1) / BLOCK]` today, so the array follows
+  # `kMaxHeadDim` and `BLOCK` instead of being pinned to them, and the
+  # predicate that used the constant -- `check_head_dim_supported`, which
+  # THREW -- went with the three launchers (a refusal with no home,
+  # `new-horizon.md` §56). The assert therefore guards a fold that has already
+  # been unfolded: it can only fire as a FALSE alarm, on a `kMaxHeadDim`
+  # change that the `.cuh` would absorb correctly. `BLOCK = 128` survives on
+  # both sides that still read it -- `LaunchRule::PagedScores` and
+  # `runtime::launch`'s `PAGED_BLOCK` -- and `kMaxHeadDim = 1024` survives at
+  # `attention_naive_paged.cuh:223`. It is recorded here and not re-asserted
+  # anywhere, and that is a decision, not an oversight.
+  #
+  # THE CONSUMER SET, both halves. Its own half is empty: every name it
+  # declared -- `BLOCK`, `MAX_HEAD_DIM`, the two mirror macros -- was in an
+  # anonymous namespace, so it exported nothing and no `pie_k_*` entry, `ffi`
+  # arm, table row or `crates/model/src` statement could name it. Its
+  # EXISTENCE half is the one that mattered and is the `kv_paged.hpp` trap
+  # this archive already sprang once: it was the last archive `#include` of
+  # `attn/attention_naive_paged.cuh` (which stays -- it is the JIT unit
+  # `attn/attention_naive_paged`, `families::attn::ATTENTION_NAIVE_PAGED`,
+  # two rows), and one of two archive includers of `attn/kv_cache_view.hpp`.
+  # THAT HEADER STAYS: `attn/attention_flashinfer.hpp:13` still includes it,
+  # exactly as `attention_flashinfer_common.cuh:75` predicted. `tensor.hpp`
+  # keeps three includers (`attn/kv_cache_view.hpp`, `quant_meta.hpp`,
+  # `weight_view.hpp`).
+  #
+  # It was the last translation unit in this archive that was neither a host
+  # launcher nor device text.
+  # THE SIX XQA FILES STAY, AND THE BLOCKER IS MECHANICAL, NOT SIZE.
+  #
+  # Their device half is done and measured: `kernels-cuda-new`'s
+  # `csrc/vendor/xqa/` carries the fifteen-file closure, `csrc/src/attn/
+  # attention_xqa_mha.cuh` is the one root all six compile, and
+  # `families::attn::XQA_LATTICE` holds the six `-D` sets. All five non-Hopper
+  # members compile rc = 0 through NVRTC with the tree's own numerics flags.
+  # The host half is `driver-cuda/src/fire/xqa.rs`, 959 lines.
+  #
+  # What blocks the deletion is the row. `attn::attention_xqa_decode_bf16_prepared`
+  # is live, and the sweep has to be run under BOTH tokens to see that --
+  # exactly the trap the brief warns about. Under the symbol string it looks
+  # like test scaffolding: `table/attn.rs:208` (a full `operands` list),
+  # `model-compiler/src/dsl.rs:6899`, `model/tests/kernels_table.rs:70`,
+  # `model/tests/lowering.rs:661`. Under the DSL wrapper name
+  # `attention_xqa_decode` a real caller appears --
+  # `model/src/shared/llama_like/forward/mod.rs:1448`, in the llama-like decode
+  # path, which is the only citation here that is a model actually asking for
+  # the kernel. The wrapper returns `Option<Val>` and its `None` is a lowering
+  # choice, not a runtime refusal, so a missing body is a link error and not a
+  # fallback. `abi::emit_c_shim` therefore writes a `pie_k_*` entry forwarding
+  # to a body these files define. Delete them and the  # generated shim TU does not compile, which is the exact failure
+  # `execution::RUST_SERVED`'s header describes and the one `attn/kv_paged.cu`
+  # nearly hit. A row loses its entry three ways and only one is available
+  # here: `device::JIT_DISPATCHED` refuses a symbol whose unit is not enrolled,
+  # dropping `operands` deletes the generated dispatch arm, so the mechanism
+  # is `RUST_SERVED` -- and `RUST_SERVED` requires `driver-cuda`'s
+  # `bind::service` to spell a body, which requires the six units enrolled,
+  # which requires a `KernelSig` for `kernel_mha`.
+  #
+  # And that is where it stops, on a fact rather than an estimate.
+  # `kernel_mha` takes `KVCacheList<usePagedKVCache>` BY VALUE -- 40 bytes,
+  # 8-aligned, with `ENABLE_4BIT_KV_CACHE` off. `runtime::args`' variant for
+  # that is `ArgValue::Bytes`, and its own comment says who may produce one:
+  # *"Only `x::Abi` produces this variant. No `Source` builds one, so no
+  # row-world binding can reach this line at all."* `kernels-cuda-new/src/x/`
+  # is another agent's directory in this migration. The XQA fire is an `Abi`
+  # impl, it is written there, and it is one change away -- not a rewrite.
+  #
+  # THAT `Abi` IMPL HAS LANDED AND THE SIX STILL STAY, so this paragraph is
+  # corrected rather than deleted -- the estimate *"one change away"* was
+  # about the FLOOR and the floor was the smaller half.
+  # `kernels-cuda-new/src/x/xqa.rs` is on disk: `KvCacheList` mirrored
+  # field-for-field, `by_value! { KvCacheList as "KVCacheList<true>", size =
+  # 40, align = 8, ... }` with the five offsets MEASURED out of NVRTC's PTX
+  # (`nvrtc-probes/xqa_kvcachelist.py`, rc = 0, NVRTC 13.0, `compute_89`), and
+  # the `Abi` impl that makes `cache_list: KvCacheList` an ordinary `unit!`
+  # parameter. `ArgValue::Bytes` therefore has a producer.
+  #
+  # WHAT IS LEFT IS THE REGISTRATION, and it is all in that same off-limits
+  # directory. `x/xqa.rs`'s own header says so in as many words: *"This module
+  # is the floor half only: the mirror, its layout, and its `Abi` impl. The
+  # `unit!`, `contract!` and `bind!` for the six-member lattice belong here
+  # too and are yours to add."* None of the three is written. Measured, as of
+  # this pass:
+  #
+  #   * `crate::x::xqa::UNITS` does not exist -- `families::ALL` names
+  #     `crate::x::{adapter,attn,gemm,layout,mlp,norm,quant,rope,sample,ssm}`
+  #     and no `xqa`, so `unit_of("kernel_mha_xqa_gqa2_bf16_p32_h128")` is
+  #     `None` and `hand::fire` cannot resolve a symbol for any of the six.
+  #   * `crate::x::xqa::ENTRIES`/`SIGS` do not exist, so
+  #     `attn::attention_xqa_decode_bf16_prepared` is still `table::attn`'s
+  #     and still resolves `Route::Rows`.
+  #   * `driver-cuda/src/fire/xqa.rs::plan_decode` still stops one step short
+  #     of a fire, by design and by its own `XqaDecode` header: there is no
+  #     `Launched` variant *"because nothing can launch yet, and a variant
+  #     named for an outcome the code cannot produce is the kind of thing that
+  #     gets wired up and then discovered."*
+  #
+  # So the mechanism is unchanged and still unavailable: `RUST_SERVED` needs a
+  # `bind::service` body, a body needs a fire, and a fire needs the six units
+  # enrolled. Writing the `RUST_SERVED` entry against a body that panics
+  # "not enrolled" would delete the shim entry and the `.cu` and leave the
+  # symbol answering a fault -- an empty list is a valid list, and that is the
+  # one failure this archive has agreed not to repeat.
   src/attn/attention_xqa.cu
   src/attn/attention_xqa_gqa2.cu
   src/attn/attention_xqa_gqa2_p16.cu
@@ -848,7 +1227,9 @@ add_library(pie_kernels_cuda STATIC
   # `driver-cuda/src`: one, `bind::abi::seed_envelopes_empty`, rewired to
   # `fire::envelope::seed_empty` with its own signature unchanged. C++:
   # `attn/kv_paged.cu` called two of the three, and both of ITS callers moved
-  # to Rust in the same change. The three
+  # to Rust in the same change — and `attn/kv_paged.cu` is now DELETED too
+  # (see its tombstone below), so that channel is empty by the file being
+  # gone rather than by the calls being gone. The three
   # `driver-cuda/tests/oracle/*/stub/layout/envelope.hpp` files define their
   # own `inline` logging bodies and shadow the real header, so they never
   # linked against this and do not notice it left.
@@ -912,7 +1293,55 @@ add_library(pie_kernels_cuda STATIC
   # the launchers did not follow. `LaunchRule::PerHead` states the
   # `dim3(num_heads, num_tokens)` grid at `device::kPadBlock` threads, which
   # is the geometry that was here.
-  src/attn/kv_paged.cu
+  # `src/attn/kv_paged.cu` WAS HERE AND IS DELETED, with `attn/kv_paged.hpp`.
+  # **IT HELD THE LAST FOUR `<<<>>>` IN ANY `.cu` OF THIS ARCHIVE, AND THE
+  # `.cu` CENSUS IS NOW ZERO** -- from 401 at the start of this migration.
+  #
+  # Zero over `.cu`, which is what `tests/sources.rs` counts, and NOT yet
+  # zero over what nvcc compiles: `src/attn/attention_mla.cu:17` includes
+  # `kernels-cuda-new/csrc/src/attn/attention_mla_naive.cuh`, which holds two
+  # host launchers at `:266` and `:725` that a `.cu`-only scan never opens.
+  # Measured: that header has exactly one includer in either tree, and it is
+  # that line. Both belong to the XQA/MLA pass and are named here so this
+  # tombstone cannot be read as claiming more than was measured.
+  #
+  # 284 lines defining exactly one function,
+  # `dequant_kv_cache_layer_to_bf16_active`: a guard, one grid, and a five-way
+  # `switch (layer.scheme)` with one launch per arm. Its thirteen earlier
+  # launchers left in earlier passes and each is recorded at its own tombstone
+  # in the file's own history.
+  #
+  # CONSUMERS, all five channels, and the fourth is why this could not go
+  # sooner:
+  #   * C++ across `.cu`/`.cuh`/`.cpp`/`.hpp`: two MENTIONS and zero calls —
+  #     `attn/attention_naive_paged.cu:16` and
+  #     `kernels-cuda-new/csrc/src/attn/fa2.cuh:138`, both comments recording
+  #     that their own calls went.
+  #   * `crates/model/src`: neither the symbol nor a wrapper name.
+  #   * Hand-written `ffi::pie_k_*` arms in `driver-cuda/src`: none.
+  #   * `model-compiler/src/dsl.rs:7750` STATES
+  #     `"attn::dequant_kv_cache_layer_to_bf16_active"` and `lower.rs:1100`
+  #     names it, so the row is LIVE and this is a routing, not a deletion of
+  #     a dead symbol. It is `execution::RUST_SERVED` now, classified
+  #     `Execution::Walk` — `Control::Switch { on: "layer.scheme" }` — first,
+  #     and `bind::service::attn_dequant_kv_cache_layer_to_bf16_active` is
+  #     what the generated arm calls. Without that entry `abi::emit_c_shim`
+  #     would still emit `pie_k_attn_dequant_kv_cache_layer_to_bf16_active`
+  #     and deleting this file would be a link error rather than a removal.
+  #   * The four REAL callers were `driver-cuda/csrc/attn/
+  #     attention_flashinfer.cu:648`, `:675`, `:1098` and `:1244` — C++
+  #     calling C++ by symbol with no shim between, which is why no routing
+  #     could reach them. That file was deleted with the FA2 host program in
+  #     the commit before this one, and the four call sites are now
+  #     `driver-cuda/src/fire/kv_paged.rs::dequant_kv_cache_layer_to_bf16_active`
+  #     called directly from `bind::service`'s four FA2 entry points.
+  #
+  # `kernels-cuda-new/csrc/src/attn/kv_paged.cuh` is UNTOUCHED and is where
+  # all fourteen `__global__`s live; `families::attn::KV_PAGED`'s rows are
+  # what compile them through NVRTC. This file was the header's only archive
+  # includer, which §21.6 required while five of the fourteen were
+  # non-templates — with no includer at all there is no translation unit to
+  # collide with, so that constraint is discharged rather than violated.
   # `src/moe/moe_dispatch.cu` was here and IS DELETED with
   # `moe/moe_dispatch.hpp`. Its last three launchers --
   # `scatter_add_weighted_bf16`, `moe_bucket_exact` and
@@ -1013,7 +1442,9 @@ add_library(pie_kernels_cuda STATIC
   # (`rmsnorm_bf16`, `rmsnorm_strided_bf16`, `rmsnorm_gated_fp32_in_bf16`)
   # and two are `execution::RUST_SERVED` (`rmsnorm_bf16_with_fp16`,
   # `rmsnorm_residual_add_scale_rmsnorm_bf16`), so the shim emits nothing for
-  # the file. `driver-cuda/src/fire/rmsnorm.rs` is the host program.
+  # the file. `kernels-cuda-new/src/x/norm.rs` holds the host programs;
+  # `driver-cuda/src/fire/rmsnorm.rs` did until §5 step 5 took `norm` into
+  # fn-world and deleted it.
   #
   # `src/norm/residual_add.cu` above IS DELETED, and the sentence that used to
   # stand here is why it took a round longer than the rest of `norm/`: it read

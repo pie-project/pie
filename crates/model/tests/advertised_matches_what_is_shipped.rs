@@ -49,7 +49,12 @@ use std::collections::BTreeMap;
 const THIS_BUILD_CANNOT_DEPLOY: &[(&str, &str)] = &[
     (
         "gemma-4-26b-a4b",
-        "no routed-expert text for a gemma-4 block",
+        // The text IS written; what is missing is the contract that
+        // publishes `experts.switch_glu.*`, and the branch's own norms
+        // and the router's two scales. `Gemma4::untraced` carries the
+        // measurement -- this column used to say "no routed-expert
+        // text", which named the wrong half.
+        "no loadable routed bank for a gemma-4 block",
     ),
     ("glm-5-106b-a12b", "no MLA latent store"),
     ("kimi-k2", "no MLA latent store"),

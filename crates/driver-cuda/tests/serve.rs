@@ -564,6 +564,11 @@ fn the_registries_run_the_id_lifecycle() {
 /// carrying its own copy of the frame hides the thing worth reading,
 /// which is WHICH deployments the shell can open.
 fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
+    use driver_api::local::{
+        InstanceBinding, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieCompletion, PieInstanceDesc,
+        PieModelLoadDesc, PieRuntimeCallbacks, TerminalCell,
+    };
+
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
         .join(".cache/huggingface/hub")
@@ -833,6 +838,11 @@ fn a_real_decode_frame_launches_through_the_abi() {
     let _gpu = gpu_guard();
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use driver_api::local::{
+        InstanceBinding, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieCompletion, PieInstanceDesc,
+        PieModelLoadDesc, PieRuntimeCallbacks, TerminalCell,
+    };
+
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
         .join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
@@ -958,6 +968,7 @@ fn a_real_decode_frame_launches_through_the_abi() {
 #[test]
 fn channels_bind_the_ring_contract() {
     let _gpu = gpu_guard();
+    use driver_api::local::{ChannelBinding, PIE_CHANNEL_DTYPE_BOOL, PieChannelDesc, PieU32Slice};
 
     let mut d = Shell::open(b"", engine_runtime()).expect("the driver creates");
 
@@ -1071,6 +1082,12 @@ fn channels_bind_the_ring_contract() {
 #[test]
 fn logits_come_back_through_the_ring() {
     let _gpu = gpu_guard();
+    // The fire retires asynchronously; this is how the test learns it did.
+    let fires = fire_counter();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
+        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
+    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -1244,6 +1261,12 @@ fn logits_come_back_through_the_ring() {
 #[test]
 fn multi_step_resize_and_copy_preserve_the_kv() {
     let _gpu = gpu_guard();
+    // The fire retires asynchronously; this is how the test learns it did.
+    let fires = fire_counter();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
+        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
+    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -1563,6 +1586,12 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
 #[test]
 fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
     let _gpu = gpu_guard();
+    // The fire retires asynchronously; this is how the test learns it did.
+    let fires = fire_counter();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
+        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
+    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -1808,6 +1837,10 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
 #[ignore = "the scaled soak: ~1 minute of GPU; run explicitly"]
 fn the_711_fire_soak_holds_steady() {
     let _gpu = gpu_guard();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
+        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
+    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -2025,6 +2058,13 @@ fn the_711_fire_soak_holds_steady() {
 #[test]
 fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     let _gpu = gpu_guard();
+    // The fire retires asynchronously; this is how the test learns it did.
+    let fires = fire_counter();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PIE_RS_FLAG_RESET, PieBytes,
+        PieChannelDesc, PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
+        StateCopyRange,
+    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -2315,6 +2355,12 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
 #[test]
 fn gemma4_loads_and_fires_both_classes_through_the_abi() {
     let _gpu = gpu_guard();
+    // The fire retires asynchronously; this is how the test learns it did.
+    let fires = fire_counter();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
+        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
+    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -3225,6 +3271,11 @@ fn a_quantized_checkpoint_loads_through_the_abi() {
 fn a_launch_returns_before_its_fire_retires() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    use driver_api::local::{
+        InstanceBinding, PieBytes, PieCompletion, PieInstanceDesc, PieModelLoadDesc,
+        PieRuntimeCallbacks,
+    };
+
     let _gpu = gpu_guard();
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -3564,6 +3615,11 @@ fn a_kv_cache_dtype_is_read_and_an_unreadable_one_is_refused() {
 #[test]
 fn every_request_in_a_frame_gets_its_own_logits() {
     let _gpu = gpu_guard();
+    let fires = fire_counter();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
+        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
+    };
 
     let Some(snap) = qwen3_snapshot() else {
         eprintln!("skipped: no cached Qwen3-0.6B");
@@ -3756,6 +3812,11 @@ fn every_request_in_a_frame_gets_its_own_logits() {
 #[test]
 fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     let _gpu = gpu_guard();
+    let fires = fire_counter();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
+        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
+    };
 
     let (Some(snap), Some(descriptor)) = (qwen3_snapshot(), qwen3_descriptor()) else {
         eprintln!("skipped: no cached Qwen3-0.6B or descriptor");
@@ -3933,6 +3994,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
 #[test]
 fn an_extern_channel_registers_and_refuses_to_attach() {
     let _gpu = gpu_guard();
+    use driver_api::local::{
+        ChannelBinding, InstanceBinding, PIE_CHANNEL_EXTERN_IMPORT, PieBytes, PieChannelDesc,
+        PieInstanceDesc, PieU32Slice, PieU64Slice,
+    };
 
     let mut d = Shell::open(b"", engine_runtime()).expect("the driver creates");
 

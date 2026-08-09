@@ -14,18 +14,22 @@
 //!
 //! Here: the three caches as Rust structs, the two real planner factories over
 //! [`kernels_cuda_new::plan`], the static non-split decode short-circuit with
-//! both of its environment gates, and the geometry gate that turns an
-//! unsupported (head dim, `CTA_TILE_Q`) pair into a named refusal.
+//! both of its environment gates, the geometry gate that turns an unsupported
+//! (head dim, `CTA_TILE_Q`) pair into a named refusal, and — north star §5
+//! step 7's last two seams — the plan H2D ([`upload_int_plan`]) and the fire
+//! ([`fire_decode`], [`fire_prefill`]).
 //!
-//! Not here: the four `switch (cache.head_dim)` dispatches. They need a
-//! `#[repr(C)]` mirror of `BatchDecodeParams` and `BatchPrefillPagedParams` —
-//! roughly 25 and 40 fields of upstream layout — passed by value through
-//! [`kernels_cuda_new::runtime::module::KernelModule::fire_raw`], and a
-//! mirror that is wrong in one field is a kernel reading a pointer out of an
-//! integer. **Until they exist the C++ file stays and still runs**; nothing in
-//! this module is on a live path yet, and the archive is not deleted. That
-//! ordering is deliberate: a half-written cache that leaves the file in place
-//! costs nothing, and a deleted file with no cache behind it does not link.
+//! `attention_flashinfer.cu` and `plan_lifecycle.cpp` **are deleted**, and
+//! `build.rs`'s last `.cuda(true)` with them. The params filling and the arm
+//! cascades are [`crate::fire::flashinfer_fa2_dispatch`]; the six table rows
+//! that used to reach the C++ through `pie_k_attn_*` now reach
+//! [`crate::bind::service`] through
+//! [`kernels_cuda_new::execution::RUST_SERVED`].
+//!
+//! Not here: the SM90 prefill launcher. [`PrefillPlanCache::sm90_plan`] is
+//! still planned and still recorded, and the dispatch refuses with
+//! `Decline::Sm90Unported` rather than firing an FA2 symbol at it — see
+//! §44.7, quoted below.
 //!
 //! # The measurements this file inherits
 //!
@@ -47,16 +51,59 @@
 //!   planner. A port that dropped the windowed branch would be fully correct
 //!   and 50x slower on exactly one layer type, which is the worst shape a
 //!   regression can have.
+//! * **The unbounded-split cost the window hint existed to avoid.**
+//!   `attention_flashinfer_common.cuh:250-260` records it: a sliding layer's
+//!   split is bounded by the window and is cheap, *"while an unbounded one at
+//!   1k context took a 256-token generation from 22 s to over 2400 s."* The
+//!   C++ carried that fact into upstream's estimator through a `thread_local`
+//!   `decode_window_hint()`, because the estimator is upstream's code and
+//!   could not take another argument. **That side channel is gone and the
+//!   fact is not**: [`plan_decode`] makes the same branch at the call site,
+//!   before choosing a planner, which is where a branch on a caller's flag
+//!   belongs.
 //! * **`head_dim_supports_cascade_merge`'s `{64, 128, 256, 512}`** (`:376`,
 //!   `:985`) is **upstream's** set, and it agrees with
 //!   [`kernels_cuda_new::families::fa2::HEAD_DIMS`] by shared origin rather
 //!   than by construction. Two facts that happen to match; whoever changes one
 //!   says which.
+//! * **The arch coverage this deletion RECOVERS, and it is worth naming**
+//!   because the measurement it recovers from was a regression.
+//!   `attention_flashinfer.cu`'s header said:
+//!
+//!   > `build.rs` gives the `pie_attn_flashinfer` unit `-gencode
+//!   > arch=compute_89,code=sm_89`, copying the towers beside it, because
+//!   > sm_89 is the box this tree is developed on. On an sm_90 part the three
+//!   > post-kernels below would fail to launch with *"no kernel image is
+//!   > available for execution on the device"*. That is a REGRESSION IN
+//!   > COVERAGE against the archive build, which reads its arch list from
+//!   > CMake.
+//!
+//!   NVRTC compiles for the loaded device, so the FA2 lattice has no
+//!   `gencode` list to be narrow. The regression is closed by the deletion
+//!   rather than by a fix, and it is recorded here because *"it stopped being
+//!   true"* and *"it was never true"* are different claims.
+//! * **§44.7's rule, which the arch note above is an instance of, and which
+//!   still binds every line below**: *every sm_90 claim in this migration is
+//!   argued from the call graph and none from a run.* Nothing here has been
+//!   run on Hopper. [`PrefillPlanCache::sm90_plan`] is planned and refused at
+//!   the fire for exactly that reason.
 
+use std::ffi::c_void;
+use std::sync::OnceLock;
+
+use kernels_cuda_new::fa2::{Device as FaDevice, KvWidth};
+use kernels_cuda_new::families::fa2::DecodeArm;
 use kernels_cuda_new::plan::{self, Device, Workspace};
 use kernels_cuda_new::plan::info::{
     DecodePlanInfo, MlaPlanInfo, PrefillPlanInfo, PrefillPlanSm90Info,
 };
+use kernels_cuda_new::runtime::Launch;
+
+use crate::device::StreamRef;
+use crate::error::Result;
+
+use super::flashinfer_fa2_dispatch::{DecodeDispatch, PrefillDispatch};
+use super::hand;
 
 /// Whether a plan was built, and by which planner.
 ///
@@ -140,7 +187,26 @@ pub enum Decline {
     /// workspace. **If a workspace overflow ever needs diagnosing from this
     /// path, this arm is what has to grow** — a `Box<plan::Error>` and the
     /// loss of `Copy`.
+    /// The planner refused, naming which one.
     Planner(&'static str),
+    /// The int workspace cannot hold this plan's descriptor.
+    ///
+    /// `plan_static_nonsplit_decode` (`attention_flashinfer.cu:173-176`) threw
+    /// *"flashinfer decode static plan: attention int workspace too small"*.
+    /// The static planner carves the descriptor itself rather than going
+    /// through [`kernels_cuda_new::plan`]'s allocator, so this is the one
+    /// overflow this module can name precisely — and it does, where
+    /// [`Decline::Planner`] cannot.
+    WorkspaceTooSmall { needed: usize, have: usize },
+    /// A score-capturing prefill plan was asked for with a sliding window.
+    ///
+    /// `attention_flashinfer.cu:299-311`, transcribed whole because the
+    /// argument is not obvious: FlashInfer applies `LogitsMask` **after**
+    /// `LogitsTransform`, so a windowed variant's mask runs on logits the
+    /// capture has already written out. The captured tensor would hold scores
+    /// for positions the kernel then discards — not a scaled answer but a
+    /// different one, and silently. The C++ threw; this refuses.
+    ScoreCaptureWindow { window_left: i32 },
 }
 
 impl core::fmt::Display for Decline {
@@ -159,6 +225,17 @@ impl core::fmt::Display for Decline {
             Self::Planner(which) => {
                 write!(f, "flashinfer fa2: the {which} planner refused")
             }
+            Self::WorkspaceTooSmall { needed, have } => write!(
+                f,
+                "flashinfer decode static plan: attention int workspace too small -- \
+                 {needed} bytes needed, {have} granted",
+            ),
+            Self::ScoreCaptureWindow { window_left } => write!(
+                f,
+                "flashinfer prefill plan: score capture is not available with a sliding window \
+                 (window_left {window_left}) -- LogitsMask runs after LogitsTransform, so the \
+                 captured scores would include positions the kernel discards",
+            ),
         }
     }
 }
@@ -407,13 +484,25 @@ pub struct PrefillPlanCache {
     pub kv_h_buf: Vec<i32>,
     /// The `CTA_TILE_Q` this plan was built at, which names the prefill unit.
     ///
-    /// **Not a field of the C++ cache.** It was recomputed at every dispatch
-    /// from `plan_info.total_num_rows` because the archive instantiated all
-    /// four `NUM_MMA_KV` points and the switch was free. Under the JIT the
-    /// tile chooses the UNIT, so it is a planning output and is recorded where
-    /// the plan is — see `families/fa2.rs`'s note on what
-    /// `DISPATCH_NUM_MMA_KV` cost the archive.
+    /// **Not a field of the C++ cache**, and not a recomputation either: it is
+    /// `PrefillPlanInfo::cta_tile_q` (`plan/info.rs:128`) copied out where the
+    /// dispatch can reach it without unpacking the plan.
+    ///
+    /// The archive did not need it. It instantiated all four `NUM_MMA_KV`
+    /// points, so `DISPATCH_NUM_MMA_KV` was a free switch on a device query
+    /// and the tile never had to leave the launcher. Under the JIT the tile
+    /// **names the unit**, so it is a planning output — see `families/fa2.rs`
+    /// on what that switch cost the archive in compiled points.
     pub cta_tile_q: u32,
+    /// Byte offset of this plan's descriptor inside the shared int workspace.
+    ///
+    /// [`DecodePlanCache::int_base_bytes`]'s twin, and **not** a field of the
+    /// C++ cache: the prefill planner always carved from offset zero because
+    /// only one prefill plan was ever live. The field exists because
+    /// [`upload_int_plan`] takes a base and taking it as a constant zero here
+    /// would be an asymmetry a reader has to go and check. It defaults to 0,
+    /// which is the C++'s behaviour exactly.
+    pub int_base_bytes: usize,
 }
 
 impl PrefillPlanCache {
@@ -421,6 +510,11 @@ impl PrefillPlanCache {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// [`DecodePlanCache::set_int_base`]'s twin.
+    pub fn set_int_base(&mut self, bytes: usize) {
+        self.int_base_bytes = bytes;
     }
 }
 
@@ -460,9 +554,142 @@ impl MlaPlanCache {
     }
 }
 
+// ── The device facts both halves need ───────────────────────────────────────
+
+/// The four device attributes the FA2 planners and geometries read, queried
+/// once.
+///
+/// [`kernels_cuda_new::plan::Device`] and
+/// [`kernels_cuda_new::fa2::Device`] are deliberately different structs — a
+/// planner needs the SM count and a geometry needs the shared-memory budget —
+/// and this is the one place that fills both, so a fire cannot pair one
+/// device's SM count with another's smem limit.
+///
+/// `fire/gemv.rs::unroll_depth`'s pattern, for its reasons: through
+/// [`crate::device::Device`] rather than a second `cudaDeviceGetAttribute`
+/// written here, `OnceLock` so two fires in one process cannot disagree, and a
+/// **named fallback** rather than a panic on a failed query.
+///
+/// # The fallback is `Device::L40S` and that is a claim, not a default
+///
+/// `fa2::Device::L40S` is *"not a default"* by its own doc, because the wrong
+/// shared-memory budget produces a valid-looking `NUM_MMA_KV` and a kernel
+/// that is quietly one CTA per SM. It is used here anyway, and the difference
+/// is that this is a *failure* path: a machine where
+/// `cudaDeviceGetAttribute` fails is a machine where the launch is going to
+/// fail too, and answering with the box this tree was developed on gives the
+/// failure a name in the log instead of a `None` three frames up.
+fn facts() -> (Device, FaDevice) {
+    static FACTS: OnceLock<(Device, FaDevice)> = OnceLock::new();
+    *FACTS.get_or_init(|| {
+        let fallback = (Device::new(148, 8), FaDevice::L40S);
+        use cudarc::runtime::sys as rt;
+        let mut ordinal: i32 = 0;
+        // SAFETY: `ordinal` is a live, writable out-parameter.
+        let code = unsafe { rt::cudaGetDevice(&raw mut ordinal) };
+        if code != rt::cudaError::cudaSuccess {
+            return fallback;
+        }
+        let Ok(device) = crate::device::Device::bind(ordinal) else {
+            return fallback;
+        };
+        let (Ok((cc_major, _)), Ok(num_sm), Ok(smem_sm), Ok(smem_block)) = (
+            device.compute_capability(),
+            device.sm_count(),
+            device.max_shared_memory_per_sm(),
+            device.max_shared_memory_per_block_optin(),
+        ) else {
+            return fallback;
+        };
+        (
+            Device::new(num_sm.max(1).unsigned_abs(), cc_major),
+            FaDevice {
+                cc_major: cc_major.max(0).unsigned_abs(),
+                max_smem_per_sm: smem_sm.max(0).unsigned_abs(),
+                max_smem_per_block_optin: smem_block.max(0).unsigned_abs(),
+            },
+        )
+    })
+}
+
+/// The planner's device facts — SM count and compute-capability major.
+#[must_use]
+pub fn plan_device() -> Device {
+    facts().0
+}
+
+/// The geometry's device facts — compute capability and both shared-memory
+/// budgets.
+#[must_use]
+pub fn fa_device() -> FaDevice {
+    facts().1
+}
+
+/// `max_grid_size` for [`plan_decode`], from the kernel that will run.
+///
+/// Upstream reads
+/// `cudaOccupancyMaxActiveBlocksPerMultiprocessor` **on the decode kernel**
+/// (`decode.cuh:715-718`) and multiplies by the SM count. That is a per-cubin
+/// fact, so under the JIT it is
+/// [`kernels_cuda_new::runtime::module::KernelModule::max_active_blocks_per_sm`]
+/// over the `CUfunction` the unit produced — which means the unit is compiled
+/// at PLAN time, before the fire.
+///
+/// `block_threads` is [`kernels_cuda_new::fa2::DecodeGeometry::num_threads`]
+/// and **not** the product of the block dims: at GQA group 3 those differ
+/// (128 against 120) and `decode.cuh:715` passes the former. Getting that
+/// wrong is a plausible-looking occupancy for a block shape nothing launches.
+///
+/// # The arm is `Full` and the other four would answer the same
+///
+/// The decode arm selects a variant *functor* — a soft cap, a window
+/// predicate — and changes neither `num_threads` nor the shared-memory
+/// request, which are the only two things the occupancy query reads. Probing
+/// one arm therefore answers for all five, and probing `Full` rather than the
+/// arm the fire will take avoids compiling a unit the fire may not want.
+///
+/// # When the query cannot be made this answers `num_sm`
+///
+/// One block per SM: a conservative answer rather than a wrong one.
+/// `max_grid_size` bounds `plan::decode::estimate`'s split, so too small
+/// yields fewer, larger KV chunks — the unsplit end of the range, which is
+/// the plan the static short-circuit uses anyway. Too LARGE would be the
+/// dangerous direction and cannot happen here.
+#[must_use]
+pub fn decode_max_grid_size(head_dim: i32, num_q_heads: i32, num_kv_heads: i32) -> u32 {
+    let (device, fa) = facts();
+    let floor = device.num_sm.max(1);
+    if head_dim < 0 || !head_dim_instantiated(head_dim as u32) {
+        return floor;
+    }
+    let group = if num_kv_heads > 0 { (num_q_heads / num_kv_heads).max(1) } else { 1 };
+    let head_dim = head_dim as u32;
+    let group = group as u32;
+    let Ok(geometry) =
+        kernels_cuda_new::fa2::DecodeGeometry::derive(head_dim, group, KvWidth::BF16, fa)
+    else {
+        return floor;
+    };
+    let Some(symbol) =
+        kernels_cuda_new::families::fa2::decode_symbol(head_dim, group, DecodeArm::Full)
+    else {
+        return floor;
+    };
+    let Some((index, unit)) = kernels_cuda_new::unit::unit_of(symbol) else {
+        return floor;
+    };
+    let Ok(module) = kernels_cuda_new::runtime::cache::module(index, unit) else {
+        return floor;
+    };
+    match module.max_active_blocks_per_sm(symbol, geometry.num_threads, geometry.smem_bytes) {
+        Ok(per_sm) => per_sm.max(1).saturating_mul(floor),
+        Err(_) => floor,
+    }
+}
+
 // ── The factories ───────────────────────────────────────────────────────────
 
-/// `plan_static_nonsplit_decode`, `attention_flashinfer.cu:135-160`.
+/// `plan_static_nonsplit_decode`, `attention_flashinfer.cu:135-211`.
 ///
 /// The hundredfold short-circuit. Writes the descriptor directly instead of
 /// running FlashInfer's planner, which is legal only under the condition this
@@ -471,6 +698,20 @@ impl MlaPlanCache {
 ///
 /// Sets [`DecodePlanCache::page_count_independent`], which is the field's only
 /// producer.
+///
+/// # It carves its own descriptor, and that is the part that is easy to lose
+///
+/// `:145-171` is a four-call bump allocator over the int workspace — three
+/// `IdType` arrays at 16-byte alignment and one scalar at 1 — and `:178-190`
+/// fills the page-locked mirror from the three static vectors plus
+/// `page_size` as the KV chunk size. Neither goes through
+/// [`kernels_cuda_new::plan`]: that module implements upstream's *planner*,
+/// and this function's whole purpose is not to run it.
+///
+/// The bytes land in [`DecodePlanCache::int_upload`] rather than in a
+/// `cudaMemcpyAsync`, because §5 step 7 puts the H2D beside the launch. See
+/// [`upload_int_plan`].
+#[allow(clippy::too_many_arguments)]
 pub fn plan_static_nonsplit_decode(
     cache: &mut DecodePlanCache,
     kv_page_indptr_h: &[u32],
@@ -479,6 +720,8 @@ pub fn plan_static_nonsplit_decode(
     num_kv_heads: i32,
     head_dim: i32,
     page_size: i32,
+    workspace: Workspace,
+    cc_major: i32,
     enable_cuda_graph: bool,
     full_attention_variant: bool,
     hnd_layout: bool,
@@ -488,10 +731,54 @@ pub fn plan_static_nonsplit_decode(
     }
     cache.refresh_static_vectors(num_requests);
 
+    let n = num_requests as usize;
+    // `:145-151`. `sizeof(IdType)` — `IdType` is `int32_t` throughout this
+    // lattice, which is also why the three static vectors are `Vec<i32>`.
+    const ID: usize = 4;
+    let mut cursor = 0usize;
+    let request_indices_offset = carve(&mut cursor, ID * n, 16);
+    let kv_tile_indices_offset = carve(&mut cursor, ID * n, 16);
+    let o_indptr_offset = carve(&mut cursor, ID * (n + 1), 16);
+    let kv_chunk_size_ptr_offset = carve(&mut cursor, ID, 1);
+
+    // `:173-176`. The base is included because several layers' plans share one
+    // int buffer and this one starts at `int_base_bytes`.
+    let needed = cursor.saturating_add(cache.int_base_bytes);
+    if needed > workspace.int_bytes {
+        return Planned::Declined(Decline::WorkspaceTooSmall {
+            needed,
+            have: workspace.int_bytes,
+        });
+    }
+
+    // `:178-190`. The C++ wrote into the page-locked mirror at
+    // `page_locked_int + int_base_bytes` and copied `cursor` bytes from there;
+    // this builds the same `cursor` bytes and hands them to the fire. The
+    // offsets are relative to the base in both cases, which is why the buffer
+    // starts at zero and the H2D adds `int_base_bytes` to the destination.
+    cache.int_upload.clear();
+    cache.int_upload.resize(cursor, 0);
+    put_i32s(&mut cache.int_upload, request_indices_offset, &cache.static_request_indices);
+    put_i32s(&mut cache.int_upload, kv_tile_indices_offset, &cache.static_kv_tile_indices);
+    put_i32s(&mut cache.int_upload, o_indptr_offset, &cache.static_o_indptr);
+    // `:189-190`. **A chunk size in TOKENS**, and for an unsplit plan the
+    // chunk is one page — which is `page_size` tokens, not 1.
+    put_i32s(&mut cache.int_upload, kv_chunk_size_ptr_offset, &[page_size]);
+
     cache.plan_info = DecodePlanInfo {
         enable_cuda_graph,
         split_kv: false,
         padded_batch_size: i64::from(num_requests),
+        request_indices_offset,
+        kv_tile_indices_offset,
+        o_indptr_offset,
+        kv_chunk_size_ptr_offset,
+        // `:153-154`, `:159` — all three explicitly zero, and they must be:
+        // nothing carves the float workspace on an unsplit plan and there is
+        // no padding for a valid mask to describe.
+        v_offset: 0,
+        s_offset: 0,
+        block_valid_mask_offset: 0,
         ..DecodePlanInfo::default()
     };
 
@@ -502,12 +789,46 @@ pub fn plan_static_nonsplit_decode(
     cache.page_size = page_size;
     cache.num_pages_in_batch =
         kv_page_indptr_h.get(num_requests as usize).copied().unwrap_or(0) as i32;
+    // `:207` — `current_device_supports_pdl()`, which `fire/xqa.rs:957` states
+    // as `major >= 9`. RECORDED AND NOT APPLIED: programmatic dependent launch
+    // is a `cudaLaunchKernelEx` attribute and this lattice fires through
+    // `cuLaunchKernel`, as every other JIT row in this driver does. The field
+    // is kept so that the day a launch attribute path exists, the plan already
+    // says whether the device would take one.
+    cache.enable_pdl = cc_major >= 9;
     cache.full_attention_variant = full_attention_variant;
     cache.hnd_layout = hnd_layout;
     cache.page_count_independent = true;
     cache.valid = true;
 
     Planned::StaticNonsplit
+}
+
+/// `align_up_bytes` then bump — the `alloc` lambda at
+/// `attention_flashinfer.cu:146-151`.
+///
+/// Returns the offset as `i64` because that is what a `PlanInfo` offset is:
+/// upstream's descriptor carries signed offsets and `offset_ptr` reads a
+/// negative one as "absent".
+fn carve(cursor: &mut usize, bytes: usize, alignment: usize) -> i64 {
+    *cursor = cursor.next_multiple_of(alignment);
+    let offset = *cursor;
+    *cursor += bytes;
+    offset as i64
+}
+
+/// The `std::memcpy` at `attention_flashinfer.cu:178-190`, as a slice write.
+///
+/// Native byte order, because the C++ `memcpy`'d host `int32_t`s and the
+/// device reads them back as `int32_t`. `to_ne_bytes` is that `memcpy`; a
+/// `to_le_bytes` here would be correct on every machine this runs on and
+/// wrong as a statement.
+fn put_i32s(dst: &mut [u8], at: i64, src: &[i32]) {
+    let at = at.max(0) as usize;
+    for (i, v) in src.iter().enumerate() {
+        let lo = at + i * 4;
+        dst[lo..lo + 4].copy_from_slice(&v.to_ne_bytes());
+    }
 }
 
 /// `plan_attention_flashinfer_decode_bf16`, `attention_flashinfer.cu:218-285`.
@@ -561,6 +882,8 @@ pub fn plan_decode(
             num_kv_heads,
             head_dim,
             page_size,
+            workspace,
+            device.cc_major,
             enable_cuda_graph,
             full_attention_variant,
             hnd_layout,
@@ -602,6 +925,8 @@ pub fn plan_decode(
         kv_page_indptr_h.get(num_requests as usize).copied().unwrap_or(0) as i32;
     cache.full_attention_variant = full_attention_variant;
     cache.hnd_layout = hnd_layout;
+    // `:283`. Recorded, not applied — see `plan_static_nonsplit_decode`.
+    cache.enable_pdl = device.cc_major >= 9;
     // The real planner's arrays ARE derived from page counts. See the field.
     cache.page_count_independent = false;
     cache.valid = true;
@@ -633,6 +958,8 @@ pub fn plan_prefill(
     full_attention_variant: bool,
     hnd_layout: bool,
     causal_mask: bool,
+    custom_mask: bool,
+    wants_prefill_score: bool,
 ) -> Planned {
     if head_dim < 0 || !head_dim_instantiated(head_dim as u32) {
         return Planned::Declined(Decline::HeadDim { head_dim: head_dim.max(0) as u32 });
@@ -640,6 +967,23 @@ pub fn plan_prefill(
     if num_requests <= 0 {
         return Planned::Declined(Decline::NoRequests);
     }
+
+    // `:299-317`. Both halves, in order: the window is refused, then the
+    // variant is PROMOTED to full.
+    //
+    // The promotion is numerics-neutral and the C++ says why: with
+    // `window_left < 0` the windowed variant's `LogitsMask` is `true` for
+    // every position, so `Full` and `Window` compute the same logits — but
+    // only `Full` has capture instantiations. Promoting therefore changes
+    // which unit runs and not what it computes.
+    let full_attention_variant = if wants_prefill_score {
+        if window_left >= 0 {
+            return Planned::Declined(Decline::ScoreCaptureWindow { window_left });
+        }
+        true
+    } else {
+        full_attention_variant
+    };
 
     cache.qo_h_buf.clear();
     cache
@@ -664,30 +1008,93 @@ pub fn plan_prefill(
         sizeof_dtype_o: 2,
         window_left,
         fixed_split_size: -1,
-        // `attention_flashinfer.cu` never sets either: it does not run POD
-        // attention, and it lets the planner search. Stated rather than
-        // defaulted because `plan::prefill::Request` derives no `Default` —
-        // deliberately, per its own doc: every field is a decision.
-        disable_split_kv: false,
+        // `:381`'s `disable_split_kv = !head_dim_supports_cascade_merge(head_dim)`,
+        // restored — and this comment is the record of what took it away and
+        // what brought it back, because the reason mattered.
+        //
+        // The C++ asked *"can `VariableLengthMergeStates` run for this head
+        // dim?"*, because a split plan leaves partial outputs in `tmp_v` and
+        // partial log-sum-exps in `tmp_s` that the cascade merge has to fold
+        // into `o`. Its answer was per-head-dim because the merge kernel was
+        // instantiated for some dims and not others (`:980-985`).
+        //
+        // For one migration pass the answer was **no for every head dim**.
+        // `attn::merge_attention_states_bf16` was deleted by
+        // `new-horizon.md` §38 — correctly, its DSL wrapper had no caller —
+        // but the C++ that actually ran was compiled into
+        // `driver-cuda/csrc/attn/attention_flashinfer.cu`, and closing the
+        // FA2 seams deleted that file. There was nothing left to fold the
+        // partials with, so a split plan was not a slower answer, it was no
+        // answer, and this said `true`. That was a REAL performance
+        // regression on short prompts and small batches, which are exactly
+        // the shapes the prefill scheduler splits.
+        //
+        // It is fixed. `kernels_cuda_new::families::cascade` carries
+        // `PersistentVariableLengthMergeStatesKernel` at all four head dims,
+        // compiled by NVRTC out of the VENDORED `cascade.cuh`, and
+        // `fire/merge_states.rs` is the Rust host program that fires it.
+        // Every dispatch that returns
+        // `flashinfer_fa2_dispatch::Fired::Split` now folds before it
+        // returns, so the predicate is upstream's again and its input is the
+        // lattice's own head-dim set — which
+        // `families::cascade::tests::the_lattice_covers_flashinfer_fa2s_head_dims`
+        // pins against `families::fa2::HEAD_DIMS`.
+        disable_split_kv: !head_dim_instantiated(head_dim.max(0) as u32),
         num_colocated_ctas: 0,
     };
 
-    let planned = match plan::prefill::plan(&req, device, workspace) {
-        Ok(p) => p,
+    // `:390-399`, the graph-mode demotion, in the shape the Rust planner
+    // makes available.
+    //
+    // The C++ recomputed a worst-case `max_qo_len` BEFORE planning and turned
+    // `enable_cuda_graph` off when the resulting tile would not fit. The Rust
+    // planner does that same arithmetic internally (`prefill.rs:225`) and
+    // reports the overflow as an error instead, so the demotion is written
+    // here as a retry: plan in graph mode, and if the carve does not fit, plan
+    // again eagerly. Same two outcomes, same order of preference, and the
+    // second attempt is the one whose failure is fatal.
+    let (planned, capturable) = match plan::prefill::plan(&req, device, workspace) {
+        Ok(p) => (p, enable_cuda_graph),
+        Err(_) if enable_cuda_graph => {
+            let req = plan::prefill::Request { enable_cuda_graph: false, ..req };
+            match plan::prefill::plan(&req, device, workspace) {
+                Ok(p) => (p, false),
+                Err(_) => return Planned::Declined(Decline::Planner("prefill")),
+            }
+        }
         Err(_) => return Planned::Declined(Decline::Planner("prefill")),
     };
 
-    // The tile the plan implies, from the same arithmetic the launcher used.
-    // `avg_packed_qo_len` is the packed QO rows over the requests they cover;
-    // `plan::arith` owns the chooser and this is its only caller here.
-    let group = if num_kv_heads > 0 { num_q_heads / num_kv_heads } else { 1 };
-    let avg_packed_qo_len =
-        i64::from(total_tokens.max(0)) * i64::from(group.max(1)) / i64::from(num_requests.max(1));
-    let cta_tile_q =
-        plan::arith::fa2_determine_cta_tile_q(avg_packed_qo_len, head_dim as u32, device.cc_major);
+    // The tile, read back from the plan rather than recomputed.
+    //
+    // This was a reconstruction — `total_tokens * group / num_requests` fed to
+    // `plan::arith::fa2_determine_cta_tile_q` — and it was the one number in
+    // this module without a citation. It is now gone, because the recompute
+    // was not merely uncited, it was **unnecessary**: `plan::prefill` at
+    // `prefill.rs:238-239` computes `avg_packed_qo_len` from
+    // `sum_packed_qo_len / batch_size` (a sum over the QO indptr, not a
+    // product of totals — my reconstruction had the wrong numerator) and
+    // publishes the answer as `PrefillPlanInfo::cta_tile_q`, `info.rs:128`,
+    // pinned at offset 24 by `info.rs:158`.
+    //
+    // Reading it back rather than recomputing it also removes a class of bug
+    // rather than a line: the planner **split the batch against this tile**
+    // (`prefill.rs:241`, `:289`), so a fire that chose its own would index a
+    // work list built for a different one. There is no arithmetic here that
+    // can drift from the planner's, because there is no arithmetic here.
+    //
+    // The graph-mode branch at `attention_flashinfer.cu:390-399` is a
+    // different quantity and is not this one: it is `max_qo_len`, the
+    // worst case where one request holds every token
+    // (`max(1, total_tokens - num_requests + 1) * max(1, gqa_group)`), used
+    // only to bound a workspace that must be sized before the batch is known.
+    // `plan::prefill` has that branch too, at `prefill.rs:225`, and takes it
+    // under the same condition.
+    let cta_tile_q = u32::try_from(planned.info.cta_tile_q).unwrap_or(0);
 
-    // The gate. See `Decline::HeadDimTile`: this cannot fire from the chooser
-    // above, and fires only if a caller substitutes its own tile.
+    // The gate. See `Decline::HeadDimTile`: with the tile now coming from the
+    // planner, `arith.rs:95`'s `head_dim < 256` makes this unreachable — it is
+    // a statement kept against an upstream edit, not a live branch.
     if head_dim as u32 >= 256 && cta_tile_q == 128 {
         return Planned::Declined(Decline::HeadDimTile { head_dim: head_dim as u32, cta_tile_q });
     }
@@ -705,9 +1112,186 @@ pub fn plan_prefill(
     cache.causal_mask = causal_mask;
     cache.hnd_layout = hnd_layout;
     cache.cta_tile_q = cta_tile_q;
+    // `:319-321`. Three fields set together because they are one decision.
+    //
+    // The C++ chose the SM90 route at `:325-333` when the layer was
+    // uncustomised, unrolled, unscored and Hopper. **This lattice never takes
+    // it**, so `use_sm90` is a written `false` rather than an unset field, and
+    // `sm90_plan` is `None` rather than stale: `families/fa2.rs` holds FA2
+    // units only, so there is no `sm90` unit for a plan to name and a `true`
+    // here would produce a cache the fire can only refuse. The refusal is
+    // `flashinfer_fa2_dispatch::Decline::Sm90Unported`, and it exists so that
+    // a future SM90 family can be wired by making this line conditional and
+    // nothing else.
+    cache.use_sm90 = false;
+    cache.sm90_plan = None;
+    // `:390-399`, the other half of the demotion above: graph capture is
+    // available only if the plan that survived was the graph-mode one.
+    cache.graph_capturable = capturable;
+    // `custom_mask` reached the C++ planner for exactly one purpose — it
+    // vetoed the SM90 route at `:325`. With that route unreachable the flag
+    // has no planning consequence left, and it is taken as a parameter anyway
+    // so that the call site keeps stating it and so this comment has somewhere
+    // to live. The mask POINTERS are a dispatch input, not a plan input:
+    // `flashinfer_fa2_dispatch::prefill_custom`.
+    let _ = custom_mask;
+    // `:362`. Recorded, not applied — see `plan_static_nonsplit_decode`.
+    cache.enable_pdl = device.cc_major >= 9;
     cache.valid = true;
 
     Planned::Full
+}
+
+// ── The H2D and the fire — north star §5 step 7's last two seams ────────────
+
+/// The plan's descriptor, host to device.
+///
+/// `attention_flashinfer.cu:193-198`, moved to where the launch is. The C++
+/// issued it at the end of the planner; this is issued immediately before the
+/// fire that reads it, which is what §5 step 7 asks for and is also the only
+/// version that is correct without further argument: the planner has no
+/// stream to order against, and a descriptor uploaded on one stream and read
+/// on another is a race the C++ avoided by having exactly one stream and not
+/// by saying so.
+///
+/// `int_base_bytes` is added to the DESTINATION and not to the offsets.
+/// [`DecodePlanCache::int_upload`] is carved from zero, so a plan that shares
+/// an int workspace with another moves as a block and the descriptor's own
+/// offsets stay relative — which is what makes
+/// [`DecodePlanCache::set_int_base`] a one-field change.
+///
+/// # The one behaviour difference from the C++, stated because it is real
+///
+/// The C++ copied from `workspace.page_locked_int`, so its `cudaMemcpyAsync`
+/// was fully asynchronous. This copies from a `Vec<u8>` the cache owns, which
+/// is pageable, and a pageable H2D `cudaMemcpyAsync` stages through a driver
+/// pinned buffer and is only *partially* async. That is a latency difference
+/// on a per-plan path, not a correctness one, and it buys the deletion of the
+/// page-locked staging slot's exclusive owner. **The source must outlive the
+/// copy** and does: `int_upload` belongs to the cache, and the cache outlives
+/// the fire.
+///
+/// # Errors
+///
+/// The copy faulted.
+///
+/// # Safety
+///
+/// `int_buffer` must name at least `int_base_bytes + bytes.len()` writable
+/// device bytes, and `stream` must outlive the copy.
+pub unsafe fn upload_int_plan(
+    bytes: &[u8],
+    int_buffer: u64,
+    int_base_bytes: usize,
+    stream: StreamRef<'_>,
+) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let dst = (int_buffer as usize).saturating_add(int_base_bytes) as *mut c_void;
+    // SAFETY: the caller's contract, forwarded verbatim.
+    unsafe { crate::device::write_raw_span(dst, bytes, stream) }
+}
+
+/// Where a plan's descriptor has to land before the launch reads it.
+///
+/// Three values that always travel together, named once so that the fire's
+/// signature does not grow a `u64` and a `usize` whose order is guessable.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanUpload<'a> {
+    /// [`DecodePlanCache::int_upload`] or [`PrefillPlanCache::int_upload`].
+    pub bytes: &'a [u8],
+    /// `AttentionWorkspaceView::int_buffer`.
+    pub int_buffer: u64,
+    /// [`DecodePlanCache::int_base_bytes`]. **Zero for prefill** — one prefill
+    /// plan serves one fire, so `make_prefill_params` reads the workspace base
+    /// directly and there is no prefill analogue of the decode offset.
+    pub int_base_bytes: usize,
+}
+
+/// Upload the plan, then fire one decode dispatch.
+///
+/// Seam 1 and seam 3 in one function, in that order, because the order is the
+/// point: the grid is `plan_info.padded_batch_size` and the work list the grid
+/// indexes is the bytes being uploaded.
+///
+/// `P` is the params type — [`kernels_cuda_new::fa2::params::DecodeParams`] or
+/// [`kernels_cuda_new::fa2::params::DecodeScoreParams`] — so the capturing and
+/// non-capturing fires are one function.
+///
+/// # A missing symbol is a panic and not an error
+///
+/// [`hand::fire_params`] panics if the lattice named a symbol the loaded
+/// module does not export. That is drift between this driver and its kernel
+/// table, and the module header of [`hand`] says why it may not be answered
+/// with a `Result`. The `Result` here is the H2D's alone.
+///
+/// # Errors
+///
+/// The descriptor upload faulted.
+///
+/// # Panics
+///
+/// The JIT and the table disagree — see above.
+///
+/// # Safety
+///
+/// Every device address in `dispatch.params` must name memory of the extent
+/// the kernel reads or writes, `upload.int_buffer` must be the workspace the
+/// params' offsets were computed against, and `stream` must outlive the
+/// launch.
+pub unsafe fn fire_decode<P>(
+    dispatch: &mut DecodeDispatch<P>,
+    upload: PlanUpload<'_>,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: the caller's contract. `StreamRef` borrows the raw stream for
+    // the copy only.
+    unsafe {
+        upload_int_plan(
+            upload.bytes,
+            upload.int_buffer,
+            upload.int_base_bytes,
+            StreamRef::from_raw(stream.cast()),
+        )?;
+    }
+    let launch = Launch { grid: dispatch.grid, block: dispatch.block, smem: dispatch.smem };
+    // SAFETY: as above.
+    unsafe { hand::fire_params(dispatch.symbol, launch, &mut dispatch.params, stream) };
+    Ok(())
+}
+
+/// Upload the plan, then fire one prefill dispatch. See [`fire_decode`].
+///
+/// # Errors
+///
+/// The descriptor upload faulted.
+///
+/// # Panics
+///
+/// The JIT and the table disagree.
+///
+/// # Safety
+///
+/// As [`fire_decode`].
+pub unsafe fn fire_prefill<P>(
+    dispatch: &mut PrefillDispatch<P>,
+    upload: PlanUpload<'_>,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        upload_int_plan(
+            upload.bytes,
+            upload.int_buffer,
+            upload.int_base_bytes,
+            StreamRef::from_raw(stream.cast()),
+        )?;
+    }
+    let launch = Launch { grid: dispatch.grid, block: dispatch.block, smem: dispatch.smem };
+    // SAFETY: as above.
+    unsafe { hand::fire_params(dispatch.symbol, launch, &mut dispatch.params, stream) };
+    Ok(())
 }
 
 #[cfg(test)]
@@ -747,5 +1331,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The static plan's descriptor is carved and filled, not merely declared.
+    ///
+    /// The regression this guards is the one the seam was left at: a
+    /// `plan_info` with the right `padded_batch_size` and four zero offsets
+    /// looks planned, launches, and reads request 0's work item for every
+    /// block. Three arrays at 16-byte alignment and one scalar at 1 —
+    /// `attention_flashinfer.cu:145-151` — for four requests is 16 + 16 + 32 +
+    /// 4, and the KV chunk size is `page_size` TOKENS.
+    #[test]
+    fn the_static_plan_carves_and_fills_its_descriptor() {
+        let mut cache = super::DecodePlanCache::new();
+        let indptr = [0u32, 2, 4, 6, 8];
+        let planned = super::plan_static_nonsplit_decode(
+            &mut cache,
+            &indptr,
+            4,
+            8,
+            2,
+            128,
+            16,
+            kernels_cuda_new::plan::Workspace { float_bytes: 1 << 20, int_bytes: 1 << 20 },
+            8,
+            false,
+            true,
+            false,
+        );
+        assert!(matches!(planned, super::Planned::StaticNonsplit));
+        let info = &cache.plan_info;
+        assert_eq!(info.request_indices_offset, 0);
+        assert_eq!(info.kv_tile_indices_offset, 16);
+        assert_eq!(info.o_indptr_offset, 32);
+        assert_eq!(info.kv_chunk_size_ptr_offset, 52);
+        assert_eq!(cache.int_upload.len(), 56);
+        assert!(!info.split_kv);
+        assert_eq!(info.padded_batch_size, 4);
+
+        let at = |off: usize| {
+            i32::from_ne_bytes(cache.int_upload[off..off + 4].try_into().unwrap())
+        };
+        assert_eq!([at(0), at(4), at(8), at(12)], [0, 1, 2, 3], "request_indices[r] = r");
+        assert_eq!([at(16), at(20), at(24), at(28)], [0; 4], "kv_tile_indices = 0");
+        assert_eq!([at(32), at(36), at(40), at(44), at(48)], [0, 1, 2, 3, 4], "o_indptr");
+        assert_eq!(at(52), 16, "the KV chunk size is page_size TOKENS, not 1");
+    }
+
+    /// A workspace that cannot hold the descriptor is a named refusal.
+    #[test]
+    fn a_short_workspace_declines_rather_than_truncating() {
+        let mut cache = super::DecodePlanCache::new();
+        cache.set_int_base(4096);
+        let indptr = [0u32, 1];
+        let planned = super::plan_static_nonsplit_decode(
+            &mut cache,
+            &indptr,
+            1,
+            8,
+            2,
+            128,
+            16,
+            kernels_cuda_new::plan::Workspace { float_bytes: 0, int_bytes: 4096 },
+            8,
+            false,
+            true,
+            false,
+        );
+        assert!(matches!(
+            planned,
+            super::Planned::Declined(super::Decline::WorkspaceTooSmall { have: 4096, .. })
+        ));
+        assert!(!cache.valid, "a declined plan is not a valid one");
     }
 }

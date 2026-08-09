@@ -73,6 +73,8 @@ use ::driver_api::{
     ProgramRegistration, RegisteredChannel, StateCopyPlan, SubmissionCompletion,
 };
 
+use super::settle_control;
+
 /// How many KV pages a shell is opened with.
 ///
 /// A number the boot config can override (`[model] kv_pages`). `driver-wgpu`'s
@@ -145,11 +147,7 @@ impl WgpuDriver {
     /// asking here means a deployment finds out from its configuration rather
     /// than from its first request.
     pub fn create(config_bytes: &[u8]) -> Result<Self> {
-        // ONE READER of the document, in `crate::driver::boot`. The default
-        // stays HERE because it is this backend's: see `DEFAULT_KV_PAGES`.
-        let kv_pages = crate::driver::BootConfig::parse(config_bytes)
-            .kv_pages
-            .unwrap_or(DEFAULT_KV_PAGES);
+        let kv_pages = boot_kv_pages(config_bytes);
 
         let device = driver_wgpu::device::Device::open()
             .map_err(|e| anyhow!("driver-wgpu: no adapter: {e}"))?;
@@ -185,6 +183,36 @@ impl WgpuDriver {
             broker: CompletionBroker::new(),
             programs: driver_wgpu::programs::Programs::new(),
         })
+    }
+
+    /// A control completion for work that has already happened.
+    ///
+    /// # Why a control op needs TWO writes and a launch needs one
+    ///
+    /// `CompletionBroker::control_completion` mints a completion that carries
+    /// a TERMINAL CELL, and the engine resolves the op by reading that cell --
+    /// `launch_completion` deliberately carries none, because a frame answers
+    /// per member instead. The asynchronous backends hand the whole
+    /// `CompletionTarget` to whatever finishes the work: CUDA gives it to the
+    /// shell, `remote` to its RPC task, and each publishes the cell and then
+    /// notifies. A host-side driver has nobody to hand it to -- `Shell::copy_kv`
+    /// has already copied by the time it returns -- so it does both here.
+    ///
+    /// **Both, and in this order.** Dropping the target and notifying nothing
+    /// is a promise nobody keeps: a fork hung a real `pie run` for 850 seconds
+    /// with the watchdog naming it exactly --
+    ///
+    ///     in_flight_control: KV copy pipeline Some(..) settled=false
+    ///
+    /// -- and notifying WITHOUT publishing is caught by the engine on the way
+    /// out, `driver callback published before terminal outcome settled`, which
+    /// is the assertion that made the ordering legible in the first place.
+    ///
+    /// `driver-metal` and `driver-vulkan` both drop the target and notify
+    /// nothing here, with a doc comment that says "settled on return". They
+    /// are not.
+    fn settled_control(&mut self) -> SubmissionCompletion {
+        settle_control(&self.broker)
     }
 
     /// The shell, or a message saying which verb was called before a load.
@@ -280,6 +308,10 @@ impl Driver for WgpuDriver {
         // binds is what has to be staged, and the shell owns the plan after
         // `open`.
         let wanted = bound_names(&text);
+        // The widest fire this deployment can actually be given, measured the
+        // same way and for the same reason: the text is the shell's after
+        // `open`, and this is a question about the text.
+        let widest = widest_fire(&text, 4096);
         // The device `create` opened and measured its facts from. A SECOND
         // call -- a re-load, not the several-descriptors case refused above --
         // opens a new adapter, because the first went into the shell this one
@@ -320,21 +352,83 @@ impl Driver for WgpuDriver {
                 .hold(&name, &bytes)
                 .map_err(|e| anyhow!("driver-wgpu: `{name}` would not stage: {e}"))?;
         }
-        let facts = ::driver_api::ModelFacts {
-            // The row's answers, not a config's: the checkpoint was
-            // identified once, above, and these come from that
-            // identification. They are the ONLY half of the capabilities this
-            // side still authors -- the driver states the rest about itself.
+        let shape = shell.shape();
+        self.shell = Some(shell);
+        Ok(::driver_api::DriverCapabilities {
+            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
+            total_pages: shape.pages,
+            kv_page_size: shape.page_size,
+            // No swap pool and no recurrent-state cache: this driver has
+            // neither, and `copy_state` refuses by name for the same reason.
+            swap_pool_size: 0,
+            // Device to device, and only that. `Pool::copy_plan` moves whole
+            // pages and single rows inside the one KV buffer -- which is what a
+            // prefix-cache hit is -- and refuses any plan whose ends are not
+            // both this driver's own domain. Host directions stay off: there is
+            // no swap pool, so a device-to-host copy has nowhere to land.
+            kv_copy_domain_mask: ::driver_api::KV_COPY_DEVICE_TO_DEVICE,
+            rs_cache_required: false,
+            rs_cache_slots: 0,
+            rs_cache_slot_bytes: 0,
+            // Not elastic. `resize_pool` here reallocates the KV buffer whole,
+            // so nothing can be given back page-wise, and both numbers are zero
+            // together -- which is the condition `bootstrap` reads before it
+            // starts a trim task at all. WebGPU has no sparse binding, so
+            // unlike Vulkan this is not a declined optional feature: there is
+            // nothing to decline.
+            elastic_page_bytes: 0,
+            elastic_budget_pages: 0,
+            has_mtp_logits: false,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            // Sinks this backend cannot honour. Every one of them would bind
+            // and then run as a silent no-op, which is worse than a refusal at
+            // the door.
+            has_kv_envelopes: false,
+            has_attn_score: false,
+            has_attn_page_mask: false,
+            has_lora: false,
+            model_site_summary: ::driver_api::ModelSiteSummary::default(),
+            // The decode envelope's ports, claimed because `envelope::fill`
+            // resolves them: `Programs::geometry` peeks each instance's
+            // channels and `launch` drives the frame a step at a time so a
+            // step's tokens can be what the step before it wrote. This field
+            // read 0 for as long as that machinery was missing, and the 0 was
+            // honest then -- the engine answered it by folding the geometry on
+            // the host, which cannot know `EmbedTokens` and said so:
+            //
+            //     decode envelope on a driver without device geometry ports
+            //     (mask 0x0, needs 0x25): falling back to host-evaluated
+            //     serialized execution
+            //     ... EmbedTokens is not host-derivable: channel 0 has no
+            //     host-known value
+            //
+            // so the fix was to build the machinery, not to widen the claim.
+            device_geometry_port_mask: ::driver_api::PIE_DECODE_ENVELOPE_PORTS,
+            // The ceilings a batch is formed under. `Shell::open` sizes one
+            // fire's scratch from `Deployment::seam`, and a fire wider than
+            // this has nothing to run in.
+            max_forward_tokens: widest,
+            max_forward_requests: 256,
+            max_page_refs: shape.pages,
+            // The row's answers, not a config's: the checkpoint was identified
+            // once and these come from that identification.
             arch_name: deployment.advertised.arch.to_string(),
             model_id: row.id().to_string(),
             vocab_size: deployment.shape.vocab,
             max_model_len: deployment.advertised.max_model_len,
+            activation_dtype: "bf16".to_string(),
             hidden_size: deployment.shape.hidden,
+            // False about the BACKEND rather than about the row: there is no
+            // encode entry point here at all, so a model with a vision tower is
+            // served as its text half.
+            supports_media_encode: false,
             snapshot_dir: path.display().to_string(),
-        };
-        let capabilities = shell.capabilities(&facts);
-        self.shell = Some(shell);
-        Ok(capabilities)
+            kv_handle: None,
+            // The shaders are in the rlib and `naga` compiles them; nothing
+            // upstream generates a kernel for this driver.
+            codegen_backend: String::new(),
+        })
     }
 
     /// Register a PTIR program: its launch package and its emitted kernels.
@@ -432,44 +526,94 @@ impl Driver for WgpuDriver {
     /// [`FrameLaunchOutcome::Exhausted`], which the engine re-posts, or
     /// `Impossible` when no growth could ever make room.
     fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
-        match self.shell("launch")?.launch(frame) {
-            Ok(driver_wgpu::frames::Launched::Exhausted) => Ok(FrameLaunchOutcome::Exhausted),
-            Ok(driver_wgpu::frames::Launched::Impossible) => Ok(FrameLaunchOutcome::Impossible),
-            Ok(driver_wgpu::frames::Launched::Ran(steps)) => {
-                // The distributions do not come back through this return, and
-                // that is the seam's shape rather than a loss: a step's answer
-                // is read by the frame's own PROGRAMS, which put it on the
-                // channels the engine reads. Firing them is this seam's job
-                // because the registry is this seam's -- it is alive from
-                // `create`, before there is a shell, and the shell's own copy
-                // stays empty -- so the driver hands back the steps and the two
-                // halves are joined here.
-                let mut faults = Vec::new();
-                for (step, sub) in steps.iter().zip(&frame.steps) {
-                    driver_wgpu::frames::run_programs(
-                        &mut self.programs,
-                        &frame.instance_ids,
-                        sub,
-                        step,
-                        &mut faults,
-                    )
-                    .map_err(|e| anyhow!("driver-wgpu: {e}"))?;
-                }
-                // Logged and not returned, as Metal and Vulkan log them: a
-                // fault kills the one instance that faulted, and the requests
-                // batched with it ran. The guest behind the dead one is not
-                // left waiting -- `driver::Registry::fire` publishes the fault
-                // on the rings that instance's host READS, and the pipeline
-                // turns that poison word into the guest's error -- so this line
-                // is an operator's record rather than the only report.
-                for (instance, why) in faults {
-                    tracing::warn!(instance, %why, "wgpu: program faulted");
-                }
-                let (_raw, completion) = self.broker.launch_completion(1);
-                Ok(FrameLaunchOutcome::Launched(completion))
+        let page = driver_wgpu::facts::PAGE_SIZE;
+        match self.shell("launch")?.admit(frame) {
+            Ok(Some(driver_wgpu::frames::Launched::Exhausted)) => {
+                return Ok(FrameLaunchOutcome::Exhausted);
             }
-            Err(e) => Err(anyhow!("driver-wgpu: {e}")),
+            Ok(Some(driver_wgpu::frames::Launched::Impossible)) => {
+                return Ok(FrameLaunchOutcome::Impossible);
+            }
+            Ok(Some(driver_wgpu::frames::Launched::Ran(_)) | None) => {}
+            Err(e) => return Err(anyhow!("driver-wgpu: {e}")),
         }
+        // A step at a time, because a DEVICE-RESOLVED step's tokens are what
+        // the step before it PUT on a channel: they do not exist until that
+        // step has both fired and had its program run. The stronger order --
+        // convert every step before firing any -- is kept for a frame of
+        // ordinary host-wire steps by `Shell::launch`, which this path does
+        // not call; here the two halves are interleaved, and a step that
+        // cannot be prepared has fired nothing of its own.
+        let mut faults = Vec::new();
+        for sub in &frame.steps {
+            let filled = driver_wgpu::envelope::fill(&self.programs, frame, sub, page)
+                .map_err(|e| anyhow!("driver-wgpu: {e}"))?;
+            let plan = match filled {
+                driver_wgpu::envelope::Filled::Ready(plan) => plan,
+                // Nothing to fire and nothing wrong: the producer has not
+                // run. Every member of this step is told to come back, which
+                // is what the scheduler's re-post is for.
+                driver_wgpu::envelope::Filled::Early { channel } => {
+                    tracing::debug!(channel, "wgpu: a step's geometry channel is not filled yet");
+                    let early = vec![driver_wgpu::frames::Ran::Early; sub.roster_rows.len()];
+                    publish_terminals(&sub.terminal_cells, &early)?;
+                    break;
+                }
+            };
+            let (requests, tokens) = self
+                .shell("launch")?
+                .prepare(&plan)
+                .map_err(|e| anyhow!("driver-wgpu: {e}"))?;
+            let step = self
+                .shell("launch")?
+                .serve(&requests, &tokens)
+                .map_err(|e| anyhow!("driver-wgpu: {e}"))?;
+            // The distributions do not come back through this return, and
+            // that is the seam's shape rather than a loss: a step's answer is
+            // read by the frame's own PROGRAMS, which put it on the channels
+            // the engine reads. Firing them is this seam's job because the
+            // registry is this seam's -- it is alive from `create`, before
+            // there is a shell, and the shell's own copy stays empty -- so the
+            // driver hands back the step and the two halves are joined here.
+            let ran = driver_wgpu::frames::run_programs(
+                &mut self.programs,
+                &frame.instance_ids,
+                sub,
+                &step,
+                &mut faults,
+            )
+            .map_err(|e| anyhow!("driver-wgpu: {e}"))?;
+            publish_terminals(&sub.terminal_cells, &ran)?;
+        }
+        // Logged and not returned, as Metal and Vulkan log them: a fault kills
+        // the one instance that faulted, and the requests batched with it ran.
+        // The guest behind the dead one is not left waiting --
+        // `driver::Registry::fire` publishes the fault on the rings that
+        // instance's host READS, and the pipeline turns that poison word into
+        // the guest's error -- so this line is an operator's record rather
+        // than the only report.
+        for (instance, why) in faults {
+            tracing::warn!(instance, %why, "wgpu: program faulted");
+        }
+        // Settled here, because it is already settled. A completion is a
+        // promise that the frame's work has finished, and the asynchronous
+        // backends keep it by notifying from wherever the work actually lands
+        // -- `remote` from its RPC task, CUDA from its stream. This driver has
+        // nowhere to notify FROM: `Shell::serve` waits on the queue itself and
+        // everything the frame asked for has happened by the time it returns.
+        //
+        // Handing back an unnotified completion is not a smaller version of
+        // that. It is a promise nobody keeps: the scheduler parks the lane on
+        // it and re-reports the same frame forever --
+        //
+        //     [pie-sched] driver 0 stalled for 370s (no progress, work queued
+        //     or in flight) ... batch of 1 (posted(token=2), age=370s)
+        //
+        // -- which is what a real `pie run` on this backend did, after a fire
+        // that had already computed its answer.
+        let (_raw, completion) = self.broker.launch_completion(1);
+        self.broker.notify(completion.wait_id(), 1);
+        Ok(FrameLaunchOutcome::Launched(completion))
     }
 
     /// # Errors
@@ -498,8 +642,7 @@ impl Driver for WgpuDriver {
         self.shell("copy_kv")?
             .copy_kv(desc)
             .map_err(|e| anyhow!("driver-wgpu: {e}"))?;
-        let (_raw, completion) = self.broker.control_completion(1);
-        Ok(completion)
+        Ok(self.settled_control())
     }
 
     /// # Errors
@@ -524,8 +667,7 @@ impl Driver for WgpuDriver {
         // Settled already: `Pool::resize` allocates the new buffers, copies the
         // kept prefix device-to-device through `Device::transfer` -- which
         // waits -- and drops the old ones.
-        let (_raw, completion) = self.broker.control_completion(1);
-        Ok(completion)
+        Ok(self.settled_control())
     }
 
     /// # Errors
@@ -548,6 +690,33 @@ impl Driver for WgpuDriver {
         self.programs.close_channel(id);
         Ok(())
     }
+}
+
+/// How many KV pages the boot TOML asks for.
+///
+/// Its own function, deviceless, for the reason the Vulkan seam's `boot_of`
+/// gives beside it: this is a CONTRACT with the worker, which writes the
+/// document (`embedded_driver::wgpu_startup_toml`), and a contract with one
+/// reader and no test is one that gets discovered broken by a server booting
+/// at a pool size nobody asked for.
+///
+/// One number where Vulkan reads two, because there is no module directory to
+/// find -- the shaders are in the rlib. The BYTES are the document and not a
+/// path to it; `create_driver_backend` hands over the text for that reason,
+/// and `worker`'s `a_parsing_seam_is_handed_the_text_that_was_written` is the
+/// other end of the same claim.
+///
+/// A document that does not parse, or one that states no `[model] kv_pages`,
+/// gets [`DEFAULT_KV_PAGES`] rather than an error: a hand-written config is
+/// entitled to leave the number out, and zero pages is not a cache.
+fn boot_kv_pages(config_bytes: &[u8]) -> u32 {
+    std::str::from_utf8(config_bytes)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|v| v.get("model")?.get("kv_pages")?.as_integer())
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_KV_PAGES)
 }
 
 /// The one rope base this shell can build a ladder at.
@@ -730,6 +899,158 @@ fn stage(
     Ok(out)
 }
 
+/// Tell each member's work item what became of it.
+///
+/// # What a terminal cell is, and why a launched frame must write one
+///
+/// The scheduler hands every request in a frame a `PieTerminalCell` and
+/// resolves that request's work item by READING it. Success commits, Failed
+/// fails the one request, Retry re-posts it -- and `Pending`, which is what an
+/// untouched cell holds, is none of those: `resolve_from_terminal` turns it
+/// into `work item completion terminal outcome is still Pending`, which the
+/// guest sees as `channel is poisoned: pipeline: forward failed`. That is the
+/// exact wall a real `pie run` on this backend hit, one greedy decode after
+/// the prefill had already computed the right row.
+///
+/// So this is not bookkeeping the asynchronous backends do for their own
+/// reasons. It is the only channel a frame has for saying that it ran. CUDA
+/// writes these cells from its stream callback and `remote` writes them from
+/// the executor's reply; a host-side driver writes them here, because by the
+/// time `Shell::serve` has returned every one of them is already decided.
+///
+/// # Errors
+///
+/// A frame that names fewer cells than the step had members, or a null one:
+/// both would have this write past what the scheduler owns, and the pointer
+/// is not something a later layer can check.
+fn publish_terminals(
+    cells: &[*mut ::driver_api::TerminalCell],
+    ran: &[driver_wgpu::frames::Ran],
+) -> Result<()> {
+    use driver_wgpu::frames::Ran;
+
+    if cells.is_empty() {
+        // A step with no cells is one the scheduler is not waiting on -- the
+        // driver's own tests build frames this way -- and writing nothing is
+        // the whole of the right answer.
+        return Ok(());
+    }
+    if cells.len() != ran.len() {
+        bail!(
+            "driver-wgpu: this frame names {} terminal cells for {} members",
+            cells.len(),
+            ran.len()
+        );
+    }
+    for (&cell, outcome) in cells.iter().zip(ran) {
+        if cell.is_null() {
+            bail!("driver-wgpu: a member of this frame has a null terminal cell");
+        }
+        let word = match outcome {
+            Ran::Fired => ::driver_api::PIE_TERMINAL_OUTCOME_SUCCESS,
+            // Not a failure and not a success: the member was skipped without
+            // being touched, and the scheduler's answer to that is to post it
+            // again. Writing SUCCESS here would answer a request whose program
+            // never ran.
+            Ran::Early => ::driver_api::PIE_TERMINAL_OUTCOME_RETRY,
+            Ran::Faulted => ::driver_api::PIE_TERMINAL_OUTCOME_FAILED,
+        };
+        // `publish` releases, so the reader that observes the outcome also
+        // observes everything the fire wrote before it.
+        unsafe {
+            (*cell).publish(word);
+        }
+    }
+    Ok(())
+}
+
+/// Does every launch of `text`'s prefill at `rows` fit the device's grid limit?
+///
+/// Split out of [`widest_fire`] so a test can ask it directly: the property
+/// that matters is that the search returns a BOUNDARY, and checking a boundary
+/// means asking this on both sides of it.
+fn every_launch_fits(text: &driver_wgpu::shell::Text, rows: u32) -> bool {
+    let Ok(low) = model_compiler::lower::lower(
+        &text.prefill,
+        &vec![
+            model_compiler::lower::Row {
+                samples: true,
+                ..model_compiler::lower::Row::default()
+            };
+            rows as usize
+        ],
+        model_compiler::lower::Fire {
+            captures_across_splits: false,
+        },
+    ) else {
+        return false;
+    };
+    for launch in &low.launches {
+        let symbol = &low.kernels[launch.kernel as usize];
+        let Ok(rule) = driver_wgpu::dispatch::rule_of(driver_wgpu::KERNELS, symbol) else {
+            continue;
+        };
+        let Some(sig) = driver_wgpu::sig_in(driver_wgpu::KERNELS, symbol) else {
+            continue;
+        };
+        let Ok(declared) =
+            driver_wgpu::reflect::entrypoint(symbol, driver_wgpu::Capability::Baseline)
+        else {
+            continue;
+        };
+        let module = driver_wgpu::geometry::Module::loaded(symbol, &declared);
+        let dims = driver_wgpu::dispatch::dims_of(sig, &low, launch, text.geometry);
+        match driver_wgpu::geometry::groups_within(
+            rule,
+            dims,
+            module,
+            driver_wgpu::geometry::MAX_WORKGROUPS_PER_DIMENSION,
+        ) {
+            Ok(_) => {}
+            Err(driver_wgpu::geometry::Ungeometric::Unruled(_)) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// The widest fire this driver can actually dispatch for `text`, up to `most`.
+///
+/// # Why this is measured and not stated
+///
+/// `max_forward_tokens` is not a description. The scheduler FORMS BATCHES
+/// under it, so a number here is a promise to take a fire that wide -- and
+/// this seam stated `4096` as a literal, which it could not keep. At 4096
+/// tokens qwen3-0.6b's `rms_single_row` wants 65,536 workgroups on one axis
+/// and the device's limit is 65,535: over by exactly one, and the fire would
+/// come back `PastDeviceLimit` from a batch the engine was told to form.
+///
+/// The ceiling is not a constant either. `Rule::Rms` launches
+/// `width.div_ceil(axis) * rows` groups, so it moves with the model's hidden
+/// width and the axis its row states; a literal that happened to fit one
+/// checkpoint would be wrong for the next in the direction that refuses fires.
+///
+/// So it is searched, over the plan this deployment actually lowered, with the
+/// same `groups_within` the fire path runs. A rule this backend does not serve
+/// is skipped -- `frames::unserved_in` and `dispatch` refuse those by name,
+/// and a row nothing can launch does not bound how wide a fire may be.
+fn widest_fire(text: &driver_wgpu::shell::Text, most: u32) -> u32 {
+    let fits = |rows: u32| every_launch_fits(text, rows);
+
+    // A fire of one row is what a decode is, and a driver that could not take
+    // it could not serve at all -- so the search starts from a floor it does
+    // not test rather than from zero.
+    let (mut lo, mut hi) = (1u32, most.max(1));
+    if fits(hi) {
+        return hi;
+    }
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) { lo = mid } else { hi = mid }
+    }
+    lo
+}
+
 /// Every weight name this model's decode plan binds.
 ///
 /// The PLAN's list and not the checkpoint's: a checkpoint holds tensors no fire
@@ -796,6 +1117,8 @@ fn text_of(
     let binding = model::catalog::MetalBinding {
         quant_group: 64,
         quant_bits: 4,
+        router_quant_group: 0,
+        router_quant_bits: 0,
         moe_mxfp4: false,
         fuse_residual_gemv: true,
         paged_multi_batch: true,
@@ -1055,6 +1378,44 @@ mod tests {
         }
     }
 
+    /// The boot document the worker writes is the boot document this seam
+    /// reads.
+    ///
+    /// Two crates, one document, and no shared type between them:
+    /// `worker`'s `wgpu_startup_toml` puts `kv_pages` under `[model]`, and
+    /// this reads it from there. Nothing in the compiler connects the two -- a
+    /// key moved to `[batching]`, which is where the Metal writer keeps its
+    /// page geometry and so the obvious thing to copy, would boot at this
+    /// seam's own default with no complaint, and an operator who asked for a
+    /// bigger cache would get 1024 pages and no sign the number was ignored.
+    ///
+    /// The literal TOML is that document's shape written out by hand on
+    /// purpose. Calling the worker's writer would be the same mistake as
+    /// sharing a type: the point is that the two agree, and a test that
+    /// derives one from the other cannot say so.
+    #[test]
+    fn the_boot_document_the_worker_writes_is_the_one_this_seam_reads() {
+        assert_eq!(
+            boot_kv_pages(
+                br#"[model]
+kv_pages = 4096
+"#
+            ),
+            4096
+        );
+        // The shapes that are NOT an error, each for its own reason: a
+        // hand-written config that says nothing, and a document that does not
+        // parse at all -- which is what a PATH looks like from in here, and
+        // the reason the worker hands over the text.
+        assert_eq!(boot_kv_pages(b"[model]\n"), DEFAULT_KV_PAGES);
+        assert_eq!(
+            boot_kv_pages(b"/home/someone/.pie/launch/0/driver.toml"),
+            DEFAULT_KV_PAGES
+        );
+        // And zero, which parses and is not a cache.
+        assert_eq!(boot_kv_pages(b"[model]\nkv_pages = 0\n"), DEFAULT_KV_PAGES);
+    }
+
     /// The two targets this shell can sit on compile one load plan.
     ///
     /// `stage` asks `model-loader` for `BackendKind::Vulkan` and this backend
@@ -1082,6 +1443,201 @@ mod tests {
             mask(BackendKind::Unknown),
             "`stage` may not fall back to the unknown target: its mask omits the encode a \
              quantised checkpoint needs, and the plan skips it silently"
+        );
+    }
+
+    /// A launched frame says so in every member's terminal cell.
+    ///
+    /// # Why this is a test and not a comment
+    ///
+    /// The cell is the ONLY channel a frame has for reporting that it ran, and
+    /// `Pending` -- what an untouched cell holds -- is a failure rather than a
+    /// silence. A `launch` that returned `Ok`, fired the right shaders and
+    /// wrote nothing here produced this, on a real `pie run`, one greedy
+    /// decode after a prefill that had already computed the right row:
+    ///
+    ///     direct launch terminal settlement failed
+    ///     err=work item completion terminal outcome is still Pending
+    ///
+    /// Nothing else in this file's tests would have caught it: the seam
+    /// answered every question it was asked correctly, and the omission was a
+    /// question nobody asked.
+    ///
+    /// The three outcomes are asserted to be DIFFERENT from each other as well
+    /// as from `Pending`, because a mapping that collapsed `Early` onto
+    /// `Success` would pass a test that only checked "not pending" and would
+    /// answer a request whose program never ran.
+    #[test]
+    fn a_launched_member_is_told_what_became_of_it() {
+        use ::driver_api::TerminalCell;
+        use driver_wgpu::frames::Ran;
+
+        let cells = [
+            TerminalCell::pending(),
+            TerminalCell::pending(),
+            TerminalCell::pending(),
+        ];
+        // Pending BEFORE, which is what makes the assertion below a change
+        // rather than a coincidence.
+        for cell in &cells {
+            assert_eq!(cell.load(), ::driver_api::PIE_TERMINAL_OUTCOME_PENDING);
+        }
+        let ptrs: Vec<*mut TerminalCell> = cells
+            .iter()
+            .map(|c| std::ptr::from_ref(c).cast_mut())
+            .collect();
+        publish_terminals(&ptrs, &[Ran::Fired, Ran::Early, Ran::Faulted])
+            .expect("three cells for three members");
+        assert_eq!(
+            cells[0].load(),
+            ::driver_api::PIE_TERMINAL_OUTCOME_SUCCESS,
+            "a member whose program fired is reported as having run"
+        );
+        assert_eq!(
+            cells[1].load(),
+            ::driver_api::PIE_TERMINAL_OUTCOME_RETRY,
+            "a member skipped for being early must be re-posted, not answered"
+        );
+        assert_eq!(
+            cells[2].load(),
+            ::driver_api::PIE_TERMINAL_OUTCOME_FAILED,
+            "a member whose program faulted is reported as failed"
+        );
+    }
+
+    /// A frame that names the wrong number of cells is refused, not written.
+    ///
+    /// The write is through a raw pointer the scheduler owns; a count this
+    /// side guessed at would be a write past it.
+    #[test]
+    fn a_mismatched_roster_is_refused_before_anything_is_written() {
+        use ::driver_api::TerminalCell;
+        use driver_wgpu::frames::Ran;
+
+        let cell = TerminalCell::pending();
+        let ptrs: Vec<*mut TerminalCell> = vec![std::ptr::from_ref(&cell).cast_mut()];
+        let refused = publish_terminals(&ptrs, &[Ran::Fired, Ran::Fired])
+            .expect_err("one cell cannot answer for two members");
+        assert!(
+            refused.to_string().contains("terminal cells"),
+            "the refusal names what disagreed: {refused}"
+        );
+        assert_eq!(
+            cell.load(),
+            ::driver_api::PIE_TERMINAL_OUTCOME_PENDING,
+            "a refused publish writes nothing at all"
+        );
+        // And a null cell is refused rather than dereferenced.
+        let nulls: Vec<*mut TerminalCell> = vec![std::ptr::null_mut()];
+        assert!(publish_terminals(&nulls, &[Ran::Fired]).is_err());
+        // A step the scheduler is not waiting on names no cells, and writing
+        // nothing is the whole of the right answer.
+        assert!(publish_terminals(&[], &[]).is_ok());
+    }
+
+    /// The ports this seam claims are the ones it can actually resolve.
+    ///
+    /// The claim is not free: a driver that names `PIE_DECODE_ENVELOPE_PORTS`
+    /// is handed decode envelopes whose geometry it must read off its own
+    /// channels, which is what `envelope::fill` and `Programs::geometry` are
+    /// for. This file claimed 0 for as long as neither existed, and the engine
+    /// answered the 0 by folding the geometry on the host -- which cannot know
+    /// `EmbedTokens` and said so, by name. So the pair is asserted together:
+    /// the mask, and a call into the machinery that earns it.
+    #[test]
+    fn the_geometry_ports_this_seam_claims_are_ones_it_can_resolve() {
+        // The number is a MEASUREMENT, not a constant this file also owns.
+        // `forward.rs` gates the decode envelope on
+        // `device_port_mask & required == required`, where `required` is
+        // computed per envelope by `envelope_required_ports`; the envelope a
+        // real greedy `pie run` of qwen3-0.6b built asked for this, and said
+        // so when the claim was still zero:
+        //
+        //     decode envelope on a driver without device geometry ports
+        //     (mask 0x0, needs 0x25): falling back to host-evaluated
+        //     serialized execution
+        //
+        // Quoting the observed requirement rather than the constant this file
+        // reports keeps the two sides independent: a `PIE_DECODE_ENVELOPE_PORTS`
+        // that changed under us would fail here rather than agree with itself.
+        const MEASURED_REQUIREMENT: u32 = 0x25;
+        let claimed = ::driver_api::PIE_DECODE_ENVELOPE_PORTS;
+        assert_eq!(
+            claimed & MEASURED_REQUIREMENT,
+            MEASURED_REQUIREMENT,
+            "the mask this seam reports must cover what a real decode envelope asked for"
+        );
+        // The control: the value this file used to report fails that same
+        // gate, which is why the run took the host fallback and died on
+        // `EmbedTokens is not host-derivable`.
+        assert_ne!(
+            0 & MEASURED_REQUIREMENT,
+            MEASURED_REQUIREMENT,
+            "a mask of zero must NOT satisfy the gate, or this test proves nothing"
+        );
+        // And what is NOT claimed is stated too: the full Track B set is
+        // wider, and this driver does not answer for it.
+        assert_ne!(
+            claimed & ::driver_api::PIE_DEVICE_GEOMETRY_PORTS,
+            ::driver_api::PIE_DEVICE_GEOMETRY_PORTS,
+            "this seam claims the decode envelope's ports, not every geometry port"
+        );
+        // The machinery the claim promises, asked for an instance that is not
+        // there: it must answer by NAME rather than by not existing.
+        let programs = driver_wgpu::programs::Programs::default();
+        let refused = programs
+            .geometry(7, driver_wgpu::facts::PAGE_SIZE)
+            .expect_err("there is no instance 7");
+        assert!(
+            refused.to_string().contains('7'),
+            "the refusal names the instance it could not find: {refused}"
+        );
+    }
+
+    /// The widest fire is the BOUNDARY, and both sides of it are asserted.
+    ///
+    /// # What this replaces
+    ///
+    /// `max_forward_tokens` was the literal `4096`, and the scheduler forms
+    /// batches under it -- so it was a promise to take a fire that wide. At
+    /// 4096 tokens qwen3-0.6b's `rms_single_row` wants 65,536 workgroups on
+    /// one axis against a device limit of 65,535. Over by ONE, and the fire
+    /// would have come back `PastDeviceLimit` from a batch the engine had been
+    /// told to form.
+    ///
+    /// # Why a boundary and not a number
+    ///
+    /// Pinning the answer would pin this model's hidden width and this row's
+    /// stated axis, and fail on the next checkpoint rather than on a defect.
+    /// What is a property of the SEARCH, and true for every model, is that it
+    /// returns the largest fitting count: `n` fits and `n + 1` does not. That
+    /// is asserted by re-running the same check `widest_fire` runs, so a
+    /// search that returned something conservative -- or something one too
+    /// large, which is the bug it was written for -- fails here.
+    #[test]
+    fn the_widest_fire_is_the_largest_one_that_fits() {
+        let row = model::catalog::find("qwen3-0.6b").expect("this build has qwen3-0.6b");
+        let (text, _) = text_of(row).expect("the row has a text");
+        let most = 4096;
+        let n = widest_fire(&text, most);
+        assert!(n >= 1, "a driver that cannot take one row cannot serve");
+        assert!(n <= most, "the search may not exceed what it was asked for");
+
+        let fits = |rows: u32| every_launch_fits(&text, rows);
+        assert!(fits(n), "the answer must itself fit");
+        if n < most {
+            assert!(
+                !fits(n + 1),
+                "{n} was returned while {} also fits, so the search stops short",
+                n + 1
+            );
+        }
+        eprintln!("qwen3-0.6b takes a fire of {n} tokens, not the 4096 that was claimed");
+        // And it is not the literal it replaced, which is the whole point.
+        assert_ne!(
+            n, 4096,
+            "qwen3-0.6b cannot take a 4096-token fire: `rms_single_row` wants \
+             65,536 workgroups on one axis and the limit is 65,535"
         );
     }
 }

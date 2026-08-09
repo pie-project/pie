@@ -328,7 +328,12 @@ fn run(
     }
     let n_u = extent("patches", n)?;
     let hd_u = extent("hidden", hd)?;
-    let im_u = extent("intermediate", im)?;
+    // `im_u` STOOD HERE and its only reader was the `rect(n_u, im_u)` at the
+    // geglu fire, which fn-world deleted. The CHECK it performed has not gone
+    // with it: a negative `im` is still refused, here, before any allocation,
+    // and it must be — `inter_elems` below is built from `im` and would
+    // otherwise size three scratch buffers off a sign-extended cast.
+    extent("intermediate", im)?;
     let out_len_u = extent("pooled rows", out_len)?;
     let nz = usize::try_from(n).unwrap_or(0);
     let hidden_elems = nz * hd as usize;
@@ -474,21 +479,31 @@ fn run(
         clin(cublas, hn.cast_const(), gate, xc, &layer.gate, n, hd, im, stream)?;
         clin(cublas, hn.cast_const(), up, xc, &layer.up, n, hd, im, stream)?;
         // `:208` — `geglu_tanh<<<(ge+255)/256, 256, 0, S>>>` with
-        // `ge = (int)((long)N*IM)`, which `Elementwise` evaluates from the
-        // `N` by `IM` rectangle.
-        fire(
-            "mlp::geglu_tanh_bf16",
-            rect(n_u, im_u),
-            &[
-                p(gate.cast_const()),
-                p(up.cast_const()),
-                pm(act),
-                ArgValue::I32(i32::try_from(inter_elems).map_err(|_| {
-                    Error::invalid(WHO, "N * IM does not fit the kernel's int")
-                })?),
-            ],
-            stream,
-        )?;
+        // `ge = (int)((long)N*IM)`. That grid was `LaunchRule::Elementwise`
+        // evaluated from the `N` by `IM` rectangle; §5 step 5 took `mlp` into
+        // fn-world, so it is `x::mlp::elementwise(n)` inside the host program
+        // — the same `(n + 255) / 256` by 256, written beside the `<<<>>>`
+        // this comment cites — and `rect(n_u, im_u)` has nothing left to say.
+        //
+        // The element count was ALREADY the last operand and is still the
+        // last parameter, so the `try_from` that refuses an `N * IM` too big
+        // for the kernel's `int` stays exactly where it was. It has to: the
+        // host program takes an `i32`, and a silent `as` here would launch a
+        // negative extent that `Fired::Declined(Empty)` would then report as
+        // an empty tensor.
+        let fired = unsafe {
+            kernels_cuda_new::x::mlp::geglu_tanh_bf16(
+                gate.cast_const().cast(),
+                up.cast_const().cast(),
+                act.cast(),
+                i32::try_from(inter_elems)
+                    .map_err(|_| Error::invalid(WHO, "N * IM does not fit the kernel's int"))?,
+                stream.as_raw().cast(),
+            )
+        };
+        if let kernels_cuda_new::x::Fired::Declined(why) = fired {
+            return Err(Error::invalid("mlp::geglu_tanh_bf16", format!("{why:?}")));
+        }
         clin(cublas, act.cast_const(), tmp, xc, &layer.down, n, im, hd, stream)?;
         rms(tmp.cast_const(), layer.post_ff_ln, tmp, n, hd, eps, stream)?;
         residual_add(h, tmp.cast_const(), hidden_elems, n_u, hd_u, stream)?;

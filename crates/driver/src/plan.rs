@@ -215,7 +215,9 @@ pub fn const_port_value(port: &driver_api::plan::LaunchPort) -> Value {
 /// Recompute every stage's execution index from the package's stage bodies.
 ///
 /// See [`StagePlan`] for why `value_ids` is sorted and keyed on first result
-/// ids. The final sweep over the value table is not redundant with the op walk:
+/// ids. The walk reads each op's `args` AND, for `pivot_threshold`, its
+/// `pred_payload`, which is an operand that does not ride in `args`. The final
+/// sweep over the value table is not redundant with the op walk:
 /// a `chan_take` whose result is dead still has to advance the ring, so a stage
 /// that lists a channel in its `takes`/`reads` must evaluate that channel root
 /// even though nothing downstream reads it. Missing it would leave the ring un-
@@ -257,6 +259,15 @@ fn rebuild_stage_indexes(package: &LaunchPackage) -> Vec<StagePlan> {
             ids.insert(op.result_id);
             for &arg in &op.args {
                 mark(arg, &mut ids);
+            }
+            // `pivot_threshold` reads a second operand that does not ride in
+            // `args`: its predicate payload -- the `k` of a rank cut, the `p`
+            // of a nucleus, the threshold of a probability floor. The device
+            // path binds it (`codegen::slots` puts it in the a1 slot), so a
+            // walk over `args` alone leaves the host interpreter with an
+            // operand nothing ever evaluates.
+            if op.code as u8 == tags::PIVOT_THRESHOLD {
+                mark(op.pred_payload, &mut ids);
             }
         }
         for put in &stage.puts {
@@ -409,7 +420,7 @@ pub fn adopt_launch_package(package: LaunchPackage) -> Result<ExecPlan> {
 
 #[cfg(test)]
 mod tests {
-    use driver_api::local::{PIE_VALUE_INTRINSIC, PIE_VALUE_OP_RESULT};
+    use driver_api::local::{PIE_VALUE_CONST, PIE_VALUE_INTRINSIC, PIE_VALUE_OP_RESULT};
     use driver_api::plan::{LaunchOp, LaunchPackage, LaunchStage, LaunchStagePlan, LaunchValue};
 
     use super::*;
@@ -510,6 +521,55 @@ mod tests {
             bounded_mtp_row_base(&plan, 5),
             Some(2),
             "vocab=5 divides the 10-element logits into two rows"
+        );
+    }
+
+    #[test]
+    fn a_pivot_threshold_payload_is_evaluated_although_it_is_not_an_arg() {
+        // v0 = logits, v1 = the nucleus `p`, v2 = the pivot. `p` rides in
+        // `pred_payload`, NOT in `args`, so a walk over `args` alone leaves it
+        // out of `value_ids` -- and an id nothing evaluates keeps the default
+        // empty cell, which `op::eval_op` then indexes at lane zero.
+        let values = vec![
+            intrinsic_value(0, intrinsic_tags::LOGITS, &[4]),
+            LaunchValue {
+                id: 1,
+                source: PIE_VALUE_CONST,
+                dtype: 3,
+                intrinsic: 0,
+                channel: 0,
+                literal_bits: 0.95f32.to_bits(),
+                shape: vec![1],
+            },
+            LaunchValue {
+                id: 2,
+                source: PIE_VALUE_OP_RESULT,
+                dtype: 0,
+                intrinsic: 0,
+                channel: 0,
+                literal_bits: 0,
+                shape: vec![4],
+            },
+        ];
+        let stage = LaunchStage {
+            kind: Stage::Epilogue as u8,
+            ops: vec![LaunchOp {
+                code: u16::from(tags::PIVOT_THRESHOLD),
+                result_count: 1,
+                result_id: 2,
+                args: vec![0],
+                pred_tag: 1,
+                pred_payload: 1,
+                shape: vec![4],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = adopt_launch_package(package_with(values, vec![stage])).expect("well-formed");
+        assert_eq!(
+            plan.stages[0].value_ids,
+            vec![0, 1, 2],
+            "the predicate payload v1 is an operand and must be evaluated with the rest"
         );
     }
 

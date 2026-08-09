@@ -56,6 +56,8 @@ use ::driver_api::{
     ProgramRegistration, RegisteredChannel, StateCopyPlan, SubmissionCompletion,
 };
 
+use super::settle_control;
+
 /// The Metal shell, behind the seam's fourteen verbs.
 ///
 /// Two fields, and the split between them is the boundary this file exists to
@@ -231,8 +233,7 @@ impl Driver for MetalDriver {
     /// leaves a layer's region.
     fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
         self.shell.copy_kv(desc)?;
-        let (_raw, completion) = self.broker.control_completion(1);
-        Ok(completion)
+        Ok(settle_control(&self.broker))
     }
 
     /// # Errors
@@ -240,8 +241,7 @@ impl Driver for MetalDriver {
     /// Always today: no model this backend serves has recurrent state.
     fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
         self.shell.copy_state(desc)?;
-        let (_raw, completion) = self.broker.control_completion(1);
-        Ok(completion)
+        Ok(settle_control(&self.broker))
     }
 
     /// Commit or release KV pages so the pool holds `target_pages`.
@@ -252,12 +252,13 @@ impl Driver for MetalDriver {
     /// for; or an arena without the memory to grow back into.
     fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
         self.shell.resize_pool(desc)?;
-        // Settled already. `Stepper::trim` waits for the GPU to pass the
-        // unmap before it returns, and a growth is complete once the memory
-        // is attached -- there is nothing left in flight for a caller to wait
-        // on.
-        let (_raw, completion) = self.broker.control_completion(1);
-        Ok(completion)
+        // The WORK is settled already -- `Stepper::trim` waits for the GPU to
+        // pass the unmap before it returns, and a growth is complete once the
+        // memory is attached. The COMPLETION is a separate fact, and this line
+        // used to get it wrong: it minted one and dropped the target, so the
+        // engine waited on an op nobody would ever settle. `settle_control`
+        // does both halves, in the order the engine's own check requires.
+        Ok(settle_control(&self.broker))
     }
 
     /// # Errors

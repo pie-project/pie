@@ -291,20 +291,6 @@
       "visibility": "Public"
     },
     {
-      "name": "model.layers.0.linear_attn.conv1d.bias",
-      "expr": {
-        "Src": "model.layers.0.linear_attn.conv1d.bias"
-      },
-      "shape": [
-        96
-      ],
-      "encoding": {
-        "Raw": "BF16"
-      },
-      "scales": null,
-      "visibility": "Public"
-    },
-    {
       "name": "model.layers.0.linear_attn.out_proj.weight",
       "expr": {
         "Src": "model.layers.0.linear_attn.out_proj.weight"

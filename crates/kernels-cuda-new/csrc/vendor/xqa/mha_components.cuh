@@ -1,6 +1,12 @@
 #pragma once
-#include "mma.cuh"
-#include "utils.cuh"
+// PIE: upstream spells these two bare. NVRTC matches include names against
+// PIE: the literal string in the directive, and the carried set already
+// PIE: holds FlashInfer's `mma.cuh` and `utils.cuh` under those exact
+// PIE: spellings — so the bare form would reach whichever tree NVRTC
+// PIE: scanned first. Spelled tree-relative here; the bytes included are
+// PIE: upstream's own files, unchanged.
+#include "xqa/mma.cuh"
+#include "xqa/utils.cuh"
 
 using InstAcc = Array2D<float, 2, 2>;
 

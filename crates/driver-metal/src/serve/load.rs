@@ -277,7 +277,11 @@ impl Shell {
         // exactly the case `Loaded::mxfp4` already carries.
         self.text_row = Some((
             row,
-            crate::model::binding::observed(geometry.quant, |name| loaded.mxfp4.contains(name)),
+            crate::model::binding::observed(
+                geometry.quant,
+                |name| loaded.affine_point_of(name),
+                |name| loaded.mxfp4.contains(name),
+            ),
         ));
         self.inv_freq = crate::model::rope::table(&geometry)
             .iter()

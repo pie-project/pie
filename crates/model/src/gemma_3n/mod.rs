@@ -589,6 +589,8 @@ mod tests {
         let bind = MetalBinding {
             quant_group: 64,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,

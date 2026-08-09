@@ -281,7 +281,20 @@ fn transcript() -> Vec<String> {
         // SAFETY: every buffer above is live and at least the size the row
         // states, and nothing frees them before the sync below.
         unsafe {
-            service::gemm_act_x_wt_bf16_out_fp32(&ctx, dact.0, dw.0, dy.0.cast(), m, n, k);
+            // §5 step 5 moved the body to `kernels_cuda_new::x::gemm`, where
+            // it takes the handle directly instead of reading `ctx.cublas`.
+            // The bytes this test hashes are the same bytes.
+            kernels_cuda_new::x::gemm::act_x_wt_bf16_out_fp32(
+                ctx.cublas,
+                dact.0,
+                dw.0,
+                dy.0.cast(),
+                m,
+                n,
+                k,
+            )
+            .ok()
+            .expect("out_fp32 declines only on an empty extent");
         }
         sync();
         dy.back_f32(&mut y);
@@ -325,7 +338,7 @@ fn transcript() -> Vec<String> {
         // SAFETY: the three arrays are `groups` long and outlive the call;
         // `ms` is the host row-count array the row declares.
         unsafe {
-            service::gemm_grouped_act_x_wt_bf16(
+            kernels_cuda_new::x::gemm::grouped_act_x_wt_bf16(
                 handle.cast(),
                 actp.as_ptr(),
                 wp.as_ptr(),
@@ -335,7 +348,9 @@ fn transcript() -> Vec<String> {
                 n,
                 k,
                 beta,
-            );
+            )
+            .ok()
+            .expect("the grouped call declines only on group_count <= 0");
         }
         sync();
         let mut off = 0usize;

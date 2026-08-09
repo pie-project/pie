@@ -57,6 +57,16 @@ impl CublasOps for LiveCublas {
         let mut h: Self::Handle = std::ptr::null_mut();
         let status = unsafe { cublasCreate_v2(&mut h) };
         if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            // A draft of the step-5 `gemm` port published this handle into a
+            // static here so a `bind!` body could read it back. It does not,
+            // and the reason is the floor's: a bind is handed a `Cx`, and a
+            // static that reaches around `Cx` is worse than widening it,
+            // because a widening is reviewable. `x::gemm` declares contracts
+            // and no `Entry`, its symbols resolve to `Route::Driver`, and
+            // the driver passes `ctx.cublas` to the host programs directly.
+            // This handle stays exactly what it was: the engine's one
+            // handle, made here, destroyed once -- `cublasDestroy` costs
+            // 3.2 ms and there is exactly one per `Shell`.
             Ok(h)
         } else {
             Err(status as i32)

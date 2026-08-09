@@ -130,11 +130,61 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
     if !plan.rs_slot_ids.is_empty() || !plan.rs_buffer_slot_ids.is_empty() {
         return Some("recurrent state: no model this driver serves holds any");
     }
-    if plan.has_user_mask || !plan.masks.is_empty() {
+    if plan.has_user_mask {
         return Some(
             "a user mask: attention here is causal, and a plan's mask \
                      would be dropped rather than applied",
         );
+    }
+    // A mask table with no user mask behind it is the engine's own synthesis,
+    // and the only synthesis it makes is the CAUSAL mask -- `wire.rs` fills
+    // `RunMask::all_true(pos + 1)` per row when it cannot elide the table.
+    // Applying that and applying nothing are the same computation on a driver
+    // whose attention is already causal, so refusing it refuses a plan this
+    // driver serves exactly.
+    //
+    // It is not hypothetical and it is not rare: the elision is skipped
+    // whenever a request is neither device-resolved nor a single-token
+    // decode, which is every request in a batch that took the host-folded
+    // path. Three concurrent `chat-completion`s through `pie serve` came back
+    // as two failures and one success -- `this driver does not serve a user
+    // mask`, about prompts that were entirely words.
+    //
+    // CHECKED, not assumed. `equals_causal` reads each mask's runs and its
+    // length against the row's own position, so a mask that differs anywhere
+    // -- a shorter window, a hole, a length that would admit the future --
+    // still takes the refusal below.
+    if !plan.masks.is_empty() && !masks_are_exactly_causal(plan) {
+        return Some(
+            "a mask that is not this driver's own causal one: attention \
+                     here is causal, and a plan's mask would be dropped \
+                     rather than applied",
+        );
+    }
+    // A request that names SEVERAL readout rows, which is a shape this driver
+    // cannot answer and used not to say so.
+    //
+    // `Serving::over` forces every row to sample and hands back one readout
+    // PER TURN -- `Step::readout_of[i]` is turn `i`'s last row, the only one
+    // that has seen the whole prompt. A caller that named `n` rows through
+    // `fwd.readout(..)` gets one, and the program that reads them faults deep
+    // inside the interpreter instead:
+    //
+    //     driver published poison epoch 1
+    //     program faulted: launch program cannot be interpreted:
+    //     logits intrinsic row range exceeds the forward's readout rows
+    //
+    // which is a real `pie serve` running `cacheback-speculative-decoding`.
+    // The rows EXIST -- every row sampled -- and what is missing is a mapping
+    // from a request to its row SPAN. Until there is one, this is a refusal at
+    // the door rather than an answer with the wrong number of rows in it.
+    if let Some(most) = widest_readout(plan) {
+        if most > 1 {
+            return Some(
+                "a request naming several readout rows: this driver reads out \
+                 one row per request, the last one",
+            );
+        }
     }
     if plan.max_layers.is_some() {
         return Some(
@@ -154,16 +204,150 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
                      channel, which this driver does not resolve",
         );
     }
-    if !plan.image_pixels.is_empty() || !plan.image_indptr.is_empty() {
+    // The CONTENT, and the indptr's last boundary -- not whether the indptr
+    // exists. These are CSRs with one boundary per request, so a batch of two
+    // text-only requests carries `image_indptr = [0, 0, 0]`: present, and
+    // naming nothing. Reading the vector's emptiness refused every multi-
+    // request frame this driver was ever handed, with a message about images
+    // that a chat completion had none of. A single request never showed it,
+    // because the single-request path leaves the side-channels empty.
+    if !plan.image_pixels.is_empty() || carries(&plan.image_indptr) {
         return Some("images: this driver serves text-only models");
     }
-    if !plan.audio_features.is_empty() || !plan.audio_indptr.is_empty() {
+    if !plan.audio_features.is_empty() || carries(&plan.audio_indptr) {
         return Some("audio: this driver serves text-only models");
     }
-    if !plan.embed_rows.is_empty() || !plan.embed_indptr.is_empty() {
+    if !plan.embed_rows.is_empty() || carries(&plan.embed_indptr) {
         return Some("pre-embedded rows: this driver embeds from token ids");
     }
     None
+}
+
+/// Is every mask in this plan exactly the causal mask this driver applies?
+///
+/// # The structure, which is not the obvious one
+///
+/// `mask_indptr` is PER REQUEST, not per row -- `wire::emit_attention_masks`
+/// pushes one boundary after appending a request's rows -- so the table has
+/// `R + 1` entries for `R` requests and holds one BRLE per QUERY ROW inside
+/// each span. Reading it as per-row costs nothing on a batch of one-row
+/// decodes, where rows and requests coincide, and refuses every prefill.
+///
+/// # What "exactly" means
+///
+/// Row `j` of a request with `n` query rows over `kv_len` keys attends,
+/// causally, to `kv_len - n + j + 1` of them: the last row sees the whole
+/// span, and each earlier row one fewer. So the mask this driver already
+/// computes is `all_true` of exactly that length, which BRLE spells `[0, m]`.
+/// Both halves are checked:
+///
+/// * The runs must be true everywhere -- see [`all_true`], which reads any
+///   encoding of that rather than only the canonical `[0, m]`.
+/// * The length must be that row's own extent. A SHORTER all-true mask is a
+///   sliding window this driver would widen; a LONGER one would admit keys
+///   past the row, which the mask permits and causal attention does not.
+///
+/// `kv_len` is the POST-TRIM span, which is what makes this work at all: when
+/// `TrimPlan` drops KV ranges it rewrites the BRLEs to match, and both sides
+/// of this comparison move together because both are read off the same plan.
+///
+/// A plan whose tables do not describe each other answers false. An unreadable
+/// mask table is not a causal one.
+fn masks_are_exactly_causal(plan: &LaunchPlan) -> bool {
+    // One boundary per request plus one, and one `kv_len` per request.
+    let requests = plan.kv_len.len();
+    if requests == 0 || plan.mask_indptr.len() != requests + 1 {
+        return false;
+    }
+    if plan.qo_indptr.len() != requests + 1 {
+        return false;
+    }
+    if plan.mask_indptr.last().copied().unwrap_or(0) as usize != plan.masks.len() {
+        return false;
+    }
+    for r in 0..requests {
+        let (mask_from, mask_to) = (
+            plan.mask_indptr[r] as usize,
+            plan.mask_indptr[r + 1] as usize,
+        );
+        // A request that names no mask is the elided case: nothing to drop.
+        if mask_from == mask_to {
+            continue;
+        }
+        if mask_to < mask_from || mask_to > plan.masks.len() {
+            return false;
+        }
+        let rows = (plan.qo_indptr[r + 1] as usize).checked_sub(plan.qo_indptr[r] as usize);
+        let Some(rows) = rows else {
+            return false;
+        };
+        // One BRLE per query row, or this is a shape with no reading.
+        if mask_to - mask_from != rows {
+            return false;
+        }
+        let kv_len = u64::from(plan.kv_len[r]);
+        for (j, mask) in plan.masks[mask_from..mask_to].iter().enumerate() {
+            // `kv_len - n + j + 1`, in an order that cannot underflow.
+            let Some(extent) = (kv_len + j as u64 + 1).checked_sub(rows as u64) else {
+                return false;
+            };
+            if mask.total_size != extent || !all_true(mask) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The most readout rows any one request in this plan names.
+///
+/// Public because two paths have to ask it: `unserved_in` for a plan that
+/// arrives whole, and `envelope::fill` for one whose table it is about to
+/// drop. One function so the two cannot drift into different readings of the
+/// same CSR.
+///
+/// `None` for a plan with no sampling table, which is the ordinary case: the
+/// engine elides it when every request wants its last row, and this driver
+/// gives exactly that.
+pub fn widest_readout(plan: &LaunchPlan) -> Option<u32> {
+    if plan.sampling_indptr.len() < 2 {
+        return None;
+    }
+    plan.sampling_indptr
+        .windows(2)
+        .map(|w| w[1].saturating_sub(w[0]))
+        .max()
+}
+
+/// Is this BRLE true everywhere, however it is encoded?
+///
+/// BRLE alternates starting with FALSE, so "all true" is any run list whose
+/// even-index runs are zero and whose odd ones cover the whole length. The
+/// canonical form is `[0, n]`, but `TrimPlan::write_skipping` rebuilds a
+/// mask's runs when it drops KV ranges and can leave zero-length falses
+/// between the pieces it kept -- which is exactly the case this function is
+/// reached for, so requiring the canonical pair would refuse the mask that
+/// motivated reading it at all.
+fn all_true(mask: &driver_api::plan::EncodedMask) -> bool {
+    let mut at = 0u64;
+    for (index, &run) in mask.runs.iter().enumerate() {
+        if at >= mask.total_size {
+            break;
+        }
+        if index % 2 == 0 && run > 0 {
+            return false;
+        }
+        at = at.saturating_add(u64::from(run));
+    }
+    at >= mask.total_size
+}
+
+/// Does this CSR name any rows at all?
+///
+/// Its LAST boundary is the total, so a table of any length whose total is
+/// zero holds nothing. An empty table holds nothing either.
+fn carries(indptr: &[u32]) -> bool {
+    indptr.last().is_some_and(|&total| total > 0)
 }
 
 /// A program pass that faulted: the instance, and what it said.
@@ -222,8 +406,9 @@ pub fn run_programs(
     sub: &driver_api::StepSubmission,
     step: &Step,
     faults: &mut Vec<Fault>,
-) -> Result<(), Unlaunched> {
+) -> Result<Vec<Ran>, Unlaunched> {
     let vocab = step.logits.vocab;
+    let mut ran = Vec::with_capacity(sub.roster_rows.len());
     for (member, &row) in sub.roster_rows.iter().enumerate() {
         let id = *instance_ids.get(row as usize).ok_or_else(|| {
             Unlaunched::Malformed(format!(
@@ -243,13 +428,17 @@ pub fn run_programs(
             // Early, and not wrong. The producer has not run, the consumer has
             // not drained, or another fire moved the ring: the member is
             // skipped, nothing about it changes, and the scheduler re-posts.
-            driver::Readiness::Retry { .. } => continue,
+            driver::Readiness::Retry { .. } => {
+                ran.push(Ran::Early);
+                continue;
+            }
             // Never runnable: a poisoned or closed ring. One instance's
             // problem, so it is a fault beside the others rather than the
             // whole frame's failure -- and a fault a waiter can see, since
             // the ring already carries the word the pipeline reads.
             driver::Readiness::Failed { channel, reason } => {
                 faults.push((id, format!("channel {channel:?}: {reason:?}")));
+                ran.push(Ran::Faulted);
                 continue;
             }
             // The frame's tables do not describe the instance they name.
@@ -286,12 +475,41 @@ pub fn run_programs(
             }
         };
         match programs.fire(id, &inputs) {
-            Ok(driver::StepOutcome::Committed | driver::StepOutcome::Blocked(_)) => {}
-            Ok(driver::StepOutcome::Faulted(why)) => faults.push((id, why)),
+            Ok(driver::StepOutcome::Committed | driver::StepOutcome::Blocked(_)) => {
+                ran.push(Ran::Fired);
+            }
+            Ok(driver::StepOutcome::Faulted(why)) => {
+                faults.push((id, why));
+                ran.push(Ran::Faulted);
+            }
             Err(e) => return Err(Unlaunched::Malformed(format!("{e}"))),
         }
     }
-    Ok(())
+    Ok(ran)
+}
+
+/// What one member of a step did, in roster order.
+///
+/// # Why the caller is told, rather than only the faults
+///
+/// Every member of a launched frame owns a TERMINAL CELL, and the engine
+/// resolves the request's work item by reading it: `Pending` is not "nothing
+/// happened", it is a failure -- `work item completion terminal outcome is
+/// still Pending` -- and a member that was skipped for being early has to say
+/// `Retry` or the scheduler turns a re-postable frame into a dead request.
+///
+/// So a fault list is not enough. It names the members that failed and cannot
+/// distinguish the two REMAINING outcomes from each other, and those two are
+/// the ones whose cells differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ran {
+    /// The member's program fired, committed or blocked on its own await.
+    Fired,
+    /// The member was not ready: its producer has not run or its ring has
+    /// moved. Nothing about it changed and the frame may be re-posted.
+    Early,
+    /// The member's program or one of its channels failed.
+    Faulted,
 }
 
 /// The head and tail this member's composer pinned, or `None` for a member it
@@ -389,8 +607,14 @@ pub fn member_requests(
 /// [`crate::turns::Serving::over`] forces every row to sample, for the arena
 /// reason recorded there, and rewrites the sampling table to the identity to
 /// match. A `samples` here would be overwritten one line later, so stating it
-/// would be a lie in the record rather than a value anyone reads. The rows a
-/// caller wanted are recoverable from `Step::readout_of` plus the plan.
+/// would be a lie in the record rather than a value anyone reads.
+///
+/// This used to add *"the rows a caller wanted are recoverable from
+/// `Step::readout_of` plus the plan"*, and that was FALSE for the case it
+/// mattered in. `readout_of` is one entry PER TURN -- a turn's answer is its
+/// LAST row -- so a request that named several readout rows gets one back, and
+/// there is nothing to recover the others from. `unserved_in` refuses such a
+/// plan by name now, which is what the claim should have been.
 ///
 /// # Errors
 ///
@@ -677,5 +901,262 @@ mod tests {
                  leaves the caller to guess which field it was"
             );
         }
+
+        // Every side-channel names ONE boundary PER REQUEST, so a batch of two
+        // text-only requests carries three zeros in each of them. That is the
+        // shape of a table with nothing in it, and it was refused as images
+        // for as long as this driver only ever saw one request at a time --
+        // the first real two-conversation turn came back as `this driver does
+        // not serve images`, about a prompt that was entirely words.
+        let two = LaunchPlan {
+            image_indptr: vec![0, 0, 0],
+            audio_indptr: vec![0, 0, 0],
+            embed_indptr: vec![0, 0, 0],
+            ..base.clone()
+        };
+        assert!(
+            unserved_in(&two).is_none(),
+            "a text-only batch of two is refused for a side-channel that holds nothing"
+        );
+        // And the boundary is still read: a table whose total is non-zero
+        // names rows, whatever its length.
+        assert_eq!(
+            unserved_in(&LaunchPlan {
+                image_indptr: vec![0, 1],
+                ..base.clone()
+            }),
+            Some("images: this driver serves text-only models"),
+            "an image the plan names only in its CSR is served silently"
+        );
+    }
+
+    /// The engine's own causal mask is served; anything else is refused.
+    ///
+    /// # The plan this was measured on
+    ///
+    /// `wire.rs` synthesizes `RunMask::all_true` per query row whenever it
+    /// cannot elide the mask table, which is every request that is neither
+    /// device-resolved nor a single-token decode. Three concurrent
+    /// `chat-completion`s through a real `pie serve` came back as one success
+    /// and two failures -- *this driver does not serve a user mask* -- about
+    /// prompts that were entirely words. The mask was the causal one, which is
+    /// the attention this driver already computes, so ignoring it and applying
+    /// it are the same bytes.
+    ///
+    /// # Why each rejection below is a separate case
+    ///
+    /// Accepting "all true" alone would be wrong, and the cases say how. A
+    /// mask SHORTER than the row's extent is a sliding window; one LONGER
+    /// admits keys past the row, which causal attention refuses and the mask
+    /// does not; a run list that is not `[0, m]` has a hole in it. In each the
+    /// two computations differ, so none is served by dropping the table.
+    ///
+    /// The multi-ROW request is the case that matters most, because
+    /// `mask_indptr` is per REQUEST: a first draft read it as per-row, passed
+    /// every one-row decode, and refused every prefill. The six-way concurrent
+    /// run that caught that is the reason this test has a prefill in it.
+    #[test]
+    fn the_engines_own_causal_mask_is_served_and_no_other_is() {
+        let brle = |m: u32| driver_api::EncodedMask::new(vec![0, m], u64::from(m));
+
+        // Two requests: a three-row prefill over a 3-key span, and a one-row
+        // decode over a 5-key span. Two rows and two requests would not tell
+        // a per-row reading of `mask_indptr` from a per-request one.
+        let base = LaunchPlan {
+            qo_indptr: vec![0, 3, 4],
+            token_ids: vec![10, 11, 12, 13],
+            position_ids: vec![0, 1, 2, 4],
+            kv_len: vec![3, 5],
+            kv_page_indices: vec![0, 1],
+            kv_page_indptr: vec![0, 1, 2],
+            ..LaunchPlan::default()
+        };
+        assert!(
+            unserved_in(&base).is_none(),
+            "the same plan without a mask table is served, so what follows is \
+             about the table and nothing else"
+        );
+
+        // What `wire.rs` builds: row j of an n-row request over kv_len keys
+        // attends to `kv_len - n + j + 1` of them.
+        let served = LaunchPlan {
+            masks: vec![brle(1), brle(2), brle(3), brle(5)],
+            mask_indptr: vec![0, 3, 4],
+            ..base.clone()
+        };
+        assert_eq!(
+            unserved_in(&served),
+            None,
+            "the causal mask is the attention this driver computes"
+        );
+
+        // A request that names NO mask is the elided case and mixes with one
+        // that does.
+        assert_eq!(
+            unserved_in(&LaunchPlan {
+                masks: vec![brle(5)],
+                mask_indptr: vec![0, 0, 1],
+                ..base.clone()
+            }),
+            None
+        );
+
+        let refused: Vec<(&str, Vec<driver_api::EncodedMask>, Vec<u32>)> = vec![
+            (
+                "a window, not the row's full extent",
+                vec![brle(1), brle(2), brle(2), brle(5)],
+                vec![0, 3, 4],
+            ),
+            (
+                "longer than the row's extent",
+                vec![brle(1), brle(2), brle(3), brle(9)],
+                vec![0, 3, 4],
+            ),
+            (
+                "a hole in the runs",
+                vec![
+                    brle(1),
+                    brle(2),
+                    driver_api::EncodedMask::new(vec![1, 2], 3),
+                    brle(5),
+                ],
+                vec![0, 3, 4],
+            ),
+            (
+                "the prefill read as one row",
+                vec![brle(3), brle(5)],
+                vec![0, 1, 2],
+            ),
+            (
+                "a table that does not close",
+                vec![brle(1), brle(2), brle(3), brle(5)],
+                vec![0, 3, 5],
+            ),
+        ];
+        for (what, masks, mask_indptr) in refused {
+            let plan = LaunchPlan {
+                masks,
+                mask_indptr,
+                ..base.clone()
+            };
+            let said =
+                unserved_in(&plan).unwrap_or_else(|| panic!("{what} must not be served silently"));
+            assert!(
+                said.contains("causal"),
+                "{what}: the refusal should say what it wanted: {said}"
+            );
+        }
+
+        // A NON-CANONICAL all-true encoding is served. `write_skipping`
+        // rebuilds a mask's runs when the trim drops KV ranges and can leave
+        // zero-length falses between the pieces it kept; a check that demanded
+        // `[0, m]` would refuse the very mask trimming produces.
+        assert_eq!(
+            unserved_in(&LaunchPlan {
+                masks: vec![
+                    brle(1),
+                    brle(2),
+                    driver_api::EncodedMask::new(vec![0, 1, 0, 2], 3),
+                    driver_api::EncodedMask::new(vec![0, 2, 0, 3], 5),
+                ],
+                mask_indptr: vec![0, 3, 4],
+                ..base.clone()
+            }),
+            None,
+            "all-true is a property of the mask, not of how it was written down"
+        );
+
+        // The length is read off `kv_len`, which is the POST-TRIM span, and
+        // that is where this parts from `driver-vulkan`'s `causal_only`: it
+        // compares against `position_ids[query] + 1`, which is ABSOLUTE. The
+        // two agree exactly when nothing was trimmed -- for an n-row request
+        // at base position p, `kv_len - n + j + 1` IS `p + j + 1` -- and part
+        // when a trim has shortened the span the driver actually binds. Here
+        // the positions say 8 and the bound span says 5; the mask the engine
+        // wrote matches the span.
+        assert_eq!(
+            unserved_in(&LaunchPlan {
+                position_ids: vec![6, 7, 8, 12],
+                masks: vec![brle(1), brle(2), brle(3), brle(5)],
+                mask_indptr: vec![0, 3, 4],
+                ..base.clone()
+            }),
+            None,
+            "a trimmed span is measured against what the plan binds, not \
+             against where the tokens are"
+        );
+
+        // And a GUEST mask is refused whatever its shape, because
+        // `has_user_mask` says a caller asked for something.
+        assert!(
+            unserved_in(&LaunchPlan {
+                has_user_mask: true,
+                masks: vec![brle(1), brle(2), brle(3), brle(5)],
+                mask_indptr: vec![0, 3, 4],
+                ..base
+            })
+            .is_some_and(|s| s.contains("user mask")),
+            "a mask the guest asked for is refused even when it is causal"
+        );
+    }
+
+    /// One readout row per request is served; several is refused by name.
+    ///
+    /// # Why the refusal is the right answer and not a smaller one
+    ///
+    /// `Serving::over` forces every row to sample, so the rows a caller asked
+    /// for EXIST in `Step::logits`. What does not exist is a mapping from a
+    /// request to its row SPAN: `readout_of` is one entry per turn, the last
+    /// row, the only one that has seen the whole prompt. Handing a program one
+    /// row where it asked for four is not a degraded answer, it is a different
+    /// one -- and until this refusal existed the program found out by faulting
+    /// inside `crates/driver`'s interpreter, four layers from the plan that
+    /// caused it:
+    ///
+    ///     logits intrinsic row range exceeds the forward's readout rows
+    ///
+    /// The ordinary case must keep working, which is the other half of this
+    /// test: the engine ELIDES the sampling table when every request wants its
+    /// last row, and a plan with no table is what twenty inferlets submit.
+    #[test]
+    fn a_request_naming_several_readout_rows_is_refused_by_name() {
+        let base = plan(&[0, 1, 3], &[10, 11, 12], &[0, 1, 2], &[0, 1], &[0, 1, 2]);
+        assert!(
+            unserved_in(&base).is_none(),
+            "a plan with no sampling table is the ordinary case and is served"
+        );
+        // One row per request, stated: still the ordinary case.
+        assert_eq!(
+            unserved_in(&LaunchPlan {
+                sampling_indices: vec![0, 2],
+                sampling_indptr: vec![0, 1, 2],
+                ..base.clone()
+            }),
+            None,
+            "one readout row per request is exactly what this driver gives"
+        );
+        // The second request wants two. That is the speculative verifier's
+        // shape, and it is refused.
+        let refused = unserved_in(&LaunchPlan {
+            sampling_indices: vec![0, 1, 2],
+            sampling_indptr: vec![0, 1, 3],
+            ..base.clone()
+        })
+        .expect("a request naming two readout rows is not served silently");
+        assert!(
+            refused.contains("readout"),
+            "the refusal names what it could not do: {refused}"
+        );
+        // And a table that names NO rows for anybody is not a refusal: nothing
+        // was asked for.
+        assert_eq!(
+            unserved_in(&LaunchPlan {
+                sampling_indices: Vec::new(),
+                sampling_indptr: vec![0, 0, 0],
+                ..base
+            }),
+            None,
+            "an empty sampling table asks for nothing, so there is nothing to refuse"
+        );
     }
 }

@@ -298,11 +298,56 @@ impl Gemma4 {
     /// for two questions" about `k_eq_v`: deployment is backend-blind
     /// and Metal deploys these rows. The routed bank is unwritten on
     /// both, and that is what this still says.
+    /// MEASURED against `mlx-community/gemma-4-26b-a4b-it-4bit`, and the
+    /// first sentence this refusal carried was wrong about its own reason.
+    ///
+    /// It said "no routed-expert TEXT", and the text is written.
+    /// `metal_shape` carries all three mixture facts, `metal_facts` sets
+    /// `dense_beside_moe: mixture.is_some()`, and
+    /// `llama_like_metal` has the branch -- a second `gated()` off the
+    /// same post-attention residual, added back -- plus `Activation::Geglu`
+    /// in the routed path. Lifting this refusal and running
+    /// `device_checkpoint_names` reaches the text and gets a different
+    /// answer: **90 names the text states are not tensors the load plan
+    /// publishes**, the routed bank and the dense MLP alike. The
+    /// checkpoint has them under exactly the spellings asked for. So the
+    /// missing half is the gemma-4 CONTRACT, not the forward.
+    ///
+    /// And the forward is not finished either, which the same measurement
+    /// shows and `mlx_lm/models/gemma4_text.py::DecoderLayer.__call__`
+    /// settles. Layer 0 of the A4B ships seven norms where the dense 31b
+    /// ships four, and the reference says what each is for:
+    ///
+    /// ```text
+    /// h1 = post_ffn_norm_1(mlp(pre_ffn_norm(h)))     // dense leg
+    /// h2 = post_ffn_norm_2(experts(pre_ffn_norm_2(h), router(h)))
+    /// h  = post_ffn_norm(h1 + h2) + residual         // join, THEN norm
+    /// ```
+    ///
+    /// Both legs read the same `h`. Each has its own pre-norm and its own
+    /// post-norm. The shared `post_feedforward_layernorm` lands on the
+    /// SUM, and in a mixture layer the dense leg's post-norm is
+    /// `post_feedforward_layernorm_1`, which a dense layer does not have
+    /// at all -- so the mixture changes the dense leg too. The Metal
+    /// branch has none of this: it chains off the post-dense residual,
+    /// reuses `mlp_norm` for the routed pre-norm, states no post-norm, and
+    /// adds instead of joining.
+    ///
+    /// The router is a sixth statement rather than a projection.
+    /// `Router.__call__` is `rms_norm(x, scale * hidden^-0.5)` -> project
+    /// -> top-k -> softmax -> `* per_expert_scale[indices]`. Both of those
+    /// weights are in the checkpoint, and nothing here states either.
+    ///
+    /// That is what makes this a refusal rather than a gap to walk past:
+    /// every one of those five tensors is small, so a build that ignored
+    /// them would run at full speed and be quietly wrong.
     fn untraced(&self) -> Option<Refusal> {
         if self.mixture.is_some() {
             return Some(Refusal::Unsupported(
-                "gemma-4 26B-A4B: this build has no routed-expert text for a gemma-4 block \
-                 (`gemma4_enable_moe`, 128 experts top-8); the dense rows serve",
+                "gemma-4 26B-A4B: the routed block is traced but not loadable here \
+                 (`gemma4_enable_moe`, 128 experts top-8) -- the contract publishes none \
+                 of `experts.switch_glu.*`, and the branch's own three norms and the \
+                 router's two scales are unstated; the dense rows serve",
             ));
         }
         None
@@ -793,9 +838,16 @@ mod tests {
             text.contains("gemma-4"),
             "the refusal must name the model: {text}"
         );
+        // This USED to ask for the token "routed-expert", which was the
+        // old sentence's own phrasing rather than anything a reader
+        // needs, and it was guarding a sentence that named the wrong
+        // missing leg: it said the routed TEXT was unwritten, and the
+        // text is written. What a reader must be able to grep is the
+        // tensor family the contract does not publish, so that is what
+        // this asks for now.
         assert!(
-            text.contains("routed-expert"),
-            "the refusal must name what is missing: {text}"
+            text.contains("switch_glu"),
+            "the refusal must name the tensors it cannot load: {text}"
         );
         assert!(
             text.contains("gemma4_enable_moe"),
@@ -887,6 +939,8 @@ mod tests {
         let bind = MetalBinding {
             quant_group: 64,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,

@@ -465,7 +465,9 @@ const AWAITING_THE_VERIFY_STASH_POOL: &[&str] =
 fn bridged_symbols() -> BTreeSet<&'static str> {
     let rows: BTreeSet<&'static str> = kernels_cuda_new::table::KERNELS
         .iter()
-        .chain(kernels_cuda_new::table::driver_internal::DRIVER_KERNELS)
+        // `table::driver_internal::DRIVER_KERNELS` was chained here. Its six
+        // rows are `x::driver_internal`'s `fn`s now, with no `contract!` and
+        // so no bridged symbol — they are called, never dispatched.
         .filter(|k| !k.operands.is_empty())
         .map(|k| k.symbol)
         .collect();
@@ -1407,15 +1409,24 @@ fn every_lowered_symbol_has_an_arm() {
             // state no operands, so this walk sees them and emits nothing,
             // which is the same answer as before for a different reason.
             kernels_cuda_new::x::rope::SIGS,
-            kernels_cuda_new::table::norm::KERNELS,
-            kernels_cuda_new::table::mlp::KERNELS,
-            kernels_cuda_new::table::gemm::KERNELS,
+            // `norm`'s twenty-eight, from `x::norm::SIGS`, for
+            // `x::rope::SIGS`' reason above; `table::norm::KERNELS` stood
+            // here until §5 step 5.
+            kernels_cuda_new::x::norm::SIGS,
+            // `mlp`'s twelve and `quant`'s eleven, derived from their
+            // `contract!` blocks, for `x::rope::SIGS`' reason above.
+            kernels_cuda_new::x::mlp::SIGS,
+            kernels_cuda_new::x::gemm::SIGS,
             kernels_cuda_new::table::moe::KERNELS,
-            kernels_cuda_new::table::ssm::KERNELS,
-            kernels_cuda_new::table::quant::KERNELS,
-            kernels_cuda_new::table::layout::KERNELS,
-            kernels_cuda_new::table::sample::KERNELS,
-            kernels_cuda_new::table::driver_internal::DRIVER_KERNELS,
+            // `ssm`'s twenty-seven, derived from its `contract!` block, for
+            // `x::rope::SIGS`' reason above. `table::ssm::KERNELS` stood
+            // here until §5 step 5 took the family into fn-world.
+            kernels_cuda_new::x::ssm::SIGS,
+            kernels_cuda_new::x::quant::SIGS,
+            // `layout`'s seven and `sample`'s one, derived from their
+            // `contract!` blocks, for `x::rope::SIGS`' reason above.
+            kernels_cuda_new::x::layout::SIGS,
+            kernels_cuda_new::x::sample::SIGS,
         ],
         &[],
     );

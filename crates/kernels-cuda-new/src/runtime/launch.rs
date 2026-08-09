@@ -700,6 +700,19 @@ const LAYERNORM_BLOCK: u32 = 128;
 /// The reference paged attention's block — `attn/attention_naive_paged.cu`'s
 /// `constexpr int BLOCK = 128;` at `:35`.
 ///
+/// **That file is DELETED and the 128 is not.** It is cited here in the past
+/// tense the way [`crate::families::attn`] and `kernels-cuda/csrc/
+/// CMakeLists.txt` cite it: the value was read off the ahead-of-time launcher
+/// while the launcher existed, which is what §17.6 asks, and a measurement
+/// does not expire because its witness was retired. What is lost is the
+/// CHECK — nothing compares this constant to a `.cu` line any more — so the
+/// oracle moved to the kernel, which is where it can still bite:
+/// `kernels-cuda-new/tests/launch_rules.rs` quotes `template <int BLOCK>` and
+/// the `reduce = smem + head_dim` partition out of
+/// `attn/attention_naive_paged.cuh`, and the instantiation string carries the
+/// 128 into NVRTC, which rejects a disagreement. Provenance is `git log
+/// --follow crates/kernels-cuda/csrc/src/attn/attention_naive_paged.cu`.
+///
 /// A FIFTH 128 in this file, and it is named apart from [`PAD_BLOCK`],
 /// [`SCAN_BLOCK`] and [`LAYERNORM_BLOCK`] for the reason all of them are: the
 /// same number under four contracts. This one is a SHARED-MEMORY CONTRACT and
@@ -2143,7 +2156,7 @@ fn axial_rope(rows: u32, heads: u32) -> Launch {
 /// and not a product, and the addend is the BLOCK: the kernel cuts
 /// `extern __shared__ float smem[]` into `q_smem = smem` of `head_dim` floats
 /// and `reduce = smem + head_dim` of `BLOCK` floats
-/// (`attention_naive_paged.cuh:334-336`). [`sdpa_vector`]'s `(rows + 256) * 4`
+/// (`attention_naive_paged.cuh:402-404`). [`sdpa_vector`]'s `(rows + 256) * 4`
 /// has the same shape and adds the block to the TOKEN count, so on a 4096-token
 /// fire over 128-wide heads it asks for 17,408 bytes where this launcher asks
 /// for 1,024 — a request the hardware serves, out of a budget the occupancy
@@ -2157,7 +2170,7 @@ fn axial_rope(rows: u32, heads: u32) -> Launch {
 /// **No row states it either**, and the second blocker is an operand rather
 /// than a grid: `naive_paged_attn` takes `device::KvScheme` and
 /// `device::KvDType` by value — one-byte enums declared at
-/// `attention_naive_paged.cuh:141` and `:152` — and `kernels::Ty` has no
+/// `attention_naive_paged.cuh:187` and `:198` — and `kernels::Ty` has no
 /// word for either, `crate::runtime::args` no `ArgValue` to marshal one. Both
 /// are outside this change's grant, so the rule is stated, cited, pinned and
 /// rowless, which is the state `attn/head_dim_pad`'s two kernels were in
@@ -2192,9 +2205,9 @@ fn paged_scores(requests: u32, rows: u32, q_heads: u32, head_dim: u32) -> Launch
 /// **`blockIdx.y` means something different in the two kernels**, which is
 /// why they are two rules rather than one with a degenerate axis.
 /// `naive_paged_decode` reads `q_head = blockIdx.y`
-/// (`attention_naive_paged.cuh:486`); `naive_paged_attn` reads
+/// (`attention_naive_paged.cuh:541`); `naive_paged_attn` reads
 /// `qo_off = blockIdx.y` and takes the head from `blockIdx.z`
-/// (`:316-317`). Collapsing them would give one of the two the other's
+/// (`:370-371`). Collapsing them would give one of the two the other's
 /// addressing at exactly the shapes where the numbers agree.
 ///
 /// Rowless for [`paged_scores`]' second reason: `naive_paged_decode` takes

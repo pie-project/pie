@@ -101,10 +101,14 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::x::abi::{MaybeConst, bf16, f16};
-use crate::x::contract::{Fired, Refusal};
 use crate::x::launch::Launch;
-use crate::{bind, contract, unit};
 
+// The host programs and the binds; the declarations above them need none of
+// these. (`unit!`, `contract!` and `bind!` arrive by `#[macro_use]` textual
+// scope from `x::macros`, not by import.)
+#[cfg(feature = "_cuda")]
+use crate::x::contract::{Fired, Refusal};
+#[cfg(feature = "_cuda")]
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
@@ -131,7 +135,7 @@ unit! {
         head_dim: i32,
         theta: f32,
     ) where *const P {
-        "rope::rope_standard_table" => [P = i32] "device::i32",
+        "rope::rope_standard_table" => where [P = i32] "device::i32",
     }
 
     /// `rope.cuh:163` — the plain NeoX/GPT-J rotation, optionally fused
@@ -300,7 +304,7 @@ unit! {
         orig_max_pos: f32,
         heads_per_block: i32,
     ) {
-        "rope::rotate_yarn_bf16" => crate::device::PLAIN,
+        "rope::rotate_yarn_bf16" => crate::device::DeviceKernel::PLAIN,
     }
 
     /// `rope.cuh:656` — YaRN as its paper spells it (OLMo-3, gpt-oss).
@@ -329,7 +333,7 @@ unit! {
         heads_per_block: i32,
         cache_pairs: i32,
     ) {
-        "rope::rotate_yarn_original_bf16" => crate::device::PLAIN,
+        "rope::rotate_yarn_original_bf16" => crate::device::DeviceKernel::PLAIN,
     }
 
     /// `rope.cuh:733` — partial rotary over the FIRST `rotary_dim` lanes.
@@ -360,9 +364,9 @@ unit! {
         rotary_dim: i32,
         theta: f32,
     ) where *mut T {
-        "rope::rope_partial_bf16" => [T = bf16] "device::bf16",
-        "rope::rotate_partial_position_delta_bf16" => [T = bf16] "device::bf16",
-        "rope::rope_partial_f16" => [T = f16] "device::f16",
+        "rope::rope_partial_bf16" => where [T = bf16] "device::bf16",
+        "rope::rotate_partial_position_delta_bf16" => where [T = bf16] "device::bf16",
+        "rope::rope_partial_f16" => where [T = f16] "device::f16",
     }
 
     /// `rope.cuh:792` — partial rotary over the LAST `rotary_dim` lanes
@@ -386,7 +390,7 @@ unit! {
         yarn_low_dim: f32,
         yarn_high_dim: f32,
     ) {
-        "rope::rotate_partial_last_bf16" => crate::device::PLAIN,
+        "rope::rotate_partial_last_bf16" => crate::device::DeviceKernel::PLAIN,
     }
 }
 

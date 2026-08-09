@@ -730,6 +730,8 @@ mod tests {
         let bind = MetalBinding {
             quant_group: 64,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: true,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
@@ -787,5 +789,74 @@ mod tests {
         // A `Backend::Cuda` is what `Deployed::single()` states, so the
         // arm above is reached by every existing caller unchanged.
         assert!(matches!(Deployed::single().backend, Backend::Cuda));
+    }
+
+    /// The ROUTER GATE takes the width the checkpoint published IT at.
+    ///
+    /// `mlx-community/gpt-oss-20b-MXFP4-Q4` states 122 per-tensor overrides:
+    /// 98 dense tensors at affine/64/4 and 24 `mlp.router` gates at
+    /// affine/64/**8**. The gate is a `[2880, 32]` matrix whose error the
+    /// whole mixture inherits, which is why `mlx_lm` spends the bits there,
+    /// and reading it at the stack's 4 is the QUIET failure -- a fluent model
+    /// routing every token to almost the right experts, cosine 0.84 against
+    /// the reference logits and not one NaN to notice it by.
+    ///
+    /// Asserted on the SYMBOL rather than on the fact, because the fact was
+    /// already stated correctly by a text that named `_b_4` anyway: the point
+    /// is threaded through `gemm_at`, and a `router_repr` that stopped
+    /// reaching it would leave this row silently served at one width.
+    #[test]
+    fn the_router_gate_is_read_at_its_own_width() {
+        use crate::catalog::{Deployed, MetalBinding};
+        use model_compiler::trace::FireClass;
+
+        let at = |router_group: u32, router_bits: u32| {
+            let bind = MetalBinding {
+                quant_group: 64,
+                quant_bits: 4,
+                router_quant_group: router_group,
+                router_quant_bits: router_bits,
+                moe_mxfp4: true,
+                fuse_residual_gemv: true,
+                paged_multi_batch: true,
+                qmm_multi_batch: true,
+                add_bias: true,
+            };
+            let plan = VARIANTS[0]
+                .trace(FireClass::Decode, Deployed::metal(&bind))
+                .expect("a Metal text");
+            format!("{plan:?}")
+        };
+
+        let uniform = at(0, 0);
+        assert!(
+            uniform.contains("affine_qmv_fast_bfloat16_gs_64_b_4"),
+            "the dense projections are the stack's own point"
+        );
+        assert!(
+            !uniform.contains("_gs_64_b_8"),
+            "a checkpoint whose gate matches its stack states ONE point: \
+             `(0, 0)` is `router_repr: None`, and a second spelling of the \
+             same encoding would make two texts of one row"
+        );
+
+        let split = at(64, 8);
+        assert!(
+            split.contains("affine_qmv_fast_bfloat16_gs_64_b_8"),
+            "the gate's own width reaches the symbol"
+        );
+        assert!(
+            split.contains("affine_qmv_fast_bfloat16_gs_64_b_4"),
+            "and the stack keeps its own -- the gate is ONE op, not a second \
+             encoding for the text"
+        );
+        // ONE PER LAYER and not one per text: the gate is a per-layer op, so
+        // twenty-four is the whole of it and any other count means the width
+        // leaked into an op that is not the gate.
+        assert_eq!(
+            split.matches("_gs_64_b_8").count(),
+            usize::try_from(VARIANTS[0].deployment(Deployed::single()).unwrap().layers).unwrap(),
+            "exactly the gates read the wider point, one per layer"
+        );
     }
 }

@@ -941,8 +941,12 @@ mod tests {
         CompileError, admits, compile_rows, compile_under, options, unassembled_tile_ir, version,
     };
     use crate::device::DeviceKernel;
-    use crate::families::norm::ALTUP_AUX as NORM_ALTUP_AUX;
+    // `crate::families::norm::ALTUP_AUX` until §5 step 5 took `norm` into
+    // fn-world; the unit is `x::norm::altup_aux::ALTUP_AUX` now, emitted by
+    // the `unit!` invocation in that module rather than written by hand. The
+    // same root, the same rows, the same `cache_key`.
     use crate::unit::Toolchain;
+    use crate::x::norm::altup_aux::ALTUP_AUX as NORM_ALTUP_AUX;
 
     /// A compile with no rows is refused, and refused before NVRTC is
     /// touched — which is why this test runs on a machine with no GPU, no
@@ -1212,20 +1216,25 @@ Compilation aborted."#;
     #[test]
     fn the_ice_gets_a_cause_attached() {
         let d = tile_header_mismatch(REAL_ICE).expect(
-            "the bf16 tile-codegen ICE must be recognised -- it is the one              CuTile failure whose message names nothing that caused it",
+            "the bf16 tile-codegen ICE must be recognised -- it is the one \
+             CuTile failure whose message names nothing that caused it",
         );
 
         // The cause, in the words that make it searchable.
         assert!(d.contains("__NV_TL_BUILTIN__"), "the marker must be named");
         assert!(
             d.contains("NOT a compiler bug"),
-            "the message must say this plainly. A day and a withdrawn bug              report went into learning it, and the ICE reads like a compiler              bug to everyone who meets it"
+            "the message must say this plainly. A day and a withdrawn bug \
+             report went into learning it, and the ICE reads like a compiler \
+             bug to everyone who meets it"
         );
 
         // And the check, which is the part that ends the debugging session.
         assert!(
             d.contains("cuda_tf32.h"),
-            "the message must give the one-`ls` proxy; a version number does              not answer the question because the RUNTIME wheel is the one              that matters and it versions independently"
+            "the message must give the one-`ls` proxy; a version number does \
+             not answer the question because the RUNTIME wheel is the one \
+             that matters and it versions independently"
         );
         assert!(
             d.contains("grep -c __NV_TL_BUILTIN__"),

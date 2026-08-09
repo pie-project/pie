@@ -111,7 +111,7 @@ mod probe {
 
         let units: Vec<&Unit> = kernels_cuda_new::x::rope::UNITS
             .iter()
-            .chain(kernels_cuda_new::families::layout::UNITS)
+            .chain(kernels_cuda_new::x::layout::UNITS)
             .collect();
 
         println!("UNITS -- every row must come back with a lowered name\n");

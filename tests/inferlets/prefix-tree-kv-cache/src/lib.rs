@@ -205,14 +205,29 @@ async fn main(input: Input) -> Result<String> {
             ));
         }
     }
-    // A KV working set is scoped to the FIRST pipeline that fires it, and every
-    // leaf was built on `tree_pipeline` — so generation must stay on that same
-    // stream. It closes once, after the last leaf is drained.
+    // The BUILD stream ends here: every append is submitted and nothing else
+    // will go on this pipeline.
+    tree_pipeline.close();
+
+    // One pipeline per leaf, because each leaf's generation IS its own
+    // sequential stream and `Pipeline`'s own doc says so -- "one pipeline per
+    // sequential stream", "call close right after the last submit". `generate`
+    // hands the pipeline to `run_ahead`, which closes it when the budget is
+    // spent, so a shared pipeline is closed after the FIRST leaf and every
+    // later submit fails with `pipeline is closed`: no fault, no refusal, and
+    // `pipeline.failure` empty, because nothing failed.
+    //
+    // The comment that used to be here said a KV working set is scoped to the
+    // first pipeline that fires it. It is not: `fork` and `submit` take `&
+    // Pipeline` for ORDERING -- "ordered on `on`" -- and a working set carries
+    // no pipeline. Ordering is what a fresh pipeline gives up, and these four
+    // generations are independent, which is the case separate pipelines exist
+    // for.
     let mut outputs = Vec::with_capacity(leaves.len());
     for (label, ws, seq_len, first) in leaves {
-        let generated = generate(&ws, &tree_pipeline, seq_len, first, input.num_tokens).await?;
+        let leaf_pipeline = Pipeline::new();
+        let generated = generate(&ws, &leaf_pipeline, seq_len, first, input.num_tokens).await?;
         outputs.push(format!("{label}: {}", model::decode(&generated)?));
     }
-    tree_pipeline.close();
     Ok(outputs.join("\n"))
 }

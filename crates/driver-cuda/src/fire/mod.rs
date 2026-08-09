@@ -33,10 +33,40 @@ pub mod flashinfer_moe;
 ///
 /// The three plan caches, the two real planner factories over
 /// `kernels_cuda_new::plan`, the static non-split short-circuit and its two
-/// environment gates. **The four `switch (cache.head_dim)` dispatches are NOT
-/// here yet** and the C++ file is still the one that runs; see the module's
-/// header for why that ordering is deliberate.
+/// environment gates, the descriptor's H2D and the two `fire_*` entry points.
+/// **The C++ file is deleted**, and with it the whole of `driver-cuda/csrc/`;
+/// nothing here forwards anywhere.
 pub mod flashinfer_fa2;
+/// The other half of [`flashinfer_fa2`]: the params structs the FA2
+/// `__global__`s take, filled from a plan and a batch, and the six dispatches
+/// that fire them.
+///
+/// Split from the plan half because the two answer different questions and
+/// have different evidence behind them — the plan half is transcribed from
+/// `attention_flashinfer.cu`, and this half is pinned against **measured**
+/// struct layouts (`nvrtc-probes/params_layout.py`), the two score-capture
+/// mirrors included: they were derived from the Itanium C++ ABI first and
+/// then probed, and the probe agreed in all six places. `fa2/params.rs`
+/// carries both the derivation and the measurement, and states which
+/// `uint_fastdiv` was measured — the shim's, which is what every JIT fire
+/// compiles against.
+pub mod flashinfer_fa2_dispatch;
+/// `cascade.cuh`'s two merge launchers — the fold [`flashinfer_fa2_dispatch`]
+/// needs when a plan splits KV, and the third half of the FA2 seam.
+///
+/// A row that left and came back. `new-horizon.md` §38 deleted
+/// `attn::merge_attention_states_bf16` for having no consumer, and it was
+/// right about the DSL wrapper — `dsl::cuda::merge_attention_states` is still
+/// called by nothing. What the deletion missed is that the FA2 lattice's own
+/// split path calls this fold directly, from inside upstream's dispatch,
+/// which is why closing the seams turned split-KV prefill OFF rather than
+/// leaving it working.
+///
+/// **The `Fired::Split` panics were the visible half of that.** They are
+/// gone: every dispatch that splits now fires this after its attention
+/// kernel, on the same stream, in the order `prefill.cuh:4343-4352` and
+/// `decode.cuh:813-824` fire them.
+pub mod merge_states;
 // `comm/custom_all_reduce.cu`'s HOST PROGRAM, in Rust — 664 lines with zero
 // `__global__` and zero `<<<>>>`, the fifth file this migration found wearing
 // a `.cu` extension for linkage rather than content. The whole lifecycle came
@@ -49,23 +79,40 @@ pub mod flashinfer_fa2;
 pub mod all_reduce;
 pub mod attention_workspace;
 pub mod attn_score;
-// `ssm/causal_conv1d.cu`'s prefill launcher, in Rust — one symbol, two
-// `__global__`s, and a host `if` on the request count.
-pub mod causal_conv1d;
+// `fire::causal_conv1d` IS GONE — §5 step 5 took `ssm` into fn-world and its
+// two host programs are `kernels_cuda_new::x::ssm::causal_conv1d`'s. The
+// two-`__global__` `if` on the request count went with them, unchanged.
 // The three families ported out of `crates/kernels-cuda/csrc/src` — `norm/`
 // and (until §5 step 3 moved it) `rope/`'s host launchers, in Rust, firing
 // NVRTC-compiled device text out of `kernels-cuda-new/csrc/src/norm/*.cuh`.
 // [`hand`] is the launch they share: a `Launch` this driver states, for the
 // geometries no `LaunchRule` does.
-pub mod dsv4_hc;
-/// The loader's two dtype casts — `quant/dtype_cast.cu`'s whole surviving
-/// surface, fired through the JIT. Named by `fire::lora`, which called them
-/// through `ffi::pie_k_quant_*` until the rows were routed.
-pub mod dtype_cast;
-/// `layout/envelope.cu`'s three launchers, in Rust — quest per-page key
+//
+// `dsv4_hc` IS NOT HERE EITHER, and for `rmsnorm`'s reason — see below. Its
+// four launchers are `kernels-cuda-new/src/x/norm.rs`'s `hc_*` fns, beside
+// the `dsv4_hc.cuh` whose `__global__`s they fire, and the three §43.9 had
+// already deleted for having no launcher (`hc_expand_bf16`,
+// `attn_sink_correction_bf16`, `per_head_rmsnorm_bf16`) are `fn`s there now
+// as well, so all seven of HC's kernels are written in one place for the
+// first time.
+// `fire::dtype_cast` IS GONE — §5 step 5 took its two host programs into
+// `kernels_cuda_new::x::quant`. Its doc read: *"The loader's two dtype casts
+// — `quant/dtype_cast.cu`'s whole surviving surface, fired through the JIT.
+// Named by `fire::lora`, which called them through `ffi::pie_k_quant_*` until
+// the rows were routed."* Both sentences are still true of
+// `x::quant::{cast_fp32_to_bf16, scale_rows_bf16}`, one crate over, beside
+// the `dtype_cast.cuh` whose `__global__`s they fire.
+//
+// The move is the third station of a three-station journey and the file
+// recorded the first two: `ffi::pie_k_quant_*`, then `bind::jit::fire` on a
+// routed row, now a host `fn`. What each step removed is one place the
+// geometry could be written — the C launcher, then the `LaunchRule` — and
+// what is left is `<<<(n + 255) / 256, 256>>>` written once, in
+// `x::quant::elementwise`, next to the `.cuh` it came from.
+/// `layout/envelope.cu`'s three launchers, IN FN-WORLD — quest per-page key
 /// envelopes, seeded, appended to and merged into. **That file is deleted.**
 ///
-/// It is the first of the two `layout` files to go and it went first because
+/// It was the first of the two `layout` files to go and it went first because
 /// it was the wall: `families/layout.rs` had refused a row for every envelope
 /// kernel, and eight launches in `attn/kv_paged.cu` were behind those
 /// refusals. The finding survives — no `LaunchRule` states a
@@ -73,13 +120,30 @@ pub mod dtype_cast;
 /// [`kernels::LaunchRule::Unstated`] plus a driver-owned `Launch` was always
 /// the answer to *"no rule states this"*, and *"one symbol, two launches"* is
 /// a Rust `if`.
-/// `layout/embed.cu`'s one launcher, in Rust — and with it the whole of
+///
+/// **`fire::envelope` IS GONE.** §5 step 5 took `layout` into fn-world and
+/// the three programs are `kernels_cuda_new::x::layout::envelope_*`, beside
+/// the declarations that name the `__global__`s they fire. `unit!` states
+/// `LaunchRule::Unstated` for every row it generates, so the finding above
+/// is no longer a choice a row makes — it is the only thing a device
+/// declaration can say, which is what "no rule states this" always meant.
+/// The two callers in [`kv_paged`] and the one in `bind::abi` call the new
+/// path directly.
+/// `layout/embed.cu`'s one launcher, IN FN-WORLD — and with it the whole of
 /// `kernels-cuda/csrc/src/layout/`, which is now EMPTY. The `VEC` choice is a
 /// 16-byte alignment test on two pointers plus `hidden % 8`, and the extent
 /// it launches over depends on the answer; that is the host program the C++
-/// kept the file for. `layout/embed.cuh` is a unit again (`families/layout.rs`
-/// `EMBED`, two instantiations of `embed<bool VEC>`), and the row moved from
-/// `table::driver_internal` to `table::layout` so `RUST_SERVED` could take it.
+/// kept the file for.
+///
+/// **`fire::embed` IS GONE**, with `fire::envelope` and in the same change:
+/// the program is `kernels_cuda_new::x::layout::embed_bf16` and the
+/// predicate is `x::layout::vectorisable`, public because a caller staging
+/// its own buffers may ask the same question. `layout/embed.cuh` is one of
+/// `x::layout`'s five units (`EMBED`, two instantiations of
+/// `embed<bool VEC>`), and the note that the row *"moved from
+/// `table::driver_internal` to `table::layout` so `RUST_SERVED` could take
+/// it"* is history: there is no row, and an empty operand list drops the
+/// shim entry without a list to keep in step.
 /// `attn/attention_naive.cu`'s two surviving launchers, in Rust — the MTP
 /// state pair, and with them the file. Three of that file's five went in an
 /// earlier pass on an empty consumer set; these two sit behind live
@@ -101,8 +165,6 @@ pub mod dsa_indexer;
 /// `PerHeadElementwise` clamps to 128, invisibly — is why the new row is
 /// `LaunchRule::Unstated` and the geometry is the driver's.
 pub mod dsv4_compress;
-pub mod embed;
-pub mod envelope;
 /// `gemm/gemm.cpp`'s HOST PROGRAM, in Rust — **zero `__global__`, zero
 /// `<<<>>>`, 138 cuBLAS/cuBLASLt calls**. Not a kernel file and never was: a
 /// shape ladder, a cuBLASLt plan cache, a private-stream autotuner and an
@@ -115,31 +177,64 @@ pub mod envelope;
 /// meant *"I did not launch"*, and a row cannot decline. [`gemv`] answered
 /// that by not being a row: its refusal is a type, so the tuner's `Gemv`
 /// candidate is now `matches!(.., Gemv::Launched)`.
-pub mod gemm;
-pub mod gemv;
-// `ssm/gated_delta_net.cu`'s four surviving launchers, in Rust — Qwen3.5's
-// decode recurrence and its two prefill scans. **Eight of that file's
-// seventeen `<<<>>>` were unreachable** behind `constexpr false` selectors
-// and are not ported; the module header carries the audit.
-pub mod gated_delta_net;
+///
+/// # BOTH FILES HAVE MOVED, AND THESE TWO NAMES ARE NOW RE-EXPORTS
+///
+/// §5 step 5 took `gemm` into fn-world. A host program belongs beside its
+/// device text, so `fire/gemm.rs` is `kernels_cuda_new::x::gemm::dense` and
+/// `fire/gemv.rs` is `kernels_cuda_new::x::gemm::gemv`; `x::gemm` itself
+/// holds the `unit!` for the GEMV rows, the twelve `contract!`s and the
+/// `bind!`.
+///
+/// The two names stay HERE as re-exports rather than being deleted, and that
+/// is not softness about a deletion. `crate::fire::gemm::act_x_wt_bf16` is
+/// spelled by `tower::gemma4_vision`, `tower::qwen3_vl`, `fire::lora` and
+/// `bind::quant_gemm`, and by a dozen doc links besides; a re-export makes
+/// every one of them keep resolving to the one definition, which is exactly
+/// what a re-root is supposed to cost. The alternative — editing four
+/// unrelated modules to say a longer path — would be a rewrite of files this
+/// change has no business in.
+pub use kernels_cuda_new::x::gemm::dense as gemm;
+pub use kernels_cuda_new::x::gemm::gemv;
+// `fire::gated_delta_net` IS GONE — §5 step 5 took it into
+// `kernels_cuda_new::x::ssm::gated_delta_net`, where its four launchers
+// became ten host programs (six of the ten were rule-driven rows with no
+// `.cu` launcher to move). **The eight-of-seventeen dead-`<<<>>>` audit and
+// the 34 % / nine-fold measurements moved with them**; nothing in it was
+// carried by this file.
 pub mod hand;
-// `ssm/kda.cu`'s two recurrence launchers, in Rust. Both rows are
-// deliberately UNSOURCED — `state_base` is a driver-owned slab and `Source`
-// has no `Scratch` (`new-horizon.md` §52.3, §56, §57.3) — so neither is reachable
-// from a model trace yet. The geometry is captured now, while the C++ that
-// states it is still readable.
-pub mod kda;
-// `ssm/nemotron_h.cu`'s two multi-armed launchers, in Rust: the fused
-// in-projection split and the Mamba-2 selective scan. **Two of that file's
-// eleven `<<<>>>` were dead** — an `if constexpr (false)` and a block after
-// an unconditional `return` — and are not ported.
-pub mod nemotron_h;
-// `quant/quant_bf16_to_fp8.cu`'s four launchers, in Rust — three ported and
-// one deleted for having no consumer in any language. It is the file the
-// three hand-written `ffi::pie_k_quant_*` arms in `bind/quant_gemm.rs` held
-// alive; those arms now call this module and `csrc/src/quant/` is gone.
-pub mod quant_int8;
-pub mod rmsnorm;
+// `fire::kda` IS GONE — §5 step 5 took it into
+// `kernels_cuda_new::x::ssm::kda`. Its two deliberately UNSOURCED rows are
+// now two `bind!` `none:` arms, which is the fn-world spelling of the same
+// fact: `state_base` is a driver-owned slab and `Source` has no `Scratch`
+// (`new-horizon.md` §52.3, §56, §57.3), so a load-time refusal prints the
+// sentence the row was carrying as prose.
+// `fire::nemotron_h` IS GONE — §5 step 5 took it into
+// `kernels_cuda_new::x::ssm::nemotron_h`, four launchers becoming seven host
+// programs. **The two-of-eleven dead-`<<<>>>` audit moved with them.**
+// `fire::quant_int8` IS GONE — §5 step 5 took its three host programs into
+// `kernels_cuda_new::x::quant`. Its doc read: *"`quant/quant_bf16_to_fp8.cu`'s
+// four launchers, in Rust — three ported and one deleted for having no
+// consumer in any language. It is the file the three hand-written
+// `ffi::pie_k_quant_*` arms in `bind/quant_gemm.rs` held alive; those arms
+// now call this module and `csrc/src/quant/` is gone."*
+//
+// `bind::quant_gemm` calls `x::quant` directly now, and the two geometries
+// this module carried BECAUSE no rule could state them — `<<<(ceil(k /
+// group_size), m), 128>>>` and `<<<(ceil(N / 32), ceil(M / 8)), (32, 8)>>>` —
+// are literal `Launch` values there, which is §5.1's rule that a kernel
+// fitting neither `flat` nor `per_row` writes the literal. The fourth
+// launcher is still deleted and still has no consumer in any language.
+// `rmsnorm` IS NOT HERE, and its absence is the migration.
+//
+// Its five host programs are `kernels-cuda-new/src/x/norm.rs`, beside the
+// `rmsnorm.cuh` whose `__global__`s they fire — `.wiki/kernel-x/northstar.md`
+// §5 step 5, the fifth family to cross and the one §5.1 named as the first
+// proof of `Composed`/`Walk`. Nothing was lost in the move: the
+// `RMSNORM_STRIDED_VEC8` sweep, the RASR sweep, the bit-identity measurement
+// and the `EMIT_FP16` defect all came with the fns that carry them, and
+// `norm::rmsnorm_bf16_with_fp16`'s three arms are now one `fn` body rather
+// than a `Choose` the row world could not write.
 // `rope` IS NOT HERE, and its absence is the migration.
 //
 // Its nine host programs are `kernels-cuda-new/src/x/rope.rs`, beside the
@@ -167,15 +262,19 @@ pub mod rmsnorm;
 // is, instead of a build error saying it three ways.
 #[cfg(feature = "abi")]
 pub mod launch;
-/// `moe/dsv4_routing.cu`'s one launcher, in Rust — the whole file, which is
-/// DELETED. DeepSeek-V4's hash router: expert INDICES gathered from a
-/// `[vocab, K]` checkpoint table keyed by token id, expert WEIGHTS still
-/// `sqrt(softplus(logits))` read at those indices. Classified
-/// `Execution::Walk` with `Control::Supplies` — the table and its first
-/// extent are what no `Source` names — and in `execution::RUST_SERVED`, which
-/// is what drops its shim entry. The row itself has no generated arm, because
-/// all eleven of its `table::moe` operands are unsourced.
-pub mod dsv4_routing;
+// `fire::dsv4_routing` IS GONE — §5 step 5 took `moe` into fn-world as
+// `x::moe`. It was `moe/dsv4_routing.cu`'s one launcher in Rust:
+// DeepSeek-V4's hash router, expert INDICES gathered from a `[vocab, K]`
+// checkpoint table keyed by token id, expert WEIGHTS still
+// `sqrt(softplus(logits))` read at those indices. Classified
+// `Execution::Walk` with `Control::Supplies` — the table and its first
+// extent are what no `Source` names — and its row had no generated arm,
+// because all eleven of its `table::moe` operands were unsourced.
+//
+// `x::moe::hash_route_lookup` is the host program and the symbol is a
+// `none:` arm: `Cx` cannot be asked whether the deployment renormalises its
+// top-k or by what factor it scales, which is the one thing between it and a
+// bind. `x/moe.rs`'s header states the two-line patch.
 /// `attn/kv_paged.cu`'s device-window explicit KV append and its quantised
 /// appenders — refusals that threw, a `Term::Is` over the page layout, a grid
 /// over the fire's full lane count, and the four-armed `layer.scheme` switch
@@ -206,11 +305,17 @@ pub mod dsv4_routing;
 /// [`envelope`] underneath them, so the two staging functions are live code
 /// with a caller even though their own symbols are not routed.
 pub mod kv_paged;
-/// The fused LM-head GEMV + argmax — `sample/argmax.cu`'s last launcher, and
-/// the whole of `csrc/src/sample/`. Two JIT'd kernels with a growable device
-/// scratch between them, on grids read off an occupancy query; reached
-/// through `bind::service`, so the model text sees one symbol.
-pub mod lm_head_argmax;
+/// The fused LM-head GEMV + argmax IS GONE — `sample/argmax.cu`'s last
+/// launcher, and the whole of `csrc/src/sample/`. Two JIT'd kernels with a
+/// growable device scratch between them, on grids read off an occupancy
+/// query.
+///
+/// §5 step 5 took `sample` into fn-world: the program is
+/// `kernels_cuda_new::x::sample::lm_head_gemv_argmax_int8`, beside the two
+/// declarations it fires. It is no longer reached through `bind::service`
+/// and no model text sees the symbol — the contract carries a written
+/// refusal instead, because the int8 head and its dequant scale are named
+/// weights no statement names. The `fn` is public and complete.
 pub mod lora;
 /// `attn/mla_paged.cu`'s two launchers, in Rust — the whole file, which is
 /// DELETED. The MLA prologue (`kv_a` RMSNorm, `k_pe` rotation, paged write,
@@ -221,25 +326,46 @@ pub mod lora;
 /// function that file held, `write_mla_to_pages_bf16`, had an empty consumer
 /// set on all five channels and is deleted rather than ported.
 pub mod mla_paged;
-pub mod moe;
-/// `moe/moe_dispatch.cu`'s launchers, in Rust — ALL EIGHT, and the file is
-/// DELETED. The two decode GEMVs, the MXFP4 group-scale relayout, the aligned
-/// pointer builder, the route-order scatter, the exact counting sort, the
-/// per-route expert-bias add and the weighted scatter-accumulate. The last
-/// three landed after the module header had spent a section arguing they
-/// could not: they are unit-hosted AND their `table::moe` rows are unsourced,
-/// which bars `JIT_DISPATCHED` and forced a `_dev` symbol split, but the
-/// unsourcedness is precisely what makes each a host program supplying a
-/// value — `Control::Supplies`, not a closed door. That header now carries
-/// the correction, since the same shape will come up again.
+/// `attention_mla_naive.cuh`'s two launchers, in Rust — the scalar
+/// flash-softmax MLA kernel and the tensor-core one, plus the shape predicate
+/// that chooses between them and the head-group wave-target search.
 ///
-/// `csrc/src/moe/` is left holding `flashinfer_moe.cu`, which is now an
-/// `extern "C"` INSTANTIATION SEAM and nothing else — five functions over
-/// `CutlassMoeFCRunner` and two standard headers, down from fourteen. Its
-/// 817-line host program (workspace arithmetic, arch probe, autotuner,
-/// tactic caches, dispatch) is `fire::flashinfer_moe`, which had zero
-/// `__global__` to move because it never had any.
-pub mod moe_dispatch;
+/// **These were the last two launches nvcc could reach, and the whole-tree
+/// census could not see them**: they sat in a `.cuh`, and
+/// `kernels-cuda/tests/sources.rs` counts over `.cu` and `.cpp` because device
+/// text does not launch (`new-horizon.md` §63.3). Not `RUST_SERVED` and not
+/// yet firing: their C++ callers moved down into
+/// `kernels-cuda/csrc/src/attn/attention_mla.cu`, which cannot be deleted
+/// until the OTHER arm of `attn::dispatch_attention_mla_bf16` — FlashInfer's
+/// `BatchMLAPagedAttention`, which passes `MLAParams` by value — can be fired,
+/// and that needs `ArgValue::Bytes`, which only `x::Abi` produces. The same
+/// blocker XQA has.
+pub mod mla_naive;
+// `fire::moe` IS GONE — §5 step 5 took `moe` into fn-world as `x::moe`. It
+// held the routing/gemv/finalize launchers with no doc block of their own;
+// every one of them is a host `fn` in `x/moe.rs` now, under the `csrc` root
+// that owns its `__global__`.
+// `fire::moe_dispatch` IS GONE — §5 step 5. It was `moe/moe_dispatch.cu`'s
+// launchers in Rust, ALL EIGHT: the two decode GEMVs, the MXFP4 group-scale
+// relayout, the aligned pointer builder, the route-order scatter, the exact
+// counting sort, the per-route expert-bias add and the weighted
+// scatter-accumulate. The last three landed after this module's header had
+// spent a section arguing they could not: they are unit-hosted AND their
+// `table::moe` rows are unsourced, which barred `JIT_DISPATCHED` and forced
+// a `_dev` symbol split. The `_dev` split is GONE with the port — `unit!`
+// hosts a `__global__` for the readers and a host `fn` fires it, and neither
+// needs the other's name — and the unsourcedness it was working around is
+// now what it always meant: `none:` arms, `Route::Unbound` at model load
+// with a sentence, and `Control::Supplies` still the reason.
+//
+// `csrc/src/moe/` is left holding `flashinfer_moe.cu`, which is an
+// `extern "C"` INSTANTIATION SEAM and nothing else — five functions over
+// `CutlassMoeFCRunner` and two standard headers, down from fourteen. Its
+// 817-line host program (workspace arithmetic, arch probe, autotuner,
+// tactic caches, dispatch) is `fire::flashinfer_moe`, WHICH STAYS: it had
+// zero `__global__` to move because it never had any, and
+// `moe::flashinfer_cutlass_moe_bf16` is `x::moe`'s one driver op — a
+// `contract!` with no `Entry`, the third registration shape.
 /// `attn/page_compact.cu`'s one launcher, in Rust — the whole file. Two
 /// launches on one stream, the second reading the `scratch_counts` buffer the
 /// first fills; `execution::COMPOSED` has stated that pair since the split

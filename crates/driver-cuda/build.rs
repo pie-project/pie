@@ -76,27 +76,62 @@ mod bridge {
         vec![
             kernels_cuda_new::table::attn::KERNELS,
             // `rope`'s twelve, from `x::rope::SIGS` — the same rows, derived
-            // from the `contract!` block beside the `.cuh` rather than
+            // from the `contract!` block in `x::rope` rather than
             // written out by hand. They state no `operands`, so the shim
             // emitter drops them (`abi::stated`) and the dispatch emitter
             // writes no arm for them; they are here so that this reader
             // still walks every symbol the crate declares, which is what
             // `armless` and `by_hand` below check.
             kernels_cuda_new::x::rope::SIGS,
-            kernels_cuda_new::table::norm::KERNELS,
-            kernels_cuda_new::table::mlp::KERNELS,
-            kernels_cuda_new::table::gemm::KERNELS,
+            // `norm`'s twenty-eight, from `x::norm::SIGS`, for
+            // `x::rope::SIGS`' reason above. `table::norm::KERNELS` stood
+            // here; §5 step 5 took `norm` into fn-world and deleted it. The
+            // count went 26 -> 28 in the move: `norm::add_bias_bf16` and
+            // `norm::rmsnorm_gated_fp32_in_bf16` are lowered
+            // (`model-compiler/src/lower.rs` `OpKind::AddBias` and
+            // `OpKind::RmsnormGated`) and had no ahead-of-time row, so they
+            // reached this reader through `families::norm`'s JIT rows only.
+            kernels_cuda_new::x::norm::SIGS,
+            // `mlp`'s twelve, from `x::mlp::SIGS`, for `x::rope::SIGS`'
+            // reason above.
+            kernels_cuda_new::x::mlp::SIGS,
+            // `gemm`'s twelve, from `x::gemm::SIGS`, for `x::rope::SIGS`'
+            // reason above: derived from the `contract!` block, stating no
+            // `operands`, so the shim emitter drops them and the dispatch
+            // emitter writes no arm — and they are still walked here.
+            kernels_cuda_new::x::gemm::SIGS,
             kernels_cuda_new::table::moe::KERNELS,
-            kernels_cuda_new::table::ssm::KERNELS,
-            kernels_cuda_new::table::quant::KERNELS,
-            kernels_cuda_new::table::layout::KERNELS,
-            kernels_cuda_new::table::sample::KERNELS,
-            kernels_cuda_new::table::adapter::KERNELS,
-            // The second table: launchers the driver fires with no DSL
-            // statement (envelope tier, QKV split, mask packers, cell
-            // moves). Same rows, same proof, outside the DSL-surface
-            // equality — see `kernels_cuda_new::table::driver_internal`.
-            kernels_cuda_new::table::driver_internal::DRIVER_KERNELS,
+            // `ssm`'s twenty-seven, from `x::ssm::SIGS`, for `x::rope::SIGS`'
+            // reason above. `table::ssm::KERNELS` stood here; §5 step 5 took
+            // `ssm`'s five roots into fn-world and deleted it. The count is
+            // unchanged at twenty-seven — four of them are `bind!` `none:`
+            // arms, which are contracts all the same and must still be walked
+            // or `check_plan` would stop refusing symbols they declare.
+            kernels_cuda_new::x::ssm::SIGS,
+            // `quant`'s eleven, from `x::quant::SIGS`, for `x::rope::SIGS`'
+            // reason above. The four routed MoE decode GEMVs that carry a
+            // `quant::` symbol are NOT here — their contracts are
+            // `table::moe`'s, which this list already walks, and they still
+            // state operands and still get an arm.
+            kernels_cuda_new::x::quant::SIGS,
+            // `layout`'s seven and `sample`'s one, from their `contract!`
+            // blocks, for `x::rope::SIGS`' reason above. `adapter`'s one is
+            // here for that reason and one more: it never had a `pie_k_`
+            // entry point at all — the LoRA seam is cuBLAS batched GEMMs —
+            // so it was always a row the shim emitter had to skip, and now
+            // it is a row that states no operands and is skipped by the
+            // general mechanism instead of by a special case.
+            kernels_cuda_new::x::layout::SIGS,
+            kernels_cuda_new::x::sample::SIGS,
+            kernels_cuda_new::x::adapter::SIGS,
+            // THE SECOND TABLE IS GONE. It was
+            // `kernels_cuda_new::table::driver_internal::DRIVER_KERNELS` —
+            // launchers the driver fires with no DSL statement, outside the
+            // DSL-surface equality — and §5 step 5 took its six rows to
+            // `x::driver_internal` as plain `fn`s with **no `contract!`**.
+            // There is nothing to append: no rows, and no `SIGS` either,
+            // because a family with no contract declares no signatures. The
+            // launchers are called directly and need no entry point.
         ]
     }
 
@@ -577,178 +612,103 @@ mod bridge {
         // `driver_internal.rs`, and `abi::emit_c_shim` emits one entry per
         // stated row.
         //
-        // Three variables survive the deletion because the FA2 block below
-        // uses all three.
-        let archive_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels-cuda/csrc/src");
-        let jit_headers =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels-cuda-new/csrc/src");
-        // The impersonating headers, since `csrc/` was re-cut by role: a
-        // SECOND `-iquote`, not an addition to the first. Load-bearing, not
-        // tidy — `csrc/src/pie_fp8.cuh` and `pie_half2.cuh` reach
-        // `cuda_fp16.h`/`cuda_fp8.h` by QUOTED include, and `shim/cuda_fp16.h`
-        // and `shim/cuda_bf16.h` come back the other way for
-        // `"pie_device.cuh"`. The inward direction fails loudly if a flag is
-        // missing. The outward one does not: a quoted `"cuda_fp16.h"` that
-        // misses resolves to the real toolkit header instead, `__half` stops
-        // being `device::f16`, and nothing says so —
-        // `kernels-cuda-new/src/source.rs` measures the two objects at
-        // 17,744 B and 15,088 B with no diagnostic between them.
-        let jit_shims =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels-cuda-new/csrc/shim");
-        assert!(
-            jit_shims.join("cuda_fp16.h").exists(),
-            "the impersonating headers are not at {} -- a quoted `#include \"cuda_fp16.h\"` \
-             that misses them resolves to the real toolkit header WITHOUT a diagnostic, so \
-             this stops here rather than linking two incompatible __half types",
-            jit_shims.display()
-        );
-        // The two JIT trees the targets below `-iquote` into. Cargo watches
-        // only paths a build script names, and `csrc/shim` decides what
-        // `__half` is — an edit there changes the meaning of every TU below
-        // without changing a byte cargo is looking at.
+        // THE THREE SURVIVING VARIABLES ARE GONE TOO. `archive_src`,
+        // `jit_headers` and `jit_shims` were kept past the towers' deletion
+        // with the note *"Three variables survive the deletion because the
+        // FA2 block below uses all three"*, and the FA2 block below is now
+        // deleted as well. There is no `cc::Build` left in this script, so
+        // there is no include path to name and nothing for the
+        // `jit_shims/cuda_fp16.h` assertion to protect: that assertion
+        // guarded a C++ TU from silently resolving `"cuda_fp16.h"` to the
+        // toolkit's header, and this crate compiles no C++ TU.
+        //
+        // The measurement it carried is not lost, it has moved to where the
+        // risk moved: NVRTC is what reads `csrc/shim` now, and
+        // `kernels-cuda-new`'s own build is what asserts the impersonating
+        // headers are present. `csrc/shim/cuda/cmath:245-280` in particular
+        // is the file recording that this shim's `__fast_div_modulo` is
+        // `{u32 @0, u64 @8}` align 8 against CCCL's `{u32,u32,u32,i32}`
+        // align 4, which put `paged_kv_t::num_heads` at +24 under the shim
+        // and +20 under CCCL with `sizeof` reconverging at 96.
+        //
+        // THAT HAZARD IS WHAT THIS DELETION ENDS, and it is the reason the
+        // `.cu` and this block had to go in the same pass.
+        // `kernels-cuda-new/src/fa2/params.rs` pins its mirror to the SHIM's
+        // layout, which is right for every JIT fire;
+        // `attention_flashinfer.cu` compiled against real CCCL and filled the
+        // +20 layout. Both were correct and neither could ever read the
+        // other's block — but only because nothing happened to hand one
+        // across. With the C++ gone there is exactly one layout in the
+        // process and the question cannot be asked again.
+        //
+        // The two `rerun-if-changed` lines for the JIT trees stay: this
+        // script does not compile them, but `kernels-cuda-new`'s generated
+        // dispatch and bindings are re-emitted from tables that describe
+        // them, and a source edit there still has to invalidate this crate.
         println!("cargo:rerun-if-changed=../kernels-cuda-new/csrc/src");
         println!("cargo:rerun-if-changed=../kernels-cuda-new/csrc/shim");
 
-        // THE FA2 CAPTURE DISPATCHES, moved here out of `kernels-cuda` for
-        // the towers' reason, one migration later. `new-horizon.md` §44.
+        // THE LAST `.cuda(true)` IN THIS BUILD SCRIPT WAS HERE, AND IT IS
+        // GONE. North star §5 step 7; `families/fa2.rs`' header holds the
+        // deletion list this hunk was cut against.
         //
-        // `csrc/attn/attention_flashinfer.cu` is a HOST PROGRAM: plan-cache
-        // lifetimes and four dispatches whose body is `switch (cache.head_dim)
-        // { #include "kernels.def" }`. Two of those four are the score-capture
-        // pair, and they are the rows that made `Execution` grow its fourth
-        // arm — `Execution::Walk`, host control flow whose SHAPE comes from
-        // the input. `Composed` was the near miss for the towers and it is the
-        // near miss here for the same reason: a `&'static [Step]` is a
-        // sequence fixed when that crate compiles, and an arm chosen at run
-        // time from a `kernels.def` shape is not one.
+        // WHAT WENT, item by item, because a deletion is a claim about a
+        // whole consumer set:
         //
-        // # Why this is C++ compiled here, and NOT the vendored FlashInfer
-        //   through NVRTC
+        //  * The `cc::Build` (`.cuda(true).std("c++17")`), its four include
+        //    groups, the `-gencode arch=compute_89,code=sm_89`, the
+        //    `--extended-lambda` / `--expt-relaxed-constexpr` pair, the two
+        //    `-Xcompiler=-iquote` flags, `.cargo_metadata(false)`, the
+        //    `read_dir` scan of `csrc/attn`, the `attn_units > 0` floor and
+        //    `fa2.compile("pie_attn_flashinfer")`.
+        //  * The two `DEP_PIE_KERNELS_CUDA_{FLASHINFER,CCCL}` `expect`s that
+        //    fed it.
+        //  * The hand-printed `rustc-link-search` / `rustc-link-lib=
+        //    static=pie_attn_flashinfer` pair below. Those had to be deleted
+        //    BY HAND and were not implied by dropping the `cc::Build`,
+        //    because `.cargo_metadata(false)` meant this target printed its
+        //    own link lines instead of letting `cc` do it.
+        //  * The four-point "why nvcc and not NVRTC" argument. Points 1, 3
+        //    and 4 were about `attention_flashinfer.cu` specifically and die
+        //    with it; the two that are still true about OTHER text are
+        //    repointed by name below rather than deleted, because they were
+        //    never claims about this file alone.
         //
-        // The JIT crate does carry a patched FlashInfer closure — 1.7 MB
-        // under `kernels-cuda-new/csrc/vendor/flashinfer/` — and a probe
-        // compiled `cascade.cuh` under NVRTC to 96 KB with 8 of 8 symbols
-        // resolving. That is a real measurement and it is not this one. Four
-        // things separate them:
+        // WHAT MADE IT DELETABLE: `csrc/attn/attention_flashinfer.cu` (1,258
+        // lines) and `csrc/attn/plan_lifecycle.cpp` (105) held `__global__`
+        // 0, `__device__` 0 and exactly one `<<<>>>` — `attn_score_fold_heads`
+        // launching `device::attn_score_fold_heads`, which is ours, already
+        // rowed (`attn::attn_score_fold_heads`) and already fired from Rust
+        // by `fire/attn_score.rs`. The four dispatches and the two planners
+        // are `bind::service::attn_*` and `fire::flashinfer_fa2*`; the six
+        // rows are on `kernels_cuda_new::execution::RUST_SERVED`, so
+        // `emit_c_shim` emits no forwarder for them and no `-l` has to
+        // resolve one. `plan_lifecycle.cpp`'s own header said it existed for
+        // *"a `unique_ptr` with a custom deleter"*; the replacement caches are
+        // plain Rust structs whose deleter is `Drop`. `csrc/` is now empty
+        // and gone, and the driver's `<<<>>>` census is ZERO.
         //
-        //  1. **What moved is not device text.**
-        //     `AttnHd<HD>::dispatch_decode_capture` and `::prefill_capture`
-        //     are host `cudaError_t` static member functions that build a
-        //     params struct, consult a plan and call FlashInfer's own
-        //     launcher. NVRTC compiles device text. There is no host program
-        //     for it to compile.
-        //  2. **The tree already priced the other half.**
-        //     `kernels-cuda-new/src/plan/mod.rs`: *"the only remaining reason
-        //     `driver-cuda` compiles C++ for attention is the kernels
-        //     themselves — and those are the thing NVRTC is for... §13.6
-        //     prices that separately and correctly: it is a FlashInfer patch
-        //     set plus ~39 bit-exact device intrinsics."* That price has not
-        //     been paid, and moving a host walk does not pay it.
-        //  3. **`cascade.cuh` does not generalise to `prefill.cuh`.** The
-        //     merge kernel is 791 lines with no `CTA_TILE_Q` search, no
-        //     `cudaFuncSetAttribute` shared-memory opt-in and no
-        //     mask/variant cross-product. `prefill.cuh` is 4,367.
-        //  4. **The capture variant is a TEMPLATE ARGUMENT.**
-        //     `fa2::DecodeScoreSink` and `PrefillScoreSink` are ours and hook
-        //     FlashInfer's `variants.cuh`; they are compiled INTO the
-        //     instantiation. That is exactly the "hundreds of instantiations
-        //     with no row" the `Walk` arm exists to describe, and a JIT unit
-        //     is a named cubin per row.
+        // WHAT IS STILL TRUE AND WHERE IT NOW POINTS. The old point 2 quoted
+        // `kernels-cuda-new/src/plan/mod.rs` — *"the only remaining reason
+        // `driver-cuda` compiles C++ for attention is the kernels themselves
+        // ... §13.6 prices that separately"* — and that price is exactly what
+        // `families/fa2.rs` has now paid for FA2: 56 units, 460 rows, one
+        // root, all NVRTC. It has NOT been paid for **FA3 (the SM90 Hopper
+        // prefill)** or for **MLA**, whose headers are CPM-only —
+        // `csrc/vendor` carries no `attention/hopper/` at all — so NVRTC
+        // cannot see them and `Headers::LibraryAndVendor` cannot be widened
+        // to reach them. Old point 3's *"`cascade.cuh` does not generalise to
+        // `prefill.cuh`"* survives as the same warning about those two: the
+        // FA2 port is not evidence that the next one is cheap.
         //
-        // So: nvcc, here, against the FlashInfer `kernels-cuda` already
-        // fetched and patched. Include dirs come across the `links` boundary
-        // as `DEP_PIE_KERNELS_CUDA_{FLASHINFER,CCCL}` rather than being
-        // re-derived, because a second `CPMAddPackage` is a second patch pass
-        // over the same CPM cache and a second chance to disagree.
-        //
-        // `plan_lifecycle.cpp` comes along and is not optional: it is the
-        // `extern "C" pie_x_*` caller of the plan-cache factories that the
-        // `.cu` defines. A static archive is scanned in place and this one is
-        // emitted BEFORE `libpie_kernels_cuda.a`, so a caller left behind in
-        // the kernels archive would be an undefined `make_decode_plan`.
-        let attn_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/attn");
-        println!("cargo:rerun-if-changed=csrc/attn");
-        let flashinfer_inc = std::env::var("DEP_PIE_KERNELS_CUDA_FLASHINFER").expect(
-            "`bridge` is on but kernels-cuda published no `flashinfer` include path. It \
-             comes out of `pie_kernels_cuda_paths.txt`, which CMake writes and \
-             `kernels-cuda/build.rs::read_flashinfer_paths` republishes — so this means \
-             the CMake configure did not run or the generator lost the key.",
-        );
-        let cccl_inc = std::env::var("DEP_PIE_KERNELS_CUDA_CCCL")
-            .expect("`bridge` is on but kernels-cuda published no `cccl` include path");
-        let mut fa2 = cc::Build::new();
-        fa2.cuda(true).std("c++17");
-        // `src` first, then CCCL, then FlashInfer, then the toolkit — the
-        // order `csrc/CMakeLists.txt` puts on `pie_kernels_cuda` itself, and
-        // the middle two are ordered that way on purpose: *"Ahead of anything
-        // the toolkit ships: FlashInfer needs its own vendored CCCL, and a
-        // toolkit that bundles an older one would shadow it."*
-        fa2.include(&archive_src);
-        for dir in cccl_inc.split(':').filter(|d| !d.is_empty()) {
-            fa2.include(dir);
-        }
-        for dir in flashinfer_inc.split(':').filter(|d| !d.is_empty()) {
-            fa2.include(dir);
-        }
-        fa2.include(&cuda_include)
-            // `-iquote` for the JIT tree, NOT `-I`, for the towers' reason
-            // above: `attn/attention_flashinfer_common.cuh`,
-            // `attn/attention_score_capture.cuh`,
-            // `attn/attention_flashinfer.cuh`, `attn/attention_score_post.cuh`
-            // and `pie_device.cuh` all live there. The shims wearing NVIDIA's
-            // filenames live one directory over since the role cut, and are
-            // reached the same way — see `jit_shims` above for why leaving
-            // the second line out is silent rather than loud.
-            .flag(&format!("-Xcompiler=-iquote,{}", jit_headers.display()))
-            .flag(&format!("-Xcompiler=-iquote,{}", jit_shims.display()))
-            .flag("-gencode")
-            .flag("arch=compute_89,code=sm_89")
-            // The archive's own two, `csrc/CMakeLists.txt:612-613`. FlashInfer
-            // does not compile without them.
-            .flag("--extended-lambda")
-            .flag("--expt-relaxed-constexpr")
-            .cargo_metadata(false)
-            .warnings(false);
-        let attn_listing = std::fs::read_dir(&attn_dir).unwrap_or_else(|e| {
-            panic!(
-                "{attn_dir:?} does not read ({e}), and the `-l static=pie_attn_flashinfer` \
-                 below names its archive unconditionally. The FA2 dispatches moved here out \
-                 of `kernels-cuda`; if that move is being reverted, the `-l` goes with the \
-                 directory."
-            )
-        });
-        let mut attn_units = 0usize;
-        for entry in attn_listing {
-            let path = entry.expect("csrc/attn entry").path();
-            match path.extension().and_then(|e| e.to_str()) {
-                Some("cu") | Some("cpp") => {
-                    fa2.file(&path);
-                    attn_units += 1;
-                }
-                _ => {}
-            }
-        }
-        // A floor on the scan, for the reason 1832b170f argues: zero
-        // translation units still produces a `libpie_attn_flashinfer.a`,
-        // still satisfies the `-l`, and defines nothing — and the failure
-        // surfaces at the final link as undefined
-        // `kernels::attn::dispatch_attention_flashinfer_*` twenty at a time
-        // under `--error-limit=20`, attached to whatever test target happened
-        // to link first. A count is the only thing between those two
-        // readings. The floor is 1 and not a literal file count,
-        // deliberately: a literal would be a second place to edit every time
-        // a unit is split or deleted, and a stale floor fails the build for a
-        // file that was correctly removed. What is not allowed to be true is
-        // that the scan found NOTHING and said so by succeeding.
-        assert!(
-            attn_units > 0,
-            "{attn_dir:?} holds no .cu or .cpp, so `pie_attn_flashinfer` would be an empty \
-             archive that the `-l` below still names, and every \
-             `kernels::attn::*flashinfer*` the launch shim forwards into would be undefined \
-             at the final link."
-        );
-        fa2.compile("pie_attn_flashinfer");
-        let attn_out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+        // The sm_89-only `gencode` and its named regression against the
+        // archive build are NOT lost with this hunk. They are recorded in
+        // `fire/flashinfer_fa2.rs`' header, together with the reason the
+        // deletion RECOVERS the coverage rather than merely dropping the
+        // claim: NVRTC compiles for the device it is loaded on, so a machine
+        // that is not sm_89 stops being excluded. §44.7's rule — every sm_90
+        // claim in this migration is argued from the call graph and none from
+        // a run — is recorded in the same place and still binds.
 
         // THE SHIM, which is what `rust_dispatch.rs` above actually calls.
         //
@@ -793,19 +753,25 @@ mod bridge {
         println!("cargo:rustc-link-search=native={}", shim_dir.display());
         println!("cargo:rustc-link-lib=static=pie_launch_shim");
 
-        // ...and the FA2 capture dispatches immediately after it, before the
-        // kernel archive. `libpie_vision_towers.a` used to sit between the
-        // two; it is gone with `csrc/vision/`, and so is the third edge that
-        // ordered it (`tower -> kernels::attn::*` FlashInfer wrappers). The
-        // Rust tower calls those wrappers through the generated bindings
-        // instead, which land in the shim's own dependency order. Two edges
-        // remain, in this order:
+        // `libpie_attn_flashinfer.a` USED TO BE NAMED HERE, immediately after
+        // the shim and before the kernel archive, by a hand-printed
+        // `rustc-link-search` / `rustc-link-lib=static=pie_attn_flashinfer`
+        // pair. Both lines are deleted with the `cc::Build` that produced the
+        // archive — and they had to be deleted explicitly, because that
+        // target set `.cargo_metadata(false)` and printed its own directives
+        // rather than letting `cc` emit them.
         //
-        //   shim  -> `kernels::attn::dispatch_attention_flashinfer_*`  (here)
-        //   here  -> `AttnHd<HD>::*`, instantiated by the four
-        //            `attention_flashinfer_hd<N>.cu` units             (archive)
-        println!("cargo:rustc-link-search=native={}", attn_out.display());
-        println!("cargo:rustc-link-lib=static=pie_attn_flashinfer");
+        // The edge they ordered is gone rather than reordered. It was:
+        //
+        //   shim  -> `kernels::attn::dispatch_attention_flashinfer_*`
+        //   there -> `AttnHd<HD>::*`, instantiated by the four
+        //            `attention_flashinfer_hd<N>.cu` units       (archive)
+        //
+        // The six FlashInfer FA2 rows are on `execution::RUST_SERVED`, so
+        // `emit_c_shim` no longer emits the forwarders that were the first
+        // edge's tail, and there is nothing left to name the second edge's
+        // head. `every_call_resolves_in_the_shim` above checks only the calls
+        // the GENERATED dispatch makes, so it is satisfied by the same fact.
 
         // The kernels archive the shim forwards into. Search paths come from
         // `kernels-cuda`'s own build script (the `native` feature this

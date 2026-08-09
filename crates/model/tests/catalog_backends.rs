@@ -53,6 +53,8 @@ use model_compiler::trace::FireClass;
 const BINDING: MetalBinding = MetalBinding {
     quant_group: 64,
     quant_bits: 4,
+    router_quant_group: 0,
+    router_quant_bits: 0,
     moe_mxfp4: false,
     fuse_residual_gemv: true,
     paged_multi_batch: true,
@@ -193,8 +195,9 @@ fn every_row_either_traces_metal_or_refuses_it_in_words() {
 /// and `sdpa_paged.metal` instantiates 64, 128, 256 and 512, so the
 /// text would name a symbol no shader defines. CUDA pads to 128 and
 /// strips; Metal has no pad in the text. `gemma-4-26b-a4b` is a listed
-/// row that refuses because it has no text on ANY backend — the build
-/// has no routed-expert gemma-4 block, and it says the same to CUDA.
+/// row that refuses on ANY backend — the build cannot LOAD a routed
+/// gemma-4 block, and it says the same to CUDA. (The refusal used to
+/// say the text was missing. It is written; see `Gemma4::untraced`.)
 /// Neither is a generation losing Metal, and an equality cannot say so.
 ///
 /// So the two directions are stated separately, and the second is the
@@ -297,9 +300,9 @@ fn the_rows_that_serve_metal_are_the_llama_like_ones() {
 ///   * The shared door refuses by [`NO_METAL_ROUTED_ENCODING`].
 ///     `qwen3-30b-a3b` and `qwen3-235b-a22b` are the rows that say so.
 ///   * gemma-4's door never gets the question. `gemma-4-26b-a4b` is
-///     refused EARLIER and by its own text — this build has no
-///     routed-expert text for a gemma-4 block — so its only routed row
-///     stops before any binding is consulted.
+///     refused EARLIER and by its own text — this build cannot load
+///     a routed gemma-4 block — so its only routed row stops before
+///     any binding is consulted.
 ///
 /// The first draft of this test asserted that gemma-4's door produced
 /// the routed refusal, on the assumption that a routed gemma-4 reached
@@ -322,6 +325,8 @@ fn no_door_serves_a_routed_bank_at_an_unstamped_point() {
     let unstamped = MetalBinding {
         quant_group: 128,
         quant_bits: 4,
+        router_quant_group: 0,
+        router_quant_bits: 0,
         moe_mxfp4: false,
         ..BINDING
     };
@@ -404,12 +409,16 @@ fn a_row_answers_the_same_way_at_every_encoding() {
         MetalBinding {
             quant_group: 32,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: true,
             ..BINDING
         },
         MetalBinding {
             quant_group: 128,
             quant_bits: 8,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             ..BINDING
         },
@@ -460,6 +469,8 @@ fn two_encodings_of_one_row_state_the_same_program() {
     let eight = MetalBinding {
         quant_group: 128,
         quant_bits: 8,
+        router_quant_group: 0,
+        router_quant_bits: 0,
         ..BINDING
     };
     let mut compared = 0usize;

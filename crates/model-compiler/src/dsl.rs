@@ -1979,6 +1979,25 @@ pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {
 pub mod metal {
     use super::*;
 
+    /// The tile the sort rounds each expert's run up to.
+    ///
+    /// ONE, because the only routed projection this backend states is a
+    /// MATVEC: `qmv_routed` reads one row per thread block and indexes the
+    /// bank by that row's own expert, so grouping the rows buys locality
+    /// and nothing about a tile. At one, `moe_aligned_rows` is exactly the
+    /// route count and the sort is a pure permutation — no padding rows to
+    /// zero, no spare tiles, and `tile_expert` is one entry per row.
+    ///
+    /// It was `QMM_TILE`-shaped (sixteen) by inheritance
+    /// from a tiled matmul this text does not launch, which padded a
+    /// four-token fire's sixteen routes out to two hundred and fifty-six
+    /// rows — sixteen times the matvec work, and every padded row read by
+    /// the expert projection.
+    ///
+    /// A blocked path would state its own block here, and would then need
+    /// an extent for `tile_expert` that divides by it.
+    const ROUTE_BLOCK: u32 = 1;
+
     fn record(
         t: &Trace,
         layer: Option<u32>,
@@ -2028,6 +2047,39 @@ pub mod metal {
             layer,
         })
     }
+
+    /// [`with_params`], plus the scalars whose value is an extent the FIRE
+    /// decides -- see [`crate::trace::OpKind::Launch::param_extents`].
+    #[allow(clippy::too_many_arguments)]
+    fn with_extents(
+        t: &Trace,
+        layer: Option<u32>,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        params: Vec<u32>,
+        param_extents: Vec<(u8, Shape)>,
+        inputs: Vec<crate::trace::ValueId>,
+        out: Option<(Shape, DType)>,
+    ) -> Option<Val> {
+        let ids = t.with(layer, |b| {
+            b.launch_with_extents(
+                kernel,
+                weights,
+                state,
+                params,
+                param_extents,
+                inputs,
+                out.into_iter().collect(),
+            )
+        });
+        ids.first().map(|&id| Val {
+            t: t.clone(),
+            id,
+            layer,
+        })
+    }
+
 
     fn kv_state(kv: &Kv) -> Option<StateRef> {
         Some(StateRef {
@@ -3026,40 +3078,61 @@ pub mod metal {
     /// FOUR outputs, and a text that named fewer would leave the combine
     /// reading whatever was in the buffer: the permutation, the per-row
     /// expert, the per-tile expert, and the inverse the combine reads back.
+    ///
+    /// # Two numbers, and neither is a constant
+    ///
+    /// `n` is the count of `(token, slot)` PAIRS the router chose, and
+    /// `padded` is the height of the SORTED STACK those pairs land in —
+    /// each touched expert's run rounded up to a whole tile. Both are
+    /// functions of the fire, so both ride [`OpKind::Launch::param_extents`]
+    /// and the constants written beside them are zero.
+    ///
+    /// They were one number, `n_experts * experts_per_token`, which is
+    /// neither: it is a property of the deployment. See
+    /// [`OpKind::Launch::param_extents`] for what that measured as.
     pub fn route_sort(
         expert_ids: &Val,
         n_experts: u32,
         experts_per_token: u32,
-        tile_rows: u32,
-        padded: u32,
         width: u32,
     ) -> (Val, Val, Val, Val) {
-        let pad = Dim::Const(padded);
+        let pairs = Shape(vec![Dim::Tokens, Dim::Const(experts_per_token)]);
+        let stack = Shape(vec![Dim::MoeAlignedRoutes {
+            top_k: experts_per_token,
+            experts: n_experts,
+            block: ROUTE_BLOCK,
+        }]);
         let ids = expert_ids.t.with(expert_ids.layer, |b| {
-            b.launch_with_params(
+            b.launch_with_extents(
                 "route_sort",
                 vec![],
                 None,
                 // `MoeRouteParams`, packed and SHARED with the gather so the
                 // sort's padding and the gather's bounds cannot disagree.
                 vec![
-                    padded,
+                    0,
                     n_experts,
                     experts_per_token,
-                    tile_rows,
-                    padded,
+                    ROUTE_BLOCK,
+                    0,
                     width,
                     width,
                 ],
+                vec![(0, pairs.clone()), (4, stack.clone())],
                 vec![expert_ids.id],
                 vec![
-                    (Shape(vec![pad]), DType::I32),
-                    (Shape(vec![pad]), DType::I32),
-                    (
-                        Shape(vec![Dim::Const(padded.div_ceil(tile_rows.max(1)))]),
-                        DType::I32,
-                    ),
-                    (Shape(vec![pad]), DType::I32),
+                    (stack.clone(), DType::I32),
+                    (stack.clone(), DType::I32),
+                    // One entry per TILE, and at [`ROUTE_BLOCK`] a tile is a
+                    // row -- so the stack's own extent is exact rather than
+                    // an upper bound. A blocked path would state its block
+                    // here and need an extent that divides by it.
+                    (stack.clone(), DType::I32),
+                    // Indexed by PAIR, not by position: `inv[i]` is where
+                    // pair `i` landed. `combine_sorted` reads it at
+                    // `token * k + slot`, which is why it is not the stack's
+                    // shape even when the two happen to be the same size.
+                    (pairs, DType::I32),
                 ],
             )
         });
@@ -3072,36 +3145,43 @@ pub mod metal {
     }
 
     /// `moe/route.metal::route_gather` — the rows, in expert order.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// One output row per sorted position, which is what the row's
+    /// [`kernels::KernelSig::rows_param`] tells the driver: this statement's
+    /// row axis is the stack, not the fire.
     pub fn route_gather(
         x: &Val,
         perm: &Val,
         n_experts: u32,
         experts_per_token: u32,
-        tile_rows: u32,
-        padded: u32,
         width: u32,
     ) -> Val {
-        with_params(
+        let stack = Dim::MoeAlignedRoutes {
+            top_k: experts_per_token,
+            experts: n_experts,
+            block: ROUTE_BLOCK,
+        };
+        with_extents(
             &x.t,
             x.layer,
             "route_gather",
             vec![],
             None,
             vec![
-                padded,
+                0,
                 n_experts,
                 experts_per_token,
-                tile_rows,
-                padded,
+                ROUTE_BLOCK,
+                0,
                 width,
                 width,
             ],
+            vec![
+                (0, Shape(vec![Dim::Tokens, Dim::Const(experts_per_token)])),
+                (4, Shape(vec![stack])),
+            ],
             vec![x.id, perm.id],
-            Some((
-                Shape(vec![Dim::Const(padded), Dim::Const(width)]),
-                DType::BF16,
-            )),
+            Some((Shape(vec![stack, Dim::Const(width)]), DType::BF16)),
         )
         .expect("the gather produces its rows")
     }
@@ -3110,11 +3190,13 @@ pub mod metal {
     ///
     /// `sel = row * slots_per_row + slot`, which is why the launch's row and
     /// slot axes are not interchangeable and why `slots_per_row` is stated.
+    #[allow(clippy::too_many_arguments)]
     pub fn routed_qmv(
         x: &Val,
-        expert_ids: &Val,
+        row_expert: &Val,
         w: &MatW,
         experts_per_token: u32,
+        in_vec: u32,
         biased: bool,
         bits: u32,
     ) -> Val {
@@ -3128,6 +3210,8 @@ pub mod metal {
         // `mlx-community/gpt-oss-20b-MXFP4-Q4` is not: its `quantization`
         // block lists 98 tensors as `affine/64/4` and leaves the expert banks
         // OUT, so they take the top-level default -- `mxfp4`, group **32**.
+        // The block has 122 entries; the 24 unaccounted for are the
+        // `mlp.router` gates at 64/**8**, a third format in the same file.
         // Dequantising that as affine-64 reads every scale from the wrong
         // offset, and bf16 garbage is NaN more often than not. The fire ran,
         // bound everything, and produced 909,207 NaNs starting at the first
@@ -3191,16 +3275,50 @@ pub mod metal {
         if matches!(w.repr, WeightRepr::Mxfp4Marlin) || biased {
             weights.push(format!("{}.bias", w.name));
         }
-        let in_w = in_width(x);
+        // `sel = tid.x * slots_per_row + tid.z` is a SORTED POSITION, so the
+        // second operand is the sort's `row_expert` -- "the expert p reads,
+        // for the matvec path", in `route_sort`'s own words -- and not the
+        // router's `[Tokens, k]` choice. Given the latter the kernel read
+        // `ids[sel]` where `sel` ranges over the stack, which agrees with the
+        // routing only where the sort happened to be the identity.
+        //
+        // The two strides say the same thing about the INPUT. Every sorted
+        // row has its own activation, at `sel * in_vec`, and `sel` arrives
+        // factored as `(tid.x, tid.z)` -- so a row is `k` slots wide and a
+        // slot is one. `x_slot_stride` was zero, which is the kernel's own
+        // documented hazard: "reading slot 0 for every expert is not a crash
+        // -- it is four copies of the first expert's activation, which
+        // survives all the way to a plausible wrong token."
+        //
+        // `in_vec` is STATED rather than read off `x`'s trailing dim,
+        // because that dim is a whole token's `k` runs end to end and this
+        // number is one run. The caller knows which projection it is asking
+        // for; the shape cannot say.
         with_params(
             &x.t,
             w.layer,
             sym,
             weights,
             None,
-            vec![in_w, w.width, 0, in_w, experts_per_token],
-            vec![x.id, expert_ids.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+            vec![
+                in_vec,
+                w.width,
+                in_vec,
+                in_vec * experts_per_token,
+                experts_per_token,
+            ],
+            vec![x.id, row_expert.id],
+            // `k` results per token, end to end. The row axis of the MATVEC
+            // is `w.width` alone and the row states so (`grid_param`); this
+            // width is what the ELEMENTWISE activation between two of these
+            // has to cover, and an elementwise grid is `width * rows`.
+            Some((
+                Shape(vec![
+                    Dim::Tokens,
+                    Dim::Const(w.width * experts_per_token.max(1)),
+                ]),
+                DType::BF16,
+            )),
         )
         .expect("a routed projection produces its value")
     }
@@ -7829,6 +7947,7 @@ mod seam_tests {
             weights: vec![],
             state: None,
             params: vec![],
+            param_extents: vec![],
         }
     }
 

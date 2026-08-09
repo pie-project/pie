@@ -836,7 +836,7 @@ pub enum Ty {
     Dtype,
     /// `attn::device::KvScheme` — which quantisation a paged KV bank is
     /// stored under (`enum class … : ::std::uint8_t`,
-    /// `attn/attention_naive_paged.cuh:141`).
+    /// `attn/attention_naive_paged.cuh:187`).
     ///
     /// `naive_paged_attn` and `naive_paged_decode` take it BY VALUE, so a
     /// row that could not spell it could not be a row at all. Its own kind
@@ -859,7 +859,7 @@ pub enum Ty {
     KvScheme,
     /// `attn::device::KvDType` — which element type a paged KV bank stores
     /// (`enum class … : ::std::uint8_t`,
-    /// `attn/attention_naive_paged.cuh:152`). See [`Ty::KvScheme`], whose
+    /// `attn/attention_naive_paged.cuh:198`). See [`Ty::KvScheme`], whose
     /// parameter it follows in both kernels.
     ///
     /// Not [`Ty::Dtype`], which is `::pie_cuda_driver::DType` — a different
@@ -1962,6 +1962,30 @@ pub struct KernelSig {
     ///
     /// `Some(i)` means *"count my heads by the statement's param `i`"*.
     pub heads_param: Option<u8>,
+    /// Where this row's ROW COUNT is stated, when the fire's is not it.
+    ///
+    /// The fourth of the family, and the one that admits a statement may
+    /// have a row axis the FIRE does not spell. A launch's rows are the
+    /// fire's row window at every rectangle whose rows are tokens — which
+    /// is nearly all of them, and why the other three came first.
+    ///
+    /// A mixture's SORTED stack is the exception. `route_sort` groups the
+    /// fire's `(token, expert-slot)` pairs by expert, so everything after
+    /// it — the gather, and a tiled matmul over the grouped rows — has one
+    /// row per ROUTE, and there are `tokens * experts_per_token` of those.
+    /// `route_gather` bounds itself at that number and zeroes every row it
+    /// reaches; given the fire's token count instead it launched over a
+    /// quarter of its own output at `top_k = 4` and left the rest whatever
+    /// the arena held, which in bf16 is `inf` more often than it is small.
+    ///
+    /// It cannot be a rule, because the rule is SHARED: `route_gather` and
+    /// `combine_sorted` are both [`LaunchRule::RouteRows`] and their row
+    /// extents are the two different things — the sorted stack and the
+    /// token-major output it collapses back to. The row is what tells them
+    /// apart.
+    ///
+    /// `Some(i)` means *"my rows are the statement's param `i`"*.
+    pub rows_param: Option<u8>,
 }
 
 impl KernelSig {
@@ -2095,6 +2119,7 @@ macro_rules! kernel {
                 grid_param: None,
                 head_param: None,
                 heads_param: None,
+                rows_param: None,
                 lowered_as: None,
             }
         }

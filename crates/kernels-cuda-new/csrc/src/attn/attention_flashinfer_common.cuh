@@ -51,7 +51,31 @@
 
 #include "cuda_check.hpp"
 #include "kernels_manifest.hpp"
-#include "attn/kv_paged.hpp"
+// `#include "attn/kv_paged.hpp"` WAS HERE AND IS DELETED, WITH THE HEADER.
+//
+// It was the ONLY non-comment includer of that header anywhere in either
+// `csrc` tree, and it used nothing from it. Measured before the deletion:
+// this file names `dequant_kv_cache_layer_to_bf16_active` zero times (it was
+// the header's one and only declaration), and names `KvCacheLayerView`,
+// `KvCacheScheme` and `kv_cache_view` zero times each -- so neither the
+// declaration nor the `attn/kv_cache_view.hpp` the header pulled in
+// transitively was reachable from here. The four translation units that
+// include THIS file -- `attn/attention_flashinfer_hd{64,128,256,512}.cu` --
+// include nothing else and name those three types zero times as well, so the
+// transitive path dies here and not one line downstream of it.
+//
+// The header went because `attn/kv_paged.cu`, its only definition site, is
+// deleted: its `dequant_kv_cache_layer_to_bf16_active` was the last
+// `<<<>>>` in the tree, and the symbol is now served in Rust by
+// `driver-cuda/src/fire/kv_paged.rs` through `execution::RUST_SERVED`. A
+// declaration whose definition has left the build is a link error waiting
+// for its first caller, which is why this line goes rather than staying as
+// a harmless-looking include.
+//
+// `attn/kv_cache_view.hpp` ITSELF IS NOT DELETED and must not be: it still
+// has two archive includers, `attn/attention_flashinfer.hpp:13` and
+// `attn/attention_naive_paged.cu:48`, and the second of those is
+// `xqa-nvrtc`'s.
 #include "attn/attention_flashinfer_hopper.hpp"
 #include "attn/attention_score_capture.cuh"
 

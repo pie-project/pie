@@ -2328,6 +2328,1246 @@ pub mod routing {
     }
 }
 
+/// `GemmKernel::Params` for the sm90 pointer-array grouped GEMM, mirrored in
+/// Rust from a measurement rather than from a transcription.
+///
+/// # Why this exists
+///
+/// The CUTLASS grouped GEMM is launched as
+/// `cudaLaunchKernelExC(&config, kernel, params)` where `kernel` is
+/// `(void const*) cutlass::device_kernel<GemmKernel>` — a *host* function
+/// pointer that exists only because nvcc compiled the `__global__` into the
+/// host translation unit. Under NVRTC that pointer becomes a `CUfunction`
+/// from `nvrtcGetLoweredName`, which is a strictly better object: it is
+/// named, it is resolvable at run time, and it does not require the host
+/// compiler to have seen device code.
+///
+/// What does *not* come for free is `params`. It is a single by-value struct,
+/// 832 bytes on the default epilogue and 1408 on the FINALIZE scatter
+/// epilogue, built on the host by `GemmUniversalAdapter::initialize` →
+/// `GemmKernel::to_underlying_arguments`. To launch from Rust the host has to
+/// fill that struct, and to fill it the host has to know its layout.
+///
+/// # How the layout was obtained
+///
+/// Not by reading the C++ declarations and adding up field sizes. CuTe
+/// compresses empty types out of tuples, `FastDivmodU64` and
+/// `FastDivmodU64Pow2` are different sizes, and the alignment of the mainloop
+/// is raised to 64 by the TMA descriptors it carries — three independent ways
+/// for a transcription to be wrong while looking right.
+///
+/// Instead the offsets were *measured* under NVRTC with the technique in
+/// `nvrtc-probes/params_layout.py`: `offsetof` and `__builtin_offsetof` are
+/// both unavailable under NVRTC, and every other constant-expression route is
+/// rejected, but this survives —
+///
+/// ```text
+/// __constant__ unsigned OFF[] = {
+///   (unsigned)((char*)&((P*)0)->field - (char*)(P*)0), ..., sizeof(P), alignof(P)
+/// };
+/// ```
+///
+/// — because the initialiser is emitted verbatim into the PTX as
+/// `.b8 OFF[N] = {..}` and can be read back out with a regex and a
+/// little-endian decode. Probes `C13` (default epilogue), `C14` (FINALIZE)
+/// and `C15` (nested interiors) are preserved in `nvrtc-probes/`. Every
+/// number below has a `const _: () = assert!(offset_of!(..) == ..)` beside
+/// it, so a mirror that drifts from the measurement fails to compile.
+///
+/// # The hazard these assertions do not cover
+///
+/// `new-horizon.md` §62.12: the FA2 probe measured the *shim's*
+/// `uint_fastdiv`, not CCCL's, and the two disagree on interior offsets while
+/// agreeing on `sizeof`. "Sizes match, therefore layouts match" has now been
+/// believed twice in this tree and was wrong both times.
+///
+/// The structures here are safer than that case — `FastDivmodU64` is
+/// CUTLASS's own (`cutlass/fast_math.h`), not CCCL's, so the probe and the
+/// kernel read the same declaration. But the general rule stands and has a
+/// live instance: while the `pie_flashinfer_cutlass_moe` CMake target still
+/// exists it compiles the same headers against real CCCL, so two layouts for
+/// the same logical struct coexist in the tree. **They must never share a
+/// filled struct.** The target's removal is what retires this hazard, and
+/// until then nothing in this module may be handed to the `extern "C"` seam.
+///
+/// # Status
+///
+/// The layout is measured and mirrored. The *filling* of it —
+/// `to_underlying_arguments`, which is where `cuTensorMapEncodeTiled` builds
+/// the two `CUtensorMap`s — is described in [`to_underlying_arguments`] and
+/// is deliberately not implemented; see that function's documentation for
+/// exactly what is known and what is not.
+pub mod params {
+    /// A TMA copy atom as it appears inside `CollectiveMainloop::Params`.
+    ///
+    /// 192 bytes, 64-aligned. The `CUtensorMap` that
+    /// `cuTensorMapEncodeTiled` writes is 128 of those bytes; the remaining
+    /// 64 are the CuTe copy atom's own layout state, which is *not* opaque
+    /// but has not been decomposed here because nothing yet needs to write
+    /// it field by field. Treated as bytes deliberately: a `CUtensorMap` is
+    /// documented as opaque and crosses to the kernel by value, which is
+    /// what `ArgValue`'s byte-buffer variant exists for.
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy)]
+    pub struct TmaCopyAtom {
+        /// The `CUtensorMap` itself, at offset [`TENSORMAP_OFFSET`] — zero,
+        /// measured. This is the 128 bytes `cuTensorMapEncodeTiled` writes.
+        pub desc: TmaDescriptor,
+        /// `Copy_Traits::aux_params_` — CuTe's `AuxTmaParams`, holding the
+        /// gmem basis stride, the TMA gbasis layout reference and the
+        /// swizzle. Every one of those is an *empty* type carrying its value
+        /// in its type, so these 64 bytes are the references' storage and not
+        /// state the host has to compute; the values themselves are in
+        /// [`ENCODE_A`]. Left as bytes because writing them would be writing
+        /// the addresses of C++ statics that do not exist in this process.
+        pub aux: [u8; 64],
+    }
+
+    impl Default for TmaCopyAtom {
+        fn default() -> Self {
+            Self { desc: TmaDescriptor::default(), aux: [0u8; 64] }
+        }
+    }
+
+    const _: () = assert!(core::mem::offset_of!(TmaCopyAtom, desc) == 0);
+    const _: () = assert!(core::mem::offset_of!(TmaCopyAtom, aux) == 128);
+    const _: () = assert!(core::mem::size_of::<TmaCopyAtom>() == 192);
+    const _: () = assert!(core::mem::align_of::<TmaCopyAtom>() == 64);
+
+    /// The byte offset of the `CUtensorMap` inside a [`TmaCopyAtom`]: **zero**.
+    ///
+    /// Measured, not assumed. Probe `T5`. The direct expression
+    /// `(char*)&((Atom*)0)->tma_desc_ - (char*)(Atom*)0` is useless as a
+    /// measurement because an all-zero `__constant__` initialiser is emitted
+    /// by NVRTC as a bare `.b8 V[8];` with no `= {...}` — a zero reads
+    /// identically to "the probe did not fire", which is the one value a
+    /// probe must never be unable to distinguish.
+    ///
+    /// So it was measured *positively* instead, by the neighbour:
+    ///
+    /// ```text
+    /// aux_params_ offset in atom  = 128
+    /// sizeof(cute::TmaDescriptor) = 128
+    /// sizeof(atom)                = 192
+    /// ```
+    ///
+    /// `Copy_Traits<SM90_TMA_LOAD, …>` declares `TmaDescriptor tma_desc_;`
+    /// immediately followed by `AuxParams aux_params_;`, and `TiledCopy` and
+    /// `Copy_Atom` are empty bases. A 128-byte member whose successor begins
+    /// at exactly 128 begins at exactly 0. The remaining 64 bytes are
+    /// `aux_params_` — the CuTe basis and swizzle the atom carries alongside
+    /// the descriptor.
+    pub const TENSORMAP_OFFSET: usize = 0;
+
+    /// `cute::TmaDescriptor`, i.e. `CUtensorMap`.
+    ///
+    /// Measured: `sizeof = 128`, `alignof = 64`. Opaque by contract — the
+    /// driver documents no field layout and reserves the right to change it,
+    /// so this is bytes on purpose rather than for want of a probe.
+    ///
+    /// `cudarc` 0.19.8 does **not** bind this type in `driver::sys`; the only
+    /// occurrences of the name in the crate are CUPTI callback identifiers.
+    /// So it is declared here.
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy)]
+    pub struct TmaDescriptor(pub [u8; 128]);
+
+    impl Default for TmaDescriptor {
+        fn default() -> Self {
+            Self([0u8; 128])
+        }
+    }
+
+    const _: () = assert!(core::mem::size_of::<TmaDescriptor>() == 128);
+    const _: () = assert!(core::mem::align_of::<TmaDescriptor>() == 64);
+    const _: () = assert!(TENSORMAP_OFFSET == 0);
+
+    /// `CUtensorMapDataType`. Only the variants this path can produce.
+    ///
+    /// **`Uint16` is the one bf16 uses, not `Bfloat16`.** CUTLASS recasts the
+    /// operand to `TmaInternalElementA = uint_bit_t<sizeof_bits_v<ElementA>>`
+    /// before building the descriptor, and probe `T2` reads the atom's value
+    /// type back as `unsigned short`. TMA is a byte mover; the float variants
+    /// exist only for out-of-bounds fill, and this path uses
+    /// [`OobFill::None`]. A transcription would have written `Bfloat16` here
+    /// and been wrong in a way no compile could catch.
+    #[repr(u32)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum TensorMapDataType {
+        /// `CU_TENSOR_MAP_DATA_TYPE_UINT8`.
+        Uint8 = 0,
+        /// `CU_TENSOR_MAP_DATA_TYPE_UINT16` — what bf16 and fp16 both use.
+        Uint16 = 1,
+        /// `CU_TENSOR_MAP_DATA_TYPE_UINT32`.
+        Uint32 = 2,
+        /// `CU_TENSOR_MAP_DATA_TYPE_BFLOAT16`. Present for completeness; see
+        /// the type's own documentation for why this path does not use it.
+        Bfloat16 = 9,
+    }
+
+    /// `CUtensorMapSwizzle`.
+    #[repr(u32)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum TensorMapSwizzle {
+        /// No swizzle.
+        None = 0,
+        /// 32-byte swizzle.
+        B32 = 1,
+        /// 64-byte swizzle.
+        B64 = 2,
+        /// 128-byte swizzle — what `cute::Swizzle<3,4,3>` maps to.
+        B128 = 3,
+    }
+
+    /// `CUtensorMapInterleave`.
+    #[repr(u32)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Interleave {
+        /// `CU_TENSOR_MAP_INTERLEAVE_NONE` — the only one CuTe emits.
+        None = 0,
+    }
+
+    /// `CUtensorMapL2promotion`.
+    #[repr(u32)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum L2Promotion {
+        /// No promotion.
+        None = 0,
+        /// 64-byte promotion.
+        B64 = 1,
+        /// 128-byte promotion — hard-coded by `make_tma_copy_desc`.
+        B128 = 2,
+    }
+
+    /// `CUtensorMapFloatOOBfill`.
+    #[repr(u32)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum OobFill {
+        /// `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE` — hard-coded by
+        /// `make_tma_copy_desc`.
+        None = 0,
+    }
+
+    /// The compile-time half of one operand's `cuTensorMapEncodeTiled` call.
+    ///
+    /// This is the *whole* of what "port CuTe" was thought to require. It is
+    /// thirteen integers, and every one of them was read off the atom's own
+    /// type name, which NVRTC prints in full when asked to complete an
+    /// undefined `PieShow<T>`:
+    ///
+    /// ```text
+    /// cute::TiledCopy<cute::Copy_Atom<cute::Copy_Traits<
+    ///     cute::SM90_TMA_LOAD,
+    ///     cute::C<131072>,                          <- NumBitsPerTMA
+    ///     cute::AuxTmaParams<
+    ///       cute::tuple<ScaledBasis<C<1>,1>, ScaledBasis<C<1>,0>, C<0>>,
+    ///       const cute::Layout<tuple<C<64>, C<128>>, …> &,   <- tma_gbasis
+    ///       const cute::Swizzle<3,4,3> &>>,                  <- swizzle
+    ///   unsigned short>, …>                                  <- TmaInternalType
+    /// ```
+    ///
+    /// `tma_dim` is `rank(tma_gbasis)`; `box_shape` is its extents;
+    /// `box_stride` is `{1,1,1,1,1}` because `make_tma_copy_desc` initialises
+    /// it so and never writes it again. `Swizzle<3,4,3>` has `B = 3`, which
+    /// `get_tma_swizzle_bits` maps to `SmemSwizzleBits::B128`, and `M = 4`,
+    /// which maps to `SmemSwizzleBase::SWIZZLE_BASE_16B`; that pair is
+    /// [`TensorMapSwizzle::B128`].
+    #[derive(Clone, Copy, Debug)]
+    pub struct TmaEncodeConfig {
+        /// `tensorDataType`.
+        pub data_type: TensorMapDataType,
+        /// `tensorRank` — `rank(tma_gbasis)`.
+        pub rank: u32,
+        /// `boxDim`, the shared-memory box in elements.
+        pub box_shape: [u32; 5],
+        /// `elementStrides`. Always all-ones on this path.
+        pub box_stride: [u32; 5],
+        /// `interleave`.
+        pub interleave: Interleave,
+        /// `swizzle`.
+        pub swizzle: TensorMapSwizzle,
+        /// `l2Promotion`.
+        pub l2_promotion: L2Promotion,
+        /// `oobFill`.
+        pub oob_fill: OobFill,
+        /// Bits moved per TMA instruction — `NumBitsPerTMA`. Not an encode
+        /// argument; it is what [`MainloopParams::tma_transaction_bytes`] is
+        /// computed from, and it is carried here because it comes from the
+        /// same type name and the two must not drift apart.
+        pub bits_per_tma: u32,
+        /// Which global mode each TMA mode reads, from `stride(tma_gbasis)`.
+        /// `[1, 0]` here: TMA mode 0 walks the K extent, mode 1 the M (or N)
+        /// extent — which is what makes the operands K-major, and what
+        /// `make_tma_copy_desc`'s `assert(gmem_prob_stride[0] == 1)` checks.
+        pub gmode_of_tma_mode: [u8; 5],
+    }
+
+    /// Operand A's encode configuration for the sm90 bf16 grouped MoE GEMM
+    /// at MMA tile `(128, 128, 64)`, cluster `(1, 1, 1)`.
+    ///
+    /// Measured by probes `T2` and `T5`.
+    pub const ENCODE_A: TmaEncodeConfig = TmaEncodeConfig {
+        data_type: TensorMapDataType::Uint16,
+        rank: 2,
+        box_shape: [64, 128, 1, 1, 1],
+        box_stride: [1, 1, 1, 1, 1],
+        interleave: Interleave::None,
+        swizzle: TensorMapSwizzle::B128,
+        l2_promotion: L2Promotion::B128,
+        oob_fill: OobFill::None,
+        bits_per_tma: 131_072,
+        gmode_of_tma_mode: [1, 0, 0, 0, 0],
+    };
+
+    /// Operand B's encode configuration.
+    ///
+    /// **Byte-for-byte identical to [`ENCODE_A`], and that is a measurement
+    /// rather than a copy.** Probe `T3` dumped `tma_load_b`'s type in full
+    /// and it is the same type as `tma_load_a`'s, down to the `C<131072>`.
+    /// It is identical because the MMA tile is square in M and N — 128 each —
+    /// and both operands are K-major over the same 64-deep K tile. A
+    /// non-square tile separates them immediately, which is why this is a
+    /// separate constant and not an alias.
+    pub const ENCODE_B: TmaEncodeConfig = TmaEncodeConfig { ..ENCODE_A };
+
+    const _: () = assert!(ENCODE_A.bits_per_tma / 8 == 64 * 128 * 2);
+
+    /// `CUresult`, as much of it as this module can produce.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CuResult(pub i32);
+
+    impl CuResult {
+        /// `CUDA_SUCCESS`.
+        pub const SUCCESS: Self = Self(0);
+    }
+
+    /// Why a TMA descriptor could not be built.
+    ///
+    /// Every variant is a precondition `make_tma_copy_desc` asserts. They are
+    /// `assert`s in C++, which means they vanish under `NDEBUG` and the
+    /// driver returns `CUDA_ERROR_INVALID_VALUE` from somewhere far away
+    /// instead. Here they are checked unconditionally and named.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum TmaError {
+        /// The global address is not 16-byte aligned.
+        Misaligned(u64),
+        /// A global extent is zero or exceeds 2^32.
+        BadGlobalExtent {
+            /// Which of the five modes.
+            mode: usize,
+            /// The offending extent.
+            extent: u64,
+        },
+        /// A byte stride is not a multiple of 16, or exceeds 2^40.
+        BadGlobalStride {
+            /// Which of the five modes.
+            mode: usize,
+            /// The offending stride, in bytes.
+            stride: u64,
+        },
+        /// A box extent is zero or exceeds 256.
+        BadBoxExtent {
+            /// Which of the five modes.
+            mode: usize,
+            /// The offending extent.
+            extent: u32,
+        },
+        /// The driver rejected the descriptor.
+        Driver(CuResult),
+    }
+
+    // SAFETY-adjacent note: this is a declaration, not a definition. The
+    // symbol is resolved out of libcuda, which `cudarc` already links; no
+    // `#[link]` attribute is added here because a second one for the same
+    // library is how a build acquires two opinions about a link order.
+    unsafe extern "C" {
+        /// `cuTensorMapEncodeTiled`, which `cudarc` 0.19.8 does not bind.
+        ///
+        /// The signature is CUDA 12/13's and is stable across both.
+        fn cuTensorMapEncodeTiled(
+            tensor_map: *mut TmaDescriptor,
+            tensor_data_type: u32,
+            tensor_rank: u32,
+            global_address: *mut core::ffi::c_void,
+            global_dim: *const u64,
+            global_strides: *const u64,
+            box_dim: *const u32,
+            element_strides: *const u32,
+            interleave: u32,
+            swizzle: u32,
+            l2_promotion: u32,
+            oob_fill: u32,
+        ) -> i32;
+    }
+
+    /// Build one operand's TMA descriptor.
+    ///
+    /// `global_extent` and `global_stride_elems` are indexed by *TMA* mode,
+    /// not by global mode — the caller applies
+    /// [`TmaEncodeConfig::gmode_of_tma_mode`]. `global_stride_elems[0]` must
+    /// be 1; that is `make_tma_copy_desc`'s "majorness of smem doesn't match
+    /// majorness of gmem" assertion, and it is the one that fires when an
+    /// operand's layout is transcribed column-major by mistake.
+    ///
+    /// Strides are given in elements and converted to bytes here, because
+    /// that is the order `make_tma_copy_desc` does it in and the bounds it
+    /// asserts are on the byte values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TmaError`] for any precondition the C++ would have asserted,
+    /// and [`TmaError::Driver`] for a non-zero `CUresult`.
+    ///
+    /// # Safety
+    ///
+    /// `global_address` must be a device allocation of at least the extent
+    /// described, live for as long as any launch reading the descriptor.
+    /// Nothing here dereferences it; the TMA unit does.
+    pub unsafe fn encode_operand(
+        cfg: &TmaEncodeConfig,
+        global_address: u64,
+        global_extent: [u64; 5],
+        global_stride_elems: [u64; 5],
+        element_bytes: u64,
+    ) -> Result<TmaDescriptor, TmaError> {
+        if global_address % 16 != 0 {
+            return Err(TmaError::Misaligned(global_address));
+        }
+        let rank = cfg.rank as usize;
+        for m in 0..rank {
+            let e = global_extent[m];
+            if e == 0 || e > (1u64 << 32) {
+                return Err(TmaError::BadGlobalExtent { mode: m, extent: e });
+            }
+            let b = cfg.box_shape[m];
+            if b == 0 || b > 256 {
+                return Err(TmaError::BadBoxExtent { mode: m, extent: b });
+            }
+        }
+        if global_stride_elems[0] != 1 {
+            return Err(TmaError::BadGlobalStride { mode: 0, stride: global_stride_elems[0] });
+        }
+
+        let mut byte_stride = [0u64; 5];
+        for m in 0..5 {
+            byte_stride[m] = global_stride_elems[m] * element_bytes;
+        }
+        for m in 1..rank {
+            let s = byte_stride[m];
+            if s >= (1u64 << 40) || s % 16 != 0 {
+                return Err(TmaError::BadGlobalStride { mode: m, stride: s });
+            }
+        }
+
+        let mut desc = TmaDescriptor::default();
+        // `cuTensorMapEncodeTiled` takes strides for modes 1.. only; mode 0's
+        // stride is implicitly one element and is the thing asserted above.
+        let strides_from_one = [byte_stride[1], byte_stride[2], byte_stride[3], byte_stride[4]];
+        let rc = unsafe {
+            cuTensorMapEncodeTiled(
+                &raw mut desc,
+                cfg.data_type as u32,
+                cfg.rank,
+                global_address as *mut core::ffi::c_void,
+                global_extent.as_ptr(),
+                strides_from_one.as_ptr(),
+                cfg.box_shape.as_ptr(),
+                cfg.box_stride.as_ptr(),
+                cfg.interleave as u32,
+                cfg.swizzle as u32,
+                cfg.l2_promotion as u32,
+                cfg.oob_fill as u32,
+            )
+        };
+        if rc != 0 {
+            return Err(TmaError::Driver(CuResult(rc)));
+        }
+        Ok(desc)
+    }
+
+    /// The bit CUTLASS clears on old drivers, and why it is not done here.
+    ///
+    /// `make_tma_copy_desc` ends with
+    ///
+    /// ```text
+    /// if (driver_version <= 13010) {
+    ///   if (bits_to_bytes(cosize(gtensor.layout()) * sizeof_bits_v<T>) < 131072) {
+    ///     reinterpret_cast<uint64_t*>(&tma_desc)[1] &= ~(1llu << 21);
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// — an undocumented poke at bit 21 of the second word of an officially
+    /// opaque descriptor, applied only to tensors smaller than 128 KiB on
+    /// drivers at or below 13.1.
+    ///
+    /// It is **not** reproduced above, and that is a decision rather than an
+    /// omission. Reproducing it would mean this module writes into a
+    /// structure whose layout the driver does not document, on a condition
+    /// (`cuDriverGetVersion`) this module would have to query, to work around
+    /// a defect nobody here has observed. The honest state is: *if a
+    /// small-tensor grouped GEMM misbehaves on a driver ≤ 13.1, this is the
+    /// first thing to try* — which is worth more written down than silently
+    /// applied.
+    pub const DRIVER_13010_BIT21_WORKAROUND_NOT_APPLIED: () = ();
+
+    /// `cutlass::gemm::GroupProblemShape<Shape<int,int,int>>`.
+    ///
+    /// Measured: `sizeof = 24`, `alignof = 8`.
+    ///
+    /// `problem_shapes` points at device memory holding `num_groups` copies
+    /// of `(M, N, K)`; `host_problem_shapes` is the optional host mirror the
+    /// scheduler reads when it wants to size the grid without a copy back.
+    /// A null `host_problem_shapes` is legal and is what the grouped path
+    /// uses when the shapes are only known on the device.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct GroupProblemShape {
+        /// Number of experts participating in this GEMM.
+        pub num_groups: i32,
+        /// Padding to the 8-byte alignment of the two pointers.
+        pub _pad0: u32,
+        /// Device pointer to `num_groups` × `(M, N, K)`.
+        pub problem_shapes: u64,
+        /// Optional host mirror; may be null.
+        pub host_problem_shapes: u64,
+    }
+
+    const _: () = assert!(core::mem::offset_of!(GroupProblemShape, num_groups) == 0);
+    const _: () = assert!(core::mem::offset_of!(GroupProblemShape, problem_shapes) == 8);
+    const _: () = assert!(core::mem::offset_of!(GroupProblemShape, host_problem_shapes) == 16);
+    const _: () = assert!(core::mem::size_of::<GroupProblemShape>() == 24);
+    const _: () = assert!(core::mem::align_of::<GroupProblemShape>() == 8);
+
+    /// `CollectiveMainloop::Params` for
+    /// `MainloopSm90ArrayTmaGmmaWarpSpecialized`.
+    ///
+    /// Measured: `sizeof = 448`, `alignof = 64`.
+    ///
+    /// Note `d_a` and `d_b`: `StrideA` is nominally a CuTe
+    /// `Stride<int64_t, _1, int64_t>`, three elements, but two of them are
+    /// *static* (`_1` and an implicit `_0` for the batch mode in the
+    /// pointer-array case) and CuTe compresses empty types out of tuples
+    /// entirely. The measurement says 8 bytes — one dynamic `int64_t` — and
+    /// that is precisely the sort of thing a transcription gets wrong.
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Default)]
+    pub struct MainloopParams {
+        /// TMA copy atom for operand A, carrying its `CUtensorMap`.
+        pub tma_load_a: TmaCopyAtom,
+        /// TMA copy atom for operand B, carrying its `CUtensorMap`.
+        pub tma_load_b: TmaCopyAtom,
+        /// Bytes moved per TMA transaction; the mbarrier arrive count.
+        pub tma_transaction_bytes: u32,
+        /// Padding to the alignment of `tensormaps`.
+        pub _pad0: u32,
+        /// Device scratch for the per-group descriptor patching that
+        /// `tensormaps_init` / `tensormaps_replace_global_address` perform.
+        pub tensormaps: u64,
+        /// Device array of per-group A pointers.
+        pub ptr_a: u64,
+        /// Dynamic leading stride of A.
+        pub d_a: i64,
+        /// Device array of per-group B pointers.
+        pub ptr_b: u64,
+        /// Dynamic leading stride of B.
+        pub d_b: i64,
+    }
+
+    const _: () = assert!(core::mem::offset_of!(MainloopParams, tma_load_a) == 0);
+    const _: () = assert!(core::mem::offset_of!(MainloopParams, tma_load_b) == 192);
+    const _: () = assert!(core::mem::offset_of!(MainloopParams, tma_transaction_bytes) == 384);
+    const _: () = assert!(core::mem::offset_of!(MainloopParams, tensormaps) == 392);
+    const _: () = assert!(core::mem::offset_of!(MainloopParams, ptr_a) == 400);
+    const _: () = assert!(core::mem::offset_of!(MainloopParams, d_a) == 408);
+    const _: () = assert!(core::mem::offset_of!(MainloopParams, ptr_b) == 416);
+    const _: () = assert!(core::mem::offset_of!(MainloopParams, d_b) == 424);
+    const _: () = assert!(core::mem::size_of::<MainloopParams>() == 448);
+    const _: () = assert!(core::mem::align_of::<MainloopParams>() == 64);
+
+    /// `cutlass::KernelHardwareInfo`.
+    ///
+    /// Measured: `sizeof = 36`, `alignof = 4`.
+    ///
+    /// `sm_count` is what the persistent scheduler divides the tile space by,
+    /// so a wrong value here is a correctness-preserving performance cliff
+    /// rather than a crash — the worst kind to leave unmeasured.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct KernelHardwareInfo {
+        /// CUDA ordinal.
+        pub device_id: i32,
+        /// Multiprocessor count; the persistent grid width.
+        pub sm_count: i32,
+        /// Maximum co-resident clusters, or zero when not queried.
+        pub max_active_clusters: i32,
+        /// `dim3` cluster shape.
+        pub cluster_shape: [u32; 3],
+        /// `dim3` fallback cluster shape for preferred-cluster launches.
+        pub cluster_shape_fallback: [u32; 3],
+    }
+
+    const _: () = assert!(core::mem::offset_of!(KernelHardwareInfo, device_id) == 0);
+    const _: () = assert!(core::mem::offset_of!(KernelHardwareInfo, sm_count) == 4);
+    const _: () = assert!(core::mem::offset_of!(KernelHardwareInfo, max_active_clusters) == 8);
+    const _: () = assert!(core::mem::offset_of!(KernelHardwareInfo, cluster_shape) == 12);
+    const _: () = assert!(core::mem::offset_of!(KernelHardwareInfo, cluster_shape_fallback) == 24);
+    const _: () = assert!(core::mem::size_of::<KernelHardwareInfo>() == 36);
+
+    /// `cutlass::FastDivmodU64Pow2` — 16 bytes.
+    ///
+    /// The power-of-two specialisation: a shift and the divisor itself.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct FastDivmodU64Pow2 {
+        /// The divisor.
+        pub divisor: u64,
+        /// `integer_log2(divisor)`.
+        pub shift_right: u32,
+        /// Tail padding to 16.
+        pub _pad0: u32,
+    }
+
+    impl FastDivmodU64Pow2 {
+        /// Precompute the power-of-two reciprocal, exactly as
+        /// `cutlass::FastDivmodU64Pow2`'s constructor does.
+        ///
+        /// A divisor of zero yields a shift of zero, which is what the C++
+        /// does — `integer_log2(0)` loops zero times.
+        #[must_use]
+        pub const fn new(divisor: u64) -> Self {
+            let shift_right = if divisor == 0 { 0 } else { 63 - divisor.leading_zeros() };
+            Self { divisor, shift_right, _pad0: 0 }
+        }
+    }
+
+    const _: () = assert!(core::mem::size_of::<FastDivmodU64Pow2>() == 16);
+
+    /// `cutlass::FastDivmodU64` — 24 bytes.
+    ///
+    /// Divisor, multiplier and shift for the Granlund–Montgomery reciprocal.
+    /// **This is the §62.12 shape.** It is CUTLASS's own type here, not
+    /// CCCL's `uint_fastdiv`, so the probe and the kernel read the same
+    /// declaration — but the identical-`sizeof`/different-interior failure
+    /// happened to `uint_fastdiv` and could happen here if the divmod ever
+    /// resolves to a different implementation.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct FastDivmodU64 {
+        /// The divisor.
+        pub divisor: u64,
+        /// Granlund–Montgomery multiplier, or zero when `divisor` is a power
+        /// of two — in which case the divide is the shift alone.
+        pub multiplier: u64,
+        /// `integer_log2(divisor)`.
+        pub shift_right: u32,
+        /// One when the low and high reciprocal estimates agree, in which
+        /// case the dividend is biased by one before the multiply.
+        pub round_up: u32,
+    }
+
+    impl FastDivmodU64 {
+        /// Precompute the reciprocal, transcribing
+        /// `cutlass::FastDivmodU64`'s constructor.
+        ///
+        /// The C++ builds the two estimates with its own `uint128_t`, whose
+        /// constructor is `(lo, hi)`:
+        ///
+        /// ```text
+        /// multiplier_lo = uint128_t(0,            power_of_two) / divisor
+        /// multiplier    = uint128_t(power_of_two, power_of_two) / divisor
+        /// round_up      = (multiplier_lo == multiplier)
+        /// ```
+        ///
+        /// Rust has `u128` natively, so `uint128_t(lo, hi)` is
+        /// `((hi as u128) << 64) | lo as u128` and the division is the
+        /// language's. This is one of the few places in this port where
+        /// reimplementing beats measuring: the inputs are genuinely dynamic —
+        /// they depend on the token count — so there is no compile-time
+        /// constant to read out of a `__constant__`.
+        ///
+        /// The truncation of `multiplier` back to 64 bits is deliberate and
+        /// matches the C++, which assigns a `uint128_t` to a `uint64_t`
+        /// member.
+        #[must_use]
+        pub const fn new(divisor: u64) -> Self {
+            if divisor == 0 {
+                return Self { divisor: 0, multiplier: 0, shift_right: 0, round_up: 0 };
+            }
+            let shift_right = 63 - divisor.leading_zeros();
+            if divisor & (divisor - 1) == 0 {
+                return Self { divisor, multiplier: 0, shift_right, round_up: 0 };
+            }
+            let power_of_two = 1u128 << shift_right;
+            let d = divisor as u128;
+            let multiplier_lo = (power_of_two << 64) / d;
+            let multiplier = ((power_of_two << 64) | power_of_two) / d;
+            Self {
+                divisor,
+                multiplier: multiplier as u64,
+                shift_right,
+                round_up: if multiplier_lo == multiplier { 1 } else { 0 },
+            }
+        }
+    }
+
+    const _: () = assert!(core::mem::offset_of!(FastDivmodU64, divisor) == 0);
+    const _: () = assert!(core::mem::offset_of!(FastDivmodU64, multiplier) == 8);
+    const _: () = assert!(core::mem::offset_of!(FastDivmodU64, shift_right) == 16);
+    const _: () = assert!(core::mem::offset_of!(FastDivmodU64, round_up) == 20);
+    const _: () = assert!(core::mem::size_of::<FastDivmodU64>() == 24);
+
+    /// `cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupParams`.
+    ///
+    /// Measured: `sizeof = 152`, `alignof = 8`. Every byte is accounted for:
+    /// the two 12-byte `GemmCoord`s at 128 and 140 close the struct exactly.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct TileSchedulerParams {
+        /// Divisor for the major cluster extent.
+        pub divmod_cluster_shape_major: FastDivmodU64Pow2,
+        /// Divisor for the minor cluster extent.
+        pub divmod_cluster_shape_minor: FastDivmodU64Pow2,
+        /// Divisor for CTA tiles along M.
+        pub divmod_cta_shape_m: FastDivmodU64,
+        /// Divisor for CTA tiles along N.
+        pub divmod_cta_shape_n: FastDivmodU64,
+        /// Total tiles across all groups; the persistent loop bound.
+        pub blocks_across_problem: u64,
+        /// Whether `problem_shapes_` has already been reduced on the host.
+        pub pre_processed_problem_shapes: bool,
+        /// Padding to the alignment of `max_swizzle_size`.
+        pub _pad0: [u8; 3],
+        /// Threadblock swizzle width.
+        pub max_swizzle_size: i32,
+        /// `RasterOrder` discriminant (`AlongM` / `AlongN`).
+        pub raster_order: i32,
+        /// Padding to the 8-byte alignment of `problem_shapes`.
+        pub _pad1: u32,
+        /// The scheduler's own copy of the problem shapes.
+        pub problem_shapes: GroupProblemShape,
+        /// `GemmCoord` CTA tile shape.
+        pub cta_shape: [i32; 3],
+        /// `GemmCoord` cluster shape.
+        pub cluster_shape: [i32; 3],
+    }
+
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, divmod_cluster_shape_major) == 0);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, divmod_cluster_shape_minor) == 16);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, divmod_cta_shape_m) == 32);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, divmod_cta_shape_n) == 56);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, blocks_across_problem) == 80);
+    const _: () =
+        assert!(core::mem::offset_of!(TileSchedulerParams, pre_processed_problem_shapes) == 88);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, max_swizzle_size) == 92);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, raster_order) == 96);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, problem_shapes) == 104);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, cta_shape) == 128);
+    const _: () = assert!(core::mem::offset_of!(TileSchedulerParams, cluster_shape) == 140);
+    const _: () = assert!(core::mem::size_of::<TileSchedulerParams>() == 152);
+    const _: () = assert!(core::mem::align_of::<TileSchedulerParams>() == 8);
+
+    /// `cutlass::gemm::GemmUniversalMode`.
+    ///
+    /// The grouped path is always `Array`. The other discriminants exist in
+    /// the C++ enum and are listed so the mirror is a mirror, not a subset.
+    #[repr(i32)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub enum GemmUniversalMode {
+        /// Single GEMM.
+        #[default]
+        Gemm = 0,
+        /// Split-K, serial reduction.
+        GemmSplitKParallel = 1,
+        /// Batched.
+        Batched = 2,
+        /// Pointer array — what the grouped MoE GEMM uses.
+        Array = 3,
+        /// Invalid sentinel.
+        Invalid = 4,
+    }
+
+    /// `GemmKernel::Params` with the **default** epilogue
+    /// (`PtrArrayNoSmemWarpSpecialized`).
+    ///
+    /// Measured: `sizeof = 832`, `alignof = 64`. Probe `C13`.
+    ///
+    /// This is the first of the two GEMMs the MoE runs — the one whose output
+    /// feeds the activation.
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Default)]
+    pub struct GemmParamsDefault {
+        /// Always [`GemmUniversalMode::Array`] here.
+        pub mode: GemmUniversalMode,
+        /// Padding to the 8-byte alignment of `problem_shape`.
+        pub _pad0: u32,
+        /// Group count and the shape arrays.
+        pub problem_shape: GroupProblemShape,
+        /// Padding to the 64-byte alignment of `mainloop`.
+        pub _pad1: [u8; 32],
+        /// TMA descriptors, operand pointers and strides.
+        pub mainloop: MainloopParams,
+        /// `CollectiveEpilogue::Params`. 72 bytes for this chain, treated as
+        /// bytes because nothing here fills it and a half-filled epilogue is
+        /// worse than an unfilled one.
+        pub epilogue: [u8; 72],
+        /// Device ordinal, SM count, cluster shape.
+        pub hw_info: KernelHardwareInfo,
+        /// Padding to the 8-byte alignment of `scheduler`.
+        pub _pad2: u32,
+        /// Persistent tile scheduler state.
+        pub scheduler: TileSchedulerParams,
+        /// Device workspace pointer.
+        pub workspace: u64,
+    }
+
+    const _: () = assert!(core::mem::offset_of!(GemmParamsDefault, mode) == 0);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsDefault, problem_shape) == 8);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsDefault, mainloop) == 64);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsDefault, epilogue) == 512);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsDefault, hw_info) == 584);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsDefault, scheduler) == 624);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsDefault, workspace) == 776);
+    const _: () = assert!(core::mem::size_of::<GemmParamsDefault>() == 832);
+    const _: () = assert!(core::mem::align_of::<GemmParamsDefault>() == 64);
+
+    /// `GemmKernel::Params` with the **FINALIZE scatter** epilogue.
+    ///
+    /// Measured: `sizeof = 1408`, `alignof = 64`. Probe `C14`.
+    ///
+    /// Identical to [`GemmParamsDefault`] up to and including `mainloop`; the
+    /// epilogue is 640 bytes instead of 72, and everything after it moves.
+    /// That 568-byte difference is the entire cost of the scatter visitor —
+    /// the per-column bias, the per-row router scales and the scatter index
+    /// map all live in the epilogue's fusion arguments.
+    ///
+    /// **Two structurally identical layouts that differ only in one field's
+    /// size is exactly the shape that produces a silent wrong answer.** They
+    /// are separate types here rather than one type with a generic parameter
+    /// so that a value built for one chain cannot be passed to the other.
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy)]
+    pub struct GemmParamsFinalize {
+        /// Always [`GemmUniversalMode::Array`] here.
+        pub mode: GemmUniversalMode,
+        /// Padding to the 8-byte alignment of `problem_shape`.
+        pub _pad0: u32,
+        /// Group count and the shape arrays.
+        pub problem_shape: GroupProblemShape,
+        /// Padding to the 64-byte alignment of `mainloop`.
+        pub _pad1: [u8; 32],
+        /// TMA descriptors, operand pointers and strides. Byte-for-byte the
+        /// same type as the default chain's.
+        pub mainloop: MainloopParams,
+        /// `CollectiveEpilogueFinalize::Params`, 640 bytes.
+        pub epilogue: [u8; 640],
+        /// Device ordinal, SM count, cluster shape.
+        pub hw_info: KernelHardwareInfo,
+        /// Padding to the 8-byte alignment of `scheduler`.
+        pub _pad2: u32,
+        /// Persistent tile scheduler state.
+        pub scheduler: TileSchedulerParams,
+        /// Device workspace pointer.
+        pub workspace: u64,
+    }
+
+    const _: () = assert!(core::mem::offset_of!(GemmParamsFinalize, mode) == 0);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsFinalize, problem_shape) == 8);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsFinalize, mainloop) == 64);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsFinalize, epilogue) == 512);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsFinalize, hw_info) == 1152);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsFinalize, scheduler) == 1192);
+    const _: () = assert!(core::mem::offset_of!(GemmParamsFinalize, workspace) == 1344);
+    const _: () = assert!(core::mem::size_of::<GemmParamsFinalize>() == 1408);
+    const _: () = assert!(core::mem::align_of::<GemmParamsFinalize>() == 64);
+
+    /// The two epilogue sizes, kept as named constants because the *contrast*
+    /// is the load-bearing fact, not either number alone.
+    pub const EPILOGUE_BYTES_DEFAULT: usize = 72;
+    /// See [`EPILOGUE_BYTES_DEFAULT`].
+    pub const EPILOGUE_BYTES_FINALIZE: usize = 640;
+
+    /// What `to_underlying_arguments` has to do, and what is not yet known.
+    ///
+    /// This function is **not implemented**. It is documented rather than
+    /// stubbed because the honest state of the port is more useful than a
+    /// function that returns a zeroed struct, and because a zeroed `Params`
+    /// launched at a real GEMM is an illegal-address fault at best.
+    ///
+    /// `GemmUniversal::to_underlying_arguments` (the sm90 array specialisation)
+    /// does five things:
+    ///
+    /// 1. **Copies the problem shape.** `num_groups` and the two pointers.
+    ///    Trivial in Rust; the device shape array is already built by
+    ///    [`super::routing`].
+    ///
+    /// 2. **Builds two `CUtensorMap`s** via `make_tma_copy` at
+    ///    `sm90_mma_array_tma_gmma_ss_warpspecialized.hpp:251` and `:257`,
+    ///    one per operand. This is the only genuinely hard part, and it is
+    ///    hard for a specific reason: `make_tma_copy` takes CuTe *layouts* —
+    ///    the global tensor layout and the shared-memory tile layout — and
+    ///    derives the descriptor's box dimensions, element strides and
+    ///    swizzle mode from compile-time layout algebra. The driver entry
+    ///    point underneath is `cuTensorMapEncodeTiled`, which Rust can call
+    ///    directly; what Rust does not have is the layout algebra that
+    ///    computes its arguments.
+    ///
+    ///    The tractable route is not to reimplement CuTe. It is to observe
+    ///    that for a *fixed* tile configuration every one of those arguments
+    ///    is a compile-time constant, and to read them out of a device
+    ///    `__constant__` array exactly as the offsets in this module were
+    ///    read out — the same probe, pointed at
+    ///    `Copy_Traits<SM90_TMA_LOAD, ...>::tma_desc` fields instead of at
+    ///    struct offsets. That turns "port CuTe" into "measure 2 × ~10
+    ///    integers per tile configuration", which is the same trade this
+    ///    module already made for the layout.
+    ///
+    /// 3. **Copies operand pointers and strides** into `ptr_a`/`d_a`/
+    ///    `ptr_b`/`d_b`. Trivial.
+    ///
+    /// 4. **Initialises the tile scheduler** —
+    ///    `TileScheduler::to_underlying_arguments` computes
+    ///    `blocks_across_problem` and the four divmods from the grid shape.
+    ///    The divmods are Granlund–Montgomery reciprocals; the arithmetic is
+    ///    twenty lines and is one of the few places where reimplementing in
+    ///    Rust is clearly cheaper than measuring, because the inputs are
+    ///    genuinely dynamic (they depend on the token count).
+    ///
+    /// 5. **Lays out the workspace.** `get_workspace_size` walks the same
+    ///    sequence of sub-allocations that `initialize_workspace` then
+    ///    assigns pointers into. Both are pure host arithmetic over
+    ///    alignments and counts, and both are already the *shape* of what
+    ///    [`super::workspace_bytes`] does for the outer MoE.
+    ///
+    /// Of those, (1), (3), (4) and (5) are ordinary Rust. (2) is the project.
+    /// Nothing here is blocked on NVRTC — probe `C14` proved the device side
+    /// compiles, lowers and yields exactly one `.entry`.
+    ///
+    /// (2) turned out not to be the project either. See [`TmaEncodeConfig`].
+    pub const DECOMPOSITION: () = ();
+
+    /// `RasterOrder` — which way the persistent scheduler walks the tile
+    /// space. `tile_scheduler_detail.hpp:38`.
+    #[repr(i32)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub enum RasterOrder {
+        /// Rasterise along M.
+        AlongM = 0,
+        /// Rasterise along N.
+        #[default]
+        AlongN = 1,
+    }
+
+    /// `RasterOrderOptions`, the *request*; [`RasterOrder`] is the answer.
+    #[repr(i32)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub enum RasterOrderOption {
+        /// Let `get_rasterization_order` choose.
+        #[default]
+        Heuristic = 0,
+        /// Force M.
+        AlongM = 1,
+        /// Force N.
+        AlongN = 2,
+    }
+
+    /// `get_rasterization_order`, `tile_scheduler_params.h:330`.
+    #[must_use]
+    pub const fn rasterization_order(
+        tiles_m: u32,
+        tiles_n: u32,
+        option: RasterOrderOption,
+    ) -> RasterOrder {
+        match option {
+            RasterOrderOption::AlongM => RasterOrder::AlongM,
+            RasterOrderOption::AlongN => RasterOrder::AlongN,
+            RasterOrderOption::Heuristic => {
+                if tiles_n > tiles_m { RasterOrder::AlongM } else { RasterOrder::AlongN }
+            }
+        }
+    }
+
+    /// The global geometry of one operand, as the *skeleton* descriptor sees
+    /// it.
+    ///
+    /// "Skeleton" is the operative word. In the pointer-array grouped case
+    /// the host builds **one** descriptor per operand, and the device patches
+    /// the global address per group in `tensormaps_replace_global_address`
+    /// (`sm90_mma_array_tma_gmma_ss_warpspecialized.hpp:656,724`). So the
+    /// address here is a representative one — group zero's — and the extents
+    /// are the bounding ones.
+    #[derive(Clone, Copy, Debug)]
+    pub struct OperandGeometry {
+        /// Device address of group zero's operand data. Must be 16-byte
+        /// aligned.
+        pub address: u64,
+        /// Extent along the *contiguous* (K) mode, in elements.
+        pub k_extent: u64,
+        /// Extent along the *strided* (M for A, N for B) mode, in elements.
+        pub strided_extent: u64,
+        /// Leading stride in elements — the distance between successive
+        /// strided-mode entries. For a row-major `M × K` operand this is `K`.
+        pub leading_stride: u64,
+    }
+
+    /// Everything `to_underlying_arguments` needs that is not a measured
+    /// constant.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Arguments {
+        /// Number of experts in this grouped GEMM.
+        pub num_groups: i32,
+        /// Device array of `num_groups` × `(M, N, K)`.
+        pub problem_shapes_dev: u64,
+        /// Optional host mirror; zero when the shapes are device-only.
+        pub problem_shapes_host: u64,
+        /// Device array of per-group A pointers.
+        pub ptr_a: u64,
+        /// Device array of per-group B pointers.
+        pub ptr_b: u64,
+        /// Device scratch for per-group descriptor patching.
+        pub tensormaps: u64,
+        /// Device workspace.
+        pub workspace: u64,
+        /// A's global geometry, for the skeleton descriptor.
+        pub geom_a: OperandGeometry,
+        /// B's global geometry.
+        pub geom_b: OperandGeometry,
+        /// CUDA ordinal.
+        pub device_id: i32,
+        /// Multiprocessor count.
+        pub sm_count: i32,
+        /// Threadblock swizzle width.
+        pub max_swizzle_size: i32,
+        /// Rasterisation request.
+        pub raster_order_option: RasterOrderOption,
+        /// Total CTA tiles along M across the grouped problem, *before*
+        /// rounding to the cluster. The caller computes this because in the
+        /// grouped case the per-group shapes may be device-only, and
+        /// `get_tiled_cta_shape_mnl` then has nothing to read; the launcher
+        /// supplies a bound instead. Passing a value smaller than the true
+        /// tile count silently drops tiles, which is why it is a named
+        /// argument rather than something inferred.
+        pub problem_blocks_m: u32,
+        /// As [`Self::problem_blocks_m`], along N.
+        pub problem_blocks_n: u32,
+        /// Batch/group extent of the tiled CTA shape.
+        pub problem_blocks_l: u32,
+    }
+
+    /// The MMA tile, measured: `(128, 128, 64)` for this configuration.
+    pub const MMA_TILE: [u32; 3] = [128, 128, 64];
+    /// The cluster shape, measured: `(1, 1, 1)`.
+    ///
+    /// One is load-bearing twice over. It makes `num_multicast` one, so
+    /// `make_tma_copy_desc`'s box-truncation loop never runs and
+    /// [`ENCODE_A`]'s `box_shape` is the untruncated `tma_gbasis`; and it
+    /// makes both cluster divmods `FastDivmodU64Pow2(1)`.
+    pub const CLUSTER_SHAPE: [u32; 3] = [1, 1, 1];
+    /// Element size in bytes for both operands, measured: bf16.
+    pub const ELEMENT_BYTES: u64 = 2;
+
+    /// Build `GemmKernel::Params` for the FINALIZE chain.
+    ///
+    /// Implements parts (1), (3), (4) and (5) of the decomposition above in
+    /// full, and part (2) by calling [`encode_operand`].
+    ///
+    /// What it does **not** fill is `epilogue`: 640 bytes whose interior is
+    /// not yet measured. The returned value therefore has a zeroed epilogue
+    /// and **must not be launched**. It is returned rather than refused
+    /// because every other field in it is correct and checkable, and because
+    /// the epilogue is one more probe of exactly the kind that produced the
+    /// rest — not a different kind of problem.
+    ///
+    /// # Errors
+    ///
+    /// [`TmaError`] from either operand's descriptor build.
+    ///
+    /// # Safety
+    ///
+    /// Every address in `args` must be a live device allocation. Nothing here
+    /// dereferences one; the launch does.
+    pub unsafe fn to_underlying_arguments(
+        args: &Arguments,
+    ) -> Result<GemmParamsFinalize, TmaError> {
+        // (1) Problem shape.
+        let problem_shape = GroupProblemShape {
+            num_groups: args.num_groups,
+            _pad0: 0,
+            problem_shapes: args.problem_shapes_dev,
+            host_problem_shapes: args.problem_shapes_host,
+        };
+
+        // (2) The two TMA skeletons. Extents are indexed by TMA mode, and
+        // `gmode_of_tma_mode` is `[1, 0, ..]` — mode 0 is K, mode 1 is the
+        // strided mode. Mode 0's stride is one element by construction,
+        // which is what makes these operands K-major.
+        let encode = |cfg: &TmaEncodeConfig, g: &OperandGeometry| {
+            let extent = [g.k_extent, g.strided_extent, 1, 1, 1];
+            let stride = [1, g.leading_stride, 0, 0, 0];
+            unsafe { encode_operand(cfg, g.address, extent, stride, ELEMENT_BYTES) }
+        };
+        let desc_a = encode(&ENCODE_A, &args.geom_a)?;
+        let desc_b = encode(&ENCODE_B, &args.geom_b)?;
+
+        // (3) Operand pointers and strides, and the transaction size the
+        // mbarrier arrives on. Both operands move the same number of bits
+        // here, which `ENCODE_B`'s documentation explains is a property of a
+        // square MMA tile and not an invariant.
+        let mainloop = MainloopParams {
+            tma_load_a: TmaCopyAtom { desc: desc_a, aux: [0u8; 64] },
+            tma_load_b: TmaCopyAtom { desc: desc_b, aux: [0u8; 64] },
+            tma_transaction_bytes: (ENCODE_A.bits_per_tma + ENCODE_B.bits_per_tma) / 8,
+            _pad0: 0,
+            tensormaps: args.tensormaps,
+            ptr_a: args.ptr_a,
+            d_a: args.geom_a.leading_stride as i64,
+            ptr_b: args.ptr_b,
+            d_b: args.geom_b.leading_stride as i64,
+        };
+
+        // (4) The tile scheduler, transcribing
+        // `PersistentTileSchedulerSm90GroupParams::initialize`.
+        let round_up = |x: u32, m: u32| x.div_ceil(m) * m;
+        let blocks_m = round_up(args.problem_blocks_m, CLUSTER_SHAPE[0]);
+        let blocks_n = round_up(args.problem_blocks_n, CLUSTER_SHAPE[1]);
+        let raster = rasterization_order(blocks_m, blocks_n, args.raster_order_option);
+
+        // Note the asymmetry, faithfully reproduced: `blocks_across_problem_`
+        // multiplies the *unrounded* `problem_blocks`, while the raster
+        // heuristic reads the *rounded* ones. With a 1×1×1 cluster the two
+        // agree, which is exactly the condition under which a transcription
+        // error here would never be noticed.
+        let blocks_across_problem = u64::from(args.problem_blocks_m)
+            * u64::from(args.problem_blocks_n)
+            * u64::from(args.problem_blocks_l);
+
+        let (major, minor) = match raster {
+            RasterOrder::AlongN => (CLUSTER_SHAPE[1], CLUSTER_SHAPE[0]),
+            RasterOrder::AlongM => (CLUSTER_SHAPE[0], CLUSTER_SHAPE[1]),
+        };
+
+        let scheduler = TileSchedulerParams {
+            divmod_cluster_shape_major: FastDivmodU64Pow2::new(u64::from(major)),
+            divmod_cluster_shape_minor: FastDivmodU64Pow2::new(u64::from(minor)),
+            divmod_cta_shape_m: FastDivmodU64::new(u64::from(MMA_TILE[0])),
+            divmod_cta_shape_n: FastDivmodU64::new(u64::from(MMA_TILE[1])),
+            blocks_across_problem,
+            pre_processed_problem_shapes: args.problem_shapes_host != 0,
+            _pad0: [0; 3],
+            max_swizzle_size: args.max_swizzle_size,
+            raster_order: raster as i32,
+            _pad1: 0,
+            problem_shapes: problem_shape,
+            cta_shape: [MMA_TILE[0] as i32, MMA_TILE[1] as i32, MMA_TILE[2] as i32],
+            cluster_shape: [
+                CLUSTER_SHAPE[0] as i32,
+                CLUSTER_SHAPE[1] as i32,
+                CLUSTER_SHAPE[2] as i32,
+            ],
+        };
+
+        Ok(GemmParamsFinalize {
+            mode: GemmUniversalMode::Array,
+            _pad0: 0,
+            problem_shape,
+            _pad1: [0; 32],
+            mainloop,
+            // (5) The epilogue. Not filled; see this function's docs.
+            epilogue: [0u8; EPILOGUE_BYTES_FINALIZE],
+            hw_info: KernelHardwareInfo {
+                device_id: args.device_id,
+                sm_count: args.sm_count,
+                max_active_clusters: 0,
+                cluster_shape: CLUSTER_SHAPE,
+                cluster_shape_fallback: [0, 0, 0],
+            },
+            _pad2: 0,
+            scheduler,
+            workspace: args.workspace,
+        })
+    }
+
+    /// The launch geometry `GemmUniversalAdapter::run` computes.
+    ///
+    /// `get_grid_shape` for the group scheduler is the persistent shape: as
+    /// many CTAs as the device can hold, capped by the tile count. The
+    /// cluster dimension and the programmatic-serialisation attribute that
+    /// `cutlass/cluster_launch.hpp:166,199` set on `cudaLaunchConfig_t` have
+    /// `CU_LAUNCH_ATTRIBUTE_*` twins, so the translation to `cuLaunchKernelEx`
+    /// is mechanical — but [`Launch`](kernels_cuda_new::runtime::Launch) has
+    /// no attribute list yet and `runtime::module::fire` uses
+    /// `cuLaunchKernel`, so a cluster launch cannot currently be expressed.
+    /// With [`CLUSTER_SHAPE`] equal to `(1,1,1)` that costs nothing today,
+    /// which is precisely why it must be written down: the first
+    /// configuration with a real cluster will need the attribute and will not
+    /// announce that it does.
+    #[must_use]
+    pub const fn grid_shape(sm_count: u32, total_tiles: u32) -> [u32; 3] {
+        [if total_tiles < sm_count { total_tiles } else { sm_count }, 1, 1]
+    }
+
+    /// `ActivationParams`, `moe_kernels.h:116` — passed **by value** to
+    /// `doActivationKernel` and `doGatedActivationKernel`.
+    ///
+    /// **Read, not measured**, and labelled so deliberately. Four plain
+    /// members with no template parameter, no CuTe tuple and no CCCL type in
+    /// sight; none of the three traps this port has hit (empty-mode
+    /// compression, `uint_fastdiv`'s divergent interior, equal `sizeof` with
+    /// different interiors) can apply to it. That is an argument for
+    /// confidence, not a substitute for a probe — the probe costs one call
+    /// and should be run before this is filled.
+    ///
+    /// The `operator ActivationType()` on the C++ struct is an implicit
+    /// conversion its own author marked `// TODO Port everything properly and
+    /// get rid of these implicit conversions`. It has no ABI effect.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ActivationParams {
+        /// `ActivationType` discriminant.
+        pub activation_type: i32,
+        /// Padding to pointer alignment.
+        pub _pad0: u32,
+        /// `float const*`, may be null.
+        pub swiglu_alpha: u64,
+        /// `float const*`, may be null.
+        pub swiglu_beta: u64,
+        /// `float const*`, may be null.
+        pub swiglu_limit: u64,
+    }
+
+    /// The six glue kernels that are *not* plain, and what each actually
+    /// needs — the correction to my own earlier verdict of "eleven ordinary
+    /// `__global__`s".
+    ///
+    /// Five of the eleven are plain and four of those are already landed as
+    /// `csrc/src/moe/expert_offsets.cuh`. The remaining six divide further,
+    /// and the division is by *signature*, not by body: what a kernel does
+    /// with `cutlass::Array` and `NumericArrayConverter` internally is
+    /// NVRTC's problem and probe `C6` settled it. What crosses the launch
+    /// boundary is the host's problem, and that is the real split.
+    ///
+    /// | kernel | line | what crosses |
+    /// |---|---|---|
+    /// | `expandInputRowsKernel` | 1430 | pointers, `int64_t`s, one `bool`; `TmaWarpSpecializedGroupedGemmInput::ElementSF*` is a **pointer**, so its element type never reaches the ABI |
+    /// | `finalizeMoeRoutingKernel` | 1731 | as above |
+    /// | `finalizeMoeRoutingNoFillingKernel` | 1811 | as above |
+    /// | `doGatedActivationKernel` | 2059 | pointers + [`ActivationParams`] **by value** |
+    /// | `doActivationKernel` | 2149 | pointers + [`ActivationParams`] **by value**, and `__launch_bounds__(ACTIVATION_THREADS_PER_BLOCK)` — a *constant*, not a host value, so NVRTC takes it |
+    /// | `computeStridesTmaWarpSpecializedKernel` | 1291 | `TmaWarpSpecializedGroupedGemmInput` **by value, twice** |
+    ///
+    /// So three of the six are ordinary rows today; two need
+    /// [`ActivationParams`] measured and mirrored, which is one probe; and
+    /// one is genuinely step (3) wearing a `__global__`'s clothes and follows
+    /// the `Params` work rather than preceding it.
+    ///
+    /// The `ElementSF` observation is the one worth keeping. It looked like a
+    /// CUTLASS type in a signature and is not: a `T*` parameter has the ABI
+    /// of a pointer whatever `T` is, and the block-scaling element type only
+    /// matters to code inside the kernel. Counting types by their spelling in
+    /// a signature is what produced "wrong for six" in the first place.
+    pub const GLUE_KERNEL_SPLIT: () = ();
+}
+
 #[cfg(test)]
 mod tests {
     //! What can be checked with no device: the pure arithmetic, the key, the

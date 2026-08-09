@@ -241,7 +241,20 @@ fn an_oversized_threadgroup_is_refused_rather_than_skipped() {
             step.dispatch([COUNT, 1, 1], [4096, 1, 1])
         })
         .expect_err("the dispatch is refused");
-    assert!(matches!(err, Error::Create { .. }), "{err}");
+    // The MESSAGE, not the variant. `Error::Create` is this crate's
+    // catch-all and `what: "dispatch"` covers three refusals in the same
+    // function, so `matches!(err, Error::Create { .. })` passed for a
+    // stepper that failed to open at all. What this test claims is that
+    // THIS dispatch was refused for THIS reason, and only the message
+    // says which of the three fired.
+    let Error::Create { what, message } = &err else {
+        panic!("{err}")
+    };
+    assert_eq!(*what, "dispatch");
+    assert!(
+        message.contains("4096 threads a threadgroup") && message.contains("the pipeline allows"),
+        "the refusal names the width it was given and the width allowed: {message}"
+    );
     // The step was still closed and committed, so the stepper is usable.
     assert!(!stepper.is_wedged());
 }
@@ -257,7 +270,14 @@ fn a_dispatch_without_a_pipeline_is_refused() {
     let err = stepper
         .run(|step| step.dispatch([64, 1, 1], [64, 1, 1]))
         .expect_err("no pipeline");
-    assert!(matches!(err, Error::Create { .. }), "{err}");
+    let Error::Create { what, message } = &err else {
+        panic!("{err}")
+    };
+    assert_eq!(*what, "dispatch");
+    assert!(
+        message.contains("no pipeline is set"),
+        "the refusal is the missing pipeline and not the threadgroup width: {message}"
+    );
 }
 
 /// Binding past the table's capacity is an error, not a no-op that surfaces

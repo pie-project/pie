@@ -22,9 +22,18 @@
 //! consolation. A caller with the right TYPES in the wrong ORDER compiled
 //! fine there — two `void*` operands swapped are still two `void*` — and the
 //! row is the only thing that knows which buffer is which. Here the values
-//! are not written by hand at all: the row generates the call, through
-//! [`emit::emit_rust_api`](crate::emit::emit_rust_api), and what remains for
-//! [`Args::bind`] to catch is a list that disagrees with the row it names.
+//! are not written by hand at all: the row generated the call, through
+//! `emit::emit_rust_api` until north star §6 half A retired it, and what
+//! remains for [`Args::bind`] to catch is a list that disagrees with the row
+//! it names.
+//!
+//! The generator is gone and the argument is unchanged, because the caller
+//! that replaced it is [`crate::x`] — a written `fn` whose parameters are the
+//! operands, so a swap is a type error at the call site rather than a row
+//! disagreement caught at bind. This module now serves the DYNAMIC path
+//! alone: [`crate::runtime::fire`], which takes a symbol string because
+//! `model-compiler` writes one into a trace, and nothing about a string can
+//! be checked before it is looked up.
 //!
 //! # Two hazards, and both are structural
 //!

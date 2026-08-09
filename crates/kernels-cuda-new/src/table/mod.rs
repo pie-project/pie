@@ -30,6 +30,13 @@
 //! so the archive is not going away — but it reads the table rather than
 //! owning it.
 //!
+//! **Both numbers are the census taken before §5 step 5 began**, when every
+//! family was still a row module; they are kept as written because they are
+//! what justified the split, and re-deriving them per port would make the
+//! argument look like it depended on the current total. It does not: the
+//! archive stays until the last of the 109 has a JIT twin, and a step-5 port
+//! moves a row from this file to `x::SIGS` without touching that count.
+//!
 //! # Two tables, one crate, and they are not the same contract
 //!
 //! A row here describes a `pie_k_*` entry point: a C++ host function that
@@ -52,17 +59,52 @@
 
 use kernels::{KernelSig, Prepare};
 
-pub mod adapter;
+// `adapter`, `layout` and `sample` ARE GONE — §5 step 5's "boring first"
+// batch took all three into fn-world.
+//
+// `layout` is `x::layout`: seven contracts, five binds, thirteen host `fn`s
+// and five `unit!`s over five roots. `sample` is `x::sample`: one contract,
+// one `none:` arm and four host `fn`s over one root, one of which is this
+// tree's first two-kernel body.
+//
+// `adapter` is the ODD ONE, in the other direction from `driver_internal`
+// below: it is `x::adapter` and holds a `contract!` and NOTHING ELSE — no
+// `unit!` (the LoRA seam is cuBLAS batched GEMMs, so there is no
+// `__global__`) and no `bind!` (an `Entry` would make `x::route` answer
+// `Bound` for a symbol `bind/mod.rs` must keep firing by hand). So it is in
+// `x::SIGS` and not in `x::FAMILIES`, which is the placement rule read from
+// the DECLARATION side: `model-compiler` must not be able to tell a cuBLAS
+// symbol from a JIT'd one, so the contract must reach it, and nothing else
+// about the symbol may.
 pub mod attn;
-pub mod driver_internal;
-pub mod gemm;
-pub mod layout;
-pub mod mlp;
+// `driver_internal` and `gemm` ARE GONE — §5 step 5 took both into fn-world.
+//
+// `gemm` is `x::gemm`: twelve contracts, two binds, ten `none:` arms and a
+// `unit!` for the two GEMV rows, with the dense autotuner and the cuBLASLt
+// plan cache beside them as `x::gemm::dense`.
+//
+// `driver_internal` is `x::driver_internal` and is the ODD ONE: six plain
+// `fn`s with **no `contract!` at all**, so it is in neither `x::FAMILIES` nor
+// `x::SIGS`. That is the placement rule applied to a whole family — a
+// `driver_internal` row was never in [`TABLES`], `table::sig` could not see
+// it, `dsl::cuda` could not wrap it and `execution::RUST_SERVED` refused it,
+// so it had no reading consumer and is therefore not data. See that module's
+// header for the four-way table.
+//
+// `mlp` and `quant` ARE GONE — §5 step 5 took both into fn-world. Neither
+// module here is replaced by a table: `x::mlp` states twelve contracts and
+// `x::quant` eleven, `Contract::sig` derives their rows, and `x::SIGS` is
+// concatenated below by [`concat_lists`]. **Both state no `operands`** — the
+// third shim-dropping mechanism, and the reason `pie_k_mlp_*`/`pie_k_quant_*`
+// were never generated in the first place: the operand list that used to be
+// the binding instruction is now the host `fn`'s parameter list.
+//
+// `ssm` IS GONE for the same reason — §5 step 5 took its five roots into
+// `x::ssm`, where twenty-seven contracts and twenty-seven host programs
+// replace twenty-seven rows. Four of the twenty-seven are `none:` arms:
+// their rows stated EVERY operand unsourced, so the sentence a load-time
+// refusal prints is the prose those rows were already carrying.
 pub mod moe;
-pub mod norm;
-pub mod quant;
-pub mod sample;
-pub mod ssm;
 
 /// Every kernel a lowered declaration may state.
 ///
@@ -81,13 +123,28 @@ pub static KERNELS: &[KernelSig] = &concat_tables();
 /// there emits no `extern "C"` and fails at link time in whichever binary
 /// happened to state one of its symbols first.
 ///
-/// [`driver_internal`] is deliberately absent, for the reason its own module
-/// doc gives — its rows are launchers the driver fires with no DSL statement,
-/// so they must not be `check_plan`-visible. The shim generator adds them
-/// back explicitly, because an entry point is what they need and a statement
-/// is not.
+/// `driver_internal` was deliberately absent, for the reason its own module
+/// doc gave — its rows were launchers the driver fires with no DSL statement,
+/// so they must not be `check_plan`-visible. **That module is gone**: §5 step
+/// 5 took its six rows to `x::driver_internal` as plain `fn`s with no
+/// `contract!`, which is the same claim made by construction instead of by
+/// omission from a list. The shim generator no longer adds them back, because
+/// a direct Rust call needs no entry point.
 ///
-/// # `rope` is not a module here, and that is the migration
+/// # A ported family is registered in ONE place, and it is not here
+///
+/// The row modules below are the ones still written as rows. Every family
+/// that has crossed into fn-world arrives through [`crate::x::SIGS`], which
+/// this list concatenates — so **porting a family means appending to
+/// `x::SIGS` and deleting a module here, and never adding a line to two
+/// lists.**
+///
+/// It was two lists for exactly one commit, and the hazard is worth naming
+/// because the §5 step-5 sweep runs several agents in parallel: a family
+/// whose contracts exist and whose `SIGS` is not in `TABLES` compiles, links,
+/// and is refused by `check_plan` at model load with *"no kernel! signature
+/// declares it"* — a message that sends the reader to the table for a symbol
+/// whose declaration is fine. One list cannot fail that way.
 ///
 /// `crate::x::rope::SIGS` is the same list from the other world: twelve
 /// contracts, derived by `Contract::sig` rather than written. A row here
@@ -97,11 +154,45 @@ pub static KERNELS: &[KernelSig] = &concat_tables();
 /// entry, and is the one every ported family uses. `check_plan` still
 /// refuses a symbol nothing declares, which is the whole reason this list
 /// keeps them.
-pub static TABLES: &[&[KernelSig]] = &[
-    attn::KERNELS, crate::x::rope::SIGS, norm::KERNELS, mlp::KERNELS, gemm::KERNELS,
-    moe::KERNELS, ssm::KERNELS, quant::KERNELS, layout::KERNELS,
-    sample::KERNELS, adapter::KERNELS,
-];
+pub static TABLES: &[&[KernelSig]] = &concat_lists();
+
+/// The families still written as rows.
+///
+/// Shrinks by one module per §5 step-5 port and is empty when the sweep is
+/// done. When it is, [`KERNELS`] is `x::SIGS` and this file is deletable —
+/// which is the clearest available statement of what step 5 finishing means.
+///
+/// `static` rather than `const`, and deliberately: the members are `static`s,
+/// and [`TABLES`] has read `static`s from a `const` context here since
+/// [`total`] was written. Matching that shape exactly means this line adds no
+/// construct the tree has not already compiled.
+static ROW_TABLES: &[&[KernelSig]] = &[attn::KERNELS, moe::KERNELS];
+
+const N_LISTS: usize = ROW_TABLES.len() + crate::x::SIGS.len();
+
+/// The row lists and the fn-world lists as one list of lists.
+///
+/// Const, because [`TABLES`] is `&'static` and read by
+/// `kernels-cuda/build.rs` before anything runs.
+const fn concat_lists() -> [&'static [KernelSig]; N_LISTS] {
+    let mut out = [EMPTY_LIST; N_LISTS];
+    let mut w = 0;
+    let mut i = 0;
+    while i < ROW_TABLES.len() {
+        out[w] = ROW_TABLES[i];
+        w += 1;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < crate::x::SIGS.len() {
+        out[w] = crate::x::SIGS[j];
+        w += 1;
+        j += 1;
+    }
+    out
+}
+
+const EMPTY_LIST: &[KernelSig] = &[];
 
 /// The row a symbol names, or nothing.
 ///
@@ -156,7 +247,7 @@ const EMPTY: KernelSig = KernelSig {
     lacks: &[], sink: None, in_place: &[], depth_prefix_plan: false, publishes_aux: &[],
     operands: &[],
     returns: "", axes: &[], grid_param: None,
-    head_param: None, heads_param: None, lowered_as: None,
+    head_param: None, heads_param: None, rows_param: None, lowered_as: None,
 };
 
 const fn copy_sig(k: &KernelSig) -> KernelSig {
@@ -168,6 +259,7 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         operands: k.operands, returns: k.returns, axes: k.axes,
         grid_param: k.grid_param,
         head_param: k.head_param, heads_param: k.heads_param,
+        rows_param: k.rows_param,
         lowered_as: k.lowered_as,
     }
 }
@@ -210,20 +302,22 @@ mod tests {
         }
     }
 
-    /// `driver_internal`'s rows are reachable and are NOT in [`KERNELS`].
+    /// `driver_internal`'s rows were reachable and NOT in [`KERNELS`].
     ///
-    /// The check the seam's closing made cheap: both tables are in one crate
-    /// now, so the rule that kept them apart — a driver-fired launcher has an
-    /// entry point and no statement — is testable in one place instead of
-    /// being restated in two crates' prose.
-    #[test]
-    fn the_driver_internal_rows_are_not_statable() {
-        for row in super::driver_internal::DRIVER_KERNELS {
-            assert!(
-                sig(row.symbol).is_none(),
-                "{} is fired by the driver and also statable by a model text",
-                row.symbol
-            );
-        }
-    }
+    /// THE TEST IS DELETED WITH ITS SUBJECT. It read
+    /// `super::driver_internal::DRIVER_KERNELS` and asserted `sig(symbol)`
+    /// answered `None` for every row — the rule that kept the two tables
+    /// apart, *a driver-fired launcher has an entry point and no statement*.
+    ///
+    /// §5 step 5 made the rule unstatable by making it true by construction:
+    /// there is no second table to compare against, because the six launchers
+    /// are `fn`s in `x::driver_internal` with no `contract!`, hence no
+    /// `Entry`, hence nothing in `x::SIGS` and nothing for `sig` to find. A
+    /// test that a symbol is absent from every list, when the symbol no
+    /// longer exists as data in any list, is a test of the empty set.
+    ///
+    /// What replaced it is not a test here but the four-way table in
+    /// `x::driver_internal`'s header, which says which of the four
+    /// arrangements each family took and why this one took the fourth.
+    const _THE_DRIVER_INTERNAL_ROWS_ARE_NOT_STATABLE: () = ();
 }

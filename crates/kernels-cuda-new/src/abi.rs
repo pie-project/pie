@@ -720,15 +720,16 @@ mod tests {
         // fn-world (`.wiki/kernel-x/northstar.md` §5 step 3) and its
         // contracts state no `operands`, so `stated()` returns nothing for
         // it and this test would assert over an empty set — which passes
-        // and proves nothing. `norm` is the nearest table that still has
-        // ahead-of-time rows.
+        // and proves nothing. `norm` was the nearest table that still had
+        // ahead-of-time rows, and §5 step 5 took `norm` too; `attn` is the
+        // nearest one now.
         //
         // The `RUST_SERVED` filter is `emit_c_shim`'s own, hoisted here
         // because the table it walks now has rows on that list: a row served
         // by a Rust host program has no shim entry BY DESIGN, and asserting
         // one exists would assert the opposite of what the emitter is for.
-        let tables: &[&'static [KernelSig]] = &[crate::table::norm::KERNELS];
-        let c = emit_c_shim(tables, &["norm/rmsnorm.hpp"], &[]).expect("no collisions");
+        let tables: &[&'static [KernelSig]] = &[crate::table::attn::KERNELS];
+        let c = emit_c_shim(tables, &["attn/attn.hpp"], &[]).expect("no collisions");
         let rs = emit_rust_bindings(tables);
         for k in stated(tables)
             .into_iter()
@@ -2463,15 +2464,37 @@ mod stated_rows {
     fn a_fully_stated_row_emits_a_branch() {
         let tables: &[&[kernels::KernelSig]] = &[
             crate::table::attn::KERNELS,
-            crate::table::gemm::KERNELS,
-            crate::table::layout::KERNELS,
-            crate::table::mlp::KERNELS,
             crate::table::moe::KERNELS,
-            crate::table::norm::KERNELS,
-            crate::table::quant::KERNELS,
+            // `crate::table::gemm::KERNELS` stood here and left for the
+            // reason below: §5 step 5 took `gemm` into fn-world, and
+            // `x::gemm`'s twelve contracts derive rows with no operands.
+            //
+            // It is NOT repointed to `x::gemm::SIGS`, and that choice is the
+            // one worth writing down. This walk's inner filter is
+            // `!k.operands.is_empty()`, so a derived list contributes ZERO
+            // rows to it: appending `x::gemm::SIGS` here would make the test
+            // still pass while asserting nothing about `gemm` — a list that
+            // cannot fail, which reads in a diff exactly like a list that
+            // passes. The same argument retired `mlp`, `quant`, `rope`,
+            // `layout` and `norm` from this list below.
+            // `crate::table::norm::KERNELS` stood here and left for the
+            // reason below: §5 step 5 took `norm` into fn-world, `x::norm`'s
+            // twenty-eight contracts derive rows with no operands, and a row
+            // with no operands is not a fully stated row.
+            // `crate::table::mlp::KERNELS` and `crate::table::quant::KERNELS`
+            // stood here and left for the reason below: §5 step 5 took both
+            // into fn-world, `x::mlp`'s twelve contracts and `x::quant`'s
+            // eleven derive rows with no operands, and a row with no operands
+            // is not a fully stated row.
             // `crate::table::rope::KERNELS` stood here; `rope` states no
             // operands now and would contribute no row to this walk.
-            crate::table::ssm::KERNELS,
+            // `crate::table::layout::KERNELS` stood here too, and left for
+            // the same reason: `x::layout`'s seven contracts derive rows
+            // with no operands, so this test — which asserts that a FULLY
+            // STATED row emits a branch — has nothing to assert about them.
+            // `crate::table::ssm::KERNELS` stood here and left last: §5 step
+            // 5 took `ssm`'s five roots into fn-world, and `x::ssm`'s
+            // twenty-seven contracts derive rows with no operands.
         ];
         let mut missing = Vec::new();
         for table in tables {

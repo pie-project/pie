@@ -661,7 +661,10 @@ impl LoadPlan {
     /// names rather than a flag because **a checkpoint need not be uniform**:
     /// `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98 tensors as affine/64/4
     /// in its `quantization` block and leaves the expert banks out, so those
-    /// take the top-level default — mxfp4, group 32.
+    /// take the top-level default — mxfp4, group 32. The block holds 122
+    /// entries, not 98; the other 24 name the `mlp.router` gates at 64/**8**.
+    /// So the one checkpoint carries THREE formats, and a set of names is the
+    /// only shape of answer that can carry that.
     ///
     /// Reading a bank with the dense format is not a near miss. Every scale
     /// comes from the wrong offset and bf16 garbage is NaN more often than
@@ -728,6 +731,89 @@ impl LoadPlan {
         points.sort_unstable();
         points.dedup();
         points
+    }
+
+    /// Each distinct affine point beside ONE tensor that arrives at it.
+    ///
+    /// [`Self::affine_points`] is a count, and a count is what a refusal
+    /// cannot act on: an operator told a checkpoint "arrives at 2 affine
+    /// points (g64/b4, g64/b8)" learns that it is refused and nothing about
+    /// what to do next. `gpt-oss-20b-MXFP4-Q4`'s second point belongs to its
+    /// 24 `mlp.router` gates and to nothing else, and a message that says so
+    /// is the difference between a dead end and a named one.
+    ///
+    /// The witness is the FIRST tensor at each point in declaration order,
+    /// which for every checkpoint this has been run against is the earliest
+    /// layer's — a name an operator can look up in the index.
+    ///
+    /// Sorted by point, for the same reason [`Self::affine_points`] is.
+    /// Every affine tensor's point, by name.
+    ///
+    /// [`Self::affine_point_of`] answers one name in a scan of the whole
+    /// declaration list; a driver that must answer several — and that must
+    /// not read [`Encoding`] and [`QuantScheme`] structurally to do it, which
+    /// is the coupling `mxfp4_tensor_names` exists to avoid — takes the map
+    /// once and asks it.
+    #[must_use]
+    pub fn affine_by_name(&self) -> std::collections::HashMap<String, (u32, u32)> {
+        self.tensors
+            .iter()
+            .filter_map(|t| match &t.encoding {
+                Encoding::Quant(spec)
+                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
+                {
+                    Some((
+                        t.name.clone(),
+                        (spec.group_size, u32::from(spec.bits_per_element)),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The affine point ONE named tensor arrives at, if it is affine.
+    ///
+    /// The by-name form of [`Self::affine_points`], for a driver that must
+    /// know not just how many points a checkpoint holds but WHICH tensor
+    /// holds which. `driver-metal` puts two names to this — the expert bank
+    /// and the router gate — and a checkpoint that answers a third point for
+    /// anything else is one it refuses.
+    ///
+    /// `None` for a tensor that is absent, raw, or MXFP4: none of the three
+    /// is read at an affine point.
+    #[must_use]
+    pub fn affine_point_of(&self, name: &str) -> Option<(u32, u32)> {
+        self.tensors
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| match &t.encoding {
+                Encoding::Quant(spec)
+                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
+                {
+                    Some((spec.group_size, u32::from(spec.bits_per_element)))
+                }
+                _ => None,
+            })
+    }
+
+    #[must_use]
+    pub fn affine_point_witnesses(&self) -> Vec<((u32, u32), String)> {
+        let mut out: Vec<((u32, u32), String)> = Vec::new();
+        for t in &self.tensors {
+            let Encoding::Quant(spec) = &t.encoding else {
+                continue;
+            };
+            if spec.scheme == QuantScheme::Mxfp4E2M1E8M0 || spec.group_size == 0 {
+                continue;
+            }
+            let point = (spec.group_size, u32::from(spec.bits_per_element));
+            if !out.iter().any(|(p, _)| *p == point) {
+                out.push((point, t.name.clone()));
+            }
+        }
+        out.sort_unstable_by_key(|(p, _)| *p);
+        out
     }
 }
 
@@ -840,6 +926,20 @@ mod plan_query_tests {
         plan.tensors
             .push(decl("layer.0.norm.weight", Encoding::Raw(DType::BF16)));
         assert_eq!(plan.affine_points(), vec![(64, 4), (64, 8)]);
+
+        // AND WHICH TENSOR MADE IT SO. The count above says a driver cannot
+        // serve this checkpoint; only the witness says the obstacle is the
+        // router gate, which is the sentence that names the next piece of
+        // work rather than ending the conversation.
+        assert_eq!(
+            plan.affine_point_witnesses(),
+            vec![
+                ((64, 4), "layer.0.q_proj.weight".to_string()),
+                ((64, 8), "layer.0.router.gate".to_string()),
+            ],
+            "each point beside the FIRST tensor declared at it, and neither \
+             the mxfp4 bank nor the raw norm is a witness to anything"
+        );
     }
 
     #[test]

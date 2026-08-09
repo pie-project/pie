@@ -1067,8 +1067,15 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // rectangle is refused nowhere and is wrong everywhere, and binding to the
     // end of the arena is refused nowhere and is the exact defect that lets a
     // kernel scribble on its neighbour. Both change this sum.
+    // RE-MEASURED after `crates/kernels` gained `rows_param` and the shared
+    // MoE rows started stating it. `route_gather`'s rows are the SORTED STACK
+    // -- one per route, `tokens * experts_per_token` of them -- not the fire's
+    // tokens, and the three routed matvecs name `out_vec_size` as their grid
+    // extent rather than their rectangle's width. Both are row content this
+    // crate had not copied, so the plans this file walks changed shape when
+    // they were.
     assert_eq!(
-        total, 2_368_916_160,
+        total, 2_964_655_200,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -1131,13 +1138,15 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
         launches, 6584,
         "a different number of rectangles was re-bound"
     );
+    // Two more, for the same reason the byte total moved: see the note above
+    // it. A wider rectangle is a rectangle with more ways to run off the end.
     assert_eq!(
-        refused, 12,
+        refused, 14,
         "{launches} launches bound against an arena one byte shorter than the \
          one they were placed in, and a different number ran off it"
     );
     assert_eq!(
-        texts_refusing, 10,
+        texts_refusing, 12,
         "a different number of texts has a rectangle ending at the end of its \
          arena"
     );
@@ -1797,8 +1806,12 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // went missing would take the fire's number and normalise over the wrong
     // width, producing numbers rather than an error, and this count going to
     // zero is the only thing that would say so.
+    // 1788 before the shared MoE rows started stating `grid_param` on the
+    // three routed matvecs and `rows_param` on `route_gather`. This crate had
+    // not copied either, so 432 rectangles were taking the fire's number where
+    // the row names one -- which is what this count exists to notice.
     assert_eq!(
-        overridden, 1788,
+        overridden, 2220,
         "a different number of rectangles states its own extent"
     );
     // Counted separately, and that was not tidying. `head_param` is 1056 and
@@ -1869,8 +1882,17 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // invocation owning one rotary pair -- and it alone dispatches 22,663,680
     // of these workgroups, which is why the two totals cannot be compared and
     // why this one is measured from the modules rather than transcribed.
+    // 48,945,410 before the shared MoE rows started stating their extents,
+    // and the +342,024 is entirely `route_gather`: `rows_param = Some(4)` puts
+    // its rows on the SORTED STACK, so it now covers all of its own output
+    // instead of a quarter of it at `top_k = 4`.
+    //
+    // It went the other way first. Reading `grid_param` without also reading
+    // it in `Rule::RoutedQmv` -- which took the rectangle's `width`, `k` times
+    // one result -- put this at 147,555,722, three times over. Both readings
+    // are the row's, and this number is what says the pair is consistent.
     assert_eq!(
-        workgroups, 48_945_410,
+        workgroups, 49_287_434,
         "the plans dispatch a different amount of work"
     );
     // The third dimension is a prefill's rows, and only the paged decodes put
@@ -1905,6 +1927,7 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
     // keep in step for no gain -- nothing below reads any field but `params`.
     let mut low = texts().swap_remove(0).1;
     let mut rows = 0u32;
+    let mut refused_rows = 0u32;
     let mut named = BTreeMap::<String, u32>::new();
 
     for sig in kernels_wgpu::KERNELS {
@@ -1959,6 +1982,30 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
             uniform_bytes: (words * 4).next_multiple_of(16),
             block_bytes: vec![None],
         };
+        // A row wanting a STRIDE is refused, and that is the answer this
+        // driver owes it. Both strides mean "walk the cache with no page
+        // table", and the pool is `[page, token, head, dim]`: handing them
+        // over makes the launch succeed against the wrong tokens. The
+        // refusal is checked here too, rather than only in the unit test,
+        // because this is the sweep that walks the SHIPPED table -- a row
+        // added tomorrow that names a stride is refused or this fails.
+        if wanted
+            .iter()
+            .any(|s| matches!(s, Source::KvHeadStride | Source::KvSeqStride))
+        {
+            let why = driver_wgpu::binding::scalars(sig, &low, &launch, &declared, &store)
+                .expect_err("a contiguous stride is refused, not answered");
+            assert!(
+                format!("{why}").contains("pool is paged"),
+                "`{}` is refused for the reason it should be: {why}",
+                sig.symbol
+            );
+            refused_rows += 1;
+            for src in wanted {
+                *named.entry(format!("{src:?}")).or_default() += 1;
+            }
+            continue;
+        }
         let got = driver_wgpu::binding::scalars(sig, &low, &launch, &declared, &store)
             .unwrap_or_else(|why| panic!("`{}`: {why}", sig.symbol));
         let bytes = match got {
@@ -2005,6 +2052,15 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
     // being written and the shader reads whatever the statement left in that
     // slot.
     assert_eq!(rows, 6, "a different number of rows names a pool number");
+    // Three of the six ROWS walk the cache contiguously -- `kv_append`,
+    // `sdpa_vector_decode` and `sdpa_vector_decode_swa`. (The strides appear
+    // five times each in the tally below because a row names both a key and a
+    // value stride; this counts rows.) The other three name only
+    // `KvPageSize` and are answered.
+    assert_eq!(
+        refused_rows, 3,
+        "a different number of rows walks the cache with no page table"
+    );
     assert_eq!(
         named,
         [
@@ -2075,4 +2131,218 @@ fn expected_run(sig: &KernelSig, low: &Lowered, params: u32) -> Vec<u32> {
         }
     }
     run
+}
+
+/// Every row count the projection guard admits to the GEMM is one the
+/// geometry can launch.
+///
+/// # The defect this was written to measure
+///
+/// `llama_like`'s projection is a GUARD, not a Rust `if`: the arm that fires
+/// is chosen per fire, at lowering time. Its predicate was
+/// `GuardPred::TokensGT(tile - 1)` — enough rows — while the kernel needs a
+/// whole number of tiles. The comment directly above it quoted the
+/// precondition it then failed to test: *"its header says the driver only
+/// selects it when `M % BM == 0`"*. 32 rows is two whole 16-row tiles, 35 is
+/// not, and both are `> 15`, so a real `pie run` of *"What is the capital of
+/// France? Answer in one word."* — 35 tokens after templating — died at the
+/// first projection:
+///
+///     Unplannable { symbol: "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32",
+///                   why: Ungeometric { why: PartialTile { rows: 35, tile: 16 } } }
+///
+/// Fifteen row counts in sixteen were in that state, on Metal, Vulkan and
+/// wgpu alike — `qmm_multi_batch` is `true` on all three.
+///
+/// # What fixed it, and why the fix was not a driver's
+///
+/// `driver-metal`'s `Ungeometric::PartialTile` says the answer is *"a text
+/// that states the pair with a predicate on rows"*, as though the text did
+/// not. It did — this guard has had a GEMM arm and a GEMV arm all along. The
+/// mechanism was not missing; the predicate was wrong, and `GuardPred` could
+/// not spell the right one. `GuardPred::TokensMultipleOf(k)` is that variant:
+/// one arm in `model_compiler::lower` (where every guard is evaluated, in ONE
+/// place), one wire slot, one line in the text.
+///
+/// No driver could have reached it. `m` is in no entrypoint's uniform block —
+/// `qmm_t.wgsl`: *"the launch names the grid and nothing else"* — so the row
+/// overhang cannot be guarded in the shader either without changing the
+/// shared table's operand list.
+///
+/// # What this asserts now
+///
+/// Not "35 works", which one predicate makes true and any other could make
+/// true by accident. It sweeps EVERY row count from 1 to four tiles, asks the
+/// plan which arm came out, and asks the geometry whether that arm's grid
+/// exists — two answers computed by different code, in different crates, that
+/// have to agree for every count. A predicate that admitted one row too many
+/// or one too few fails on the count it got wrong, by number.
+#[test]
+fn every_row_count_the_guard_sends_to_the_gemm_has_a_grid() {
+    let facts = LlamaLikeFacts::qwen3_0_6b();
+    let metal = wgpu_facts();
+    let tile = metal.qmm_tile.0.max(1) as usize;
+    assert!(
+        metal.qmm_multi_batch,
+        "the guard only exists for such a build"
+    );
+
+    // The GEMM's own symbol, built the way the text builds it, so the tile the
+    // geometry reads is the tile the plan named.
+    let symbol = format!(
+        "affine_qmm_t{}",
+        model_compiler::dsl::metal::affine_gemm_point(
+            metal.proj_repr,
+            metal.affine_bits,
+            metal.qmm_tile,
+        )
+    );
+    let module = driver_wgpu::reflect::entrypoint(&symbol, kernels_wgpu::Capability::Baseline)
+        .map(|d| driver_wgpu::geometry::Module::loaded(&symbol, &d))
+        .unwrap_or_else(|e| panic!("`{symbol}` is a module this build has: {e}"));
+
+    let mut gemm_counts = Vec::new();
+    for rows in 1..=4 * tile {
+        let low = lowered(&facts, &metal, FireClass::Prefill, rows)
+            .unwrap_or_else(|| panic!("qwen3 lowers at {rows} rows"));
+        let takes_gemm = low.kernels.iter().any(|k| k.starts_with("affine_qmm_t"));
+        let grid = driver_wgpu::geometry::groups(
+            driver_wgpu::geometry::Rule::Qmm,
+            driver_wgpu::geometry::Dims {
+                rows: rows as u32,
+                width: 1024,
+                in_width: 1024,
+                ..Default::default()
+            },
+            module,
+        );
+        if takes_gemm {
+            gemm_counts.push(rows);
+            assert!(
+                grid.is_ok(),
+                "the guard sent {rows} rows to `{symbol}`, which the geometry \
+                 refuses: {:?}",
+                grid.unwrap_err()
+            );
+        } else {
+            // The other direction, so this is not one claim checked against
+            // itself: a count the guard KEEPS from the GEMM is a count the
+            // geometry would have refused. If they ever both say yes here, the
+            // guard has become needlessly narrow rather than wrong.
+            assert!(
+                grid.is_err(),
+                "{rows} rows took the GEMV arm, but the GEMM's grid exists for \
+                 it -- the guard is refusing work it could do"
+            );
+        }
+    }
+
+    // And the set is the multiples of the tile, stated as a list rather than
+    // as a rule, because a rule here would be the predicate agreeing with
+    // itself.
+    assert_eq!(
+        gemm_counts,
+        vec![tile, 2 * tile, 3 * tile, 4 * tile],
+        "the GEMM arm is taken at exactly the tile-aligned row counts"
+    );
+}
+
+/// Every launch of a real plan, at the token count this seam CLAIMS, fits the
+/// device limit it will be dispatched under.
+///
+/// # The claim this measures
+///
+/// `engine/src/driver/backend/wgpu.rs` reports a `max_forward_tokens` and a
+/// `max_forward_requests`. Those are not descriptions -- the scheduler FORMS
+/// BATCHES under them, so a fire of four thousand tokens is a fire this driver
+/// has said it will take. Nothing had checked that it can, and it could not:
+/// the seam stated 4096 and the largest that fits is 4095.
+///
+/// The bound that makes this a real question is `MAX_WORKGROUPS_PER_DIMENSION`,
+/// and `geometry.rs`'s own note says how close it is: *"a `Rule::Elementwise`
+/// launch over a 4096-wide hidden and 32 rows is 131072 lanes, which is 512
+/// workgroups at 256 wide -- fine -- but the same rule over a 151936-wide
+/// vocabulary at 16 rows is 9496 workgroups, and a 64-row prefill of it is
+/// 37984. The margin is one order of magnitude, not six."* One order of
+/// magnitude is four doublings, and the claim is a factor of sixty-four above
+/// the largest row count anything else in this file lowers.
+///
+/// # What it does NOT do
+///
+/// It does not dispatch. `groups_within` is the same arithmetic the fire path
+/// runs, asked of the same modules over the same plans, and a grid that fits
+/// here is one no `PastDeviceLimit` can reject there. What a GPU would add is
+/// whether the memory exists, which is a different claim and one
+/// `max_page_refs` makes separately.
+#[test]
+fn every_launch_at_the_claimed_token_ceiling_fits_the_device() {
+    // What the seam MEASURES, not what it used to state. It reported the
+    // literal 4096 until this test failed on it: at 4096 tokens
+    // `rms_single_row` wants 65,536 workgroups on one axis and the device's
+    // limit is 65,535 -- over by exactly one. The seam searches for the
+    // boundary now (`widest_fire`), and for this model the answer is 4095.
+    //
+    // Stated here as a literal ON PURPOSE. If the seam's search changes, this
+    // should fail and be read, rather than quietly following it.
+    const CLAIMED_TOKENS: usize = 4095;
+    const LIMIT: u32 = driver_wgpu::geometry::MAX_WORKGROUPS_PER_DIMENSION;
+
+    let facts = LlamaLikeFacts::qwen3_0_6b();
+    let metal = wgpu_facts();
+    let low = lowered(&facts, &metal, FireClass::Prefill, CLAIMED_TOKENS)
+        .unwrap_or_else(|| panic!("qwen3 lowers at the {CLAIMED_TOKENS} tokens it is promised"));
+    let geometry = Geometry {
+        q_heads: facts.q_heads,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        rotary_dims: facts.head_dim,
+        n_experts: facts.n_experts,
+        experts_per_token: facts.experts_per_token,
+    };
+    let mods = modules(std::iter::once(&low));
+
+    let mut checked = 0usize;
+    let mut widest = 0u32;
+    for launch in &low.launches {
+        let symbol = &low.kernels[launch.kernel as usize];
+        let Some(declared) = mods.get(symbol) else {
+            continue;
+        };
+        let module = driver_wgpu::geometry::Module::loaded(symbol, declared);
+        let Ok(rule) = driver_wgpu::dispatch::rule_of(kernels_wgpu::KERNELS, symbol) else {
+            continue;
+        };
+        let sig = kernels::sig_in(kernels_wgpu::KERNELS, symbol);
+        let dims = match sig {
+            Some(sig) => driver_wgpu::dispatch::dims_of(sig, &low, launch, geometry),
+            None => continue,
+        };
+        match driver_wgpu::geometry::groups_within(rule, dims, module, LIMIT) {
+            Ok(g) => {
+                checked += 1;
+                widest = widest.max(g.into_iter().max().unwrap_or(0));
+            }
+            // A rule this backend does not serve is not this test's business;
+            // `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`
+            // is where that lives.
+            Err(driver_wgpu::geometry::Ungeometric::Unruled(_)) => {}
+            Err(e) => {
+                panic!("`{symbol}` at {CLAIMED_TOKENS} tokens, which this seam says it takes: {e}")
+            }
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "no launch of a {CLAIMED_TOKENS}-token prefill was checked, so this \
+         test measures nothing"
+    );
+    // The margin, printed rather than asserted: it is a fact about this model
+    // at this ceiling, and pinning it would fail on the next model rather than
+    // on a defect. What IS asserted is that nothing crossed the line.
+    eprintln!(
+        "{checked} launches at {CLAIMED_TOKENS} tokens, widest grid {widest} of {LIMIT} \
+         ({}% of the limit)",
+        widest as u64 * 100 / u64::from(LIMIT)
+    );
 }

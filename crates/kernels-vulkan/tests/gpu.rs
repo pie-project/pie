@@ -1721,6 +1721,206 @@ fn sdpa_paged_decode_matches_a_scalar_reference() {
     }
 }
 
+/// `sdpa_paged_tiled_bfloat16_d_64` against the same scalar reference.
+///
+/// The prefill path, which until this test had no direct numeric coverage at
+/// all -- it was checked only through the driver, end to end, against a
+/// checkpoint's expected tokens. That is a real check but a slow and blunt
+/// one, and it was not enough to rewrite the kernel against.
+///
+/// The rewrite made the key loop cooperative: thirty-two lanes share a row and
+/// reduce one score between them, instead of each lane recomputing the whole
+/// dot product for every dimension it owns. Doing that needs a workgroup-wide
+/// `barrier()` inside the key loop, and a barrier is only legal if every
+/// thread reaches it -- which is the hard part here, because a tile spans
+/// thirty-two DIFFERENT rows with different positions, different windows and
+/// different masks. Three things had to become uniform: the loop bound is the
+/// largest position in the TILE rather than each row's own, rows past
+/// `n_rows` stay in the loop with `q_pos = -1` instead of returning, and the
+/// mask became a predicate on the body rather than a `continue`.
+///
+/// **This test does not prove those three.** It was written believing it did,
+/// and then mutated to find out. Reverting the tile-wide bound to each row's
+/// own position passes. Letting the dead rows return early passes. Both do,
+/// because on this GPU a row's thirty-two lanes are exactly one subgroup, so
+/// lanes never actually wait on a barrier a neighbouring row failed to reach
+/// -- the divergence the barrier rule exists to forbid is unobservable here.
+/// The uniform shape is still what the specification requires and is what a
+/// wider or narrower subgroup would need; this machine simply cannot tell.
+/// Saying so is better than a comment claiming coverage that does not exist.
+///
+/// What it DOES prove, by mutants that fail: the mask and window are applied
+/// (dropping `keeps` fails), and each lane accumulates the output dimensions
+/// it actually owns (striding them `lane * n + i` instead of
+/// `lane + i * 32` fails). Together with the page table, the shuffled
+/// physical pages, grouped-query attention and the online-softmax fold, that
+/// is the arithmetic of the rewrite. The barrier discipline is argued, not
+/// measured, and a machine with a subgroup narrower than 32 would be the
+/// place to measure it.
+///
+/// The reference below is the plain softmax, computed only over the keys the
+/// mask and the window keep.
+#[test]
+fn sdpa_paged_tiled_matches_a_scalar_reference() {
+    let gpu = gpu!();
+
+    let head_dim = 64usize;
+    let page_size = 16usize;
+    let n_kv_heads = 2usize;
+    let gqa = 2usize;
+    let n_q_heads = n_kv_heads * gqa;
+    let scale = 0.125f32;
+    let window = 8i32;
+
+    // Two requests prefilled at once: 20 tokens and 15. 35 rows is one full
+    // tile plus three, which is the point -- see the doc above.
+    let lengths = [20usize, 15];
+    let rows: usize = lengths.iter().sum();
+    assert!(rows > 32, "the dead-lane case is the interesting one");
+
+    let pages_per: Vec<usize> = lengths.iter().map(|l| l.div_ceil(page_size)).collect();
+    let total_pages: usize = pages_per.iter().sum();
+    let physical: Vec<u32> = {
+        let mut v: Vec<u32> = (0..total_pages as u32).collect();
+        v.reverse();
+        v
+    };
+    let mut indptr = vec![0u32];
+    for p in &pages_per {
+        indptr.push(indptr.last().unwrap() + *p as u32);
+    }
+
+    let slots = total_pages * page_size;
+    let kv_elems = slots * n_kv_heads * head_dim;
+    let kf: Vec<f32> = (0..kv_elems)
+        .map(|i| ((i % 31) as f32 - 15.0) / 40.0)
+        .collect();
+    let vf: Vec<f32> = (0..kv_elems)
+        .map(|i| ((i % 23) as f32 - 11.0) / 30.0)
+        .collect();
+    let qf: Vec<f32> = (0..rows * n_q_heads * head_dim)
+        .map(|i| ((i % 19) as f32 - 9.0) / 20.0)
+        .collect();
+
+    let mut positions: Vec<i32> = Vec::new();
+    let mut req_of_token: Vec<i32> = Vec::new();
+    for (req, len) in lengths.iter().enumerate() {
+        for t in 0..*len {
+            positions.push(t as i32);
+            req_of_token.push(req as i32);
+        }
+    }
+
+    // Row 7 is in the first tile, row 33 in the second and alive; both keep
+    // only the keys whose index is not one more than a multiple of three, and
+    // their own position is always kept so no row ends up with an empty
+    // softmax.
+    let stride = 20usize;
+    let masked_rows = [7usize, 33];
+    let mut mask = vec![0u8; rows * stride];
+    let mut mask_on = vec![0u8; rows];
+    for &r in &masked_rows {
+        mask_on[r] = 1;
+        for kp in 0..stride {
+            let keep = kp % 3 != 1 || kp == positions[r] as usize;
+            mask[r * stride + kp] = u8::from(keep);
+        }
+    }
+
+    let operands = vec![
+        bf16_bytes(&qf),
+        bf16_bytes(&kf),
+        bf16_bytes(&vf),
+        vec![0u8; rows * n_q_heads * head_dim * 2],
+        positions.iter().flat_map(|p| p.to_le_bytes()).collect(),
+        req_of_token.iter().flat_map(|r| r.to_le_bytes()).collect(),
+        physical.iter().flat_map(|p| p.to_le_bytes()).collect(),
+        indptr.iter().flat_map(|p| p.to_le_bytes()).collect(),
+        mask.clone(),
+        mask_on.clone(),
+        vec![0u8; n_q_heads * 2],
+    ];
+
+    let mut push = Vec::new();
+    push.extend_from_slice(&(gqa as i32).to_le_bytes());
+    push.extend_from_slice(&(page_size as i32).to_le_bytes());
+    push.extend_from_slice(&(n_kv_heads as i32).to_le_bytes());
+    push.extend_from_slice(&scale.to_le_bytes());
+    push.extend_from_slice(&(stride as u32).to_le_bytes());
+    push.extend_from_slice(&window.to_le_bytes());
+    push.extend_from_slice(&(rows as i32).to_le_bytes());
+
+    let out = gpu.dispatch(
+        "sdpa_paged_tiled_bfloat16_d_64",
+        Capability::Baseline,
+        &operands,
+        &push,
+        [n_q_heads as u32, (rows as u32).div_ceil(32), 1],
+    );
+
+    let q = bf16_read(&operands[0]);
+    let k = bf16_read(&operands[1]);
+    let v = bf16_read(&operands[2]);
+    let slot_of = |req: usize, kp: usize| {
+        let phys = physical[indptr[req] as usize + kp / page_size] as usize;
+        phys * page_size + kp % page_size
+    };
+
+    let mut want = vec![0.0f32; rows * n_q_heads * head_dim];
+    let mut kept_total = 0usize;
+    for row in 0..rows {
+        let req = req_of_token[row] as usize;
+        let q_pos = positions[row] as usize;
+        let start = if window > 0 && q_pos as i32 >= window {
+            q_pos + 1 - window as usize
+        } else {
+            0
+        };
+        let keeps: Vec<usize> = (start..=q_pos)
+            .filter(|kp| mask_on[row] == 0 || mask[row * stride + kp] != 0)
+            .collect();
+        kept_total += keeps.len();
+        for h in 0..n_q_heads {
+            let kv_head = h / gqa;
+            let q_base = (row * n_q_heads + h) * head_dim;
+            let scores: Vec<f32> = keeps
+                .iter()
+                .map(|&kp| {
+                    let k_base = (slot_of(req, kp) * n_kv_heads + kv_head) * head_dim;
+                    (0..head_dim)
+                        .map(|d| scale * q[q_base + d] * k[k_base + d])
+                        .sum::<f32>()
+                })
+                .collect();
+            let hi = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - hi).exp()).collect();
+            let denom: f32 = exps.iter().sum();
+            for d in 0..head_dim {
+                let acc: f32 = keeps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &kp)| {
+                        let v_at = (slot_of(req, kp) * n_kv_heads + kv_head) * head_dim + d;
+                        exps[i] * v[v_at]
+                    })
+                    .sum();
+                want[q_base + d] = acc / denom;
+            }
+        }
+    }
+
+    // The window and the mask must actually have thrown keys away, or the
+    // whole point of the shape above is lost and this is a causal-only test.
+    let all_causal: usize = (0..rows).map(|r| positions[r] as usize + 1).sum();
+    assert!(
+        kept_total < all_causal,
+        "the window and mask kept everything ({kept_total} of {all_causal}); \
+         this test is not covering what it claims to"
+    );
+
+    assert_close(&bf16_read(&out[3]), &want, "sdpa_paged_tiled d_64");
+}
+
 // ---------------------------------------------------------------------------
 // the remaining common idioms
 // ---------------------------------------------------------------------------
@@ -4044,7 +4244,7 @@ fn every_module_this_device_claims_it_can_load_builds_a_pipeline() {
         // pipeline creation checks (capabilities against enabled features, the
         // workgroup against `maxComputeWorkGroupSize`, the push block against
         // the range) applies to them exactly as it does to the rest.
-        let (buffers, push, from_module) = if buffers == 0 && push == 0 {
+        let (buffers, push, _from_module) = if buffers == 0 && push == 0 {
             unstated += 1;
             (
                 declared_binding_count(&spv_words(&dir.join(Capability::Baseline.module(&name)))),

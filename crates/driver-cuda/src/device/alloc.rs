@@ -450,6 +450,49 @@ pub unsafe fn read_raw_span(
     )
 }
 
+/// A host-to-device write into a RAW span — a base the caller knows names
+/// live device memory.
+///
+/// [`read_raw_span`]'s opposite, added for north-star §5 step 7: FlashInfer's
+/// planner used to write its descriptor into the workspace's page-locked
+/// mirror and issue its own `cudaMemcpyAsync` (`attention_flashinfer.cu:193`),
+/// and the Rust planner returns the bytes instead —
+/// `kernels_cuda_new::plan::Plan::int_upload` — precisely so that the copy
+/// lands beside the launch that reads it. This is the copy.
+///
+/// Prefer [`DeviceBuffer::write_at`], which checks the span against a length
+/// it owns. This exists for the case the plan is in: the destination is
+/// `AttentionWorkspaceView::int_buffer`, a base that arrives from the fire
+/// with only a byte count beside it and no [`DeviceBuffer`] in hand.
+///
+/// # Safety
+///
+/// `dst` must name at least `src.len()` writable device bytes for the duration
+/// of the copy, and `stream` must outlive it. `src` is read before this
+/// returns only if it is page-locked; for pageable memory the runtime stages
+/// it, so the caller must keep `src` alive until the stream is synchronised.
+///
+/// # Errors
+///
+/// The copy faulted.
+pub unsafe fn write_raw_span(dst: *mut c_void, src: &[u8], stream: StreamRef<'_>) -> Result<()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    check_rt(
+        unsafe {
+            cudaMemcpyAsync(
+                dst,
+                src.as_ptr().cast(),
+                src.len(),
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream.as_raw(),
+            )
+        },
+        "cudaMemcpyAsync (write_raw_span)",
+    )
+}
+
 /// A device-to-device copy between two RAW spans.
 ///
 /// [`read_raw_span`]'s sibling, added for the same reason and by the same

@@ -233,7 +233,12 @@ fn the_seven_rows_state_only_kinds_the_binder_takes() {
 fn the_seven_rows_are_typed() {
     let expected: &[(&str, &str, Ty)] = &[
         ("quant::quant_bf16_to_fp8_e4m3", "w", Ty::Bf16s),
-        ("quant::quantize_bf16_to_fp8_e4m3_per_channel", "w_bf16", Ty::Bf16s),
+        // `w`, and it was `w_bf16` until `quant` crossed into fn-world. The
+        // two `quantize_*_per_channel` symbols are two instantiations of ONE
+        // `fn quant_per_channel`, so they share ONE parameter list and cannot
+        // spell the same parameter two ways. The CLAIM this line makes is
+        // about the TYPE; the name is how the claim is addressed.
+        ("quant::quantize_bf16_to_fp8_e4m3_per_channel", "w", Ty::Bf16s),
         ("quant::quantize_bf16_to_int8_per_channel", "w", Ty::Bf16s),
         ("quant::quantize_bf16_to_int8_per_channel", "out", Ty::I8sMut),
         ("quant::cast_bf16_to_fp8_e4m3_per_channel", "w", Ty::Bf16s),
@@ -372,47 +377,56 @@ fn all_seven_typecheck_together() {
 // The mutants
 // ---------------------------------------------------------------------------
 
+// Every mutant below states `Source::Unbound` and `LaunchRule::Unstated`
+// because `quant` is fn-world now and that is what a `unit!` row IS: the
+// operand list is the host `fn`'s parameter list, and the rule the row used
+// to carry is a `Launch` the `fn` builds. `differs_in_exactly_one_operand`
+// requires name, source and nullability to match the real row exactly, so
+// these three fields are not decoration -- they are what makes a mutant a
+// control rather than a second, drifting copy. The one thing that still
+// differs, and the only thing this file is about, is one operand's `ty`.
+
 /// `quant::bf16_to_fp16` with `in_bf16` spelled `F16s` — the new vocabulary,
 /// used wrong.
 static BF16_TO_FP16_AS_F16: KernelSig = kernel!(bf16_to_fp16 "quant::bf16_to_fp16",
     file = Some("quant/dequant_wna16.cuh"),
-    launch = LaunchRule::Slab,
+    launch = LaunchRule::Unstated,
     operands = operands![
-        in_bf16: F16s <- Source::In(0),
-        out_fp16: BufMut <- Source::Out(0),
-        n: I64 <- Source::OutElements(0),
+        in_bf16: F16s <- Source::Unbound,
+        out: BufMut <- Source::Unbound,
+        n: I64 <- Source::Unbound,
     ]);
 
 /// `quant::bf16_to_fp16` as it read BEFORE this change: `Buf`, which
 /// `device_cpp_ty` spells from the row's own `elem` — `device::f16`.
 static BF16_TO_FP16_AS_BUF: KernelSig = kernel!(bf16_to_fp16 "quant::bf16_to_fp16",
     file = Some("quant/dequant_wna16.cuh"),
-    launch = LaunchRule::Slab,
+    launch = LaunchRule::Unstated,
     operands = operands![
-        in_bf16: Buf <- Source::In(0),
-        out_fp16: BufMut <- Source::Out(0),
-        n: I64 <- Source::OutElements(0),
+        in_bf16: Buf <- Source::Unbound,
+        out: BufMut <- Source::Unbound,
+        n: I64 <- Source::Unbound,
     ]);
 
 /// `quant::cast_f16_to_bf16` with `src` spelled `Bf16s`.
 static CAST_F16_TO_BF16_AS_BF16: KernelSig = kernel!(cast_f16_to_bf16 "quant::cast_f16_to_bf16",
     file = Some("quant/dtype_cast.cuh"),
-    launch = LaunchRule::Elementwise,
+    launch = LaunchRule::Unstated,
     operands = operands![
-        src: Bf16s <- Source::In(0),
-        dst: BufMut <- Source::Out(0),
-        n: Usize <- Source::OutElements(0),
+        src: Bf16s <- Source::Unbound,
+        dst: BufMut <- Source::Unbound,
+        n: Usize <- Source::Unbound,
     ]);
 
 /// `quant::cast_f16_to_bf16` as it read before: `Buf`, spelled from `elem`,
 /// which here is `device::bf16`.
 static CAST_F16_TO_BF16_AS_BUF: KernelSig = kernel!(cast_f16_to_bf16 "quant::cast_f16_to_bf16",
     file = Some("quant/dtype_cast.cuh"),
-    launch = LaunchRule::Elementwise,
+    launch = LaunchRule::Unstated,
     operands = operands![
-        src: Buf <- Source::In(0),
-        dst: BufMut <- Source::Out(0),
-        n: Usize <- Source::OutElements(0),
+        src: Buf <- Source::Unbound,
+        dst: BufMut <- Source::Unbound,
+        n: Usize <- Source::Unbound,
     ]);
 
 /// `quant::cast_bf16_to_int8_per_channel` as it read before: an UNSIGNED
@@ -420,12 +434,12 @@ static CAST_F16_TO_BF16_AS_BUF: KernelSig = kernel!(cast_f16_to_bf16 "quant::cas
 static CAST_BF16_TO_INT8_AS_U8: KernelSig =
     kernel!(cast_bf16_to_int8_per_channel "quant::cast_bf16_to_int8_per_channel",
         file = Some("quant/quant_bf16_to_fp8.cuh"),
-        launch = LaunchRule::RouteRows,
+        launch = LaunchRule::Unstated,
         operands = operands![
-            w: Bf16s <- Source::In(0),
-            out: U8sMut <- Source::Out(0),
-            scale_inv: F32s <- Source::In(1),
-            cols: I32 <- Source::InWidth(0),
+            w: Bf16s <- Source::Unbound,
+            out: U8sMut <- Source::Unbound,
+            scale_inv: F32s <- Source::Unbound,
+            cols: I32 <- Source::Unbound,
         ]);
 
 /// A synthetic table that exercises all three kinds through the emitters that

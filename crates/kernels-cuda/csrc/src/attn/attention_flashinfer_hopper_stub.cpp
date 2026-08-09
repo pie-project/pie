@@ -1,3 +1,21 @@
+// The non-SM90 arm of `PIE_CUDA_FLASHINFER_HOPPER_SOURCE`.
+//
+// WHAT THIS FILE IS FOR HAS CHANGED, and the name no longer describes it.
+// `attention_flashinfer_hopper.cu` — the real FA3 prefill this stubbed — is
+// DELETED, unreachable by call graph and not merely by a flag; the CMakeLists
+// entry carries the argument. So the three `..._sm90_bf16` bodies below are
+// now the ONLY definitions of those symbols anywhere, and only on non-sm90
+// builds. That is harmless because nothing calls them (no table row, no
+// `pie_k_*` entry, no `ffi` arm, and their one C++ caller went with
+// `driver-cuda/csrc/`), and it is deliberate: a throw that nothing reaches is
+// cheaper to keep than a declaration set to re-derive if FA3 comes back.
+//
+// The one body here that is still LIVE is the last one:
+// `detail::launch_attention_xqa_decode_bf16_gqa8_sm90_prepared`, which
+// `attention_xqa_gqa8.cu:156` calls unconditionally inside the GQA-8 arm of
+// `attention_xqa_decode_bf16_prepared`. That is a real, rowed, model-reachable
+// path on every architecture, and it is why this file cannot go until the six
+// `attention_xqa*.cu` do.
 #include "attn/attention_flashinfer_hopper.hpp"
 #include <stdexcept>
 
@@ -55,10 +73,16 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
 // stub threw on the first fire, poisoning the driver and taking gpt-oss and
 // gemma-4 down with it.
 //
-// The real implementation now lives in `attention_merge_states.cu`, which is
-// compiled unconditionally. Re-adding a stub here would be an ODR conflict,
-// which is the desired outcome: it makes the mistake a link error rather
-// than a runtime one.
+// THE REAL IMPLEMENTATION IS ALSO GONE NOW. It lived in
+// `attention_merge_states.cu`, compiled unconditionally, and that file is
+// DELETED — not because the argument above stopped holding, but because
+// `attn::merge_attention_states_bf16` lost its `table::attn` row to §38 and
+// the definition had been unreachable ever since. So the symbol is absent
+// from the archive on every architecture, and re-adding a stub HERE would be
+// wrong twice: it would resurrect the sm90 gating this paragraph exists to
+// refute, and it would answer a symbol whose only correct answer is a row
+// with a Rust body over `flashinfer/attention/cascade.cuh`. The CMakeLists
+// entry that was this file's neighbour carries the full consumer sweep.
 
 }  // namespace pie_cuda_driver::kernels::attn
 

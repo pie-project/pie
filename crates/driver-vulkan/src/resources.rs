@@ -579,6 +579,20 @@ impl Pool {
     /// A shrink drops the tail; the caller owes the check that nobody holds a
     /// page in it, which [`crate::shell::Shell::resize_pool`] makes.
     ///
+    /// # What it costs, which is why nobody calls it
+    ///
+    /// The POOL, twice: every layer's old buffer is read down to host memory
+    /// and a fresh one is written back up. The delta does not enter. Measured
+    /// at 256 pages of qwen3-0.6b, dropping ONE page takes 2.77 s and
+    /// dropping a hundred and twenty-six takes 0.74 s -- the deeper cut is
+    /// cheaper, because the destination it fills is smaller.
+    ///
+    /// That is why the Vulkan seam publishes `elastic_page_bytes: 0`, so the
+    /// engine's trim task never starts and this is reached only by
+    /// `Shell::admit` growing to a frame's own demand.
+    /// `giving_back_one_page_costs_what_giving_back_half_the_pool_costs`
+    /// pins it.
+    ///
     /// # Errors
     ///
     /// [`Failed`] from the allocation, in which case the pool is UNCHANGED
@@ -621,12 +635,16 @@ impl Pool {
         // a server can be built on.
         {
             let mut probe: Vec<u8> = Vec::new();
-            probe.try_reserve_exact(bytes).map_err(|_| {
-                Failed::Vulkan(format!(
-                    "a cache of {pages} pages wants {bytes} bytes a layer, which \
-                     this host cannot stage"
-                ))
-            })?;
+            probe
+                .try_reserve_exact(bytes)
+                .map_err(|_| Failed::OutOfMemory {
+                    bytes: bytes as u64,
+                    // The HOST refused, not the device, and the caller's move is
+                    // the same either way: this is "not now", not "never". It
+                    // reads as a device refusal in the log, which is why `during`
+                    // says which allocation it was.
+                    during: "stage a resized cache",
+                })?;
         }
 
         let mut fresh = Vec::with_capacity(self.keys.len() + self.values.len());

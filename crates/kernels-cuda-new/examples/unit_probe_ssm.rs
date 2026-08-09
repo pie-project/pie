@@ -81,7 +81,11 @@ mod imp {
         println!("architecture:  {arch}");
         println!("headers:       {} carried\n", DEVICE_HEADERS.len());
 
-        let units = kernels_cuda_new::families::ssm::UNITS;
+        // `families::ssm::UNITS` stood here; §5 step 5 took the family into
+        // fn-world and the five units are `unit!`-generated now. Same five
+        // `Unit`s, same texts, same rows — only the file they are written in
+        // changed, which is what makes this probe still meaningful.
+        let units = kernels_cuda_new::x::ssm::UNITS;
         println!(
             "{:<28} {:>5} {:>8} {:>10} {:>12}",
             "unit", "rows", "lowered", "ms", "cubin bytes"

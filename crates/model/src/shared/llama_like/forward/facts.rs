@@ -265,6 +265,12 @@ pub struct LlamaLikeMetalFacts {
     /// take the top-level default -- `mxfp4`, group **32**. One checkpoint,
     /// two formats.
     ///
+    /// Three, in fact. The block names 122 tensors and not 98; the other 24
+    /// are the `mlp.router` gates at `affine`/64/**8**, and [`Self::router_repr`]
+    /// is where that one goes. Every count of "98" in this tree stopped at
+    /// the same place, because the router entries are the only ones in the
+    /// block with no `mode` key to read.
+    ///
     /// Reading the banks with the dense format is not a near miss. Every scale
     /// comes from the wrong offset, and bf16 garbage is NaN more often than
     /// not: the fire bound everything, ran, and produced 909,207 NaNs
@@ -276,6 +282,29 @@ pub struct LlamaLikeMetalFacts {
     /// [`Self::affine_bits`] for the expert banks; see [`Self::moe_repr`].
     #[serde(default)]
     pub moe_bits: u32,
+    /// How this deployment stores its ROUTER GATE, when that is not how it
+    /// stores its dense projections.
+    ///
+    /// [`Self::moe_repr`]'s twin and the third format in gpt-oss's file.
+    /// `mlx_lm` publishes the gate WIDER than the stack it routes -- 8 bits
+    /// inside a 4-bit model -- and it does so deliberately: the gate is a
+    /// tiny `[hidden, n_experts]` matrix whose error the whole mixture
+    /// inherits, so the bits are cheap there and expensive everywhere else.
+    ///
+    /// Getting it wrong is the failure mode this field exists to make
+    /// impossible, and it is the quiet one. An expert bank read at the wrong
+    /// format is 909,207 NaNs; a GATE read at the wrong width is a fluent
+    /// model routing every token to almost the right experts, measured at
+    /// cosine 0.84 against the reference logits with not one NaN to notice
+    /// it by.
+    ///
+    /// `None` is "the same as `proj_repr`", which is every other checkpoint,
+    /// including every non-MoE one.
+    #[serde(default)]
+    pub router_repr: Option<model_compiler::dsl::WeightRepr>,
+    /// [`Self::affine_bits`] for the router gate; see [`Self::router_repr`].
+    #[serde(default)]
+    pub router_bits: u32,
     /// The GEMM's `(row tile, column tile)`, as the entrypoint spells them.
     ///
     /// `affine_qmm_t` is instantiated over `(group × bits × bm × bn)`, so the
@@ -604,8 +633,9 @@ impl LlamaLikeMetalFacts {
             window_left: (0..24).map(|l| if l % 2 == 0 { 128 } else { -1 }).collect(),
             // The EXPERT BANKS' own encoding, which is not the projections'.
             // `mlx-community/gpt-oss-20b-MXFP4-Q4`'s `quantization` block
-            // lists 98 tensors as affine/64/4 and leaves the banks out, so
-            // they take the top-level default: mxfp4, group 32, 4 bits.
+            // lists 122 tensors: 98 at affine/64/4, 24 `mlp.router` gates at
+            // affine/64/8, and the expert banks in neither list, so they take
+            // the top-level default: mxfp4, group 32, 4 bits.
             // Measured off the tensors too — `experts.gate_proj.weight` is
             // `[32, 2880, 360]` beside `scales` `[32, 2880, 90]`, and
             // 2880/90 is 32.
@@ -643,6 +673,22 @@ impl LlamaLikeMetalFacts {
             per_layer_emb_dim: 256,
             kv_shared_layers: 4,
             dense_beside_moe: true,
+            // `sqrt(1024)`, and 1024 is the `hidden` of
+            // `LlamaLikeFacts::qwen3_0_6b()`, which is what both call sites
+            // pair this with.
+            //
+            // Not optional and not a width: `gemma_4::project::metal_facts`
+            // sets `embed_scale: sqrt(hidden)` UNCONDITIONALLY, so there is
+            // no gemma deployment that leaves it zero. This fixture did, and
+            // zero is the branch -- `llama_like_metal` reads
+            // `embed_scale > 0.0` and emits `embed_gather` instead of
+            // `embed_gather_scaled`, so the fixture whose doc says it is
+            // "the fixture a gemma4 text reads" made a different FIRST
+            // statement than any gemma. The comment at that branch already
+            // records one defect of exactly this shape, where the scale was
+            // read off the side network's width and silently dropped for
+            // gemma-4-31b.
+            embed_scale: 32.0,
             window_left: (0..24).map(|l| if l % 6 == 5 { -1 } else { 512 }).collect(),
             rope_theta: 1_000_000.0,
             // The SLIDING layers' base. gemma states both, and this fixture
@@ -756,6 +802,11 @@ impl LlamaLikeMetalFacts {
             // Uniform: the synthetic fixture's banks are the dense format.
             moe_repr: None,
             moe_bits: 0,
+            // `None` is "the same as the dense projections", and that is the
+            // right synthetic answer: a fixture that states a SECOND affine
+            // point states a checkpoint fact, and this file holds none.
+            router_repr: None,
+            router_bits: 0,
             // The narrowest rung `qmm_bm` can pick, so it is the one a short
             // window fires; `bn = 32` is the only column tile the residual
             // variant is instantiated at.
@@ -992,13 +1043,26 @@ mod tests {
         }
     }
 
-    /// The gemma fixture carries the three facts that make it gemma.
+    /// The gemma fixture carries the facts that make it gemma.
     ///
     /// Stated because this fixture is what a gemma-4 text reads in the
     /// conformance runs, and the doc is explicit that the WIDTHS are
-    /// plausible rather than measured. These three are not widths — they
-    /// are the structural claims, and a fixture that lost one would make
-    /// the gemma path test the llama path under a gemma name.
+    /// plausible rather than measured. These are not widths — they are
+    /// the structural claims, and a fixture that lost one would make the
+    /// gemma path test the llama path under a gemma name.
+    ///
+    /// Which is what happened. `embed_scale` was not on this list and was
+    /// not in the fixture, so it fell through `..synthetic()` at zero,
+    /// and zero is a BRANCH: `llama_like_metal` reads `embed_scale > 0.0`
+    /// and the gemma text was emitting `embed_gather` where every gemma
+    /// deployment emits `embed_gather_scaled`. `gemma_4::project::metal_facts`
+    /// sets it to `sqrt(hidden)` unconditionally -- there is no gemma row
+    /// that leaves it zero -- so the conformance text and the device fire
+    /// were both proving the wrong first statement, under a gemma name,
+    /// for as long as the fixture existed.
+    ///
+    /// A guard whose doc names the defect and whose list omits the field
+    /// is worse than no guard, because it is read as coverage.
     #[test]
     fn the_gemma_fixture_is_gemma_shaped_rather_than_llama_shaped() {
         let facts = LlamaLikeMetalFacts::gemma_like();
@@ -1007,6 +1071,10 @@ mod tests {
         assert_eq!(facts.per_layer_emb_dim, 256);
         assert_eq!(facts.kv_shared_layers, 4);
         assert!(facts.dense_beside_moe);
+        assert!(
+            facts.embed_scale > 0.0,
+            "a gemma scales its embedding, and zero picks the other statement"
+        );
 
         let plain = LlamaLikeMetalFacts::synthetic();
         assert!(
@@ -1015,5 +1083,6 @@ mod tests {
         );
         assert_eq!(plain.logit_softcap, 0.0);
         assert_eq!(plain.per_layer_emb_dim, 0);
+        assert_eq!(plain.embed_scale, 0.0);
     }
 }

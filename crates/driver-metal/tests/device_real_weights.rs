@@ -193,7 +193,44 @@ struct Reference {
     /// llama-3.2 begins at 128000 and gemma-4 at 2.
     bos: u32,
     /// MLX's top five, in order, with the logits it gave them.
+    ///
+    /// **TAKEN IN f32**, by `model.set_dtype(mx.float32)` before the forward,
+    /// and this is not a detail. gpt-oss-20b's row was first taken in MLX's
+    /// default dtype for that checkpoint, which is bf16, and the gate then
+    /// read this driver as wrong at rank five: MLX said 279 and the driver
+    /// said 198.
+    ///
+    /// MLX's OWN top five moves under the change:
+    ///
+    /// ```text
+    ///   bf16  11 9.9375   1 9.875    7 9.25     13 9.25    279 9.125
+    ///   f32   11 10.1734  1 9.8654   7 9.5159   12 9.1921  198 9.1736
+    /// ```
+    ///
+    /// and the driver's answer -- 11 10.1875, 1 9.9375, 7 9.5, 198 9.25,
+    /// 13 9.1875 -- is the f32 column rounded to bf16, everywhere, to within
+    /// an ulp. Its span `[-8.25, 10.1875]` is `bf16(-8.259116)` and
+    /// `bf16(10.173439)` EXACTLY.
+    ///
+    /// So the disagreement was two bf16 roundings of one f32 answer being
+    /// compared to each other. A reference is the value both sides
+    /// approximate, and comparing one approximation to another measures the
+    /// two roundings and nothing else -- with a bf16 tolerance on top, which
+    /// then has to cover both.
+    ///
+    /// f32 also makes the tolerance mean what its comment says it means: the
+    /// driver's readout is bf16, so `bf16_slack` is a statement about the
+    /// DRIVER'S format against a reference that has none.
     top: [(usize, f32); 5],
+    /// The SIXTH logit, where someone has taken it.
+    ///
+    /// Not for comparing -- for knowing how deep the top-five claim goes. A
+    /// set claim over five needs the fifth separated from the sixth by more
+    /// than the readout can resolve, and only this number says whether it is.
+    /// gpt-oss's fifth and sixth are 9.1736 and 9.1306, two thirds of a bf16
+    /// ulp apart: which of them a bf16 readout ranks fifth is a property of
+    /// the rounding.
+    next: Option<f32>,
     /// The whole distribution's span, because five agreeing logits at the top
     /// is consistent with a distribution that is wrong everywhere else.
     span: (f32, f32),
@@ -211,6 +248,32 @@ struct Reference {
     /// the cap, where a bf16 ulp is a bf16 ulp and a disagreement is a
     /// disagreement.
     mid: [(usize, f32); 3],
+    /// The widest activation MLX's OWN forward reaches on this checkpoint.
+    ///
+    /// A saturation bound is a measurement too, and this one was a constant:
+    /// `1e3`, with the comment "a llama-1B decode measures its widest
+    /// activation under one, so the bound sits orders of magnitude out".
+    /// That is true of llama-1B and says nothing about anything else.
+    ///
+    /// gpt-oss-20b's residual stream reaches 42,752 in MLX -- measured, by
+    /// walking its own layers and taking `max(abs(h))` after each. It is at
+    /// 111 after layer four and at 42,496 after layer six, which is the
+    /// massive-activation channel this family is known for and not a
+    /// saturation. A driver reading 12,672 there was reported as "saturation
+    /// or silence rather than a forward pass" by a bound forty times too
+    /// tight.
+    ///
+    /// llama-3.2-1B's is 410.5, and this field first held `1.0` because that
+    /// was what the old comment SAID -- "measures its widest activation under
+    /// one" -- transcribed instead of measured. The driver's arena tops out
+    /// at 410 on the same fire, one bf16 ulp from MLX's 410.5, so the number
+    /// the comment gave was wrong by a factor of four hundred and the
+    /// checkpoint agrees with MLX far more sharply than either said.
+    ///
+    /// So the number rides the checkpoint, like every other number here --
+    /// and `None` where nobody has taken it, which is not the same as a
+    /// small one.
+    widest: Option<f32>,
     /// `final_logit_softcapping`, or zero for a readout that has none.
     ///
     /// A LOGIT AT THE CAP IS A LOGIT THE CAP HAS ERASED. `cap * tanh(x/cap)`
@@ -240,8 +303,38 @@ const REFERENCES: &[Reference] = &[
             (791, 5.781_25),
             (475, 5.601_562),
         ],
+        next: Some(5.427_544),
         span: (-4.613, 6.406),
         mid: [(111_912, 3.595_703), (34917, 2.455_078), (22631, 1.400_391)],
+        widest: Some(410.5),
+        cap: 0.0,
+    },
+    // gpt-oss-20b, and the first routed checkpoint in the table: every
+    // number above was measured on a DENSE mlp, so nothing here had ever
+    // held a mixture's answer to account. Taken the same way -- `mlx_lm`
+    // load, one forward over `[[bos]]`, the last logit row as f32.
+    //
+    // Its `bos` is 199998, which is not 128000 and not 2: `o200k_harmony`
+    // numbers its specials at the END of a 201088-token vocabulary.
+    //
+    // No softcap. The top five sit within a fifth of a logit of each other
+    // and four of the five are punctuation and articles, which is what an
+    // unconditioned start-of-text row looks like when nothing has been read
+    // yet -- so the MID ranks carry most of the weight here.
+    Reference {
+        model: "gpt-oss-20b-MXFP4-Q4",
+        bos: 199_998,
+        top: [
+            (11, 10.173_439),
+            (1, 9.865_355),
+            (7, 9.515_914),
+            (12, 9.192_102),
+            (198, 9.173_553),
+        ],
+        next: Some(9.130_610),
+        span: (-8.259_116, 10.173_439),
+        mid: [(39985, 6.580_502), (43065, 4.287_484), (10303, 1.586_527)],
+        widest: Some(42_752.0),
         cap: 0.0,
     },
     Reference {
@@ -254,8 +347,12 @@ const REFERENCES: &[Reference] = &[
             (236_799, 29.75),
             (236_814, 29.625),
         ],
+        next: None,
         span: (-27.75, 30.0),
         mid: [(10541, 22.5), (18373, 19.25), (223_439, 14.75)],
+        // Not measured. It has been passing under the loose bound below,
+        // which says only that it is under a thousand.
+        widest: None,
         cap: 30.0,
     },
 ];
@@ -565,7 +662,11 @@ fn observed(
     dg: &driver_metal::batch::DecodeGeometry,
     loaded: &driver_metal::weights::load::Loaded,
 ) -> MetalBinding {
-    driver_metal::model::binding::observed(dg.quant, |t| loaded.mxfp4.contains(t))
+    driver_metal::model::binding::observed(
+        dg.quant,
+        |t| loaded.affine_point_of(t),
+        |t| loaded.mxfp4.contains(t),
+    )
 }
 
 /// The row's own Metal text, through the one door the driver uses.
@@ -890,7 +991,15 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // Which statement each arena offset belongs to, and whether it is that
     // statement's OUTPUT. A region nothing wrote is diagnosable only if the
     // report says which launch was supposed to write it.
-    let mut writers: HashMap<usize, String> = HashMap::new();
+    //
+    // EVERY distinct writer, not the first: regions are reused across layers,
+    // so the bytes read below are the LAST write while a first-writer-wins map
+    // names the first. For a stack of identical layers the two agree and the
+    // list is one entry. Where they do not agree — a region an epilogue reuses,
+    // or one two different kernels take turns on — naming only the first is a
+    // report that points diagnosis at the wrong kernel, which is worse than
+    // naming none.
+    let mut writers: HashMap<usize, Vec<String>> = HashMap::new();
     for launch in &lowered.launches {
         let symbol = &lowered.kernels[launch.kernel as usize];
         let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
@@ -919,9 +1028,10 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         let split = widthed.len().saturating_sub(results);
         for arg in widthed.iter().skip(split) {
             if let model_compiler::lower::Arg::Arena { at, .. } = arg {
-                writers
-                    .entry(*at)
-                    .or_insert_with(|| format!("written by {symbol}"));
+                let seen = writers.entry(*at).or_default();
+                if !seen.iter().any(|s| s == symbol) {
+                    seen.push(symbol.clone());
+                }
             }
         }
     }
@@ -962,28 +1072,28 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         // absent write points diagnosis at binding when the answer is
         // arithmetic. Read the zeros, not the finite values.
         let untouched = r.zero == len_in_elements(*len, *element);
+        // The writer is named for EVERY region and not only the empty ones.
+        // "Nothing wrote this" is one question the map answers; "what wrote
+        // the widest value in the arena" is the other, and it is the one a
+        // saturation asks. Naming the kernel only on failure means the report
+        // is silent exactly when every region was written and one of them was
+        // written wrong.
+        let who = writers.get(at).map_or_else(
+            || "no launch writes it — read-only".to_string(),
+            |w| w.join(", "),
+        );
         eprintln!(
-            "  @{at:>8} {len:>8} B x{element}: {:>7} nz, {:>7} zero, {:>7} NaN, max |v| = {}{}",
+            "  @{at:>8} {len:>8} B x{element}: {:>7} nz, {:>7} zero, {:>7} NaN, max |v| = {:<12} {who}{}",
             r.finite_nonzero,
             r.zero,
             r.nan,
             r.max_abs,
             if untouched {
-                format!(
-                    "   <- NOTHING WROTE THIS ({})",
-                    writers
-                        .get(at)
-                        .map_or("NO LAUNCH WRITES IT — read-only", String::as_str)
-                )
+                "   <- NOTHING WROTE THIS"
             } else if r.finite_nonzero == 0 && r.nan > 0 {
-                format!(
-                    "   <- WRITTEN, ALL NaN ({})",
-                    writers
-                        .get(at)
-                        .map_or("NO LAUNCH WRITES IT — read-only", String::as_str)
-                )
+                "   <- WRITTEN, ALL NaN"
             } else {
-                String::new()
+                ""
             }
         );
     }
@@ -1047,10 +1157,17 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // activation under one and its widest logit around 0.08 -- both small,
     // both finite -- and the bounds sit orders of magnitude out so a real
     // drift trips them and a different checkpoint does not.
+    //
+    // The CEILING is this checkpoint's own, when someone has measured it.
+    // `1e3` is llama-1B's, and a constant is what made it read gpt-oss's
+    // massive-activation channel -- 42,752 in MLX itself -- as a defect.
+    // Four times the measurement, because what is being caught is
+    // saturation and not the last bf16 ulp.
+    let ceiling = reference_for(&snapshot).and_then(|r| r.widest).map_or(1e3, |w| w * 4.0);
     assert!(
-        c.max_abs > 1e-4 && c.max_abs < 1e3,
-        "the widest value anywhere is {}, which is saturation or silence \
-         rather than a forward pass.",
+        c.max_abs > 1e-4 && c.max_abs < ceiling,
+        "the widest value anywhere is {}, against a ceiling of {ceiling}, \
+         which is saturation or silence rather than a forward pass.",
         c.max_abs
     );
 
@@ -1797,9 +1914,41 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
         }
         (nan, widest)
     };
+    let total = lowered.launches.len();
+
+    // THE MAGNITUDE TRAIL RUNS EITHER WAY, and it used to be reachable only
+    // through a NaN: the walk below is the sharpest instrument in this file
+    // and `return`ing here handed nothing at all to a fire that is finite and
+    // wrong -- which is the fire a driver spends most of its life being.
+    //
+    // Per LAYER rather than per statement, because that is the axis a
+    // reference can be taken on: MLX will hand back `max(abs(h))` after each
+    // of its own blocks for the cost of a loop, and a driver whose layer four
+    // reads 111 against MLX's 111 and whose layer six reads 4e2 against MLX's
+    // 4e4 has named the block to open. A per-statement trail cannot be
+    // compared to anything outside this process.
+    eprintln!("  widest finite |v| after each layer:");
+    let last_of_layer = {
+        let mut ends: Vec<(u16, usize)> = Vec::new();
+        for (n, l) in lowered.launches.iter().enumerate() {
+            let layer = l.layers.end.saturating_sub(1);
+            match ends.last_mut() {
+                Some((prev, at)) if *prev == layer => *at = n + 1,
+                _ => ends.push((layer, n + 1)),
+            }
+        }
+        ends
+    };
+    for (layer, at) in &last_of_layer {
+        let (nan, widest) = probe(*at);
+        eprintln!(
+            "    through layer {layer:>3} (statement {at:>4}): {widest:>12.4e}{}",
+            if nan.is_some() { "  (holds a NaN)" } else { "" }
+        );
+    }
+
     let mut nan_after = |n: usize| -> bool { probe(n).0.is_some() };
 
-    let total = lowered.launches.len();
     if !nan_after(total) {
         eprintln!("the whole fire ({total} statements) is NaN-free");
         return;
@@ -2211,6 +2360,16 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     for (i, &t) in order.iter().take(5).enumerate() {
         eprintln!("  top{i}: {t} logit {:.6}", logits[t]);
     }
+    // AND THE TAIL, printed before anything is asserted. A top-five mismatch
+    // and a whole distribution shifted are different defects, and the top five
+    // alone cannot tell them apart: five tokens out of 201 088 is a statement
+    // about the peak. The deep ranks say whether the rest of the vocabulary
+    // moved with it.
+    for r in [100usize, 1000, 10000] {
+        if let Some(&t) = order.get(r) {
+            eprintln!("  rank{r}: {t} logit {:.6}", logits[t]);
+        }
+    }
 
     // MLX's answer for the same token over the same snapshot, top five, in
     // order, with the logits it gave them.
@@ -2226,13 +2385,57 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     //
     // The set is what a tied top five states, and it is not weaker: five
     // tokens out of 262144 in any order is the same claim about the fire.
-    let mut want_set: Vec<usize> = reference.top.iter().map(|(t, _)| *t).collect();
-    let mut got_set: Vec<usize> = order[..reference.top.len()].to_vec();
+    //
+    // AND IT RUNS ONLY AS DEEP AS THE READOUT CAN RESOLVE, which is the rule
+    // the argmax below already lives by -- applied here because the boundary
+    // of a SET is a comparison too. "The top five are these five" says the
+    // fifth logit outranks the sixth; where those two are closer together
+    // than a bf16 ulp, a bf16 readout ranking them either way is reporting
+    // its rounding.
+    //
+    // gpt-oss-20b at position zero, in f32: 9.1921, 9.1736, 9.1306 at ranks
+    // four, five and six -- three tokens inside one ulp. This gate read the
+    // driver's 198-over-13 as a defect and there is no fire that could have
+    // satisfied it. Ranks one to three are 0.31, 0.35 and 0.32 apart, all of
+    // them resolvable, and that is the claim this checkpoint supports.
+    //
+    // llama-3.2-1B loses nothing: its fifth and sixth are 5.6016 and 5.4275,
+    // 2.8 ulps apart, so `depth` is the full five.
+    // A prefix of length `m` claims `top[m-1]` outranks whatever is below it,
+    // so `m` is founded exactly when that ONE gap is resolvable. The scan
+    // stops at the first gap that is not: everything deeper is behind it.
+    let depth = {
+        let n = reference.top.len();
+        let mut d = 0;
+        for m in 1..=n {
+            // Below the last entry is the sixth logit, which only `next` has.
+            let Some(below) = (if m < n { Some(reference.top[m].1) } else { reference.next }) else {
+                break;
+            };
+            if reference.top[m - 1].1 - below <= bf16_slack(below) {
+                break;
+            }
+            d = m;
+        }
+        d
+    };
+    if depth == 0 {
+        // MLX's own top two are inside an ulp of each other. There is no
+        // ranking to hold this driver to, and the per-token logits below are
+        // the whole of what can be asked.
+        eprintln!("SKIP the set: MLX's top two are closer than bf16 resolves");
+    }
+    let mut want_set: Vec<usize> = reference.top[..depth].iter().map(|(t, _)| *t).collect();
+    let mut got_set: Vec<usize> = order[..depth].to_vec();
     want_set.sort_unstable();
     got_set.sort_unstable();
+    eprintln!(
+        "the top {depth} of {} are resolvable in bf16",
+        reference.top.len()
+    );
     assert_eq!(
         got_set, want_set,
-        "MLX's top five are {want_set:?} and this driver's are {got_set:?}. At \
+        "MLX's top {depth} are {want_set:?} and this driver's are {got_set:?}. At \
          position zero rope is the identity and attention has one key, so \
          nothing position-dependent can explain a difference."
     );

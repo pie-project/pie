@@ -2819,7 +2819,6 @@ fn whole_plan(
         fired: low.launches.len(),
         answer,
         kernels: low.kernels.clone(),
-        arena: recorded,
     }
 }
 
@@ -2889,11 +2888,6 @@ struct Ran {
     fired: usize,
     /// The distributions the batched run left in the arena.
     answer: driver_vulkan::serve::Logits,
-    /// The arena the batched run left behind.
-    ///
-    /// Here so a caller can state the arena differed between two runs rather
-    /// than take it on the whole-plan test's word.
-    arena: Vec<u8>,
     /// The distinct symbols the lowering stated.
     ///
     /// Returned so a caller comparing two plans can prove they were two
@@ -3121,27 +3115,50 @@ fn gemm_agrees(
     );
 }
 
-/// A routed prefill gives the same answer twice, even though it does not leave
-/// the same arena twice.
+/// A routed prefill answers the same twice, though its arena does not.
 ///
-/// The whole-plan test found that both mixtures of experts disagree with
-/// THEMSELVES at a prefill: `route_sort` orders its permutation with
-/// workgroup-scoped atomics, so two rows wanting the same expert land in
-/// whichever order the atomic gave them and the gather writes them to
-/// different offsets. That is a fact about the arena. It is not, on its own, a
-/// fact about the answer -- the combine reads the permutation back through its
-/// inverse, so a run that shuffled differently should still finish in the same
-/// place.
+/// This test has now been wrong in both directions, and both corrections are
+/// kept because the pair is the actual finding.
 ///
-/// Should. Nothing had checked, and the difference matters to a caller: an
-/// arena that varies is a curiosity, a distribution that varies is a model
-/// that answers the same prompt differently on Tuesday.
+/// It began by asserting that two runs of one routed fire leave DIFFERENT
+/// arenas and the same logits, hunting up to five runs for a difference. Then
+/// upstream fixed a real race -- `route_sort`'s `n` was `n_experts * k` where
+/// `expert_ids` holds `tokens * k`, so the kernel scanned 112 entries past
+/// its region into the `perm` it was concurrently writing -- and the hunt
+/// stopped finding anything. So the claim was inverted to byte equality, on
+/// the reading that a fixed kernel is a reproducible one, and it passed three
+/// times.
 ///
-/// So this fires the same routed prefill twice and compares the two things
-/// separately: the arena, which is expected to differ, and the logits, which
-/// are not.
+/// It was luck. The arenas are NOT equal, and the reason is the one this
+/// suite had written down all along, in `whole_plan`'s own comment: the
+/// permutation is built with workgroup-scoped atomics, so which of two rows
+/// wanting the same expert lands first is whichever lane won the atomic. That
+/// is a design, not a defect -- the same bump-counter every backend's router
+/// uses -- and it survives the fix, because the race and the ordering were
+/// two separate things sharing one symptom.
+///
+/// Measured, when the byte claim finally failed: 75k to 198k of 6.2M arena
+/// bytes differ, run to run, and 141 bytes of `route_sort`'s own 512-byte
+/// `perm` region are among them. That last number is what makes this an
+/// ordering rather than an overrun -- the difference is INSIDE the buffer the
+/// router owns, not past it -- and it is why a byte comparison cannot be the
+/// claim here.
+///
+/// So the claim is what the ordering cannot move: the ANSWER. Not merely
+/// close, which the old second line already said, but the same choice --
+/// every row's argmax identical across both fires, which is what a caller
+/// actually consumes and what a rank flip would break. The relative bound
+/// stays beside it because an argmax can survive a distribution that has
+/// drifted badly. Both were measured over two fires: 0 flips of 16 rows, and
+/// a worst relative difference of 0.0067 against the 0.05 the bound allows.
+///
+/// What this no longer catches is an overrun that changes the arena without
+/// changing the answer. That is `whole_plan`'s job and it does it properly:
+/// it re-runs the reference against itself precisely so it can tell "the
+/// batching is wrong" from "the plan has no single answer", which is the
+/// distinction this test spent two revisions failing to make.
 #[test]
-fn a_routed_prefill_gives_the_same_answer_twice() {
+fn a_routed_prefill_answers_the_same_twice() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model_compiler::trace::FireClass;
 
@@ -3156,34 +3173,8 @@ fn a_routed_prefill_gives_the_same_answer_twice() {
         compare: false,
         real: None,
     };
-    // UP TO FIVE RUNS, AND THE REASON IS A FLAKE THIS TEST PRODUCED. Two runs
-    // were enough for a long time and then, once, left the same arena: the
-    // router's shuffle is a race, and a race that can come out differently can
-    // also come out the same twice. The premise below then failed and reported
-    // "this says nothing about the router" about a run where the router simply
-    // did not vary.
-    //
-    // So the shuffle is SEARCHED for rather than assumed, and the loop stops
-    // the moment it is found -- which on this card is almost always the second
-    // run, so the cost is only paid when the premise was about to be wrong.
     let once = whole_plan(&device, dir, "qwen3_30b_a3b", &facts, &metal, want);
-    let mut twice = whole_plan(&device, dir, "qwen3_30b_a3b", &facts, &metal, want);
-    let mut shuffled = once
-        .arena
-        .iter()
-        .zip(&twice.arena)
-        .position(|(a, b)| a != b);
-    for _ in 0..3 {
-        if shuffled.is_some() {
-            break;
-        }
-        twice = whole_plan(&device, dir, "qwen3_30b_a3b", &facts, &metal, want);
-        shuffled = once
-            .arena
-            .iter()
-            .zip(&twice.arena)
-            .position(|(a, b)| a != b);
-    }
+    let twice = whole_plan(&device, dir, "qwen3_30b_a3b", &facts, &metal, want);
 
     // The precondition: this text really does route. Without it the claim
     // below is about a dense model and says nothing.
@@ -3201,15 +3192,55 @@ fn a_routed_prefill_gives_the_same_answer_twice() {
         "every logit is {first}, so two runs agreeing means nothing"
     );
 
-    // THE PREMISE, measured here rather than borrowed from another test: two of
-    // these runs did not leave the same arena. If none of them differed, the
-    // comparison below would be about a plan that happens to be deterministic
-    // today and would stop meaning anything the moment it was not.
+    // The comparisons below are over a distribution, so they pass for free on
+    // one that is empty or one row wide. A 16-row fire is neither, and saying
+    // so here is what keeps the claim from going quiet if `whole_plan` ever
+    // stops reading the logits back.
+    let rows = once.answer.rows.max(1);
+    assert_eq!(
+        rows, 16,
+        "this fire was asked for 16 rows and answered {rows}, so the per-row \
+         comparison below covers something other than the prefill"
+    );
+    assert_eq!(
+        once.answer.values.len(),
+        twice.answer.values.len(),
+        "two fires of one plan produced distributions of different sizes"
+    );
+    let per = once.answer.values.len() / rows;
     assert!(
-        shuffled.is_some(),
-        "four runs left the same arena, so this says nothing about the router"
+        per > 1000,
+        "a {per}-wide row is not a vocabulary, so an argmax over it is not the \
+         choice a caller makes"
     );
 
+    // THE CHOICE. The sharp half: an argmax is what a caller consumes, and a
+    // router whose ordering reached the ranking would flip one here. Per row,
+    // because a single flipped row in sixteen is exactly the failure a
+    // whole-distribution norm would average away.
+    let argmax = |s: &[f32]| {
+        s.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .expect("a row has a widest logit")
+    };
+    let flipped: Vec<usize> = (0..rows)
+        .filter(|r| {
+            argmax(&once.answer.values[r * per..(r + 1) * per])
+                != argmax(&twice.answer.values[r * per..(r + 1) * per])
+        })
+        .collect();
+    assert!(
+        flipped.is_empty(),
+        "two fires of one routed prefill chose different tokens on rows {flipped:?}: \
+         the router's ordering reached the ranking, which is the one place it must \
+         not"
+    );
+
+    // THE DISTRIBUTION. The blunt half, kept from the original: an argmax can
+    // survive a distribution that has drifted badly, so the values are held
+    // too.
     let worst = once
         .answer
         .values
@@ -3220,7 +3251,8 @@ fn a_routed_prefill_gives_the_same_answer_twice() {
     assert!(
         worst < 0.05,
         "the same routed prefill answered differently twice, by {worst}: the router's \
-         nondeterminism reaches the distribution and not just the arena"
+         nondeterminism reaches the distribution and not just the arena it is \
+         allowed to reorder"
     );
 }
 
@@ -8039,6 +8071,462 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
         shell.shape().pages,
         pages,
         "the state pool's target was applied to the KV pool"
+    );
+}
+
+/// A decode step answers in tens of milliseconds, not in seconds.
+///
+/// # Why a timing test exists at all here
+///
+/// Because a stall in this driver has already shipped once. A KV copy that
+/// took 370 seconds was found by running something, not by any test in this
+/// file: every correctness gate passed throughout, because the answers were
+/// right and only the clock was wrong. This is the guard that class of defect
+/// deserves -- an ORDER OF MAGNITUDE tripwire, not a benchmark.
+///
+/// # The profile behind the ceiling
+///
+/// Measured on a 4090, release build, no validation layers, qwen3-0.6b at
+/// 4 bits, a single conversation decoding one token at a time. 18 ms a step,
+/// about 55 tokens a second at this context.
+///
+/// The shape of the step, taken when it still cost 44 ms and still true in
+/// proportion:
+///
+/// | phase | share |
+/// |---|---|
+/// | `lower` | 0.8-6 ms |
+/// | pool stage + state upload | 2.5-6 ms |
+/// | the arena (326 KB, allocated per step) | 0.2 ms |
+/// | `fire` | the rest |
+/// | ...of which descriptor writes, 452 launches | 0.1 ms |
+/// | ...of which building the run list | 0.03 ms |
+/// | ...of which recording the command buffer | 0.3 ms |
+/// | ...of which **submit and wait on the GPU** | **almost all of it** |
+///
+/// That is the useful half of the measurement: this crate's own CPU work is
+/// under a millisecond, so a regression in the driver's bookkeeping would
+/// have to be enormous before it showed up beside the fire.
+///
+/// # Where the other half went, and four wrong answers on the way
+///
+/// The device half was 38 ms of the 44, and every kernel in it ran at about
+/// 12 GB/s on a card that does roughly a thousand -- the lm_head launch
+/// reading its 78 MB of weights, and equally the small launches reading
+/// 1.5 MB. The card drew 85 W of 450 at "100% utilisation": resident and
+/// stalled.
+///
+/// Four hypotheses were tested and refuted, and they are recorded because
+/// each cost an experiment and because being wrong four times is what
+/// eventually pointed at the right thing:
+///
+/// 1. **Redundant loads in the quantised matvec.** `dot_lane` re-fetches the
+///    same packed word once per code -- eight times at 4 bits -- and the
+///    scale and bias once per element. Rewriting it around
+///    `pie_affine_word_dot`, one word load and one scale per eight MACs,
+///    changed the step from 44.4 ms to 44.3 ms. The shader compiler was
+///    already hoisting them.
+/// 2. **The serial reduction.** `reduce_store` has lane 0 sum 32 shared
+///    floats per row while 62 of 64 lanes idle. Deleting the reduction
+///    outright -- wrong answers, pure probe -- gave 45.1 ms. It is free.
+/// 3. **Barrier serialization.** Every dispatch is separated by a global
+///    memory barrier, so no two ever overlap. Removing every barrier -- also
+///    wrong answers -- gave 39.6 ms. Worth about 5 ms of 44, real but not the
+///    story.
+/// 4. **Occupancy in the matvec.** 32 lanes to a row and 64 threads to a
+///    workgroup is little to hide memory latency behind. Widening it to 64
+///    lanes and 128 threads gave 31.5 ms against 31.8 ms. Nothing.
+///
+/// The clue was in what all four had in common: 12 GB/s at EVERY launch size
+/// and for every kernel, which is not what a shader's decomposition looks
+/// like. It is what a bus looks like. `Device::buffer` asked for the first
+/// memory type that was `HOST_VISIBLE | HOST_COHERENT` -- and on this card
+/// that is type 2, which is system RAM. Every weight, every KV page and every
+/// activation lived across PCIe, and 12 GB/s is what PCIe 4.0 x16 gives.
+/// Type 4 is `DEVICE_LOCAL` as well, mappable across the whole 24 GB because
+/// resizable BAR is on. Preferring it took the step from 31.8 ms to 18.1 ms,
+/// and a 1536-token step from 110 ms to 59 ms.
+///
+/// The kernels were never the ceiling. They may yet be worth improving --
+/// nothing above proves they are good, only that they were not what was
+/// wrong -- but that is a `kernels-vulkan` question and no longer an urgent
+/// one.
+///
+/// # Why the ceiling is where it is
+///
+/// 400 ms per step, against 18 ms measured in release and about 70 ms in the
+/// debug build this suite runs under two validation layers. The margin is
+/// for the shared box rather than the driver: the number to catch is a stall
+/// of seconds, not a slow afternoon, and a tighter bound would be a
+/// benchmark -- which on a shared machine is a flaky test.
+#[test]
+fn a_decode_step_does_not_stall() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the step cost is unmeasured");
+        return;
+    };
+    let mut shell = shelled(dir, &REALS[0], real, 64);
+
+    let mut prompt: Vec<u32> = Vec::new();
+    for _ in 0..4 {
+        prompt.extend_from_slice(&PERIOD);
+    }
+    let step = |shell: &mut driver_vulkan::shell::Shell, tokens: Vec<u32>| {
+        shell
+            .step(&[driver_vulkan::turns::Turn { who: 1, tokens }])
+            .unwrap_or_else(|e| panic!("{e}"));
+    };
+    step(&mut shell, prompt);
+    // Warm: the first decode after a prefill builds pipelines this one reuses,
+    // and charging pipeline construction to a steady-state ceiling would
+    // measure the cache rather than the fire.
+    for _ in 0..2 {
+        step(&mut shell, vec![PERIOD[0]]);
+    }
+
+    const STEPS: u32 = 8;
+    let at = std::time::Instant::now();
+    for _ in 0..STEPS {
+        step(&mut shell, vec![PERIOD[0]]);
+    }
+    let each = at.elapsed() / STEPS;
+    eprintln!("a decode step: {each:?}");
+    assert!(
+        each < std::time::Duration::from_millis(400),
+        "a decode step took {each:?}, and the measured cost on this card is about 44 ms: \
+         something is stalling, which is how the 370 s KV copy looked from here"
+    );
+}
+
+/// A LONG conversation's decode step does not stall either.
+///
+/// # Why the short one is not enough
+///
+/// Because the two are bounded by different things, and the sibling above
+/// only ever sees twenty-four tokens of context. Decode cost has two parts:
+/// a fixed part -- twenty-eight layers of weights read whatever the history
+/// -- and a part that grows with the history, which is attention reading
+/// every key it has kept. At twenty-four tokens the second part is invisible.
+///
+/// It was measured, and it was not small. Release, no layers, this card:
+///
+/// | context | decode step |
+/// |---|---|
+/// | 24 | 38.0 ms |
+/// | 384 | 100.6 ms |
+/// | 1536 | 306.4 ms |
+///
+/// 0.177 ms per token of history then, so at a thousand tokens -- an ordinary
+/// conversation -- attention was five sixths of every step, and the crate's
+/// whole performance story had been written from a twenty-four token prompt
+/// where it looked like a rounding error.
+///
+/// # What that measurement found
+///
+/// A decode workgroup in `attn/sdpa_paged.comp` has one thread per head
+/// dimension, and every one of those threads was walking the entire query and
+/// key vectors to arrive at the same scalar score. A hundred and twenty-eight
+/// threads computing one number a hundred and twenty-eight times. Having the
+/// workgroup add its own terms in a tree instead:
+///
+/// | context | before | cooperative | and in VRAM |
+/// |---|---|---|---|
+/// | 24 | 38.0 ms | 31.8 ms | 18.1 ms |
+/// | 384 | 100.6 ms | 49.9 ms | 31.8 ms |
+/// | 1536 | 306.4 ms | 110.1 ms | 59.2 ms |
+///
+/// 0.052 ms per token, and 2.8x faster where it matters; the third column is
+/// the memory-type fix `a_decode_step_does_not_stall` describes, which is
+/// worth another 1.9x and is a separate finding. Which is why this test
+/// exists: the defect was not visible at all from the short context, and
+/// nothing would have noticed it coming back.
+///
+/// # Why the ceiling is where it is, and why 384 and not 1536
+///
+/// One second, against 31.8 ms measured in release at this context and about
+/// 107 ms in the debug build this suite runs under two validation layers.
+/// Thirty times the release cost and nine times the debug one, margin for a shared
+/// box rather than for the kernel; it would still catch the
+/// hundred-and-twenty-eight-fold regression it was written for.
+///
+/// The context is 384 tokens and not the 1536 the table above measures,
+/// because a 1536-token prefill does not finish inside `run_all`'s
+/// ten-second fence wait in a debug build with GPU-assisted validation on.
+/// That is a property of the layers, not of the driver -- but it is the
+/// configuration this suite runs in, and a test that trips a timeout is a
+/// test about the timeout. The growth term is perfectly visible at 384: it
+/// is two thirds of the step.
+///
+/// Trying it at 1536 was not wasted. The timeout was reported correctly and
+/// then buried, because freeing the fire's scalar block afterwards tripped a
+/// validation error this driver treats as fatal, so the process aborted on
+/// the consequence and never printed the cause. `Device::run_all` now waits
+/// for the device to go idle before a failed fire returns.
+#[test]
+fn a_long_conversations_decode_step_does_not_stall() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the step cost is unmeasured");
+        return;
+    };
+    let mut shell = shelled(dir, &REALS[0], real, 512);
+
+    let mut prompt: Vec<u32> = Vec::new();
+    for _ in 0..64 {
+        prompt.extend_from_slice(&PERIOD);
+    }
+    let context = prompt.len();
+    let step = |shell: &mut driver_vulkan::shell::Shell, tokens: Vec<u32>| {
+        shell
+            .step(&[driver_vulkan::turns::Turn { who: 1, tokens }])
+            .unwrap_or_else(|e| panic!("{e}"));
+    };
+    step(&mut shell, prompt);
+    for _ in 0..2 {
+        step(&mut shell, vec![PERIOD[0]]);
+    }
+
+    const STEPS: u32 = 4;
+    let at = std::time::Instant::now();
+    for _ in 0..STEPS {
+        step(&mut shell, vec![PERIOD[0]]);
+    }
+    let each = at.elapsed() / STEPS;
+    eprintln!("a decode step at {context} tokens: {each:?}");
+    assert!(
+        each < std::time::Duration::from_millis(1000),
+        "a decode step at {context} tokens of history took {each:?}, and the measured cost \
+         is about 110 ms in release: attention is reading the history far too many times, \
+         which is exactly the defect this test was written for"
+    );
+}
+
+/// Giving back ONE page costs what giving back HALF THE POOL costs.
+///
+/// # Why this is a test and not a benchmark
+///
+/// The Vulkan seam publishes `elastic_page_bytes: 0` and
+/// `elastic_budget_pages: 0`, and `bootstrap` reads those two together: a
+/// trim task starts only when both are non-zero. So this backend's pool is
+/// never trimmed in production, even though `Shell::resize_pool` is
+/// implemented, contents-preserving, and refusal-safe -- proven by
+/// `a_cache_resized_under_a_conversation_does_not_change_its_answer` just
+/// above.
+///
+/// Advertising zero for a thing that works needs a REASON, and the seam
+/// stated the wrong one for as long as it stated any: "nothing can be given
+/// back page-wise". That is false. A shrink frees the old buffers and takes
+/// smaller ones, so bytes do come back, at any page granularity the caller
+/// names.
+///
+/// The true reason is the COST, and the cost has nothing to do with the
+/// delta. `Pool::resize` reads every layer's whole old buffer down to host
+/// memory and writes the survivors up into a fresh one, so a caller is
+/// charged for the POOL, twice, however few pages it asked to move.
+///
+/// Measured on this box, at 1024 pages of qwen3-0.6b -- 28 layers, both
+/// halves, about 1.8 GB of cache:
+///
+/// | shrink | cost |
+/// |---|---|
+/// | 1024 -> 1023 (one page) | 5.5 s |
+/// | 1023 -> 1022 (one page) | 9.3 s |
+/// | 1022 -> 512 (510 pages) | 10.3 s |
+/// | 512 -> 511 (one page) | 5.7 s |
+///
+/// ...and at the 256 pages this test uses, where it is not merely
+/// delta-independent but INVERTED:
+///
+/// | shrink | cost |
+/// |---|---|
+/// | 255 -> 254 (one page) | 2.77 s |
+/// | 254 -> 128 (126 pages) | 0.74 s |
+///
+/// Handing back one page costs nearly four times what handing back half the
+/// pool costs, and that is not noise: the charge is `old + new`, so the
+/// deeper cut allocates and fills a smaller destination and finishes sooner.
+/// The cheapest trim this pool offers is the largest one.
+///
+/// A trim task ticking every few seconds against a pool that charges seconds
+/// to hand back a single page does not relieve pressure, it manufactures it
+/// -- and it peaks at BOTH sizes at once while it works, since `Pool::resize`
+/// takes all the new buffers before freeing any old one. A shrink asked for
+/// under memory pressure needs more memory than not shrinking. That is the
+/// reason for the zero, and it is now written where the zero is.
+///
+/// # What this asserts, and why so loosely
+///
+/// That a one-page shrink costs at least half of what a half-pool shrink
+/// costs. Measured, it costs about four times as much. The margin is eight-
+/// fold and deliberate: this is a shared box behind two validation layers,
+/// and an assertion that tracked the measurement would fail whenever the
+/// other tenant got busy.
+///
+/// It still fails hard the day the premise changes. A genuinely page-wise
+/// pool -- Vulkan sparse binding, behind a `sparseResidencyBuffer` tier --
+/// would make one page a rounding error against half the pool, this
+/// assertion would go red, and the failure is the reminder to go and
+/// advertise what by then would be true.
+///
+/// It is a lower bound only. An upper bound would be a benchmark, would fail
+/// whenever the other agent on this box got busy, and would be measuring the
+/// machine rather than the pool.
+#[test]
+fn giving_back_one_page_costs_what_giving_back_half_the_pool_costs() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the resize cost is unmeasured");
+        return;
+    };
+    // Big enough that the restage dominates the call's fixed overhead, small
+    // enough to leave the box to its other tenant: 256 pages of qwen3-0.6b is
+    // about 460 MB of cache.
+    const FULL: u64 = 256;
+    let mut shell = shelled(dir, &REALS[0], real, FULL as u32);
+
+    let cost = |shell: &mut driver_vulkan::shell::Shell, to: u64| {
+        let at = std::time::Instant::now();
+        shell
+            .resize_pool(&driver_api::PoolResizePlan {
+                pool_id: driver_api::PIE_ELASTIC_POOL_KV,
+                target_pages: to,
+                ..driver_api::PoolResizePlan::default()
+            })
+            .unwrap_or_else(|e| panic!("resize to {to}: {e}"));
+        assert_eq!(
+            u64::from(shell.shape().pages),
+            to,
+            "the pool did not follow"
+        );
+        at.elapsed()
+    };
+
+    // Warm first, and DISCARDED: the first resize of a process pays for host
+    // allocator growth the later ones reuse, and charging that to the
+    // one-page case would prove this test's point by accident.
+    let _ = cost(&mut shell, FULL - 1);
+
+    let one = cost(&mut shell, FULL - 2);
+    let half = cost(&mut shell, FULL / 2);
+
+    assert!(
+        one * 2 >= half,
+        "a one-page shrink took {one:?} and a {}-page shrink took {half:?}: this pool has \
+         become page-wise, so `elastic_page_bytes` and `elastic_budget_pages` at the Vulkan \
+         seam are now understating it and should be revisited",
+        FULL / 2 - 2,
+    );
+}
+
+/// A growth the machine will not stage is retryable, and changes nothing.
+///
+/// `Shell::admit` grows the pool to whatever a frame NAMES, because the
+/// engine owns page allocation and hands physical pages down. That growth can
+/// fail, and until this it failed as a FAULT -- which, now that a driver lane
+/// answers its token instead of hanging, means the user's request dies for a
+/// condition that clears the moment something is evicted.
+///
+/// So the failure is classified: [`driver_vulkan::device::Failed::OutOfMemory`]
+/// is a scheduling fact and everything else is a fault, and `admit` turns the
+/// first into `Launched::Exhausted` -- the variant this crate declared,
+/// documented, matched on at the engine seam, and produced nowhere.
+///
+/// # What this proves and what it cannot
+///
+/// It proves the classification and the recovery on a REAL pool: the request
+/// is refused as retryable, the pool keeps the shape it had, and the
+/// conversation sitting in it still answers. It cannot prove the arm where
+/// the DEVICE refuses, because provoking that means running a shared machine
+/// out of memory to exercise one comparison. That comparison is unit-tested
+/// in `device.rs` instead, on the result codes themselves.
+///
+/// The path forced here is the host half: the staging buffer a resize builds
+/// before it allocates. That is the same `Failed::OutOfMemory`, reached by
+/// the same call, and it is also the second line of defence that a mutation
+/// once found by killing the test binary with SIGABRT -- a `Vec` that cannot
+/// be allocated aborts the process rather than returning.
+#[test]
+fn a_pool_growth_the_host_cannot_stage_is_retryable_rather_than_fatal() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the growth refusal is unmeasured");
+        return;
+    };
+    let mut shell = shelled(dir, &REALS[0], real, 24);
+
+    // A conversation in the pool, so "changed nothing" is a claim about
+    // contents and not only about a number.
+    let want = {
+        let step = shell
+            .step(&[driver_vulkan::turns::Turn {
+                who: 1,
+                tokens: PERIOD[..4].to_vec(),
+            }])
+            .expect("a first turn");
+        step.logits
+            .row(step.readout_of[0])
+            .expect("a readout row")
+            .to_vec()
+    };
+    let was = shell.shape().pages;
+
+    // Three billion pages: a u32, so the plan is well-formed and the target
+    // reaches the pool rather than being refused as unrepresentable. Its
+    // staging buffer is tens of terabytes, which `try_reserve_exact` refuses
+    // without touching a byte of real memory -- this test costs nothing to
+    // run and does not put the machine under pressure.
+    let refused = shell
+        .resize_pool(&driver_api::PoolResizePlan {
+            pool_id: driver_api::PIE_ELASTIC_POOL_KV,
+            target_pages: 3_000_000_000,
+            ..driver_api::PoolResizePlan::default()
+        })
+        .expect_err("no host stages a cache that size");
+    let driver_vulkan::shell::Unresized::Device(e) = refused else {
+        panic!("a growth nothing can stage was refused as a stranded page: {refused}");
+    };
+    assert!(
+        e.is_out_of_memory(),
+        "a growth the machine cannot stage was classified as a fault, so the \
+         scheduler fails the request instead of evicting and re-posting: {e}"
+    );
+
+    assert_eq!(
+        shell.shape().pages,
+        was,
+        "a refused growth resized the pool anyway, so the re-post the \
+         classification asks for would run against a half-grown cache"
+    );
+    // The book was put back too, or the next page handed out is one the cache
+    // does not have.
+    let again = shell
+        .step(&[driver_vulkan::turns::Turn {
+            who: 1,
+            tokens: PERIOD[..4].to_vec(),
+        }])
+        .expect("the conversation survives a refused growth");
+    let _ = again;
+    let fresh = {
+        let step = shell
+            .step(&[driver_vulkan::turns::Turn {
+                who: 7,
+                tokens: PERIOD[..4].to_vec(),
+            }])
+            .expect("a fresh conversation after a refused growth");
+        step.logits
+            .row(step.readout_of[0])
+            .expect("a readout row")
+            .to_vec()
+    };
+    assert_eq!(
+        fresh, want,
+        "the same prompt answered differently after a refused growth, so the \
+         refusal left the pool or the book in a state it did not start in"
     );
 }
 

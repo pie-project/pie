@@ -370,8 +370,8 @@ pub const NO_METAL_NORMED_LANDING_BIAS: &str = "this row publishes a bias on its
 /// wrong. Every gemma row published today runs at head width 256,
 /// which the shader stamps; and gemma-4's only routed row,
 /// `gemma-4-26b-a4b`, is refused EARLIER and in its own words — this
-/// build has no routed-expert text for a gemma-4 block — so the affine
-/// point was never asked of it. Nothing was being mis-served. What was
+/// build cannot load a routed gemma-4 block — so the affine point was
+/// never asked of it. Nothing was being mis-served. What was
 /// true is that two doors could not have SAID so, and the first row to
 /// land at an unstamped width would have met `model-compiler`'s abort
 /// instead of a sentence.
@@ -634,6 +634,21 @@ pub fn metal_facts(
         // every scale comes from the wrong offset, and the fire that did
         // it produced 909,207 NaNs beginning at the first routed
         // projection of layer 0.
+        // The ROUTER GATE's own format, when the checkpoint published it
+        // wider than the stack it routes. `None` is "the same as the dense
+        // projections", which is every checkpoint but gpt-oss's -- and
+        // getting it wrong is the QUIET failure: a bank read at the wrong
+        // format is 909,207 NaNs, and a gate read at the wrong width is a
+        // fluent model routing every token to almost the right experts.
+        router_repr: (bind.router_quant_group != 0).then(|| {
+            model_compiler::dsl::WeightRepr::Scaled {
+                layout: model_compiler::dsl::ScaleLayout::PerGroup,
+                group: bind.router_quant_group,
+                axis: 0,
+                zero_point: true,
+            }
+        }),
+        router_bits: bind.router_quant_bits,
         moe_repr: bind
             .moe_mxfp4
             .then_some(model_compiler::dsl::WeightRepr::Mxfp4Marlin),
@@ -1104,6 +1119,8 @@ mod tests {
         MetalBinding {
             quant_group: group,
             quant_bits: bits,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,

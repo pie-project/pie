@@ -6,15 +6,63 @@
 //! case. `rope` has crossed into fn-world (`.wiki/kernel-x/northstar.md` §5
 //! step 3): its host programs are `kernels-cuda-new/src/x/rope.rs`, beside
 //! the `rope.cuh` they fire, and its contracts state no `operands` at all.
-//! There is no row left to emit a shim from, so six cases went with it —
+//! There is no row left to emit a shim from, so six cases named `rope` and
+//! **four of the six went with it** —
 //! `every_rope_row_states_its_launcher_exactly`,
 //! `every_launcher_the_header_declares_has_a_row`,
-//! `an_unstated_row_is_skipped_rather_than_called_with_nothing`,
-//! `a_wrong_row_does_not_compile`, `renaming_an_operand_is_not_a_mistake`
-//! and `the_rust_bindings_name_the_symbols_the_shim_defines`, plus the
-//! `rope_shim` helper and the `ROPE_HPP` constant.
+//! `a_wrong_row_does_not_compile` and
+//! `renaming_an_operand_is_not_a_mistake`, plus the `rope_shim` helper and
+//! the `ROPE_HPP` constant.
+//!
+//! **The other two did not, and the distinction is the whole of what this
+//! header got wrong once.** A case that NAMED `rope` is not the same thing as
+//! a case whose SUBJECT was `rope`:
+//!
+//! * `an_unstated_row_is_skipped_rather_than_called_with_nothing` is about
+//!   `abi::stated()`, and its own doc said so — *"the check is about
+//!   `stated()`, so its subject should be too"*. `rope` was only where it
+//!   borrowed a realistic row from. `stated()` dropping an empty operand list
+//!   is now the third of `x::SIGS`' three shim-dropping mechanisms and the
+//!   one **every** ported family is carried by, so the case is more
+//!   load-bearing than it was, not less. Re-keyed at `table::KERNELS`.
+//! * `the_rust_bindings_name_the_symbols_the_shim_defines` is about two
+//!   emitters agreeing on `entry_name`, which is the one string the linker
+//!   matches on. Re-keyed at `table::KERNELS`, over the rows the shim
+//!   actually defines — the two emitters do not filter identically and the
+//!   intersection is the set the claim is about.
+//!
+//! Both are keyed at the AGGREGATE now rather than at a family, deliberately:
+//! `table::KERNELS` spans `ROW_TABLES ++ x::SIGS`, so it cannot rot as the §5
+//! step-5 sweep empties one family after another — which is exactly how these
+//! six came to be broken and unnoticed in the first place.
 //!
 //! **What replaces the proof for `rope`**: `kernels_cuda_new::x::abi`'s
+//! `typecheck_tu` emits a TU that names each declared device function
+//! through `Abi::CPP`, so the `__global__` and the Rust `raw::` stub are
+//! checked against each other by the same compiler for the same reason.
+//! §6.1 of the north star is the argument: *"nothing is written twice"*
+//! means *"nothing is written twice **unchecked**"*, and the typecheck TU is
+//! the oracle that holds the two sides together.
+//!
+//! **What is NOT replaced, and is a real loss**: `a_wrong_row_does_not_
+//! compile` was the mutation suite for `emit_c_shim` ITSELF, which still
+//! serves ten families. It was keyed on `rope::qk_rmsnorm_rope_bf16` by
+//! OPERAND INDEX (`retype(0, Ty::Buf)`, `retype(2, Ty::BufMut)`, two
+//! `swap`s), so re-keying it means choosing a row from a family that is
+//! neither `device::JIT_DISPATCHED` nor `execution::RUST_SERVED` — the two
+//! filters `emit_c_shim` applies — and reading its operand order. That is a
+//! choice that has to be made against a build, and this change was written
+//! without one. It is left undone deliberately rather than re-keyed on a
+//! guess: a mutation suite pointed at the wrong row passes and proves
+//! nothing, which is worse than an absent one.
+//!
+//! That decision stands, and it now has the measurement it was missing: the
+//! surviving donor pool is **three rows, all `attn`, and no one of them
+//! carries the nine cases' vocabulary**. The full sweep — per family, per
+//! filter, with the two rows that would have to be used together and why
+//! `csrc/src/norm/` disqualifies twenty-six more — is written where the two
+//! tests stood, together with the `Ty`-keyed re-key that dissolves the
+//! index-rot this paragraph is about.
 //! `typecheck_tu` emits a TU that names each declared device function
 //! through `Abi::CPP`, so the `__global__` and the Rust `raw::` stub are
 //! checked against each other by the same compiler for the same reason.
@@ -89,23 +137,33 @@ fn csrc() -> PathBuf {
 
 /// Every tree that currently holds a `.cu` or `.cuh` launcher body.
 ///
-/// TWO, AND THE SECOND ONE IS A HOLE THIS CLOSES rather than a place things
-/// belong. `csrc()` is the archive. `driver-cuda/csrc` holds
-/// `attn/attention_flashinfer.cu`, `attn/plan_lifecycle.cpp`,
-/// `supergraph.cu` and the three towers, which earlier passes moved out of the
-/// archive because they could not be compiled by NVRTC. That reasoning is
-/// right about NVRTC and wrong about the destination — host code is Rust, and
-/// C++ in this crate is staging awaiting a rewrite, not a home.
+/// ONE NOW, AND THE HOLE IS FILLED RATHER THAN CLOSED. This used to return
+/// two: `csrc()`, the archive, and `driver-cuda/csrc`, which held
+/// `attn/attention_flashinfer.cu`, `attn/plan_lifecycle.cpp`, `supergraph.cu`
+/// and the three towers — files earlier passes moved out of the archive
+/// because they could not be compiled by NVRTC. The doc that added the second
+/// root said the destination was wrong and that C++ in this crate was staging
+/// awaiting a rewrite, not a home. **The rewrite happened.** `supergraph.cu`
+/// and the towers went earlier; `attention_flashinfer.cu` (1,258 lines) and
+/// `plan_lifecycle.cpp` (105) went with the FA2 dispatches, and
+/// `crates/driver-cuda/csrc/` does not exist. A root that names a directory
+/// with no files in it is not a scan, it is a comment.
 ///
-/// Either way the scans below have to read it. Every `Orphaned` claim in the
-/// exception list means NOTHING CALLS THIS, and it is checked by reading every
-/// `.cu` body and looking for a call. A scan that reads one tree while
-/// launchers live in two finds fewer callers than exist, so `Orphaned` gets
-/// easier to claim exactly as files move — and it fails SILENTLY, by passing.
-/// That is the opposite of what this list is for. Adding the second root costs
-/// nothing and removes the incentive.
+/// The reason the second root was added still stands and is why this is a
+/// deletion rather than a rename: every `Orphaned` claim in the exception
+/// list means NOTHING CALLS THIS, checked by reading every `.cu` body and
+/// looking for a call, and a scan that reads one tree while launchers live in
+/// two finds fewer callers than exist — failing SILENTLY, by passing. That
+/// incentive is gone by the launchers being gone, not by the scan being
+/// widened, which is the stronger of the two ways to remove it.
+///
+/// `collect_cu_bodies` returns quietly on a missing directory, so leaving the
+/// dead root would also have "worked". It would have worked the way the
+/// one-root scan worked before the second was added: by finding nothing and
+/// saying nothing. The vacuity floors below are what stop that, and they are
+/// re-measured against one root at their assertions.
 fn cu_roots() -> Vec<PathBuf> {
-    vec![csrc(), Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc")]
+    vec![csrc()]
 }
 
 /// Compile a generated shim against the real headers.
@@ -206,8 +264,13 @@ fn compile_with(shim: &str, extra: &[PathBuf]) -> Result<(), String> {
 /// family is not proven while two of its rows sit outside the shim, so the
 /// list follows the ROWS rather than the directory.
 fn attn_headers() -> Vec<String> {
-    let mut hs: Vec<String> = std::fs::read_dir(csrc().join("attn"))
-        .expect("attn/")
+    // `attn/` is the last family in the archive and will go the same way the
+    // other nine did. `headers_in`'s header carries the argument for treating
+    // its absence as a fact.
+    let Ok(entries) = std::fs::read_dir(csrc().join("attn")) else {
+        return Vec::new();
+    };
+    let mut hs: Vec<String> = entries
         .filter_map(|e| {
             let n = e.ok()?.file_name().into_string().ok()?;
             n.ends_with(".hpp").then(|| format!("attn/{n}"))
@@ -227,8 +290,13 @@ fn attn_shim(table: &'static [KernelSig]) -> String {
 
 /// The headers `norm`'s rows are declared in — every `norm/*.hpp`.
 fn norm_headers() -> Vec<String> {
-    let mut hs: Vec<String> = std::fs::read_dir(csrc().join("norm"))
-        .expect("norm/")
+    // `norm/` has left the archive; this is `headers_in("norm")` spelled out,
+    // and it returns the empty set for the reason that function's header
+    // gives.
+    let Ok(entries) = std::fs::read_dir(csrc().join("norm")) else {
+        return Vec::new();
+    };
+    let mut hs: Vec<String> = entries
         .filter_map(|e| {
             let n = e.ok()?.file_name().into_string().ok()?;
             n.ends_with(".hpp").then(|| format!("norm/{n}"))
@@ -238,72 +306,58 @@ fn norm_headers() -> Vec<String> {
     hs
 }
 
-/// `norm`'s rows, proven the same way `attn`'s are.
-///
-/// Twenty-eight launchers across seven headers, and the family every
-/// other one leans on: a wrong row here is a wrong argument in an arm
-/// that four executors reach.
-#[test]
-fn every_norm_row_states_its_launcher_exactly() {
-    let table = kernels_cuda_new::table::norm::KERNELS;
-    let stated = table.iter().filter(|k| !k.operands.is_empty()).count();
-    assert_eq!(
-        stated,
-        table.len(),
-        "{} of {} norm rows are unstated, so the shim silently skips them",
-        table.len() - stated,
-        table.len()
-    );
-    let hs = norm_headers();
-    let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
-    let shim = kernels_cuda_new::abi::emit_c_shim(
-        &[table],
-        &refs,
-        &kernels_cuda_new::device::jit_dispatched(),
-    )
-    .expect("no entry-point collisions");
-    if let Err(err) = compile(&shim) {
-        panic!(
-            "the generated shim does not compile, so a row misstates its \
-             launcher:\n{err}"
-        );
-    }
-}
+// `every_norm_row_states_its_launcher_exactly` STOOD HERE, and it is deleted
+// for the reason the `mlp` note below gives, which now applies to it too:
+// §5 step 5 took `norm` into fn-world and `x::norm`'s twenty-eight contracts
+// state NO operands, so the assertion would read "0 of 28 rows are stated"
+// and fail on the change that made it right.
+//
+// Its text was: *"`norm`'s rows, proven the same way `attn`'s are. Twenty-eight
+// launchers across seven headers, and the family every other one leans on: a
+// wrong row here is a wrong argument in an arm that four executors reach."*
+// It asserted that every one of `table::norm`'s rows states its `operands`,
+// then compiled the shim those operands generate.
+//
+// TWENTY-EIGHT was the count of LAUNCHERS across the seven `norm/*.hpp`
+// headers; `table::norm::KERNELS` held twenty-SIX rows, and the two the
+// table never had -- `norm::add_bias_bf16` and
+// `norm::rmsnorm_gated_fp32_in_bf16` -- are contracts in `x::norm` now, which
+// is how the port found them. The launcher-side claim this test made survives
+// in `every_norm_launcher_is_a_row_or_a_stated_exception` below, which reads
+// the same seven
+// headers and requires every declaration in them to have a row or a stated
+// reason; it reads `x::norm::SIGS` for that half now.
+//
+// The C-shim half is not replaced and does not need to be: a contract-derived
+// row states no operands, `emit_c_shim` drops it, and the shim for `norm`
+// would be a file of includes and no bodies -- the same empty compile the
+// `mlp` note records below.
 
-/// `mlp`'s rows. Sixteen activations across two headers, and the family
-/// whose default arguments make a hand-written binding easiest to get
-/// wrong -- `gpt_oss_glu_bf16` alone carries three.
-#[test]
-fn every_mlp_row_states_its_launcher_exactly() {
-    let table = kernels_cuda_new::table::mlp::KERNELS;
-    let stated = table.iter().filter(|k| !k.operands.is_empty()).count();
-    assert_eq!(
-        stated,
-        table.len(),
-        "{} of {} mlp rows are unstated, so the shim silently skips them",
-        table.len() - stated,
-        table.len()
-    );
-    let shim = kernels_cuda_new::abi::emit_c_shim(
-        &[table],
-        // `mlp/swiglu.hpp` was here and is DELETED with `mlp/swiglu.cu` --
-        // the whole of `csrc/src/mlp/`. All twelve `table::mlp` rows are in
-        // `device::JIT_DISPATCHED`, so `emit_c_shim` skips every one of them
-        // and this shim is now a file of includes and no bodies. The
-        // assertion above it still bites: a row that stopped stating its
-        // operands would fail the count, and the count is what this test is
-        // actually for.
-        &[],
-        &kernels_cuda_new::device::jit_dispatched(),
-    )
-    .expect("no entry-point collisions");
-    if let Err(err) = compile(&shim) {
-        panic!(
-            "the generated shim does not compile, so a row misstates its \
-             launcher:\n{err}"
-        );
-    }
-}
+// `every_mlp_row_states_its_launcher_exactly` STOOD HERE, and it is deleted
+// rather than repaired, because §5 step 5 makes its assertion the OPPOSITE of
+// what is now correct.
+//
+// Its text was: *"`mlp`'s rows. Sixteen activations across two headers, and
+// the family whose default arguments make a hand-written binding easiest to
+// get wrong -- `gpt_oss_glu_bf16` alone carries three."* It asserted that
+// every one of `table::mlp`'s twelve rows states its `operands`, then
+// compiled the shim those operands generate.
+//
+// `x::mlp`'s twelve contracts state NO operands — that is the third of the
+// three shim-dropping mechanisms and it is the point of the port, not a
+// regression — so the assertion would now read "0 of 12 rows are stated" and
+// fail on the change that made it right. `emit_c_shim` was already emitting
+// nothing here (the comment inside said so: *"this shim is now a file of
+// includes and no bodies"*), so the compile half tested an empty file.
+//
+// The claim the test actually protected — that a stated row describes a real
+// launcher — survived in `every_norm_row_states_its_launcher_exactly` until
+// §5 step 5 took `norm` too (see the note above this one), and survives in
+// `the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers` below,
+// which is deliberately NOT a whole-family assertion for exactly this reason.
+// What replaces it for `mlp` is `driver-cuda/build.rs`'s `armless` check and
+// the `x::mlp` host programs themselves: `gpt_oss_glu_bf16`'s three defaults
+// are now three Rust parameters with types, which is the ladder §1 draws.
 
 /// `quant`'s and `moe`'s rows, and the STATED half of `layout`'s and
 /// `gemm`'s.
@@ -329,10 +383,22 @@ fn every_mlp_row_states_its_launcher_exactly() {
 /// What IS stated compiles, which is the claim this test can make.
 #[test]
 fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
+    // `table::gemm::KERNELS` was the third; `x::gemm::SIGS` is the same
+    // twelve symbols derived from the `contract!` block.
+    //
+    // `table::layout::KERNELS` was the second and `x::layout::SIGS` is its
+    // seven, derived the same way. Both derived lists state no `operands`,
+    // so `shim_over` emits nothing for either and they are here only so the
+    // walk still sees every symbol these headers cover — which is what makes
+    // `"layout/embed.hpp"` below an include for a family whose rows no
+    // longer reach it, rather than an include that lost its rows silently.
     let tables: [&'static [KernelSig]; 4] = [
-        kernels_cuda_new::table::quant::KERNELS,
-        kernels_cuda_new::table::layout::KERNELS,
-        kernels_cuda_new::table::gemm::KERNELS,
+        // `table::quant::KERNELS` was the first; `x::quant::SIGS` is its
+        // eleven symbols derived from the `contract!` block, stating no
+        // `operands` for the same reason `layout`'s and `gemm`'s do.
+        kernels_cuda_new::x::quant::SIGS,
+        kernels_cuda_new::x::layout::SIGS,
+        kernels_cuda_new::x::gemm::SIGS,
         kernels_cuda_new::table::moe::KERNELS,
     ];
     let headers = [
@@ -356,9 +422,11 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
         // until this list gained the include."* Those rows were the three in
         // `table/driver_internal.rs`, and they are deleted -- the driver
         // reaches the kernels through `driver_cuda::fire::quant_int8` now.
-        // `table::quant::KERNELS` above stays in the table list: its rows are
-        // all routed, so the shim emits nothing and there is nothing left to
-        // include for them.
+        // `x::quant::SIGS` above stays in the table list: its rows state no
+        // operands at all now, so the shim emits nothing and there is nothing
+        // left to include for them. The sentence held for a different reason
+        // before the port — the rows were all routed — and both readings end
+        // at the same empty shim, which is what made the swap safe.
         "layout/embed.hpp",
         // `layout/slot_ops.hpp` and `layout/deinterleave.hpp` were here and
         // are DELETED with their `.cu` files. `copy_if_valid_slot` and
@@ -413,63 +481,31 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
     }
 }
 
-/// `ssm`'s rows — the largest single family, and the one whose ten
-/// recurrence spellings differ only by which state dtype and whether the
-/// heads are grouped.
-///
-/// Ten near-identical argument lists is exactly where a hand-written
-/// binding goes wrong quietly: `state_base` is `float*` in six of them
-/// and `void*` in four, and the two are the same pointer at a call site.
-#[test]
-fn every_ssm_row_states_its_launcher_exactly() {
-    let table = kernels_cuda_new::table::ssm::KERNELS;
-    // THREE rows stay unstated, and naming them is the point of pinning
-    // the count rather than asserting it away:
-    //
-    //
-    // The two `build_nemotron_moe_ptrs_*` builders came IN with the
-    // pointer-array kinds -- they take `const void* const*` for the
-    // weights they read and `void**` for the arrays they fill, and only
-    // `BufArray` vs `BufArrayOutMut` makes the difference a compile
-    // error instead of a builder writing an array it was handed to
-    // read.
-    let stated = table.iter().filter(|k| !k.operands.is_empty()).count();
-    assert_eq!(
-        stated,
-        table.len(),
-        "{} of {} ssm rows are unstated, so the shim silently skips them",
-        table.len() - stated,
-        table.len()
-    );
-    let shim = kernels_cuda_new::abi::emit_c_shim(
-        &[table],
-        // NO HEADERS AT ALL, AND THAT IS THE END STATE RATHER THAN A GAP.
-        // The comment this replaces read: *"ONE header, and the eleven that
-        // used to need the other three are the reason there is one.
-        // `ssm/{causal_conv1d,gated_delta_net,kda}.hpp` are deleted with
-        // their `.cu`s: every launcher they declared is
-        // `execution::RUST_SERVED` now, `emit_c_shim` skips a `RUST_SERVED`
-        // row, and a header declaring nothing the shim calls is an include
-        // that can only break the build later."*
-        //
-        // `ssm/nemotron_h.hpp` has now gone the same way and `csrc/src/ssm/`
-        // with it, so this shim is EMPTY: every `table::ssm` row is either
-        // `device::JIT_DISPATCHED` or `execution::RUST_SERVED`. The test
-        // stays because it still makes a claim -- the `stated` assertion
-        // above is not vacuous, and an ssm row that ever comes back
-        // unrouted will emit a body with no header to declare it and fail
-        // here rather than at link.
-        &[] as &[&str],
-        &kernels_cuda_new::device::jit_dispatched(),
-    )
-    .expect("no entry-point collisions");
-    if let Err(err) = compile(&shim) {
-        panic!(
-            "the generated shim does not compile, so a row misstates its \
-             launcher:\n{err}"
-        );
-    }
-}
+// `every_ssm_row_states_its_launcher_exactly` STOOD HERE, and it is deleted
+// for the reason the `norm` and `mlp` notes above give, which now applies to
+// it too: §5 step 5 took `ssm`'s five roots into fn-world and `x::ssm`'s
+// twenty-seven contracts state NO operands, so the assertion would read
+// "0 of 27 rows are stated" and fail on the change that made it right.
+//
+// Its text was: *"`ssm`'s rows — the largest single family, and the one whose
+// ten recurrence spellings differ only by which state dtype and whether the
+// heads are grouped. Ten near-identical argument lists is exactly where a
+// hand-written binding goes wrong quietly: `state_base` is `float*` in six of
+// them and `void*` in four, and the two are the same pointer at a call
+// site."*
+//
+// THAT CLAIM SURVIVES AND IS NOW A COMPILE ERROR RATHER THAN AN ASSERTION,
+// which is the whole of what the port bought here. The ten spellings are ten
+// `pub unsafe fn`s in `x::ssm::gated_delta_net`, six taking `*mut f32` and
+// four `*mut c_void`, and `unit!`'s generic binding group ties each symbol to
+// the instantiation that matches — so handing a `float*` state to a bf16 row
+// no longer type-checks. No test is needed for a thing the compiler refuses.
+//
+// The C-shim half needed no replacement even before the port: this test's own
+// comment recorded that the shim it compiled was ALREADY EMPTY, because every
+// `table::ssm` row was either `device::JIT_DISPATCHED` or
+// `execution::RUST_SERVED` and `emit_c_shim` skips both. It was compiling a
+// file of no includes and no bodies.
 
 /// The same proof at family scale: all fifty `attn` rows, ~700 operands.
 ///
@@ -809,8 +845,18 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     for root in cu_roots() {
         collect_cu_bodies(&root, &mut cu_text);
     }
+    // 60 KB, WAS 100 KB, AND THE MOVE IS THE POINT OF THE NUMBER. The old
+    // floor was measured with `driver-cuda/csrc` in `cu_roots`. That tree is
+    // deleted, and this scan — comment lines, `void <name>(` lines and
+    // `"`-quoted spans removed — now reads 73,055 bytes from the archive
+    // alone. A floor left at 100_000 would fail for the one reason a vacuity
+    // guard must never fail for: the tree really did get smaller. A floor
+    // raised to 73_000 would break on the next honest deletion. 60_000 is
+    // ~82% of what is there, which is a scan that stopped, not a tree that
+    // shrank — and `attention_xqa*`, the largest bodies left, are owned by
+    // another pass, so this number is expected to move again with them.
     assert!(
-        cu_text.len() > 100_000,
+        cu_text.len() > 60_000,
         "only {} bytes of .cu body found, so the orphan check is vacuous",
         cu_text.len()
     );
@@ -1028,7 +1074,11 @@ fn collect_cu_bodies(dir: &Path, out: &mut String) {
 /// Every `void` launcher declared across `attn/*.hpp`, by name.
 fn declared_launchers() -> Vec<String> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(csrc().join("attn")).expect("attn/") {
+    // Same as `attn_headers`: the directory's absence is the family finishing.
+    let Ok(entries) = std::fs::read_dir(csrc().join("attn")) else {
+        return out;
+    };
+    for entry in entries {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("hpp") {
             continue;
@@ -1089,6 +1139,242 @@ fn mentions_word(hay: &str, needle: &str) -> bool {
     })
 }
 
+/// A row with no operands is not a row that takes none.
+///
+/// The distinction matters while the table is being filled a family at a
+/// time: emitting an unstated row as a nullary `extern "C"` would generate a
+/// call the compiler rejects for the wrong reason, and would make "this
+/// family is done" indistinguishable from "this family is empty".
+///
+/// Asked of a SYNTHETIC row rather than of whichever family happens to be
+/// empty today. It used to point at `attn`, and filling `attn` turned a
+/// passing test into a failing one without anything being wrong — the check
+/// is about `stated()`, so its subject should be too.
+///
+/// # Its subject did not leave with `rope`, it got PROMOTED
+///
+/// The donor was `table::rope::KERNELS` and `rope` is fn-world's pilot, so
+/// the row is gone. The rule is not: `abi::stated()` dropping a row with an
+/// empty operand list is the THIRD of `x::SIGS`' three shim-dropping
+/// mechanisms, and `x/mod.rs` names it *"the mechanism every ported row is
+/// carried by"*. Every family that crosses adds twelve-odd rows whose only
+/// protection from being emitted as a nullary `extern "C"` is this one
+/// predicate — so a test that was about a corner of the fill campaign is now
+/// the guard on the whole §5 step-5 sweep.
+///
+/// So the donor is re-keyed at `table::KERNELS`, the aggregate, rather than
+/// at a family. A family-keyed donor is a citation that rots the day that
+/// family crosses, which is the failure that brought this test here; the
+/// aggregate cannot, because it is what `check_plan` reads and it spans both
+/// worlds by construction (`ROW_TABLES ++ x::SIGS`).
+///
+/// The second half is the same predicate asked of REAL unstated rows instead
+/// of a synthetic one, and it carries its own non-emptiness guard. An empty
+/// list is a valid list: `assert!(!shim.contains("extern \"C\""))` over a
+/// `SIGS` that had gone to zero rows would pass while checking nothing, and
+/// a passing assertion over nothing is the one failure this tree has already
+/// shipped once.
+#[test]
+fn an_unstated_row_is_skipped_rather_than_called_with_nothing() {
+    let stated = kernels_cuda_new::table::KERNELS
+        .iter()
+        .find(|k| !k.operands.is_empty())
+        .expect("some row of the aggregate table is stated");
+    let row: &'static [KernelSig] = Vec::leak(vec![KernelSig {
+        operands: &[],
+        ..*stated
+    }]);
+    // `rope_shim` went with `rope`. The headers are irrelevant to what is
+    // being asked — nothing is emitted, so nothing needs declaring — and
+    // `shim_over` is the family-agnostic spelling the rest of the file uses.
+    let shim = shim_over(row, &[]);
+    assert!(
+        !shim.contains("extern \"C\""),
+        "the row states no operands, so nothing should be emitted:\n{shim}"
+    );
+
+    // AND THE REAL ONES. `x::rope::SIGS` is twelve contracts whose derived
+    // rows state no `operands` by construction — the thing the synthetic row
+    // above imitates — so the same predicate must drop all twelve.
+    let ported = kernels_cuda_new::x::rope::SIGS;
+    assert!(
+        !ported.is_empty(),
+        "`x::rope::SIGS` is empty, so the assertion below would pass over \
+         nothing. Either the pilot family lost its contracts or this test is \
+         pointed at the wrong list; both are defects and neither is a green run"
+    );
+    assert!(
+        ported.iter().all(|k| k.operands.is_empty()),
+        "a fn-world contract derived a row WITH operands, so `stated()` would \
+         emit a `pie_k_*` entry forwarding to a launcher that is a Rust `fn`"
+    );
+    let ported_shim = shim_over(ported, &[]);
+    assert!(
+        !ported_shim.contains("extern \"C\""),
+        "a ported family still emits a shim entry:\n{ported_shim}"
+    );
+}
+
+// THE MUTATION SUITE AND ITS CONTROL ARE RETIRED HERE, UNRESOLVED, AND THAT
+// IS DELIBERATE. Both were keyed on `rope::qk_rmsnorm_rope_bf16`, and `rope`
+// is fn-world's pilot.
+//
+// `a_wrong_row_does_not_compile` read:
+//
+// > Corrupting a row must break the build — the mutation suite, answered
+// > exactly.
+// >
+// > Each case changes ONE thing a hand-written binding gets wrong, and every
+// > one of them has to be caught. The last two are the interesting ones: they
+// > are not type errors, they are an operand list of the right types in the
+// > wrong ORDER, which is precisely the failure a `void*`-flattened ABI
+// > cannot see and this one can.
+//
+// It built NINE corruptions of the pilot row and required every one to fail
+// the C++ compile: a written buffer claimed read-only (`retype(0, Buf)`), a
+// read-only weight claimed written (`retype(2, BufMut)`), positions losing
+// its element type (`retype(4, Buf)`), an extent widened to a float
+// (`retype(5, F32)`), a rate narrowed to an int (`retype(9, I32)`), the
+// stream dropped, an operand invented at index 5, `q` and `k_weight` trading
+// places (`swap(0, 3)`) and an extent trading with a rate (`swap(6, 9)`).
+// `renaming_an_operand_is_not_a_mistake` was its control: rename all eleven
+// operands, which is prose, and require the same shim to still compile.
+//
+// # The subject is ALIVE, so this is a loss and not a close
+//
+// `emit_c_shim` still serves every row family, and the mutation suite is the
+// only thing in the tree that asks whether the proof is watching. This file's
+// header already recorded the decision not to re-key on a guess; what follows
+// is the measurement that decision was missing, so the next attempt starts
+// from numbers instead of from a survey.
+//
+// # Why it is not re-keyed, measured rather than asserted
+//
+// `emit_c_shim` applies three filters — `abi::stated()` (a non-empty operand
+// list), `device::JIT_DISPATCHED`, and `execution::RUST_SERVED` — so a donor
+// must survive all three, and its family's `.hpp` must still be in
+// `csrc/src/` for the control to compile. Swept 2026-08-14 against
+// `table/{attn,norm,moe}.rs`, `device::JIT_DISPATCHED` (37 symbols) and
+// `execution::RUST_SERVED` (51):
+//
+//   * `attn` — 36 rows, **3 survive all three filters**.
+//   * `norm` — 26 rows survive the filters and NONE is a candidate:
+//     `csrc/src/norm/` is deleted, so `norm_headers()` is empty and there is
+//     no declaration for a shim body to call.
+//   * `moe` — 24 rows, **0 survive**.
+//
+// The three surviving `attn` rows do not carry the vocabulary between them,
+// and they fail in opposite directions:
+//
+//   * `attn::attention_xqa_decode_bf16_prepared` (13 operands) has `Buf`,
+//     `BufMut`, `I32` and `F32` — and NO typed device array, so "positions
+//     loses its element type" has no subject.
+//   * `attn::attn_score_fold_heads` (9) has `F32s`, `I32s`, `U32s`,
+//     `F32sMut` and `I32` — and no `Buf`, no `BufMut`, no scalar `F32`, so
+//     five of the nine cases have no subject.
+//   * `attn::dispatch_attention_mla_bf16` (14) carries two opaque plan/view
+//     types and no scalar `F32`.
+//
+// So a re-key needs TWO donors and would still be pointed at `attn`, which
+// `x/attn.rs` and `x/xqa.rs` say is mid-crossing. Splitting a nine-case
+// mutation suite across two rows of a family that is leaving is how the
+// citation rots again, and this file's `HELD`-table lesson — a gate whose
+// denominator is a set the claimant supplies — is the same shape.
+//
+// # What a re-key should do instead, when there is a build to check it with
+//
+// Key on `Ty`, not on index. The suite failed to survive its family because
+// `retype(4, Buf)` is a claim about `rope::qk_rmsnorm_rope_bf16`'s operand 4;
+// `retype(first_of(Ty::I32s), Ty::Buf)` is a claim about the vocabulary, and
+// the vocabulary does not move when a family does. Select the donor at run
+// time as *the first row of `table::KERNELS` that survives the three filters
+// and carries a `BufMut`, a `Buf`, a typed device array, a scalar `I32` and a
+// scalar `F32`*, `.expect()` with those five kinds named, and derive all nine
+// cases from it. That donor is `None` today, which is why this is a record
+// and not a patch.
+//
+// One fact makes the re-key sound the moment a donor exists, and it is worth
+// carrying because it is not obvious: the emitted body forwards **through a
+// function pointer of the row's exact type**, and `emit_c_shim`'s own header
+// says why — *"A function-pointer initialisation admits NO parameter
+// conversions ... a direct call is checked by overload resolution, and
+// overload resolution accepts `void*` where the callee takes `const void*`."*
+// So every one of the nine really is a compile error, including the two
+// swaps: `int`/`float` would convert silently in a direct call and cannot in
+// a pointer initialisation. A re-key does not have to re-establish that.
+//
+// The control goes with the suite, and only with it. A control's whole job is
+// to fail when the mutations pass for an unrelated reason; kept alone it
+// would assert that one arbitrary row compiles, which
+// `every_attn_row_states_its_launcher_exactly` already asserts for all of
+// them. Re-land the two together or neither.
+
+/// The Rust bindings declare exactly what the C++ shim defines.
+///
+/// Both are generated from one row, so this cannot fail by drift; what it
+/// pins is that the two emitters agree on the ENTRY POINT spelling, which is
+/// the one string the linker matches on and the one thing neither compiler
+/// checks.
+///
+/// # Re-keyed off `rope` and onto the aggregate, and the loop gained a filter
+///
+/// The donor was `table::rope::KERNELS` and `rope` crossed into fn-world, so
+/// the rows are gone. The claim is not: `entry_name` is still the one string
+/// the linker matches on, and `emit_c_shim` and `emit_rust_bindings` are
+/// still two emitters that can disagree about it. `table::KERNELS` is the
+/// right subject because it cannot rot as families cross — it spans
+/// `ROW_TABLES ++ x::SIGS` by construction — and because a disagreement is a
+/// link error in whichever binary states the symbol first, which has nothing
+/// to do with which family the row is in.
+///
+/// **The two emitters do not filter identically, and iterating the table raw
+/// would fail on that rather than on a disagreement.** Both apply
+/// `abi::stated()` and both skip `execution::RUST_SERVED`; only
+/// `emit_c_shim` also skips `device::JIT_DISPATCHED`, because a routed row
+/// has no host launcher to forward to while its Rust declaration is still
+/// legitimate (`bind::jit::fire` is its path, and `driver-cuda/build.rs`'s
+/// "a declaration with no definition is only legitimate for a routed row"
+/// check is where that is enforced). So the loop walks the INTERSECTION —
+/// the rows the shim actually defines — which is exactly the set on which
+/// "the two emitters agree" is a statement at all.
+///
+/// The intersection is checked for emptiness first. It is one row per family
+/// still in the archive and it shrinks with every port; when it reaches zero
+/// this test passes over nothing, and it must say so rather than go green.
+#[test]
+fn the_rust_bindings_name_the_symbols_the_shim_defines() {
+    let table = kernels_cuda_new::table::KERNELS;
+    let jit = kernels_cuda_new::device::jit_dispatched();
+    let defined: Vec<&'static KernelSig> = table
+        .iter()
+        .filter(|k| !k.operands.is_empty())
+        .filter(|k| !jit.iter().any(|d| d.sig.symbol == k.symbol))
+        .filter(|k| !kernels_cuda_new::execution::RUST_SERVED.contains(&k.symbol))
+        .collect();
+    assert!(
+        !defined.is_empty(),
+        "no row survives the shim's three filters, so the loop below would \
+         check nothing. The archive has no entry points left — which is the \
+         end of the migration and is the right moment to DELETE this test \
+         with a record, not to let it report green over an empty set"
+    );
+
+    // `rope_shim` went with `rope`; `shim_over` is the family-agnostic
+    // spelling, and the headers are irrelevant here — this asks what the
+    // emitters NAME, not whether the bodies compile, which is
+    // `every_attn_row_states_its_launcher_exactly`'s question.
+    let shim = shim_over(table, &[]);
+    let rs = kernels_cuda_new::abi::emit_rust_bindings(&[table]);
+    for k in defined {
+        let entry = kernels_cuda_new::abi::entry_name(k.symbol);
+        assert!(
+            shim.contains(&format!("void {entry}(")),
+            "{entry} not defined"
+        );
+        assert!(rs.contains(&format!("fn {entry}(")), "{entry} not declared");
+    }
+}
+
 /// The two ways the SHIM BUILD can fail that no per-family case reaches.
 ///
 /// Both were found by the `origin/rewrite` merge, which is the point: a
@@ -1135,10 +1421,7 @@ fn the_whole_bridge_generates_for_both_sides() {
          would pass vacuously: {dirs:?}"
     );
 
-    let tables: &[&'static [kernels::KernelSig]] = &[
-        kernels_cuda_new::table::KERNELS,
-        kernels_cuda_new::table::driver_internal::DRIVER_KERNELS,
-    ];
+    let tables: &[&'static [kernels::KernelSig]] = &[kernels_cuda_new::table::KERNELS];
     let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
     let shim = kernels_cuda_new::abi::emit_c_shim(
         tables,
@@ -1393,9 +1676,38 @@ fn without_the_binding_a_dropped_field_would_go_unnoticed() {
 // this branch. They are back, unchanged except where the remote's own work
 // made an assertion stale — noted at the line it changed.
 
+/// The `.hpp` a family declares its ahead-of-time launchers in, or **nothing
+/// at all** once the family has left the archive.
+///
+/// # A missing directory is a fact, not an error
+///
+/// This used to `.expect("family directory")`, and that was right while every
+/// family had one. `norm/`, `ssm/`, `mlp/`, `sample/`, `quant/`, `gemm/`,
+/// `comm/` and the rest are now gone from `kernels-cuda/csrc/src` — their
+/// kernels are NVRTC's and their host programs are Rust — so the read panics
+/// for a family that finished rather than a family that broke. The panic is
+/// also misattributed: it fires in whichever test runs first and names a
+/// directory, not the deletion that removed it.
+///
+/// So absence returns the empty set. What that means downstream is exact and
+/// worth stating rather than leaving to be inferred: `emit_c_shim` writes one
+/// entry per row whose declaration it can find, so a family with no headers
+/// contributes no entries — which is the correct answer for rows now carried
+/// by `device::JIT_DISPATCHED` or `execution::RUST_SERVED`, and the same
+/// answer the shim would give if the headers were present and empty.
+///
+/// **The cost is that a test over an empty set is vacuous and still green.**
+/// That is the honest trade here — the alternative is a hard-coded list of
+/// which families are supposed to still exist, which is a second denominator
+/// to keep in step, and §21's recurring defect in this tree is exactly a gate
+/// asserting its own denominator. The countdown is `kernels-cuda/tests/
+/// sources.rs`'s census; it is that file's job to notice a family leaving,
+/// and it re-derives by walking.
 fn headers_in(dir: &str) -> Vec<String> {
-    let mut hs: Vec<String> = std::fs::read_dir(csrc().join(dir))
-        .expect("family directory")
+    let Ok(entries) = std::fs::read_dir(csrc().join(dir)) else {
+        return Vec::new();
+    };
+    let mut hs: Vec<String> = entries
         .filter_map(|e| {
             let n = e.ok()?.file_name().into_string().ok()?;
             n.ends_with(".hpp").then(|| format!("{dir}/{n}"))
@@ -1435,17 +1747,27 @@ fn prove_family(family: &str, table: &'static [KernelSig], headers: &[String]) {
     }
 }
 
-/// The one `sample` row. Its weight is the table's only `const int8_t*`
-/// (`I8s`) — a fused GEMV+argmax over an int8 lm_head with per-channel fp32
-/// scales.
-#[test]
-fn every_sample_row_states_its_launcher_exactly() {
-    prove_family(
-        "sample",
-        kernels_cuda_new::table::sample::KERNELS,
-        &headers_in("sample"),
-    );
-}
+// The one `sample` row IS GONE, and this test with it.
+//
+// It read:
+//
+// > The one `sample` row. Its weight is the table's only `const int8_t*`
+// > (`I8s`) — a fused GEMV+argmax over an int8 lm_head with per-channel
+// > fp32 scales.
+//
+// §5 step 5 took `sample` into fn-world as `x::sample`, whose one contract
+// derives a row that states no `operands` — so `prove_family`'s first
+// assertion ("`n` of `m` rows are unstated, so the shim silently skips
+// them") is now true BY CONSTRUCTION for every fn-world row and says
+// nothing. There is also no shim to compile: `sample`'s launcher is
+// `x::sample::lm_head_gemv_argmax_int8`, a Rust `fn`, and the C++ entry
+// point it used to prove has no caller.
+//
+// **The `I8s` measurement survives** and is worth keeping in reach: it was
+// this table's only `const int8_t*` operand, and it is now the `*const i8`
+// parameter of `x::sample`'s `lm_head_gemv_argmax_int8` declaration —
+// checked by the typecheck translation unit against the `.cuh` rather than
+// by a shim compile, which is the same proof one layer down.
 
 /// Across EVERY table, the rows without operands are exactly the ones with
 /// a written reason — and nothing else.
@@ -1549,11 +1871,16 @@ fn every_driver_internal_row_states_its_launcher_exactly() {
     // and a header list that is a superset costs a parse.
     headers.push("vision/qwen3_vl_tower_c.hpp".into());
     headers.push("vision/gemma4_towers_c.hpp".into());
-    prove_family(
-        "driver-internal",
-        kernels_cuda_new::table::driver_internal::DRIVER_KERNELS,
-        &headers,
-    );
+    // `prove_family("driver-internal", DRIVER_KERNELS, &headers)` STOOD HERE.
+    //
+    // It proved that every `driver_internal` row's symbol had a matching
+    // `extern "C"` declaration in the archive's headers. §5 step 5 deleted
+    // the rows: the six launchers are `fn`s in `x::driver_internal` with no
+    // `contract!`, they are called directly from Rust, and there is no
+    // declaration for them to agree with. The two `headers.push` lines above
+    // are kept because the vision headers are still parsed by the callers
+    // below.
+    let _ = &headers;
 }
 
 /// Every launcher declared across a family's headers, by name.
@@ -1565,7 +1892,13 @@ fn every_driver_internal_row_states_its_launcher_exactly() {
 /// exception tests exist to force.
 fn declared_in(dir: &str, returns: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(csrc().join(dir)).expect("family directory") {
+    // A family that has left the archive declares nothing, and that is the
+    // answer rather than a panic. See `headers_in`'s header for the argument
+    // and for what an empty set costs the tests that read it.
+    let Ok(entries) = std::fs::read_dir(csrc().join(dir)) else {
+        return out;
+    };
+    for entry in entries {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("hpp") {
             continue;
@@ -1681,8 +2014,26 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
         );
     }
 
+    // `table::norm::KERNELS` until §5 step 5 took `norm` into fn-world.
+    // `x::norm::SIGS` is the same set of symbols, derived from the
+    // `contract!` block instead of written by hand -- and it is TWO LONGER,
+    // because `norm::add_bias_bf16` and `norm::rmsnorm_gated_fp32_in_bf16`
+    // are lowered symbols that never had an ahead-of-time row and reached
+    // the driver only through `families::norm`'s JIT rows. The port gave
+    // them contracts, because a symbol a lowering can state and no contract
+    // declares reaches `Route::Unknown` and refuses the model at load.
+    //
+    // SO ALL THREE `EmitterChosen` EXCEPTIONS NOW HAVE A ROW. That does not
+    // fail anything -- `undecided` only shrinks, and `stale` asks whether a
+    // header still DECLARES the launcher, not whether a row exists -- but it
+    // does mean the exceptions list is no longer the reason those three are
+    // decided. It is kept, and kept honest by the `EmitterChosen` check at
+    // the bottom, which reads `lower.rs` and is the claim that actually
+    // matters: these three are chosen by the emitter, and now they are also
+    // declared in `x::norm`, which is the same statement made twice rather
+    // than a contradiction.
     let has_row = |n: &str| {
-        kernels_cuda_new::table::norm::KERNELS
+        kernels_cuda_new::x::norm::SIGS
             .iter()
             .any(|k| k.symbol == format!("norm::{n}"))
     };
@@ -1817,8 +2168,18 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
     for root in cu_roots() {
         collect_cu_bodies(&root, &mut cu_text);
     }
+    // 60 KB, WAS 100 KB, AND THE MOVE IS THE POINT OF THE NUMBER. The old
+    // floor was measured with `driver-cuda/csrc` in `cu_roots`. That tree is
+    // deleted, and this scan — comment lines, `void <name>(` lines and
+    // `"`-quoted spans removed — now reads 73,055 bytes from the archive
+    // alone. A floor left at 100_000 would fail for the one reason a vacuity
+    // guard must never fail for: the tree really did get smaller. A floor
+    // raised to 73_000 would break on the next honest deletion. 60_000 is
+    // ~82% of what is there, which is a scan that stopped, not a tree that
+    // shrank — and `attention_xqa*`, the largest bodies left, are owned by
+    // another pass, so this number is expected to move again with them.
     assert!(
-        cu_text.len() > 100_000,
+        cu_text.len() > 60_000,
         "only {} bytes of .cu body found, so the orphan check is vacuous",
         cu_text.len()
     );

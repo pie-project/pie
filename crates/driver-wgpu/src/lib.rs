@@ -255,6 +255,8 @@ pub mod device;
 // device -- which is what lets `frames::unserved_in` and `frames::pages_named`
 // be tested with no adapter at all.
 #[cfg(feature = "native")]
+pub mod envelope;
+#[cfg(feature = "native")]
 pub mod frames;
 #[cfg(feature = "native")]
 pub mod serve;
@@ -284,5 +286,14 @@ pub mod resources;
 
 pub use binding::{Allocation, Arena, Bound, Resolve, Unbindable, bind, resolve};
 pub use geometry::{Dims, Local, Module, Rule, Tile, Ungeometric, groups, groups_within, lanes};
+/// The row a symbol belongs to, from the table above.
+pub use kernels::sig_in;
+/// The kernel table and the tier vocabulary this driver was built against.
+///
+/// Re-exported because a caller that must ask "how wide a fire can this
+/// driver take" needs the same table the dispatcher reads, and a second copy
+/// -- an engine depending on `kernels-wgpu` directly -- is a second thing that
+/// can drift.
+pub use kernels_wgpu::{Capability, KERNELS};
 pub use lowering::{Call, Mismatch, Value, pack};
 pub use reflect::Declared;

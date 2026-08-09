@@ -163,8 +163,55 @@ pub enum Failed {
         /// What `maxComputeWorkGroupCount` allows on that axis.
         limit: u32,
     },
+    /// The device would not give this allocation memory, right now.
+    ///
+    /// Separated from [`Self::Vulkan`] because the CALLER'S next move
+    /// differs, which is the only reason any of these variants exist. Every
+    /// other failure here is a fault: the frame is wrong, or the module is,
+    /// and repeating it repeats the failure. This one is a scheduling fact.
+    /// The same frame, posted after something else is evicted, succeeds.
+    ///
+    /// It is reachable in ordinary service rather than only under abuse.
+    /// [`Device::budget`] reports a heap's SIZE, not what is free in it, so
+    /// [`crate::resources::Pool::ceiling`] admits any frame the device could
+    /// hold if it were empty -- and the device is never empty, because the
+    /// model's weights are in it. A frame under the ceiling and over the free
+    /// space is the normal shape of a busy server, not a bug.
+    OutOfMemory {
+        /// What was asked for, in bytes.
+        bytes: u64,
+        /// Which call refused, for the log. Not matched on.
+        during: &'static str,
+    },
     /// A Vulkan call failed.
     Vulkan(String),
+}
+
+impl Failed {
+    /// Classify a Vulkan result: out of memory, or a fault.
+    ///
+    /// The two out-of-memory codes are one answer here. A caller cannot act
+    /// on the difference -- it evicts and retries either way -- and treating
+    /// only the device-local one as retryable would make the host-visible
+    /// heap, which is the one this shell allocates from, the case that
+    /// wrongly kills a request.
+    #[must_use]
+    pub fn of_vulkan(result: ash::vk::Result, during: &'static str, bytes: u64) -> Self {
+        if matches!(
+            result,
+            ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY
+        ) {
+            Self::OutOfMemory { bytes, during }
+        } else {
+            Self::Vulkan(format!("{during}: {result}"))
+        }
+    }
+
+    /// Whether the device refused for want of memory rather than for a fault.
+    #[must_use]
+    pub fn is_out_of_memory(&self) -> bool {
+        matches!(self, Self::OutOfMemory { .. })
+    }
 }
 
 impl core::fmt::Display for Failed {
@@ -207,6 +254,10 @@ impl core::fmt::Display for Failed {
                 f,
                 "binding {binding} reads a {needs}-byte block and was given \
                  {given} bytes, whose tail reads as zero"
+            ),
+            Self::OutOfMemory { bytes, during } => write!(
+                f,
+                "this device would not give {bytes} bytes to `{during}` right now"
             ),
             Self::Vulkan(e) => write!(f, "{e}"),
         }
@@ -976,17 +1027,57 @@ impl Device {
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let handle = unsafe { self.device.create_buffer(&info, None) }
-            .map_err(|e| Failed::Vulkan(format!("create buffer: {e}")))?;
+            .map_err(|e| Failed::of_vulkan(e, "create buffer", size))?;
         let need = unsafe { self.device.get_buffer_memory_requirements(handle) };
 
         let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let index = (0..self.memory.memory_type_count).find(|i| {
-            need.memory_type_bits & (1 << i) != 0
-                && self.memory.memory_types[*i as usize]
-                    .property_flags
-                    .contains(want)
-        });
-        let Some(index) = index else {
+        // DEVICE_LOCAL FIRST, and this one line was the whole performance
+        // story of this driver.
+        //
+        // Every buffer here is host-visible, because this driver writes
+        // weights, page tables and scalars straight into mapped memory and
+        // has no staging path. That requirement is real. What was NOT
+        // examined is that a discrete card offers SEVERAL host-visible types,
+        // and this took the first one it found. On the 4090 the list is:
+        //
+        // | type | flags | heap |
+        // |---|---|---|
+        // | 1 | `DEVICE_LOCAL` | 24 GB, VRAM |
+        // | 2 | `HOST_VISIBLE \| HOST_COHERENT` | 47 GB, system RAM |
+        // | 3 | + `HOST_CACHED` | 47 GB, system RAM |
+        // | 4 | `DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT` | 24 GB, VRAM |
+        //
+        // The first match is type 2. So every weight, every KV page and every
+        // activation lived in SYSTEM MEMORY, and each of the 452 dispatches
+        // in a decode step reached across PCIe for all of it. Type 4 is the
+        // same memory the card computes out of, mappable across its whole
+        // twenty-four gigabytes because resizable BAR is on.
+        //
+        // This is what "about 12 GB/s on a card that does roughly a thousand"
+        // was, at every launch size, for every kernel, uniformly -- the
+        // uniformity being the clue that went unread for three refuted
+        // hypotheses about the shaders. PCIe 4.0 x16 is 32 GB/s of theory and
+        // twelve of practice. The kernels were never the ceiling; the bus
+        // was.
+        //
+        // Falling back rather than requiring it, in both directions. A part
+        // without a device-local host-visible type -- an older card without
+        // resizable BAR exposes 256 MB of one, an integrated part has only
+        // the one pool -- still gets the type it always got. And a device-
+        // local allocation that FAILS falls back too, because the mappable
+        // VRAM heap is smaller than system memory and shared with every other
+        // process on the card: a model that no longer fits should get slower,
+        // not refused.
+        let prefers = |flags: vk::MemoryPropertyFlags| {
+            (0..self.memory.memory_type_count).find(|i| {
+                need.memory_type_bits & (1 << i) != 0
+                    && self.memory.memory_types[*i as usize]
+                        .property_flags
+                        .contains(flags)
+            })
+        };
+        let local = prefers(want | vk::MemoryPropertyFlags::DEVICE_LOCAL);
+        let Some(index) = local.or_else(|| prefers(want)) else {
             unsafe { self.device.destroy_buffer(handle, None) };
             return Err(Failed::Vulkan("no host-visible memory type".into()));
         };
@@ -996,9 +1087,28 @@ impl Device {
             .memory_type_index(index);
         let memory = match unsafe { self.device.allocate_memory(&alloc, None) } {
             Ok(m) => m,
+            // The device-local heap is the one that runs out. Ask again for
+            // the plain host-visible type before reporting a failure, so that
+            // a card whose VRAM is full serves slowly instead of refusing.
+            Err(_) if local == Some(index) => {
+                let Some(fallback) = prefers(want) else {
+                    unsafe { self.device.destroy_buffer(handle, None) };
+                    return Err(Failed::Vulkan("no host-visible memory type".into()));
+                };
+                let alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(need.size)
+                    .memory_type_index(fallback);
+                match unsafe { self.device.allocate_memory(&alloc, None) } {
+                    Ok(m) => m,
+                    Err(e) => {
+                        unsafe { self.device.destroy_buffer(handle, None) };
+                        return Err(Failed::of_vulkan(e, "allocate", need.size));
+                    }
+                }
+            }
             Err(e) => {
                 unsafe { self.device.destroy_buffer(handle, None) };
-                return Err(Failed::Vulkan(format!("allocate: {e}")));
+                return Err(Failed::of_vulkan(e, "allocate", need.size));
             }
         };
         if let Err(e) = unsafe { self.device.bind_buffer_memory(handle, memory, 0) } {
@@ -1222,7 +1332,44 @@ impl Device {
             .map_err(|e| (0, Failed::Vulkan(format!("descriptor pool: {e}"))))?;
         // Safe because `pool` came from `scratch` a line ago and the
         // recording is the only user of either until it returns.
-        unsafe { self.record_all(run, pool, &scratch) }
+        let fired = unsafe { self.record_all(run, pool, &scratch) };
+        if fired.is_err() {
+            // A failed fire is the DANGEROUS case, not the harmless one.
+            //
+            // The caller's next act after a refusal is to give the scalar
+            // block back -- `serve::fire` frees it on both paths -- and the
+            // sets recorded a moment ago still name it. If the failure was the
+            // fence timing out, the queue may also still be reading it. So the
+            // device is brought to a halt before anything is freed.
+            //
+            // Found by asking for a decode over a thousand tokens of history
+            // in a debug build under two validation layers, where one prefill
+            // tile does not finish inside the ten-second wait. The timeout was
+            // reported correctly and then buried: the free that followed it
+            // tripped "vkDestroyBuffer(): can't be called on VkBuffer ...
+            // currently in use by VkDescriptorSet", which this driver treats
+            // as fatal, so the process aborted on the consequence and never
+            // printed the cause. An hour went into the wrong bug.
+            let _ = unsafe { self.device.device_wait_idle() };
+        }
+        // The sets are freed at the end of the fire that used them, rather
+        // than at the start of the next one.
+        //
+        // `for_run` already resets, and for a long time that was the only
+        // reset, which is a different claim than it looks: it means a fire's
+        // descriptor sets outlive the fire, still naming its buffers, until
+        // some later fire happens to want the pool. The scalar block is freed
+        // as soon as the fire returns, so the window is every gap between two
+        // fires.
+        //
+        // Safe for the same reason `for_run`'s reset is -- the fence was
+        // waited on inside `record_all` -- and on the failing path because of
+        // the idle above.
+        let _ = unsafe {
+            self.device
+                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+        };
+        fired
     }
 
     /// Everything [`Self::run`] refuses a dispatch for, without recording it.
@@ -2004,4 +2151,60 @@ pub fn groups_for(
 fn slots(pipeline: &Pipeline) -> impl Iterator<Item = usize> + '_ {
     (0..pipeline.bindings as usize)
         .filter(|i| pipeline.declared.used.get(*i).copied().unwrap_or(true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Failed;
+    use ash::vk;
+
+    /// The classification, which is the whole of the retry decision.
+    ///
+    /// It is a pure function of a result code, and it is tested as one
+    /// because the alternative -- proving it on the device -- means genuinely
+    /// exhausting the machine's memory. This tree runs on a box shared with
+    /// other work, and a test that provokes the OOM killer to prove a `match`
+    /// arm is a bad trade: the arm is one comparison, and the consequence of
+    /// running the box out of memory lands on somebody else's job.
+    ///
+    /// See `Shell::admit` for what is done with the answer.
+    #[test]
+    fn a_device_that_is_out_of_memory_is_told_apart_from_one_that_faulted() {
+        for code in [
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        ] {
+            let e = Failed::of_vulkan(code, "allocate", 4096);
+            assert!(
+                e.is_out_of_memory(),
+                "{code:?} is a scheduling fact and was classified as a fault, so \
+                 a frame the scheduler could serve after evicting fails the \
+                 request instead"
+            );
+            assert!(
+                matches!(e, Failed::OutOfMemory { bytes: 4096, during } if during == "allocate"),
+                "the size and the call are what the log needs to say which \
+                 allocation refused"
+            );
+        }
+    }
+
+    /// A fault must NOT be retried, which is the failure the other direction.
+    ///
+    /// `ERROR_DEVICE_LOST` is the case that matters: it repeats forever, so a
+    /// scheduler told to evict and re-post would spin on it rather than
+    /// surfacing it.
+    #[test]
+    fn a_lost_device_is_a_fault_and_not_something_to_retry() {
+        let e = Failed::of_vulkan(vk::Result::ERROR_DEVICE_LOST, "submit", 0);
+        assert!(
+            !e.is_out_of_memory(),
+            "a lost device was classified as out of memory, so the scheduler \
+             would evict and re-post forever against a device that is gone"
+        );
+        assert!(
+            e.to_string().contains("submit"),
+            "a fault's text must name the call that failed: {e}"
+        );
+    }
 }

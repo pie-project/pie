@@ -1136,13 +1136,20 @@ mod transcribed {
     const AUDIO: &str = include_str!("../../driver-cuda/src/tower/gemma4_audio.rs");
     const QWEN: &str = include_str!("../../driver-cuda/src/tower/qwen3_vl.rs");
     // `ssm/gated_delta_net.cu` IS DELETED and `GDN` names the Rust that
-    // replaced it — `driver-cuda/src/fire/gated_delta_net.rs`, which quotes
-    // every `<<<>>>` it reproduces beside the `Launch` that reproduces it.
-    // The same move `gemma4_{vision,audio}.cu` and the three capture
-    // post-kernels made, and it costs the same thing: the pins that read it
-    // are `quoted()` rather than `pinned()`, because a line number in a file
-    // under active authorship is a citation that breaks on formatting.
-    const GDN: &str = include_str!("../../driver-cuda/src/fire/gated_delta_net.rs");
+    // replaced it. That Rust MOVED AGAIN in §5 step 5:
+    // `driver-cuda/src/fire/gated_delta_net.rs` is deleted too and the host
+    // programs are `kernels-cuda-new/src/x/ssm.rs`, which quotes every
+    // `<<<>>>` it reproduces beside the `Launch` that reproduces it. Same
+    // move `rope` and `norm` made — see `ROPE` and `RMSNORM` below, which
+    // name `src/x/` files for the same reason — and it costs the same thing:
+    // the pins that read it are `quoted()` rather than `pinned()`, because a
+    // line number in a file under active authorship is a citation that
+    // breaks on formatting.
+    //
+    // `NEMOTRON_RS` below names THE SAME FILE. Both are kept rather than
+    // collapsed, because the two names say which launcher family a failure
+    // is about, and a five-root file is exactly where that matters.
+    const GDN: &str = include_str!("../src/x/ssm.rs");
     const GDN_CUH: &str = include_str!("../csrc/src/ssm/gated_delta_net.cuh");
     // ── `quant/dequant_wna16.cu` IS DELETED AND `WNA16` IS UNRESOLVED ──
     //
@@ -1157,17 +1164,42 @@ mod transcribed {
     // file's text, so the path is left as it stands: a compile error that
     // says the source is gone, rather than a green test reading a stranger.
     //
-    // WHAT THE ONE SURVIVING PIN LOSES. `constexpr int DECODE_BLOCK = 256;`
-    // at `:23` has no witness left anywhere in the tree, and
-    // `quant/dequant_wna16.cuh:119-125` says why in its own words: *"The
-    // block width these kernels are launched at is NOT here ... 256 is the
-    // launcher's decision and it stays in `dequant_wna16.cu` beside the
-    // `<<<>>>` that spends it. A copy here would be a second place for the
-    // same number."* That `.cu` is now gone, so the second copy the split
-    // refused to make is the only copy there could have been. The single
-    // remaining transcription is `runtime::launch`'s own doc at `:1828`,
-    // which is the RULE citing itself — a pin against it would agree with
-    // the rule by construction and check nothing, so it is not written.
+    // WHAT THE ONE SURVIVING PIN LOSES, AND WHY IT IS PROVENANCE AND NOT A
+    // CHECK. `constexpr int DECODE_BLOCK = 256;` at `:23` now has exactly one
+    // copy in the tree. A pin between two copies checks that a transcription
+    // is FAITHFUL; one copy cannot be unfaithful to itself, so this is not a
+    // check that broke, it is a check whose subject no longer exists.
+    //
+    // That is only the harmless reading if 256 is a tuning choice rather than
+    // a correctness constraint, so it was established from THIS file's device
+    // text and not carried over from `dequant_fp4.cuh`'s answer. Every kernel
+    // in `quant/dequant_wna16.cuh` adapts to the width it is given:
+    // `:150` strides the packed-word column by `blockDim.x`, `:298` and
+    // `:374` compute warps-per-block as `blockDim.x >> 5` at RUN TIME, and
+    // `:572-573` is a grid-stride loop over `gridDim.x * blockDim.x`. There
+    // is no `__launch_bounds__`, no `static_assert` and no `blockDim.x ==`
+    // anywhere in the file. A launcher that said 512 would compute the same
+    // numbers, differently fast. The header states it outright at `:120-125`:
+    // *"The block width these kernels are launched at is NOT here. Every one
+    // of them reads `blockDim.x` or a warp lane, so 256 is the launcher's
+    // decision ... A copy here would be a second place for the same number"*
+    // — and NVRTC agreed, emitting `variable "DECODE_BLOCK" was declared but
+    // never referenced`.
+    //
+    // SO NO `static_assert` IS OWED HERE. The honest statement is that this
+    // number has one copy and no oracle, which is CORRECT for a tuning
+    // constant; its history is `git log --follow
+    // crates/kernels-cuda/csrc/src/quant/dequant_wna16.cu`. That is the
+    // policy `families::vision` already states for the same situation:
+    // *"a citation's job is to say where a number came from, and these
+    // numbers came from those lines"* (`families/vision.rs:44-50`).
+    //
+    // ONE RESIDUAL, RECORDED SO IT IS NOT RE-DERIVED: `blockDim.x >> 5` is
+    // exact only when the width is a multiple of 32 — at 100 threads the
+    // kernel computes 3 warps per block while lanes 96-99 report warp 3, and
+    // consecutive `blockIdx.y` overlap rows. That is a property of a RUNTIME
+    // `blockDim`, which `static_assert` cannot see, so the assert is not the
+    // fix for it and none is written.
     const WNA16: &str = include_str!("../../kernels-cuda/csrc/src/quant/dequant_wna16.cu");
     const WNA16_CUH: &str = include_str!("../csrc/src/quant/dequant_wna16.cuh");
     // ── `quant/dequant_fp4.cu` IS DELETED AND `FP4` IS UNRESOLVED ──
@@ -1178,19 +1210,65 @@ mod transcribed {
     // Rust host program exists. `dequant_fp4.cuh`'s own header still names
     // the deleted file as its other half — *"`dequant_fp4.cu` is the four
     // host launchers and the `kTok` dispatch that reads an environment
-    // variable; this file is what the GPU runs"* — so the three constants
-    // pinned below (`kMxfp4DecodeBlock`, `kMxfp4GateUpPairs`,
-    // `kMxfp4DownRows`, at `:39`, `:42` and `:44`) died with the host half
-    // and are witnessed nowhere. `families::quant` and `runtime::launch`
-    // both transcribe them and both are the claim, not the evidence.
+    // variable; this file is what the GPU runs"*.
+    //
+    // THE THREE CONSTANTS ARE NOT ALL THE SAME SHAPE, AND NONE IS
+    // "WITNESSED NOWHERE".
+    //
+    // `kMxfp4GateUpPairs` and `kMxfp4DownRows` are TEMPLATE ARGUMENTS —
+    // `template <int kPairsT>` at `dequant_fp4.cuh:209` and
+    // `template <int kRowsT>` at `:345`. The row's instantiation string
+    // carries the value into NVRTC, which fails loudly on one the template
+    // rejects, so these two are witnessed BY THE COMPILE. That is a stronger
+    // oracle than the pin was, not a weaker one, and `kernels/src/lib.rs:407`
+    // already says so: *"TEMPLATE argument — `kMxfp4GateUpPairs` for the
+    // gate/up leg, `kMxfp4DownRows` for the down leg, both `4`"*.
+    //
+    // `kMxfp4DecodeBlock = 128` is a BLOCK SIZE THE KERNEL ADAPTS TO. All
+    // three decode kernels read warps-per-block at run time —
+    // `(blockIdx.y * (blockDim.x >> 5) + warp_in_block)` at `:236`, `:361`
+    // and `:487` — and the file has no `__launch_bounds__`, no
+    // `static_assert` and no `blockDim.x ==` check. A launcher that said 256
+    // would compute the right answer, differently fast. So this is tuning,
+    // not correctness: one copy and no oracle, which is what a tuning
+    // constant should have, and its history is `git log --follow
+    // crates/kernels-cuda/csrc/src/quant/dequant_fp4.cu`.
+    //
+    // AND THE PART THAT NEEDED AN ARGUMENT KEPT ONE, in the device text,
+    // where it outlives every host program that will ever launch it —
+    // `dequant_fp4.cuh:227-230`: *"Every extra pair reuses the activation
+    // vector one more time and gives the unpack more independent work to hide
+    // behind, which is what this kernel is short of: at 2 it sustains about
+    // 1.4 TB/s against an HBM roofline near 3."*
+    //
+    // What is genuinely lost is PROVENANCE, not verification, and provenance
+    // is `git log --follow` — the policy `families/vision.rs:44-50` already
+    // states for exactly this case. No `static_assert` is owed here.
     const FP4: &str = include_str!("../../kernels-cuda/csrc/src/quant/dequant_fp4.cu");
     const FP4_CUH: &str = include_str!("../csrc/src/quant/dequant_fp4.cuh");
-    // SLATED TO DIE NEXT: agent `xqa-nvrtc` is retiring
-    // `attn/attention_naive_paged.cu`. When it goes, `NAIVE`'s successor is
-    // whatever Rust that agent lands for `paged_scores`; repoint here and
-    // downgrade its pins to `quoted()`, exactly as `MLA` and `QKV` below.
-    const NAIVE: &str =
-        include_str!("../../kernels-cuda/csrc/src/attn/attention_naive_paged.cu");
+    // `attn/attention_naive_paged.cu` IS DELETED and `NAIVE` names the device
+    // text that outlived it -- `kernels-cuda-new/csrc/src/attn/
+    // attention_naive_paged.cuh`, the two `__global__`s themselves. This is
+    // the one repoint on this list that does NOT go to Rust: the `.cu`'s four
+    // launchers were deleted as unreached (§43/§56) rather than ported, so
+    // there is no `fire/*.rs` to point at, and the file's last content was two
+    // `static_assert` blocks now carried by `driver-cuda/tests/enum_mirrors.rs`.
+    //
+    // THE PINS BELOW MOVE TO THE CONSUMER, WHICH IS A STRONGER ORACLE THAN THE
+    // LAUNCHER WAS, and the same argument `FP4_CUH` makes above. A launcher
+    // line proved what the host WROTE into `<<<>>>`; the kernel's own
+    // `blockIdx` reads and its shared-memory partition prove what the device
+    // EXPECTS, and it is the device that NVRTC compiles now. `PagedScores`
+    // transcribes a three-axis grid and a `(head_dim + BLOCK) * sizeof(float)`
+    // smem; `:323-325` and `:397` are where a disagreement would actually
+    // corrupt an answer.
+    //
+    // The cost is `pinned`'s second half, exactly as for `MLA` and `QKV`: THE
+    // LINE IS NO LONGER CHECKED, so every `at :NNN` naming this `.cuh` in
+    // `families::attn` and `runtime::launch` can go stale unnoticed -- and the
+    // `.cuh`'s own line numbers moved in the same pass that deleted the `.cu`,
+    // since its header records the deletion.
+    const NAIVE: &str = include_str!("../csrc/src/attn/attention_naive_paged.cuh");
     // `attn/mla_paged.cu` IS DELETED (`244df6054`) and `MLA` names the Rust
     // that replaced it — `driver-cuda/src/fire/mla_paged.rs`, whose header
     // quotes the two `<<<>>>` it reproduces beside the `Launch` that
@@ -1258,17 +1336,41 @@ mod transcribed {
     // launcher was DROPPED RATHER THAN MOVED, and there is no Rust to point
     // at; the path is left as it stands.
     //
-    // WHAT THE TWO PINS LOSE. `constexpr int kThreads = 256;` at `:39` and
-    // `device::copy_if_valid_slot<<<1, kThreads, 0, stream>>>(` at `:40` are
-    // the whole evidence for `LaunchRule::Single`'s literal `1` — there is
-    // no arithmetic below to check it against — and they now have no source.
-    // `layout/slot_ops.cuh` survives and states the SHAPE in prose
-    // (*"`copy_if_valid_slot` launches `<<<1, 256>>>` -- exactly one block,
-    // whatever the fire's row count"*), which is a paraphrase and not the
-    // launcher; its header still says *"`slot_ops.cu` includes this file and
-    // keeps its two launchers"*, which is now false. The only verbatim copies
-    // left are `families::layout:346-347` and `runtime::launch:1146-1147`,
-    // and both of those ARE the claim this file exists to check.
+    // WHAT THE TWO PINS LOSE, AND WHAT SHAPE THE NUMBERS ARE. `constexpr int
+    // kThreads = 256;` at `:39` and `device::copy_if_valid_slot<<<1,
+    // kThreads, 0, stream>>>(` at `:40` were the whole evidence for
+    // `LaunchRule::Single`, and each now has one copy rather than two. As
+    // with `WNA16` and `FP4` this is a check whose subject is gone rather
+    // than a check that broke — but the shape was established from THIS
+    // family's device text, not carried across from the quant answer.
+    //
+    // THE 256 IS TUNING. Both `__global__`s in `layout/slot_ops.cuh` are
+    // block-stride loops that adapt to whatever width they are given —
+    // `for (usize i = threadIdx.x; i < slot_bytes; i += blockDim.x)` at `:59`
+    // and `for (usize i = threadIdx.x; i < bytes; i += blockDim.x)` at `:72`.
+    // Neither uses shared memory, a warp lane or `warpSize`; the file has no
+    // `__launch_bounds__` and no `static_assert`. The tree launches this
+    // shape at widths it does not know until run time elsewhere in the same
+    // family — `families::layout` records `graph_pad::graph_pad_rows` as
+    // `<<<1, padding>>>` at `:175` — so a width is not a contract here.
+    //
+    // THE `1` IS NOT A BLOCK-SIZE QUESTION AT ALL, and it is the half worth
+    // keeping: `copy_if_valid_slot` contains NO `blockIdx` term (`:64-73`),
+    // so a grid above 1 re-runs the identical copy. `slot_ops.cuh:14-17`
+    // already says it — *"Correct by accident (the copy is idempotent) and
+    // wrong as a statement"* — which is why `RouteRows` was refused and
+    // `Single` written. That is a claim about WORK, not about correctness,
+    // and `gridDim` is a run-time value, so it is not `static_assert`-able.
+    //
+    // SO NO `static_assert` IS OWED FOR THIS FILE EITHER. The argument for
+    // both numbers survives in `slot_ops.cuh`'s header, which is where it
+    // will outlive any launcher; provenance is `git log --follow
+    // crates/kernels-cuda/csrc/src/layout/slot_ops.cu`, per
+    // `families/vision.rs:44-50`. The header's opening sentence said
+    // `slot_ops.cu` still included it and kept its two launchers, which
+    // stopped being true at `cd5cebd3d`; it is corrected in place, at the
+    // same line count so that every `slot_ops.cuh:NN` citation in
+    // `families::layout` and `runtime::launch` still lands.
     const SLOT_OPS: &str = include_str!("../../kernels-cuda/csrc/src/layout/slot_ops.cu");
     // SLATED TO DIE NEXT: agent `fa2-nvrtc` is retiring `attn/kv_paged.cu`,
     // blocked on the same four C++ callers as `FLASHINFER`. When it goes,
@@ -1292,28 +1394,38 @@ mod transcribed {
     // that claim is no longer checked by this file at all — `fire::page_compact`
     // quotes both at `:46` and `:49` and is where a reader must now look.
     const PAGE_COMPACT: &str = include_str!("../../driver-cuda/src/fire/page_compact.rs");
-    // `norm/rmsnorm.cu` IS DELETED (`58b31cf1b`) and `RMSNORM` names
+    // `norm/rmsnorm.cu` IS DELETED (`58b31cf1b`) and `RMSNORM` named
     // `driver-cuda/src/fire/rmsnorm.rs` — *"Three of its five launchers are
     // `device::JIT_DISPATCHED` ... and two are `execution::RUST_SERVED` ...
     // `driver-cuda/src/fire/rmsnorm.rs` is the host program"*, per
     // `kernels-cuda/csrc/CMakeLists.txt`. `quoted()` at `MLA`'s cost.
-    const RMSNORM: &str = include_str!("../../driver-cuda/src/fire/rmsnorm.rs");
+    //
+    // THAT FILE IS DELETED TOO, by §5 step 5, which took `norm` into
+    // fn-world. Its host programs are `kernels-cuda-new/src/x/norm.rs`'s and
+    // they carry the same quotes, so this follows them exactly as `ROPE`
+    // above already does for `rope`. Still `quoted()`, still at `MLA`'s cost.
+    const RMSNORM: &str = include_str!("../src/x/norm.rs");
     // `ssm/nemotron_h.cu` IS DELETED (`9ba759034`), and with it the whole of
     // `kernels-cuda/csrc/src/ssm/`. Its two halves are both still here: the
-    // HOST half is `driver-cuda/src/fire/nemotron_h.rs` — which
-    // `NEMOTRON_RS` below already names, and which
-    // `kernels-cuda/csrc/CMakeLists.txt` confirms holds the two surviving
-    // `build_nemotron_moe_ptrs_*` launchers — and the DEVICE half is the
-    // `.cuh` `NEMOTRON` now names, where `mamba_split` itself lives. The
-    // const follows the device half so that the coverage list below keeps
-    // covering two files rather than naming one file twice; it carries no
-    // pin, so nothing is cited from it.
+    // HOST half was `driver-cuda/src/fire/nemotron_h.rs` and is now
+    // `kernels-cuda-new/src/x/ssm.rs` (§5 step 5), which `NEMOTRON_RS` below
+    // names, and the DEVICE half is the `.cuh` `NEMOTRON` names, where
+    // `mamba_split` itself lives. The const follows the device half so that
+    // the coverage list below keeps covering two files rather than naming
+    // one file twice; it carries no pin, so nothing is cited from it.
+    //
+    // The two surviving `build_nemotron_moe_ptrs_*` launchers that
+    // `kernels-cuda/csrc/CMakeLists.txt` used to confirm are `x::ssm`
+    // contracts with `none:` binds now — `Route::Unbound` at model load —
+    // and the driver-owned slab their arrays point into is still the
+    // `Source` this tree has no word for (§52.3, §57.5).
     const NEMOTRON: &str = include_str!("../csrc/src/ssm/nemotron_h.cuh");
-    // The `.cu` is DELETED, so its two `mamba_split` arms are read from
-    // `driver-cuda/src/fire/nemotron_h.rs`, which quotes each line it
-    // reproduced. The four pins below are `quoted()` for the reason `GDN`'s
-    // are.
-    const NEMOTRON_RS: &str = include_str!("../../driver-cuda/src/fire/nemotron_h.rs");
+    // The `.cu` is DELETED, so its two `mamba_split` arms are read from the
+    // Rust that reproduced them — `kernels-cuda-new/src/x/ssm.rs`, which
+    // quotes each line it reproduced. The four pins below are `quoted()` for
+    // the reason `GDN`'s are, and `GDN` is the same file: see its
+    // declaration for why both names are kept.
+    const NEMOTRON_RS: &str = include_str!("../src/x/ssm.rs");
 
     /// Assert `text` appears in `src` at 1-based `line`, and say which
     /// citation goes stale if it has moved.
@@ -1666,7 +1778,7 @@ mod transcribed {
         // deleted line is the one thing it structurally cannot guard.
         assert!(
             !GDN.contains("dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);"),
-            "driver-cuda/src/fire/gated_delta_net.rs quotes `warp_tiled_scan`'s grid.\n\
+            "kernels-cuda-new/src/x/ssm.rs quotes `warp_tiled_scan`'s grid.\n\
              The two launchers were deleted as unreached; if one is back, this\n\
              transcription must be re-pinned to it rather than to the .cuh."
         );
@@ -1810,55 +1922,115 @@ mod transcribed {
 
         // ── `paged_scores` and `paged_scores_decode` ──
         //
-        // FOUR launches, three of them the same three lines. Each is pinned
-        // separately: `attention_naive_paged.cu` holds three prefill
-        // launchers that differ only in how they reach the cache, and a
+        // FOUR launches, three of them the same three lines. Each was pinned
+        // separately: `attention_naive_paged.cu` held three prefill launchers
+        // that differed only in how they reached the cache, and a
         // transcription written from one of them is evidence for that one.
-        pinned(NAIVE, "attn/attention_naive_paged.cu", 35, "constexpr int BLOCK = 128;", "`paged_scores`");
-        // Was three lines; one of the three prefill launchers has since been
-        // deleted as unreached (§43), so this is two.
-        for line in [108, 163] {
-            pinned(
-                NAIVE,
-                "attn/attention_naive_paged.cu",
-                line,
-                "dim3 grid(num_requests, total_tokens, num_q_heads);",
-                "`paged_scores`",
-            );
-        }
-        pinned(
+        //
+        // ALL OF THEM ARE NOW `quoted()` AGAINST THE `.cuh`, because the `.cu`
+        // is deleted and its launchers were never ported -- see `NAIVE` above
+        // for why the kernel is the successor and not a `fire/*.rs`. What is
+        // quoted is what the DEVICE reads, which is what the rule has to
+        // agree with:
+        //
+        //   * the three-axis grid, one `blockIdx` read at a time. A
+        //     transposition -- request on `y`, head on `x` -- is the failure
+        //     this rule can actually have, and it is visible here and nowhere
+        //     else now.
+        quoted(
             NAIVE,
-            "attn/attention_naive_paged.cu",
-            110,
-            "const std::size_t smem = (head_dim + BLOCK) * sizeof(float);",
+            "attn/attention_naive_paged.cuh",
+            "const int r        = blockIdx.x;          // request idx",
             "`paged_scores`",
         );
-        for line in [165] {
-            pinned(
-                NAIVE,
-                "attn/attention_naive_paged.cu",
-                line,
-                "const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);",
-                "`paged_scores`",
-            );
-        }
-        pinned(
+        quoted(
             NAIVE,
-            "attn/attention_naive_paged.cu",
-            111,
-            "device::naive_paged_attn<BLOCK><<<grid, block, smem, stream>>>(",
+            "attn/attention_naive_paged.cuh",
+            "const int qo_off   = blockIdx.y;          // offset within this request",
             "`paged_scores`",
         );
-        // `paged_scores_decode`'s LAUNCHER IS GONE (§43) — its three pins
-        // with it. The rule is still stated and still transcribed below; what
-        // is no longer true is that this `.cu` opens the grid. Asserted as an
-        // absence for the direction `pinned` cannot see, since a pin proves
-        // presence and can therefore never notice a deletion.
+        quoted(
+            NAIVE,
+            "attn/attention_naive_paged.cuh",
+            "const int q_head   = blockIdx.z;          // q head idx",
+            "`paged_scores`",
+        );
+        //   * the smem PARTITION, which is the `(head_dim + BLOCK) *
+        //     sizeof(float)` the rule computes, read from the side that
+        //     consumes it: `q_smem` is `[head_dim]` floats and `reduce`
+        //     starts exactly there. A rule that sized smem to `head_dim`
+        //     alone would compile, launch, and let the halving reduction
+        //     write past the allocation.
+        quoted(
+            NAIVE,
+            "attn/attention_naive_paged.cuh",
+            "float* reduce = smem + head_dim;          // [BLOCK] reduction scratch",
+            "`paged_scores`",
+        );
+        //   * `BLOCK` as a TEMPLATE parameter, which is what makes the 128 an
+        //     instantiation string NVRTC will reject if the row and the
+        //     kernel disagree -- the same "witnessed by the compile" oracle
+        //     `kMxfp4GateUpPairs` has above, and stronger than the deleted
+        //     `constexpr int BLOCK = 128;` pin it replaces. The 128 itself is
+        //     `runtime::launch::PAGED_BLOCK` and is compared against the row's
+        //     instantiation string elsewhere in this file.
+        quoted(
+            NAIVE,
+            "attn/attention_naive_paged.cuh",
+            "template <int BLOCK>\n__global__ void naive_paged_attn(",
+            "`paged_scores`",
+        );
+        //   * and `paged_scores_decode`'s TWO-axis grid, whose `y` is a head
+        //     where the prefill's is a token. Two rules, two grids, and the
+        //     only thing that ever kept them apart was reading both.
+        quoted(
+            NAIVE,
+            "attn/attention_naive_paged.cuh",
+            "template <int BLOCK>\n__global__ void naive_paged_decode(",
+            "`paged_scores_decode`",
+        );
+        quoted(
+            NAIVE,
+            "attn/attention_naive_paged.cuh",
+            "const int r = blockIdx.x;",
+            "`paged_scores_decode`",
+        );
+        quoted(
+            NAIVE,
+            "attn/attention_naive_paged.cuh",
+            "const int q_head = blockIdx.y;",
+            "`paged_scores_decode`",
+        );
+        // The absence assert SURVIVES THE REPOINT and changes meaning, which
+        // is worth stating rather than leaving to be noticed. It used to say
+        // "the deleted launcher has not come back to this `.cu`"; the `.cu`
+        // cannot have a launcher, so it now says the stronger thing -- no
+        // `<<<>>>` has appeared in the DEVICE HEADER. A `.cuh` under
+        // `kernels-cuda-new` that opens a launch is an ahead-of-time
+        // translation unit wearing a device-text extension, and that is the
+        // invariant this migration rests on. `pinned` proves presence and can
+        // never notice a deletion; this is the other direction. The second
+        // assert strips comment lines first, and that is not fastidiousness:
+        // this header QUOTES `<<<grid, block, smem, stream>>>` twice while
+        // describing the launchers it outlived, so a plain `contains` would
+        // fire on the prose and be deleted by whoever hit it.
         assert!(
             !NAIVE.contains("device::naive_paged_decode<BLOCK><<<grid, block, smem, stream>>>("),
-            "attn/attention_naive_paged.cu launches `naive_paged_decode` again.\n\
+            "attn/attention_naive_paged.cuh launches `naive_paged_decode`.\n\
              `paged_scores_decode`'s transcription below was written from a\n\
              launcher that was deleted; if it is back, re-pin it."
+        );
+        assert!(
+            !NAIVE
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("<<<")),
+            "attn/attention_naive_paged.cuh contains a `<<<` launch in CODE.\n\
+             This header is device text carried into NVRTC; a launch in it is\n\
+             an ahead-of-time translation unit and nvcc comes back with it.\n\
+             (Comments are excluded on purpose -- this header's own prose\n\
+             quotes the four `<<<>>>` that used to live beside it, and a\n\
+             substring scan cannot tell a quotation from a launch.)"
         );
 
         // ── `mla_prepare`: the grid AND the three lines that build its y ──
@@ -2374,70 +2546,93 @@ mod transcribed {
         // `EMIT_FP16=true`, and the launch says 512 where the row states
         // 256. Both halves are cited so neither can drift alone.
         //
-        // ALL THREE ARE NOW `quoted()` against `fire/rmsnorm.rs`, at `MLA`'s
-        // cost — AND THE MIDDLE ONE, WHICH IS THE ROW'S WHOLE CLAIM, IS NOT
-        // REPRODUCED. The Rust quotes `rmsnorm.cu:69-77` with the template
-        // arguments STRIPPED OF THEIR COMMENTS: `device::rmsnorm_vec8<VBLOCK,
-        // false, true><<<grid, VBLOCK, 0, stream>>>(` where the C++ read
-        // `<VBLOCK, /*WEIGHT_PLUS_ONE=*/false, /*EMIT_FP16=*/true>`. The two
-        // `bool`s are still there and still in that order, so the LAUNCH is
-        // reproduced; what is gone is the only text in the tree that said
+        // ALL THREE ARE `quoted()`, at `MLA`'s cost, and they read
+        // `x/norm.rs` now — see the `RMSNORM` const above.
+        //
+        // THE MIDDLE ONE WAS LEFT FAILING and now passes again. The note
+        // that stood here read: *"The Rust quotes `rmsnorm.cu:69-77` with the
+        // template arguments STRIPPED OF THEIR COMMENTS: `device::rmsnorm_vec8
+        // <VBLOCK, false, true><<<grid, VBLOCK, 0, stream>>>(` where the C++
+        // read `<VBLOCK, /*WEIGHT_PLUS_ONE=*/false, /*EMIT_FP16=*/true>`. The
+        // two `bool`s are still there and still in that order, so the LAUNCH
+        // is reproduced; what is gone is the only text in the tree that said
         // WHICH BOOL IS WHICH, which is exactly the half `RMSNORM_SIGS[10]`
-        // was written from. That assertion is left failing rather than
-        // re-quoted against the stripped form, because re-quoting it would
-        // turn "the row names EMIT_FP16" into "the row names the second
-        // `true`" without anyone deciding to.
+        // was written from."* It was left failing rather than re-quoted
+        // against the stripped form, because re-quoting would have turned
+        // "the row names EMIT_FP16" into "the row names the second `true`"
+        // without anyone deciding to.
+        //
+        // §5 step 5's port RESTORED THE TWO `/*NAME=*/` COMMENTS in
+        // `x::norm::rmsnorm_bf16_with_fp16`, recovering the text from THIS
+        // FILE'S OWN PIN — which was the last verbatim copy of that line in
+        // the tree, which is why the pin was worth keeping while it failed.
+        // The claim is a claim about EMIT_FP16 again and not about a
+        // position, and it is checked.
+        //
+        // `families::norm::RMSNORM_SIGS[10]` is deleted with the rest of
+        // `families/norm.rs`; what states the same thing now is the
+        // `#vec8_512` row in `x::norm::rmsnorm`'s `unit!` and the `if` in
+        // that host program, and the citations name it.
         quoted(
             RMSNORM,
-            "driver-cuda src/fire/rmsnorm.rs",
+            "kernels-cuda-new src/x/norm.rs",
             "constexpr int VBLOCK = 512;",
-            "`families::norm::RMSNORM_SIGS[10]`",
+            "`x::norm::rmsnorm_bf16_with_fp16`, ex-`families::norm::RMSNORM_SIGS[10]`",
         );
         quoted(
             RMSNORM,
-            "driver-cuda src/fire/rmsnorm.rs",
+            "kernels-cuda-new src/x/norm.rs",
             "device::rmsnorm_vec8<VBLOCK, /*WEIGHT_PLUS_ONE=*/false, /*EMIT_FP16=*/true>",
-            "`families::norm::RMSNORM_SIGS[10]`",
+            "`x::norm::rmsnorm_bf16_with_fp16`, ex-`families::norm::RMSNORM_SIGS[10]`",
         );
         quoted(
             RMSNORM,
-            "driver-cuda src/fire/rmsnorm.rs",
+            "kernels-cuda-new src/x/norm.rs",
             "<<<grid, VBLOCK, 0, stream>>>(",
-            "`families::norm::RMSNORM_SIGS[10]`",
+            "`x::norm::rmsnorm_bf16_with_fp16`, ex-`families::norm::RMSNORM_SIGS[10]`",
         );
 
         // ── `ssm/nemotron_h.cu`'s two `mamba_split` arms, in Rust ──
         //
-        // `families::ssm::NEMOTRON_H_SIGS[3]` states the SECOND. The first
-        // is quoted too, and deliberately: the row's doc argues that
-        // `ElementwiseIn` would OVER-LAUNCH it, and that argument is about
-        // the `conv_dim + num_heads` extent. A refusal's evidence gets the
-        // same citation a claim's does.
+        // `families::ssm::NEMOTRON_H_SIGS[3]` stated the SECOND, and that
+        // file is DELETED by §5 step 5 — the row is
+        // `x::ssm::nemotron_h`'s `mamba_split` declaration now, and the
+        // `LaunchRule` argument the citation names is the doc comment on
+        // `x::ssm::mamba_split_bf16`. The citation strings below are kept
+        // spelling the old path on purpose: they name WHERE THE CLAIM WAS
+        // MADE, which is a fact about this repository's history, and the
+        // `src` they are checked against is the file that holds the text
+        // today.
         //
-        // The `.cu` is DELETED, so these four read
-        // `driver-cuda/src/fire/nemotron_h.rs`, which quotes each line it
-        // reproduced. All four texts are there verbatim.
+        // The first arm is quoted too, and deliberately: the row's doc
+        // argues that `ElementwiseIn` would OVER-LAUNCH it, and that
+        // argument is about the `conv_dim + num_heads` extent. A refusal's
+        // evidence gets the same citation a claim's does.
+        //
+        // The `.cu` is DELETED and so is the `fire/` module that replaced
+        // it, so these four read `kernels-cuda-new/src/x/ssm.rs`, which
+        // quotes each line it reproduced. All four texts are there verbatim.
         quoted(
             NEMOTRON_RS,
-            "driver-cuda src/fire/nemotron_h.rs",
+            "kernels-cuda-new src/x/ssm.rs",
             "constexpr int BLOCK = 256;",
             "`families::ssm::NEMOTRON_H_SIGS[3]`",
         );
         quoted(
             NEMOTRON_RS,
-            "driver-cuda src/fire/nemotron_h.rs",
+            "kernels-cuda-new src/x/ssm.rs",
             "const int conv_dt_total = N * (conv_dim + num_heads);",
             "`families::ssm::NEMOTRON_H_SIGS[3]`'s argument for holding the SIBLING arm",
         );
         quoted(
             NEMOTRON_RS,
-            "driver-cuda src/fire/nemotron_h.rs",
+            "kernels-cuda-new src/x/ssm.rs",
             "const int grid = (total + BLOCK - 1) / BLOCK;",
             "`families::ssm::NEMOTRON_H_SIGS[3]`",
         );
         quoted(
             NEMOTRON_RS,
-            "driver-cuda src/fire/nemotron_h.rs",
+            "kernels-cuda-new src/x/ssm.rs",
             "device::mamba_split<<<grid, BLOCK, 0, stream>>>(",
             "`families::ssm::NEMOTRON_H_SIGS[3]`",
         );
@@ -3109,7 +3304,7 @@ mod transcribed {
         for (n, line) in &code {
             assert!(
                 !line.contains("getenv"),
-                "driver-cuda/src/fire/gated_delta_net.rs:{n} reads the environment in \
+                "kernels-cuda-new/src/x/ssm.rs:{n} reads the environment in \
                  code: {line}\n\
                  a tuning knob is configuration; it is not a symbol and it is not\n\
                  geometry. If configuration must reach a launch it arrives as a\n\
@@ -3119,7 +3314,7 @@ mod transcribed {
 
         assert!(
             !GDN.contains("#include <cstdlib>"),
-            "driver-cuda/src/fire/gated_delta_net.rs includes <cstdlib>; the only thing \
+            "kernels-cuda-new/src/x/ssm.rs includes <cstdlib>; the only thing \
              it was ever pulled in for was `std::getenv`"
         );
 
@@ -3133,11 +3328,23 @@ mod transcribed {
         // that helper was `constexpr false`, so the conjunct was a constant
         // true and the `KLast = true` arms it guarded were unreachable. The
         // shape half — the half that reads the fire — is unchanged.
+        //
+        // §5 step 5 SPELLS THE TWO 128s AS A NAMED CONSTANT, so this is two
+        // quotes where it was one: the predicate, and the constant's value.
+        // That is not a weakening either — it is the same claim in two
+        // pieces, and the second piece is the one that could drift silently
+        // if only the first were pinned.
         quoted(
             GDN,
-            "driver-cuda src/fire/gated_delta_net.rs",
-            "if v_d == 128 && k_d == 128 {",
+            "kernels-cuda-new src/x/ssm.rs",
+            "if v_d == GDN_SMEM_ARM_WIDTH && k_d == GDN_SMEM_ARM_WIDTH {",
             "`the deleted PIE_QWEN35_GDN_SMEM_STEP`",
+        );
+        quoted(
+            GDN,
+            "kernels-cuda-new src/x/ssm.rs",
+            "const GDN_SMEM_ARM_WIDTH: i32 = 128;",
+            "`the deleted PIE_QWEN35_GDN_SMEM_STEP`'s two 128s",
         );
     }
 
@@ -3194,12 +3401,12 @@ mod transcribed {
             (SCORE_RS, "driver-cuda src/fire/attn_score.rs"),
             (FLASHINFER, "driver-cuda csrc/attn/attention_flashinfer.cu"),
             (QWEN, "driver-cuda src/tower/qwen3_vl.rs"),
-            (GDN, "driver-cuda src/fire/gated_delta_net.rs"),
+            (GDN, "kernels-cuda-new src/x/ssm.rs (gated_delta_net)"),
             (WNA16, "dequant_wna16.cu"),
             (WNA16_CUH, "dequant_wna16.cuh"),
             (FP4, "dequant_fp4.cu"),
             (FP4_CUH, "dequant_fp4.cuh"),
-            (NAIVE, "attention_naive_paged.cu"),
+            (NAIVE, "attention_naive_paged.cuh"),
             (MLA, "driver-cuda src/fire/mla_paged.rs"),
             (QKV, "driver-cuda src/fire/qkv_fused.rs"),
             (ALTUP_CUH, "norm/altup.cuh"),
@@ -3209,9 +3416,9 @@ mod transcribed {
             (KV_PAGED, "attn/kv_paged.cu"),
             (NAIVE_UNPAGED, "driver-cuda src/fire/attention_naive.rs"),
             (PAGE_COMPACT, "driver-cuda src/fire/page_compact.rs"),
-            (RMSNORM, "driver-cuda src/fire/rmsnorm.rs"),
+            (RMSNORM, "kernels-cuda-new src/x/norm.rs"),
             (NEMOTRON, "ssm/nemotron_h.cuh"),
-            (NEMOTRON_RS, "driver-cuda src/fire/nemotron_h.rs"),
+            (NEMOTRON_RS, "kernels-cuda-new src/x/ssm.rs (nemotron_h)"),
         ] {
             assert!(!src.is_empty(), "{name} is empty — `include_str!` found the wrong file");
         }
@@ -7130,8 +7337,32 @@ mod fires {
     /// The `Single` rows, hosted, at the rules they claim.
     #[test]
     fn the_literal_grid_rows_are_stated_and_hosted() {
+        // `("layout::copy_if_valid_slot", Rule::Single, "layout/slot_ops.cuh")`
+        // STOOD HERE, and was this tree's FIRST `Rule::Single` witness.
+        //
+        // §5 step 5 took `layout` into fn-world, and a `unit!` row states no
+        // rule: `x::contract::SIG_BASE` fixes `launch: LaunchRule::Unstated`
+        // for every generated row, so the field this loop reads is now
+        // `Unstated` for this symbol and the tuple could only fail. The other
+        // two facts it asserted SURVIVE unchanged and are asserted below —
+        // `runtime::hosts` still answers true and `row.sig.file` is still
+        // `Some("layout/slot_ops.cuh")`, because `unit!` emits `file:
+        // Some($ufile)` from its `file =` clause.
+        //
+        // The rule itself did not evaporate, it stopped being DATA: the
+        // literal `<<<1, kThreads>>>` at `layout/slot_ops.cu:61` with
+        // `kThreads = 256` is now spelled once, as
+        // `Launch { grid: [1, 1, 1], block: [256, 1, 1], smem: 0 }` in
+        // `x::layout::slot_ops`'s host `fn`. `Rule::Single` remains a live
+        // variant with live witnesses (`attn::build_window_page_view`, just
+        // below) and a live EVALUATOR, which
+        // `the_single_row_reproduces_the_slot_copy_launcher` still exercises
+        // against this very symbol — it passes `Rule::Single` as a literal
+        // and compares the evaluated grid to the fired one, so the near-miss
+        // measurement that test carries (at 200 rows `ceil(200 / 256)` is 1
+        // and the miss is INVISIBLE; at 300 rows it is 2) is untouched by
+        // this deletion.
         for (symbol, rule, file) in [
-            ("layout::copy_if_valid_slot", Rule::Single, "layout/slot_ops.cuh"),
             ("attn::build_window_page_view", Rule::Single, "attn/kv_paged.cuh"),
             ("attn::build_full_split_view", Rule::SingleWarp, "attn/kv_paged.cuh"),
             (
@@ -7145,6 +7376,24 @@ mod fires {
             assert_eq!(row.sig.launch, rule, "{symbol}");
             assert_eq!(row.sig.file, Some(file), "{symbol}");
         }
+
+        // The fn-world half of the deleted tuple. A ported row still HOSTS
+        // and still names its `.cuh`; the only thing it stopped carrying is
+        // the rule, so those are the two facts asserted and the third is
+        // deliberately absent.
+        assert!(
+            runtime::hosts("layout::copy_if_valid_slot"),
+            "layout::copy_if_valid_slot is hosted by no unit"
+        );
+        let ported = runtime::row("layout::copy_if_valid_slot").expect("hosted");
+        assert_eq!(ported.sig.file, Some("layout/slot_ops.cuh"));
+        assert_eq!(
+            ported.sig.launch,
+            Rule::Unstated,
+            "a `unit!` row states no rule by construction — if this is ever \
+             anything else, `x::contract::SIG_BASE` changed and the comment \
+             above this loop is wrong"
+        );
 
         // The two that KEEP `PerRow` against the same launcher text, asserted
         // rather than left to prose. `runtime::launch::per_request` and

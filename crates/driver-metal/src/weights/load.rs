@@ -72,9 +72,41 @@ pub struct Loaded {
     ///
     /// [`LoadPlan::affine_points`]: model_loader::plan::LoadPlan::affine_points
     pub affine_points: Vec<(u32, u32)>,
+    /// One TENSOR NAME per point in [`Self::affine_points`], same order.
+    ///
+    /// Carried only so the refusal can name what it refused over. A count of
+    /// points tells an operator that a checkpoint is not servable; a witness
+    /// tells them which tensors made it so, and for `gpt-oss` that is 24
+    /// router gates and nothing else — a fact that turns a dead end into the
+    /// next piece of work.
+    pub affine_witnesses: Vec<((u32, u32), String)>,
+    /// Every affine tensor's point, by name — [`LoadPlan::affine_by_name`].
+    ///
+    /// Read through [`Self::affine_point_of`], and put to exactly two names:
+    /// `binding::EXPERT_BANK` and `binding::ROUTER_GATE`. It answers an
+    /// ENCODING and not a model fact, which is the same licence
+    /// [`Self::mxfp4`] holds and the same one `no_probe_decides_a_fact`
+    /// checks.
+    ///
+    /// [`LoadPlan::affine_by_name`]: model_loader::plan::LoadPlan::affine_by_name
+    pub affine_by_name: std::collections::HashMap<String, (u32, u32)>,
 }
 
 impl Loaded {
+    /// The affine point ONE named tensor arrived at.
+    ///
+    /// `None` when the checkpoint has no such tensor, or has it raw or in
+    /// MXFP4 — none of the three is read at an affine point.
+    #[must_use]
+    pub fn affine_point_of(&self, name: &str) -> Option<crate::batch::AffineFormat> {
+        self.affine_by_name
+            .get(name)
+            .map(|(group, bits)| crate::batch::AffineFormat {
+                bits: *bits,
+                group: *group,
+            })
+    }
+
     /// THE AFFINE POINT THE BYTES ARRIVED IN — measured, not declared.
     ///
     /// # Why this is not `Encoding::from_config_json`
@@ -117,8 +149,28 @@ impl Loaded {
     /// [`LoadPlan::affine_points`]: model_loader::plan::LoadPlan::affine_points
     /// [`DecodeGeometry`]: crate::batch::DecodeGeometry
     pub fn affine_point(&self, row: &str) -> Result<crate::batch::AffineFormat> {
-        match self.affine_points.as_slice() {
-            [] => Ok(crate::batch::AffineFormat { bits: 0, group: 0 }),
+        // THE POINTS NOTHING HAS ACCOUNTED FOR. The router gate is allowed
+        // its own — `MetalBinding::router_quant_group` carries it and the
+        // text names a second `affine_point` for that one op — so it is
+        // subtracted before the count that refuses.
+        //
+        // Subtracting a point the gate SHARES with the stack removes
+        // nothing that matters: the empty arm hands that same point back,
+        // which is the uniform checkpoint's answer and the reason this needs
+        // no rule for what a router name looks like.
+        let router = self.affine_point_of(crate::model::binding::ROUTER_GATE);
+        let unaccounted: Vec<(u32, u32)> = self
+            .affine_points
+            .iter()
+            .copied()
+            .filter(|p| router.is_none_or(|r| (r.group, r.bits) != *p))
+            .collect();
+        match unaccounted.as_slice() {
+            // Every affine tensor is the gate, or there are none at all.
+            // `{0, 0}` is how this driver spells a dense checkpoint, and
+            // `geometry_from_deployment` replaces it with a point some
+            // shader is instantiated at rather than passing `gs_0_b_0` on.
+            [] => Ok(router.unwrap_or(crate::batch::AffineFormat { bits: 0, group: 0 })),
             [(group, bits)] => Ok(crate::batch::AffineFormat {
                 bits: *bits,
                 group: *group,
@@ -126,19 +178,25 @@ impl Loaded {
             many => {
                 let points = many
                     .iter()
-                    .map(|(g, b)| format!("g{g}/b{b}"))
+                    .map(|(g, b)| {
+                        let witness = self
+                            .affine_witnesses
+                            .iter()
+                            .find(|(p, _)| p == &(*g, *b))
+                            .map_or_else(String::new, |(_, n)| format!(" (`{n}`)"));
+                        format!("g{g}/b{b}{witness}")
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 Err(crate::Error::Create {
                     what: "checkpoint",
                     message: format!(
-                        "`{row}` arrives at {} affine points ({points}) and this \
-                         driver instantiates ONE kernel set. Every tensor at the \
-                         other point would be dequantised at the first one's \
-                         width — scales read from the wrong offset, and for a \
-                         router gate that is not a fault but a mixture routing to \
-                         almost the right experts. Refused rather than served \
-                         wrongly",
+                        "`{row}` arrives at {} affine points beside its router \
+                         gate's ({points}) and this driver instantiates ONE \
+                         kernel set for the stack. Every tensor at another \
+                         point would be dequantised at the first one's width — \
+                         scales read from the wrong offset. Refused rather \
+                         than served wrongly",
                         many.len()
                     ),
                 })
@@ -223,10 +281,14 @@ pub fn load(
         .collect();
     let mxfp4 = plan.mxfp4_tensor_names();
     let affine_points = plan.affine_points();
+    let affine_witnesses = plan.affine_point_witnesses();
+    let affine_by_name = plan.affine_by_name();
     Ok(Loaded {
         regions,
         tensors,
         mxfp4,
         affine_points,
+        affine_witnesses,
+        affine_by_name,
     })
 }

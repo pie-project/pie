@@ -241,6 +241,33 @@ impl Programs {
         Ok(driver::check(&states, effects, tickets))
     }
 
+    /// Read one instance's device-resolved geometry off its channels.
+    ///
+    /// A PEEK, not a take: the ports that consume are consumed once, later,
+    /// by the interpreter's own port loop when the program fires. Reading
+    /// twice would drop a cell, and the symptom is a fire silently using the
+    /// fire-after-next's tokens.
+    ///
+    /// `page` is the KV page size, which the `kv_len` port's contract needs.
+    ///
+    /// # Errors
+    ///
+    /// [`Unregistered`] for an instance id the registry does not hold, or one
+    /// whose program has gone.
+    pub fn geometry(&self, instance: u64, page: u32) -> Result<driver::Resolution, Unregistered> {
+        let inst = self
+            .registry
+            .instance(instance)
+            .ok_or_else(|| Unregistered(format!("no instance {instance}")))?;
+        let program = self.registry.program(inst.program_id).ok_or_else(|| {
+            Unregistered(format!(
+                "instance {instance} names program {} which is gone",
+                inst.program_id
+            ))
+        })?;
+        Ok(driver::resolve(&program.plan, &inst.interp, page))
+    }
+
     /// Register a channel and hand back where its ring lives.
     ///
     /// The ring is HOST memory, as it is on Metal and on the dummy driver.

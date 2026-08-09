@@ -28,6 +28,7 @@ fn launch(symbol: &str) -> Op {
             weights: vec![],
             state: None,
             params: vec![],
+            param_extents: vec![],
         },
         inputs: vec![],
         outputs: vec![],

@@ -406,6 +406,82 @@ fn no_rule_puts_work_on_an_axis_its_shader_never_reads() {
     assert!(checked >= 180, "only {checked} entrypoints were checked");
 }
 
+/// The MIRROR of the check above, which is the dangerous direction.
+///
+/// `no_rule_puts_work_on_an_axis_its_shader_never_reads` asks `if !read &&
+/// given > 1` -- work handed to an axis nothing reads, which is WASTE. This
+/// asks the opposite: an axis the body READS that the rule leaves at one lane,
+/// which is DATA LOSS. Every index past the first on that axis is never
+/// dispatched, nothing faults, and the buffer keeps what it was allocated
+/// with.
+///
+/// They are different predicates and only the first was written, which is
+/// exactly why this crate did not catch `geglu_tanh_strided`: its body
+/// declared `local_size_y = 16` and read `gl_GlobalInvocationID.y` as the row
+/// under a rule (`Elementwise`) that puts one lane on y. Every row past 15 of
+/// gemma's per-layer-embedding gate was dropped, on every prefill longer than
+/// sixteen tokens, silently. The body is flat now; this is what would have
+/// said so.
+///
+/// Transcribed from `driver-wgpu`'s `no_module_reads_a_grid_axis_its_rule_
+/// leaves_flat`, which was written after the same defect was measured there.
+#[test]
+fn no_module_reads_a_grid_axis_its_rule_leaves_flat() {
+    let _ = modules!();
+    let mut checked = 0;
+    let mut found: Vec<String> = Vec::new();
+    for (name, rule, d) in table() {
+        if rule == Rule::Unstated || DECODE_ONLY.contains(&&*name) {
+            continue;
+        }
+        // 128 rows and not the 64 the sibling check uses, because this
+        // predicate is the other way round and 64 makes it lie. Every compiled
+        // GEMM tile divides 64, so `Rule::Qmm`'s y extent is
+        // `rows.div_ceil(bm)` = 1 for a `bm` of 64 -- one row tile, correctly
+        // one workgroup, and a body reading `gl_WorkGroupID.y` there is
+        // reading index 0 because index 0 is all there is. 128 is a multiple
+        // of every tile too and makes that axis two, so an axis that is flat
+        // is flat because the RULE flattened it.
+        let fire = Dims {
+            rows: 128,
+            ..dims_for(rule, d.local)
+        };
+        // LANES, not workgroups, and the difference is the whole predicate.
+        // `Rule::PerHead` puts `head_dim` lanes on x; a module 128 wide covers
+        // a 128-channel head in ONE workgroup, and a body reading
+        // `gl_GlobalInvocationID.x` there sees 0..127, not just 0. Measured
+        // against `groups` this check called that data loss. An axis is flat
+        // when the rule puts one LANE on it, because only then can the body
+        // never see an index above zero.
+        let Ok(g) = geometry::lanes(rule, fire, Module::loaded(&name, &d)) else {
+            continue;
+        };
+        for (axis, (&read, &given)) in d.grid_axes.iter().zip(g.iter()).enumerate() {
+            // A module whose own workgroup is wider than one on this axis may
+            // legitimately read a LOCAL index there -- `gl_LocalInvocationID.y`
+            // is a lane within the group and says nothing about the grid. Only
+            // a GLOBAL read of a flattened axis is the defect, and `grid_axes`
+            // is about the global builtins.
+            if read && given <= 1 {
+                found.push(format!(
+                    "`{name}` ({rule:?}) is indexed by axis {axis} and its rule \
+                     puts {given} workgroup there"
+                ));
+            }
+        }
+        checked += 1;
+    }
+    assert!(
+        found.is_empty(),
+        "{} entrypoints read a grid axis their rule flattens, so every index \
+         past the first on that axis is never written and the dispatch \
+         succeeds anyway:\n{}",
+        found.len(),
+        found.join("\n")
+    );
+    assert!(checked >= 180, "only {checked} entrypoints were checked");
+}
+
 /// The entrypoints that are one row by construction, and why each is.
 ///
 /// Not a way to quiet the check -- a record of the modules whose row count is

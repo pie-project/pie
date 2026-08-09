@@ -64,9 +64,9 @@ pub struct BuildArgs {
     /// directory, or a `.zt` artifact.
     pub source: String,
     /// Load-time requantization to bake in: `fp8`, `int8` or `mxfp4` for
-    /// `--backend cuda`, `int4` for `--backend metal` or `--backend vulkan`. Absent means none — the
-    /// optimization is then the layout work alone (fused banks, expert stacks,
-    /// dequantized schemes).
+    /// `--backend cuda`, `int4` for `--backend metal`, `--backend vulkan` or
+    /// `--backend wgpu`. Absent means none — the optimization is then the
+    /// layout work alone (fused banks, expert stacks, dequantized schemes).
     ///
     /// Whatever is named here is the transform a serve boot would otherwise
     /// run over every weight, done once and written down instead.
@@ -83,14 +83,15 @@ pub struct BuildArgs {
     /// needs the device's Marlin repack and cannot be materialized offline.
     #[arg(long)]
     pub moe: Option<String>,
-    /// Which driver will serve the artifact: `cuda`, `metal` or `vulkan`.
+    /// Which driver will serve the artifact: `cuda`, `metal`, `vulkan` or
+    /// `wgpu`.
     ///
     /// Not cosmetic and not inferable: the drivers read different tensors.
-    /// CUDA binds fused q/k/v banks under HuggingFace names; Metal and Vulkan
-    /// bind in-place projections under MLX names, and an artifact materialized
-    /// for one family is not what the other's bind path reads. Stated as a flag
-    /// for the reason `--fp8-native` is: an offline run cannot probe the
-    /// device it is optimizing for.
+    /// CUDA binds fused q/k/v banks under HuggingFace names; Metal, Vulkan and
+    /// wgpu bind in-place projections under MLX names, and an artifact
+    /// materialized for one family is not what the other's bind path reads.
+    /// Stated as a flag for the reason `--fp8-native` is: an offline run cannot
+    /// probe the device it is optimizing for.
     #[arg(long, default_value = "cuda")]
     pub backend: String,
     /// Write the artifact here instead of the store. A path ending in `.zt`
@@ -409,22 +410,31 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
 /// fused banks -- so one flag sets both and no combination can be spelled
 /// that no bind path reads.
 ///
-/// Vulkan reads exactly what Metal reads. The two drivers share no code, but
-/// they share a bind path shape: MLX names over in-place projections, matvecs
-/// over MLX affine int4. One arm rather than a second policy that happened to
-/// be equal, which would be a second thing to keep equal.
+/// Vulkan reads exactly what Metal reads, and wgpu reads exactly what Vulkan
+/// reads. The three drivers share no code, but they share a bind path shape:
+/// MLX names over in-place projections, matvecs over MLX affine int4. One arm
+/// rather than three policies that happened to be equal, which would be three
+/// things to keep equal.
+///
+/// For wgpu the equality is not a resemblance: `driver-wgpu/src/names.rs` is
+/// byte-identical to `driver-vulkan/src/names.rs`, which is what the test
+/// below asserts by diffing the two files rather than by agreeing with this
+/// comment.
 fn bind_policy(backend: &str) -> Result<(Projections, Naming)> {
     match backend {
         "cuda" => Ok((Projections::Fused, Naming::Hf)),
-        "metal" | "vulkan" => Ok((Projections::InPlace, Naming::Mlx)),
-        other => bail!("--backend {other:?} is not `cuda`, `metal` or `vulkan`"),
+        "metal" | "vulkan" | "wgpu" => Ok((Projections::InPlace, Naming::Mlx)),
+        other => bail!("--backend {other:?} is not `cuda`, `metal`, `vulkan` or `wgpu`"),
     }
 }
 
 /// Refuses a requantization the serving backend's kernels do not read.
 fn quant_fits(backend: &str, quant: RuntimeQuant, spelled: Option<&str>) -> Result<()> {
     match (backend, quant) {
-        ("metal" | "vulkan", RuntimeQuant::Fp8 | RuntimeQuant::Int8 | RuntimeQuant::Mxfp4) => {
+        (
+            "metal" | "vulkan" | "wgpu",
+            RuntimeQuant::Fp8 | RuntimeQuant::Int8 | RuntimeQuant::Mxfp4,
+        ) => {
             bail!(
                 "--quant {} is CUDA's; this backend's matvecs read MLX affine, so \
                  `--quant int4` is the requantization it can serve",
@@ -433,7 +443,8 @@ fn quant_fits(backend: &str, quant: RuntimeQuant, spelled: Option<&str>) -> Resu
         }
         ("cuda", RuntimeQuant::Int4) => bail!(
             "--quant int4 is MLX affine, which no CUDA kernel reads; it is \
-             what `--backend metal` and `--backend vulkan` requantize to"
+             what `--backend metal`, `--backend vulkan` and `--backend wgpu` \
+             requantize to"
         ),
         _ => Ok(()),
     }
@@ -482,5 +493,62 @@ mod tests {
         }
         assert!(quant_fits("cuda", RuntimeQuant::Int4, Some("int4")).is_err());
         assert!(quant_fits("cuda", RuntimeQuant::Fp8, Some("fp8")).is_ok());
+    }
+
+    /// wgpu takes the same artifact as Vulkan, and the reason is checkable.
+    ///
+    /// # Why this diffs two files instead of trusting the arm
+    ///
+    /// `bind_policy` puts `wgpu` in Metal's arm because `driver-wgpu` binds
+    /// the tensors `driver-vulkan` binds. That is a claim about ANOTHER crate,
+    /// and an arm that merely says so would keep saying so after the two
+    /// parted -- an artifact authored for the wrong names does not fail to
+    /// build, it fails at `Shell::open` with a missing weight, one command
+    /// later and in a different crate's words.
+    ///
+    /// So the claim is checked where it lives: the two name tables are read
+    /// off disk and compared. `driver-wgpu/src/names.rs` was copied from the
+    /// sibling and is expected to stay a copy; the day it stops being one,
+    /// this test says so and this arm needs splitting.
+    #[test]
+    fn wgpu_is_authored_the_way_vulkan_is_because_it_binds_the_same_names() {
+        assert_eq!(
+            bind_policy("wgpu").unwrap(),
+            bind_policy("vulkan").unwrap(),
+            "the flag must author what the wgpu bind path reads"
+        );
+        assert!(quant_fits("wgpu", RuntimeQuant::Int4, Some("int4")).is_ok());
+        assert!(quant_fits("wgpu", RuntimeQuant::Fp8, Some("fp8")).is_err());
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let wgpu = std::fs::read_to_string(root.join("crates/driver-wgpu/src/names.rs"))
+            .expect("driver-wgpu carries a name table");
+        let vulkan = std::fs::read_to_string(root.join("crates/driver-vulkan/src/names.rs"))
+            .expect("driver-vulkan carries a name table");
+        assert_eq!(
+            wgpu, vulkan,
+            "the two drivers no longer spell weights the same way, so one              `--backend` arm can no longer author for both"
+        );
+        // A control: the file is not empty, so the equality above is an
+        // equality of CONTENT rather than of two failed reads.
+        assert!(
+            wgpu.contains("lm_head"),
+            "the table read is the real one, not an empty file"
+        );
+    }
+
+    /// The refusal names every spelling it would have taken.
+    ///
+    /// A user who typed `--backend webgpu` learns that `wgpu` exists; one who
+    /// learns only that `webgpu` is wrong tries `--backend gpu` next.
+    #[test]
+    fn an_unknown_backend_is_refused_by_listing_the_known_ones() {
+        let refused = bind_policy("webgpu").unwrap_err().to_string();
+        for known in ["cuda", "metal", "vulkan", "wgpu"] {
+            assert!(
+                refused.contains(known),
+                "the refusal omits `{known}`: {refused}"
+            );
+        }
     }
 }

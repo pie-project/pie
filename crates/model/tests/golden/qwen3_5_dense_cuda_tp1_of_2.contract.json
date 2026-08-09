@@ -131,69 +131,6 @@
       "visibility": "Public"
     },
     {
-      "name": "model.layers.0.linear_attn.conv1d.bias",
-      "expr": {
-        "Concat": {
-          "axis": 0,
-          "parts": [
-            {
-              "Shard": {
-                "src": {
-                  "Slice": {
-                    "src": {
-                      "Src": "model.layers.0.linear_attn.conv1d.bias"
-                    },
-                    "axis": 0,
-                    "start": 0,
-                    "len": 32
-                  }
-                },
-                "axis": 0
-              }
-            },
-            {
-              "Shard": {
-                "src": {
-                  "Slice": {
-                    "src": {
-                      "Src": "model.layers.0.linear_attn.conv1d.bias"
-                    },
-                    "axis": 0,
-                    "start": 32,
-                    "len": 32
-                  }
-                },
-                "axis": 0
-              }
-            },
-            {
-              "Shard": {
-                "src": {
-                  "Slice": {
-                    "src": {
-                      "Src": "model.layers.0.linear_attn.conv1d.bias"
-                    },
-                    "axis": 0,
-                    "start": 64,
-                    "len": 32
-                  }
-                },
-                "axis": 0
-              }
-            }
-          ]
-        }
-      },
-      "shape": [
-        48
-      ],
-      "encoding": {
-        "Raw": "BF16"
-      },
-      "scales": null,
-      "visibility": "Public"
-    },
-    {
       "name": "model.layers.0.linear_attn.A_log",
       "expr": {
         "Cast": {

@@ -320,7 +320,25 @@ pub enum Arg {
     },
     /// A value the BACKEND binds by name — the values a seam exposes
     /// (the observed query, the logits). `Buffers::NAMED` says which.
-    Named { value: ValueId, width: u32 },
+    Named {
+        value: ValueId,
+        width: u32,
+        /// Bytes per ELEMENT, for the same reason [`Arg::Arena::bytes`]
+        /// states it — and this variant needed it more.
+        ///
+        /// `slot` has always computed this and threw it away here, so a
+        /// backend that wanted the rectangle in BYTES had to guess the
+        /// width. Two is the guess that looks safe, and it is wrong in
+        /// the one place a driver has actually measured: `driver-vulkan`
+        /// records a four-row `row_gather` over a one-entry `u32`
+        /// sampling table as *"a sixteen-byte read of a four-byte
+        /// buffer"*, and notes it can see it nowhere — `Arg::Named` has
+        /// no extent to check, the descriptor is bound whole, and the
+        /// validation layer does not report storage-buffer overruns
+        /// even with GPU-AV on. A two-byte guess would have called that
+        /// rectangle eight bytes and still not caught it.
+        bytes: u32,
+    },
     /// A weight, by the name the trace states (`layer.3.q_proj`). The
     /// driver resolves it against its own tensor store, which is the one
     /// thing that stays per-family and is a MAP rather than a switch.
@@ -1125,13 +1143,30 @@ impl Lowerer<'_> {
         }
         let first_param = self.params.len() as u32;
         if let OpKind::Launch {
-            weights, params, ..
+            weights,
+            params,
+            param_extents,
+            ..
         } = &op.kind
         {
             for name in weights {
                 self.args.push(Arg::Weight(name.clone()));
             }
             self.params.extend_from_slice(params);
+            // The scalars that are extents. Written over the constants the
+            // text left, because the fire is what decides them and only the
+            // lowering knows the fire.
+            for (i, shape) in param_extents {
+                let at = first_param as usize + *i as usize;
+                if let Some(slot) = self.params.get_mut(at) {
+                    *slot = u32::try_from(shape_elements(
+                        shape,
+                        self.rows.len(),
+                        self.buffers.n_requests as usize,
+                    ))
+                    .unwrap_or(u32::MAX);
+                }
+            }
         }
         self.launches.push(Launch {
             kernel: id,
@@ -1181,7 +1216,11 @@ impl Lowerer<'_> {
             .get(v as usize)
             .map_or(2, |info| dtype_bytes(info.dtype));
         match self.buffers.offset.get(v as usize) {
-            Some(&Buffers::NAMED) | None => Arg::Named { value: v, width },
+            Some(&Buffers::NAMED) | None => Arg::Named {
+                value: v,
+                width,
+                bytes,
+            },
             Some(&at) => Arg::Arena { at, width, bytes },
         }
     }
@@ -1385,6 +1424,10 @@ impl Lowerer<'_> {
             // question asked of a count instead of a flag.
             GuardPred::TokensLE(k) => self.rows.len() as u32 <= k,
             GuardPred::TokensGT(k) => self.rows.len() as u32 > k,
+            // `k == 0` is false rather than a division: a guard that named a
+            // zero tile would otherwise trap here, and a tile of no rows is a
+            // statement error rather than a fire property.
+            GuardPred::TokensMultipleOf(k) => k != 0 && (self.rows.len() as u32).is_multiple_of(k),
             // The window CLASS, as a row property. `FireClass::Decode`
             // meant exactly this and could not say it; a mixed fire
             // answers false and takes the ragged arm, which serves a
@@ -2134,12 +2177,24 @@ pub fn value_bytes(plan: &ForwardPlan, v: ValueId, n_tokens: usize, n_requests: 
     let Some(info) = plan.values.get(v as usize) else {
         return 0;
     };
+    shape_elements(&info.shape, n_tokens, n_requests) * dtype_bytes(info.dtype) as usize
+}
+
+/// How many elements `shape` describes for a fire of this size.
+///
+/// One place, because the arena's reading of an extent and the number a
+/// kernel is TOLD that extent is must be the same reading — see
+/// [`crate::trace::OpKind::Launch::param_extents`], which is the channel
+/// that lets a statement say "this scalar is that shape" instead of
+/// writing a constant beside it.
+#[must_use]
+pub fn shape_elements(shape: &crate::trace::Shape, n_tokens: usize, n_requests: usize) -> usize {
     let mut elements = 1usize;
-    for dim in &info.shape.0 {
+    for dim in shape.0.iter().copied() {
         elements *= match dim {
             Dim::Tokens => n_tokens,
             Dim::Requests => n_requests,
-            Dim::Const(c) => *c as usize,
+            Dim::Const(c) => c as usize,
             // The padded route count, which is a function of the fire's
             // tokens and three load-time numbers -- so a residue ledger
             // sizing this value gets the real footprint, not an estimate.
@@ -2147,10 +2202,10 @@ pub fn value_bytes(plan: &ForwardPlan, v: ValueId, n_tokens: usize, n_requests: 
                 top_k,
                 experts,
                 block,
-            } => Dim::moe_aligned_rows(n_tokens as u32, *top_k, *experts, *block) as usize,
+            } => Dim::moe_aligned_rows(n_tokens as u32, top_k, experts, block) as usize,
         };
     }
-    elements * dtype_bytes(info.dtype) as usize
+    elements
 }
 
 /// Bytes per element. One place, because two answers to this question is

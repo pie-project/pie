@@ -106,8 +106,8 @@
 //!   so an overshoot is harmless. An UNDERSHOOT is not, and it is the direction
 //!   that fails silently: a lane that never launches writes nothing, the gap
 //!   reads back as whatever the buffer held, and the dispatch completes.
-//!   [`kernels::KernelSig::grid_param`], `head_param` and `heads_param` say
-//!   which of the STATEMENT's params give the shape.
+//!   [`kernels::KernelSig::grid_param`], `head_param`, `heads_param` and
+//!   `rows_param` say which of the STATEMENT's params give the shape.
 //! * **Ask the adapter for its limits.** WebGPU's guaranteed floor is **8**
 //!   storage buffers per shader stage, and [`over_downlevel_storage_limit`]
 //!   names the rows that need more — `sdpa_paged_decode` binds eleven. A shell
@@ -193,6 +193,7 @@ const EMPTY: KernelSig = KernelSig {
     grid_param: None,
     head_param: None,
     heads_param: None,
+    rows_param: None,
     lowered_as: None,
     publishes_aux: &[],
 };
@@ -215,6 +216,7 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         grid_param: k.grid_param,
         head_param: k.head_param,
         heads_param: k.heads_param,
+        rows_param: k.rows_param,
         lowered_as: k.lowered_as,
         publishes_aux: k.publishes_aux,
     }

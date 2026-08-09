@@ -10,20 +10,36 @@
 //! it — and the softmax scale is applied INSIDE flashinfer, which is why
 //! `run`'s layer body never scales the scores.
 //!
-//! # THIS IS THE ONE CALLEE THAT IS STILL C++, AND IT IS NOT THIS STEP'S
+//! # THE LAST C++ CALLEE IS GONE, AND THIS IS WHAT IT BECAME
 //!
-//! `pie_k_attn_dispatch_attention_flashinfer_prefill_bf16` and the
-//! `pie_x_*_prefill_plan` trio are `driver-cuda/csrc/attn/`'s — the FA2
-//! lattice — reached across the C ABI exactly as `fire/attn_score.rs` reaches
-//! its own driver-owned launcher. **North star §5 step 8 retires them**, and
-//! until it does, a tower whose walk is Rust and whose attention crosses one
-//! FFI edge is the complete result of THIS step: the edge is a call, not a
-//! host program, and no `<<<>>>` crosses it.
+//! This module's header used to read *"THIS IS THE ONE CALLEE THAT IS STILL
+//! C++, AND IT IS NOT THIS STEP'S"*, and it named the two edges:
+//! `pie_k_attn_dispatch_attention_flashinfer_prefill_bf16` (the generated
+//! shim entry) and the `pie_x_*_prefill_plan` trio (the hand-written extras).
+//! Both were `driver-cuda/csrc/attn/`'s — the FA2 lattice — reached across
+//! the C ABI. North star §5 step 7 deleted
+//! `csrc/attn/attention_flashinfer.cu` and `csrc/attn/plan_lifecycle.cpp`
+//! whole, so there is nothing on the far side of either edge any more.
 //!
-//! `execution.rs` wrote this down before the port: *"`ffi::pie_k_attn_
+//! WHAT REPLACED THEM, in the order this file uses them:
+//!
+//! * The plan is [`crate::bind::PrefillPlan::plan_prefill_variant`], which is
+//!   the wrapper this module used to reach past. It exists because this
+//!   caller needs `causal_mask = false` and the old wrapper hard-coded
+//!   `true`; the five booleans are now [`crate::bind::PrefillPlanFlags`],
+//!   named, so the ViT's bidirectionality is a field and not a position.
+//! * The fire is [`crate::fire::flashinfer_fa2_dispatch::prefill`] followed
+//!   by [`crate::fire::flashinfer_fa2::fire_prefill`] — the same two steps
+//!   `bind::service::attn_dispatch_attention_flashinfer_prefill_bf16` takes.
+//!   This tower cannot go through the service because it holds no
+//!   `DispatchCtx`: it is not a lowered model, it is a hand-written walk.
+//! * The kernel is NVRTC's, from `kernels-cuda-new`'s `families::fa2`. No
+//!   `<<<>>>` and no C++ is reached from this file at all.
+//!
+//! `execution.rs` wrote the old state down before the port: *"`ffi::pie_k_attn_
 //! dispatch_attention_flashinfer_prefill_bf16` already exists, so
-//! `vis_helpers.cpp:131` needs no forwarder."* It did not, and this module is
-//! the call it was talking about.
+//! `vis_helpers.cpp:131` needs no forwarder."* It no longer exists, because
+//! the row is on `execution::RUST_SERVED` and `emit_c_shim` skips it.
 //!
 //! # What the port UNDOES
 //!
@@ -40,9 +56,12 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 use crate::bind::PrefillPlan;
-use crate::bind::abi::{AttentionWorkspaceView, ffi};
+use crate::bind::abi::AttentionWorkspaceView;
 use crate::device::{Allocator, DeviceBuffer, StreamRef};
 use crate::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps, StagingOps};
+use crate::fire::flashinfer_fa2 as fa2;
+use crate::fire::flashinfer_fa2_dispatch as fa2d;
+use crate::fire::merge_states;
 use crate::{Error, Result};
 
 /// This module's name in a refusal — `super::WHO`'s reason, one file down.
@@ -238,47 +257,64 @@ pub(super) fn attend(
         // tower: that helper passes `causal_mask = true`, because its caller
         // is a decoder prefill where a token may not see its future. A ViT is
         // bidirectional — every patch attends to every patch of its own image
-        // — so this calls the entry directly with the C++'s six flags:
-        // `enable_cuda_graph=false, window_left=-1, full_attention_variant=
-        // false, hnd_layout=false, causal_mask=false` (`vis_helpers.cpp:
-        // 121-126`), plus the two the declaration carries and the C++ left
-        // defaulted, `custom_mask` and `wants_prefill_score`, both false.
+        // — so this states the flags itself.
+        //
+        // WHAT THIS USED TO BE, because the shape of the change is the point.
+        // It called `ffi::pie_x_plan_attention_flashinfer_prefill_bf16`
+        // directly — reaching PAST `bind::PrefillPlan` to the hand-written C
+        // extra, because the wrapper hard-coded the one flag this caller has
+        // to flip. North star §5 step 7 deleted that extra along with
+        // `csrc/attn/plan_lifecycle.cpp` and
+        // `csrc/attn/attention_flashinfer.cu`, so the back door is gone and
+        // `PrefillPlan::plan_prefill_variant` is the front one: the same five
+        // booleans the C++ signature took, as NAMED fields, which is what
+        // stops a sixth `false` from landing in `causal_mask`'s slot and
+        // planning a causal ViT.
+        //
+        // `vis_helpers.cpp:121-126`'s flags, unchanged: `enable_cuda_graph =
+        // false`, `window_left = -1`, `full_attention_variant = false`,
+        // `hnd_layout = false`, `causal_mask = false`, and the two the
+        // declaration carried and the C++ left defaulted, `custom_mask` and
+        // `wants_prefill_score`, both false.
+        //
+        // ONE THING IS NOW DIFFERENT AND IT IS SAID HERE RATHER THAN FOUND.
+        // `prefill_arm(full_attention_variant = false, causal = false,
+        // soft_cap = 0)` is `PrefillArm::CausalWindow`: the non-full branch of
+        // `dispatch_attention_flashinfer_prefill_bf16:786-798` is CAUSAL-ONLY,
+        // so a bidirectional, unwindowed, uncapped prefill falls through to
+        // the causal windowed instantiation. That is upstream's own
+        // fallthrough, it is what the C++ dispatched to for this exact call,
+        // and `flashinfer_fa2_dispatch`'s
+        // `a_bidirectional_windowed_prefill_falls_through_to_causal` pins it
+        // so a future edit cannot quietly "fix" it into a different kernel.
         //
         // The workspace's plan-update fence (`begin_plan_update` /
         // `end_plan_update`) is NOT taken, exactly as the C++ did not take
-        // it. One staging slot, no rotation, and the upload the planner
-        // queues is stream-ordered behind the dispatch that preceded it on
-        // the same stream. The residual hazard — the CPU writing the pinned
-        // mirror while an in-flight dispatch still reads the device copy — is
-        // the C++'s and is inherited, not introduced; it is bounded by the
-        // fact that a re-plan happens only when the image SHAPE changes.
-        //
-        // SAFETY: `plan` is this module's own live handle, the three CSR
-        // pointers address host `Vec`s that outlive the call, and the view's
-        // pointers are the workspace's own. `stream` is live for the borrow.
-        unsafe {
-            ffi::pie_x_plan_attention_flashinfer_prefill_bf16(
-                st.plan.as_ptr(),
-                qo.as_ptr(),
-                kvpi.as_ptr(),
-                klpl.as_ptr(),
-                total,
-                num_seqs,
-                heads,
-                heads,
-                head_dim,
-                PAGE_SIZE,
-                view,
-                stream.as_raw().cast(),
-                false,
-                -1,
-                false,
-                false,
-                false,
-                false,
-                false,
-            );
-        }
+        // it. The hazard it guarded is now smaller rather than larger: the
+        // descriptor stages into the cache's own `Vec<u8>` and is uploaded
+        // beside the launch that reads it (§5 step 7's third seam), so the
+        // workspace's pinned mirror is not written here at all.
+        st.plan.plan_prefill_variant(
+            &qo,
+            &kvpi,
+            &klpl,
+            heads,
+            heads,
+            head_dim,
+            PAGE_SIZE,
+            view,
+            stream.as_raw().cast(),
+            false,
+            -1,
+            crate::bind::PrefillPlanFlags {
+                full_attention_variant: false,
+                hnd_layout: false,
+                causal_mask: false,
+                custom_mask: false,
+                wants_prefill_score: false,
+            },
+        );
+        let _ = (total, num_seqs);
         st.sig = Some(sig);
     }
 
@@ -296,33 +332,82 @@ pub(super) fn attend(
     #[allow(clippy::cast_precision_loss)]
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
     let view: AttentionWorkspaceView = st.ws.view();
-    // `vis_helpers.cpp:131-133`. THE ONE FFI EDGE THIS TOWER STILL CROSSES —
-    // see the module header, and north star §5 step 8 for what closes it.
-    // The argument order is the row's (`table::attn`'s `flashinfer_prefill`),
-    // which is where `kv_page_indices` precedes `kv_page_indptr`: the C++
-    // call passes `st.kvidx_d` then `st.kvpi_d` for exactly that reason.
+    // `vis_helpers.cpp:131-133`. THE FFI EDGE IS CLOSED. This was
+    // `ffi::pie_k_attn_dispatch_attention_flashinfer_prefill_bf16`, the
+    // GENERATED shim entry for the row; the row is now on
+    // `execution::RUST_SERVED`, so `emit_c_shim` emits no such entry and the
+    // symbol no longer exists to call. `bind::service` is the same body the
+    // shim forwarded to, minus the language boundary, and it takes a
+    // `DispatchCtx` this tower does not have — so the call lands one layer
+    // lower, on the function the service itself calls.
+    //
+    // The argument order is still the row's (`table::attn`'s
+    // `flashinfer_prefill`), which is where `kv_page_indices` precedes
+    // `kv_page_indptr`: the C++ call passed `st.kvidx_d` then `st.kvpi_d` for
+    // exactly that reason, and `Buffers` names both so the order cannot be
+    // got wrong silently any more.
     //
     // SAFETY: `q`/`k`/`v`/`o` are the walk's scratch, live until the caller
     // synchronises; the four index buffers are this module's own and were
-    // uploaded on this stream; the view is the workspace's; `lse_out` is null,
+    // uploaded on this stream; the view is the workspace's; `lse` is null,
     // which the launcher reads as "do not write log-sum-exp".
+    let bufs = fa2d::Buffers {
+        q: q as u64,
+        k_pages: k as u64,
+        v_pages: v as u64,
+        o: o as u64,
+        kv_page_indices: kvidx_d.as_ptr() as u64,
+        kv_page_indptr: kvpi_d.as_ptr() as u64,
+        kv_last_page_lens: klpl_d.as_ptr() as u64,
+        qo_indptr: qo_d.as_ptr() as u64,
+        lse: 0,
+        int_buffer: view.int_buffer as u64,
+        float_buffer: view.float_buffer as u64,
+    };
+    let plan = st.plan.cache();
+    let arm = fa2d::prefill_arm(plan.full_attention_variant, plan.causal_mask, 0.0);
+    let fired = fa2d::prefill(plan, &bufs, fa2::fa_device(), arm, 0.0, sm_scale);
+    let (mut dispatch, partials) = match fired {
+        fa2d::Fired::Whole(d) => (d, None),
+        // The plan split KV. The fire writes per-chunk partials -- its
+        // `params.o`/`params.lse` were redirected to them -- and the fold
+        // after the launch turns them into `o`, on this stream.
+        //
+        // `lse` is 0 here, which the merge carries through as a null
+        // `s_merged`: `cascade.cuh:461` tests it and the ViT does not want
+        // log-sum-exps.
+        fa2d::Fired::Split(d, split) => (d, Some(split)),
+        fa2d::Fired::Declined(why) => {
+            return Err(Error::invalid(WHO, format!("the ViT prefill declined: {why}")));
+        }
+    };
+    // SAFETY: as above; the plan outlives the fire because `st` does.
     unsafe {
-        ffi::pie_k_attn_dispatch_attention_flashinfer_prefill_bf16(
-            st.plan.as_ptr().cast_const(),
-            q,
-            k,
-            v,
-            o,
-            qo_d.as_ptr().cast::<u32>().cast_const(),
-            kvidx_d.as_ptr().cast::<u32>().cast_const(),
-            kvpi_d.as_ptr().cast::<u32>().cast_const(),
-            klpl_d.as_ptr().cast::<u32>().cast_const(),
-            view,
+        fa2::fire_prefill(
+            &mut dispatch,
+            fa2::PlanUpload {
+                bytes: &plan.int_upload,
+                int_buffer: view.int_buffer as u64,
+                int_base_bytes: plan.int_base_bytes,
+            },
             stream.as_raw().cast(),
-            0.0,
-            sm_scale,
-            std::ptr::null_mut(),
-        );
+        )
+    }?;
+    if let Some(split) = partials {
+        // SAFETY: as above. `prefill.cuh:4350-4352` fires exactly this, in
+        // exactly this position.
+        //
+        // A refusal is an `Err` here and a panic in the six services, and
+        // the difference is that this caller HAS an error to return. Both
+        // refuse; neither substitutes a different kernel.
+        let merged =
+            unsafe { merge_states::variable_length(split.merge(), stream.as_raw().cast()) };
+        if let merge_states::Merged::Declined(why) = merged {
+            return Err(Error::invalid(
+                WHO,
+                format!("the ViT prefill split KV and the cascade merge declined: {why}"),
+            ));
+        }
     }
     Ok(())
 }

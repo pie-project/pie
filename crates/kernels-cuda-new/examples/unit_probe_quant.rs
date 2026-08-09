@@ -36,7 +36,7 @@
 //!
 //! `quant/dequant_wna16.cuh` and `quant/transcode.cuh` carry kernels no
 //! `LaunchRule` fits and no `DeviceKernel::instantiation` can name — the
-//! reasons are enumerated in `families::quant`. They still get compiled
+//! reasons are enumerated in `x::quant`. They still get compiled
 //! here, as roots with no name expressions, because `build.rs` carries EVERY
 //! `.cuh` under `csrc/src` into the header set: text that is carried and
 //! never compiled is a `<cstdint>` waiting for whichever unit first includes
@@ -66,7 +66,7 @@ mod probe {
     use std::ffi::{CStr, CString};
 
     use cudarc::nvrtc::sys as nv;
-    use kernels_cuda_new::families::quant;
+    use kernels_cuda_new::x::quant;
     use kernels_cuda_new::runtime::cache;
     use kernels_cuda_new::source;
 

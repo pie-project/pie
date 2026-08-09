@@ -594,6 +594,10 @@ impl Shell {
     /// [`Unlaunched`]. A frame the pool cannot hold is an `Ok` answer --
     /// [`Launched::Exhausted`] or [`Launched::Impossible`] -- and not an
     /// error, because a full cache is a scheduling fact rather than a fault.
+    /// The two are different questions and are answered in different places:
+    /// `Impossible` is the ceiling, decided before anything is attempted;
+    /// `Exhausted` is the growth itself refusing, which cannot be known
+    /// without trying.
     pub fn launch(&mut self, frame: &driver_api::FrameSubmission) -> Result<Launched, Unlaunched> {
         if let Some(refused) = self.admit(frame)? {
             return Ok(refused);
@@ -641,9 +645,21 @@ impl Shell {
             return Ok(Some(Launched::Impossible));
         }
         if need > self.pool.shape().pages {
-            self.pool
-                .resize(&self.device, need)
-                .map_err(|e| Unlaunched::Unstepped(crate::turns::Unstepped::Failed(e)))?;
+            // A resize that the device would not give memory for is
+            // `Exhausted`, not a fault. The distinction is the whole reason
+            // that variant exists, and until this it was produced nowhere:
+            // the ceiling above is measured against a heap's SIZE, so a frame
+            // that clears it can still be more than the device has FREE once
+            // the weights are resident. Faulting there would fail a request
+            // the scheduler could have served by evicting first -- and since
+            // a driver lane that faults now answers the token with the
+            // failure rather than hanging, that fault reaches the user.
+            if let Err(e) = self.pool.resize(&self.device, need) {
+                if e.is_out_of_memory() {
+                    return Ok(Some(Launched::Exhausted));
+                }
+                return Err(Unlaunched::Unstepped(crate::turns::Unstepped::Failed(e)));
+            }
         }
         Ok(None)
     }

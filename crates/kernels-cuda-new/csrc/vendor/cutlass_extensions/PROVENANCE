@@ -1,0 +1,87 @@
+cutlass_extensions/ -- TensorRT-LLM's CUTLASS epilogue extensions
+=================================================================
+
+Provenance
+----------
+
+Upstream is NOT CUTLASS.  These headers are NVIDIA's TensorRT-LLM additions
+to CUTLASS, carried inside FlashInfer's source tree at
+
+    csrc/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/
+
+and fetched by the `CPMAddPackage` at `crates/kernels-cuda/csrc/CMakeLists.txt`
+while that file still exists.  The distinction matters: a patch to a CUTLASS
+header is a patch to a widely-used upstream and wants to go there; a patch to
+`cutlass_extensions` is a patch to a vendored fork of a vendored fork, and
+nobody upstream is waiting for it.
+
+The directory is spelled `cutlass_extensions/...` rather than
+`tensorrt_llm/cutlass_extensions/...` because that is the spelling its
+includers write -- `moe_gemm_tma_ws_launcher.inl` says
+
+    #include "cutlass_extensions/epilogue/fusion/sm90_visitor_scatter.hpp"
+
+and the carried set is rooted so that the name an includer writes is the name
+the set carries.
+
+Why only one file
+-----------------
+
+Because a compile should not carry what it cannot need, and the closure has
+not been computed yet.  The three candidate trees measure 710 files / 16 MB
+(cutlass), 112 / 12 MB (cute) and 8,172 / 67 MB (cccl); the carried set is
+`include_str!`, so carrying them whole is binary size, and the CUB closure was
+already refused once at 429 files / 4.2 MB for four kernels doing an exclusive
+sum of an `int`.
+
+This file is here ahead of its closure for one specific reason: **it is
+patched, and the patch is invisible to whoever computes the closure later.**
+A closure computation copies files out of the CPM tree.  It would copy the
+unpatched `sm90_visitor_scatter.hpp` and silently reintroduce a compile
+failure that took a full probe cycle to diagnose.  A patched file sitting
+here with its `// PIE:` markers is what stops that.
+
+Relationship to ../MODIFICATIONS
+--------------------------------
+
+`csrc/vendor/MODIFICATIONS` and the three tests in
+`tests/vendor_manifest.rs` that keep it honest are scoped to
+`csrc/vendor/flashinfer/` -- `vendored()` roots its walk there, so the file
+table, the byte counts and the `// PIE:` marker total all describe that
+subtree and only that subtree.  `csrc/vendor/xqa/` already sits outside the
+same scope.
+
+That is a scope gap, not a licence.  The property MODIFICATIONS asserts --
+*strip every `// PIE:` marker and its guard and you get upstream back, byte
+for byte* -- is the property this file holds too, and the transform for it is
+purely textual:
+
+    sm90_visitor_scatter.hpp:  2 markers, 2 changed lines
+      `size<1>(decltype(args.epi_tile){})`  ->  `size<1>(args.epi_tile)`
+      `size<0>(decltype(args.epi_tile){})`  ->  `size<0>(args.epi_tile)`
+
+When the CUTLASS closure lands, this subtree should come under
+MODIFICATIONS' table rather than keep its own note, and this file should be
+deleted in the same change.  It is written down here in the meantime because
+an undocumented patch is how vendoring becomes a fork.
+
+What the patch buys
+-------------------
+
+Measured under `libnvrtc.so.13`, `--gpu-architecture=compute_90a`,
+`-std=c++17 -default-device`: with it, the sm90 pointer-array grouped GEMM
+carrying the FINALIZE scatter epilogue -- the whole `GemmUniversal` device
+body, not a fragment -- compiles rc=0 to 3,500,029 bytes of PTX with exactly
+one `.entry`, and `nvrtcGetLoweredName` returns its mangled name.  Without
+it, `expression must have a constant value` at
+`sm90_visitor_scatter.hpp:301`, followed by a cascade of
+`cute::C<<error-constant>>` incomplete-type errors from `cute/container/
+tuple.hpp` as the poisoned constant propagates through the layout algebra.
+
+This is the finding that retires the `_UNRESOLVED` on the FINALIZE epilogue
+recorded in `.wiki/driver/new-horizon.md` §62.7.  The earlier refusal was
+diagnosed at the time as "my parameterisation, not NVRTC", and that diagnosis
+was half right: the parameterisation was indeed wrong (see the corrected
+`using` chain in `crates/driver-cuda/src/fire/flashinfer_moe.rs`), but fixing
+it exposed this second, real, frontend-conformance issue underneath.  Two
+faults in series is why the first probe read as a wall.

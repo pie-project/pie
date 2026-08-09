@@ -136,6 +136,16 @@
 
 use core::fmt;
 
+/// The two params structs the FA2 `__global__`s take, `#[repr(C)]`-mirrored
+/// and pinned against layouts measured out of NVRTC's PTX.
+///
+/// Separate from this module because it answers a different question: this
+/// module derives the GEOMETRY a launch needs (grid, block, smem, and the
+/// template constants that name the unit), and [`params`] describes the single
+/// ARGUMENT that launch passes. Both are needed to fire; neither is derivable
+/// from the other.
+pub mod params;
+
 /// The KV cache element width FA2 is launched over, in bytes.
 ///
 /// A named type rather than a bare `usize` because `sizeof(DTypeKV)` appears in
@@ -931,7 +941,7 @@ mod tests {
     /// (`prefill.cuh:72-96`, `:198`), which is the geometry the probe spelled.
     #[test]
     fn derive_reaches_the_probed_point() {
-        let g = PrefillGeometry::derive(128, 64, KvWidth::BF16, true, &Device::L40S)
+        let g = PrefillGeometry::derive(128, 64, KvWidth::BF16, true, Device::L40S)
             .expect("hd128 / CTA_TILE_Q 64 is a valid point");
         assert_eq!((g.num_warps_q, g.num_warps_kv), (4, 1));
         assert_eq!(g.num_mma_q, 1);

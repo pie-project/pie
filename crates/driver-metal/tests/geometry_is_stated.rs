@@ -122,11 +122,28 @@ fn stated(s: &str, names: &BTreeSet<String>) -> BTreeSet<String> {
 fn every_geometry_field_is_stated_or_accounted_for() {
     let s = source();
     let names = declared(&s);
-    assert!(
-        names.len() > 35,
-        "found only {} fields — the scan broke",
-        names.len()
-    );
+    // THE SCAN IS ALIVE, asked by NAME rather than by count.
+    //
+    // This was `names.len() > 35`, which is the field count the struct had
+    // the day the guard was written -- so a refactor that collapsed four rope
+    // fields (`rope_freq_factor`, `rope_low_freq_factor`,
+    // `rope_high_freq_factor`, `rope_original_max_position`) into one
+    // `rope_rescale: Option<Rescale>` took it to exactly 35 and the guard
+    // reported "the scan broke" about a scan that was working perfectly.
+    //
+    // What can actually break is `block` finding the wrong braces or
+    // `strip_prefix("pub ")` ceasing to match, and both return a set missing
+    // the fields any decode geometry has whatever else it holds. Naming those
+    // says the same thing without pinning a number that has no business
+    // being constant.
+    for anchor in ["hidden", "n_layers", "vocab", "head_dim", "n_q_heads"] {
+        assert!(
+            names.contains(anchor),
+            "the scan found {} field(s) and `{anchor}` is not among them, \
+             so it is not reading `DecodeGeometry`: {names:?}",
+            names.len()
+        );
+    }
 
     let stated = stated(&s, &names);
     let accounted: BTreeSet<&str> = FILLED_ELSEWHERE.iter().map(|(n, _)| *n).collect();

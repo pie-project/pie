@@ -637,6 +637,8 @@ mod tests {
         MetalBinding {
             quant_group: 64,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
@@ -729,6 +731,8 @@ mod tests {
         let b = MetalBinding {
             quant_group: 128,
             quant_bits: 8,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             ..binding()
         };
         let mine = metal_facts(&f, &schedule(), NORM_EPS, Deployed::metal(&b), &b);

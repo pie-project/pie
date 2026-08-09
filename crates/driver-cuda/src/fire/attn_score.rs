@@ -679,6 +679,23 @@ impl ScoreOps for LiveScoreOps {
              pointers (raw={raw:?}, folded={folded:?}, indptr={score_indptr_d:?})"
         );
 
+        let Some((index, unit)) = kernels_cuda_new::unit::unit_of(FOLD_SYMBOL) else {
+            panic!("{FOLD_SYMBOL} is in no JIT unit — this driver and its kernel table disagree");
+        };
+        let Some(sig) = unit.row(FOLD_SYMBOL).map(|row| row.sig) else {
+            panic!(
+                "{FOLD_SYMBOL} named unit `{}` and is not one of its rows",
+                unit.name
+            );
+        };
+        let module = match cache::module(index, unit) {
+            Ok(module) => module,
+            Err(why) => panic!(
+                "{FOLD_SYMBOL}: unit `{}` would not compile or load: {why}",
+                unit.name
+            ),
+        };
+
         // The row's operands, in the row's order. `Args::bind` checks them
         // against the signature, so a drift between this list and
         // `ATTN_SCORE_FOLD_SIGS` is a refusal and not a shifted argument.

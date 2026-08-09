@@ -96,14 +96,109 @@
 #[path = "src/device.rs"]
 mod device;
 #[allow(dead_code, unused_imports)]
-#[path = "src/emit.rs"]
-mod emit;
-#[allow(dead_code, unused_imports)]
 #[path = "src/families/mod.rs"]
 mod families;
 #[allow(dead_code, unused_imports)]
 #[path = "src/unit.rs"]
 mod unit;
+// The fn-world floor, because `families::ALL` names `x::rope::UNITS` — and
+// the REAL floor, not a stub: `carried::generate` walks `unit::UNITS` into
+// the header set, and a stub here would carry a different set of files than
+// the library holds. Cargo compiles a build script under the package's feature
+// `cfg`s (the `CARGO_FEATURE_*` variables are the RUN-time spelling of the
+// same fact), so with `cuda-12` on, `x`'s `_cuda` half compiles here too —
+// against the `runtime`/`execution`/`table` stubs below, which exist to be
+// compiled and never run, exactly as `mod source` does.
+#[allow(dead_code, unused_imports)]
+#[path = "src/x/mod.rs"]
+mod x;
+
+/// `src/runtime`'s signatures as far as `x`'s `_cuda` half names them, and no
+/// further — `mod source`'s argument, one module over. This script walks rows
+/// and never fires: every body here is `unreachable!()`, and what keeps the
+/// two sides honest is the loud direction — a fn-world file that grows a new
+/// `crate::runtime` dependency is a compile failure of this script naming the
+/// missing item.
+#[allow(dead_code, unused_imports, clippy::unused_self)]
+#[cfg(feature = "_cuda")]
+mod runtime {
+    use core::ffi::c_void;
+
+    /// The marshalling cell `x::Abi::arg` answers with.
+    pub enum ArgValue {
+        I32(i32),
+        U32(u32),
+        F32(f32),
+        Bool(bool),
+        I64(i64),
+        Usize(usize),
+        Ptr(*mut c_void),
+        Bytes { ptr: *const u8, len: usize },
+    }
+
+    /// What `cuLaunchKernel` takes; `x::launch::Launch` converts into it.
+    pub struct Launch {
+        pub grid: [u32; 3],
+        pub block: [u32; 3],
+        pub smem: u32,
+    }
+
+    pub struct Args;
+    impl Args {
+        pub fn bind(
+            _sig: &kernels::KernelSig,
+            _values: &[ArgValue],
+        ) -> Result<Self, &'static str> {
+            unreachable!("the build script never fires")
+        }
+    }
+
+    pub struct Stream;
+    impl Stream {
+        pub unsafe fn from_runtime(_raw: *mut c_void) -> Self {
+            unreachable!("the build script never fires")
+        }
+    }
+
+    pub mod cache {
+        pub struct Module;
+        impl Module {
+            pub fn fire(
+                &self,
+                _sig: &kernels::KernelSig,
+                _launch: super::Launch,
+                _args: &mut super::Args,
+                _stream: super::Stream,
+            ) -> Result<(), &'static str> {
+                unreachable!("the build script never fires")
+            }
+        }
+        pub fn module(_index: usize, _unit: &crate::unit::Unit) -> Result<Module, &'static str> {
+            unreachable!("the build script never fires")
+        }
+    }
+}
+
+/// `src/execution.rs` and `src/table/` as far as `x::route` names them.
+/// Compiled, never run: this script emits from rows and routes nothing.
+#[allow(dead_code)]
+#[cfg(feature = "_cuda")]
+mod execution {
+    pub enum Service {
+        DriverOp,
+    }
+    pub fn service(_symbol: &str) -> Option<Service> {
+        unreachable!("the build script never routes")
+    }
+}
+
+#[allow(dead_code)]
+#[cfg(feature = "_cuda")]
+mod table {
+    pub fn sig(_symbol: &str) -> Option<&'static kernels::KernelSig> {
+        unreachable!("the build script never routes")
+    }
+}
 
 /// `src/source.rs` as far as the tables need it, and no further — see the
 /// header for why it cannot be the file itself.
@@ -159,7 +254,6 @@ mod carried;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/emit.rs");
     // The rows themselves. Cargo would rebuild this script anyway -- every
     // file below is one of its compile inputs, and rustc reports them -- but
     // the list is stated because it is also the ANSWER to "what does the
@@ -169,15 +263,16 @@ fn main() {
     println!("cargo:rerun-if-changed=src/unit.rs");
     println!("cargo:rerun-if-changed=src/families");
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    // UNCONDITIONALLY, including without `_cuda`. Generating the text costs a
-    // string walk over the rows and needs no CUDA at all, so gating it would
-    // buy nothing and would put a `#[cfg]` on the one file in the crate that
-    // cannot use the feature it would name -- a build script sees
-    // `CARGO_FEATURE_*` as environment, not as `cfg`. `src/lib.rs` includes
-    // the result only under the feature, which is where the decision belongs:
-    // the text is data, and only the module it calls into needs a GPU.
-    let text = emit::emit_rust_api(&emit::all_rows());
-    std::fs::write(out.join("api.rs"), text).expect("write api.rs");
+    // `emit::emit_rust_api(&emit::all_rows())` wrote `api.rs` here until north
+    // star §6 half A. What it walked was `unit::rows()` and NOT
+    // `table::ROW_TABLES` — the device row list, which every fn-world family
+    // still contributes to, because a unit's rows carry the instantiation
+    // strings NVRTC lowers. So the generator was never going to run dry on
+    // its own: the row list it read is the one the JIT needs.
+    //
+    // The three `rerun-if-changed` lines above stay. They are `carried`'s
+    // now — `device.rs`, `unit.rs` and `families/` are what decides the
+    // header set, and that is the half of this script that survives.
 
     carried::generate(&out);
 }

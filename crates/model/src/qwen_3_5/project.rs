@@ -115,10 +115,24 @@ pub fn manifest(f: &Qwen35HybridFacts) -> Manifest {
             "layer.{}.linear_attn.conv1d",
             [conv_dim, 1, u64::from(g.conv_kernel)],
         ))
-        .with(TensorSpec::required(
-            "layer.{}.linear_attn.conv1d.bias",
-            [conv_dim],
-        ))
+        // AND NO BIAS BESIDE IT. This declared `linear_attn.conv1d.bias` as
+        // `required`, and no Qwen3.5 or Qwen3.6 checkpoint has one:
+        // `modular_qwen3_next.py` builds the depthwise conv as
+        // `nn.Conv1d(..., bias=False, groups=self.conv_dim)`, and both
+        // mlx-community conversions on hand -- 27B and 35B-A3B -- publish
+        // `conv1d.weight` alone.
+        //
+        // `identify` therefore refused every real Qwen3.6 snapshot with
+        // "missing layer.{}.linear_attn.conv1d.bias", one tensor short of a
+        // match, and `device_checkpoint_names` read that correct refusal as a
+        // panic. `driver-cuda`'s bridge already knew -- "the 0.8B conv has no
+        // bias -- the null path" -- and answered `None` for the name instead
+        // of saying so here. Two places holding one fact, and the one that
+        // decides whether a checkpoint loads held the wrong half.
+        //
+        // Nothing reads it either way: `dsl::ConvW` is `name`, `kernel`,
+        // `layer`, with no bias to bind.
+
         // One decay parameter and one step bias per VALUE head — the
         // scan is per head, and this is the extent that says so.
         .with(TensorSpec::required(
@@ -167,8 +181,32 @@ pub fn manifest(f: &Qwen35HybridFacts) -> Manifest {
             // spec asks that it exist and says nothing about its
             // shape. This is the same rule that keeps an FP8 build
             // and a bf16 build on one row.
-            .with(TensorSpec::present("layer.{}.mlp.experts.0.gate_proj"))
-            .with(TensorSpec::present("layer.{}.mlp.experts.0.down_proj"))
+            //
+            // AND THE NAME IS A PACKING DECISION TOO, which this asked
+            // shape-agnostically while still insisting on one spelling.
+            // `.0.` is a per-expert publication -- HuggingFace's own
+            // qwen3-moe conversion writes one tensor per expert -- and
+            // mlx-community fuses the bank into a single
+            // `mlp.switch_mlp.gate_proj` at `[experts, out, in]` with no
+            // index anywhere. Both are this model.
+            //
+            // `shared/weight_names.rs` already held that fact and held it
+            // the right way round: `expert_gate` resolves
+            // `mlp.switch_mlp.gate_proj|experts.switch_glu.gate_proj|
+            // mlp.experts.gate_proj`, and its doc names `switch_mlp` as
+            // qwen3-moe's own convention -- first in the list. So the
+            // loader could read the fused bank and the manifest refused
+            // the checkpoint holding it: Qwen3.6-35B-A3B was reported as
+            // matching no model this build serves, on a machine where the
+            // rest of its tensors matched exactly.
+            .with(
+                TensorSpec::present("layer.{}.mlp.experts.0.gate_proj")
+                    .or_published_as([("layer.{}.mlp.switch_mlp.gate_proj", [0u64; 0])]),
+            )
+            .with(
+                TensorSpec::present("layer.{}.mlp.experts.0.down_proj")
+                    .or_published_as([("layer.{}.mlp.switch_mlp.down_proj", [0u64; 0])]),
+            )
             .either(
                 shared != 0,
                 "layer.{}.mlp.shared_expert.gate_proj",
@@ -541,6 +579,43 @@ mod tests {
             .expect("stated");
         assert_eq!(bank.presence, Presence::Required);
         assert!(bank.extents.is_empty(), "extents are a packing decision");
+    }
+
+    /// A checkpoint that fused the expert bank is still this row.
+    ///
+    /// The two publications this crate serves, both of them through
+    /// their own author: HuggingFace's qwen3-moe writes one tensor per
+    /// expert and `author_qwen3_5_moe` stacks them at load
+    /// (`hf_moe_expert_stacks`); mlx-community ships the bank already
+    /// stacked under `mlp.switch_mlp` and `author_qwen3_5_mlx` binds it
+    /// as-is. So a manifest naming only the first refuses half the
+    /// checkpoints the crate can load, and it did: Qwen3.6-35B-A3B on
+    /// disk was "matches no model this build serves".
+    ///
+    /// Built from the implied checkpoint with the two routed names
+    /// respelled, so this stays a test about the SPELLING rather than a
+    /// second hand-written tensor list that could drift from the row.
+    #[test]
+    fn a_fused_expert_bank_satisfies_the_mixture_row() {
+        let m = manifest(&mixture());
+        let implied = Observed::from_pairs(
+            m.tensors
+                .iter()
+                .filter(|t| t.presence != Presence::Absent)
+                .map(|t| {
+                    let n = t.name.replace("{}", "0");
+                    let n = match n.rsplit_once("mlp.experts.0.") {
+                        Some((head, tail)) => format!("{head}mlp.switch_mlp.{tail}"),
+                        None => n,
+                    };
+                    (n, t.extents.clone())
+                }),
+        );
+        assert!(
+            m.check(&implied).is_ok(),
+            "the fused bank is refused: {}",
+            m.check(&implied).unwrap_err()
+        );
     }
 
     /// Every projection satisfies the checkpoint it implies, which is

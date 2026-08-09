@@ -12,6 +12,25 @@
 //! attention_flashinfer_hd512.cu   template struct AttnHd<512>;
 //! ```
 //!
+//! **All four are now deleted.** This block is their record, and the reason
+//! they went without any of the three shim-entry mechanisms is that they never
+//! had a row to lose: `AttnHd<HD>` is a C++ class template, not a table
+//! symbol, so `abi::emit_c_shim` never wrote a `pie_k_*` for one and nothing
+//! in `crates/model/src` names either the type or a wrapper for it. They were
+//! reached only by nvcc being told to compile them.
+//!
+//! `kernels.def` itself STAYS. It is not a translation unit and it has two
+//! consumers that are not compilers: `csrc/src/kernels_manifest.hpp`'s
+//! `head_dim_instantiated()`, which is what keeps "96 is deliberately absent"
+//! a checkable claim rather than a remark, and [`HEAD_DIMS`] below. What was
+//! retired with the files is the two-way consistency check in
+//! `csrc/CMakeLists.txt` that made `kernels.def`'s list and the set of
+//! `attention_flashinfer_hd*.cu` on disk agree. That check could not simply be
+//! left: `kernels.def` still declares all four head dims and none of the four
+//! files exists, so its forward loop would stop configure with a `FATAL_ERROR`
+//! whose remedy -- "copy an existing stub" -- is now precisely the wrong
+//! advice. It was retired with its reasoning, not deleted.
+//!
 //! Each one existed to make nvcc run FlashInfer's host derivations ahead of
 //! time and emit every instantiation the run-time arms might select. That is
 //! what a lattice declaration is, and it is what this file is: the same
@@ -116,48 +135,110 @@
 //! 36 and not 4x4x4=64 because `KernelTraits::IsInvalid()` (`prefill.cuh:221`)
 //! prunes the rest; see [`prefill_unit!`] for the pruning, point by point.
 //!
-//! # What still has to go, and why it has not gone yet
+//! # What went, and what the list it went against was
 //!
-//! This file is north-star §5 step 8's device half. The host half —
-//! `driver-cuda/csrc/attn/attention_flashinfer.cu`'s six plan factories, two
-//! plan-cache lifetimes and four `switch (cache.head_dim)` dispatches, plus
-//! `plan_lifecycle.cpp` — is **not written**, and until it is, the driver
-//! still reaches those symbols by name. Deleting the archive first is a link
-//! failure across the whole driver rather than a compile error in one place,
-//! so the order is fixed: the Rust host program lands, then the build.
+//! This file is north-star §5 step 8's device half, and the host half is now
+//! written. `driver-cuda/csrc/attn/attention_flashinfer.cu` (1,258 lines) and
+//! `plan_lifecycle.cpp` (105) are **deleted**, along with the whole of
+//! `driver-cuda/csrc/`, which they were the last two files in. The measured
+//! census that permitted it: `__global__` 0, `__device__` 0, and one real
+//! `<<<>>>` — `attn_score_fold_heads` launching
+//! `device::attn_score_fold_heads`, which is ours, already rowed, and already
+//! fired from Rust by `driver-cuda/src/fire/attn_score.rs`. **The driver's
+//! `<<<>>>` census is zero for the first time since 401.**
 //!
-//! The hunks that go with it, named here so the deletion is a list and not a
-//! search. All in `crates/driver-cuda/build.rs`:
+//! Where the host half went:
+//!
+//! * `driver-cuda/src/fire/flashinfer_fa2.rs` — the two plan factories, the
+//!   static non-split decode short-circuit, the descriptor H2D and the two
+//!   `fire_*` entry points.
+//! * `.../fire/flashinfer_fa2_dispatch.rs` — the four `switch
+//!   (cache.head_dim)` dispatches, as symbol + grid + filled params.
+//! * `.../bind/service.rs` — the six `RUST_SERVED` rows' bodies, which is
+//!   where a module and a stream meet and the only place anything launches.
+//! * `.../bind/mod.rs` — `DecodePlan`/`PrefillPlan`, now owning boxed Rust
+//!   caches whose deleter is `Drop`.
+//!
+//! THE `build.rs` HUNKS, which this header named in advance so the deletion
+//! would be a list and not a search. All were taken, all in
+//! `crates/driver-cuda/build.rs`:
 //!
 //! * The `cc::Build` itself, `:672-743` — `fa2.cuda(true).std("c++17")`, the
 //!   include list, `-gencode arch=compute_89,code=sm_89`, `--extended-lambda`,
 //!   `--expt-relaxed-constexpr`, the `csrc/attn` directory scan, the
 //!   `attn_units > 0` assertion at `:738` and `fa2.compile(...)` at `:743`.
+//!   **Gone.** It was the last `.cuda(true)` in that script, so **nvcc is
+//!   zero as well**.
 //! * `DEP_PIE_KERNELS_CUDA_FLASHINFER` at `:664` and its CCCL sibling — the
 //!   two `expect`s that read the vendored trees out of the kernels crate's
-//!   metadata. Under NVRTC those trees reach a compile as carried headers and
-//!   nothing consumes the env vars.
+//!   metadata. **Gone.** Under NVRTC those trees reach a compile as carried
+//!   headers and nothing consumes the env vars.
 //! * **`println!("cargo:rustc-link-search=native=...")` and
 //!   `println!("cargo:rustc-link-lib=static=pie_attn_flashinfer")`, `:800-801`.**
-//!   Worth stating because the general rule points the other way:
-//!   `cc::Build::compile()` emits its own `rustc-link-lib` and leaves nothing
-//!   to delete. This build is one of the two exceptions — it calls
-//!   `.cargo_metadata(false)` at `:703` and hand-prints the pair — so both
-//!   lines are real deletions, and leaving them behind is a link error naming
-//!   a library nothing builds any more.
+//!   **Gone**, and worth having been listed, because the general rule points
+//!   the other way: `cc::Build::compile()` emits its own `rustc-link-lib` and
+//!   leaves nothing to delete. This build was one of the two exceptions — it
+//!   called `.cargo_metadata(false)` at `:703` and hand-printed the pair — so
+//!   both lines were real deletions, and leaving them behind would have been
+//!   a link error naming a library nothing builds any more.
 //! * The four-point "why nvcc and not NVRTC" comment block above the build.
-//!   **Delete it rather than defeat it.** Any of its reasons still true about
-//!   something else — FA3 and MLA are unprobed — gets repointed at that thing
-//!   by name, not left standing as a claim about FA2.
+//!   **Deleted rather than defeated.** Points 1, 3 and 4 were claims about
+//!   `attention_flashinfer.cu` in particular and die with it. Point 2's price
+//!   — §13.6's FlashInfer patch set plus the bit-exact intrinsics — is
+//!   repointed by name at **FA3, the SM90 Hopper prefill, whose headers are
+//!   CPM-only**: `csrc/vendor` has no `attention/hopper/` at all, so NVRTC
+//!   cannot see them and this port is not evidence that the next one is
+//!   cheap.
 //!
-//! And in the tree: `pie_x_make_decode_plan` and its siblings, the
-//! `dequant_kv_cache_layer_to_bf16_active` callers at
-//! `attention_flashinfer.cu:648`, `:675`, `:1098`, `:1244` (the last thing
-//! holding the archive census above zero), and a sweep of
-//! `model-compiler/src/dsl.rs`, `lower.rs::semantic()`, `crates/model/src` for
-//! **both** the symbol string and the DSL wrapper name — they are different
-//! tokens, and a sweep for one of them once reported a live symbol as
-//! uncalled.
+//!   **CORRECTION, and it was mine: that sentence said "FA3 **and MLA**", and
+//!   MLA does not belong in it.** The reason given covers FA3 only.
+//!   `csrc/vendor/flashinfer/attention/` carries `mla.cuh` (54 KB),
+//!   `mla_params.cuh`, `scheduler.cuh` (87 KB) and `fastdiv.cuh` — which is
+//!   every FlashInfer header `kernels-cuda/csrc/src/attn/attention_mla.cu`
+//!   includes, measured against its include list rather than assumed.
+//!   `table::attn`'s MLA block has always stated this correctly (*"THE HEADER
+//!   GATE: this row clears it"*); this file was the one that was wrong, and
+//!   at least one later pass inherited the error from here and had to
+//!   re-measure to find it. What actually blocks MLA is one level down and
+//!   nothing to do with headers: its FA2 arm passes an `MLAParams` BY VALUE,
+//!   which wants `ArgValue::Bytes`, which only `x::Abi` produces — the same
+//!   capability XQA's `KVCacheList` waits on.
+//!
+//!   The general lesson is worth more than the correction: a claim of the
+//!   form "X and Y are blocked, because <reason>" has to have the reason
+//!   checked against X and against Y SEPARATELY, because a shared verdict
+//!   hides an unshared cause and reads as evidence for both.
+//! * A fourth item the list did not have: `archive_src`, `jit_headers` and
+//!   `jit_shims`, the three locals a comment kept alive with *"because the
+//!   FA2 block below uses all three"*, plus the `jit_shims/cuda_fp16.h`
+//!   assertion that guarded a C++ TU this crate no longer has.
+//!
+//! And in the tree, all taken: the seven `pie_x_*` declarations in
+//! `bind/abi.rs` and their entry in `scripts/csrc-reachability-audit.py`'s
+//! `DIRECT_ROOTS`; the four `dequant_kv_cache_layer_to_bf16_active` callers
+//! at `attention_flashinfer.cu:648`, `:675`, `:1098`, `:1244`, which were the
+//! last thing holding the census above zero and are now four calls to
+//! `driver-cuda/src/fire/kv_paged.rs`'s Rust replacement; and the sweep of
+//! `model-compiler/src/dsl.rs`, `lower.rs::semantic()` and
+//! `crates/model/src` for **both** the symbol string and the DSL wrapper name
+//! — different tokens, and a sweep for one of them once reported a live
+//! symbol as uncalled. That sweep found all six rows live and none deleted:
+//! the rows stayed, only their language changed.
+//!
+//! # THE HAZARD THIS CLOSED
+//!
+//! `kernels-cuda-new/csrc/shim/cuda/cmath:245-280` records that this shim's
+//! `__fast_div_modulo` is `{u32 @0, u64 @8}` align 8 while **CCCL's** is
+//! `{u32, u32, u32, i32}` align 4 — so `paged_kv_t::num_heads` sat at **+24
+//! under the shim and +20 under CCCL**, with `sizeof` reconverging at 96
+//! under both. `fa2/params.rs`' mirror is pinned to the SHIM's layout, which
+//! is correct for every JIT fire; `attention_flashinfer.cu` compiled against
+//! real CCCL and filled the **+20** layout. Both were correct, and a params
+//! block filled on one side and read on the other is a silent wrong answer
+//! rather than a crash. It was safe only because neither read the other's.
+//! With the `cc::Build` gone there is one layout in the process and the
+//! question cannot be asked again — which is why 4 and 5 belonged in the same
+//! pass as the seams and not after them.
 
 use crate::unit::Unit;
 

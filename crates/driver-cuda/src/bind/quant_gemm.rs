@@ -834,43 +834,29 @@ unsafe fn dequant_then_bf16(
         // `(fp8_in, bf16_out, scale_dev, cols, group_size)`. The launcher's
         // `rows` became the rule's grid and its `scale_cols` is derived
         // device-side as `ceil(cols / group_size)`.
-        unsafe {
-            super::jit::fire(
-                "quant::dequant_fp8_e4m3_to_bf16_per_group",
-                Dims {
-                    rows: n.max(0) as u32,
-                    width: k.max(0) as u32,
-                    ..Dims::default()
-                },
-                &[
-                    ArgValue::Ptr(w_fp8.cast_mut()),
-                    ArgValue::Ptr(bf16_w),
-                    ArgValue::Ptr(w_scale_fp32_dev.cast_mut()),
-                    ArgValue::I32(k),
-                    ArgValue::I32(group_size),
-                ],
+        empty_or_panic("quant::dequant_fp8_e4m3_to_bf16_per_group", unsafe {
+            kernels_cuda_new::x::quant::dequant_fp8_e4m3_to_bf16_per_group(
+                w_fp8.cast(),
+                bf16_w.cast(),
+                w_scale_fp32_dev.cast(),
+                n,
+                k,
+                group_size,
                 fill_stream,
-            );
-        }
+            )
+        });
     } else if scale_kind == quant_kind::PER_CHANNEL {
         // `(fp8_in, bf16_out, scale_inv_dev, cols)` — `rows` is the grid.
-        unsafe {
-            super::jit::fire(
-                "quant::dequant_fp8_e4m3_to_bf16_per_channel",
-                Dims {
-                    rows: n.max(0) as u32,
-                    width: k.max(0) as u32,
-                    ..Dims::default()
-                },
-                &[
-                    ArgValue::Ptr(w_fp8.cast_mut()),
-                    ArgValue::Ptr(bf16_w),
-                    ArgValue::Ptr(w_scale_fp32_dev.cast_mut()),
-                    ArgValue::I32(k),
-                ],
+        empty_or_panic("quant::dequant_fp8_e4m3_to_bf16_per_channel", unsafe {
+            kernels_cuda_new::x::quant::dequant_fp8_e4m3_to_bf16_per_channel(
+                w_fp8.cast(),
+                bf16_w.cast(),
+                w_scale_fp32_dev.cast(),
+                n,
+                k,
                 fill_stream,
-            );
-        }
+            )
+        });
     } else {
         // PerTensor. The scale is a DEVICE scalar and the kernel takes it by
         // VALUE, so the host must read it back — one `cudaMemcpyAsync` and a
@@ -900,23 +886,21 @@ unsafe fn dequant_then_bf16(
         stream_synchronize(fill_stream);
         // `quant::dequant_fp8_e4m3_to_bf16`, `LaunchRule::Elementwise`:
         // `(fp8_in, bf16_out, scale, n)`.
-        unsafe {
-            super::jit::fire(
-                "quant::dequant_fp8_e4m3_to_bf16",
-                Dims {
-                    rows: 1,
-                    width: u32::try_from(weight_elems).unwrap_or(u32::MAX),
-                    ..Dims::default()
-                },
-                &[
-                    ArgValue::Ptr(w_fp8.cast_mut()),
-                    ArgValue::Ptr(bf16_w),
-                    ArgValue::F32(scale),
-                    ArgValue::Usize(weight_elems),
-                ],
+        // The scale crosses BY VALUE as an `f32`, which is the one thing the
+        // deleted row could not spell: `Ty::F32` with `Source::Param(0)` is
+        // ungenerable — `abi.rs:1119` turns a `Param` into an `i32` and
+        // `cast_for` adds no conversion — so this fire was ALWAYS the live
+        // path and the row's `ParamF32` operand was never reached. The host
+        // program takes an `f32` parameter and the question does not arise.
+        empty_or_panic("quant::dequant_fp8_e4m3_to_bf16", unsafe {
+            kernels_cuda_new::x::quant::dequant_fp8_e4m3_to_bf16(
+                w_fp8.cast(),
+                bf16_w.cast(),
+                scale,
+                weight_elems,
                 fill_stream,
-            );
-        }
+            )
+        });
     }
 
     if fill_stream != stream {
@@ -947,24 +931,16 @@ unsafe fn int8_dequant_then_bf16(
     let bf16_w = with_lt_ctx(|ctx| ctx.dequant.ensure(weight_elems * 2));
     // `quant::dequant_int8_to_bf16_per_channel` — a JIT row already, fired
     // through `unit_of` like the FP8 three.
-    unsafe {
-        super::jit::fire(
-            "quant::dequant_int8_to_bf16_per_channel",
-            Dims {
-                rows: n.max(0) as u32,
-                width: k.max(0) as u32,
-                ..Dims::default()
-            },
-            &[
-                ArgValue::Ptr(w_int8.cast_mut()),
-                ArgValue::Ptr(bf16_w),
-                ArgValue::Ptr(w_scale_inv.cast_mut()),
-                ArgValue::I32(k),
-                ArgValue::Usize(weight_elems),
-            ],
+    empty_or_panic("quant::dequant_int8_to_bf16_per_channel", unsafe {
+        kernels_cuda_new::x::quant::dequant_int8_to_bf16_per_channel(
+            w_int8.cast(),
+            bf16_w.cast(),
+            w_scale_inv.cast(),
+            n,
+            k,
             stream,
-        );
-    }
+        )
+    });
     unsafe { gemm_bf16(handle, act, bf16_w, y, m, n, k, beta) };
 }
 
@@ -1030,11 +1006,17 @@ unsafe fn blockwise_w8a8(
     // operand by another, and §10.5 refuses vocabulary grown for one kernel.
     // `fire/quant_int8.rs` states the rectangle beside the `<<<>>>` it came
     // from. This was `ffi::pie_k_quant_*` until `csrc/src/quant/` was deleted.
-    unsafe {
-        crate::fire::quant_int8::quantize_bf16_to_fp8_e4m3_per_token_group(
-            act, act_fp8, act_scale.cast(), m, k, 128, stream,
-        );
-    }
+    empty_or_panic("quant::quantize_bf16_to_fp8_e4m3_per_token_group", unsafe {
+        kernels_cuda_new::x::quant::quantize_bf16_to_fp8_e4m3_per_token_group(
+            act.cast(),
+            act_fp8.cast(),
+            act_scale.cast(),
+            m,
+            k,
+            128,
+            stream,
+        )
+    });
 
     let desc = LtMatmulDesc::new(
         lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -1388,16 +1370,16 @@ unsafe fn int8_w_bf16_act(
     // `quantize_bf16_to_int8_per_token` was a forwarder onto
     // `quantize_bf16_to_int8_per_channel` and this calls that row directly,
     // which is what `table/driver_internal.rs` prescribed for it.
-    unsafe {
-        crate::fire::quant_int8::quantize_bf16_to_int8_per_channel(
-            act_bf16,
+    empty_or_panic("quant::quantize_bf16_to_int8_per_channel", unsafe {
+        kernels_cuda_new::x::quant::quantize_bf16_to_int8_per_channel(
+            act_bf16.cast(),
             act_int8.cast(),
             act_scale.cast(),
             m,
             k,
             stream,
-        );
-    }
+        )
+    });
 
     // Stage 2: `cublasGemmEx` INT8. Same row-major-as-col-major
     // reinterpretation as the bf16 path:
@@ -1463,31 +1445,31 @@ unsafe fn int8_w_bf16_act(
     // residual-add — the same trick marlin used. For `beta == 0` dequant
     // straight into `y_bf16`.
     if beta == 0.0 {
-        unsafe {
-            crate::fire::quant_int8::dequant_int32_w8a8_to_bf16(
+        empty_or_panic("quant::dequant_int32_w8a8_to_bf16", unsafe {
+            kernels_cuda_new::x::quant::dequant_int32_w8a8_to_bf16(
                 acc_int32.cast(),
                 act_scale.cast(),
                 w_scale_inv.cast(),
-                y_bf16,
+                y_bf16.cast(),
                 m,
                 n,
                 stream,
-            );
-        }
+            )
+        });
     } else {
         let mn = (m as usize) * (n as usize);
         let dq_dst = with_lt_ctx(|ctx| ctx.dequant.ensure(mn * 2));
-        unsafe {
-            crate::fire::quant_int8::dequant_int32_w8a8_to_bf16(
+        empty_or_panic("quant::dequant_int32_w8a8_to_bf16", unsafe {
+            kernels_cuda_new::x::quant::dequant_int32_w8a8_to_bf16(
                 acc_int32.cast(),
                 act_scale.cast(),
                 w_scale_inv.cast(),
-                dq_dst,
+                dq_dst.cast(),
                 m,
                 n,
                 stream,
-            );
-        }
+            )
+        });
         // `norm::residual_add_bf16`, `LaunchRule::Elementwise`: `(y, x, n)`.
         // Fired through the JIT rather than through the shim entry for
         // `bind::service::gemm_act_x_wt_bias_bf16`'s reason — a `pie_k_*`
@@ -1657,27 +1639,53 @@ pub unsafe fn act_x_w(
         let bf16_w = with_lt_ctx(|ctx| ctx.dequant.ensure(weight_bf16_bytes));
         // `quant::dequant_mxfp4_to_bf16`, `LaunchRule::RouteRows`:
         // `(packed, block_scale, out, in_dim)` — `out_dim` is the grid.
-        unsafe {
-            super::jit::fire(
-                "quant::dequant_mxfp4_to_bf16",
-                Dims {
-                    rows: n.max(0) as u32,
-                    width: k.max(0) as u32,
-                    ..Dims::default()
-                },
-                &[
-                    ArgValue::Ptr(w.data.cast_mut()),
-                    ArgValue::Ptr(w.scale_data.cast_mut()),
-                    ArgValue::Ptr(bf16_w),
-                    ArgValue::I32(k),
-                ],
+        empty_or_panic("quant::dequant_mxfp4_to_bf16", unsafe {
+            kernels_cuda_new::x::quant::dequant_mxfp4_to_bf16(
+                w.data.cast(),
+                w.scale_data.cast(),
+                bf16_w.cast(),
+                n,
+                k,
                 stream,
-            );
-        }
+            )
+        });
         unsafe { gemm_bf16(handle, act, bf16_w, y, m, n, k, beta) };
         return;
     }
     unsupported("act_x_w", act_dtype, w.dtype, y_dtype);
+}
+
+/// An empty extent is a no-op; every other decline is a bug in this file.
+///
+/// Nine fires in this module reached `quant` through `super::jit::fire`,
+/// which returns `()` and swallows its own refusals: a mistyped operand list
+/// or a `Dims` that did not match the row was a silent no-launch. §5 step 5
+/// took `quant` into fn-world, so all nine are now direct calls to
+/// `kernels_cuda_new::x::quant`, and the outcome is a `#[must_use] Fired`
+/// with two arms that must not be collapsed:
+///
+///   * `Declined(Empty)` is the `.cu`'s own early return, moved into the host
+///     program unchanged — `dequant_fp8.cu`'s `if (rows == 0 || cols == 0)`,
+///     `quant_bf16_to_fp8.cu:71`, `:108` and `:128`. This router builds
+///     rectangles from a `WeightView` and a live `m`/`n`/`k`, so an empty one
+///     means the caller asked for nothing and getting nothing is right.
+///   * Anything else means a host program refused an argument this file
+///     built. `super::jit::fire` had no way to say that and this file has no
+///     way to handle it, so it aborts with the symbol.
+///
+/// Three of the nine changed shape and not just spelling. The two `Dims`
+/// fields these calls filled — `rows` and `width` — were the `LaunchRule`'s
+/// inputs, and the rules are gone: `route_rows`, `elementwise`, `rms` and the
+/// two literal geometries live in `x::quant` beside the `<<<>>>` each came
+/// from. So `n` and `k` are ordinary `i32` parameters now, passed in the
+/// kernel's own order, and a swap is a type error at the two places where the
+/// types differ rather than a transposed grid at run time.
+fn empty_or_panic(symbol: &str, fired: kernels_cuda_new::x::Fired) {
+    if let kernels_cuda_new::x::Fired::Declined(why) = fired
+        && !matches!(why, kernels_cuda_new::x::Refusal::Empty { .. })
+    {
+        panic!("{symbol} declined: {why:?}");
+    }
 }
 
 /// `cublasGetStream(handle, &stream)`.

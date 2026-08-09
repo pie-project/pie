@@ -46,7 +46,7 @@
 //! vector types WITHOUT `<vector_types.h>` was an open question when this file
 //! was written. So the second table instantiates them anyway, through rows the
 //! probe owns and nothing fires. They live here rather than in
-//! [`kernels_cuda_new::families::mlp`] because a `Unit` with rows in it is a
+//! [`kernels_cuda_new::x::mlp`] because a `Unit` with rows in it is a
 //! claim that the rows can be LAUNCHED, and these cannot.
 //! `LaunchRule::Unstated` is the honest spelling of that: the row has not said.
 //!
@@ -93,7 +93,7 @@ mod imp {
 
     /// The vectorised SwiGLU kernels, instantiated by nothing else.
     ///
-    /// Same root as `families::mlp::SWIGLU`, different rows: this is the
+    /// Same root as `x::mlp::swiglu::SWIGLU`, different rows: this is the
     /// unrowed half of the same file, and compiling it is how the `bf16x2`
     /// reinterpretation gets checked under NVRTC at all.
     const SWIGLU_UNROWED: Unit = Unit {
@@ -221,9 +221,9 @@ mod imp {
         println!("architecture:  {arch}");
         println!("headers:       {} carried\n", DEVICE_HEADERS.len());
 
-        let declared: Vec<&Unit> = kernels_cuda_new::families::mlp::UNITS
+        let declared: Vec<&Unit> = kernels_cuda_new::x::mlp::UNITS
             .iter()
-            .chain(kernels_cuda_new::families::sample::UNITS)
+            .chain(kernels_cuda_new::x::sample::UNITS)
             .collect();
 
         println!("the units these families declare");

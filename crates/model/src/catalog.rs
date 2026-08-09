@@ -176,11 +176,34 @@ impl LoadShape {
 pub struct MetalBinding {
     /// The affine quantisation group width the staged tensors carry.
     ///
-    /// Asked of the load rather than inferred from a tensor's shape,
-    /// because g64/b8 and g128/b4 pack to identical extents.
+    /// Asked of the load, which reads it off the TENSORS. This said it was
+    /// asked of the load "rather than inferred from a tensor's shape, because
+    /// g64/b8 and g128/b4 pack to identical extents", and they do not: for
+    /// 5760 columns those two are `scales` of 90 against 45 and packed
+    /// `weight` of 1440 `u32` against 720. Both extents distinguish them,
+    /// twice over, and `LoadPlan::affine_points` performs exactly those
+    /// divisions. What the load must not do is believe `config.json`, whose
+    /// block is a DEFAULT its per-tensor overrides may supersede for every
+    /// tensor in the file — `gpt-oss-20b-MXFP4-Q4` declares g32/b4 and holds
+    /// not one tensor at it.
     pub quant_group: u32,
     /// The affine quantisation bit width the staged tensors carry.
     pub quant_bits: u32,
+    /// The ROUTER GATE's own affine point, `(0, 0)` when it has none.
+    ///
+    /// `mlx_lm` publishes gpt-oss's gate at 8 bits inside a 4-bit stack,
+    /// deliberately: it is a tiny `[hidden, n_experts]` matrix whose error
+    /// the whole mixture inherits. Read at the stack's width the model stays
+    /// fluent and routes every token to almost the right experts — cosine
+    /// 0.84 against the reference logits, and not one NaN to notice it by.
+    ///
+    /// `(0, 0)` means "the same as [`Self::quant_group`]", which is every
+    /// other checkpoint and every non-MoE one. Asked of the load for the
+    /// reason [`Self::moe_mxfp4`] is: it is the CHECKPOINT's and not the
+    /// row's.
+    pub router_quant_group: u32,
+    /// The router gate's affine bit width; see [`Self::router_quant_group`].
+    pub router_quant_bits: u32,
     /// Whether the expert bank reached the device still in MXFP4.
     ///
     /// A fact about what the loader did — it transcodes to affine when

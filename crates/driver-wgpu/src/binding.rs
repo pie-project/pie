@@ -452,6 +452,15 @@ const SCALE_PREFIX: &str = "scale.";
 /// Why an operand could not become a bind-group entry.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Unbindable {
+    /// A seam value whose rectangle is larger than the stand-in buffer.
+    PastSeam {
+        /// The value the plan named.
+        value: ValueId,
+        /// Bytes its rectangle covers.
+        extent: u64,
+        /// Bytes the stand-in holds.
+        seam: u64,
+    },
     /// An arena operand's rectangle runs past the arena the plan sized.
     ///
     /// Never seen in a real lowering -- and the tightest real operand ends
@@ -515,6 +524,14 @@ pub enum Unbindable {
 impl std::fmt::Display for Unbindable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PastSeam {
+                value,
+                extent,
+                seam,
+            } => write!(
+                f,
+                "seam value {value:?} covers {extent} bytes and the stand-in holds {seam}"
+            ),
             Self::PastArena { at, extent, arena } => {
                 write!(f, "{extent} bytes at {at} runs off an arena of {arena}")
             }
@@ -542,9 +559,9 @@ impl std::error::Error for Unbindable {}
 
 /// How many bytes one operand of this launch covers.
 ///
-/// `None` for the operand kinds whose extent is not the plan's to state: a
-/// weight is as big as its tensor and a seam value is as big as the backend
-/// made it, and in both cases the resolver's buffer already says so.
+/// `None` only for a WEIGHT, whose extent is its tensor's and which the plan
+/// does not carry. Everything else states a rectangle and an element width,
+/// so everything else can be measured.
 #[must_use]
 pub fn extent(arg: &Arg, launch: &Launch) -> Option<u64> {
     match arg {
@@ -557,7 +574,19 @@ pub fn extent(arg: &Arg, launch: &Launch) -> Option<u64> {
                     .saturating_mul(u64::from(*bytes)),
             )
         }
-        Arg::Named { .. } | Arg::Weight(_) => None,
+        // A seam value states the same three things an arena operand does --
+        // rows from the launch, `width`, and `bytes` -- so it is measured the
+        // same way. It answered `None` here until `Arg::Named` carried
+        // `bytes`, which is what let a seam value bind a whole buffer without
+        // anyone asking whether the rectangle fit in it.
+        Arg::Named { width, bytes, .. } => {
+            let rows = u64::from(launch.rows.end - launch.rows.start);
+            Some(
+                rows.saturating_mul(u64::from(*width))
+                    .saturating_mul(u64::from(*bytes)),
+            )
+        }
+        Arg::Weight(_) => None,
     }
 }
 
@@ -595,10 +624,35 @@ pub fn resolve<'a, R: Resolve>(
             }
             Bound::within(arena.buffer, at64, extent, min_offset).map_err(Unbindable::Unaddressable)
         }
-        Arg::Named { value, .. } => resolver
-            .named(*value)
-            .map(Bound::whole)
-            .ok_or(Unbindable::UnknownNamed(*value)),
+        Arg::Named { value, .. } => {
+            let held = resolver
+                .named(*value)
+                .ok_or(Unbindable::UnknownNamed(*value))?;
+            // THE STAND-IN IS A SIZE, AND IT WAS NEVER CHECKED.
+            //
+            // `Deployment::seam` is documented as "the stand-in buffer's size,
+            // which bounds the largest scalar block a fire can stage" -- a
+            // bound nothing enforced. `Bound::whole` binds the buffer however
+            // small it is, and WGSL bounds-checks every access against the
+            // BOUND range, so a rectangle larger than the seam reads ZEROS
+            // past the end. That is the same silent answer `Source::OutWidth`
+            // produced, arriving by a different door: a plausible tensor, a
+            // fire that succeeds, and a model that says something.
+            //
+            // The seam is 4 MiB by default and the values that ride it are
+            // small, so this refuses nothing the engine builds today. It is
+            // the deployment knob a caller may lower.
+            if let Some(extent) = extent(arg, launch) {
+                if extent > held.size() {
+                    return Err(Unbindable::PastSeam {
+                        value: *value,
+                        extent,
+                        seam: held.size(),
+                    });
+                }
+            }
+            Ok(Bound::whole(held))
+        }
         Arg::Weight(name) => {
             if let Some(rest) = name.strip_prefix(SCALE_PREFIX) {
                 return Err(Unbindable::Constant(rest.to_owned()));
@@ -917,7 +971,68 @@ pub fn reorder<'a, R: Resolve>(
             // buffer at whatever slot the row placed it, and `scalars` decides
             // where that is.
             kernels::Source::Unbound => Ok(Slot::Nothing),
-            _ => Ok(Slot::Params),
+            // EVERY remaining source, spelled out, and the reason is a defect
+            // this file has already made once. `_ => Ok(Slot::Params)` sent
+            // anything unrecognised to the parameter buffer -- a scalar the
+            // TEXT states -- and a source that means a fact about the FIRE
+            // then arrives as whatever the text happened to put there.
+            // `Source::OutWidth` did exactly that at the sister site in
+            // `scalars`, where a `_ => {}` produced a silent zero: a width of
+            // zero is a grid of nothing, and the dispatch returned success
+            // over untouched memory.
+            //
+            // The `LaunchRule` match in `geometry.rs` is enumerated for the
+            // same reason and says so; this one now is too, so a variant added
+            // to `Source` tomorrow stops this build instead of being read as a
+            // parameter. That property is NOT free elsewhere:
+            // `driver-vulkan/src/binding.rs:683` catches all and answers
+            // `None`, so a new source lands there silently.
+            kernels::Source::WeightNamed
+            | kernels::Source::WeightNamed2
+            | kernels::Source::WeightSuffix(_)
+            | kernels::Source::Param(_)
+            | kernels::Source::ParamF32(_)
+            | kernels::Source::KvHeadStride
+            | kernels::Source::KvSeqStride
+            | kernels::Source::KvPageSize
+            | kernels::Source::KvLayerView
+            | kernels::Source::KvLayerField(_)
+            | kernels::Source::RequestCount
+            | kernels::Source::Rows
+            | kernels::Source::ResultOrRegion(_)
+            | kernels::Source::Aux(_)
+            | kernels::Source::OutRows(_)
+            | kernels::Source::InRows(_)
+            | kernels::Source::OutWidth(_)
+            | kernels::Source::InWidth(_)
+            | kernels::Source::OutElements(_)
+            | kernels::Source::InElements(_)
+            | kernels::Source::InDim(_, _)
+            | kernels::Source::OutDim(_, _)
+            | kernels::Source::Attn(_)
+            | kernels::Source::AttnWindow
+            | kernels::Source::AttnPlan(_)
+            | kernels::Source::AttnNonZero(_)
+            | kernels::Source::Gdn(_)
+            | kernels::Source::GdnSlab(_)
+            | kernels::Source::CtxByLayer(_)
+            | kernels::Source::Ctx(_)
+            | kernels::Source::CtxNonZero(_)
+            | kernels::Source::RoutesOfParam(_)
+            | kernels::Source::Lit(_)
+            | kernels::Source::Width(_)
+            | kernels::Source::Mul(_, _)
+            | kernels::Source::Sub(_, _)
+            | kernels::Source::Div(_, _)
+            | kernels::Source::Isqrt(_)
+            | kernels::Source::Ne(_, _)
+            | kernels::Source::Or(_, _)
+            | kernels::Source::IfPresent(_, _, _)
+            | kernels::Source::PerHeadDim
+            | kernels::Source::NamedScale
+            | kernels::Source::RotaryWidth
+            | kernels::Source::LayerScale
+            | kernels::Source::Beta => Ok(Slot::Params),
         };
         slots.push(got.map_err(|e| (slot, e))?);
     }
@@ -1036,6 +1151,39 @@ pub enum Misplaced {
         /// so it cannot be carried whole in a type that is.
         source: String,
     },
+    /// The row addresses the KV cache CONTIGUOUSLY, and this driver's pool is
+    /// paged.
+    ///
+    /// [`kernels::Source::KvHeadStride`] and [`kernels::Source::KvSeqStride`]
+    /// appear on exactly the rows that walk the cache with two strides and no
+    /// page table -- `kv_append`, `sdpa_vector_decode`, `sdpa_vector_decode_
+    /// swa`. `attn/kv_write.wgsl` shows the pair side by side: the paged
+    /// writer takes `page_size` and `n_kv_heads`, the contiguous one takes the
+    /// strides and computes `h * head_stride + pos * seq_stride + d`.
+    ///
+    /// `resources::Shape` allocates `[page, token, head, dim]` for every fire
+    /// this driver runs, so that expression is right only while the fire's
+    /// pages happen to be physically consecutive from zero -- true of one
+    /// freshly-allocated sequence and false of the second one. It reads real
+    /// memory at every step and attends to the WRONG TOKENS: nothing faults,
+    /// nothing is out of bounds, and the text stays fluent.
+    ///
+    /// `crates/model` reached the same conclusion from the other side and
+    /// stopped emitting these rows (*"no contiguous attention over a paged
+    /// pool"*). This is the same fact said where it is a fact -- the pool's
+    /// layout is the DRIVER's, and a text is not the last thing that can be
+    /// wrong about it.
+    ///
+    /// The refusal is blanket rather than conditional on the translation being
+    /// the identity. A driver that served these rows *sometimes* would be
+    /// correct on the first request of a fresh cache and wrong afterwards,
+    /// which is the worst way to be wrong.
+    Contiguous {
+        /// Which operand of the row, counting from zero.
+        at: usize,
+        /// The operand's name, as the row spells it.
+        name: &'static str,
+    },
 }
 
 impl core::fmt::Display for Misplaced {
@@ -1054,6 +1202,12 @@ impl core::fmt::Display for Misplaced {
                 f,
                 "operand {at} (`{name}`) is sourced from {source}, which this \
                  driver does not know how to work out"
+            ),
+            Self::Contiguous { at, name } => write!(
+                f,
+                "operand {at} (`{name}`) is a contiguous KV stride, and this \
+                 driver's pool is paged: the row would read real memory at \
+                 the wrong tokens"
             ),
         }
     }
@@ -1178,10 +1332,22 @@ pub fn scalars<R: Resolve>(
             );
             continue;
         }
+        // The two contiguous strides are refused rather than answered. The
+        // pool is `[page, token, head, dim]`, so `Shape::number` CAN produce a
+        // head stride and a sequence stride for it -- and handing them to a
+        // kernel that walks the cache without a page table is what makes the
+        // launch succeed against the wrong tokens. See `Misplaced::Contiguous`.
+        if matches!(
+            operand.source,
+            kernels::Source::KvHeadStride | kernels::Source::KvSeqStride
+        ) {
+            return Err(Misplaced::Contiguous {
+                at,
+                name: operand.name,
+            });
+        }
         let number = match operand.source {
             kernels::Source::KvPageSize => Some(FireNumber::KvPageSize),
-            kernels::Source::KvHeadStride => Some(FireNumber::KvHeadStride),
-            kernels::Source::KvSeqStride => Some(FireNumber::KvSeqStride),
             _ => None,
         };
         if let Some(want) = number {
@@ -1498,6 +1664,20 @@ mod tests {
         }
     }
 
+    /// A seam value of the stated element width, at value id zero.
+    fn seam(width: u32, bytes: u32) -> Arg {
+        named(0, width, bytes)
+    }
+
+    /// A seam value, by id.
+    fn named(value: u32, width: u32, bytes: u32) -> Arg {
+        Arg::Named {
+            value,
+            width,
+            bytes,
+        }
+    }
+
     #[test]
     fn an_arena_operands_extent_is_its_rectangle_and_not_one_row() {
         let arg = Arg::Arena {
@@ -1511,12 +1691,87 @@ mod tests {
         assert_eq!(extent(&arg, &launch(64, 1)), Some(64 * 256));
     }
 
+    /// A weight has no rectangle; a SEAM VALUE has one, and states it.
+    ///
+    /// This asserted that neither did, and the seam half was wrong. A weight
+    /// genuinely has none -- its extent is the tensor's, which the plan does
+    /// not carry -- but `Arg::Named` states the same three things
+    /// `Arg::Arena` does. Answering `None` there is what let a seam value
+    /// bind a stand-in buffer without anyone asking whether the rectangle
+    /// fits in it, and WGSL bounds-checking then reads ZEROS past the end.
+    ///
+    /// The four-byte case is asserted because it is the one a driver has
+    /// MEASURED, and because it is the case a plausible shortcut gets wrong.
+    /// `Arg::Named` carried no `bytes` until this change, so the obvious
+    /// reading was "two, like every activation" -- and `driver-vulkan`
+    /// records the real one as a four-row gather over a one-entry `u32`
+    /// table, *"a sixteen-byte read of a four-byte buffer"*. A two-byte
+    /// assumption calls that rectangle eight bytes, fits it in four, and
+    /// reports nothing.
     #[test]
-    fn a_weight_and_a_seam_value_do_not_get_their_extent_from_the_plan() {
+    fn a_weight_has_no_rectangle_and_a_seam_value_does() {
         assert_eq!(extent(&Arg::Weight("w".into()), &launch(1, 1)), None);
         assert_eq!(
-            extent(&Arg::Named { value: 0, width: 8 }, &launch(1, 1)),
-            None
+            extent(&seam(8, 2), &launch(1, 1)),
+            Some(16),
+            "one row of eight bf16 elements"
+        );
+        assert_eq!(
+            extent(&seam(8, 2), &launch(64, 1)),
+            Some(64 * 16),
+            "the rows are the launch's, as for an arena operand"
+        );
+        assert_eq!(
+            extent(&seam(1, 4), &launch(4, 1)),
+            Some(16),
+            "the vulkan case: four u32 rows are sixteen bytes, not eight"
+        );
+    }
+
+    /// A seam value larger than the stand-in is refused, not bound short.
+    ///
+    /// `Deployment::seam` is documented as "the stand-in buffer's size, which
+    /// bounds the largest scalar block a fire can stage" -- and nothing
+    /// enforced the bound. `Bound::whole` binds the buffer however small it
+    /// is, and a rectangle past its end reads zeros: a plausible tensor, a
+    /// fire that succeeds, and a model that says something.
+    ///
+    /// The control is the first assertion: a value that FITS still binds
+    /// whole, so this is about the size and not about the path.
+    #[test]
+    fn a_seam_value_larger_than_the_stand_in_is_refused() {
+        let stand_in = buffer(256);
+        let store = Store {
+            named: [(0u32, stand_in)].into_iter().collect(),
+            ..Store::default()
+        };
+        let arena_buf = buffer(1 << 20);
+        let arena = Arena {
+            buffer: &arena_buf,
+            bytes: 1 << 20,
+        };
+        // 8 elements x 2 bytes x 16 rows = 256, exactly what the stand-in
+        // holds.
+        let fits = seam(8, 2);
+        assert!(
+            resolve(&fits, &launch(16, 1), arena, &store, 1).is_ok(),
+            "a rectangle the stand-in holds must still bind whole"
+        );
+        // One row more is one row past it.
+        let over = resolve(&fits, &launch(17, 1), arena, &store, 1)
+            .expect_err("a rectangle past the stand-in is not bound short");
+        assert!(
+            matches!(over, Unbindable::PastSeam { .. }),
+            "the refusal names the seam: {over:?}"
+        );
+        // And the width is READ, not assumed: the same rectangle in four-byte
+        // elements is twice the bytes and does not fit. This is the assertion
+        // that fails if `extent` goes back to multiplying by two.
+        let wide = resolve(&seam(8, 4), &launch(16, 1), arena, &store, 1)
+            .expect_err("four-byte elements are twice the bytes");
+        assert!(
+            matches!(wide, Unbindable::PastSeam { .. }),
+            "the element width is read from the plan: {wide:?}"
         );
     }
 
@@ -1655,14 +1910,7 @@ mod tests {
         // tensor's own size is the right answer.
         assert_eq!((w.offset(), w.len()), (0, 4096));
 
-        let n = resolve(
-            &Arg::Named { value: 7, width: 8 },
-            &launch(1, 1),
-            arena,
-            &store,
-            256,
-        )
-        .expect("bound");
+        let n = resolve(&named(7, 8, 2), &launch(1, 1), arena, &store, 256).expect("bound");
         assert_eq!((n.offset(), n.len()), (0, 64));
     }
 
@@ -1686,14 +1934,7 @@ mod tests {
             Unbindable::UnknownWeight("layer.3.q_proj".into())
         );
         assert_eq!(
-            resolve(
-                &Arg::Named { value: 7, width: 8 },
-                &launch(1, 1),
-                arena,
-                &store,
-                256
-            )
-            .expect_err("not bound"),
+            resolve(&named(7, 8, 2), &launch(1, 1), arena, &store, 256).expect_err("not bound"),
             Unbindable::UnknownNamed(7)
         );
     }
@@ -1913,6 +2154,58 @@ mod tests {
         );
     }
 
+    /// A contiguous-cache row is refused; the paged one beside it is not.
+    ///
+    /// `attn/kv_write.wgsl` holds both writers. The paged entry point takes
+    /// `page_size` and `n_kv_heads` and walks a page table; the contiguous one
+    /// takes `k_head_stride`/`k_seq_stride` and computes `h * head_stride +
+    /// pos * seq_stride + d`. `resources::Shape` allocates `[page, token,
+    /// head, dim]` for every fire, so `Shape::number` CAN produce both strides
+    /// -- and a launch given them reads real memory at the wrong tokens the
+    /// moment a sequence's pages are not consecutive from zero. Nothing
+    /// faults, nothing is out of bounds, and the text stays fluent.
+    ///
+    /// `crates/model` stopped emitting these rows (*"no contiguous attention
+    /// over a paged pool"*), which guards the texts that exist. This is the
+    /// driver saying it too, because the pool's layout is the driver's fact.
+    ///
+    /// The paged writer is the control: it is the SAME shader file and the
+    /// same kind of row, so a refusal that fired on the file, on `Source::
+    /// KvPageSize`, or on scalars generally would fail here.
+    #[test]
+    fn the_contiguous_kv_writer_is_refused_and_the_paged_one_is_not() {
+        let store = Store::default();
+        let placed = |name: &str| {
+            let sig = kernels::sig_in(kernels_wgpu::KERNELS, name).expect("stated");
+            let fields = kernels_wgpu::uniform_layout(sig);
+            let offsets: Vec<u32> = fields.iter().map(|f| f.offset).collect();
+            let low = with_params((0..fields.len() as u32).map(|n| n + 1).collect());
+            scalars(
+                sig,
+                &low,
+                &scalar_launch(fields.len() as u32),
+                &declared(&offsets, &[None; 4]),
+                &store,
+            )
+        };
+        assert!(
+            placed("kv_append_paged").is_ok(),
+            "the paged writer still places its scalars"
+        );
+        let why = placed("kv_append").expect_err("the contiguous writer is refused");
+        assert!(
+            matches!(
+                why,
+                Misplaced::Contiguous {
+                    name: "k_head_stride",
+                    ..
+                }
+            ),
+            "the refusal names the operand: {why}"
+        );
+        assert!(format!("{why}").contains("paged"), "and says why: {why}");
+    }
+
     /// A row that names a `Buf` param says where its struct goes; the module
     /// is not consulted.
     ///
@@ -1950,9 +2243,15 @@ mod tests {
     }
 
     /// A row's scalar operands ride the uniform block, and take no entry.
+    ///
+    /// The specimen is `kv_append_paged` and used to be `kv_append`, which is
+    /// now refused outright: its scalars are the contiguous strides, and this
+    /// driver's pool is paged. The paged writer has three scalars of its own
+    /// (`head_dim`, `page_size`, `n_kv_heads`), so it asks the same question
+    /// about a row this driver can actually serve.
     #[test]
     fn a_rows_scalar_operands_are_placed_in_the_uniform_block() {
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append").expect("stated");
+        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append_paged").expect("stated");
         let fields = kernels_wgpu::uniform_layout(sig);
         assert!(
             !fields.is_empty(),
@@ -2199,6 +2498,17 @@ mod tests {
     /// operand per input and output, one weight per weight -- because the
     /// derived sources are answered from the launch's args, so a plan that did
     /// not match the row would make the sweep pass for the wrong reason.
+    ///
+    /// # What it cannot catch, and what does
+    ///
+    /// It walks the sources STATED ROWS NAME. A variant added to
+    /// `kernels::Source` that no row uses yet is invisible to it -- and the
+    /// day a row does use it, this test would be finding out at the same
+    /// moment a fire does. The guard for that is the COMPILER: `slot_of`
+    /// enumerates every variant of `Source` individually, so a new one stops
+    /// this build. That is deliberate and it is not free elsewhere;
+    /// `driver-vulkan/src/binding.rs` catches all and answers `None`, so a new
+    /// source lands there silently.
     #[test]
     fn every_source_a_stated_row_names_is_one_this_driver_can_work_out() {
         let mut checked = 0;

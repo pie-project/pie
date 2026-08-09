@@ -683,7 +683,6 @@ fn qwen3_5(w: &mut Wiring<'_>) {
                 );
             }
             w.alias(format!("layer.{i}.conv"), n("linear_attn.conv1d.weight"));
-            w.alias(format!("layer.{i}.conv_bias"), n("linear_attn.conv1d.bias"));
             w.alias(format!("layer.{i}.a_log"), n("linear_attn.A_log"));
             w.alias(format!("layer.{i}.dt_bias"), n("linear_attn.dt_bias"));
             w.alias(format!("layer.{i}.gate_norm"), n("linear_attn.norm.weight"));

@@ -493,6 +493,64 @@ fn build_lowering(
     // buffer instead of losing its graph. See `o_off` at the fire site.
 
     let dplan = DispatchPlan::new(&plan, &lowered);
+    // ── THE LOAD-TIME REFUSAL ────────────────────────────────────────
+    //
+    // `.wiki/kernel-x/northstar.md` §5 step 4: *"unknown symbols now refuse
+    // at load"*, and §0's rule that this serves — *"every refusal the system
+    // can make is made at model load; a fire is a straight line."*
+    //
+    // Two classes reach `unfireable`, both knowable from the symbol table
+    // before a single operand is bound:
+    //
+    // * `Refusal::Undeclared` — no contract and no row declares the symbol.
+    // * `Refusal::Unstated` — fn-world declares it and NO bind can fire it,
+    //   ever. The sentence is the one its row carried as prose beside an
+    //   unsourced operand; here it is the diagnostic.
+    //
+    // # Why this refuses in BOTH guard modes, which is not obvious
+    //
+    // The tempting caution is to refuse under `Resolve` and merely report
+    // under `Union`, on the grounds that a union lowering carries arms this
+    // fire will not take. It does not hold, and the reason is in the LoRA
+    // arm's own comment below: *"under `Union` every arm lowers and the
+    // conditional decides at replay, so the arm has to be ISSUABLE with its
+    // predicate false"*. Issuable means dispatched during capture. So an
+    // unfireable symbol fails under `Union` at capture exactly as it fails
+    // under `Resolve` at the fire — there is no mode in which one loads and
+    // runs today.
+    //
+    // Moving the failure here therefore costs no working model. What it buys
+    // is the difference between a token-time `NoArm` naming a kernel and a
+    // load-time refusal naming the kernel, the reason and the family.
+    //
+    // # What this does NOT catch
+    //
+    // A `Route::Rows` symbol whose generated arm does not exist — see
+    // `DispatchPlan::unfireable`. That gap is the row world's and closes
+    // with it.
+    let unfireable = dplan.unfireable();
+    if !unfireable.is_empty() {
+        for u in unfireable {
+            eprintln!("[driver-cuda] {}: cannot fire {u}", plan.family);
+        }
+        sg_trace(|| {
+            format!(
+                "refused at load: {} unfireable symbol(s): {}",
+                unfireable.len(),
+                unfireable
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        return Err(PIE_STATUS_UNSUPPORTED);
+    }
+    // How much of this model still fires through the row world — §5 step 5's
+    // progress, counted over what a real deployment actually states rather
+    // than over a census of files.
+    let (rows_left, total) = dplan.sweep_progress();
+    sg_trace(|| format!("routes: {rows_left}/{total} still row-world"));
     sg_trace(|| format!("built: launches={} union={union}", lowered.launches.len()));
     Ok(LoweredFire {
         plan,

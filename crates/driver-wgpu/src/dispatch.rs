@@ -145,6 +145,16 @@ pub enum Undispatchable {
         /// The `kernels::Source` variant, rendered.
         source: String,
     },
+    /// The row walks the KV cache with strides and no page table, and this
+    /// driver's pool is paged. See [`crate::binding::Misplaced::Contiguous`].
+    Contiguous {
+        /// The symbol whose row named it.
+        symbol: String,
+        /// Which operand, counting from zero.
+        at: usize,
+        /// The operand's name, as the row spells it.
+        name: &'static str,
+    },
     /// The rule and dims do not describe a grid.
     Ungeometric {
         /// Why.
@@ -207,6 +217,12 @@ impl std::fmt::Display for Undispatchable {
                 f,
                 "`{symbol}` operand {at} (`{name}`) is sourced from {source}, \
                  which this driver does not know how to work out"
+            ),
+            Self::Contiguous { symbol, at, name } => write!(
+                f,
+                "`{symbol}` operand {at} (`{name}`) is a contiguous KV stride, \
+                 and this driver's pool is paged: the row would read real \
+                 memory at the wrong tokens"
             ),
             Self::Conditional { symbol, cond } => {
                 write!(f, "`{symbol}` sits under unevaluated guard {cond}")
@@ -286,7 +302,14 @@ pub fn dims_of(sig: &KernelSig, lowered: &Lowered, launch: &Launch, fire: Geomet
     let width = widths(lowered, launch).next_back().unwrap_or(0);
     let extent = stated(lowered, launch, sig.grid_param);
     Dims {
-        rows: launch.rows.end - launch.rows.start,
+        // The ROW COUNT the statement's own rectangle has, when the fire's row
+        // window is not it. A mixture's sorted stack is one row per ROUTE, and
+        // there are `tokens * experts_per_token` of those, so `route_gather`
+        // states its rows as a param -- and given the fire's count instead it
+        // gathers a quarter of its own output at `top_k = 4` and leaves the
+        // rest whatever the arena held. See `kernels::KernelSig::rows_param`.
+        rows: stated(lowered, launch, sig.rows_param)
+            .unwrap_or(launch.rows.end - launch.rows.start),
         width,
         // The FIRST widthed operand, which is the first input. What sizes a
         // statement that reads one packed buffer and writes several, since
@@ -434,6 +457,11 @@ pub fn plan_one<'a, R: Resolve>(
             at,
             name,
             source,
+        },
+        crate::binding::Misplaced::Contiguous { at, name } => Undispatchable::Contiguous {
+            symbol: symbol.to_owned(),
+            at,
+            name,
         },
     })?;
 
@@ -617,6 +645,7 @@ mod tests {
         grid_param: None,
         head_param: None,
         heads_param: None,
+        rows_param: None,
         lowered_as: None,
         publishes_aux: &[],
     }];
@@ -1118,8 +1147,44 @@ mod tests {
 
         refused.sort();
         refused.dedup();
+        // The six that are refused ON PURPOSE, enumerated rather than filtered
+        // by their message: they are the entrypoints of the three rows that
+        // walk the KV cache with two strides and no page table, and this
+        // driver's pool is `[page, token, head, dim]`. Handing them a head
+        // stride and a sequence stride makes the launch SUCCEED against the
+        // wrong tokens -- real memory, no fault, fluent text. See
+        // `binding::Misplaced::Contiguous`.
+        //
+        // Listed by name so that a fourth row growing the same dependency is a
+        // failure here rather than a silent addition to a filter, and so that
+        // a refusal escaping to any OTHER row is one too.
+        let contiguous = [
+            "kv_append_bfloat16",
+            "sdpa_vector_decode_bfloat16_d_64",
+            "sdpa_vector_decode_bfloat16_d_128",
+            "sdpa_vector_decode_bfloat16_d_256",
+            "sdpa_vector_decode_swa_bfloat16_d_256",
+            "sdpa_vector_decode_swa_bfloat16_d_512",
+        ];
+        let (paged, contiguous_refusals): (Vec<String>, Vec<String>) = refused
+            .into_iter()
+            .partition(|r| !contiguous.iter().any(|c| r.contains(c)));
+        assert_eq!(
+            contiguous_refusals.len(),
+            contiguous.len(),
+            "every contiguous entrypoint is refused, and only those:\n  {}",
+            contiguous_refusals.join("\n  ")
+        );
+        assert!(
+            contiguous_refusals
+                .iter()
+                .all(|r| r.contains("this driver's pool is paged")),
+            "the refusal says WHY:\n  {}",
+            contiguous_refusals.join("\n  ")
+        );
+        let refused = paged;
         // EMPTY, and that is the result rather than the setup. Every one of the
-        // 189 plans: the row's operand order, the module's binding count, the
+        // 183 plans: the row's operand order, the module's binding count, the
         // uniform block's member count and the launch rule's grid all agree,
         // computed from two places that never consult each other -- the table
         // in `kernels-wgpu/src/*.rs` and the WGSL in `kernels-wgpu/kernels/`.
@@ -1138,8 +1203,9 @@ mod tests {
             refused.join("\n  ")
         );
         assert_eq!(
-            planned, 189,
-            "44 rows over 189 entrypoints state operands, and all of them plan"
+            planned, 183,
+            "44 rows over 189 entrypoints state operands; 183 plan and the six \
+             contiguous-cache ones are refused above"
         );
     }
 

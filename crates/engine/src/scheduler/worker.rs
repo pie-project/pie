@@ -1004,6 +1004,48 @@ enum LaneCommit {
     },
 }
 
+/// What a lane request still owes its caller: one reply, on one token.
+///
+/// Read off the request BEFORE it is served, because the reason it exists is
+/// the case where serving it does not return -- a panic on the lane thread.
+/// The scheduler's launch and control slots are keyed by token and waited on
+/// with no timeout, so a token that is never answered is a request that never
+/// ends.
+enum Owed {
+    Launch(u64),
+    Control(u64),
+    /// Shutdown answers on its own channel, and a lane that panicked answers it
+    /// in [`DriverLane::drain_poisoned`] instead.
+    Nothing,
+}
+
+impl Owed {
+    fn of(request: &LaneRequest) -> Owed {
+        match request {
+            LaneRequest::Launch { token, .. } => Owed::Launch(*token),
+            LaneRequest::Control { token, .. } => Owed::Control(*token),
+            LaneRequest::Shutdown { .. } => Owed::Nothing,
+        }
+    }
+
+    fn answer(self, reply_tx: &crossbeam::channel::Sender<SchedulerItem>, why: &str) {
+        let reply = match self {
+            Owed::Launch(token) => LaneReply::LaunchDone {
+                token,
+                result: Err(why.to_string()),
+            },
+            Owed::Control(token) => LaneReply::ControlDone {
+                token,
+                commit: LaneCommit::AsyncControl {
+                    result: Err(why.to_string()),
+                },
+            },
+            Owed::Nothing => return,
+        };
+        let _ = reply_tx.send(SchedulerItem::Lane(reply));
+    }
+}
+
 /// Which response shape a successful bind commits to.
 enum BindRespond {
     Bind(tokio::sync::oneshot::Sender<Result<BoundInstance>>),
@@ -1158,24 +1200,36 @@ impl DriverLane {
                 charge: lane_was_work,
                 prefill: lane_was_prefill,
             };
-            match request {
-                LaneRequest::Launch {
-                    token, submission, ..
-                } => {
-                    let LaneLaunch(submission) = submission;
-                    // Folded admission (ABI v14): EXHAUSTED retries in place —
-                    // the lane is FIFO, so retrying here preserves global
-                    // frame order (later frames must not overtake), and the
-                    // physical pool frees resolve on the driver's own
-                    // completion threads, never on this lane. Bounded so a
-                    // wedged pool converges to a loud failure.
-                    const EXHAUSTED_RETRY_SLEEP: Duration = Duration::from_micros(200);
-                    const EXHAUSTED_RETRY_MAX: u32 = 25_000; // ~5 s
-                    let result = match driver.as_mut() {
-                        Some(driver) => crate::probe_fire!(stats.fire.execute.driver_fire_us, {
-                            let mut attempts = 0u32;
-                            loop {
-                                match driver.launch(&submission) {
+            // The token this request must be answered with, taken before the
+            // work so a panic can still answer it. Every arm below replies
+            // exactly once; a panic that skips its reply does not fail the
+            // request, it leaves the frame in flight forever -- measured, on a
+            // panic in the shared program interpreter, as
+            // `driver 0 stalled for 7030.132606596s (no progress, work queued
+            // or in flight)` until the process was killed by hand.
+            let owed = Owed::of(&request);
+            let handled =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match request {
+                        LaneRequest::Launch {
+                            token, submission, ..
+                        } => {
+                            let LaneLaunch(submission) = submission;
+                            // Folded admission (ABI v14): EXHAUSTED retries in place —
+                            // the lane is FIFO, so retrying here preserves global
+                            // frame order (later frames must not overtake), and the
+                            // physical pool frees resolve on the driver's own
+                            // completion threads, never on this lane. Bounded so a
+                            // wedged pool converges to a loud failure.
+                            const EXHAUSTED_RETRY_SLEEP: Duration = Duration::from_micros(200);
+                            const EXHAUSTED_RETRY_MAX: u32 = 25_000; // ~5 s
+                            let result =
+                                match driver.as_mut() {
+                                    Some(driver) => {
+                                        crate::probe_fire!(stats.fire.execute.driver_fire_us, {
+                                            let mut attempts = 0u32;
+                                            loop {
+                                                match driver.launch(&submission) {
                                     Ok(crate::driver::FrameLaunchOutcome::Launched(completion)) => {
                                         break Ok(completion);
                                     }
@@ -1201,22 +1255,40 @@ impl DriverLane {
                                     }
                                     Err(err) => break Err(format!("{err:#}")),
                                 }
-                            }
-                        }),
-                        None => Err("driver has no backend installed".to_string()),
-                    };
-                    let _ =
-                        reply_tx.send(SchedulerItem::Lane(LaneReply::LaunchDone { token, result }));
-                }
-                LaneRequest::Control { token, item } => {
-                    let commit = Self::execute_control(&mut driver, &mut channels, *item);
-                    let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
-                        token,
-                        commit,
-                    }));
-                }
-                LaneRequest::Shutdown { response } => {
-                    let _ = response.send((driver.take(), std::mem::take(&mut channels)));
+                                            }
+                                        })
+                                    }
+                                    None => Err("driver has no backend installed".to_string()),
+                                };
+                            let _ = reply_tx
+                                .send(SchedulerItem::Lane(LaneReply::LaunchDone { token, result }));
+                        }
+                        LaneRequest::Control { token, item } => {
+                            let commit = Self::execute_control(&mut driver, &mut channels, *item);
+                            let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
+                                token,
+                                commit,
+                            }));
+                        }
+                        LaneRequest::Shutdown { response } => {
+                            let _ = response.send((driver.take(), std::mem::take(&mut channels)));
+                            return true;
+                        }
+                    }
+                    false
+                }));
+            match handled {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(_) => {
+                    // The panic hook has already printed it. What is left is
+                    // the frame nobody will complete, and the queue behind it.
+                    tracing::error!(
+                        "driver lane panicked mid-request; failing it and every request \
+                         behind it rather than leaving them in flight"
+                    );
+                    owed.answer(&reply_tx, "the driver lane panicked serving this request");
+                    Self::drain_poisoned(&launch_rx, &control_rx, &reply_tx, driver, channels);
                     return;
                 }
             }
@@ -1224,6 +1296,32 @@ impl DriverLane {
         // Worker dropped its sender without a shutdown handshake (panic
         // path): release the driver here.
         drop(driver.take());
+    }
+
+    /// Answer every request still queued, and every one that arrives, with the
+    /// same failure -- the lane is gone and its driver is not touched again.
+    ///
+    /// The driver is LEAKED rather than dropped. A panic mid-fire tears state
+    /// the destructor would then run over (a command buffer recorded and never
+    /// submitted, a pool half resized), and a second panic in a `Drop` during
+    /// unwinding aborts the process. Leaking a driver in the seconds before an
+    /// operator restarts the server is the cheaper of the two.
+    fn drain_poisoned(
+        launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
+        control_rx: &crossbeam::channel::Receiver<LaneRequest>,
+        reply_tx: &crossbeam::channel::Sender<SchedulerItem>,
+        driver: Option<DriverBackend>,
+        channels: HashSet<u64>,
+    ) {
+        std::mem::forget(driver);
+        drop(channels);
+        while let Ok(request) = Self::next_request(launch_rx, control_rx) {
+            if let LaneRequest::Shutdown { response } = request {
+                let _ = response.send((None, HashSet::new()));
+                return;
+            }
+            Owed::of(&request).answer(reply_tx, "the driver lane is down after a panic");
+        }
     }
 
     /// The driver half of the old `dispatch_ordered_item`: everything a
@@ -4819,5 +4917,117 @@ impl TrackedInstance {
 
     fn close_wait_slots(self) {
         self.wait_slots.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A driver whose `launch` panics, which is the only interesting thing
+    /// about it.
+    ///
+    /// Every other verb is a stub: what is under test is the LANE, not a
+    /// backend, and the lane cannot tell a panic in `launch` from a panic
+    /// anywhere else it calls through this trait.
+    struct PanickingDriver;
+
+    impl driver_api::Driver for PanickingDriver {
+        fn kind(&self) -> &'static str {
+            "panicking"
+        }
+        fn device_domain(&self) -> driver_api::DeviceDomain {
+            driver_api::local::PIE_MEMORY_DOMAIN_HOST_PINNED
+        }
+        fn load_model(
+            &mut self,
+            _descs: Vec<driver_api::ModelLoadDesc>,
+        ) -> Result<driver_api::DriverCapabilities> {
+            Err(anyhow!("no model"))
+        }
+        fn register_program(
+            &mut self,
+            _plan: &driver_api::ProgramRegistration,
+        ) -> Result<driver_api::ProgramId> {
+            Err(anyhow!("no programs"))
+        }
+        fn register_channel(
+            &mut self,
+            _plan: &driver_api::ChannelRegistrationPlan,
+        ) -> Result<driver_api::RegisteredChannel> {
+            Err(anyhow!("no channels"))
+        }
+        fn bind_instance(
+            &mut self,
+            _plan: &driver_api::InstanceBindingPlan,
+        ) -> Result<driver_api::BoundInstance> {
+            Err(anyhow!("no instances"))
+        }
+        fn close_instance(&mut self, _id: u64) -> Result<()> {
+            Ok(())
+        }
+        fn close_channel(&mut self, _id: u64) -> Result<()> {
+            Ok(())
+        }
+        fn launch(
+            &mut self,
+            _frame: &crate::driver::FrameSubmission,
+        ) -> Result<crate::driver::FrameLaunchOutcome> {
+            panic!("the shape of an interpreter reading lane zero of an empty cell");
+        }
+    }
+
+    /// A launch the driver panics on is ANSWERED, and so is the one behind it.
+    ///
+    /// Before this, neither was. The lane replies exactly once per request and
+    /// a panic skipped the reply, so the scheduler's slot for that token was
+    /// never filled and the frame stayed in flight -- for two hours, in the run
+    /// that found it, printing `driver 0 stalled for 7030.132606596s` once a
+    /// minute. A failed request is recoverable; a request that never ends is
+    /// not.
+    #[test]
+    fn a_panicking_driver_fails_its_launch_instead_of_leaving_it_in_flight() {
+        let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
+        let mut lane = DriverLane::spawn(
+            0,
+            Some(Box::new(PanickingDriver)),
+            reply_tx,
+            Arc::new(SchedulerStats::default()),
+        );
+
+        for token in [7_u64, 8] {
+            lane.post(LaneRequest::Launch {
+                token,
+                submission: LaneLaunch(crate::driver::FrameSubmission::default()),
+                prefill: false,
+            });
+        }
+
+        // Bounded, because the failure this test exists for is a wait with no
+        // end: an `unwrap` on a blocking `recv` would hang the suite rather
+        // than fail it.
+        for want in [7_u64, 8] {
+            let reply = reply_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("token {want} was never answered"));
+            let SchedulerItem::Lane(LaneReply::LaunchDone { token, result }) = reply else {
+                panic!("a launch must be answered with a launch reply");
+            };
+            assert_eq!(token, want, "answered in the order posted");
+            let Err(err) = result else {
+                panic!("a panicking driver cannot have launched anything");
+            };
+            assert!(
+                err.contains("panic"),
+                "the failure must say what happened, so an operator restarts \
+                 rather than retries: {err}"
+            );
+        }
+
+        // And the lane still answers its shutdown handshake, without touching
+        // the driver it left alone.
+        let (driver, channels) = lane.shutdown();
+        assert!(driver.is_none(), "a poisoned lane hands back no driver");
+        assert!(channels.is_empty());
     }
 }

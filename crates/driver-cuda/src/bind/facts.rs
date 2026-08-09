@@ -13,8 +13,9 @@
 //!
 //! # Why the trait lives in `kernels-cuda-new` and the impl lives here
 //!
-//! A bind body is beside the `.cuh` it fires, which is in
-//! `kernels-cuda-new`. The facts are the fire's, which is here.
+//! A bind body lives in `kernels-cuda-new/src/x/`, holding the `.cuh` it
+//! fires by `include_str!` (northstar §5.1 ①). The facts are the fire's,
+//! which is here.
 //! `driver-cuda` depends on `kernels-cuda-new` and not the other way round,
 //! so the vocabulary is declared there as a trait and answered here — the
 //! only direction that is not a cycle. `Cx` holds `&dyn Facts`, so a bind
@@ -181,6 +182,53 @@ impl Facts for Fire<'_> {
             .map(|p| p.as_ptr().cast_const().cast::<i32>())
     }
 
+    /// The fire's token ids.
+    ///
+    /// `*mut c_void` on [`DispatchCtx`] and `*const i32` here, because the
+    /// buffer is written by the sampler and only ever READ by a kernel; the
+    /// row world spelled the same narrowing as `Source::Ctx("token_ids")`
+    /// against an `Operand` of `Ty::I32s`.
+    ///
+    /// Null is absence, which is the same convention [`positions`] uses one
+    /// method up: a fire that carries no tokens leaves the field null rather
+    /// than pointing it at an empty allocation.
+    ///
+    /// [`positions`]: Facts::positions
+    fn token_ids(&self) -> Option<*const i32> {
+        NonNull::new(self.ctx.token_ids).map(|p| p.as_ptr().cast_const().cast::<i32>())
+    }
+
+    /// How many tokens the vocabulary holds.
+    ///
+    /// Zero is absence and not a width, [`head_dim`]'s convention: a fire
+    /// that states no vocabulary leaves it at zero, and an embedding gather
+    /// that bounds-checked against zero would refuse every token.
+    ///
+    /// [`head_dim`]: Facts::head_dim
+    fn vocab(&self) -> Option<i32> {
+        (self.ctx.vocab > 0).then_some(self.ctx.vocab)
+    }
+
+    /// The rows a sampling gather collects, or `None` when it gathers every
+    /// row.
+    ///
+    /// Already `*const i32` on [`DispatchCtx`], so this is a null test and
+    /// nothing else. The row grammar's `Source::SamplingIndices` — a source
+    /// spelling with exactly one consumer — is what retires with the row.
+    fn sampling_indices(&self) -> Option<*const i32> {
+        NonNull::new(self.ctx.sampling_indices.cast_mut()).map(|p| p.as_ptr().cast_const())
+    }
+
+    /// The per-layer-embedding width.
+    ///
+    /// Zero is absence, and here the row grammar SAID SO: the layer count
+    /// was `Div(Width(In(0)), CtxNonZero("ple_dim"))`, and `CtxNonZero`
+    /// exists because dividing by this field when it is zero faults.
+    /// `Option` is that statement in the type system.
+    fn ple_dim(&self) -> Option<i32> {
+        (self.ctx.ple_dim > 0).then_some(self.ctx.ple_dim)
+    }
+
     /// The fire's peel window, `[start, count]`, device-resident.
     ///
     /// **This is the operand `table/rope.rs` refused.** Its note read *"a
@@ -235,6 +283,15 @@ impl Facts for Fire<'_> {
 
     fn rms_eps(&self) -> Option<f32> {
         (self.ctx.eps > 0.0).then_some(self.ctx.eps)
+    }
+
+    /// The logit soft cap, absent when the deployment states none.
+    ///
+    /// Zero is absence, not a cap of zero — which is the reading
+    /// `Source::CtxNonZero("final_logit_softcap")` already had, moved into
+    /// the type. Gemma-2/3/3n are the only deployments that state it.
+    fn final_logit_softcap(&self) -> Option<f32> {
+        (self.ctx.final_logit_softcap > 0.0).then_some(self.ctx.final_logit_softcap)
     }
 
     /// GPT-J adjacent-pair rotation, vs NeoX half/half.

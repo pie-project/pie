@@ -40,16 +40,14 @@
 //! that owns a given driver instance.
 
 pub mod backend;
-pub mod boot;
 pub mod channel;
 
 pub use waker;
 
 pub use backend::{
     DriverBackend, DriverSpec, RemoteDisconnectHandle, RemoteDriver, SchedulerLimits, get_spec,
-    open, register_driver_backend, take_driver_backend, unregister_driver,
+    open, register_driver, register_driver_backend, take_driver_backend, unregister_driver,
 };
-pub use boot::BootConfig;
 pub use channel::{ChannelCloser, ChannelEndpoint, ChannelValue, RegisteredChannel};
 
 // The contract, re-exported at the path the engine already reads it from.
@@ -60,13 +58,9 @@ pub use channel::{ChannelCloser, ChannelEndpoint, ChannelValue, RegisteredChanne
 // decides. Re-exporting is what let the contract move out of this crate
 // without touching them.
 pub use ::driver_api::completion::WorkItemAttemptOutcome;
-// `CompletionLease` and `CompletionTarget` are NOT among these, and the
-// difference is the point of the paragraph above. Both are read — a lease by
-// `BoundInstance`, a target by the four seams — but neither is read THROUGH
-// this path: `driver-api` names them itself, seven times for the target and
-// twice for the lease, and `crate::driver::CompletionTarget` appears nowhere.
-// A re-export nobody reads is a wall in front of a door nobody opens.
-pub use ::driver_api::completion::{CompletionBroker, SubmissionCompletion, WorkItemCompletion};
+pub use ::driver_api::completion::{
+    CompletionBroker, CompletionLease, CompletionTarget, SubmissionCompletion, WorkItemCompletion,
+};
 pub use ::driver_api::instance::{BoundInstance, InstanceBindingPlan, InstanceId, ProgramId};
 pub use ::driver_api::plan::{
     ChannelRegistrationPlan, KvCopyPlan, LaunchPlan, PoolResizePlan, ProgramRegistration,

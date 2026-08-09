@@ -19,12 +19,16 @@
 //!
 //! # Why the temperature is zero
 //!
-//! Greedy, so the gate is exact rather than likely -- and because the top-p
-//! arm of the shared PTIR interpreter panics on this path
-//! (`crates/driver/src/op.rs`'s `PIVOT_THRESHOLD`, `CummassLe`: the payload
-//! value arrives with no lanes and the index is taken unchecked). That is a
-//! gap in the interpreter every host-side driver shares, not in this
-//! backend's forward, so it is recorded here rather than worked around.
+//! Greedy, so the gate is exact rather than likely: one sentence, asserted by
+//! its words. Sampling is a separate gate -- `vulkan_sampled_completion` --
+//! because what it can assert is weaker, and mixing the two would weaken this
+//! one.
+//!
+//! It used to be zero for a second reason: any other value panicked. The
+//! payload of `PIVOT_THRESHOLD` arrived with no lanes, because the stage-index
+//! walk in `crates/driver/src/plan.rs` marked each op's `args` and that
+//! operand does not ride in `args`. It is fixed, and the sampling gate is what
+//! keeps it fixed.
 //!
 //! One boot per process, so this is its own test binary.
 

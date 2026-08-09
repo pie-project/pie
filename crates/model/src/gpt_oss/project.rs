@@ -413,6 +413,19 @@ pub fn metal_facts(
         // it named `affine_qmv_routed_bfloat16_gs_128_b_8`, which no
         // `kernel!` signature declares, and the row stopped being servable at
         // an encoding it must be servable at.
+        // The ROUTER GATE's own format, when the checkpoint published it
+        // wider than the stack it routes. `None` is "the same as the dense
+        // projections", which is every checkpoint but gpt-oss's -- and
+        // getting it wrong is the QUIET failure: a bank read at the wrong
+        // format is 909,207 NaNs, and a gate read at the wrong width is a
+        // fluent model routing every token to almost the right experts.
+        router_repr: (bind.router_quant_group != 0).then(|| WeightRepr::Scaled {
+            layout: ScaleLayout::PerGroup,
+            group: bind.router_quant_group,
+            axis: 0,
+            zero_point: true,
+        }),
+        router_bits: bind.router_quant_bits,
         moe_repr: bind.moe_mxfp4.then_some(WeightRepr::Mxfp4Marlin),
         // Four by the format's definition and read only when the repr above
         // is `Some`, exactly as the shared projection states it.
@@ -525,6 +538,8 @@ mod tests {
         let bind = crate::catalog::MetalBinding {
             quant_group: 64,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: true,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
@@ -575,6 +590,8 @@ mod tests {
         let bind = crate::catalog::MetalBinding {
             quant_group: 64,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: true,
             fuse_residual_gemv: true,
             paged_multi_batch: true,

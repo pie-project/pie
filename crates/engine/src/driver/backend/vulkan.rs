@@ -35,6 +35,60 @@
 //!
 //! `export_kv_handle` answers `None`: there is no cross-process sharing path.
 //!
+//! # A verb that has already finished still has to say so
+//!
+//! `copy_kv` and `resize_pool` are host work -- this driver's buffers are
+//! coherent, so the first is a `memmove` and the second an allocation, and
+//! both are done by the time the verb returns. This seam took that to mean
+//! there was nothing to settle, minted a completion and dropped its target.
+//!
+//! The engine then waited forever. Measured here, on `prefix-tree-kv-cache`,
+//! which forks one prefill into two branches and each into two leaves:
+//!
+//! ```text
+//! in_flight_control: KV copy pipeline Some(..) settled=false
+//! [pie-sched] driver 0 stalled for 370.00s (no progress, work queued ...)
+//! ```
+//!
+//! With [`settle_control`] the same run reaches its end in 11.8 s. It then
+//! fails elsewhere, with `pipeline is closed` and no driver fault and no
+//! stall, exactly as the wgpu seam does after the same repair.
+//!
+//! That second failure is not this driver's, and it is worth saying WHY
+//! rather than only that. Backtracing every `PipelineScope::close` through
+//! the run puts the call in the GUEST: `run_ahead` closes its pipeline the
+//! instant the budget is spent, which is `Pipeline`'s own documented rule and
+//! is worth +9.5% to +18.7% to a lane that owns its stream. This example does
+//! not own its stream -- it builds four leaves on one `tree_pipeline` and
+//! then generates from each, so the first leaf's `run_ahead` closes the
+//! pipeline the other three still need.
+//!
+//! The obvious repair does not work either, which is what makes it a contract
+//! problem rather than a typo. Giving each leaf its own pipeline trades one
+//! engine refusal for the other:
+//!
+//! ```text
+//! pipeline: KV working set is already scoped to pipeline 0000..0001
+//! ```
+//!
+//! because a working set is scoped to the first pipeline that fires it and
+//! the scope is reclaimable only once the old one has both closed AND
+//! drained. So the example is caught between two rules, and no `run_ahead`
+//! variant that leaves the stream open exists to escape them. Reported with
+//! the mechanism, not fixed here: the fix is a decode loop's shape, and this
+//! is a driver.
+//!
+//! `beam-search`, the other forking example, obeys both rules -- one
+//! pipeline, one `run_ahead`, forks taken inside the callback -- and stops at
+//! a third wall that is also not a backend's: its per-lane ancestry mask is a
+//! channel-bound dense `AttnMask`, which `fire/geometry.rs` declines to the
+//! pool-owned device-geometry class because "the envelope composes batched
+//! lanes and has no per-lane mask state -- on any backend, not just this
+//! one". So no forking example completes here yet, and none of the three
+//! reasons is a Vulkan one. `Shell::fork` itself is measured, in
+//! `tests/device.rs`: a fork answers as its source does, diverges when fed
+//! different tokens, and refuses three ways.
+//!
 //! A `launch` here is two halves and this seam is where they meet: the shell
 //! fires the model rows and hands back one `Step` per step, and then the
 //! frame's PROGRAMS are fired over those steps -- each instance over its own
@@ -42,6 +96,33 @@
 //! reads. The registry lives on this side rather than in the shell (see
 //! `programs` below), which is why the join is here rather than one layer
 //! down.
+//!
+//! That join is now measured rather than asserted. `mod tests` proves the
+//! registry answers -- a program, a channel and an instance, with no device
+//! open at all -- but a registry that hands back well-formed ids for a
+//! program nobody fires is indistinguishable from one that works, and what it
+//! would hide is a channel that never fills, which is a guest waiting
+//! forever. So `tests/gpu/tests/vulkan_programmable_sampler.rs` runs the
+//! plane instead: `mirostat-v2-sampling` builds its own forward pass, reads
+//! each step's logits back over a channel, decides the token host-side and
+//! feeds a control value forward into the next step. Eight tokens in 4.2
+//! seconds under the validation layer, with the guest's `mu` moving from the
+//! 6.0 it was given to 10.41 -- and that movement is the round trip's
+//! signature, since the only thing that can move it is a surprise computed
+//! from a distribution that actually came back.
+//!
+//! Two more gates cover the plane's other directions. `vulkan_sampling_
+//! primitives` runs a whole op set inside ONE epilogue and reads six channels
+//! out of it, three of them a full 151936 wide. `vulkan_grammar_constrained`
+//! runs the only direction where the host writes INTO the epilogue every
+//! step: `json-schema-constrained-decoding` holds a grammar matcher host-side
+//! and puts its allowed-token mask into a channel that `masked_argmax` reads
+//! as an operand, then re-puts a different mask on the very next fire of the
+//! same instance. A mask bound once and reused is still a legal decode, just
+//! one against a stale grammar -- so that gate makes the model answer with an
+//! object whose required keys are `zqx` and `wbn`, which no continuation of
+//! its prompt would ever choose. Getting them back is only possible if the
+//! buffer the host wrote is what the argmax ranged over.
 //!
 //! A served `launch` is not an unconditional one. A `LaunchPlan` can name
 //! eight things this driver does not implement -- recurrent state, a user
@@ -61,6 +142,8 @@ use ::driver_api::{
     FrameSubmission, InstanceBindingPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan,
     ProgramRegistration, RegisteredChannel, StateCopyPlan, SubmissionCompletion,
 };
+
+use super::settle_control;
 
 /// How many KV pages a shell is opened with.
 ///
@@ -149,6 +232,36 @@ impl VulkanDriver {
             )
         })
     }
+
+    /// A driver with no device behind it, for the verbs that do not need one.
+    ///
+    /// This is the state a real driver is in between `create` and
+    /// `load_model` -- no shell, an empty registry -- with two differences:
+    /// its facts were never measured, so they are the specification's floor
+    /// rather than a device's answer, and it holds no modules, because a
+    /// module set is read from a directory and CI has no reason to have one.
+    ///
+    /// It exists because CI has no GPU, and this seam's seven existing tests
+    /// all SHORT-CIRCUIT when `PIE_KERNELS_VULKAN_SPV_DIR` is unset or no
+    /// device answers -- so on a machine without a card, not one verb of the
+    /// fourteen was ever called. An `impl` that compiles proves only that a
+    /// method exists; `todo!()`, `unimplemented!()` and a silent `Ok(())` all
+    /// compile too, and the last would take a KV copy the scheduler then
+    /// believes happened. Ten verbs never touch a device -- the five registry
+    /// ones, the two by-name refusals, and the three "before `load_model`"
+    /// errors -- so ten can be walked here, and are.
+    #[cfg(test)]
+    pub(super) fn without_adapter() -> Self {
+        Self {
+            shell: None,
+            facts: driver_vulkan::facts::floor(),
+            modules: BTreeMap::new(),
+            module_dir: std::path::PathBuf::from("<none: this driver read no modules>"),
+            kv_pages: 0,
+            broker: CompletionBroker::new(),
+            programs: driver_vulkan::programs::Programs::new(),
+        }
+    }
 }
 
 impl Driver for VulkanDriver {
@@ -161,13 +274,11 @@ impl Driver for VulkanDriver {
     }
 
     /// The device's stated facts.
-    #[must_use]
     fn device_facts(&self) -> Option<&::driver_api::DeviceFacts> {
         Some(&self.facts)
     }
 
     /// Vulkan exports no KV handle: there is no cross-process sharing path.
-    #[must_use]
     fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
         None
     }
@@ -227,21 +338,109 @@ impl Driver for VulkanDriver {
                 .hold(&name, &bytes)
                 .map_err(|e| anyhow!("driver-vulkan: `{name}` would not stage: {e:?}"))?;
         }
-        let facts = ::driver_api::ModelFacts {
+        let shape = shell.shape();
+        self.shell = Some(shell);
+        Ok(::driver_api::DriverCapabilities {
+            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
+            total_pages: shape.pages,
+            kv_page_size: shape.page_size,
+            // No swap pool and no recurrent-state cache: this driver has
+            // neither, and `copy_state` refuses by name for the same reason.
+            swap_pool_size: 0,
+            // Device to device, and only that. `Pool::copy_plan` moves whole
+            // pages inside the one KV buffer -- which is what a prefix-cache
+            // hit is -- and refuses any plan whose ends are not both
+            // `PIE_MEMORY_DOMAIN_VULKAN_DEVICE`.
+            //
+            // Advertising it is new, and it only became true once the
+            // scheduler stopped stamping `PIE_MEMORY_DOMAIN_CUDA_DEVICE` on
+            // every plan regardless of backend. Host directions stay off:
+            // there is no swap pool here, so `swap_pool_size` is 0 and a
+            // device-to-host copy has nowhere to land.
+            kv_copy_domain_mask: ::driver_api::KV_COPY_DEVICE_TO_DEVICE,
+            // No recurrent-state cache. `driver-metal` answers this one with
+            // `deployment.recurrent.is_some()`; this backend cannot serve a
+            // hybrid stack at all, so the answer is a constant.
+            //
+            // A constant is only honest if a hybrid cannot arrive, and that
+            // was a belief here until it was checked. It holds, but not for
+            // the reason a guard here would give: every hybrid family in the
+            // catalog is turned away one line above, by `row.trace`, because
+            // none has a Metal text -- and the row says so far better than
+            // this seam could, naming the backend that does serve it.
+            // `a_model_that_holds_a_recurrent_state_is_refused_before_it_is_
+            // staged` scans the whole catalog for that, so the day a hybrid
+            // gains a Metal text these three lines stop being true and a test
+            // says so.
+            rs_cache_required: false,
+            rs_cache_slots: 0,
+            rs_cache_slot_bytes: 0,
+            // Not elastic, and the reason is the COST rather than the
+            // ability. `Shell::resize_pool` works: it preserves the pages
+            // that survive, refuses by name a shrink that would strand a
+            // seated conversation, and leaves the pool untouched when the
+            // machine will not stage the new one. What it cannot be is
+            // CHEAP. `Pool::resize` reads every layer's whole buffer to host
+            // memory and writes the survivors into a fresh one, so the charge
+            // is the pool's size twice over and not the delta's.
+            //
+            // Measured at 256 pages of qwen3-0.6b: handing back one page
+            // takes 2.77 s and handing back a hundred and twenty-six takes
+            // 0.74 s -- the deeper cut is nearly four times cheaper, because
+            // it fills a smaller destination. The cheapest trim this pool
+            // offers is the largest one, which is the opposite of what a trim
+            // task is for. It also peaks at both sizes at once, so a shrink
+            // asked for under memory pressure needs more memory than not
+            // shrinking at all.
+            //
+            // So both numbers are zero together, which is the condition
+            // `bootstrap` reads before it starts a trim task at all, and the
+            // task never starts.
+            //
+            // This said "nothing can be given back page-wise" until it was
+            // measured, and that was false -- a shrink does free the old
+            // buffers, at any granularity asked for. Right answer, wrong
+            // reason. `giving_back_one_page_costs_what_giving_back_half_the_
+            // pool_costs` in `tests/device.rs` now pins the real one, and
+            // goes red if this pool ever becomes page-wise.
+            elastic_page_bytes: 0,
+            elastic_budget_pages: 0,
+            has_mtp_logits: false,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            // Sinks this backend cannot honour. Every one of them would bind
+            // and then run as a silent no-op, which is worse than a refusal
+            // at the door.
+            has_kv_envelopes: false,
+            has_attn_score: false,
+            has_attn_page_mask: false,
+            has_lora: false,
+            model_site_summary: ::driver_api::ModelSiteSummary::default(),
+            device_geometry_port_mask: ::driver_api::PIE_DECODE_ENVELOPE_PORTS,
+            // The ceilings a batch is formed under, and they are the arena's:
+            // `Shell::open` sizes one fire's scratch, and a fire wider than
+            // this has nothing to run in.
+            max_forward_tokens: 4096,
+            max_forward_requests: 256,
+            max_page_refs: shape.pages,
             // The row's answers, not a config's: the checkpoint was
-            // identified once, above, and these come from that
-            // identification. They are the ONLY half of the capabilities this
-            // side still authors -- the driver states the rest about itself.
+            // identified once and these come from that identification.
             arch_name: deployment.advertised.arch.to_string(),
             model_id: row.id().to_string(),
             vocab_size: deployment.shape.vocab,
             max_model_len: deployment.advertised.max_model_len,
+            activation_dtype: "bf16".to_string(),
             hidden_size: deployment.shape.hidden,
+            // False about the BACKEND rather than about the row: there is no
+            // encode entry point here at all, so a model with a vision tower
+            // is served as its text half. `Shell::encode` refuses by name.
+            supports_media_encode: false,
             snapshot_dir: path.display().to_string(),
-        };
-        let capabilities = shell.capabilities(&facts);
-        self.shell = Some(shell);
-        Ok(capabilities)
+            kv_handle: None,
+            // The modules are read from disk already built; nothing upstream
+            // generates a kernel for this driver.
+            codegen_backend: String::new(),
+        })
     }
 
     /// Register a PTIR program: its launch package and its emitted kernels.
@@ -369,6 +568,13 @@ impl Driver for VulkanDriver {
                         channel,
                         "vulkan: a step's geometry channel is not filled yet"
                     );
+                    tracing::warn!(
+                        channel,
+                        members = sub.roster_rows.len(),
+                        "vulkan: a step's geometry channel is unfilled at fire time; \
+                         v14 admission is supposed to make that impossible, so its \
+                         members are failed rather than re-posted"
+                    );
                     let early = vec![driver_vulkan::frames::Ran::Early; sub.roster_rows.len()];
                     publish_terminals(&sub.terminal_cells, &early)?;
                     break;
@@ -442,9 +648,12 @@ impl Driver for VulkanDriver {
 
     /// Move KV pages, and the rows inside them, within this pool.
     ///
-    /// Settled on return: every buffer this driver allocates is host-visible
-    /// and coherent, so the move is a host `memmove` with no command buffer
-    /// and nothing is in flight for a caller to wait on.
+    /// The move itself is finished on return: every buffer this driver
+    /// allocates is host-visible and coherent, so it is a host `memmove` with
+    /// no command buffer and nothing in flight. The COMPLETION is a separate
+    /// fact, and this seam used to get it wrong -- it minted one and dropped
+    /// the target, so the engine waited on an op nobody would ever settle.
+    /// [`settle_control`] does both halves; see it for the order.
     ///
     /// # Errors
     ///
@@ -453,8 +662,7 @@ impl Driver for VulkanDriver {
         self.shell("copy_kv")?
             .copy_kv(desc)
             .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
-        let (_raw, completion) = self.broker.control_completion(1);
-        Ok(completion)
+        Ok(settle_control(&self.broker))
     }
 
     /// # Errors
@@ -474,10 +682,9 @@ impl Driver for VulkanDriver {
         self.shell("resize_pool")?
             .resize_pool(desc)
             .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
-        // Settled already: the resize returns with the new buffers allocated
-        // and the old ones freed, and there is nothing left in flight.
-        let (_raw, completion) = self.broker.control_completion(1);
-        Ok(completion)
+        // The resize returns with the new buffers allocated and the old ones
+        // freed, so the only thing left is to say so.
+        Ok(settle_control(&self.broker))
     }
 
     /// # Errors
@@ -522,24 +729,22 @@ struct Boot {
 ///
 /// No module directory, from either the file or the environment.
 fn boot_of(config_bytes: &[u8]) -> Result<Boot> {
-    // ONE READER of the document, in `crate::driver::boot`. What stays here
-    // is what is VULKAN's: the environment fallback (the variable names this
-    // backend in its own spelling) and the refusal when neither answers.
-    // `BootConfig` states what the operator wrote; what a missing key means
-    // is a question about this device.
-    let boot = crate::driver::BootConfig::parse(config_bytes);
+    // The boot TOML is the ENGINE's format, read here for the same reason
+    // the Metal seam reads it here: a driver that parsed it would be the
+    // second thing entitled to an opinion about the file's shape.
+    let boot = std::str::from_utf8(config_bytes)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok());
     // The directory `kernels-vulkan`'s build script wrote, which reaches
     // this crate only if it is asked for. It is NOT a dependency of this
     // one: the engine linking a shader compiler to run a driver would be
     // the build-time equivalent of loading a checkpoint format, and a
     // driver consumes modules rather than producing them.
     let module_dir = boot
-        .kernels
-        .or_else(|| {
-            std::env::var("PIE_KERNELS_VULKAN_SPV_DIR")
-                .ok()
-                .map(std::path::PathBuf::from)
-        })
+        .as_ref()
+        .and_then(|v| Some(v.get("model")?.get("kernels")?.as_str()?.to_string()))
+        .or_else(|| std::env::var("PIE_KERNELS_VULKAN_SPV_DIR").ok())
+        .map(std::path::PathBuf::from)
         .ok_or_else(|| {
             anyhow!(
                 "driver-vulkan: no SPIR-V module directory. Set `[model] kernels` in the \
@@ -547,9 +752,14 @@ fn boot_of(config_bytes: &[u8]) -> Result<Boot> {
                  `kernels-vulkan` built."
             )
         })?;
+    let kv_pages = boot
+        .as_ref()
+        .and_then(|v| v.get("model")?.get("kv_pages")?.as_integer())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(DEFAULT_KV_PAGES);
     Ok(Boot {
         module_dir,
-        kv_pages: boot.kv_pages.unwrap_or(DEFAULT_KV_PAGES),
+        kv_pages,
     })
 }
 
@@ -727,11 +937,23 @@ fn publish_terminals(
         }
         let word = match outcome {
             Ran::Fired => ::driver_api::PIE_TERMINAL_OUTCOME_SUCCESS,
-            // Not a failure and not a success: the member was skipped without
-            // being touched, and the scheduler's answer to that is to post it
-            // again. Writing SUCCESS here would answer a request whose program
-            // never ran.
-            Ran::Early => ::driver_api::PIE_TERMINAL_OUTCOME_RETRY,
+            // FAILED, and it used to be RETRY. A member skipped for being
+            // early has not run, so SUCCESS would answer a request whose
+            // program never fired -- but RETRY is not an outcome this stack
+            // still honours. The scheduler rejects it by name:
+            //
+            //     driver published RETRY at frame settle; retry is not a v14
+            //     outcome (frame admission bounds every in-frame gate)
+            //
+            // and `worker`'s executor knows only SUCCESS and FAILED. So the
+            // choice is between a legible failure and a rejection that blames
+            // the driver in the abstract, and the reason is logged beside it.
+            //
+            // The v14 argument is also why nothing here tries to be cleverer:
+            // if admission bounds every in-frame gate then a member cannot be
+            // early, so reaching this arm is a broken invariant rather than a
+            // slow producer, and a broken invariant should stop.
+            Ran::Early => ::driver_api::PIE_TERMINAL_OUTCOME_FAILED,
             Ran::Faulted => ::driver_api::PIE_TERMINAL_OUTCOME_FAILED,
         };
         // `publish` releases, so the reader that observes the outcome also
@@ -815,6 +1037,8 @@ fn text_of(
     let binding = model::catalog::MetalBinding {
         quant_group: 64,
         quant_bits: 4,
+        router_quant_group: 0,
+        router_quant_bits: 0,
         moe_mxfp4: false,
         fuse_residual_gemv: true,
         paged_multi_batch: true,
@@ -871,6 +1095,58 @@ fn text_of(
 mod tests {
     use super::*;
     use model_compiler::trace::FireClass;
+
+    /// A member skipped for being early is FAILED, not RETRY.
+    ///
+    /// This mapping was RETRY, which reads as the kind answer and is the
+    /// wrong one: `resolve_from_terminal` accepts the word, but the frame
+    /// settle above it rejects the request that carried it --
+    ///
+    ///     driver published RETRY at frame settle; retry is not a v14
+    ///     outcome (frame admission bounds every in-frame gate)
+    ///
+    /// -- and `worker`'s executor has only SUCCESS and FAILED in it at all.
+    /// Nothing re-posts the member, so the RETRY bought a worse message and
+    /// no second attempt.
+    ///
+    /// The arm is measured-unreachable in a real `pie serve`: the program
+    /// that fills a channel runs in the same call that reads it. It is
+    /// asserted here rather than deleted because the resolver can still
+    /// return `NotReady`, and answering that with a fire would sample a
+    /// distribution nobody computed.
+    #[test]
+    fn a_member_skipped_for_being_early_is_failed_rather_than_retried() {
+        use driver_vulkan::frames::Ran;
+
+        let cells: Vec<::driver_api::TerminalCell> = (0..3).map(|_| Default::default()).collect();
+        let ptrs: Vec<*mut ::driver_api::TerminalCell> = cells
+            .iter()
+            .map(|c| std::ptr::from_ref(c).cast_mut())
+            .collect();
+        publish_terminals(&ptrs, &[Ran::Fired, Ran::Early, Ran::Faulted])
+            .expect("three cells for three members");
+        assert_eq!(
+            cells[0].load(),
+            ::driver_api::PIE_TERMINAL_OUTCOME_SUCCESS,
+            "a member whose program fired is reported as having run"
+        );
+        assert_eq!(
+            cells[1].load(),
+            ::driver_api::PIE_TERMINAL_OUTCOME_FAILED,
+            "an early member must be answered with a word this stack still \
+             honours, and RETRY is not one"
+        );
+        assert_ne!(
+            cells[1].load(),
+            ::driver_api::PIE_TERMINAL_OUTCOME_RETRY,
+            "RETRY at frame settle is rejected by the scheduler by name"
+        );
+        assert_eq!(
+            cells[2].load(),
+            ::driver_api::PIE_TERMINAL_OUTCOME_FAILED,
+            "a member whose program faulted is reported as failed"
+        );
+    }
 
     /// A row's id and the fixture the driver's own numbers were taken from.
     type Measured = (
@@ -1004,6 +1280,106 @@ kernels = "/tmp/spv"
         assert_eq!(read.kv_pages, super::DEFAULT_KV_PAGES);
     }
 
+    /// Every hybrid stack in the catalog is refused, and by the ROW.
+    ///
+    /// # The belief this checks
+    ///
+    /// Six comments across `driver-vulkan` say "no model this driver serves
+    /// holds a recurrent state", and until this test not one of them was
+    /// enforced or checked. It read as a prediction about which checkpoints
+    /// would turn up, and the catalog looked like it falsified the
+    /// prediction: `nemotron_h`, `kimi_k3` and `qwen_3_5` all project
+    /// `recurrent: Some(..)`, and nothing here routes them away.
+    ///
+    /// # What was actually found, which is not what was expected
+    ///
+    /// A guard was written for this seam first -- refuse a row whose
+    /// deployment states a recurrent shape -- and then measured, and it never
+    /// fired. Every hybrid in the catalog is already refused one line
+    /// earlier, by `row.trace`, because none of them has a Metal text: the
+    /// qwen-3.5 family says its forward is `qwen3_5_hybrid_cuda` and
+    /// "interleaves gated DeltaNet layers with attention"; nemotron-h says
+    /// its forward is `nemotron_h_cuda` and that the one Metal text here
+    /// "has no recurrent layer kind". Both then name the backend that does
+    /// serve them.
+    ///
+    /// Those sentences are better than any this seam could write, and they
+    /// arrive before a device is touched. So the guard was DELETED and this
+    /// test kept. The belief is true; it is just not this crate that makes it
+    /// true, and a guard that cannot fire is a claim that cannot be checked.
+    ///
+    /// # Why it scans the catalog instead of naming the families
+    ///
+    /// So the day a hybrid gains a Metal text, this goes red -- which is
+    /// exactly the day the deleted guard would need to come back, and the
+    /// only day it would have been worth anything. A test naming
+    /// `nemotron-h` would pass forever while a fourth family walked in.
+    ///
+    /// # The controls
+    ///
+    /// 1. The scan must find hybrids, or it asserts nothing.
+    /// 2. The two rows this backend serves must still be ACCEPTED, so this is
+    ///    measuring a specific refusal and not a closed door.
+    #[test]
+    fn a_model_that_holds_a_recurrent_state_is_refused_before_it_is_staged() {
+        use model::catalog::Deployed;
+        let binding = model::catalog::MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+            add_bias: true,
+        };
+
+        let mut hybrids = 0;
+        for row in model::catalog::catalog() {
+            let Ok(deployment) = row.deployment(Deployed::metal(&binding)) else {
+                continue;
+            };
+            if deployment.recurrent.is_none() {
+                continue;
+            }
+            hybrids += 1;
+            let Err(said) = text_of(*row) else {
+                panic!(
+                    "`{}` holds a recurrent state and this driver allocates no slot for one, \
+                     yet the seam took it: the guard deleted above needs to come back",
+                    row.id()
+                )
+            };
+            let said = said.to_string();
+            assert!(
+                said.contains(row.id()),
+                "the refusal must name the row: {said}"
+            );
+            // The row's own sentence, carried out unchanged. If this stops
+            // holding, the refusal has moved somewhere later and coarser.
+            assert!(
+                said.contains("no Metal text"),
+                "a hybrid must be refused for having no text, before any device is touched: \
+                 {said}"
+            );
+        }
+        assert!(
+            hybrids > 0,
+            "no row in the catalog projects a recurrent shape, so this test asserted nothing -- \
+             the qwen-3.5, nemotron-h and kimi-k3 families did when it was written"
+        );
+
+        // The control: a specific refusal, not a closed door.
+        for (id, _) in MEASURED {
+            let row =
+                model::catalog::find(id).unwrap_or_else(|| panic!("`{id}` is in the catalog"));
+            text_of(row).unwrap_or_else(|e| {
+                panic!("`{id}` holds no recurrent state and must still be served: {e}")
+            });
+        }
+    }
+
     /// A model this build has no text for is refused in the ROW's words.
     ///
     /// Phi-3-mini's heads are 96 wide and the Metal text names
@@ -1079,19 +1455,15 @@ kernels = "/tmp/spv"
     /// `requested_instance_id` of 0 to "any" -- a seam that passed the 0
     /// through would ask the registry for instance zero by name.
     ///
-    /// No model is loaded: the plane is deviceless and modelless, and this
-    /// running without a checkpoint is part of what it measures. A device is
-    /// still needed because `create` opens one.
+    /// No model is loaded and NO DEVICE IS OPEN: the plane is deviceless and
+    /// modelless, and this running without either is part of what it
+    /// measures. It used to go through `create`, which opens a device for its
+    /// facts and then drops it -- so on a machine without a card the whole
+    /// test skipped, and the deviceless claim was the one thing never checked
+    /// where it is most worth checking.
     #[test]
     fn the_seam_registers_a_program_a_channel_and_an_instance() {
-        if std::env::var("PIE_KERNELS_VULKAN_SPV_DIR").is_err() {
-            eprintln!("skipped: PIE_KERNELS_VULKAN_SPV_DIR is unset");
-            return;
-        }
-        let Ok((mut driver, _facts)) = super::VulkanDriver::create(b"") else {
-            eprintln!("skipped: no Vulkan device answered");
-            return;
-        };
+        let mut driver = super::VulkanDriver::without_adapter();
 
         let program = driver
             .register_program(&::driver_api::ProgramRegistration {
@@ -1173,6 +1545,86 @@ kernels = "/tmp/spv"
         driver.close_channel(9).expect("closes");
     }
 
+    /// Every verb that needs no device is reachable, and says so in words.
+    ///
+    /// Ten of the fourteen. The five registry ones are the test above; these
+    /// are the other five plus the four constants, and what they have in
+    /// common is that a machine with no GPU can run them -- which is the
+    /// machine this crate is compiled on most often, and the one where none
+    /// of them was called at all until now.
+    ///
+    /// The claim is not that these verbs work. It is that each one is WIRED:
+    /// that `encode` and `copy_state` refuse rather than silently succeed,
+    /// and that the three device verbs called before `load_model` name
+    /// themselves rather than panicking on an `unwrap` of `self.shell`. A
+    /// silent `Ok` from `copy_kv` is the dangerous one -- the scheduler would
+    /// take it as a promise that a conversation's pages had moved, and the
+    /// next turn would read another request's tokens as its own.
+    ///
+    /// Each message is checked for the verb's own name, because "unsupported"
+    /// alone in a log does not say which of fourteen calls produced it.
+    #[test]
+    fn every_verb_that_needs_no_device_answers_in_its_own_words() {
+        let mut driver = super::VulkanDriver::without_adapter();
+
+        assert_eq!(driver.kind(), "vulkan", "the name the engine matches on");
+        assert_eq!(
+            driver.device_domain(),
+            ::driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE
+        );
+        let facts = driver.device_facts().expect("a driver states its facts");
+        assert_eq!(facts.backend, driver_vulkan::facts::BACKEND);
+        assert_eq!(facts.abi_version, ::driver_api::PIE_DRIVER_ABI_VERSION);
+        assert_eq!(facts.page_size, driver_vulkan::facts::PAGE_SIZE);
+        assert!(
+            driver.export_kv_handle().is_none(),
+            "this driver's pages are not exportable, and a handle here would              invite another process to map them"
+        );
+
+        // The two refusals. Both are unconditional, and both are a refusal
+        // rather than a no-op because a no-op is indistinguishable from
+        // success to the caller.
+        let Err(encode) = driver.encode(&mut ::driver_api::MediaEncodePlan::default()) else {
+            panic!("media encode is not implemented here, so it must not succeed")
+        };
+        assert!(
+            encode.to_string().contains("encode"),
+            "the refusal does not name the verb: {encode}"
+        );
+        let Err(state) = driver.copy_state(&::driver_api::StateCopyPlan::default()) else {
+            panic!("no model here holds a recurrent state, so this must not succeed")
+        };
+        assert!(
+            state.to_string().contains("recurrent state"),
+            "the refusal does not say what is missing: {state}"
+        );
+
+        // The three that need a shell, called before there is one. Every
+        // message has to name its own verb.
+        let Err(launched) = driver.launch(&::driver_api::FrameSubmission::default()) else {
+            panic!("a frame before a model has nothing to run on")
+        };
+        assert!(
+            launched.to_string().contains("launch")
+                && launched.to_string().contains("before load_model"),
+            "a frame before a load did not say so: {launched}"
+        );
+        let Err(copied) = driver.copy_kv(&::driver_api::KvCopyPlan::default()) else {
+            panic!("there is no pool to copy within, so this must not report a move")
+        };
+        assert!(
+            copied.to_string().contains("copy_kv"),
+            "a KV copy before a load did not name itself: {copied}"
+        );
+        let Err(resized) = driver.resize_pool(&::driver_api::PoolResizePlan::default()) else {
+            panic!("there is no pool to resize")
+        };
+        assert!(
+            resized.to_string().contains("resize_pool"),
+            "a resize before a load did not name itself: {resized}"
+        );
+    }
+
     /// The seam's own staging is the driver's, measured by the answer.
     ///
     /// `driver-vulkan`'s device suite already serves these weights and gets
@@ -1207,7 +1659,7 @@ kernels = "/tmp/spv"
         // reason `driver-vulkan/tests/checkpoint.rs` takes a list.
         let mut served = 0usize;
         for artifact in artifacts.split(':').filter(|a| !a.is_empty()) {
-            let Ok((mut backend, _facts)) = VulkanDriver::create(boot.as_bytes()) else {
+            let Ok(mut backend) = VulkanDriver::create(boot.as_bytes()) else {
                 eprintln!("SKIP: no Vulkan device");
                 return;
             };

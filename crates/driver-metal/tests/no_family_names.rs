@@ -182,9 +182,17 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // THREE BECAME TWO when `RopeScaling::Llama3` was renamed to
         // `RopeScaling::Piecewise` in `model::deployment`: the match arm was
         // a family name this file had no way to spend differently, because
-        // the vocabulary it matched on carried the lineage. The two left are
-        // the refusal's own sentence, which is deliberate.
-        ("batch/geometry.rs", 2),
+        // the vocabulary it matched on carried the lineage. The two left were
+        // the refusal's own sentence.
+        //
+        // TWO BECAME NONE, and the entry left with them. Those two lines said
+        // "this driver derives only llama-3's piecewise table" to an operator
+        // whose checkpoint wanted a YaRN ladder; then the driver learned to
+        // derive the ladder, and a refusal nobody can reach has no sentence
+        // to spend. The entry is deleted rather than zeroed, for the reason
+        // the entries above it were: a budget of zero is not a budget, and an
+        // unlisted file that scores fails `unlisted` with the argument
+        // attached, which is stricter than a ceiling of zero and says more.
         // The kernel ABI's family-prefixed kind names. Absent from this
         // table until `PREFIXES` was added, because every one of its
         // mentions is an abbreviation: it names no family in full. 62 of

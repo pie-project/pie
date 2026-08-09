@@ -624,7 +624,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // end of the arena is refused nowhere and is the exact defect
     // `tests/device.rs` shows corrupting a neighbour. Both change this sum.
     assert_eq!(
-        total, 2_368_916_160,
+        total, 2_964_655_200,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -1335,9 +1335,12 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     //
     // Was 710, all of them `rms_single_row`'s reduction axis. The other 400
     // are the two paged decodes, which could not be planned at all until the
-    // walk started stating the model's geometry.
+    // walk started stating the model's geometry. Then 1788, and now 2220: the
+    // 432 added are the three routed matvecs, which began stating
+    // `out_vec_size` when the geometry stopped dividing the rectangle's width
+    // by a guessed expert count.
     assert_eq!(
-        overridden, 1788,
+        overridden, 2220,
         "a different number of rectangles states its own extent"
     );
     // `head_param` and `heads_param` fired ZERO times for as long as the walk
@@ -1425,8 +1428,17 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // grid can be the wrong size while being all of those things. Dropping
     // `dims_of`'s statement override changes no other assertion in this file
     // and changes this one, which is the whole reason it is stated.
+    //
+    // Was 60_245_642 while `Rule::RoutedQmv` divided the output rectangle's
+    // width by a guessed four experts. Every MoE text in this tree routes to
+    // EIGHT, so that guess asked for twice the workgroups the shader needed,
+    // and 11.2 million of the number above were workgroups that started, found
+    // `out_row >= out_vec_size`, and returned. The count going DOWN is the
+    // evidence the guess was wrong in the safe direction here; it is the other
+    // direction -- a text routing to fewer than four -- that the guess would
+    // have answered with silence and stale arena bytes.
     assert_eq!(
-        workgroups, 35_504_450,
+        workgroups, 49_063_562,
         "the plans dispatch a different amount of work"
     );
     // The third dimension was 1 across every text until the paged decodes
@@ -1519,6 +1531,7 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
     // keep in step for no gain -- nothing below reads any field but `params`.
     let mut low = texts().swap_remove(0).1;
     let mut rows = 0u32;
+    let mut refused_rows = 0u32;
     let mut named = std::collections::BTreeMap::<String, u32>::new();
     for sig in kernels_vulkan::KERNELS {
         let wanted: Vec<Source> = sig
@@ -1571,6 +1584,31 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
             push_offsets: (0..words).map(|i| i * 4).collect(),
             block_bytes: vec![None],
         };
+        // A row wanting a STRIDE is refused, and that is the answer this
+        // driver owes it. Both strides mean "walk the cache with no page
+        // table", and the pool is `[page, token, head, dim]`: handing them
+        // over makes the dispatch succeed against the wrong tokens, with
+        // nothing out of bounds for `robustBufferAccess` to catch. Checked
+        // here as well as in the unit tests because this is the sweep that
+        // walks the SHIPPED table -- a row added tomorrow that names a
+        // stride is refused, or this fails.
+        if wanted
+            .iter()
+            .any(|s| matches!(s, Source::KvHeadStride | Source::KvSeqStride))
+        {
+            let why = driver_vulkan::binding::scalars(sig, &low, &launch, &declared, &store)
+                .expect_err("a contiguous stride is refused, not answered");
+            assert!(
+                matches!(why, driver_vulkan::binding::Misplaced::Contiguous { .. }),
+                "`{}` is refused for the reason it should be: {why:?}",
+                sig.symbol
+            );
+            refused_rows += 1;
+            for src in wanted {
+                *named.entry(format!("{src:?}")).or_default() += 1;
+            }
+            continue;
+        }
         let got = driver_vulkan::binding::scalars(sig, &low, &launch, &declared, &store)
             .unwrap_or_else(|e| panic!("`{}`: {e:?}", sig.symbol));
         let bytes = match got {
@@ -1606,6 +1644,15 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
     // stops being written and the shader reads whatever the statement left
     // in that slot.
     assert_eq!(rows, 6, "a different number of rows names a pool number");
+    // Three of the six ROWS walk the cache contiguously -- `kv_append`,
+    // `sdpa_vector_decode` and `sdpa_vector_decode_swa`. (The strides appear
+    // five times each in the tally below because a row names both a key and a
+    // value stride; this counts rows.) The other three name only `KvPageSize`
+    // and are answered.
+    assert_eq!(
+        refused_rows, 3,
+        "a different number of rows walks the cache with no page table"
+    );
     assert_eq!(
         named,
         [

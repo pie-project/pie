@@ -40,7 +40,7 @@ use clap::Args;
 use model_loader::checkpoint::read::parse_checkpoint_metadata;
 use model_loader::checkpoint::write::CheckpointWriter;
 use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
-use model_loader::contract::materialize::materialize_contract;
+use model_loader::contract::materialize::{Materialization, materialize_contract};
 use model_loader::executor::Progress;
 use model_loader::executor::sink::TensorSink;
 use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
@@ -189,8 +189,21 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         }
     }
 
-    let materialization =
+    let mut materialization =
         materialize_contract(&metadata).map_err(|err| anyhow!("cannot convert: {err}"))?;
+    // Before the counts are printed, so a `--dry-run` reports what a real run
+    // would write. See `declares_tied_head`.
+    if declares_tied_head(&source) {
+        let dropped = drop_tied_head(&mut materialization);
+        for name in &dropped {
+            println!(
+                "convert: dropping `{name}` — this checkpoint declares \
+                 `tie_word_embeddings`, so its head IS the embedding and a \
+                 catalog row that spells the tie as the tensor's absence \
+                 cannot identify an artifact that carries it"
+            );
+        }
+    }
     println!(
         "convert: decode {} blocked tensor(s) to plain dtypes, copy {} through",
         materialization.decoded.len(),
@@ -700,6 +713,74 @@ fn tokenizer_path(source: &Source) -> Option<PathBuf> {
 /// `Ok(None)` when there is no `config.json` — a lone `.gguf` carries its
 /// metadata in its own header, and a directory without one is a weights-only
 /// checkpoint.
+/// Whether the source declares its output head TIED to the embedding.
+///
+/// # Why the importer cares
+///
+/// A tie means the model has no separate head: the forward reads the embedding
+/// table transposed. HuggingFace nonetheless ships a materialized
+/// `lm_head.weight` beside it in every stock Qwen3 export — byte for byte the
+/// same tensor as `model.embed_tokens.weight` — and `catalog::identify` spells
+/// a tie as the ABSENCE of that name (`crates/model/src/catalog.rs`), so the
+/// artifact is refused by the one row that describes it:
+///
+///     matches no catalog row: qwen3-0.6b: unexpected lm_head
+///
+/// with every other name and every extent agreeing. Carrying the duplicate
+/// through therefore costs the artifact its identity, and the weight it buys
+/// is one nothing reads.
+///
+/// The config is the authority and the byte comparison is not needed: if the
+/// checkpoint declares the head tied then the forward uses the embedding,
+/// whatever those bytes happen to hold. A checkpoint that meant them to differ
+/// would be one that did not declare the tie.
+fn declares_tied_head(source: &Source) -> bool {
+    if source.path.is_file() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read(source.path.join("config.json")) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.get("tie_word_embeddings")
+                .or_else(|| v.get("text_config")?.get("tie_word_embeddings"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// The names a tied checkpoint materializes for a head it does not have.
+const TIED_HEAD_NAMES: [&str; 2] = ["lm_head.weight", "lm_head.bias"];
+
+/// Removes a materialized tied head from every set that would write it.
+///
+/// Returns what was dropped, which is what the caller reports. Both sets are
+/// swept and the contract with them: a head stored as F16 lands in `decoded`
+/// with a `TensorContract` behind it, and one stored as BF16 lands in
+/// `passthrough`, so removing it from only the set this checkpoint happened to
+/// use would work until the next checkpoint chose the other width.
+fn drop_tied_head(materialization: &mut Materialization) -> Vec<String> {
+    let mut dropped = Vec::new();
+    let mut take = |set: &mut Vec<String>| {
+        set.retain(|name| {
+            let keep = !TIED_HEAD_NAMES.contains(&name.as_str());
+            if !keep {
+                dropped.push(name.clone());
+            }
+            keep
+        });
+    };
+    take(&mut materialization.decoded);
+    take(&mut materialization.passthrough);
+    materialization
+        .contract
+        .tensors
+        .retain(|t| !TIED_HEAD_NAMES.contains(&t.name.as_str()));
+    dropped
+}
+
 pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
     if source.path.is_file() {
         return Ok(None);
@@ -1018,5 +1099,89 @@ mod tests {
         let junk = dir.path().join("junk.zt");
         std::fs::write(&junk, b"not a zt file").unwrap();
         assert!(staleness(&junk, "0.1.0", "qwen/qwen3-0.6b").is_some());
+    }
+
+    /// A source is asked about its tie by reading its config, not its tensors.
+    #[test]
+    fn a_tie_is_read_off_the_config_that_declares_it() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let at = |json: &str| {
+            std::fs::write(dir.path().join("config.json"), json).expect("write");
+            declares_tied_head(&Source {
+                path: dir.path().to_path_buf(),
+                name: "x".into(),
+                origin: "x".into(),
+            })
+        };
+        assert!(at(r#"{"tie_word_embeddings": true}"#));
+        assert!(!at(r#"{"tie_word_embeddings": false}"#));
+        // Silence is not a tie: an untied checkpoint whose head was dropped is
+        // a model with no output layer.
+        assert!(!at(r#"{"hidden_size": 1024}"#));
+        // Multimodal configs nest the text model's flags, and the tie is the
+        // TEXT model's.
+        assert!(at(r#"{"text_config": {"tie_word_embeddings": true}}"#));
+        // Unparseable is not a tie either. Nothing is dropped on a guess.
+        assert!(!at("{not json"));
+        // A single file has no snapshot to read, so it declares nothing.
+        assert!(!declares_tied_head(&Source {
+            path: dir.path().join("model.safetensors"),
+            name: "x".into(),
+            origin: "x".into(),
+        }));
+    }
+
+    /// The head is dropped from every set that would write it, at either width.
+    ///
+    /// Both sets are swept because the width decides which one the head lands
+    /// in: a BF16 head passes through and an F16 head is decoded to BF16 with a
+    /// `TensorContract` behind it. Sweeping only the set a Qwen3 export happens
+    /// to use would work until a checkpoint chose the other one.
+    #[test]
+    fn a_tied_head_is_dropped_from_every_set_that_would_write_it() {
+        use model_loader::contract::{Expr, ModelContract, TensorContract};
+
+        let head = |name: &str| {
+            TensorContract::new(
+                name,
+                Expr::src(name).cast(Encoding::Raw(DType::BF16)),
+                vec![151936, 1024],
+                Encoding::Raw(DType::BF16),
+            )
+        };
+        let mut m = Materialization {
+            contract: ModelContract {
+                alignment: 1,
+                tensors: vec![head("lm_head.weight"), head("model.norm.weight")],
+                groups: Vec::new(),
+            },
+            decoded: vec!["lm_head.weight".into(), "model.norm.weight".into()],
+            passthrough: vec!["lm_head.bias".into(), "model.embed_tokens.weight".into()],
+            meta: vec!["pie.meta/x".into()],
+        };
+        let mut dropped = drop_tied_head(&mut m);
+        dropped.sort();
+        assert_eq!(dropped, ["lm_head.bias", "lm_head.weight"]);
+        assert_eq!(m.decoded, ["model.norm.weight"]);
+        assert_eq!(m.passthrough, ["model.embed_tokens.weight"]);
+        assert_eq!(
+            m.contract
+                .tensors
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["model.norm.weight"],
+            "a dropped tensor must not be left with a contract that names it"
+        );
+        // The embedding is what the tie points AT, so dropping the head must
+        // never take it -- an artifact without it has no model at all.
+        assert!(
+            m.passthrough
+                .contains(&"model.embed_tokens.weight".to_string())
+        );
+        assert_eq!(m.meta, ["pie.meta/x"], "metadata is not a weight");
+        // Idempotent: a second sweep finds nothing, so a re-import of an
+        // artifact this already cleaned reports no drops.
+        assert!(drop_tied_head(&mut m).is_empty());
     }
 }

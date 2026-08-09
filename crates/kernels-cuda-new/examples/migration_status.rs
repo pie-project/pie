@@ -1001,9 +1001,26 @@ pub static CLASSIFIED: &[Refusal] = &[
     Refusal { symbol: "attn::compact_page_csr", class: Class::Structural(Wall::TwoLaunches),
         consumer: Consumer::TestOnly { cite: Cite { at: "crates/driver-cuda/tests/page_mask_parity.rs:128", names: "compact_page_csr" } },
         why: "`count_kept` then `scan_and_scatter`; a row for either states half a contract" },
-    Refusal { symbol: "norm::rmsnorm_bf16_with_fp16", class: Class::Structural(Wall::TwoLaunches),
-        consumer: Consumer::TestOnly { cite: Cite { at: "crates/kernels-cuda-new/tests/layers.rs:489", names: "norm::rmsnorm_bf16_with_fp16" } },
-        why: "unaligned rows fall back to `rmsnorm_bf16` PLUS `quant::bf16_to_fp16`; `norm/rmsnorm.cu:50-53` says so" },
+    // `norm::rmsnorm_bf16_with_fp16` STOOD HERE AND IT IS MIGRATED. Its
+    // `why` was: *"unaligned rows fall back to `rmsnorm_bf16` PLUS
+    // `quant::bf16_to_fp16`; `norm/rmsnorm.cu:50-53` says so"*, its consumer
+    // `crates/kernels-cuda-new/tests/layers.rs:489`, its wall
+    // `Wall::TwoLaunches`. Every word of that is still true about the KERNEL;
+    // what changed is that a two-launch op is no longer unstatable.
+    //
+    // §5 step 5 took `norm` into fn-world and this symbol is the FIRST
+    // `Composed` two-call body in the tree -- `.wiki/kernel-x/northstar.md`
+    // §5.1 names it as written-and-unproven and says `norm` and `ssm` prove
+    // it first. `x::norm::rmsnorm_bf16_with_fp16` is a Rust `fn`: three arms,
+    // and the middle one launches `norm::rmsnorm_bf16` and then
+    // `quant::bf16_to_fp16` on the same stream. A `fn` states two launches
+    // by BEING two launches, which is what `Wall::TwoLaunches` said no row
+    // could do.
+    //
+    // The other three `TwoLaunches` rows above are `gemm::`'s and one
+    // `attn::`'s; they are unaffected and stay. This one is deleted rather
+    // than reclassified because there is no wall left: the op is hosted, it
+    // is bound, and it fires.
 
     // ── C: the text is not split yet ─────────────────────────────────────
     // `attn::attn_score_fold_heads` WAS HERE, and its departure is the
@@ -1261,6 +1278,17 @@ fn assert_total(refused: &BTreeSet<&str>, rows: usize, migrated: usize, library:
     //    `driver-cuda/src/fire/{rmsnorm,dsv4_hc,rope}.rs` and twelve of their
     //    device rows were renamed for the same reason (`families/rope.rs`'s
     //    `ROPE_SIGS` doc has the table).
+    //
+    //    ALL THREE OF THOSE `fire/` FILES ARE DELETED. §5 step 5 moved their
+    //    host programs into `x::rope` and `x::norm`, and the walks they were
+    //    walked by are deleted with them -- so the seventeen is falling, not
+    //    because the drift was fixed but because the rows on the wrong side
+    //    of it are leaving the row world entirely. `execution::execution`
+    //    answers `None` for a symbol with no `Walk` and no `RUST_SERVED`
+    //    entry, and the loop below `continue`s on `None`, so a migrated
+    //    family is silently out of this assertion's reach. That is the real
+    //    reason the seventh wall is still worth adding: it is the only thing
+    //    that would have COUNTED them on the way out.
     //
     //    What closes it is a `Wall` whose `kind_of_wall` is `Kind::Op` and
     //    that is HONEST about these: not `SchemeSwitch` (four of the fifteen

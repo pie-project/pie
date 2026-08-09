@@ -103,9 +103,31 @@ fn walk_ext(dir: &Path, root: &Path, ext: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Every `src/**.cu` in the archive, as a path relative to `csrc`.
+///
+/// # The floor is `>= 1`, and it was `> 40`
+///
+/// `> 40` was measured when 71 `.cu` files were on disk, and it is the shape
+/// `a_split_file_uses_the_header_it_was_split_into` already corrected in its
+/// own guard: *"A guard against a vacuous pass must not be satisfiable only
+/// while the thing it guards is broken."* This population SHRINKS BY
+/// DELETION as the migration finishes — 71, then 40, then 16, and 15 with
+/// `attn/kv_paged.cu` gone — so a fixed floor asserts that the work is
+/// incomplete and goes red on its own success. It had already: the tree
+/// passed under 40 several passes before this one.
+///
+/// What the guard is actually for is one failure and it is binary. `walk_ext`
+/// takes a path, and a path that stops resolving yields an empty vector and
+/// makes every caller below pass by iterating nothing — the §21.2 failure
+/// this file names twice. `>= 1` catches exactly that and nothing else,
+/// which is all the walk can honestly claim.
 fn cu_on_disk() -> Vec<String> {
     let out = sources_with("cu");
-    assert!(out.len() > 40, "the walk found almost nothing: {out:?}");
+    assert!(
+        !out.is_empty(),
+        "the walk under `csrc/src` found no `.cu` at all, so every check \
+         below iterates an empty set and passes without looking"
+    );
     out
 }
 
@@ -1012,9 +1034,9 @@ fn no_file_lost_a_launch_in_the_split() {
     //     `attn::kimi_split_q_b_bf16` joined `kimi_split_kv_a_norm_bf16` in
     //     `JIT_DISPATCHED`; the file's own header predicted this deletion
     //     and named the measurement that would land it.
-    //   * `attn/attention_naive_paged.cu` — 2 of 2, DEAD. The FILE STAYS and
-    //     holds no `<<<>>>`, on the `attn/attention_xqa.cu` precedent: its
-    //     `static_assert`s are the only place `KvCacheScheme`/`DType` are
+    //   * `attn/attention_naive_paged.cu` — 2 of 2, DEAD. The FILE STAYED and
+    //     held no `<<<>>>`, on the `attn/attention_xqa.cu` precedent: its
+    //     `static_assert`s were the only place `KvCacheScheme`/`DType` were
     //     compared with the `device::KvScheme`/`KvDType` mirrors NVRTC
     //     reads, and deleting launchers does not make mirrors agree. The
     //     `.hpp` is deleted. `attention_naive_paged_bf16` had no row at all
@@ -1022,6 +1044,18 @@ fn no_file_lost_a_launch_in_the_split() {
     //     dequantised first, so the two went together — and with them the
     //     archive's last call to `dequant_kv_cache_layer_to_bf16_active`
     //     outside `driver-cuda/csrc/`.
+    //     THE FILE IS NOW DELETED TOO and the sentence above is why it took a
+    //     separate pass: the condition it set for itself was a REPLACEMENT for
+    //     that comparison, not the observation that the launchers were dead.
+    //     `crates/driver-cuda/tests/enum_mirrors.rs` is that replacement and
+    //     it compares the pair that can actually renumber a page — Rust
+    //     against the `.cuh` — where the `static_assert`s compared host C++,
+    //     which under NVRTC no longer reaches a launch. Writing it found two
+    //     `DType` enumerators, `MXFP4_PACKED` and `E8M0`, that the device
+    //     mirror never had. `kernels-cuda/csrc/CMakeLists.txt` carries the
+    //     evidence block, including the ONE assert the replacement does not
+    //     reproduce (`MAX_HEAD_DIM == BLOCK * 8`) and the argument that its
+    //     premise had already expired.
     //   * `attn/split_packed.cu` — 1 of 2, DEAD. `attn::split_qkv_bf16` is
     //     routed; `split_qkv_bf16_devwin` stays, because no device row
     //     states its instantiation and its shim entry is still reached.
@@ -1280,7 +1314,9 @@ fn no_file_lost_a_launch_in_the_split() {
     //     `ffi::pie_k_layout_*` arm, calls `fire::envelope::seed_empty` with
     //     its own signature unchanged.
     //   * `attn/kv_paged.cu` (16 -> 8) — FILE SURVIVES, and the reason is
-    //     named below rather than left as a number. Three launchers moved:
+    //     named below rather than left as a number. **THAT `SURVIVES` IS
+    //     SUPERSEDED: the pass at `EXPECTED` below took the file to 0 and
+    //     deleted it, with `attn/kv_paged.hpp`.** Three launchers moved:
     //     `write_kv_to_pages_bf16` (2, no `table` row of its own — a C++
     //     helper, so no shim entry to drop), `write_kv_to_pages` (4) and
     //     `write_kv_explicit_bf16` (2). The last two are LIVE `table::attn`
@@ -1409,7 +1445,196 @@ fn no_file_lost_a_launch_in_the_split() {
     // are `dequant_kv_cache_layer_to_bf16_active` in `attn/kv_paged.cu`, with
     // four live C++ callers in `crates/driver-cuda/csrc/attn/
     // attention_flashinfer.cu`, a directory off limits to this migration.
-    const EXPECTED: usize = 4;
+    //
+    // ── ZERO. `attn/kv_paged.cu` IS DELETED AND THE CENSUS IS CLOSED ─────
+    //
+    // Walked fresh over the tree as it stands, by this function's own rule,
+    // never as a delta:
+    //
+    //   attn     0 across 14    moe      0 across  1
+    //   comm/gemm/layout/norm/rope/sample/ssm/vision: no `.cu` at all
+    //
+    //                                          TOTAL    0 across 15
+    //
+    // `-4 launches, -1 file`, and it is the last `-4` there is to take. The
+    // paragraph above named the exact thing holding the floor — four live C++
+    // callers in `driver-cuda/csrc/attn/attention_flashinfer.cu` — and that
+    // file is deleted, along with the whole of `driver-cuda/csrc/`. The four
+    // call sites are `driver-cuda/src/bind/service.rs`' four FA2 entry points
+    // calling `fire::kv_paged::dequant_kv_cache_layer_to_bf16_active`, which
+    // fires the same four kernels through NVRTC out of the same
+    // `kernels-cuda-new/csrc/src/attn/kv_paged.cuh` the archive compiled.
+    //
+    // `attn/kv_paged.hpp` went with it, and the symbol is
+    // `execution::RUST_SERVED` — classified `Execution::Walk` with
+    // `Control::Switch { on: "layer.scheme" }` first — so `emit_c_shim` emits
+    // no `pie_k_` entry for a launcher that no longer exists. The ROW is
+    // live and unchanged: `model-compiler/src/dsl.rs:7750` states it and
+    // `emit_rust_dispatch` still writes its arm.
+    //
+    // WHAT ZERO DOES AND DOES NOT MEAN. It does not mean no kernel launches;
+    // it means **no launch is issued from C++ in this tree**. Every one is
+    // issued by `driver-cuda` through `kernels_cuda_new::runtime`, against a
+    // `__global__` NVRTC compiled from a `.cuh`.
+    //
+    // AND IT IS ZERO OVER `.cu` FILES, WHICH IS NOT THE SAME AS ZERO OVER
+    // WHAT NVCC COMPILES. `sources_with("cu")` opens `.cu` and nothing else,
+    // so a launch in an INCLUDED header is outside this count by
+    // construction, and there are two of them: this crate's
+    // `attn/attention_mla.cu:17` includes
+    // `kernels-cuda-new/csrc/src/attn/attention_mla_naive.cuh`, whose host
+    // launchers fire `mla_naive_paged_kernel` at `:266` and
+    // `mla_mma_paged_kernel` at `:725`. Both are reachable from nvcc through
+    // that one include and through no other -- measured, that header has
+    // exactly one includer in either `csrc` tree.
+    //
+    // They are NOT counted here and they are NOT this pass's: `attention_mla`
+    // and its header belong to the pass that is porting the XQA and MLA
+    // launchers, and a count that reached into another pass's files to make
+    // its own number look rounder would be the same dishonesty as widening a
+    // scan to hide a deleted root. The number this file states is the number
+    // this file measures. The tree reaches nvcc-zero when that header's two
+    // launchers land in Rust, and `attn/attention_mla.cu` -- the only
+    // translation unit that can reach them -- is deleted with them.
+    //
+    // The `.cu` files that remain hold zero `<<<>>>` each, which is why the
+    // total is the same whether they are deleted or not, and the set is
+    // shrinking under that other pass as this is written, so it is
+    // deliberately not enumerated here: a list of filenames in a comment is
+    // a second census that can disagree with the first. `files` in the
+    // message below is the live count and needs no help.
+    //
+    // A `.cu` with no launch is a translation unit awaiting a reason to
+    // exist, not a hole in this count.
+    //
+    // THE ASSERTION BELOW CHANGES MEANING WITH THIS NUMBER, and that is
+    // deliberate rather than a weakening. At 401 and at 4 it caught a DROP —
+    // a split that moved device text out and took a host launcher with it,
+    // which compiles, links and silently stops launching. At 0 there is
+    // nothing left to drop, so what it catches is a RISE: a `<<<>>>`
+    // reappearing in this archive at all. Whoever adds one is adding nvcc
+    // back, and this line is where that argument has to be made.
+    // ── TWO. THE COUNT RISES AND NO LAUNCH WAS ADDED ────────────────────
+    //
+    // Walked fresh over the tree as it stands, by this function's own rule,
+    // never as a delta:
+    //
+    //   attn     2 across  8    moe      0 across  1
+    //   comm/gemm/layout/norm/rope/sample/ssm/vision: no `.cu` at all
+    //
+    //                                          TOTAL    2 across  9
+    //
+    // `+2 launches, -6 files`, and the two halves of that have nothing to do
+    // with each other.
+    //
+    // THE `-6` FIRST, because it is the ordinary half. `attn` went 14 -> 8:
+    // `attention_flashinfer_hd{64,128,256,512}.cu` (13 lines each, a single
+    // `template struct AttnHd<N>;` apiece, replaced by `families::fa2`'s 56
+    // units), `attention_merge_states.cu` (47) and
+    // `attention_flashinfer_hopper.cu` (392). Every one contributed ZERO to
+    // this total on arrival and zero on departure, so the launch count could
+    // not move and did not.
+    //
+    // THE `+2`, WHICH IS THE ENTRY WORTH READING. **No launch was written,
+    // duplicated, or restored. Two that this census could not see became
+    // visible to it.** The paragraph above this one predicted them by name:
+    //
+    // > a launch in an INCLUDED header is outside this count by construction,
+    // > and there are two of them: this crate's `attn/attention_mla.cu:17`
+    // > includes `kernels-cuda-new/csrc/src/attn/attention_mla_naive.cuh`,
+    // > whose host launchers fire `mla_naive_paged_kernel` at `:266` and
+    // > `mla_mma_paged_kernel` at `:725`.
+    //
+    // That header is now DEVICE TEXT ONLY — two `__global__`s, zero `<<<>>>`,
+    // NVRTC-clean at `sm_89` under this tree's numerics contract — and its
+    // four host functions (`mma_detail::smem_bytes`, `mla_mma_supported`,
+    // `launch_mla_mma_paged_raw`, `launch_mla_naive_paged_raw`) are in
+    // `attn/attention_mla.cu:48-200`, the only translation unit that ever
+    // reached them. The launches did not move ACROSS the nvcc boundary; they
+    // moved DOWN to the side of it they were always on.
+    //
+    // So the honest reading of the previous entry is that **`0` was under by
+    // two**, and the reason is scope rather than arithmetic: `sources_with
+    // ("cu")` was a correct classifier for the entire life of this tree —
+    // a `.cuh` under `kernels-cuda-new/csrc` is device text carried into
+    // NVRTC, and device text does not launch — and it stopped being one the
+    // moment a `.cuh` grew a launcher. A measured premise that names its
+    // evidence can still expire, and the evidence is what has to be
+    // re-checked, not the conclusion. The repair was to move the launchers
+    // into the file this census already opens, NOT to widen the scan:
+    // widening was available and would have bought a bigger number over a
+    // tree that still hid host code in a header.
+    //
+    // WHAT IT WOULD TAKE TO GET BACK TO ZERO, precisely, because "port the
+    // launchers" is not it — they ARE ported, at
+    // `driver-cuda/src/fire/mla_naive.rs`, with both grids cited and the
+    // `std::call_once` opt-in answered by `runtime::module::
+    // raise_dynamic_smem_cap`. What holds `attn/attention_mla.cu` on disk is
+    // its OTHER arm: `dispatch_attention_mla_bf16` is one row with two, and a
+    // row loses its shim entry whole or not at all. The FA2 arm calls
+    // `flashinfer::mla::BatchMLAPagedAttention<MASK, 512, 64>` passing one
+    // `MLAParams` BY VALUE, which needs `ArgValue::Bytes`, which
+    // `Args::bind` says only `x::Abi` produces. That capability is in
+    // flight in another crate and it clears XQA's `KVCacheList` at the same
+    // time. Until it lands, deleting this file would leave `emit_c_shim`
+    // writing a `pie_k_` entry with no definition — a link error, not a
+    // clean removal, which is the exact trap `kv_paged.cu` set and passed.
+    //
+    // THE ASSERTION BELOW CHANGES MEANING AGAIN, and back. At 401 and at 4 it
+    // caught a DROP. At 0 it caught a RISE — nvcc coming back. At 2 it is a
+    // FLOOR with a named holder, the shape this file has used four times
+    // before: the two are `attn/attention_mla.cu`'s and they leave when the
+    // `x::Abi` impl lands and the file does. A third would be new nvcc and
+    // has to be argued here.
+    // ── THREE. A FILE LEAVES AND THE COUNT DOES NOT MOVE ────────────────
+    //
+    // Walked fresh over the tree as it stands, by this function's own rule,
+    // never as a delta:
+    //
+    //   attn     2 across  7    moe      0 across  1
+    //   comm/gemm/layout/norm/rope/sample/ssm/vision: no `.cu` at all
+    //
+    //                                          TOTAL    2 across  8
+    //
+    // `+0 launches, -1 file`. `attn/attention_naive_paged.cu` is DELETED, and
+    // it is the only file this archive has lost that contributed nothing to
+    // this count at either end AND had no host program to name on the way out
+    // — it held no launcher, no launch and no `__global__`. Its content was
+    // two `static_assert` blocks, and what replaces it is a CHECK:
+    // `crates/driver-cuda/tests/enum_mirrors.rs`. The full argument, the one
+    // assert the replacement does not reproduce, and both halves of its
+    // consumer set are in `kernels-cuda/csrc/CMakeLists.txt`; the entry at
+    // `attn/attention_naive_paged.cu` in the list above is amended in place.
+    //
+    // THE ONE SENTENCE ABOVE THAT HAS EXPIRED, corrected rather than edited
+    // away, because what it got wrong is the shape of the remaining work and
+    // not the conclusion. The `TWO` entry says the `ArgValue::Bytes`
+    // capability *"is in flight in another crate and it clears XQA's
+    // `KVCacheList` at the same time."* **It has landed** —
+    // `kernels-cuda-new/src/x/xqa.rs` holds the `KvCacheList` mirror, a
+    // `by_value!` whose size, alignment and five offsets were MEASURED out of
+    // NVRTC's PTX rather than read off the declaration, and the `Abi` impl
+    // that produces the variant. `EXPECTED` is still 2 and the holder is
+    // still `attn/attention_mla.cu`, so the correction changes the reason and
+    // not the number:
+    //
+    //   * XQA needed the floor AND the six-member enrolment on top of it —
+    //     `unit!`, `contract!` and `bind!` for `families::attn::XQA_LATTICE`,
+    //     which `x/xqa.rs`'s own header says *"belong here too and are yours
+    //     to add"* and which are not written. Until they are,
+    //     `attn::attention_xqa_decode_bf16_prepared` states `operands`, is in
+    //     neither `JIT_DISPATCHED` nor `RUST_SERVED`, and keeps a `pie_k_*`
+    //     entry that the six `attention_xqa*.cu` are the definition of.
+    //   * MLA needs the same three plus a `by_value!` for `MLAParams`, which
+    //     is the HARDER mirror: `KVCacheList<true>` is four pointers and a
+    //     `uint32_t` with no nested aggregate, while `MLAParams` embeds two
+    //     `uint_fastdiv`s — 24 bytes each where the declaration reads like
+    //     one `u32`, per `x/xqa.rs`'s own table of transcription traps.
+    //
+    // So the blocker moved from a missing capability to an unwritten
+    // registration, in a directory this pass does not own. Neither is a
+    // reason to widen this scan or to move the number.
+    const EXPECTED: usize = 2;
     assert_eq!(
         total, EXPECTED,
         "the tree executes {total} launches across {files} files, not {EXPECTED}. \
@@ -1524,7 +1749,12 @@ fn pinned(text: &str, file: &str, line: usize, want: &str, what: &str) {
 /// * `attn/attention_flashinfer_hopper.cu` —
 ///   `PIE_CUDA_DISABLE_HOPPER_EXTENDED` answered a CAPABILITY per launch.
 ///   Folded to a constant that names its default, `true`, which is exactly
-///   what an unset variable meant.
+///   what an unset variable meant. **The file itself is now deleted too** —
+///   392 lines of FA3/sm_90 prefill funnel, unreachable by call graph and not
+///   merely by a flag — so this test no longer checks it, and the capability
+///   is prose on `driver-cuda/src/fire/flashinfer_fa2_dispatch.rs`'s
+///   `Decline::Sm90Unported` rather than a constant anywhere. The loop below
+///   says so at the name's old position.
 /// * `comm/custom_all_reduce.cu` — three `getenv` helpers that took the
 ///   variable's name as a parameter and that nothing called. **The file
 ///   itself is now deleted too** — 664 lines with zero `__global__` and zero
@@ -1595,7 +1825,31 @@ fn the_audited_launchers_read_no_environment_variable() {
         // wide-exponent disagreements) in its own doc comment so the next
         // reader meets it where the decision is made. Nothing here is a
         // weaker claim about the OTHER two files.
-        "attn/attention_flashinfer_hopper.cu",
+        // `attn/attention_flashinfer_hopper.cu` was the second name in this
+        // list and is DELETED — 392 lines, the FA3/sm_90 prefill funnel — so
+        // this test can no longer read it, and reading a deleted file is a
+        // panic rather than a failure, which is why the name had to come out
+        // rather than be left as documentation.
+        //
+        // ITS §36 FINDING IS NOT DROPPED, it is out of scope the way
+        // `gemm/gemv.cu`'s two are, and it moved further than they did.
+        // `PIE_CUDA_DISABLE_HOPPER_EXTENDED` became `constexpr bool
+        // kHopperExtendedShapes = true` in that file, and now it is prose on
+        // `driver-cuda/src/fire/flashinfer_fa2_dispatch.rs`'s
+        // `Decline::Sm90Unported` — the refusal that stands where the file
+        // stood. Everything the pin below used to hold is stated there:
+        // that `true` is exactly `getenv(...) == nullptr` because nothing in
+        // this repository ever set the variable; that a capability answered
+        // per launch is answered too late to be refusable; that the
+        // `set_hopper_extended_shapes(bool)` seam was written and WITHDRAWN
+        // for having no caller; and the one real run the predicate was worth
+        // (gemma-4-26B-A4B at 1k context, attention 4.19 ms -> 2.73 ms,
+        // 122.5 -> 144.1 tok/s, output unchanged).
+        //
+        // The `.cpp` stub below is what is left of that pair on disk, and it
+        // takes the loop's place rather than emptying it: a `for` over an
+        // empty array is a test that passes by having nothing to check.
+        "attn/attention_flashinfer_hopper_stub.cpp",
         // `comm/custom_all_reduce.cu` was the second name here and is
         // DELETED. Its three `getenv` helpers took the variable's name as a
         // parameter and NOTHING CALLED THEM, so there was no finding to
@@ -1641,105 +1895,54 @@ fn the_audited_launchers_read_no_environment_variable() {
     // Rust. Re-pinning them wants a test that lives beside them; this one
     // deliberately does not grow a second root to reach across.
 
-    // The capability that replaced the Hopper read: a constant that names its
-    // default, pinned, and still consulted. A constant nothing reads is a
-    // fact nothing is bound by, so the call site is checked too.
-    let hopper = read_src("attn/attention_flashinfer_hopper.cu");
-    pinned(
-        &hopper,
-        "attn/attention_flashinfer_hopper.cu",
-        179,
-        "constexpr bool kHopperExtendedShapes = true;",
-        "`the deleted PIE_CUDA_DISABLE_HOPPER_EXTENDED`",
-    );
-    assert!(
-        code_lines(&hopper)
-            .any(|(_, l)| l.contains("if (!hopper_extended_shapes_enabled())")),
-        "attn/attention_flashinfer_hopper.cu states the capability but no \
-         longer asks it; a default nothing reads binds nothing"
-    );
-    assert!(
-        env_reads(&read_src("attn/attention_flashinfer_hopper_stub.cpp")).is_empty(),
-        "the hopper stub must not read the environment either"
-    );
+    // THE HOPPER CAPABILITY PIN WAS HERE AND IS GONE WITH ITS FILE. It read
+    //
+    //     pinned(&hopper, "attn/attention_flashinfer_hopper.cu", 179,
+    //            "constexpr bool kHopperExtendedShapes = true;", ...)
+    //
+    // plus a check that `if (!hopper_extended_shapes_enabled())` still asked
+    // it, on the rule that a constant nothing reads binds nothing. Both are
+    // unpinnable now for the same reason the two `gemv.cu` pins above are:
+    // the subject is not in this crate. The constant did not become a Rust
+    // constant either — it became an ARGUMENT, on
+    // `fire::flashinfer_fa2_dispatch::Decline::Sm90Unported`, because the
+    // capability it answered has no live caller to answer for. Re-pinning it
+    // wants a test that lives beside that enum; this one deliberately does
+    // not grow a second root to reach across.
+    //
+    // The stub `.cpp`'s `env_reads` check is NOT gone: it moved into the loop
+    // above, where it is now the only live member. It was asserted twice
+    // otherwise, and a duplicated assertion is a second census.
 }
 
-/// `PIE_GRAPH_STATS` prints, and decides nothing.
-///
-/// This one is NOT deleted, and the audit that deleted the other five says so
-/// on purpose: a diagnostic that only writes to stderr changes no kernel, no
-/// grid and no byte, so it is not a selector and there is nothing to make
-/// reproducible. What would make it one is a line inside its block that
-/// touched the decision it reports on — and the decision is right there,
-/// `enable_cuda_graph = false`, six lines above.
-///
-/// So the guard is not "no `getenv` in this file". It is: exactly one, it
-/// names `PIE_GRAPH_STATS`, and its block assigns nothing.
-#[test]
-fn the_graph_stats_environment_read_only_prints() {
-    let rel = "attn/attention_flashinfer.cu";
-    let text = read_src(rel);
-    let reads = env_reads(&text);
-    assert_eq!(
-        reads.len(),
-        1,
-        "{rel} should read the environment exactly once — the `PIE_GRAPH_STATS` \
-         diagnostic — and reads it {} times:\n{}",
-        reads.len(),
-        reads.join("\n")
-    );
-    assert!(
-        reads[0].contains("PIE_GRAPH_STATS"),
-        "{rel}'s one environment read is no longer the graph-stats diagnostic:\n{}",
-        reads[0]
-    );
-
-    // Brace-match the guarded block and assert it only prints. `enable_cuda_graph`
-    // is the demotion this block REPORTS; the moment it also performs it, a
-    // diagnostic has become a selector.
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| !l.trim_start().starts_with("//") && l.contains("getenv"))
-        .expect("the read was just found");
-    let mut depth = 0i32;
-    let mut end = start;
-    let mut opened = false;
-    for (i, line) in lines.iter().enumerate().skip(start) {
-        depth += line.matches('{').count() as i32;
-        depth -= line.matches('}').count() as i32;
-        if line.contains('{') {
-            opened = true;
-        }
-        if opened && depth <= 0 {
-            end = i;
-            break;
-        }
-    }
-    assert!(opened && end > start, "the graph-stats block did not parse");
-    let body = &lines[start..=end];
-    for (offset, line) in body.iter().enumerate() {
-        let t = line.trim_start();
-        if t.starts_with("//") {
-            continue;
-        }
-        assert!(
-            !line.contains("enable_cuda_graph"),
-            "{rel}:{} — the `PIE_GRAPH_STATS` block touches `enable_cuda_graph`:\n  {}\n\
-             It is allowed to exist because it only writes to stderr. A \
-             diagnostic that decides anything is a selector, and a selector \
-             read from the environment is what §30 and §36 removed everywhere \
-             else in this tree.",
-            start + offset + 1,
-            line.trim()
-        );
-    }
-    assert!(
-        body.iter().any(|l| l.contains("fprintf")),
-        "{rel}'s graph-stats block no longer prints; if it stopped being a \
-         diagnostic, it stopped being exempt"
-    );
-}
+// `the_graph_stats_environment_read_only_prints` WAS HERE AND IS DELETED,
+// WITH THE FILE IT READ.
+//
+// It read `attn/attention_flashinfer.cu` through `read_src`, which joins
+// `csrc/src` — and that file left this crate for `driver-cuda/csrc/attn/` in
+// an earlier pass without the test following it, so the `read_src` `expect`
+// had been panicking on a missing path rather than checking anything. The
+// file is now deleted outright, with the whole of `driver-cuda/csrc/`, so
+// there is no path to repoint it at: it can never pass again.
+//
+// WHAT IT ASSERTED, so that nothing is lost by the deletion. Exactly one
+// `getenv` in the file; it names `PIE_GRAPH_STATS`; its brace-matched block
+// contains a `fprintf` and does NOT touch `enable_cuda_graph`. The rule
+// behind it is the one worth keeping and it is general, not this file's: a
+// diagnostic that only writes to stderr changes no kernel, no grid and no
+// byte, so it is not a selector; the moment it touches the decision it
+// reports on, it is one, and §30/§36 removed selectors read from the
+// environment everywhere in this tree.
+//
+// WHERE THE DECISION WENT. `enable_cuda_graph`'s demotion is
+// `driver-cuda/src/fire/flashinfer_fa2.rs::plan_prefill`, in Rust, and it
+// reads no environment variable at all — the graph-mode retry is a plan
+// failure re-planned eagerly, not a knob. So the property this test guarded
+// is now enforced by there being nothing to enforce it against, which is
+// the same way `comm/custom_all_reduce.cu`'s three `getenv` helpers left.
+//
+// The sibling above, `no_environment_variable_selects_a_kernel`, is
+// untouched and still walks its own list; it never named this file.
 
 /// Every arm of the two guards above, fired — each must FAIL.
 ///
@@ -1858,8 +2061,10 @@ fn the_environment_guard_fails_when_a_selector_comes_back() {
 /// build of the archive it is protecting.
 #[test]
 fn every_emitted_shim_entry_has_a_launcher() {
-    let mut tables = kernels_cuda_new::table::TABLES.to_vec();
-    tables.push(kernels_cuda_new::table::driver_internal::DRIVER_KERNELS);
+    // `table::driver_internal::DRIVER_KERNELS` was pushed here too, and is
+    // gone with that module: §5 step 5 made its six launchers `fn`s with no
+    // `contract!`, so no shim entry is emitted for them and none is wanted.
+    let tables = kernels_cuda_new::table::TABLES.to_vec();
     // `build.rs::shim` builds this list the same way, and the include list is
     // deliberately empty: `includes` only chooses `#include` lines, never
     // which rows get a body, so an empty one asks the emitter exactly the

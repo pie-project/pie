@@ -9,8 +9,12 @@
 //!
 //! `fire/attn_score.rs` and `fire/gemv.rs` each carry a private copy of this
 //! function; this is the same body, factored, so that the ported families
-//! (`fire::rmsnorm`, `fire::dsv4_hc`, and `rope` until it crossed to
-//! `kernels_cuda_new::x::rope`) do not add three more. **The resolution
+//! (`fire::rmsnorm` and `fire::dsv4_hc` until §5 step 5 took `norm` to
+//! `kernels_cuda_new::x::norm`, and `rope` until it crossed to
+//! `kernels_cuda_new::x::rope`) do not add three more. All three of those
+//! callers are gone now, which is the point of the paragraph below rather
+//! than a contradiction of this one: they did not stop needing the body,
+//! they moved to the copy that lives beside the `.cuh`. **The resolution
 //! order is the contract** — `unit_of`, then `unit.row`, then
 //! `cache::module`, then `Args::bind`, then `fire` — and a copy per call
 //! site is one place per copy for that order to drift.
@@ -80,6 +84,62 @@ pub fn fire(
     // put it in a `<<<>>>`.
     let stream = unsafe { Stream::from_runtime(stream) };
     if let Err(why) = module.fire(sig, launch, &mut args, stream) {
+        panic!("{symbol}: {why}");
+    }
+}
+
+/// Resolve one row through the JIT table and launch it with ONE
+/// `__grid_constant__` params struct.
+///
+/// [`fire`]'s sibling for the third shim mechanism. `families::fa2`'s 460 rows
+/// state **no operands** — not because they take none, but because each
+/// `__global__` takes exactly one argument, a params struct by value
+/// (`decode.cuh:618-621`, `prefill.cuh:3966-3967`), and
+/// [`kernels_cuda_new::Ty`] has no variant for a struct and must not grow one:
+/// a `Ty::Struct` would have to carry a layout, and the layout is
+/// [`kernels_cuda_new::fa2::params`]'s job, pinned by assertion, in one place.
+///
+/// So there is nothing for `Args::bind` to check and the resolution order is
+/// two steps shorter — `unit_of`, `cache::module`, `fire_raw`. The check that
+/// `Args::bind` would have made is made instead by `params`' type: a caller
+/// that hands the wrong struct hands the wrong type.
+///
+/// `params` is taken by `&mut` because that is what CUDA's argument array is:
+/// a `void*` to a host cell the driver reads at launch. It is not written.
+///
+/// # Panics
+///
+/// If `symbol` is in no unit, its unit will not compile or load, the loaded
+/// module has no such entry point, or the driver refuses the launch. See the
+/// module header for why none of these may be answered with a `bool` — and
+/// note the third: [`kernels_cuda_new::runtime::Error::Missing`] here means
+/// the family table named an instantiation the unit did not emit, which is
+/// exactly the drift a `false` would hide.
+///
+/// # Safety
+///
+/// Every device address inside `params` must name memory of the extent the
+/// kernel will read or write, and `stream` must outlive the launch — the same
+/// assertion the caller made when it handed a filled params struct to a C++
+/// launcher that put it in a `<<<>>>`.
+pub unsafe fn fire_params<P>(
+    symbol: &'static str,
+    launch: Launch,
+    params: &mut P,
+    stream: *mut std::ffi::c_void,
+) {
+    let Some((index, unit)) = kernels_cuda_new::unit::unit_of(symbol) else {
+        panic!("{symbol} is in no JIT unit — this driver and its kernel table disagree");
+    };
+    let module = match cache::module(index, unit) {
+        Ok(module) => module,
+        Err(why) => panic!("{symbol}: unit `{}` would not compile or load: {why}", unit.name),
+    };
+    let mut cell: [*mut std::ffi::c_void; 1] = [std::ptr::from_mut(params).cast()];
+    // SAFETY: as the function's own contract — the caller holds the stream and
+    // the params' pointees live across the launch. `cell` outlives the call.
+    let stream = unsafe { Stream::from_runtime(stream) };
+    if let Err(why) = unsafe { module.fire_raw(symbol, launch, &mut cell, stream) } {
         panic!("{symbol}: {why}");
     }
 }

@@ -442,9 +442,25 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
         Rule::RouterSort => [module.local.at(0), 1, 1],
         Rule::RouteRows => [dims.width, rows, 1],
         // Rows on x as for `Qmv`, and the expert slot on z.
+        //
+        // The y axis is the row's OWN statement of its output length, which is
+        // what `grid_param = Some(1)` names: `out_vec_size`, the second word.
+        // It used to be `width.div_ceil(4)`, and that division was a guess --
+        // a routed projection writes a whole token's `k` results end to end,
+        // so the rectangle is `k` times as wide as one result, and dividing by
+        // four is right only when four experts are routed to. gpt-oss routes
+        // to four, which is why it went unseen; qwen3's MoE routes to eight,
+        // where the same expression asks for twice the workgroups it needs
+        // (harmless, `active_out` guards the tail), and anything routing to
+        // fewer than four UNDERSHOOTS -- and an undershot grid writes nothing,
+        // reads back as whatever the arena held, and reports success.
+        //
+        // Found by the `driver-wgpu` agent, who carried the identical
+        // expression, hit it against their own shader, and left a note saying
+        // this file had it too. Fixed here from that report.
         Rule::RoutedQmv => [
             module.local.at(0) * rows,
-            dims.width.max(1).div_ceil(4),
+            dims.axis.max(1),
             dims.experts_per_token.max(1),
         ],
     })

@@ -817,6 +817,20 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
             let x = vals[a0].lanes_f32();
             let len = x.len().checked_div(rows).unwrap_or(0);
             let payload = op.pred_payload as usize;
+            // The predicate's own operand. A cell with no lanes means it was
+            // never evaluated -- the walk that builds the stage index missed
+            // it -- and every arm below broadcasts lane zero of it. Faulting
+            // the instance is the answer; indexing an empty cell panics the
+            // thread the driver runs on, and a panic with a frame in flight is
+            // a launch nothing ever completes.
+            if vals.get(payload).is_none_or(Value::is_empty) {
+                return Err(Error::Program {
+                    message: format!(
+                        "pivot_threshold reads value {payload} as its predicate payload \
+                         and that value has no lanes"
+                    ),
+                });
+            }
             let mut keep = vec![0u8; x.len()];
             for r in 0..rows {
                 let row = &x[r * len..r * len + len];
@@ -1048,6 +1062,52 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interpreter runs on the driver's own thread, and that thread has a
+    /// frame in flight. A panic there is not a failed request -- it is a launch
+    /// nothing ever completes, and an engine that waits for it forever.
+    #[test]
+    fn an_unevaluated_predicate_payload_faults_rather_than_panicking() {
+        use driver_api::plan::{LaunchOp, LaunchValue};
+
+        let value = |id: u32, dims: &[u32]| LaunchValue {
+            id,
+            source: 0,
+            dtype: 3,
+            intrinsic: 0,
+            channel: 0,
+            literal_bits: 0,
+            shape: dims.to_vec(),
+        };
+        let package = LaunchPackage {
+            values: vec![value(0, &[4]), value(1, &[1]), value(2, &[4])],
+            ..Default::default()
+        };
+        let op = LaunchOp {
+            code: u16::from(tags::PIVOT_THRESHOLD),
+            result_count: 1,
+            result_id: 2,
+            args: vec![0],
+            pred_tag: 1,
+            pred_payload: 1,
+            shape: vec![4],
+            ..Default::default()
+        };
+        // v1 empty: the shape a missed walk leaves behind.
+        let mut vals = vec![
+            Value::F32(vec![0.4, 0.3, 0.2, 0.1]),
+            Value::F32(Vec::new()),
+            Value::F32(Vec::new()),
+        ];
+        let err = eval_op(&op, &package, &mut vals).expect_err("an empty payload must fault");
+        assert!(
+            matches!(err, Error::Program { .. }),
+            "the instance faults; the process does not die: {err:?}"
+        );
+
+        vals[1] = Value::F32(vec![0.95]);
+        eval_op(&op, &package, &mut vals).expect("a payload with a lane evaluates");
+    }
 
     #[test]
     fn canonical_reduce_uses_a_pairwise_tree_not_a_left_fold() {

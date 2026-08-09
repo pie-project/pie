@@ -291,9 +291,21 @@ pub fn dims_of(
             .flatten()
             .filter(|n| *n > 0)
     });
+    // The ROW COUNT the statement's own rectangle has, when the fire's row
+    // window is not it. The fourth reading, and the one that admits a
+    // statement may have a row axis the fire does not spell: a mixture's
+    // sorted stack is one row per ROUTE, and there are `tokens *
+    // experts_per_token` of those. See [`kernels::KernelSig::rows_param`].
+    let stated_rows = sig.rows_param.and_then(|i| {
+        let at = launch.params.start as usize + i as usize;
+        (at < launch.params.end as usize)
+            .then(|| lowered.params.get(at).copied())
+            .flatten()
+            .filter(|n| *n > 0)
+    });
     let width = sizing_width(lowered, launch);
     Dims {
-        rows: launch.rows.end - launch.rows.start,
+        rows: stated_rows.unwrap_or(launch.rows.end - launch.rows.start),
         width,
         in_width: input_width(lowered, launch),
         q_heads: geometry.q_heads,

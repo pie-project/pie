@@ -78,7 +78,11 @@
 //! is indexed against the CALLEE's parameter. This walk follows calls to
 //! recover it (see [`Declared::grid_axes`]), with a depth bound, and where it
 //! cannot follow it answers "every axis" rather than "no axis", because the
-//! unknown answer must not let a wrong grid pass a check.
+//! unknown answer must not let a wrong grid pass a check. Where it CAN follow
+//! it is exact, and the pair in
+//! [`tests::two_entrypoints_of_one_file_are_told_apart_by_the_axis_they_read`]
+//! is the measurement: two bodies of one file, one `//#if` apart, differing in
+//! exactly the axis they read.
 //!
 //! **`block_bytes` survives for the same reason it existed.** A parameter
 //! struct in a storage buffer is what `rms_single_row`'s `params: Buf` operand
@@ -1049,6 +1053,58 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
             compared, 189,
             "44 rows state operands, over 189 entrypoints, and every one of \
              them is compared -- a floor here would let the sweep shrink"
+        );
+    }
+
+    /// One file, two entry points, one axis apart.
+    ///
+    /// # Why this pair and not any other
+    ///
+    /// `attn/kv_write.wgsl` states both `kv_append` bodies, separated by a
+    /// single `//#if defined(PIE_PAGED)`. The paged body reads `gid.z` -- the
+    /// page index -- and the contiguous one does not. So the two agree on
+    /// everything a reader could confuse them by: file, name prefix, workgroup
+    /// size, argument list, even the `gid` binding itself. They differ in one
+    /// axis of one builtin, inside a preprocessor branch.
+    ///
+    /// That makes this the control for the whole of `grid_axes`. A reflection
+    /// that answered from the SOURCE TEXT rather than the compiled module
+    /// would give both the same answer, because both bodies are in the file
+    /// either way; only a walk over the module `kernels_wgpu` actually
+    /// produced can tell them apart.
+    ///
+    /// It also settles a note this crate carried in `geometry.rs`, which read
+    /// the `gid.z` in this file, saw `[true, true, false]` for `kv_append`,
+    /// and recorded a FALSE NEGATIVE in the reflection. The `gid.z` belongs to
+    /// the paged variant. The reflection was right and the note was wrong,
+    /// which is worth a test rather than a correction, because the note was
+    /// written from the same file this test reads.
+    #[test]
+    fn two_entrypoints_of_one_file_are_told_apart_by_the_axis_they_read() {
+        let plain = super::entrypoint("kv_append_bfloat16", kernels_wgpu::Capability::Baseline)
+            .expect("the contiguous kv_append is in the table");
+        let paged = super::entrypoint(
+            "kv_append_paged_bfloat16",
+            kernels_wgpu::Capability::Baseline,
+        )
+        .expect("the paged kv_append is in the table");
+        assert_eq!(
+            plain.grid_axes,
+            [true, true, false],
+            "the contiguous body indexes x and y; there is no page axis to read"
+        );
+        assert_eq!(
+            paged.grid_axes,
+            [true, true, true],
+            "the paged body reads `gid.z` for its page, and the walk must find it"
+        );
+        // The control, stated as an assertion so it cannot rot: the two are
+        // NOT the same answer. If they ever are, this test has stopped
+        // distinguishing the thing it exists to distinguish.
+        assert_ne!(
+            plain.grid_axes, paged.grid_axes,
+            "one `//#if` apart is enough to change the answer, or the walk is \
+             reading the file rather than the module"
         );
     }
 }

@@ -85,7 +85,7 @@ fn main() {
 mod native {
     use std::path::{Path, PathBuf};
 
-    /// Every family table, plus the rows only the driver fires.
+    /// Every family table.
     ///
     /// `kernels_cuda_new::table::TABLES` is the same list `KERNELS`
     /// concatenates, read rather than restated — a second hand-written copy
@@ -93,13 +93,15 @@ mod native {
     /// there and forgotten here emits no `extern "C"` and fails at link time
     /// in whichever binary happened to state one of its symbols first.
     ///
-    /// `driver_internal` is appended because it is deliberately NOT in that
-    /// list: its rows have no DSL statement, which changes which invariant
-    /// they answer to and not whether they need an entry point.
+    /// `driver_internal` USED to be appended, because it was deliberately
+    /// NOT in that list: its rows had no DSL statement, which changed which
+    /// invariant they answered to and not whether they needed an entry
+    /// point. **They no longer need one.** §5 step 5 made them `fn`s in
+    /// `x::driver_internal` with no `contract!`, so nothing generates a
+    /// `pie_k_*` for them and nothing calls one — the six callers are direct
+    /// Rust calls. There is no second table left to append.
     fn tables() -> Vec<&'static [kernels::KernelSig]> {
-        let mut out = kernels_cuda_new::table::TABLES.to_vec();
-        out.push(kernels_cuda_new::table::driver_internal::DRIVER_KERNELS);
-        out
+        kernels_cuda_new::table::TABLES.to_vec()
     }
 
     fn csrc_src() -> PathBuf {

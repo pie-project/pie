@@ -92,6 +92,54 @@ fn texts() -> Vec<Text> {
                 experts_per_token: 8,
             },
         },
+        // The BIAS seam, and the reason is NOT that the symbol was
+        // uncovered. It was written here claiming to be the only entry
+        // with `qkv_bias: true`; a symbol census over all five says
+        // otherwise -- this text names 12 symbols and none of them is
+        // unique to it, because gpt-oss has attention biases too and has
+        // been carrying `add_bias_bfloat16` all along.
+        //
+        // What it adds, measured: `add_bias` evaluated at a SECOND
+        // geometry. gpt-oss reaches it at 64 q heads of 64, so the bias
+        // spans 4096 and 512; Qwen-2.5-1.5B reaches it at 12 q heads of
+        // 128, so 1536 and 256. `every_launch_of_every_text_becomes_a_
+        // legal_grid` is a per-text check evaluated at the text's own
+        // `Geometry`, and one shape is not a rule.
+        //
+        // And it states an INTENT the other entry holds by accident.
+        // gpt-oss is here for sinks, its own SwiGLU and MXFP4 banks; its
+        // biases are incidental, so a change to that fixture could take
+        // the whole bias seam with it and nothing would say so. This row
+        // is named for the seam, so losing it is a deletion rather than a
+        // side effect.
+        //
+        // `add_bias` is a CAPABILITY on the metal facts and `qkv_bias` is
+        // a fact about the checkpoint; `synthetic()` states the first and
+        // `qwen2_5_1_5b()` the second, and both must hold for the text to
+        // state the bias at all.
+        Text {
+            name: "llama_like (qwen2 qkv bias)",
+            plan: |class| {
+                use model::shared::llama_like::forward::facts::{
+                    LlamaLikeFacts, LlamaLikeMetalFacts,
+                };
+                model::shared::llama_like::forward::llama_like_metal(
+                    &LlamaLikeFacts::qwen2_5_1_5b(),
+                    &LlamaLikeMetalFacts::synthetic(),
+                    class,
+                )
+            },
+            // Qwen2.5-1.5B as measured: 12 q heads, 2 kv, hidden 1536 / 12.
+            // Standard rope over the whole head, so `rotary_dims == head_dim`.
+            geometry: Geometry {
+                q_heads: 12,
+                kv_heads: 2,
+                head_dim: 128,
+                rotary_dims: 128,
+                n_experts: 0,
+                experts_per_token: 0,
+            },
+        },
         // gpt-oss, and it joins the same way: attention SINKS, its own SwiGLU and
         // an alternating window are three facts, not a family. What is new is one
         // weight per layer and one symbol.
@@ -331,13 +379,14 @@ fn the_harness_covers_every_family_that_has_a_text() {
     // Counted rather than named: the list is short and its growth is the whole
     // remaining plan (`.wiki/new-driver/metal.md` task 5).
     //
-    // TWO entries over ONE text, and the gap is the interesting part: the
-    // mixture joined by naming a fixture rather than by being a family, so a
-    // routed FFN reaches the device with no second text and no per-family
-    // branch anywhere in the executor.
+    // FIVE entries over ONE text, and the gap is the interesting part: every
+    // one of them joined by naming a fixture rather than by being a family,
+    // so a routed FFN, attention sinks, a geglu with a softcap and a q/k/v
+    // bias all reach the device with no second text and no per-family branch
+    // anywhere in the executor.
     assert_eq!(
         texts().len(),
-        4,
+        5,
         "a Metal text or fixture landed or left. Add or remove its row in \
          `texts()` — everything above is per-text and a shape not listed is a \
          shape not checked."

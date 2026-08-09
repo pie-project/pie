@@ -347,23 +347,43 @@ fn llama_like_metal_text(
         // first the KV pool held q in its K pages, without the second every
         // projection wrote zeros over its own input.
         //
-        // `TokensGT(tile - 1)` rather than `TokensLE`: the arm that runs on
-        // the common path is the one that wants to be read first.
+        // `TokensMultipleOf(tile)` and not `TokensGT(tile - 1)`, which is
+        // what this guard said for as long as it existed. The quoted
+        // precondition three paragraphs up is `M % BM == 0`, and a threshold
+        // does not test it: 32 rows is two whole 16-row tiles and 35 is not,
+        // and both are `> 15`. So every count above the tile that the tile
+        // does not divide -- fifteen in sixteen -- reached an arm no driver
+        // can launch, and a real `pie run` of a 35-token prompt died on
+        // `PartialTile { rows: 35, tile: 16 }` on Metal, Vulkan and wgpu
+        // alike. The threshold needed no companion and neither does this: for
+        // a non-zero token count, `N % tile == 0` already implies `N >= tile`.
+        //
+        // Stated POSITIVELY, still: the arm that runs on the common path is
+        // the one that wants to be read first.
         let tile = metal.qmm_tile.0.max(1);
-        let gemm = |x: &Val, w: &MatW| {
+        // The POINT is a parameter because one tensor in this stack may not
+        // share it: see `LlamaLikeMetalFacts::router_repr`. Everything else
+        // -- the guard, its two arms, the shape the value takes -- is the
+        // same for every projection, and threading a point rather than
+        // writing a second closure is what keeps it so. A router that took
+        // `qmv` unguarded wrote row zero of a three-row prefill and left the
+        // rest as the arena's zeros, which reads as a model with no
+        // distribution rather than as a wrong one.
+        let gemm_at = |x: &Val, w: &MatW, pt: &str, gpt: &str| {
             if !(multi_batch && metal.qmm_multi_batch) {
-                return dsl::metal::qmv(x, w, &point);
+                return dsl::metal::qmv(x, w, pt);
             }
             let shape = (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16);
             let (g, v) = dsl::guarded_value(x.trace(), w.layer, shape);
-            g.arm(GuardPred::TokensGT(tile - 1), || {
-                dsl::metal::qmm(x, w, &gemm_point);
+            g.arm(GuardPred::TokensMultipleOf(tile), || {
+                dsl::metal::qmm(x, w, gpt);
             })
             .otherwise(|| {
-                dsl::metal::qmv(x, w, &point);
+                dsl::metal::qmv(x, w, pt);
             });
             v
         };
+        let gemm = |x: &Val, w: &MatW| gemm_at(x, w, &point, &gemm_point);
         // The residual-fused twin, guarded the same way and for the same
         // reason: `affine_qmm_t_residual` is that tiling with an epilogue.
         let gemm_add = |x: &Val, w: &MatW, residual: &Val| {
@@ -375,7 +395,7 @@ fn llama_like_metal_text(
             }
             let shape = (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16);
             let (g, v) = dsl::guarded_value(x.trace(), w.layer, shape);
-            g.arm(GuardPred::TokensGT(tile - 1), || {
+            g.arm(GuardPred::TokensMultipleOf(tile), || {
                 dsl::metal::qmm_residual(x, w, residual, &gemm_point);
             })
             .otherwise(|| {
@@ -458,15 +478,34 @@ fn llama_like_metal_text(
                 return activate(&gemm(x, &w.gate_proj), &gemm(x, &w.up_proj), f.intermediate);
             }
             let k = f.experts_per_token.max(1);
-            // Rows after the sort pads each expert's group up to a tile. The
-            // gather writes this many and the matmuls read them, so the number
-            // is stated once and threaded rather than recomputed.
-            let padded = (f.n_experts * k).max(1);
             // The router's logits, biased if the checkpoint publishes one.
             // BEFORE the top-k, which is the whole point: this bias moves a
             // ranking rather than an activation, so applying it afterwards
             // -- or not at all -- picks different experts.
-            let logits = gemm(x, &w.router);
+            //
+            // AT THE GATE'S OWN POINT, which need not be the dense one. This
+            // is `bank` below for a matrix of thirty-two columns, and it is
+            // the same mechanism because it is the same fact: `mlx_lm`
+            // publishes gpt-oss's gate at 8 bits inside a 4-bit stack. The
+            // difference is what getting it wrong looks like -- a bank read
+            // at the wrong format is NaN, and a GATE read at the wrong width
+            // is a fluent model routing to almost the right experts.
+            //
+            // `qmv` directly rather than through `gemm`: the gate is
+            // `[hidden, n_experts]` and no GEMM tile is that narrow, so the
+            // guard `gemm` builds would have an arm that can never run.
+            let logits = match metal.router_repr {
+                None => gemm(x, &w.router),
+                Some(repr) => gemm_at(
+                    x,
+                    &dsl::MatW {
+                        repr,
+                        ..w.router.clone()
+                    },
+                    &dsl::metal::affine_point(repr, metal.router_bits),
+                    &dsl::metal::affine_gemm_point(repr, metal.router_bits, metal.qmm_tile),
+                ),
+            };
             let logits = if f.router_bias && metal.add_bias {
                 dsl::metal::add_bias(&logits, &w.router_bias)
             } else {
@@ -474,20 +513,25 @@ fn llama_like_metal_text(
             };
             let (ids, weights) =
                 dsl::metal::router_topk(&logits, f.n_experts, k, false, metal.norm_topk_prob);
-            let (perm, _row_expert, _tile_expert, inv) =
-                dsl::metal::route_sort(&ids, f.n_experts, k, metal.qmm_tile.0, padded, f.hidden);
-            let rows = dsl::metal::route_gather(
-                x,
-                &perm,
-                f.n_experts,
-                k,
-                metal.qmm_tile.0,
-                padded,
-                f.hidden,
-            );
+            // The SORTED stack: one row per `(token, expert-slot)` route,
+            // grouped so that consecutive rows read the same expert bank.
+            // Its height is a function of the FIRE, which is why nothing
+            // here is a count -- `dsl::metal::route_sort` states the extent
+            // and the lowering resolves it.
+            //
+            // `row_expert` is the operand the projections below take. It is
+            // the sort's answer to "which expert does sorted row `p` read",
+            // and it was discarded here while the projections were handed
+            // the router's `[Tokens, k]` choice instead -- a list indexed by
+            // PAIR being read at a SORTED position.
+            let (perm, row_expert, _tile_expert, inv) =
+                dsl::metal::route_sort(&ids, f.n_experts, k, f.hidden);
+            let rows = dsl::metal::route_gather(x, &perm, f.n_experts, k, f.hidden);
             // The bank's OWN format, which need not be the dense one --
-            // gpt-oss stores 98 tensors affine/64 and its expert banks
-            // mxfp4/32. See `LlamaLikeMetalFacts::moe_repr`.
+            // gpt-oss stores 98 tensors affine/64/4, its expert banks
+            // mxfp4/32, and its 24 router gates affine/64/**8**: three
+            // formats, one checkpoint. See `LlamaLikeMetalFacts::moe_repr`
+            // and `router_repr`.
             let bank = |m: &dsl::MatW| match metal.moe_repr {
                 Some(repr) => dsl::MatW { repr, ..m.clone() },
                 None => m.clone(),
@@ -497,13 +541,45 @@ fn llama_like_metal_text(
             } else {
                 metal.affine_bits
             };
+            // `k * moe_intermediate` and not `moe_intermediate`: each of
+            // these values is a whole token's `k` expert results end to end,
+            // and the activation between them is elementwise over all of it.
+            // Told one result's width it covered a `k`th of the stack.
+            //
+            // The projections read one run at a time, and say so with their
+            // own `in_vec`: `hidden` into the bank, `moe_intermediate` out
+            // of it.
             let h = activate(
-                &dsl::metal::routed_qmv(&rows, &ids, &bank(&w.expert_gate), k, false, bits),
-                &dsl::metal::routed_qmv(&rows, &ids, &bank(&w.expert_up), k, false, bits),
-                f.moe_intermediate,
+                &dsl::metal::routed_qmv(
+                    &rows,
+                    &row_expert,
+                    &bank(&w.expert_gate),
+                    k,
+                    f.hidden,
+                    false,
+                    bits,
+                ),
+                &dsl::metal::routed_qmv(
+                    &rows,
+                    &row_expert,
+                    &bank(&w.expert_up),
+                    k,
+                    f.hidden,
+                    false,
+                    bits,
+                ),
+                f.moe_intermediate * k,
             );
             let routed = dsl::metal::combine_sorted(
-                &dsl::metal::routed_qmv(&h, &ids, &bank(&w.expert_down), k, false, bits),
+                &dsl::metal::routed_qmv(
+                    &h,
+                    &row_expert,
+                    &bank(&w.expert_down),
+                    k,
+                    f.moe_intermediate,
+                    false,
+                    bits,
+                ),
                 &weights,
                 &inv,
                 k,
@@ -873,16 +949,43 @@ fn llama_like_metal_text(
                 };
             }
 
-            // ── gemma's BRANCH. ──
+            // ── gemma's BRANCH. UNREACHABLE, and known to be unfinished. ──
             //
             // A mixture that sits BESIDE the dense MLP rather than replacing
-            // it: both read the post-attention residual and their results are
-            // added, which is five norms round one block. Every other family
-            // in this text runs one FFN or the other.
+            // it. Every other family in this text runs one FFN or the other.
             //
-            // Stated after the dense FFN because that is the order the
-            // dispatches run in, and the join is a plain add — the branch's
-            // own norm is `mlp_norm` at the same width, so no new statement.
+            // `Gemma4::untraced` refuses every row that has a mixture, so
+            // nothing reaches these three statements today, and the refusal
+            // carries the measurement that says why they are not yet right.
+            // Two of its findings are about the lines just below.
+            //
+            // `mlx_lm/models/gemma4_text.py::DecoderLayer.__call__` is the
+            // reference, and it is a JOIN, not an append:
+            //
+            //     h1 = post_ffn_norm_1(mlp(pre_ffn_norm(h)))
+            //     h2 = post_ffn_norm_2(experts(pre_ffn_norm_2(h), router(h)))
+            //     h  = post_ffn_norm(h1 + h2) + residual
+            //
+            // Four ways these three lines are not that. They read `y`, which
+            // the dense FFN reassigned a few lines up, so the branch chains
+            // off the post-dense value where both legs take the same
+            // post-attention `h`. They reuse `mlp_norm` for the routed
+            // pre-norm on the argument that it is "at the same width, so no
+            // new statement" -- same width, different weights, and the
+            // checkpoint ships `pre_feedforward_layernorm_2` to prove it.
+            // They state no post-norm, where the reference has one per leg.
+            // And they `residual_add` into `y` where the reference adds the
+            // legs to each other, norms the sum, and only then rejoins.
+            //
+            // The dense FFN above is wrong for these rows too, and more
+            // quietly: it fuses the down projection into the residual add,
+            // which is the right call when nothing sits between them. In a
+            // mixture layer `post_feedforward_layernorm_1` does, and a dense
+            // layer does not even have that tensor. The mixture changes the
+            // dense leg, so `owes_down` cannot stay the only question asked.
+            //
+            // Width is what a shape check can see; provenance is not, which
+            // is how an assumption like `mlp_norm` survives one.
             if metal.dense_beside_moe && f.n_experts > 0 {
                 let branch = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
                 let mixed = gated(&branch, &w);
@@ -2548,7 +2651,7 @@ mod metal_tests {
         // BOTH arms of the projection guard are in the M>1 text, which is what
         // a guard is for: `qmm_t.metal` needs `M % BM == 0` and no row count
         // under `qmm_tile.0` gives it, so the text states the pair with
-        // `TokensGT(tile - 1)` and the FIRE picks. A Rust `if` would resolve
+        // `TokensMultipleOf(tile)` and the FIRE picks. A Rust `if` would resolve
         // at trace time and leave a short prefill with nothing to run.
         assert!(
             count(&mb, "affine_qmv_fast") > 1,

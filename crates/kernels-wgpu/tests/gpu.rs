@@ -5735,121 +5735,147 @@ fn a_norm_folds_its_residual_and_its_layer_gain() {
 /// previous row's last element, written by a different workgroup at the same
 /// moment, and the compare-exchange is what keeps both.
 ///
-/// # Two things this dispatch is deliberately NOT doing, both measured
+/// # Two defects this measured, and then closed
 ///
-/// **The grid below is not the one this row's launch rule gives.** The row
+/// **The dispatch was not the one this row's launch rule gives.** The row
 /// states `LaunchRule::Elementwise`, which is `[width * rows, 1, 1]` LANES —
-/// everything on x — while this variant alone is `@workgroup_size(16, 16)` and
-/// reads `gid.y` as the ROW. Divided by a 16-high workgroup that is ONE group
-/// on y, so only rows 0..15 ever launch. Dispatched that way at 21 rows on an
-/// RTX 4090, row 16 column 0 comes back holding the sentinel it was born with
-/// and the dispatch succeeds. `ElementwiseRows` is the shape this body wants
-/// and is what is dispatched here; changing the row is a table edit and a
-/// parity question, so it is reported rather than made.
+/// everything on x — while this variant alone was `@workgroup_size(16, 16)`
+/// and read `gid.y` as the ROW. Divided by a 16-high workgroup that is ONE
+/// group on y, so only rows 0..15 ever launched: at 21 rows on an RTX 4090,
+/// row 16 column 0 came back holding the sentinel it was born with and the
+/// dispatch SUCCEEDED. This file used to dispatch `ElementwiseRows` to work
+/// around it, which measured the body under a launch no driver would give it.
 ///
-/// **The header's stated x extent is one short at an odd `out_pitch`.**
-/// `mlp/gated.wgsl` says "`gid.x` counts words of the output row, so the host's
-/// x extent is `ceil(width / 2)`". At an odd pitch an ODD row's span starts in
-/// a word's upper half and therefore straddles `ceil(width / 2) + 1` words.
-/// Measured: at `width = 64` — where `ceil(width / 2)` is exactly two 16-wide
-/// workgroups, so the round-up hides nothing — with pitches 89/71/67, row 1's
-/// element 63 comes back as the sentinel. The shape below is saved only
-/// because 23 rounds up to 32. That is the case `store_half` exists for, so
-/// the extent that cannot cover it is the interesting half.
+/// **The stated x extent was one word short at an odd `out_pitch`.**
+/// `mlp/gated.wgsl` said "`gid.x` counts words of the output row, so the
+/// host's x extent is `ceil(width / 2)`". At an odd pitch an ODD row's span
+/// starts in a word's upper half and straddles one word more. Measured: at
+/// `width = 64` — where `ceil(width / 2)` is exactly two 16-wide workgroups,
+/// so the round-up hides nothing — with pitches 89/71/67, row 1's element 63
+/// came back as the sentinel.
+///
+/// Both are gone, and one change closed both: the body is
+/// `@workgroup_size(256)` over a flat ELEMENT index, which is exactly what
+/// `Elementwise` hands it, and word ownership is derived from the absolute
+/// output offset rather than from the lane number. The dispatch below is now
+/// the row's own rule, and the two shapes it runs are the two that failed.
 #[test]
 fn a_strided_geglu_reads_three_different_pitches() {
     let Some((gpu, _held)) = adapter() else {
         return;
     };
-    let width = 46usize;
-    let rows = ROWS as usize;
-    // Three pitches, all different, all wider than the width, and the output's
-    // is odd.
-    let gate_pitch = 79usize;
-    let up_pitch = 53usize;
-    let out_pitch = 61usize;
-    for (a, b) in [
-        (gate_pitch, up_pitch),
-        (up_pitch, out_pitch),
-        (gate_pitch, out_pitch),
+    // TWO shapes, and each is a case this body used to get wrong.
+    //
+    // * 21 rows is past the sixteen a `@workgroup_size(16, 16)` body reached
+    //   on one group of y. Row 16 came back holding its sentinel, and the
+    //   dispatch succeeded.
+    // * width 64 with an odd pitch is where the old word-indexed x extent,
+    //   `ceil(width / 2)`, was one word short: an odd row starts in a word's
+    //   upper half, so its 64 elements straddle 33 words and element 63 was
+    //   never written. 64 is chosen because `ceil(64 / 2)` is exactly two
+    //   16-wide workgroups, so no round-up hides the shortfall.
+    //
+    // Both are fixed by the same change -- the body indexes ELEMENTS, which is
+    // what its row's `Elementwise` rule hands it -- so both are measured here.
+    for (width, rows, gate_pitch, up_pitch, out_pitch) in [
+        (46usize, 21usize, 79usize, 53usize, 61usize),
+        (64, 17, 89, 71, 67),
     ] {
-        assert_ne!(a, b, "equal pitches are the case that proves nothing");
-    }
-    assert_eq!(
-        out_pitch % 2,
-        1,
-        "an odd output pitch is what reaches store_half"
-    );
-
-    let (gate, gate_seen) = bf16s(gpu, &spread(rows * gate_pitch, 2901));
-    let (up, up_seen) = bf16s(gpu, &spread(rows * up_pitch, 2903));
-    let out = sentinelled(gpu, (rows * out_pitch).div_ceil(2));
-    // `GegluStridedParams { width, rows, gate_pitch, up_pitch, out_pitch }`,
-    // a STORAGE struct at binding 3 — the row states `params: Buf`.
-    let params = storage(
-        gpu,
-        &[width, rows, gate_pitch, up_pitch, out_pitch]
-            .iter()
-            .flat_map(|v| u32::try_from(*v).expect("fits").to_le_bytes())
-            .collect::<Vec<u8>>(),
-    );
-
-    // The body is `@workgroup_size(16, 16)` and `gid.x` counts WORDS of the
-    // output row, so the x extent is `ceil(width / 2)`.
-    run(
-        gpu,
-        "geglu_tanh_strided_bfloat16",
-        &[&gate, &up, &out, &params],
-        &[],
-        [over(width.div_ceil(2) as u32, 16), over(rows as u32, 16), 1],
-    );
-
-    let sentinel = from_bf16((SENTINEL & 0xffff) as u16);
-    let got = unpack(&read(gpu, &out), rows * out_pitch);
-    for row in 0..rows {
-        let base = row * out_pitch;
-        let want: Vec<f32> = (0..width)
-            .map(|k| {
-                geglu_tanh_reference(gate_seen[row * gate_pitch + k], up_seen[row * up_pitch + k])
-            })
-            .collect();
-        let what = format!("row {row}");
-        agrees(&got[base..base + width], &want, &what).expect("the strided geglu agrees");
-        if row == rows - 1 {
-            refuses_a_perturbed_reference(&got[base..base + width], &want, &what);
+        for (a, b) in [
+            (gate_pitch, up_pitch),
+            (up_pitch, out_pitch),
+            (gate_pitch, out_pitch),
+        ] {
+            assert_ne!(a, b, "equal pitches are the case that proves nothing");
         }
-        // Between the width and the pitch is nobody's, and at an odd pitch the
-        // boundary word is shared with the next row — so the compare-exchange
-        // has to leave the padding exactly as it found it.
-        for c in width..out_pitch {
-            assert_eq!(
-                got[base + c].to_bits(),
-                sentinel.to_bits(),
-                "row {row} column {c} is between the width ({width}) and the \
+        assert_eq!(
+            out_pitch % 2,
+            1,
+            "an odd output pitch is what reaches store_half"
+        );
+
+        let (gate, gate_seen) = bf16s(gpu, &spread(rows * gate_pitch, 2901));
+        let (up, up_seen) = bf16s(gpu, &spread(rows * up_pitch, 2903));
+        let out = sentinelled(gpu, (rows * out_pitch).div_ceil(2));
+        // `GegluStridedParams { width, rows, gate_pitch, up_pitch, out_pitch }`,
+        // a STORAGE struct at binding 3 — the row states `params: Buf`.
+        let params = storage(
+            gpu,
+            &[width, rows, gate_pitch, up_pitch, out_pitch]
+                .iter()
+                .flat_map(|v| u32::try_from(*v).expect("fits").to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+
+        // The body is `@workgroup_size(256)` and `gid.x` is a flat ELEMENT index
+        // over `rows * width`, which is exactly what this row's stated
+        // `LaunchRule::Elementwise` gives it: `[width * rows, 1, 1]`.
+        //
+        // Dispatched by the ROW'S OWN RULE, and that is the point of this line. It
+        // used to be `[ceil(width / 2) / 16, rows / 16, 1]` -- the shape the body
+        // wanted when it was `@workgroup_size(16, 16)` and read `gid.y` as the row
+        // -- which is a shape no driver would ever produce for this row. A kernel
+        // measured under a launch its table does not state is a kernel measured
+        // under a launch nothing will give it, and this file said so about itself
+        // for as long as the body disagreed with the row.
+        run(
+            gpu,
+            "geglu_tanh_strided_bfloat16",
+            &[&gate, &up, &out, &params],
+            &[],
+            [over((width * rows) as u32, 256), 1, 1],
+        );
+
+        let sentinel = from_bf16((SENTINEL & 0xffff) as u16);
+        let got = unpack(&read(gpu, &out), rows * out_pitch);
+        for row in 0..rows {
+            let base = row * out_pitch;
+            let want: Vec<f32> = (0..width)
+                .map(|k| {
+                    geglu_tanh_reference(
+                        gate_seen[row * gate_pitch + k],
+                        up_seen[row * up_pitch + k],
+                    )
+                })
+                .collect();
+            let what = format!("row {row}");
+            agrees(&got[base..base + width], &want, &what).expect("the strided geglu agrees");
+            if row == rows - 1 {
+                refuses_a_perturbed_reference(&got[base..base + width], &want, &what);
+            }
+            // Between the width and the pitch is nobody's, and at an odd pitch the
+            // boundary word is shared with the next row — so the compare-exchange
+            // has to leave the padding exactly as it found it.
+            for c in width..out_pitch {
+                assert_eq!(
+                    got[base + c].to_bits(),
+                    sentinel.to_bits(),
+                    "row {row} column {c} is between the width ({width}) and the \
                  output pitch ({out_pitch}) and was written anyway",
-            );
+                );
+            }
         }
-    }
 
-    // A body that read the gate and the up with the OUTPUT's pitch — the flat
-    // kernel's mistake — must disagree.
-    let mut by_out_pitch = Vec::with_capacity(rows * width);
-    let mut flat = Vec::with_capacity(rows * width);
-    for row in 0..rows {
-        for k in 0..width {
-            let at = row * out_pitch + k;
-            by_out_pitch.push(geglu_tanh_reference(
-                gate_seen[at.min(gate_seen.len() - 1)],
-                up_seen[at.min(up_seen.len() - 1)],
-            ));
-            flat.push(got[at]);
+        // A body that read the gate and the up with the OUTPUT's pitch — the flat
+        // kernel's mistake — must disagree.
+        let mut by_out_pitch = Vec::with_capacity(rows * width);
+        let mut flat = Vec::with_capacity(rows * width);
+        for row in 0..rows {
+            for k in 0..width {
+                let at = row * out_pitch + k;
+                by_out_pitch.push(geglu_tanh_reference(
+                    gate_seen[at.min(gate_seen.len() - 1)],
+                    up_seen[at.min(up_seen.len() - 1)],
+                ));
+                flat.push(got[at]);
+            }
         }
-    }
-    agrees(&flat, &by_out_pitch, "the strided geglu read at one pitch").expect_err(
-        "three pitches that disagree is the whole point of this variant; if \
+        agrees(&flat, &by_out_pitch, "the strided geglu read at one pitch").expect_err(
+            "three pitches that disagree is the whole point of this variant; if \
          reading all three at the output's also satisfies the device, the \
          shape is not separating them",
-    );
+        );
+    }
 }
 
 /// A softmax attention with gpt-oss's learned SINK folded into the

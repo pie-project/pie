@@ -1,46 +1,72 @@
-// Naive paged MLA kernel (Blackwell / sm100 fallback).
+// Naive paged MLA kernels (Blackwell / sm100 fallback): DEVICE TEXT ONLY.
 //
-// Lives in a header so the standalone microbenchmark
-// (`crates/driver-cuda/csrc/bench/mla_bench.cu`) compiles the *same* source the driver
-// runs. Iterating on this kernel through a full engine rebuild costs minutes;
-// the microbenchmark costs seconds.
+// Two `__global__`s — a scalar flash-softmax kernel and a tensor-core one —
+// and the `__device__` helpers they reach. **No launcher, no triple-angle
+// launch, no host function of any kind.** That is a change and it is the
+// point of the file now, so it is the first thing stated.
+//
+// The literal `<` `<` `<` is not written anywhere below, prose included, and
+// that is deliberate rather than fastidious: a census that greps for it must
+// read zero here, and a file whose comments explain why it holds no launches
+// by quoting one is a file that answers such a grep with itself.
+//
+// # What left, and where it went
+//
+// This header used to be MIXED: the two `__global__`s plus four host
+// functions — `launch_mla_naive_paged_raw`, `launch_mla_mma_paged_raw`,
+// `mla_mma_supported` and `mma_detail::smem_bytes` — and the two launches
+// that were the LAST two anywhere nvcc compiles. They are now in
+// `kernels-cuda/csrc/src/attn/attention_mla.cu`, the file that already held
+// their only caller and that dies with the archive; their Rust form, with
+// every geometry cited line by line, is `driver-cuda/src/fire/mla_naive.rs`.
+//
+// **Moving them was not cosmetic and it was not the obvious direction.** A
+// launch in a `.cuh` is invisible to `kernels-cuda/tests/sources.rs`, whose
+// census walks `.cu` and `.cpp` — which was CORRECT for the entire life of
+// this tree, because a `.cuh` under `kernels-cuda-new/csrc` is device text
+// carried into NVRTC and device text does not launch. This file was the one
+// counter-example, and it is why the whole-tree census read zero while two
+// launches were live (`new-horizon.md` §63.3). The repair is not a wider
+// scan: it is putting the launches where the classification says a launch
+// goes, and then this header can be a JIT unit root, which it could not be
+// while it opened `<mutex>` and `<stdexcept>`.
+//
+// The old header said this file existed so that
+// `crates/driver-cuda/csrc/bench/mla_bench.cu` could compile the identical
+// source standalone. **That benchmark no longer exists** — the whole of
+// `crates/driver-cuda/csrc/` is deleted — so the reason is recorded as
+// history rather than repeated as a rationale. The property it wanted is now
+// structural instead of conventional: the device text is a unit root, so the
+// driver and any probe compile the same string because there is only one.
+//
+// # `<cstring>` was always needed and was never declared
+//
+// `pack2` below calls `std::memcpy` and this file never included `<cstring>`.
+// Under nvcc it compiled because `<cuda_runtime.h>` pulled it in
+// transitively; under NVRTC it is `namespace "std" has no member "memcpy"`
+// even with the full toolkit include path on the command line, because no
+// include path can supply a header nobody asked for. The include below is
+// that repair and `csrc/shim/cstring` is the other half.
+//
+// # Probed
+//
+// NVRTC 13.0, `sm_89`, under the tree's own numerics contract
+// (`--fmad=false --prec-div=true --prec-sqrt=true`) and the carried header
+// set only — `csrc/{src,shim,vendor}` and no toolkit path: **rc = 0, 117 621
+// bytes of PTX, two `.entry`**, `mla_naive_paged_kernel` and
+// `mla_mma_paged_kernel`. Byte-identical to the same text compiled with
+// `/usr/local/cuda/include` answering `cuda_pipeline.h`, `math_constants.h`
+// and `cstring`, which is what those three shim headers record.
 #pragma once
 
 #include <cstdint>
-#include <cstdlib>
-#include <mutex>
-#include <stdexcept>
-#include <string>
+#include <cstring>
 
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
-#include <cuda_runtime.h>
 #include <math_constants.h>
 
-#ifndef PIE_MLA_NAIVE_CHECK
-#define PIE_MLA_NAIVE_CHECK(expr)                                             \
-    do {                                                                      \
-        const cudaError_t pie_mla_err_ = (expr);                              \
-        if (pie_mla_err_ != cudaSuccess) {                                    \
-            throw std::runtime_error(std::string("naive MLA: ") +             \
-                                     cudaGetErrorString(pie_mla_err_));       \
-        }                                                                     \
-    } while (0)
-#endif
-
 namespace pie_cuda_driver::kernels::attn::mla_naive {
-
-inline bool mla_mma_supported(int kv_lora_rank, int qk_rope_head_dim, int num_heads);
-inline void launch_mla_mma_paged_raw(
-    const void* q_nope, const void* q_pe,
-    const void* ckv_pages, const void* kpe_pages, int page_size, void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int total_tokens, int num_requests, int num_heads,
-    float sm_scale, bool causal, cudaStream_t stream,
-    const std::uint8_t* index_mask, int index_mask_stride);
 
 constexpr int kMlaNaiveBlock = 256;
 constexpr int kMlaNaiveWarps = kMlaNaiveBlock / 32;
@@ -196,85 +222,6 @@ __global__ void mla_naive_paged_kernel(
     }
 }
 
-inline void launch_mla_naive_paged_raw(
-    const void* q_nope, const void* q_pe,
-    const void* ckv_pages, const void* kpe_pages,
-    int kv_lora_rank, int qk_rope_head_dim, int page_size, void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int total_tokens, int num_requests, int num_heads,
-    float sm_scale, bool causal, cudaStream_t stream,
-    const std::uint8_t* index_mask, int index_mask_stride)
-{
-    if (total_tokens <= 0) return;
-    if (qo_indptr_d == nullptr || kv_page_indptr_d == nullptr ||
-        kv_last_page_lens_d == nullptr) {
-        throw std::runtime_error(
-            "naive MLA: missing device indptr/lens (qo/kv_page_indptr/"
-            "kv_last_page_lens)");
-    }
-    if (mla_mma_supported(kv_lora_rank, qk_rope_head_dim, num_heads)) {
-        launch_mla_mma_paged_raw(
-            q_nope, q_pe, ckv_pages, kpe_pages, page_size, o, qo_indptr_d,
-            kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-            total_tokens, num_requests, num_heads, sm_scale, causal, stream,
-            index_mask, index_mask_stride);
-        return;
-    }
-    const int CKV = kv_lora_rank;
-    const int KPE = qk_rope_head_dim;
-    if (CKV % 32 != 0 || CKV / 32 > kMlaNaiveMaxPer) {
-        throw std::runtime_error("naive MLA: unsupported kv_lora_rank");
-    }
-    if (KPE % 32 != 0 || KPE / 32 > kMlaNaiveMaxPePer) {
-        throw std::runtime_error("naive MLA: unsupported qk_rope_head_dim");
-    }
-    // Pick the largest head group that still fills the machine. Every head in a
-    // block walks the same keys, so a bigger group means the latent KV is read
-    // from L1 instead of L2/HBM — but the grid is (tokens x head-groups), so
-    // shrinking it too far starves the SMs. Two waves is the target.
-    constexpr int kForcedGroup = 0;
-    const int kMlaWaveTarget = 296;
-    int G = kMlaNaiveWarps;
-    if (kForcedGroup > 0) {
-        G = kForcedGroup;
-        while (G > 1 && (num_heads % G != 0 || kMlaNaiveWarps % G != 0)) G >>= 1;
-    } else {
-        while (G > 1 &&
-               (num_heads % G != 0 ||
-                static_cast<long long>(total_tokens) * (num_heads / G) <
-                    kMlaWaveTarget)) {
-            G >>= 1;
-        }
-    }
-    const std::size_t smem =
-        (static_cast<std::size_t>(kMlaNaiveWarps) * CKV +
-         2 * kMlaNaiveWarps) * sizeof(float);
-    // Wide blocks are what make this kernel fast at decode: the grid is only
-    // (tokens x head-groups), so with a narrow block the SMs sit at single-digit
-    // occupancy and every key's load latency is exposed. The partial-softmax
-    // scratch that buys the extra warps can exceed the 48 KB default.
-    static std::once_flag smem_optin;
-    std::call_once(smem_optin, [&] {
-        cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(mla_naive_paged_kernel),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, 200 * 1024);
-    });
-    dim3 grid(total_tokens, num_heads / G);
-    mla_naive_paged_kernel<<<grid, kMlaNaiveBlock, smem, stream>>>(
-        static_cast<const __nv_bfloat16*>(q_nope),
-        static_cast<const __nv_bfloat16*>(q_pe),
-        static_cast<const __nv_bfloat16*>(ckv_pages),
-        static_cast<const __nv_bfloat16*>(kpe_pages),
-        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-        static_cast<__nv_bfloat16*>(o),
-        index_mask, index_mask_stride,
-        num_requests, num_heads, CKV, KPE, page_size, sm_scale, causal, G);
-    PIE_MLA_NAIVE_CHECK(cudaGetLastError());
-}
-
 
 // ── Tensor-core paged MLA ───────────────────────────────────────────────
 // The scalar kernel above tops out around 3 TFLOP/s on every shape, which is
@@ -314,7 +261,11 @@ namespace mma_detail {
 #ifndef PIE_MLA_MMA_STAGES
 #define PIE_MLA_MMA_STAGES 1
 #endif
-// Occupancy hint. Shared memory (see `smem_bytes()`) already caps residency,
+// Occupancy hint. Shared memory already caps residency -- the size is
+// `mma_detail::smem_bytes()`, which is host arithmetic over the constants
+// below and now lives with the launcher in
+// `kernels-cuda/csrc/src/attn/attention_mla.cu` and in
+// `driver-cuda/src/fire/mla_naive.rs::MMA_SMEM_BYTES`, where it is 100 032 --
 // so asking for more blocks than that only tightens the register budget and
 // buys spills.
 #ifndef PIE_MLA_MMA_MINBLK
@@ -679,58 +630,6 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     }
 }
 
-inline std::size_t smem_bytes() {
-    return static_cast<std::size_t>(kBM * kLdD + kStages * kBK * kLdD +
-                                    kBM * kLdP) *
-               sizeof(__nv_bfloat16) +
-           static_cast<std::size_t>(kBM * kBK + 3 * kBM) * sizeof(float);
-}
-
 }  // namespace mma_detail
-
-inline bool mla_mma_supported(int kv_lora_rank, int qk_rope_head_dim, int num_heads) {
-    static const int forced = [] {
-        return 0;
-        if (false) return -1;
-        if (false) return 1;
-        return 0;
-    }();
-    if (forced < 0) return false;
-    return kv_lora_rank == mma_detail::kCkv &&
-           qk_rope_head_dim == mma_detail::kKpe &&
-           num_heads % mma_detail::kBM == 0;
-}
-
-inline void launch_mla_mma_paged_raw(
-    const void* q_nope, const void* q_pe,
-    const void* ckv_pages, const void* kpe_pages, int page_size, void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int total_tokens, int num_requests, int num_heads,
-    float sm_scale, bool causal, cudaStream_t stream,
-    const std::uint8_t* index_mask, int index_mask_stride)
-{
-    using namespace mma_detail;
-    const std::size_t smem = smem_bytes();
-    static std::once_flag opt_in;
-    std::call_once(opt_in, [&] {
-        PIE_MLA_NAIVE_CHECK(cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(mla_mma_paged_kernel),
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem)));
-    });
-    dim3 grid(num_heads / kBM, total_tokens);
-    mla_mma_paged_kernel<<<grid, kThreads, smem, stream>>>(
-        static_cast<const __nv_bfloat16*>(q_nope),
-        static_cast<const __nv_bfloat16*>(q_pe),
-        static_cast<const __nv_bfloat16*>(ckv_pages),
-        static_cast<const __nv_bfloat16*>(kpe_pages),
-        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-        static_cast<__nv_bfloat16*>(o), index_mask, index_mask_stride,
-        num_requests, num_heads, page_size, sm_scale, causal);
-    PIE_MLA_NAIVE_CHECK(cudaGetLastError());
-}
 
 }  // namespace pie_cuda_driver::kernels::attn::mla_naive

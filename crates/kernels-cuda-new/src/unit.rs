@@ -308,7 +308,7 @@ impl Demands {
 
 /// The units that demand something other than [`Demands::DEFAULT`].
 ///
-/// **One entry, and it covers 56 units** — see the prefix rule below.
+/// **Two entries, and the first covers 56 units** — see the prefix rule below.
 ///
 /// It was empty until the FA2 lattice landed, and that emptiness was a
 /// measurement rather than a placeholder: every unit declared before it
@@ -316,8 +316,13 @@ impl Demands {
 /// set. `crate::families::fa2` is the first that does not. Its 56 units
 /// `#include <flashinfer/attention/decode.cuh>` and
 /// `<flashinfer/attention/prefill.cuh>`, which reach the whole 1.7 MB patched
-/// vendor closure, so they demand [`Headers::LibraryAndVendor`] and every
-/// other unit still demands nothing.
+/// vendor closure, so they demand [`Headers::LibraryAndVendor`].
+///
+/// `crate::families::cascade` is the second and the last, for now. Its one
+/// unit `#include`s `<flashinfer/attention/cascade.cuh>` — the OTHER half of
+/// FA2's split path, the fold that turns `tmp_v`/`tmp_s` into `o` — which
+/// reaches `cp_async.cuh`, `math.cuh`, `utils.cuh` and `state.cuh`, all
+/// vendored. Every other unit still demands nothing.
 ///
 /// The one file that would ALSO be here — `moe/moe_grouped_gemm_tile` — is
 /// deliberately not a unit yet, and adding it here without adding the unit
@@ -410,10 +415,53 @@ impl Demands {
 /// library form, so this is a subprocess and a packaging decision rather than
 /// another `dlopen`. `.wiki/driver/new-horizon.md` §23.18 has the bisect that
 /// found `CUDA_ROOT` and the eight-step transcript.
-const DEMANDS: &[(&str, Demands)] = &[(
-    "attn/fa2_*",
-    Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
-)];
+const DEMANDS: &[(&str, Demands)] = &[
+    (
+        "attn/fa2_*",
+        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+    ),
+    // The second entry, and the first that is not a family prefix.
+    //
+    // `crate::families::cascade`'s one unit `#include`s
+    // `<flashinfer/attention/cascade.cuh>`, which reaches `cp_async.cuh`,
+    // `math.cuh`, `utils.cuh` and `state.cuh` — vendored, every one of them,
+    // and unreachable from `Headers::Library`. It is the same demand
+    // `attn/fa2_*` makes and it is stated separately rather than widened into
+    // a `*` that would cover both, because the two are different families and
+    // a shared wildcard would be a key that stops naming what it covers.
+    //
+    // An EXACT key, so the `const` assertion below checks it the strongest
+    // way it can: one unit, one name, and a rename is a compile error rather
+    // than a prefix that silently matches nothing else.
+    (
+        "cascade/merge_states",
+        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+    ),
+    // The third, and the second family prefix.
+    //
+    // `crate::x::xqa`'s five enrolled units all compile ONE root,
+    // `csrc/src/attn/attention_xqa_mha.cuh`, whose two includes are
+    // `<cuda_bf16.h>` and `<xqa/mha.cuh>` — and the second reaches the
+    // fifteen-file, 272 KB closure at `csrc/vendor/xqa/`. Every byte of it
+    // is vendor, none of it is reachable from `Headers::Library`, and
+    // `families::attn::XQA_LATTICE`'s own doc names this entry as the one
+    // the table would gain: *"Every member needs
+    // `crate::unit::Headers::LibraryAndVendor`, and that is the one entry
+    // the currently-empty `DEMANDS` table would gain."* The table was not
+    // empty by the time it was written, which changes the sentence and not
+    // the demand.
+    //
+    // A PREFIX and not five exact keys, for `attn/fa2_*`'s reason with one
+    // addition: the sixth member of the lattice is deliberately NOT enrolled
+    // (see `XQA_LATTICE`'s last entry, "NOT READY"), and a prefix is the one
+    // spelling that is already correct on the day it is. Five exact keys
+    // would have to be edited to six, and the `const` assertion below cannot
+    // see a key that was never added.
+    (
+        "attn/attention_xqa_mha_*",
+        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+    ),
+];
 
 /// Whether a [`DEMANDS`] key applies to a unit name.
 ///
@@ -639,11 +687,13 @@ impl Unit {
     /// demand.
     ///
     /// The seam that makes "the key spans the floor and the choice" a checked
-    /// claim rather than a stated one: [`DEMANDS`] is empty, so without a way
-    /// to hand a demand in, the two new terms could be dropped from the format
-    /// string and every test would still pass. It is the same seam
-    /// `runtime::nvrtc::compile_under` is, for the same reason and about the
-    /// same two facts.
+    /// claim rather than a stated one. It was written when [`DEMANDS`] was
+    /// empty, so without a way to hand a demand in the two new terms could
+    /// have been dropped from the format string with every test still
+    /// passing; the table has two entries now and neither varies a FLOOR, so
+    /// half of that hole is still open and this is still the only thing that
+    /// closes it. It is the same seam `runtime::nvrtc::compile_under` is, for
+    /// the same reason and about the same two facts.
     #[must_use]
     pub fn cache_key_under(&self, arch: &str, headers: &[Header], demands: Demands) -> String {
         let mut wanted = String::new();
@@ -803,9 +853,16 @@ mod tests {
     /// The key spans everything that can change the cubin, checked one term
     /// at a time — because a key that ignores a term is indistinguishable
     /// from a correct one until the term moves.
+    ///
+    /// The unit under test was `families::norm::ALTUP_AUX` until §5 step 5
+    /// took `norm` into fn-world. It is `x::norm::altup_aux::ALTUP_AUX` now
+    /// — the same root, the same rows, the same key, emitted by a `unit!`
+    /// invocation instead of written by hand. That is the point of naming a
+    /// REAL unit here: the assertions below are about `cache_key`, and they
+    /// hold across the move because nothing about the unit changed.
     #[test]
     fn the_cache_key_moves_when_anything_it_spans_does() {
-        let unit = crate::families::norm::ALTUP_AUX;
+        let unit = crate::x::norm::altup_aux::ALTUP_AUX;
         let base = unit.cache_key("sm_90");
         assert_eq!(base, unit.cache_key("sm_90"), "and is stable");
         assert_ne!(base, unit.cache_key("sm_80"), "a cubin is per-architecture");
@@ -836,18 +893,19 @@ mod tests {
         );
 
         assert_ne!(
-            crate::families::norm::ALTUP_AUX.cache_key("sm_90"),
-            crate::families::norm::ELEMENTWISE.cache_key("sm_90"),
+            crate::x::norm::altup_aux::ALTUP_AUX.cache_key("sm_90"),
+            crate::x::norm::elementwise::ELEMENTWISE.cache_key("sm_90"),
             "two units, two roots, two keys"
         );
     }
 
     /// The two new terms are in the key, checked one at a time and through
-    /// the seam that can vary them — because [`DEMANDS`] is empty, so a key
-    /// that dropped both would pass every other test in this file.
+    /// the seam that can vary them — because no entry in [`DEMANDS`] states a
+    /// floor other than [`Toolchain::ANY`], so a key that dropped that term
+    /// would pass every other test in this file.
     #[test]
     fn the_cache_key_moves_when_the_floor_or_the_header_choice_does() {
-        let unit = crate::families::norm::ALTUP_AUX;
+        let unit = crate::x::norm::altup_aux::ALTUP_AUX;
         let base = unit.cache_key("sm_90");
         assert_eq!(
             base,
@@ -907,16 +965,33 @@ mod tests {
         assert_eq!(Toolchain::ANY.to_string(), "any", "so a report reads as a sentence");
     }
 
-    /// A unit states what it demands, and every unit declared today demands
-    /// the default — which is what makes this change move no cubin.
+    /// A unit states what it demands, and the table and the units agree.
+    ///
+    /// This asserted `DEMANDS.is_empty()` and that every unit demanded the
+    /// default, which was true until the FA2 lattice landed and is not the
+    /// property worth checking anyway. The property is that the two spellings
+    /// of one fact agree: a unit demands the default **iff** no key covers it.
+    /// That holds however many entries the table grows, and it fails for the
+    /// one mistake this test can see — a key that matches a unit it was not
+    /// written for, which a prefix entry makes possible.
     #[test]
-    fn every_declared_unit_demands_the_default_today() {
+    fn a_units_demand_is_exactly_what_the_table_says_about_it() {
         for unit in UNITS {
+            let covered = DEMANDS.iter().any(|(key, _)| demand_covers(key, unit.name));
+            if covered {
+                assert_ne!(
+                    unit.demands(),
+                    Demands::DEFAULT,
+                    "`{}` is covered by a key that states the default, which is a \
+                     row saying nothing",
+                    unit.name
+                );
+                continue;
+            }
             assert_eq!(
                 unit.demands(),
                 Demands::DEFAULT,
-                "`{}` states a demand, and this test is the record of when that \
-                 stopped being true -- update it with the reason",
+                "`{}` states a demand no key covers",
                 unit.name
             );
             assert!(unit.floor().is_any());
@@ -925,20 +1000,37 @@ mod tests {
             // use of it may be a separate copy of the same bytes.
             assert_eq!(unit.header_set(), DEVICE_HEADERS);
         }
-        assert!(
-            DEMANDS.is_empty(),
-            "the table and the units above are two spellings of one fact"
-        );
+    }
+
+    /// The two families that reach the vendored closure, and only those two.
+    ///
+    /// Named rather than counted. A count is a number to bump; a name is a
+    /// claim that fails when a third family starts `#include`ing
+    /// `<flashinfer/...>` without saying so — which is the failure
+    /// [`DEMANDS`]' own doc calls the one direction no mechanism can check,
+    /// caught here for the two cases where it is checkable because the
+    /// answer is written down.
+    #[test]
+    fn the_vendored_closure_is_demanded_by_the_two_families_that_reach_it() {
+        for unit in UNITS {
+            let wants_vendor = unit.name.starts_with("attn/fa2_")
+                || unit.name == crate::families::cascade::MERGE_STATES.name;
+            assert_eq!(
+                unit.headers() == Headers::LibraryAndVendor,
+                wants_vendor,
+                "`{}`",
+                unit.name
+            );
+        }
     }
 
     /// A demand is resolved by name, and the resolution is the identity every
     /// caller depends on.
     #[test]
     fn a_demand_is_resolved_by_the_units_own_name() {
-        // The table is empty, so this exercises the lookup rather than an
-        // entry: an unknown name resolves to the default, which is the answer
-        // that must never be a floor someone else stated.
-        let unit = crate::families::norm::ALTUP_AUX;
+        // An unknown name resolves to the default, which is the answer that
+        // must never be a floor someone else stated.
+        let unit = crate::x::norm::altup_aux::ALTUP_AUX;
         assert_eq!(Unit { name: "norm/nowhere", ..unit }.demands(), Demands::DEFAULT);
 
         // The two sets are two sets, and the choice reaches them.

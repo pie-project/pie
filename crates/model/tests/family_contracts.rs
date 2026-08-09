@@ -671,8 +671,10 @@ fn qwen3_5_checkpoint() -> CheckpointMetadata {
     ck.push(&format!("{la}in_proj_z.weight"), &[v_dim, hidden], bf16());
     ck.push(&format!("{la}in_proj_b.weight"), &[8, hidden], bf16());
     ck.push(&format!("{la}in_proj_a.weight"), &[8, hidden], bf16());
+    // `conv1d.weight` and nothing beside it: HF builds this depthwise conv
+    // `bias=False`, so a fixture that pushed `conv1d.bias` was teaching a
+    // checkpoint layout no Qwen3.5 or Qwen3.6 snapshot has.
     ck.push(&format!("{la}conv1d.weight"), &[conv_dim, 1, 4], bf16());
-    ck.push(&format!("{la}conv1d.bias"), &[conv_dim], bf16());
     ck.push(&format!("{la}out_proj.weight"), &[hidden, v_dim], bf16());
     // A_log ships bf16 here, so the widening pass has a cast to state.
     ck.push(&format!("{la}A_log"), &[8], bf16());

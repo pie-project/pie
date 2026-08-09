@@ -61,7 +61,18 @@ fn a_zero_count_heap_is_refused_rather_than_returned_as_nothing() {
         return;
     };
     let err = Timestamps::new(&context, 0).expect_err("zero entries is refused");
-    assert!(matches!(err, Error::Create { .. }), "{err}");
+    // `what: "MTL4CounterHeap"` is also what a DEVICE-DECLINED heap
+    // reports, and on a stack that predates Metal 4 counter heaps that is
+    // the likelier failure -- so the variant alone would let this test
+    // pass without the zero ever being checked.
+    let Error::Create { what, message } = &err else {
+        panic!("{err}")
+    };
+    assert_eq!(*what, "MTL4CounterHeap");
+    assert!(
+        message.contains("no index that can be marked"),
+        "the refusal is the zero count and not the device: {message}"
+    );
 }
 
 #[test]

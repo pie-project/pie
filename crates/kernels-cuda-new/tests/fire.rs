@@ -156,28 +156,38 @@ fn the_typed_api_and_the_dynamic_path_agree() {
     // SAFETY: the allocation is `bytes` long.
     unsafe { cudarc::driver::sys::cuMemcpyHtoD_v2(device_ptr, ones.as_ptr().cast(), bytes) };
 
-    // `..Default::default()` for the axes an elementwise rule never reads.
-    // `Dims` gained a head and expert vocabulary when the rest of
-    // `LaunchRule` was ported; a flat pointwise fire states the three
-    // extents it has and leaves the rest zero, which is what a rule that
-    // reads them would refuse on rather than silently launch nothing.
-    let dims = Dims {
-        rows: 1,
-        width: u32::try_from(n).unwrap(),
-        in_width: u32::try_from(n).unwrap(),
-        ..Default::default()
-    };
+    // No `Dims` here, and that is the whole difference between the two
+    // surfaces. The generated wrapper took one because a row states a
+    // `LaunchRule` and the geometry is derived from `Dims` at the call site;
+    // `x::norm::scalar_mul_bf16` computes its own grid from the extent it
+    // takes, so there is no vocabulary of axes for a caller to fill in
+    // wrongly. The sibling test above still builds one, because
+    // `runtime::fire` is the dynamic path and still binds by symbol.
     // SAFETY: a live device allocation of `n` bf16 elements and the null stream.
-    unsafe {
-        kernels_cuda_new::api::norm_scalar_mul_bf16(
-            device_ptr as *mut std::ffi::c_void,
+    let fired = unsafe {
+        kernels_cuda_new::x::norm::scalar_mul_bf16(
+            device_ptr as *mut kernels_cuda_new::x::abi::bf16,
             2.0,
             n,
-            dims,
-            Stream::NULL,
+            std::ptr::null_mut(),
         )
-    }
-    .expect("the typed entry fires");
+    };
+    // `api::norm_scalar_mul_bf16` was here until north star §6 half A retired
+    // `emit.rs`. It was the emitter's ONLY caller in the tree — `model-loader`
+    // had already crossed to `x::quant`'s four host programs and said so in
+    // its own module doc, so a 1,070-line generator and a `pub mod api`
+    // survived the whole sweep on this one line.
+    //
+    // The replacement is not the same shape and the difference is the point.
+    // The generated function took `dims` and returned `Result`, because a row
+    // states a `LaunchRule` and the geometry is computed from `Dims` at the
+    // call site. `x::norm::scalar_mul_bf16` takes the extent it actually uses
+    // and returns `Fired`, which can say `Declined` — the refusal is a value
+    // here, where the generator could only drop the row and leave a comment.
+    assert!(
+        matches!(fired, kernels_cuda_new::x::Fired::Launched),
+        "the typed entry fires: {fired:?}"
+    );
 
     // SAFETY: no outstanding work beyond the launch above.
     unsafe { cudarc::driver::sys::cuCtxSynchronize() };

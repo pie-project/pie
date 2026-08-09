@@ -57,21 +57,42 @@
 use model::catalog::MetalBinding;
 use model_compiler::trace::{FireClass, ForwardPlan};
 
-/// The one tensor this driver still asks a question of, and the question is
-/// about an ENCODING.
+/// The FIRST of the two tensors this driver asks a question of, and the
+/// question is about an ENCODING.
 ///
 /// `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98 tensors as affine/64/4 and
 /// leaves the expert banks out, so they take the top-level default, mxfp4/32.
+/// Its `quantization` block holds 122 entries and not 98: the other 24 are
+/// the `mlp.router` gates at 64/**8**, which is the SECOND tensor below and
+/// the reason there is a second one.
 /// A checkpoint need not quantize uniformly, and reading a bank with the
 /// dense format is 909,207 NaNs rather than a near miss — the first of them
 /// in `affine_qmv_routed_bfloat16_gs_64_b_4`, layer 0.
 ///
+/// The 98 is a count that stops one entry short. The block carries 122
+/// overrides; the other 24 are the `mlp.router` gates at affine/64/**8**, and
+/// [`ROUTER_GATE`] is the name that asks after those. Theirs are the only
+/// entries in the block with no `mode` key, which is why every independent
+/// copy of this count stopped in the same place.
+///
 /// It is named as a constant rather than spelled at the call site so that the
-/// claim "one probe, and it decides an encoding" is something a test can
+/// claim "two probes, and each decides an encoding" is something a test can
 /// check by reading this file. Whether the model HAS experts is the row's
 /// answer and is not asked here; this asks only what format the bytes for
 /// them arrived in.
 pub const EXPERT_BANK: &str = "layers.0.mlp.experts.gate_proj.weight";
+
+/// The ROUTER GATE this load asks the affine point of.
+///
+/// The second and last name this driver puts to a checkpoint, and it asks
+/// the same KIND of question [`EXPERT_BANK`] does: what format did the bytes
+/// for this tensor arrive in. Whether the model HAS a router is the row's
+/// answer and is not asked here.
+///
+/// It is a constant for the reason that one is — so "which tensors does the
+/// load ask about" stays answerable by reading one file — and
+/// `no_probe_decides_a_fact` is the test that keeps it so.
+pub const ROUTER_GATE: &str = "layers.0.mlp.router.weight";
 
 /// What this build's kernels can do, at any encoding.
 ///
@@ -89,9 +110,30 @@ pub const EXPERT_BANK: &str = "layers.0.mlp.experts.gate_proj.weight";
 /// predecessor was.
 #[must_use]
 pub const fn build_kernels(quant_group: u32, quant_bits: u32, moe_mxfp4: bool) -> MetalBinding {
+    build_kernels_at(quant_group, quant_bits, 0, 0, moe_mxfp4)
+}
+
+/// [`build_kernels`], for a checkpoint whose ROUTER GATE arrived at its own
+/// affine point.
+///
+/// `(0, 0)` for the router is "the same as the dense projections", which is
+/// every checkpoint but gpt-oss's. Kept as a separate constructor rather than
+/// four arguments on the common one because `ANY_ENCODING` and every test
+/// fixture below want the three-argument question, and a gate width is not
+/// part of "what can this build do".
+#[must_use]
+pub const fn build_kernels_at(
+    quant_group: u32,
+    quant_bits: u32,
+    router_quant_group: u32,
+    router_quant_bits: u32,
+    moe_mxfp4: bool,
+) -> MetalBinding {
     MetalBinding {
         quant_group,
         quant_bits,
+        router_quant_group,
+        router_quant_bits,
         moe_mxfp4,
         fuse_residual_gemv: true,
         paged_multi_batch: true,
@@ -154,9 +196,24 @@ pub const ANY_ENCODING: MetalBinding = build_kernels(64, 4, false);
 #[must_use]
 pub fn observed(
     quant: crate::batch::AffineFormat,
+    point_of: impl Fn(&str) -> Option<crate::batch::AffineFormat>,
     is_mxfp4: impl Fn(&str) -> bool,
 ) -> MetalBinding {
-    build_kernels(quant.group, quant.bits, is_mxfp4(EXPERT_BANK))
+    // The gate's point, and ONLY when it differs. Equal is not "no second
+    // point", it is the same point twice, and stating it would put a
+    // `Some(repr)` on the text where `None` means the same thing -- two
+    // spellings of one encoding, which is how a text stops being comparable
+    // to itself across two checkpoints of the same row.
+    let router = point_of(ROUTER_GATE).filter(|p| *p != quant).unwrap_or(
+        crate::batch::AffineFormat { bits: 0, group: 0 },
+    );
+    build_kernels_at(
+        quant.group,
+        quant.bits,
+        router.group,
+        router.bits,
+        is_mxfp4(EXPERT_BANK),
+    )
 }
 
 /// A row that answered a Metal load with some other backend's text.
@@ -276,12 +333,13 @@ mod tests {
                 bits: 8,
                 group: 128,
             },
+            |_| None,
             |_| false,
         );
         assert_eq!(b.quant_bits, 8);
         assert_eq!(b.quant_group, 128);
 
-        let g64 = observed(AffineFormat { bits: 4, group: 64 }, |_| false);
+        let g64 = observed(AffineFormat { bits: 4, group: 64 }, |_| None, |_| false);
         assert_eq!(g64.quant_bits, 4);
         assert_eq!(g64.quant_group, 64);
     }
@@ -297,7 +355,7 @@ mod tests {
     #[test]
     fn exactly_one_tensor_is_asked_about_and_it_decides_an_encoding() {
         let asked = std::cell::RefCell::new(Vec::new());
-        let b = observed(AffineFormat { bits: 4, group: 64 }, |name| {
+        let b = observed(AffineFormat { bits: 4, group: 64 }, |_| None, |name| {
             asked.borrow_mut().push(name.to_string());
             name == EXPERT_BANK
         });
@@ -312,7 +370,7 @@ mod tests {
             "the bank answered mxfp4, so the binding says so"
         );
 
-        let dense = observed(AffineFormat { bits: 4, group: 64 }, |_| false);
+        let dense = observed(AffineFormat { bits: 4, group: 64 }, |_| None, |_| false);
         assert!(
             !dense.moe_mxfp4,
             "a checkpoint whose bank was transcoded reads as the dense format"
@@ -323,7 +381,7 @@ mod tests {
     /// and a real one cannot disagree about them.
     #[test]
     fn the_build_capabilities_do_not_move_with_the_encoding() {
-        let real = observed(AffineFormat { bits: 8, group: 32 }, |_| true);
+        let real = observed(AffineFormat { bits: 8, group: 32 }, |_| None, |_| true);
         assert_eq!(real.fuse_residual_gemv, ANY_ENCODING.fuse_residual_gemv);
         assert_eq!(real.paged_multi_batch, ANY_ENCODING.paged_multi_batch);
         assert_eq!(real.qmm_multi_batch, ANY_ENCODING.qmm_multi_batch);
@@ -433,7 +491,7 @@ mod tests {
         let Some(row) = model::catalog::find("qwen3-0.6b") else {
             panic!("`qwen3-0.6b` is the row the device gates open");
         };
-        let b = observed(AffineFormat { bits: 4, group: 64 }, |_| false);
+        let b = observed(AffineFormat { bits: 4, group: 64 }, |_| None, |_| false);
         for class in [FireClass::Decode, FireClass::Prefill] {
             let mine = text(row, class, &b).expect("a metal text for a served row");
             let theirs = row
@@ -560,12 +618,13 @@ mod tests {
     #[test]
     fn two_encodings_of_one_row_state_the_same_program() {
         let row = model::catalog::find("qwen3-0.6b").expect("a row the device gates open");
-        let four = observed(AffineFormat { bits: 4, group: 64 }, |_| false);
+        let four = observed(AffineFormat { bits: 4, group: 64 }, |_| None, |_| false);
         let eight = observed(
             AffineFormat {
                 bits: 8,
                 group: 128,
             },
+            |_| None,
             |_| false,
         );
         let (a, b) = (

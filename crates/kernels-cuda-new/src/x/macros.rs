@@ -19,11 +19,16 @@
 //!    strictly better than a proc macro doing it textually, because a name
 //!    that does not resolve is a compile error at the declaration.
 //! 2. **Indexing a parallel array.** `DeviceKernel::sig` is a
-//!    `&'static KernelSig` and the old table wrote `&ROPE_SIGS[3]`. Counting
-//!    repetitions in `macro_rules!` needs a TT muncher. It is not needed:
-//!    a `const SIG` item inside the row's own block is promoted to
-//!    `'static` when referenced, so each row carries its own signature and
-//!    no index can be off by one.
+//!    `&'static KernelSig` and the old table wrote `&ROPE_SIGS[3]`. No
+//!    counting is needed: a `const SIG` item inside the row's own block is
+//!    promoted to `'static` when referenced, so each row carries its own
+//!    signature and no index can be off by one. A TT muncher IS needed, for
+//!    a different reason: a row's operand list repeats over the `fn`'s
+//!    parameters, and `macro_rules!` refuses a params-depth metavariable
+//!    transcribed under the rows repetition ("meta-variable repeats N
+//!    times"). The `@rows`/`@params` accumulators below take the rows one
+//!    at a time, so inside each step the parameters are the only repetition
+//!    in sight.
 //! 3. **Generating an identifier from a symbol string.** Nothing needs it.
 //!    The one place that looked like it did — a per-row module for the
 //!    typecheck list — is a block instead.
@@ -51,8 +56,8 @@
 ///         position_delta: i32, num_q_heads: i32, num_kv_heads: i32,
 ///         head_dim: i32, rotary_dim: i32, theta: f32,
 ///     ) {
-///         "rope::rope_partial_bf16" => [T = bf16] "device::bf16",
-///         "rope::rope_partial_f16"  => [T = f16]  "device::f16",
+///         "rope::rope_partial_bf16" => where [T = bf16] "device::bf16",
+///         "rope::rope_partial_f16"  => where [T = f16]  "device::f16",
 ///     }
 /// }
 /// ```
@@ -77,6 +82,132 @@
 /// `tests/units.rs` already walk, and generating a second copy of it would
 /// be the one thing this design refuses.
 ///
+/// # A by-value aggregate needs nothing here
+///
+/// A `__global__` that takes a struct whole — XQA's
+/// `KVCacheList<true> const cacheList` — is declared exactly like a scalar:
+///
+/// ```ignore
+/// fn kernel_mha = "kernel_mha" (
+///     ...
+///     cache_list: crate::x::xqa::KvCacheList,
+///     ...
+/// ) { ... }
+/// ```
+///
+/// because [`by_value!`](crate::by_value) makes the mirror an ordinary
+/// [`Abi`](crate::x::Abi) impl. `PARAMS` gets its [`Abi::CPP`], `ROWS` gets
+/// its [`Abi::TY`], `raw::` takes it by value and `arg` answers
+/// `ArgValue::Bytes`. That the macro needed no new grammar for the case §3.2
+/// called out is the evidence that "an open set of impls, not a closed enum"
+/// was the right shape.
+///
+/// The one thing that is NOT derived is the layout assertion list: a unit
+/// with by-value parameters passes its `ByValue::LAYOUT`s to
+/// `x::abi::typecheck_tu` alongside `PARAMS`. `PARAMS` is `&[&[&str]]` of
+/// spellings and a spelling cannot be turned back into a type, so the
+/// family names them. See `x::xqa::LAYOUTS`.
+///
+/// # ONE UNIT PER INVOCATION, and what a multi-unit family does
+///
+/// Every item above is at module scope, so two invocations in one file
+/// collide on `UNITS`, `ROWS`, `PARAMS` and `raw`. §5.1 predicted this would
+/// be where the macros needed real work; the sweep answered it without a
+/// grammar change, and the answer is better than a grammar change would have
+/// been.
+///
+/// A family with several roots wraps each invocation in its own inline
+/// module and writes the family-level list by hand:
+///
+/// ```ignore
+/// pub mod envelope { unit! { unit ENVELOPE = "layout/envelope", ... } }
+/// pub mod embed    { unit! { unit EMBED    = "layout/embed",    ... } }
+///
+/// pub static UNITS: &[Unit] = &[envelope::ENVELOPE, embed::EMBED];
+/// ```
+///
+/// `layout` is five units and reads well this way — `raw::` picks up a
+/// natural qualifier (`envelope::raw::merge_written`) that a flat file would
+/// have had to spell into every stub name. The hand-written family `UNITS`
+/// is four words per root and is the only line that is written twice, which
+/// is under the bar §0 sets.
+///
+/// **An `n`-unit grammar would have to answer a question this does not.**
+/// `ROWS` is per-unit and `PARAMS` is asserted parallel to it; a single
+/// invocation producing several `Unit`s would need to say which `ROWS` each
+/// one names, and the parallel-array assertion that makes `PARAMS`
+/// trustworthy would become an index the macro maintains rather than a
+/// property of the expansion. Reach for it only if a root count arrives that
+/// makes the module wrapper genuinely unreadable — FA2's 56 units on one
+/// root is the case to judge it on, and that shape is 56 *instantiations*
+/// under one `unit!`, which this grammar already expresses.
+///
+/// # A CROSS-FAMILY LAUNCH NEEDS NOTHING, and the reason is worth reading
+///
+/// `norm::rmsnorm_bf16_with_fp16`'s second launch is `quant::bf16_to_fp16`;
+/// `gemm::act_x_wt_bias_bf16`'s is `norm::add_bias_bf16`. Both were reported
+/// as a hole in the floor — *"`rmsnorm::raw::` cannot spell a `quant::`
+/// symbol"* — with the untyped `x::fire::fire` and a hand-built
+/// `&[ArgValue]` as the workaround, and the alternative being a duplicate
+/// `quant` declaration, which would write the kernel twice.
+///
+/// **Neither is necessary. Call the other family's stub.**
+///
+/// ```ignore
+/// // in x/norm.rs, inside the rmsnorm host program:
+/// unsafe {
+///     crate::x::quant::cast::raw::bf16_to_fp16(
+///         "quant::bf16_to_fp16", launch, src, dst, n, stream,
+///     );
+/// }
+/// ```
+///
+/// The premise is true and does not matter: `rmsnorm::raw::` indeed cannot
+/// spell a `quant::` symbol, and nothing asks it to. A `raw::` stub is
+/// **not bound to the unit it was declared beside**. Read the expansion —
+/// it takes `symbol`, `launch`, its typed parameters and `stream`, and calls
+/// `x::fire::fire(symbol, ..)`, which resolves `unit::unit_of(symbol)`
+/// globally. `$UNIT` appears nowhere in a stub's body. The module path is
+/// Rust namespacing and only that, so `pub mod raw` in one family file is
+/// reachable from every other with full typing, the real `Abi::CPP`
+/// spellings behind it, and no second declaration anywhere.
+///
+/// So the answer to *"a cross-family launch is not exotic — it is what
+/// `Composed` is"* is: correct, and it was already ordinary. Reach for
+/// `x::fire::fire` by hand only for a symbol **no `unit!` declares**, which
+/// after the sweep is nothing.
+///
+/// ## The one consequence, which is real
+///
+/// A cross-family call makes the callee's unit a dependency of the caller's
+/// host program, and nothing in the type system says so — `symbol` is a
+/// `&'static str`. If the callee's unit is absent or its symbol misspelled,
+/// `unit_of` returns `None` and `fire` panics naming the symbol, which is
+/// the deliberate behaviour for a broken JIT and is the right failure, but
+/// it happens at the fire and not at the load. Put the callee's family in a
+/// `// fires: quant::bf16_to_fp16` note beside the call, so a reader
+/// deleting a `quant` unit finds the caller by grep.
+///
+/// # No `units!`, and this one is a refusal
+///
+/// A multi-root family hand-writes `pub static UNITS: &[Unit] = &[..]` and
+/// that is *"the one place where adding a root is two edits instead of
+/// one"*. It stays two edits.
+///
+/// The aggregate is the family's MANIFEST — the one place a reader learns
+/// what device text this family compiles — and it has real reading
+/// consumers: `cache::module` walks it and `tests/units.rs` walks it.
+/// §0's rule is *data only for what has a reading consumer*, and this list
+/// has two. A macro that synthesised it would make the reader chase an
+/// expansion to answer "what does `norm` compile", which is the question the
+/// file should answer at a glance. Four words per root, once, is the price
+/// of that, and it is the right price.
+///
+/// The only thing that would genuinely make it one edit is a build-time
+/// derivation from the directory — and §6.1 has already refused that class
+/// once, for the declaration itself, on the ground that an FFI-adjacent fact
+/// which is derived is a fact nothing checks.
+///
 /// [`Abi::TY`]: crate::x::Abi::TY
 /// [`Abi::CPP`]: crate::x::Abi::CPP
 #[macro_export]
@@ -91,7 +222,11 @@ macro_rules! unit {
             ) $(where $($wty:ty),+ $(,)?)? {
                 $(
                     $(#[$rmeta:meta])*
-                    $symbol:literal => $([$($bg:ident = $bty:ty),+ $(,)?])? $elem:expr
+                    // `where` before the binding group, because `[` opens an
+                    // array expression too and the matcher could not tell the
+                    // group from `$elem`. `where` cannot begin an expression,
+                    // so one keyword settles it.
+                    $symbol:literal => $(where [$($bg:ident = $bty:ty),+ $(,)?])? $elem:expr
                 ),* $(,)?
             }
         )*
@@ -114,32 +249,18 @@ macro_rules! unit {
         /// row has no sources in fn-world** — a `fn` binds its own
         /// arguments — and `LaunchRule::Unstated` for the same reason.
         /// What survives is exactly what NVRTC and `Args::bind` read.
-        static ROWS: &[$crate::device::DeviceKernel] = &[$($(
-            $(#[$rmeta])*
+        //
+        // Through the `@rows` accumulator and not a nested repetition: a
+        // row's operand list repeats over `$pname`, which is bound at
+        // params depth, and the transcriber refuses it under the rows
+        // repetition. See the module header, point 2.
+        static ROWS: &[$crate::device::DeviceKernel] = &$crate::unit!(@rows [] $(
             {
-                $($(type $bg = $bty;)+)?
-                const SIG: ::kernels::KernelSig = ::kernels::KernelSig {
-                    // The symbol in both columns. `name` is `emit_c_shim`'s
-                    // `pie_k_` stem and no device row is shimmed, so the
-                    // only honest answer is the symbol itself.
-                    name: $symbol,
-                    symbol: $symbol,
-                    file: Some($ufile),
-                    operands: &[$(::kernels::Operand {
-                        name: stringify!($pname),
-                        ty: <$pty as $crate::x::Abi>::TY,
-                        nullable: <$pty as $crate::x::Abi>::NULLABLE,
-                        source: ::kernels::Source::Unbound,
-                    }),*],
-                    ..$crate::x::contract::SIG_BASE
-                };
-                $crate::device::DeviceKernel {
-                    sig: &SIG,
-                    template_path: $path,
-                    elem: $elem,
-                }
+                path = $path; file = $ufile;
+                params = [$(($pname: $pty))*];
+                $(row = [$(#[$rmeta])* $symbol => $(where [$(($bg = $bty))+])? $elem];)*
             }
-        ),*),*];
+        )*);
 
         /// Each row's C++ parameter types, parallel to `ROWS`.
         ///
@@ -147,12 +268,13 @@ macro_rules! unit {
         /// with any template type argument substituted by the compiler
         /// rather than by this macro. This is the input to the typecheck
         /// translation unit §6.1 keeps.
-        pub static PARAMS: &[&[&str]] = &[$($(
+        pub static PARAMS: &[&[&str]] = &$crate::unit!(@params [] $(
             {
-                $($(type $bg = $bty;)+)?
-                &[$(<$pty as $crate::x::Abi>::CPP),*] as &[&str]
+                path = $path; file = $ufile;
+                params = [$(($pname: $pty))*];
+                $(row = [$(#[$rmeta])* $symbol => $(where [$(($bg = $bty))+])? $elem];)*
             }
-        ),*),*];
+        )*);
 
         /// Typed launchers, one per declared `__global__`.
         ///
@@ -183,13 +305,109 @@ macro_rules! unit {
                         $crate::x::fire::fire(
                             symbol,
                             launch,
-                            &[$(<$pty as $crate::x::Abi>::arg($pname)),*],
+                            // `arg` borrows. For a scalar or a pointer that
+                            // is a copy either way; for a by-value aggregate
+                            // the borrow is of THIS binding, which lives
+                            // across the call, and `Args::bind` copies the
+                            // bytes out before `fire` returns.
+                            &[$(<$pty as $crate::x::Abi>::arg(&$pname)),*],
                             stream,
                         );
                     }
                 }
             )*
         }
+    };
+
+    // -----------------------------------------------------------------------
+    // The `@rows` / `@params` accumulators.
+    //
+    // Each takes the fn groups one ROW at a time, carrying the fn's
+    // parameter list beside the row, so a step never transcribes a
+    // params-depth metavariable under the rows repetition — which the
+    // transcriber refuses ("meta-variable `symbol` repeats 1 time, but
+    // `pname` repeats 4 times"). The accumulator collects finished array
+    // elements; the terminal arm emits them as one array literal, which is
+    // what the `&` at the invocation site borrows.
+    // -----------------------------------------------------------------------
+
+    (@rows [$($acc:tt)*]) => { [$($acc)*] };
+    (@rows [$($acc:tt)*]
+        {
+            path = $path:literal; file = $ufile:literal;
+            params = [$(($pname:ident : $pty:ty))*];
+            row = [$(#[$rmeta:meta])* $symbol:literal => $(where [$(($bg:ident = $bty:ty))+])? $elem:expr];
+            $($rows:tt)*
+        }
+        $($rest:tt)*
+    ) => {
+        $crate::unit!(@rows
+            [
+                $($acc)*
+                $(#[$rmeta])*
+                {
+                    $($(type $bg = $bty;)+)?
+                    const SIG: ::kernels::KernelSig = ::kernels::KernelSig {
+                        // The symbol in both columns. `name` is
+                        // `emit_c_shim`'s `pie_k_` stem and no device row is
+                        // shimmed, so the only honest answer is the symbol
+                        // itself.
+                        name: $symbol,
+                        symbol: $symbol,
+                        file: Some($ufile),
+                        operands: &[$(::kernels::Operand {
+                            name: stringify!($pname),
+                            ty: <$pty as $crate::x::Abi>::TY,
+                            nullable: <$pty as $crate::x::Abi>::NULLABLE,
+                            source: ::kernels::Source::Unbound,
+                        }),*],
+                        ..$crate::x::contract::SIG_BASE
+                    };
+                    $crate::device::DeviceKernel {
+                        sig: &SIG,
+                        template_path: $path,
+                        elem: $elem,
+                    }
+                },
+            ]
+            { path = $path; file = $ufile; params = [$(($pname: $pty))*]; $($rows)* }
+            $($rest)*
+        )
+    };
+    (@rows [$($acc:tt)*]
+        { path = $path:literal; file = $ufile:literal; params = [$($p:tt)*]; }
+        $($rest:tt)*
+    ) => {
+        $crate::unit!(@rows [$($acc)*] $($rest)*)
+    };
+
+    (@params [$($acc:tt)*]) => { [$($acc)*] };
+    (@params [$($acc:tt)*]
+        {
+            path = $path:literal; file = $ufile:literal;
+            params = [$(($pname:ident : $pty:ty))*];
+            row = [$(#[$rmeta:meta])* $symbol:literal => $(where [$(($bg:ident = $bty:ty))+])? $elem:expr];
+            $($rows:tt)*
+        }
+        $($rest:tt)*
+    ) => {
+        $crate::unit!(@params
+            [
+                $($acc)*
+                {
+                    $($(type $bg = $bty;)+)?
+                    &[$(<$pty as $crate::x::Abi>::CPP),*] as &[&str]
+                },
+            ]
+            { path = $path; file = $ufile; params = [$(($pname: $pty))*]; $($rows)* }
+            $($rest)*
+        )
+    };
+    (@params [$($acc:tt)*]
+        { path = $path:literal; file = $ufile:literal; params = [$($p:tt)*]; }
+        $($rest:tt)*
+    ) => {
+        $crate::unit!(@params [$($acc)*] $($rest)*)
     };
 }
 

@@ -392,6 +392,8 @@ fn the_text_this_driver_runs_is_the_text_the_row_states() {
         MetalBinding {
             quant_group: 128,
             quant_bits: 8,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             ..AT_METAL
         },
     ];

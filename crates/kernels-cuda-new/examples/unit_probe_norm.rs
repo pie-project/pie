@@ -34,7 +34,7 @@
 //! not instantiate them, and a template that only fails when instantiated is
 //! exactly the failure a parse does not find. So the second table instantiates
 //! them anyway, through rows this probe owns and nothing fires — carried here
-//! rather than in [`kernels_cuda_new::families::norm`] because a `Unit` with
+//! rather than in [`kernels_cuda_new::x::norm`] because a `Unit` with
 //! rows in it is a claim that the rows can be LAUNCHED, and these cannot.
 //! `LaunchRule::Unstated` is the honest spelling of that: the row has not said.
 //!
@@ -244,7 +244,7 @@ mod probe {
 
         println!("\nthe units, and the rows they state:\n");
         let mut stated: Vec<Report> = Vec::new();
-        for unit in kernels_cuda_new::families::norm::UNITS {
+        for unit in kernels_cuda_new::x::norm::UNITS {
             stated.push(probe(unit, arch));
         }
         table(&stated);

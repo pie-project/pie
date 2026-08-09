@@ -39,8 +39,8 @@
 // §57, which is the section that also deleted the launchers: the refusals
 // the paragraph records were all refusals of a LAUNCH RULE, and
 // `LaunchRule::Unstated` plus a driver-owned `kernels::Launch` in
-// `driver-cuda/src/fire/gated_delta_net.rs` is exactly the answer to "no
-// rule states this". Read the next paragraph as the history of what each
+// `kernels-cuda-new/src/x/ssm.rs` is exactly the answer to "no rule
+// states this". Read the next paragraph as the history of what each
 // row had to route AROUND, not as a list of what is still missing. The one
 // kernel with no row is the `_fused` pair's, and that is not a vocabulary
 // refusal either: `qwen_gdn_fused_step_enabled()` was `constexpr false`, so
@@ -173,8 +173,8 @@ using state_bf16 = __nv_bfloat16;
 /// `constexpr int BV = 128;` beside the launch; this is that same constant,
 /// moved to where a row can reach it, and the launcher's grid
 /// (`ceil(V_d / BV)` on `grid.x`) is stated against it in
-/// `driver-cuda/src/fire/gated_delta_net.rs`. Change one and both rows and
-/// that grid are stale together, which is why they cite this line.
+/// `kernels-cuda-new/src/x/ssm.rs` as `SMEM_BV`. Change one and both rows
+/// and that grid are stale together, which is why they cite this line.
 constexpr int gqa_smem_bv = 128;
 
 template <typename StateT>

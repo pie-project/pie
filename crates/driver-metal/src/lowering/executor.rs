@@ -267,7 +267,7 @@ pub fn resolve_arg<S: Resolver>(
                 width: *width,
             }
         }
-        Arg::Named { value, width } => BoundArg {
+        Arg::Named { value, width, .. } => BoundArg {
             slice: resolver
                 .named(*value)
                 .ok_or(BindRefusal::UnknownNamed(*value))?,
@@ -442,14 +442,30 @@ mod tests {
         let frame = arena(64);
         let mut store = Store::default();
         assert_eq!(
-            resolve_arg(&Arg::Named { value: 7, width: 4 }, frame, &mut store),
+            resolve_arg(
+                &Arg::Named {
+                    value: 7,
+                    width: 4,
+                    bytes: 4,
+                },
+                frame,
+                &mut store
+            ),
             Err(BindRefusal::UnknownNamed(7))
         );
         store.named.insert(7, slice(0xF00, 16));
         assert_eq!(
-            resolve_arg(&Arg::Named { value: 7, width: 4 }, frame, &mut store)
-                .expect("bound now")
-                .slice,
+            resolve_arg(
+                &Arg::Named {
+                    value: 7,
+                    width: 4,
+                    bytes: 4,
+                },
+                frame,
+                &mut store
+            )
+            .expect("bound now")
+            .slice,
             slice(0xF00, 16)
         );
     }

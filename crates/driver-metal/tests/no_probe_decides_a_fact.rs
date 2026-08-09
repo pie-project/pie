@@ -32,12 +32,21 @@
 //! top-level mxfp4/32 default, and no row may state which format a publisher
 //! packed a bank in.
 //!
+//! That same checkpoint later added a TENTH, for the same reason. Its
+//! `quantization` block carries 122 overrides and not 98: the other 24 are
+//! the `mlp.router` gates at affine/64/**8**, a second affine point in one
+//! file. `layers.0.mlp.router.weight` is asked its point, and the alternative
+//! — a rule here about what a router's name looks like — would have been a
+//! model fact decided by a probe, which is the thing this file exists to
+//! prevent. Two probes, both encodings, is the invariant holding rather than
+//! bending.
+//!
 //! # What it checks
 //!
 //! Two properties of `serve/load.rs`, both by reading it:
 //!
-//! 1. The load path asks the tensors exactly one question, and the answer
-//!    feeds a `MetalBinding` rather than a fact.
+//! 1. Every question the load path puts to the tensors decides an ENCODING,
+//!    and each answer feeds a `MetalBinding` rather than a fact.
 //! 2. The "no Metal text for this row" refusal is REACHED BEFORE STAGING. The
 //!    placement is the whole value of that refusal — on the 31B gemma the
 //!    alternative is 17 GB of weights read to reach an answer identification
@@ -101,6 +110,55 @@ fn code(text: &str) -> Vec<(usize, &str)> {
 /// The one tensor name the load path may spell, and it decides an encoding.
 const ENCODING_PROBE: &str = "loaded.mxfp4.contains";
 
+/// Every way `serve/load.rs` may mention the staged tensors, and what each
+/// one decides.
+///
+/// `loaded` is the only handle that function has on the checkpoint's bytes —
+/// one `let` at line 192, one function in the file — so a list of the ways it
+/// is touched is a COMPLETE list of the questions this load asks. That is
+/// what makes the test below an instrument rather than a restatement: a new
+/// probe cannot reach the tensors without adding a line this list does not
+/// have.
+///
+/// Three of the six entries are not questions: the `let` that produces the
+/// handle, the move that gives it away, and the region walk. They are here
+/// because a list that only held questions would need a rule for what a
+/// question looks like, and the rule is what a new probe would be written to
+/// slip past. Every MENTION, adjudicated, has no such gap.
+const TENSOR_QUESTIONS: &[(&str, &str)] = &[
+    (
+        "loaded.affine_point(",
+        "which affine point the checkpoint's dense projections were written \
+         at, and the refusal when there is more than one the driver can hold",
+    ),
+    (
+        "loaded.affine_point_of(",
+        "which point ONE named tensor was written at — the router gate, whose \
+         width gpt-oss states separately from its stack's",
+    ),
+    (
+        ENCODING_PROBE,
+        "whether the expert banks reached the device still in the \
+         checkpoint's own MXFP4 rather than an affine repack",
+    ),
+    (
+        "&loaded.regions",
+        "not a question of the tensors at all: the staged regions, walked to \
+         record which buffer each weight address belongs to",
+    ),
+    (
+        "let loaded = crate::weights::load::load(",
+        "not a question either: this is where the bytes arrive. It is the \
+         only `let` that produces the handle, which is what makes this list \
+         complete",
+    ),
+    (
+        "self.model = Some(loaded)",
+        "and this is where they leave, moved to the field that owns them. \
+         Neither end asks anything",
+    ),
+];
+
 /// The load path asks the tensors nothing that decides a model fact.
 ///
 /// Measured as: no line of code in `serve/load.rs` contains a per-layer
@@ -134,55 +192,81 @@ fn no_tensor_name_is_spelled_in_the_load_path() {
     );
 }
 
-/// The load path's only question of the tensors is about an ENCODING.
+/// Every question the load path puts to the tensors is about an ENCODING.
 ///
 /// The companion to the test above, and the half that would notice a probe
 /// spelled indirectly — through a helper, a constant or a name built at run
-/// time. There is exactly one place the staged tensors are consulted, it is
-/// the MXFP4 set rather than the tensor index, and its answer goes into a
-/// `MetalBinding`.
+/// time. The other test forbids a tensor NAME here; this one forbids a
+/// tensor QUESTION here, whatever it is spelled with.
 ///
-/// `loaded.tensors.contains_key` is named in the failure message because it
-/// is what the deleted code called, twice, and what a re-introduced probe
-/// would most naturally reach for.
+/// # Why "one question" became two, and why that is not a weakening
+///
+/// This test used to assert the count was exactly one. It was, until
+/// gpt-oss-20b-MXFP4-Q4 turned out to publish TWO affine points in one file:
+/// 98 dense tensors at 64/4 and 24 `mlp.router` gates at 64/**8**. A second
+/// question was the only honest answer, because the alternative is a rule
+/// about what a router's name looks like — which is a MODEL fact, decided
+/// here, which is the exact thing this file exists to prevent.
+///
+/// So the invariant was never the number. It is that each question's answer
+/// is an ENCODING: what format a publisher packed some bytes in, which no
+/// `model::catalog` row may state and none does. [`TENSOR_QUESTIONS`] carries
+/// that adjudication per question, in prose, next to the expression that asks
+/// it — so adding a third means writing down what it decides, and a probe
+/// that decides a model fact has nowhere to write itself down.
+///
+/// # The narrow signature is still the guarantee
+///
+/// Both encoding questions are passed to `binding::observed` as CLOSURES
+/// rather than answered here, and the assertion below pins them to the lines
+/// directly beneath that call. `observed` cannot see the geometry, so it
+/// cannot smuggle a model fact into a binding; a probe answered on its own
+/// line, before the call, would have the whole of `load_model` in scope and
+/// would lose that.
 #[test]
-fn the_load_paths_one_tensor_question_feeds_a_binding() {
+fn every_tensor_question_the_load_asks_decides_an_encoding() {
     let (path, text) = load_path();
-    let probes: Vec<(usize, &str)> = code(&text)
-        .into_iter()
-        .filter(|(_, l)| l.contains(".contains_key(") || l.contains(".contains("))
+    let lines = code(&text);
+    let unaccounted: Vec<String> = lines
+        .iter()
+        .filter(|(_, l)| l.contains("loaded"))
+        .filter(|(_, l)| !TENSOR_QUESTIONS.iter().any(|(q, _)| l.contains(q)))
+        .map(|(i, l)| format!("{i}: {l}"))
         .collect();
-    assert_eq!(
-        probes.len(),
-        1,
-        "{} asks the staged tensors {} questions; it may ask one, and that \
-         one must decide an ENCODING. `loaded.tensors.contains_key(..)` is \
-         what `facts_from_with` called to decide a model fact:\n  {}",
+    assert!(
+        unaccounted.is_empty(),
+        "{} consults the staged tensors in a way `TENSOR_QUESTIONS` does not \
+         account for. `loaded` is this function's only handle on the \
+         checkpoint's bytes, so every such line is a question this load asks \
+         — and the price of asking one is writing down what it decides, \
+         beside the others, where it can be read as an encoding or caught as \
+         a fact. `loaded.tensors.contains_key(..)` is what `facts_from_with` \
+         called to decide a model fact:\n  {}",
         path.display(),
-        probes.len(),
-        probes
-            .iter()
-            .map(|(i, l)| format!("{i}: {l}"))
-            .collect::<Vec<_>>()
-            .join("\n  ")
+        unaccounted.join("\n  ")
     );
-    let (line, src) = probes[0];
-    assert!(
-        src.contains(ENCODING_PROBE),
-        "{}:{line} asks the tensors `{src}`, which is not the expert bank's \
-         format. The one probe this load may make is `{ENCODING_PROBE}`, and \
-         it answers what a publisher packed a bank in — not what the model is",
-        path.display()
-    );
-    assert!(
-        src.contains("binding::observed"),
-        "{}:{line} probes the tensors outside `binding::observed`. That \
-         function takes an affine format and one question deliberately: it \
-         cannot see the geometry, so it cannot smuggle a model fact into a \
-         binding, and a probe that reaches the load path by another route \
-         loses that guarantee",
-        path.display()
-    );
+    // The two ENCODING probes sit in the argument list of `binding::observed`
+    // and nowhere else. Pinned positionally rather than by presence, because
+    // a probe hoisted to its own `let` above the call still "appears in the
+    // file" while having lost the one property that makes it safe.
+    let at = lines
+        .iter()
+        .position(|(_, l)| l.contains("binding::observed("))
+        .unwrap_or_else(|| panic!("{} no longer calls `binding::observed`", path.display()));
+    let arms: Vec<&str> = lines[at + 1..].iter().take(3).map(|(_, l)| *l).collect();
+    for probe in ["loaded.affine_point_of(", ENCODING_PROBE] {
+        assert!(
+            arms.iter().any(|l| l.contains(probe)),
+            "{}:{} does not hand `{probe}` to `binding::observed` as an \
+             argument. That function takes its questions as closures \
+             deliberately: it cannot see the geometry, so it cannot smuggle a \
+             model fact into a binding, and a probe answered before the call \
+             loses that guarantee. What follows the call is:\n  {}",
+            path.display(),
+            lines[at].0,
+            arms.join("\n  ")
+        );
+    }
 }
 
 /// The "no Metal text" refusal is reached before a byte is staged.

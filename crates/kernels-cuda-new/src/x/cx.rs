@@ -109,12 +109,80 @@ pub struct Plan {
 /// and matches it against `"conv_state"` and `"recurrent_state"`. There are
 /// two, there have always been two, and a `&str` that can be misspelled is
 /// the row world's habit surviving into code. Two variants.
+///
+/// # A SLAB ADDRESS IS TWO HALVES, and this is one of them
+///
+/// [`Facts::slab`] hands back a layer's **base** and nothing that can index
+/// it. Every kernel that takes `state_base` takes `slot_ids` and a stride in
+/// the next two argument slots, because the address a request actually
+/// touches is
+///
+/// ```text
+/// base + slot_ids[r] * stride
+/// ```
+///
+/// `ssm` is `slab()`'s first caller and found this: *"an address with no
+/// addressing"*. The two-variant enum is right and the `spec.state.layer`
+/// indexing is right; what was missing was never a third variant. The other
+/// half is [`Gdn::slot_ids_d`] with [`Gdn::conv_stride_elems`] or
+/// [`Gdn::state_stride_elems`] — **and the stride you take must match the
+/// slab you took**, `Conv` with `conv_stride_elems`, `Recurrent` with
+/// `state_stride_elems`, because both are `i64` and swapping them is a
+/// silent stride error rather than a type error.
+///
+/// The next person to add a slab kind adds a stride to [`Gdn`] in the same
+/// change, or repeats this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slab {
     /// The short convolution's ring buffer.
     Conv,
     /// The recurrent state.
     Recurrent,
+}
+
+/// A linear-attention fire's shape and its state addressing.
+///
+/// `GdnCtx`, which `Fire` already borrows, named. Eighteen of `ssm`'s
+/// twenty-seven rows sourced at least one operand from `Source::Gdn(..)`,
+/// which is the row world spelling one context through eleven separate
+/// string keys; here it is one query returning one value, and a family that
+/// wants three of the eleven pays for one lookup.
+///
+/// **It is one struct for two architectures, deliberately.** `GdnCtx`'s own
+/// doc gives the mapping: when a fire is MAMBA rather than GDN, `v_h` is
+/// `num_heads`, `v_d` is `head_dim` and `k_d` is `state_size`, so the state
+/// stride `v_h·k_d·v_d` reads `heads·state·head_dim` — which IS mamba's
+/// slab. The two shapes share one context because they share one arithmetic,
+/// not because nobody separated them.
+#[derive(Clone, Copy, Debug)]
+pub struct Gdn {
+    /// Key heads, compact — before any GQA repeat.
+    pub k_h: i32,
+    /// Value heads. Mamba's `num_heads`.
+    pub v_h: i32,
+    /// Key head width. Mamba's `state_size`.
+    pub k_d: i32,
+    /// Value head width. Mamba's `head_dim`.
+    pub v_d: i32,
+    /// Conv channels, `2·k_h·k_d + v_h·v_d`.
+    pub conv_dim: i32,
+    /// Conv window width.
+    pub conv_k: i32,
+    /// Mamba's B/C group count. **Zero on a GDN family**, and zero is the
+    /// honest answer rather than an absence — a GDN fire has no groups, it
+    /// does not fail to state how many.
+    pub n_groups: i32,
+    /// Elements per conv slot, `conv_k · conv_dim`. Pairs with
+    /// [`Slab::Conv`].
+    pub conv_stride_elems: i64,
+    /// Elements per recurrent slot. Pairs with [`Slab::Recurrent`].
+    pub state_stride_elems: i64,
+    /// Device request→slot ids, one per request in the fire.
+    ///
+    /// The indexing half of every slab address — see [`Slab`].
+    pub slot_ids_d: *const i32,
+    /// Whether this fire advances state.
+    pub write_state: bool,
 }
 
 /// The YaRN quartet, as a checkpoint states it.
@@ -214,6 +282,47 @@ pub trait Facts {
     fn positions(&self) -> Option<*const i32> {
         None
     }
+    /// The fire's TOKEN IDS, one per row.
+    ///
+    /// `DispatchCtx::token_ids`, which the row world sourced as
+    /// `Source::Ctx("token_ids")`. The first launch of every fire —
+    /// `layout::embed_bf16` — reads it, so this is the least optional query
+    /// on the trait and is still `Option`, because the trait is one shape
+    /// for every family and a norm kernel has no tokens.
+    fn token_ids(&self) -> Option<*const i32> {
+        None
+    }
+    /// How many tokens the vocabulary holds.
+    ///
+    /// `DispatchCtx::vocab`, row-sourced as `Source::Ctx("vocab")`. An
+    /// embedding gather bounds-checks against it and an LM head's output
+    /// width is it.
+    fn vocab(&self) -> Option<i32> {
+        None
+    }
+    /// The rows a sampling gather collects, or `None` when the fire gathers
+    /// every row.
+    ///
+    /// `DispatchCtx::sampling_indices`, row-sourced as
+    /// `Source::SamplingIndices` — a source spelling with exactly one
+    /// consumer, which is the shape §0 means by "one small declaration
+    /// serves the readers that cannot call". Under fn-world it is a query
+    /// and the grammar entry retires with the row.
+    fn sampling_indices(&self) -> Option<*const i32> {
+        None
+    }
+    /// The per-layer-embedding width, for a checkpoint that carries PLE
+    /// tables beside its weights.
+    ///
+    /// `DispatchCtx::ple_dim`, row-sourced as `Source::Ctx("ple_dim")` and,
+    /// for the layer count, `Div(Width(In(0)), CtxNonZero("ple_dim"))`.
+    /// **`CtxNonZero` is where the row grammar already said that zero means
+    /// absent**; `Option` is that statement in the type system, so a driver
+    /// impl returns `None` for zero rather than handing back a divisor that
+    /// faults.
+    fn ple_dim(&self) -> Option<i32> {
+        None
+    }
     /// The fire's PEEL WINDOW: a device-resident `[start, count]`, or `None`
     /// when this fire has no row split.
     ///
@@ -253,6 +362,21 @@ pub trait Facts {
     fn rms_eps(&self) -> Option<f32> {
         None
     }
+    /// The logit soft cap, or `None` where the deployment states none.
+    ///
+    /// `Source::CtxNonZero("final_logit_softcap")` is where the row grammar
+    /// already said that zero means absent, and this is that statement moved
+    /// into the type system: an impl returns `None` for zero rather than
+    /// handing back a cap of zero, which would scale every logit to nothing.
+    ///
+    /// Gemma-2, Gemma-3 and Gemma-3n state it; nothing else does. That is why
+    /// `attn::logit_softcap_bf16` could not cross without this — a `none:`
+    /// arm surfaces as [`crate::x::Route::Unbound`] at model **load**, so it
+    /// would refuse every Gemma deployment for a symbol that fires correctly
+    /// today.
+    fn final_logit_softcap(&self) -> Option<f32> {
+        None
+    }
     /// The rotation pairs adjacent elements rather than halves.
     fn rope_interleaved(&self) -> bool {
         false
@@ -274,8 +398,57 @@ pub trait Facts {
         None
     }
     /// One of a gated-delta-net layer's state slabs.
+    ///
+    /// The BASE only. See [`Slab`] for the other half of the address, which
+    /// is [`Facts::gdn`]'s.
     fn slab(&self, which: Slab) -> Option<*mut c_void> {
         let _ = which;
+        None
+    }
+    /// This fire's linear-attention shape and state addressing.
+    fn gdn(&self) -> Option<Gdn> {
+        None
+    }
+    /// The `i`th AUXILIARY buffer this statement publishes or reads.
+    ///
+    /// `Source::Aux(i)`. Scratch the lowering placed and named by index —
+    /// a chunked scan's per-chunk partials, a split-K's accumulator.
+    ///
+    /// **Pre-resolved.** `bind/facts.rs`'s note is the constraint: *"a
+    /// `Resolver` is `&mut` and `Facts` is not."* A driver impl holds the
+    /// answer already, computed at the dispatch site; it does not resolve
+    /// one here. That is what keeps [`Cx`] query-only and it is why this
+    /// returns a pointer rather than an index into something.
+    fn aux(&self, i: usize) -> Option<*mut c_void> {
+        let _ = i;
+        None
+    }
+    /// The `i`th RESULT placement.
+    ///
+    /// `Source::ResultOrRegion(i)`, and **this is not [`Facts::arg_out`]**.
+    /// The two read different lists: a result reads `spec.outs[i]`, an
+    /// output operand reads `bound.args[n_in + i]`. They agree for a
+    /// statement whose outputs are all operands and disagree for one that
+    /// writes into a region the lowering placed, which is exactly the case
+    /// `ResultOrRegion` was minted for. Taking the wrong one writes to a
+    /// valid address that belongs to something else.
+    ///
+    /// Pre-resolved, for [`Facts::aux`]'s reason.
+    fn result(&self, i: usize) -> Option<*mut c_void> {
+        let _ = i;
+        None
+    }
+    /// The statement's bias weight, when it carries one.
+    ///
+    /// **Absence is legal here and is not a refusal** —
+    /// `csrc/src/ssm/causal_conv1d.cuh:383` marks the parameter
+    /// `// [C] nullable`, so the kernel takes a null and the host program
+    /// says so. [`Cx::weight_bias`] therefore returns `Option` rather than
+    /// `Result`: the only query on [`Cx`] that does, because it is the only
+    /// fact whose absence the device text explicitly accepts.
+    ///
+    /// Pre-resolved, for [`Facts::aux`]'s reason.
+    fn weight_bias(&self) -> Option<*mut c_void> {
         None
     }
 }
@@ -369,6 +542,22 @@ impl<'a> Cx<'a> {
         positions -> *const i32, "positions"
     );
     query!(
+        /// The fire's token ids, one per row.
+        token_ids -> *const i32, "the fire's token ids"
+    );
+    query!(
+        /// How many tokens the vocabulary holds.
+        vocab -> i32, "the vocabulary size"
+    );
+    query!(
+        /// The rows a sampling gather collects.
+        sampling_indices -> *const i32, "the rows a sampling gather collects"
+    );
+    query!(
+        /// The per-layer-embedding width.
+        ple_dim -> i32, "the per-layer-embedding width"
+    );
+    query!(
         /// The fire's device-resident peel window, `[start, count]`.
         peel_window -> NonNull<u32>, "a peel window"
     );
@@ -397,6 +586,10 @@ impl<'a> Cx<'a> {
         rms_eps -> f32, "the rms epsilon"
     );
     query!(
+        /// The logit soft cap. Absent unless the deployment states one.
+        final_logit_softcap -> f32, "the final logit soft cap"
+    );
+    query!(
         /// How many of each head's elements rotate.
         rotary_width -> i32, "the rotary width"
     );
@@ -416,6 +609,37 @@ impl<'a> Cx<'a> {
         /// One of a gated-delta-net layer's state slabs.
         slab(which: Slab) -> *mut c_void, "a state slab"
     );
+    query!(
+        /// This fire's linear-attention shape and state addressing.
+        gdn -> Gdn, "a linear-attention context"
+    );
+    query!(
+        /// The `i`th auxiliary buffer.
+        aux(i: usize) -> *mut c_void, "an auxiliary buffer"
+    );
+    query!(
+        /// The `i`th result placement. NOT [`Cx::arg_out`] — see
+        /// [`Facts::result`].
+        result(i: usize) -> *mut c_void, "a result placement"
+    );
+
+    /// The statement's bias weight, or `None` when it carries none.
+    ///
+    /// **The one query that does not refuse**, and the exception is the
+    /// device text's: `causal_conv1d.cuh:383` marks the parameter
+    /// `// [C] nullable`. A `Result` here would make a host program write
+    /// `.unwrap_or(null_mut())` at every call site, which is a refusal
+    /// spelled as an escape — and a refusal that every caller escapes is
+    /// worse than no refusal, because the next reader cannot tell which
+    /// escapes are load-bearing.
+    ///
+    /// Absence is `None` and the kernel takes a null. Nothing else on
+    /// [`Cx`] may copy this shape without a `// [C] nullable` beside the
+    /// parameter it feeds.
+    #[must_use]
+    pub fn weight_bias(&self) -> Option<*mut c_void> {
+        self.facts.weight_bias()
+    }
 
     /// Which rows this fire launches. Always answerable.
     #[must_use]

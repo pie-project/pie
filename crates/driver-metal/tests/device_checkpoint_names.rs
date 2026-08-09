@@ -70,16 +70,39 @@ fn snapshot() -> Option<PathBuf> {
 /// tell apart. Every `affine_qmv_fast_bfloat16_gs_N_b_M` symbol the text
 /// names carries that pair in its name, so a gate that guessed it would
 /// report missing kernels for a checkpoint that is fine.
+///
+/// `None` WHEN NOTHING IN THIS BUILD CLAIMS THE CHECKPOINT, which is a
+/// refusal and not a crash. Every caller's preamble already says it -- "the
+/// claim comes first, and there are two sound outcomes, not one" -- and this
+/// was the one place that said it with a panic, one step earlier than the
+/// `serves()` branch that says it with a skip. A gate whose subject is
+/// whether a checkpoint answers the names a text states has nothing to ask
+/// when no text was ever going to be built.
+///
+/// `identify`'s refusal names every near-miss row and the tensors each one
+/// wanted, so the finding is printed rather than swallowed. Two are open on
+/// this machine and neither is a Metal defect:
+///
+/// * **Qwen3.6-35B-A3B** publishes MLX's fused MoE spelling,
+///   `mlp.switch_mlp.{gate,up,down}_proj` plus a `shared_expert`, with zero
+///   expert-indexed tensors, where the row wants `mlp.experts.0.gate_proj`.
+/// * **Qwen3.6-27B** is a `Qwen3_5ForConditionalGeneration` snapshot, so its
+///   text tensors sit under `language_model.` beside a vision tower.
 fn served(
     dir: &std::path::Path,
-) -> (
+) -> Option<(
     &'static dyn model::catalog::Variant,
     model::encoding::Encoding,
-) {
+)> {
     let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(dir)
         .unwrap_or_else(|e| panic!("{} did not read as a checkpoint: {e:?}", dir.display()));
-    let row = model::catalog::identify(&meta, &model::catalog::Override::None)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    let row = match model::catalog::identify(&meta, &model::catalog::Override::None) {
+        Ok(row) => row,
+        Err(why) => {
+            eprintln!("SKIP: {}: {why}", dir.display());
+            return None;
+        }
+    };
     // The embedded copy when the artifact carries one, the snapshot's own
     // file when it does not. A converted `.pie` archive has the first; a raw
     // HuggingFace snapshot -- which is what `PIE_METAL_NAMES_SNAPSHOT`
@@ -96,15 +119,25 @@ fn served(
             dir.display()
         )
     });
-    (row, encoding)
+    Some((row, encoding))
 }
 
-/// The affine point a snapshot's encoding names, as the kernels spell it.
-fn affine(encoding: &model::encoding::Encoding) -> driver_metal::batch::AffineFormat {
-    driver_metal::batch::AffineFormat {
-        bits: encoding.bits,
-        group: encoding.group_size,
-    }
+/// The affine point a checkpoint's TENSORS arrive at, as the kernels spell it.
+///
+/// This read `encoding.bits`/`encoding.group_size` — the top of
+/// `config.json`'s quantization block — and that block is a DEFAULT whose
+/// per-tensor overrides may supersede it for every tensor in the file.
+/// `gpt-oss-20b-MXFP4-Q4` declares `g32/b4` there, describing the only
+/// tensors it holds that are not affine at all, and every affine tensor
+/// overrides it.
+fn affine(points: &[(u32, u32)]) -> driver_metal::batch::AffineFormat {
+    points.first().map_or(
+        driver_metal::batch::AffineFormat { bits: 0, group: 0 },
+        |(group, bits)| driver_metal::batch::AffineFormat {
+            bits: *bits,
+            group: *group,
+        },
+    )
 }
 
 /// Every weight name the Metal text states, over both fire classes.
@@ -179,7 +212,9 @@ fn the_checkpoint_answers_the_names_the_text_states() {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
-    let (row, encoding) = served(&snapshot);
+    let Some((row, encoding)) = served(&snapshot) else {
+        return;
+    };
 
     // Does this driver CLAIM this checkpoint? Asking second is how this gate
     // spent its life reporting a failure that was not one: pointed at a
@@ -196,8 +231,8 @@ fn the_checkpoint_answers_the_names_the_text_states() {
     // distinguishable at all: `architecture_of` re-read `config.json` and
     // could disagree with what the seam built, so a mismatch showed up as
     // missing names rather than as a refusal.
-    let arch = match row.deployment(model::catalog::Deployed::single()) {
-        Ok(d) => d.advertised.arch,
+    let deployment = match row.deployment(model::catalog::Deployed::single()) {
+        Ok(d) => d,
         Err(why) => {
             eprintln!(
                 "SKIP: the matched row `{}` does not deploy: {why}",
@@ -206,6 +241,7 @@ fn the_checkpoint_answers_the_names_the_text_states() {
             return;
         }
     };
+    let arch = deployment.advertised.arch;
     if let Err(why) = driver_metal::model::binding::serves(row) {
         // No assertion here, deliberately: the refusal `binding::text` gives
         // at the fire IS this one, so checking it after branching on it
@@ -227,17 +263,37 @@ fn the_checkpoint_answers_the_names_the_text_states() {
     );
 
     // The checkpoint's own shape, projected the way the seam projects it:
-    // once, off the row the tensors matched, at the affine point the config
-    // declares.
-    let deployment = row
-        .deployment(model::catalog::Deployed::single())
-        .expect("the matched row deploys");
-    let geometry = driver_metal::batch::geometry_from_deployment(
+    // once, off the row the tensors matched, at the affine point its TENSORS
+    // arrived at.
+    //
+    // A GEOMETRY REFUSAL IS THE OTHER SOUND OUTCOME, and this was an
+    // `.expect`. The whole preamble above is written around "the claim comes
+    // first, and there are two sound outcomes, not one" -- and then panicked
+    // on a driver correctly declining a checkpoint whose facts its geometry
+    // cannot express. That is the same defect the 576-missing-names report
+    // was, one seam later: a right answer read as a crash.
+    //
+    // It is a SKIP for exactly the reason the sweep below gives for its own:
+    // a refusal is a finding, and swallowing findings is how a checkpoint
+    // stops being covered without anyone noticing -- but `catalog_coverage.rs`
+    // holds every row to the rule that a refusal names something its
+    // `Deployment` shows, so the finding already has a gate that runs with no
+    // checkpoint on the machine.
+    let geometry = match driver_metal::batch::geometry_from_deployment(
         &deployment,
         row.load_shape(),
-        affine(&encoding),
-    )
-    .expect("a decodable geometry");
+        affine(&loaded.affine_points),
+    ) {
+        Ok(g) => g,
+        Err(why) => {
+            eprintln!(
+                "SKIP: the geometry refuses `{}` -- {}",
+                row.id(),
+                why.0
+            );
+            return;
+        }
+    };
     // WHAT THE LOAD OBSERVED, and nothing else. This was
     // `text::facts_from(&geometry, |t| loaded.tensors.contains_key(t))` --
     // twenty-nine model facts rebuilt here from the tensors, in a gate whose
@@ -248,8 +304,11 @@ fn the_checkpoint_answers_the_names_the_text_states() {
     // `loaded.mxfp4` is the one question left, and it is the seam's own: a
     // bank the load left in the publisher's format states an mxfp4 symbol
     // rather than an affine one.
-    let binding =
-        driver_metal::model::binding::observed(geometry.quant, |t| loaded.mxfp4.contains(t));
+    let binding = driver_metal::model::binding::observed(
+        geometry.quant,
+        |t| loaded.affine_point_of(t),
+        |t| loaded.mxfp4.contains(t),
+    );
 
     let named = HashMap::new();
     let mut store = Store::new(Names::mlx(), &loaded.tensors, &named);
@@ -291,7 +350,9 @@ fn what_this_checkpoint_published() {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
-    let (row, encoding) = served(&snapshot);
+    let Some((row, encoding)) = served(&snapshot) else {
+        return;
+    };
     // A report cannot fail on a refusal -- the refusal is the thing to
     // report. `weights::stage` asks `fits_on_this_gpu` before staging, and on
     // this machine the 31B gemma reaches it only in the THIRD test of the
@@ -398,10 +459,25 @@ fn snapshots_to_check() -> Vec<PathBuf> {
 /// reporting its every tensor as missing says nothing except that.
 fn check_one_snapshot(dir: &std::path::Path) {
     let dir = dir.to_path_buf();
-    let (row, encoding) = served(&dir);
-    let deployment = row
-        .deployment(model::catalog::Deployed::single())
-        .unwrap_or_else(|e| panic!("{}: the matched row does not deploy -- {e}", dir.display()));
+    let Some((row, encoding)) = served(&dir) else {
+        return;
+    };
+    // A DEPLOY REFUSAL IS A SKIP HERE TOO, and it was a panic. The
+    // single-checkpoint gate above already skips on this exact call, and the
+    // geometry refusal thirty lines below already skips with the reason
+    // written out -- so the sweep panicked on the one refusal of the three it
+    // had not been taught, and it fired on every run: gemma-4 26B-A4B is on
+    // this machine and this build cannot load a routed gemma-4 block.
+    // That is the driver declining correctly, and the sweep reported
+    // it as a crash for every checkpoint it was pointed at, because it walks
+    // them all.
+    let deployment = match row.deployment(model::catalog::Deployed::single()) {
+        Ok(d) => d,
+        Err(why) => {
+            eprintln!("    SKIP: the matched row does not deploy -- {why}");
+            return;
+        }
+    };
 
     // Whether a text serves this checkpoint at all, asked of the DRIVER
     // rather than of a list kept here. `qwen3_5` interleaves linear
@@ -446,7 +522,7 @@ fn check_one_snapshot(dir: &std::path::Path) {
     let geometry = match driver_metal::batch::geometry_from_deployment(
         &deployment,
         row.load_shape(),
-        affine(&encoding),
+        affine(&plan.affine_points()),
     ) {
         Ok(g) => g,
         Err(why) => {
@@ -474,7 +550,14 @@ fn check_one_snapshot(dir: &std::path::Path) {
         })
         .map(|t| t.name.as_str())
         .collect();
-    let binding = driver_metal::model::binding::observed(geometry.quant, |t| mxfp4.contains(t));
+    let binding = driver_metal::model::binding::observed(
+        geometry.quant,
+        |t| {
+            plan.affine_point_of(t)
+                .map(|(group, bits)| driver_metal::batch::AffineFormat { bits, group })
+        },
+        |t| mxfp4.contains(t),
+    );
 
     let tensors = HashMap::new();
     let named = HashMap::new();
@@ -566,9 +649,25 @@ fn check_projection_widths(
     let mut wrong = Vec::new();
     for (l, layer) in deployment.attention.iter().enumerate() {
         let head_dim = layer.head_dim;
+        // The KV COUNT OFF THE LAYER, not off the stack. This read
+        // `deployment.shape.kv_heads`, which is the absence
+        // `LayerAttention::kv_heads` exists to close -- its own doc says the
+        // struct "stated the width and left the count on the stack-wide
+        // `Geometry`, which is right for every family whose layers agree --
+        // and gemma-4's do not".
+        //
+        // So this gate held gemma-4-31b's ten `full_attention` layers to the
+        // fifty sliding ones' count and reported every one of them as a
+        // driver reading the wrong bytes. Measured off the snapshot, layer 4
+        // publishes k at 4096 and layer 5 at 2048 against q's 8192 and 16384:
+        // two shapes, which is what the table already says and what the
+        // stack-wide number cannot.
+        //
+        // `q_heads` stays stack-wide because there is no per-layer q count to
+        // read, and every q_proj agreed.
         for (role, heads) in [
             (format!("layer.{l}.q_proj"), deployment.shape.q_heads),
-            (format!("layer.{l}.k_proj"), deployment.shape.kv_heads),
+            (format!("layer.{l}.k_proj"), layer.kv_heads),
         ] {
             let Some(got) = width_of(&role) else { continue };
             let want = i64::from(heads * head_dim);

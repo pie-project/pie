@@ -322,6 +322,28 @@ pub enum Ungeometric {
     /// why this refuses instead of falling back to the matvec grid:
     /// `affine_qmm_t` reads its tile FROM the grid, so a matvec grid points it
     /// at a tiling that is not there and a two-token prefill came back NaN.
+    ///
+    /// # Where the shape came from, and who fixed it
+    ///
+    /// Not the driver, and not by choosing a different kernel here — that is
+    /// the choice this refusal exists to push back to the text, and the text
+    /// makes it: `llama_like`'s projection is a `guarded_value` whose arms are
+    /// the GEMM and the GEMV.
+    ///
+    /// Its predicate used to be `GuardPred::TokensGT(tile - 1)`, which asks
+    /// whether there are ENOUGH rows where the kernel needs a WHOLE NUMBER OF
+    /// TILES, so every count above the tile that the tile did not divide —
+    /// fifteen in sixteen — was admitted to an arm that could not run, and a
+    /// 35-token prompt reached this variant on Metal, Vulkan and wgpu alike.
+    /// `GuardPred::TokensMultipleOf(tile)` is the predicate that guard wanted,
+    /// and it is what the text states now.
+    ///
+    /// So this refusal should be UNREACHABLE from a stated text today. It is
+    /// kept, and kept refusing, because it is the only thing standing between
+    /// a mis-stated guard and a fire that runs on a tiling that is not there.
+    /// `driver-wgpu/tests/arena.rs::every_row_count_the_guard_sends_to_the_gemm_has_a_grid`
+    /// sweeps every row count up to four tiles and requires the text's arm and
+    /// this file's answer to agree on each.
     PartialTile {
         /// The row count asked for.
         rows: u32,
@@ -370,7 +392,13 @@ impl core::fmt::Display for Ungeometric {
                 "a row of {width} is not a whole number of {head_dim}-wide heads"
             ),
             Self::PartialTile { rows, tile } => {
-                write!(f, "{rows} rows is not a whole number of {tile}-row tiles")
+                write!(
+                    f,
+                    "{rows} rows is not a whole number of {tile}-row tiles \
+                     (a stated text guards this arm with \
+                     `GuardPred::TokensMultipleOf({tile})`, so reaching this \
+                     means some text does not)"
+                )
             }
             Self::PastDeviceLimit {
                 axis,
@@ -585,9 +613,19 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
         // `driver-vulkan` carries the identical expression against a
         // `local_size_y = 8` shader, so it has the same four-fold undershoot.
         // Reported rather than fixed here: it is the sibling's file.
+        //
+        // The y extent is `axis` and not `width`, which is the ROW's own
+        // statement rather than this file's reading of the rectangle. A routed
+        // projection writes a whole token's `k` results end to end, so the
+        // output is `k` times as wide as one result and `width` is `k *
+        // out_vec_size`; `grid_param = Some(1)` on all three routed matvecs
+        // names the second word, which is `out_vec_size` itself. `axis` falls
+        // back to `width` for a row that states nothing, so this is the same
+        // answer wherever the two agree. `driver-metal` reads `dims.axis`
+        // here too.
         Rule::RoutedQmv => [
             module.local.at(0) * rows,
-            dims.width.max(1),
+            dims.axis.max(1),
             dims.experts_per_token.max(1),
         ],
     })
@@ -1214,36 +1252,37 @@ mod tests {
     /// helper it answers "every axis" rather than "no axis", so a module this
     /// check cannot read makes the check STRICTER rather than vacuous.
     ///
-    /// ## The defect it catches
+    /// ## The defect it caught, and how it was closed
     ///
     /// `geglu_tanh_strided`'s row states `LaunchRule::Elementwise`, which is
     /// `[width * rows, 1, 1]`. Its body alone among the five in
-    /// `mlp/gated.wgsl` is `@workgroup_size(16, 16)` and reads `gid.y` as the
-    /// row, so one workgroup on y covers 16 rows and every row past 15 keeps
+    /// `mlp/gated.wgsl` was `@workgroup_size(16, 16)` and read `gid.y` as the
+    /// row, so one workgroup on y covered 16 rows and every row past 15 kept
     /// the bytes it was allocated with. Measured at 21 rows on a 4090: row 16
-    /// held its sentinel and the dispatch succeeded.
+    /// held its sentinel and the dispatch succeeded. gemma's PLE reaches this
+    /// with `rows` = the fire's token count, so any prefill past sixteen
+    /// tokens was dropping most of its per-layer embeddings, silently.
     ///
-    /// `kernels-vulkan`'s copy is `local_size_y = 16` over the same rule, so
-    /// the sibling has it too. The row is shared with `kernels-metal` — where
-    /// a threadgroup is sized at dispatch and `Elementwise` is right — so
-    /// fixing it is a change to the shared table (`ElementwiseRows` is the
-    /// shape this body wants) and a parity question rather than a local one.
+    /// The obvious fix was a new rule -- `ElementwiseRows` is the shape that
+    /// body wanted -- but the row is shared with `kernels-metal`, where a
+    /// threadgroup is sized at dispatch and `Elementwise` is already right.
+    /// Changing the row would have been three tables and three drivers to fix
+    /// one body. Changing the BODY to match the rule it already states was
+    /// local, so that is what happened: it is `@workgroup_size(256)` and
+    /// `gid.x` is a flat element index. `kernels-vulkan`'s copy is still
+    /// `local_size_y = 16` over the same rule and still has this.
     ///
-    /// Until that lands the row is listed below with its reason. The list is
-    /// asserted to be exactly what is known, so a second row joining it is a
-    /// failure that has to be read rather than a line quietly added.
+    /// The list below is consequently EMPTY, and the emptiness is asserted
+    /// from both ends: an entry that stops being defective fails just as
+    /// loudly as a row that starts being one. That is what said the fix had
+    /// landed -- `these are listed as known-defective and are not` -- in the
+    /// same run that proved it.
     #[test]
     fn no_module_reads_a_grid_axis_its_rule_leaves_flat() {
-        // Rows whose module reads an axis the rule flattens. Each is a defect,
-        // each is named, and the list is pinned so it cannot grow in silence.
-        const KNOWN: [(&str, &str); 1] = [(
-            "geglu_tanh_strided",
-            "states `Elementwise` ([n, 1, 1]) and its body is @workgroup_size(16, 16) \
-             reading gid.y as the row, so every row past 15 is never written. \
-             `ElementwiseRows` is the shape it wants; the row is shared with \
-             `kernels-metal`, where a dispatch-sized threadgroup makes \
-             `Elementwise` correct, so the fix is a change to the shared table.",
-        )];
+        // Rows whose module reads an axis the rule flattens. Each would be a
+        // defect, each would be named, and the list is pinned so it cannot
+        // grow in silence.
+        const KNOWN: [(&str, &str); 0] = [];
 
         let d = Dims {
             rows: 7,
@@ -1365,29 +1404,33 @@ mod tests {
         //   rather than in the row: `lanes()` is a THREAD extent and a body
         //   that indexes by lane consumes it correctly.
         //
-        // * `kv_append` reads `gid.z` — the line is right there in
-        //   `attn/kv_write.wgsl` — and `grid_axes` answers `[true, true,
-        //   false]`. That is a FALSE NEGATIVE in the reflection, and it is the
-        //   documented weakness: `crate::reflect`'s notes say the walk follows
-        //   a builtin into a helper with a depth bound and answers "every
-        //   axis" where it cannot follow. Here it followed, decided, and
-        //   decided wrong.
+        // * `kv_append` reads only `gid.x` and `gid.y`, and `grid_axes` says
+        //   so. This note used to record a FALSE NEGATIVE here, on the
+        //   strength of a `gid.z` read straight out of `attn/kv_write.wgsl`.
+        //   That `gid.z` belongs to the OTHER body in the same file: the two
+        //   `kv_append` variants are one `//#if defined(PIE_PAGED)` apart, and
+        //   the page index is the paged one's. The reflection was reading the
+        //   compiled module and was right; the note was reading the file and
+        //   was wrong.
         //
-        // The second one matters because it is the direction that loses data.
-        // The check above trusts `grid_axes` to say an axis IS read; a false
-        // negative there is a defect this test would excuse. It does not
-        // excuse one today — `kv_append`'s rule gives it work on z, so the
-        // flat-axis half never looks at it — but the exposure is real and is
-        // written down rather than discovered later.
+        //   `reflect::tests::two_entrypoints_of_one_file_are_told_apart_by_the_axis_they_read`
+        //   now pins the pair, because a mistake made by reading a file is one
+        //   the next reader of that file will make again.
         //
-        // So this is printed and not asserted. An assertion would either be
-        // wrong (the three router rows are correct) or would need an exception
-        // list that hides the `kv_append` finding inside it.
+        // So what is printed below is the first cause only, and the check
+        // above keeps trusting `grid_axes` to say an axis IS read -- a trust
+        // that is now measured on the one pair in the tree built to test it.
+        //
+        // It is printed and not asserted because the rows it names are RIGHT:
+        // asserting emptiness would fail on three rows that consume their
+        // lanes correctly, and asserting an exception list would be a list of
+        // three correct rows. What the print buys is that a FOURTH row joining
+        // them is visible in the output rather than silent.
         if !wasted.is_empty() {
             eprintln!(
                 "rows given work on an axis `grid_axes` says they never read \
-                 ({} of them). Two causes, and only one is a row's fault -- see \
-                 the note above this print:\n  {}",
+                 ({} of them). Expected for a body that indexes by lane over a \
+                 workgroup -- see the note above this print:\n  {}",
                 wasted.len(),
                 wasted.join("\n  "),
             );
@@ -1454,18 +1497,30 @@ mod tests {
                     declared.local
                 );
 
-                // A width that is NOT a multiple of the module's y, so the
+                // An extent that is NOT a multiple of the module's y, so the
                 // round-up is a different expression from the division. At a
                 // multiple the two agree and this check proves nothing --
                 // which is how the defect survived a suite that used them.
-                for width in [13u32, 47, 1] {
-                    let d = Dims { width, ..dims() };
+                //
+                // The extent is `axis`, which is what `grid_param = Some(1)`
+                // on these three rows names: `out_vec_size`, one result's
+                // width. `width` is set to FOUR TIMES it here, modelling a
+                // routed projection at `top_k = 4` writing a whole token's
+                // results end to end -- so a grid that read the rectangle
+                // instead of the row's own statement launches four times over
+                // and fails this by number.
+                for axis in [13u32, 47, 1] {
+                    let d = Dims {
+                        axis,
+                        width: axis * 4,
+                        ..dims()
+                    };
                     let got = groups(Rule::RoutedQmv, d, module)
-                        .unwrap_or_else(|e| panic!("`{name}` at width {width}: {e}"));
+                        .unwrap_or_else(|e| panic!("`{name}` at axis {axis}: {e}"));
                     assert_eq!(
                         got[1],
-                        width.div_ceil(lanes_y),
-                        "`{name}` at width {width}: {} workgroups on y for a \
+                        axis.div_ceil(lanes_y),
+                        "`{name}` at axis {axis}: {} workgroups on y for a \
                          module owning {lanes_y} output rows each. Every row \
                          past {} is never written, and the dispatch succeeds.",
                         got[1],

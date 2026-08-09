@@ -498,7 +498,68 @@ pub fn reorder<'a, R: Resolve>(
             // block at whatever slot the row placed it, and `params` decides
             // where that is.
             kernels::Source::Unbound => Ok(Slot::Nothing),
-            _ => Ok(Slot::Params),
+            // EVERY remaining source, spelled out, and the reason is a defect
+            // this file has already made once. `_ => Ok(Slot::Params)` sent
+            // anything unrecognised to the parameter buffer -- a scalar the
+            // TEXT states -- and a source that means a fact about the FIRE
+            // then arrives as whatever the text happened to put there.
+            // `Source::OutWidth` did exactly that at the sister site in
+            // `scalars`, where a `_ => {}` produced a silent zero: a width of
+            // zero is a grid of nothing, and the dispatch returned success
+            // over untouched memory. That arm is a named refusal now, and this
+            // one is the other half of the same repair.
+            //
+            // The `LaunchRule` match in `geometry.rs` is enumerated for the
+            // same reason and says so; this one now is too, so a variant added
+            // to `Source` tomorrow stops this build instead of being read as a
+            // parameter. `driver-wgpu` enumerated its copy first and left a
+            // note that this file had not; this is that note acted on.
+            kernels::Source::WeightNamed
+            | kernels::Source::WeightNamed2
+            | kernels::Source::WeightSuffix(_)
+            | kernels::Source::Param(_)
+            | kernels::Source::ParamF32(_)
+            | kernels::Source::KvHeadStride
+            | kernels::Source::KvSeqStride
+            | kernels::Source::KvPageSize
+            | kernels::Source::KvLayerView
+            | kernels::Source::KvLayerField(_)
+            | kernels::Source::RequestCount
+            | kernels::Source::Rows
+            | kernels::Source::ResultOrRegion(_)
+            | kernels::Source::Aux(_)
+            | kernels::Source::OutRows(_)
+            | kernels::Source::InRows(_)
+            | kernels::Source::OutWidth(_)
+            | kernels::Source::InWidth(_)
+            | kernels::Source::OutElements(_)
+            | kernels::Source::InElements(_)
+            | kernels::Source::InDim(_, _)
+            | kernels::Source::OutDim(_, _)
+            | kernels::Source::Attn(_)
+            | kernels::Source::AttnWindow
+            | kernels::Source::AttnPlan(_)
+            | kernels::Source::AttnNonZero(_)
+            | kernels::Source::Gdn(_)
+            | kernels::Source::GdnSlab(_)
+            | kernels::Source::CtxByLayer(_)
+            | kernels::Source::Ctx(_)
+            | kernels::Source::CtxNonZero(_)
+            | kernels::Source::RoutesOfParam(_)
+            | kernels::Source::Lit(_)
+            | kernels::Source::Width(_)
+            | kernels::Source::Mul(_, _)
+            | kernels::Source::Sub(_, _)
+            | kernels::Source::Div(_, _)
+            | kernels::Source::Isqrt(_)
+            | kernels::Source::Ne(_, _)
+            | kernels::Source::Or(_, _)
+            | kernels::Source::IfPresent(_, _, _)
+            | kernels::Source::PerHeadDim
+            | kernels::Source::NamedScale
+            | kernels::Source::RotaryWidth
+            | kernels::Source::LayerScale
+            | kernels::Source::Beta => Ok(Slot::Params),
         };
         slots.push(got.map_err(|e| (slot, e))?);
     }
@@ -561,6 +622,69 @@ pub enum Misplaced {
         push: usize,
         /// The sizes of every knowable block the module declares, in bytes.
         blocks: Vec<u32>,
+    },
+    /// The row addresses the KV cache CONTIGUOUSLY, and this driver's pool is
+    /// paged.
+    ///
+    /// [`kernels::Source::KvHeadStride`] and [`kernels::Source::KvSeqStride`]
+    /// appear on exactly the rows that walk the cache with two strides and no
+    /// page table -- `kv_append`, `sdpa_vector_decode`,
+    /// `sdpa_vector_decode_swa`. The paged writer beside them takes
+    /// `page_size` and `n_kv_heads` and consults the page table instead.
+    ///
+    /// `resources::Shape` allocates `[page, token, head, dim]` for every fire
+    /// this driver runs, so `Shape::number` can answer both strides for it --
+    /// and that is the defect, not the fix. The arithmetic is right only while
+    /// a fire's pages happen to be physically consecutive from zero: true of
+    /// one freshly-allocated sequence, false of the second. It reads real
+    /// memory at every step and attends to the WRONG TOKENS, and
+    /// `robustBufferAccess` has nothing to say because nothing is out of
+    /// bounds.
+    ///
+    /// `crates/model` reached the same conclusion from the other side and
+    /// stopped emitting these rows (*"no contiguous attention over a paged
+    /// pool"*), which guards the texts that exist. The pool's layout is the
+    /// DRIVER's fact, and this is the last place that knows it.
+    Contiguous {
+        /// Which operand of the row, counting from zero.
+        at: usize,
+        /// The operand's name, as the row spells it.
+        name: &'static str,
+    },
+    /// The row names a scalar this driver cannot work out.
+    ///
+    /// A NAMED refusal where there used to be a zero, twice: `_ => 0` in the
+    /// packed-struct arm and `_ => {}` in the scalar run. Zero is the worst
+    /// available default because it is PLAUSIBLE -- a width is a row pitch, so
+    /// at zero the shader writes element 0 of every row or the rule builds a
+    /// grid of nothing, and `vkQueueSubmit` returns success over a buffer that
+    /// kept whatever it held.
+    ///
+    /// This file had already met the shape and repaired one instance of it:
+    /// there is an arm for `Source::OutWidth` and a note saying it was split
+    /// out "when `kernels::Source::OutWidth` arrived". The coverage stopped
+    /// there, so the next row naming `InWidth`, `OutElements` or `InElements`
+    /// would have got the zero.
+    ///
+    /// The scalar run splits on the operand's KIND rather than on a list of
+    /// source names, which is what closes it: a buffer contributes no scalar
+    /// because binding it is `reorder`'s job, and everything else must resolve
+    /// or be named here. So a new BUFFER source cannot enter the run by
+    /// omission and a new DERIVED one cannot enter it as a zero.
+    ///
+    /// It deliberately does NOT answer the row family. `OutRows` is a value's
+    /// leading extent -- `Rows` for a token-shaped value, a load-time constant
+    /// for a fixed one, a padded block-major count for the MoE aligned path --
+    /// so answering the fire's rows would be right for most values and
+    /// silently wrong for exactly the ones the source exists to distinguish.
+    Unresolved {
+        /// Which operand of the row, counting from zero.
+        at: usize,
+        /// The operand's name, as the row spells it.
+        name: &'static str,
+        /// The [`kernels::Source`] variant, rendered -- `Source` is not `Eq`,
+        /// so it cannot be carried whole in a type that is.
+        source: String,
     },
 }
 
@@ -642,6 +766,41 @@ fn runs(sig: &kernels::KernelSig, args: &[Arg]) -> Runs {
 /// Param(2)` against a plan that carries four, and its module has room for
 /// three. Taking the run whole was refusing it as one scalar too many.
 ///
+/// Whether an operand crosses as a device allocation rather than as a value.
+///
+/// Asked here because [`scalars`] has to know whether an operand it did not
+/// recognise owes the parameter run a word or nothing at all. Read off the
+/// KIND and not off a list of source names, so a row that grows a new buffer
+/// source cannot land in the run by omission. Transcribed from
+/// `driver-wgpu`'s `is_buffer_kind`, which asks the same question of the same
+/// enum.
+fn is_buffer_kind(ty: kernels::Ty) -> bool {
+    use kernels::Ty;
+    matches!(
+        ty,
+        Ty::BufMut
+            | Ty::Buf
+            | Ty::I32s
+            | Ty::I64s
+            | Ty::U32s
+            | Ty::U8s
+            | Ty::F32sMut
+            | Ty::F32s
+            | Ty::I32sMut
+            | Ty::U32sMut
+            | Ty::U8sMut
+            | Ty::U16s
+            | Ty::U16sMut
+            | Ty::I8s
+            | Ty::BufArray
+            | Ty::BufArrayMut
+            | Ty::BufArrayOut
+            | Ty::BufArrayOutMut
+            | Ty::U8Array
+            | Ty::I32Array
+    )
+}
+
 /// A row also interleaves numbers the DRIVER resolves. `kv_append_paged` is
 /// `Param(0), KvPageSize, Param(1)` -- the page size is a property of the
 /// pool, not of the statement, and it lands between the two scalars the
@@ -664,22 +823,47 @@ pub fn scalars<R: Resolve>(
         return params_from(stated, declared);
     }
     let mut run: Vec<u32> = Vec::new();
-    for operand in sig.operands {
+    for (at, operand) in sig.operands.iter().enumerate() {
         // A field of the preceding packed struct: the driver's number, added
         // to the run the struct covers. `row_gather` is the only one --
         // `Param(0)` there is a `Buf`, which is how a row says "the rest of
         // this run is a struct in a buffer".
         if operand.ty == kernels::Ty::InPacked {
+            // Not `_ => 0`. Zero is the worst available default for a field of
+            // a struct a shader reads: a width of zero is a row pitch of
+            // nothing, a count of zero is a loop that runs no iterations, and
+            // both return success over a buffer that kept whatever it held.
+            // `Source::OutWidth` is the row this file already had to split out
+            // "when `kernels::Source::OutWidth` arrived", and the next source
+            // to arrive got the zero instead.
             run.push(match operand.source {
                 kernels::Source::RequestCount => lowered.n_requests,
-                _ => 0,
+                _ => {
+                    return Err(Misplaced::Unresolved {
+                        at,
+                        name: operand.name,
+                        source: format!("{:?}", operand.source),
+                    });
+                }
             });
             continue;
         }
+        // The two contiguous strides are refused rather than answered. See
+        // `Misplaced::Contiguous`: the pool is `[page, token, head, dim]`, so
+        // `Shape::number` CAN produce both -- and handing them to a body that
+        // walks the cache without a page table is what makes the dispatch
+        // succeed against the wrong tokens.
+        if matches!(
+            operand.source,
+            kernels::Source::KvHeadStride | kernels::Source::KvSeqStride
+        ) {
+            return Err(Misplaced::Contiguous {
+                at,
+                name: operand.name,
+            });
+        }
         let number = match operand.source {
             kernels::Source::KvPageSize => Some(FireNumber::KvPageSize),
-            kernels::Source::KvHeadStride => Some(FireNumber::KvHeadStride),
-            kernels::Source::KvSeqStride => Some(FireNumber::KvSeqStride),
             _ => None,
         };
         if let Some(want) = number {
@@ -745,7 +929,21 @@ pub fn scalars<R: Resolve>(
                         .unwrap_or(0),
                 );
             }
-            _ => {}
+            // Split on the operand's KIND rather than on a list of source
+            // names, which is what makes this closed. A BUFFER contributes no
+            // scalar because binding it is `reorder`'s job, so a new buffer
+            // source cannot land in the parameter run by omission. Anything
+            // else is a scalar the shader will read, and a source this file
+            // cannot work out is named rather than silently left at whatever
+            // the statement put in that slot.
+            _ if is_buffer_kind(operand.ty) => {}
+            _ => {
+                return Err(Misplaced::Unresolved {
+                    at,
+                    name: operand.name,
+                    source: format!("{:?}", operand.source),
+                });
+            }
         }
     }
     params_from(&run, declared)
@@ -865,7 +1063,14 @@ mod tests {
     fn a_weight_and_a_seam_value_do_not_get_their_extent_from_the_plan() {
         assert_eq!(extent(&Arg::Weight("w".into()), &launch(1, 1)), None);
         assert_eq!(
-            extent(&Arg::Named { value: 0, width: 8 }, &launch(1, 1)),
+            extent(
+                &Arg::Named {
+                    value: 0,
+                    width: 8,
+                    bytes: 2,
+                },
+                &launch(1, 1)
+            ),
             None
         );
     }
@@ -968,7 +1173,11 @@ mod tests {
         assert_eq!((w.offset(), w.len()), (0, 4096));
 
         let n = resolve(
-            &Arg::Named { value: 7, width: 8 },
+            &Arg::Named {
+                value: 7,
+                width: 8,
+                bytes: 2,
+            },
             &launch(1, 1),
             arena,
             &store,
@@ -999,7 +1208,11 @@ mod tests {
         );
         assert_eq!(
             resolve(
-                &Arg::Named { value: 7, width: 8 },
+                &Arg::Named {
+                    value: 7,
+                    width: 8,
+                    bytes: 2,
+                },
                 &launch(1, 1),
                 arena,
                 &store,
@@ -1134,6 +1347,62 @@ mod tests {
         assert_eq!(got, Params::Push(vec![7, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0]));
     }
 
+    /// A contiguous-cache row is refused; the paged one beside it is not.
+    ///
+    /// Both writers live in the same shader family. The paged one takes
+    /// `page_size` and `n_kv_heads` and consults the page table; the
+    /// contiguous one takes `k_head_stride`/`k_seq_stride` and walks the cache
+    /// with arithmetic alone. `resources::Shape` allocates `[page, token,
+    /// head, dim]` for every fire, so `Shape::number` CAN produce both strides
+    /// -- and a dispatch given them reads real memory at the wrong tokens the
+    /// moment a sequence's pages are not consecutive from zero. Nothing is out
+    /// of bounds, so `robustBufferAccess` has nothing to say.
+    ///
+    /// The paged writer is the control: same family, same kind of row, so a
+    /// refusal that fired on scalars generally or on `Source::KvPageSize`
+    /// would fail here.
+    #[test]
+    fn the_contiguous_kv_writer_is_refused_and_the_paged_one_is_not() {
+        let store = Store::default();
+        let placed = |name: &str| {
+            let sig = kernels::sig_in(kernels_vulkan::KERNELS, name).expect("stated");
+            let words = sig
+                .operands
+                .iter()
+                .filter(|o| !matches!(o.ty, kernels::Ty::Buf | kernels::Ty::BufMut))
+                .count() as u32;
+            let low = with_params((0..words).map(|n| n + 1).collect());
+            scalars(
+                sig,
+                &low,
+                &scalar_launch(words),
+                &declared(&(0..words).map(|i| i * 4).collect::<Vec<_>>(), &[None; 4]),
+                &store,
+            )
+        };
+        // The control is about the KIND of refusal, not about placement: this
+        // fixture's push block is a guess at the paged row's run length, so it
+        // may well disagree about the COUNT. What it must never be is
+        // `Contiguous`, which is the whole claim -- the refusal is about the
+        // two strides and not about the family, the shader file or scalars in
+        // general.
+        assert!(
+            !matches!(placed("kv_append_paged"), Err(Misplaced::Contiguous { .. })),
+            "the paged writer is not refused for walking the cache"
+        );
+        let why = placed("kv_append").expect_err("the contiguous writer is refused");
+        assert!(
+            matches!(
+                why,
+                Misplaced::Contiguous {
+                    name: "k_head_stride",
+                    ..
+                }
+            ),
+            "the refusal names the operand: {why:?}"
+        );
+    }
+
     #[test]
     fn scalars_a_block_holds_go_to_the_binding_whose_size_matches() {
         let low = with_params(vec![1, 2, 3]);
@@ -1247,6 +1516,66 @@ mod tests {
         )
         .expect("the row's one scalar places");
         assert_eq!(got, Params::Push(128u32.to_le_bytes().to_vec()));
+    }
+
+    /// A source this driver cannot work out is REFUSED, by name.
+    ///
+    /// The control for the two catch-alls this replaced: `_ => 0` in the
+    /// packed-struct arm and `_ => {}` in the scalar run. Both would pass every
+    /// other test in this crate, because no row in the shipped table names a
+    /// source they miss -- which is exactly the state `Source::OutWidth` was in
+    /// until `add_bias` landed and this file had to grow an arm for it.
+    ///
+    /// `OutRows` is the case with teeth: a real variant of the fleet's
+    /// vocabulary, named by no row here, and deliberately NOT derived. A
+    /// value's leading extent is the fire's rows only for a token-shaped
+    /// value; answering `rows` for the MoE aligned path would be a plausible
+    /// number where a padded block-major count belongs.
+    #[test]
+    fn a_source_this_driver_cannot_work_out_is_refused_rather_than_zeroed() {
+        let base = kernels::sig_in(kernels_vulkan::KERNELS, "add_bias").expect("stated");
+        let operands: Vec<kernels::Operand> = base
+            .operands
+            .iter()
+            .map(|o| kernels::Operand {
+                source: match o.source {
+                    kernels::Source::OutWidth(i) => kernels::Source::OutRows(i),
+                    other => other,
+                },
+                ..*o
+            })
+            .collect();
+        let sig = kernels::KernelSig {
+            operands: Box::leak(operands.into_boxed_slice()),
+            ..*base
+        };
+        let low = lowered(vec![
+            Arg::Arena {
+                at: 0,
+                width: 4096,
+                bytes: 2,
+            },
+            Arg::Weight("layer.0.q_bias".into()),
+        ]);
+        let why = scalars(
+            &sig,
+            &low,
+            &launch(8, 2),
+            &declared(&[0], &[None, None]),
+            &Store::default(),
+        )
+        .expect_err("a source this driver cannot work out is not a zero");
+        assert!(
+            matches!(
+                why,
+                Misplaced::Unresolved {
+                    name: "width",
+                    ref source,
+                    ..
+                } if source == "OutRows(0)"
+            ),
+            "the refusal names the operand and the source: {why:?}"
+        );
     }
 
     /// A `Lowered` holding nothing but the operands under test.

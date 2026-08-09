@@ -691,8 +691,9 @@ fn the_parity_check_reads_every_field_a_row_can_carry() {
 /// [`the_parity_check_reads_every_field_a_row_can_carry`], because a named list
 /// rots: a field added upstream and not added here is a field the comparison
 /// silently stops making. `publishes_aux` arrived exactly that way.
-const FIELDS: [&str; 14] = [
+const FIELDS: [&str; 15] = [
     "grid_param",
+    "rows_param",
     "head_param",
     "heads_param",
     "launch",

@@ -54,14 +54,51 @@ use kernels_vulkan::Capability;
 ///
 /// A trait and not a `&dyn Fn` so that the common case -- a map built once at
 /// startup -- is the case with no wrapper in it.
+///
+/// # The tier is an argument, and for a long time it was not
+///
+/// `kernels-vulkan` compiles a tiered module beside the baseline one and
+/// names it `<entrypoint>.<tag>.spv`, and every store here is keyed by FILE
+/// STEM -- so the cooperative-matrix build of `affine_qmm_t_..._bm_32_bn_32`
+/// is stored under `affine_qmm_t_..._bm_32_bn_32.coopmat`.
+///
+/// A plan never names that. A plan states the bare entrypoint, because the
+/// tier is a property of the DEVICE and not of the text. So while this method
+/// took only a symbol, the lookup could not reach a tiered module even in
+/// principle: **all 146 cooperative-matrix modules and all 20 fp16 ones were
+/// unreachable**, on every device, in production and in tests alike.
+///
+/// Nothing failed. `Device::tiers()` still reported `Coopmat` first, `Shell`
+/// still set `tier: Coopmat`, the pipeline cache still keyed on it and the
+/// seam still advertised it -- every part of the machinery agreed the tier
+/// was in use except the one lookup that had to name the file. That is why
+/// it survived: it looks exactly like a tier that is on, and it is only
+/// visible in a benchmark that refuses to move.
+///
+/// It was found by measuring. A prefill of 1536 tokens cost the same at a
+/// GEMM row tile of 16, 32 and 64 -- 56.1 s, 54.7 s, 54.4 s -- when 32 and 64
+/// have a cooperative-matrix module and 16 deliberately does not. A tier
+/// that changes nothing when you switch to it is a tier that is not running.
 pub trait Modules {
-    /// The module for an entrypoint, or `None` if this store has not got it.
-    fn code(&self, symbol: &str) -> Option<&[u8]>;
+    /// The best module for an entrypoint at `tier`, or `None`.
+    ///
+    /// Walks [`Capability::PREFERENCE`] from `tier` downward and takes the
+    /// first the store has, so a device at `Coopmat` still gets the baseline
+    /// module for an entrypoint that was never compiled with the extension --
+    /// which is most of them, and is what "tiers are additive" means.
+    fn code(&self, symbol: &str, tier: Capability) -> Option<&[u8]>;
 }
 
 impl Modules for BTreeMap<String, Vec<u8>> {
-    fn code(&self, symbol: &str) -> Option<&[u8]> {
-        self.get(symbol).map(Vec::as_slice)
+    fn code(&self, symbol: &str, tier: Capability) -> Option<&[u8]> {
+        Capability::PREFERENCE
+            .iter()
+            .skip_while(|&&c| c != tier)
+            .find_map(|&c| match c {
+                Capability::Baseline => self.get(symbol),
+                other => self.get(&format!("{symbol}.{}", other.tag())),
+            })
+            .map(Vec::as_slice)
     }
 }
 
@@ -291,7 +328,7 @@ pub fn fire<R: Resolve, M: Modules>(
     };
     for (at, launch) in lowered.launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
-        let Some(code) = modules.code(symbol) else {
+        let Some(code) = modules.code(symbol, tier) else {
             return Err(Unfired::NoModule {
                 at,
                 symbol: symbol.to_owned(),
@@ -474,7 +511,7 @@ fn record<M: Modules>(
         };
         // `modules.code` answered for this symbol in pass one, so it answers
         // here.
-        let code = modules.code(symbol).unwrap_or_default();
+        let code = modules.code(symbol, tier).unwrap_or_default();
         pipelines
             .get(device, symbol, code, push, b.len() as u32, tier)
             .map_err(|why| Unfired::Refused { at, why })?;
@@ -665,4 +702,72 @@ pub fn logits(
         vocab,
         values,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Modules;
+    use kernels_vulkan::Capability;
+    use std::collections::BTreeMap;
+
+    fn store() -> BTreeMap<String, Vec<u8>> {
+        let mut m = BTreeMap::new();
+        m.insert("qmm".to_owned(), vec![1]);
+        m.insert("qmm.coopmat".to_owned(), vec![2]);
+        m.insert("qmm.fp16".to_owned(), vec![3]);
+        m.insert("rope".to_owned(), vec![4]);
+        m
+    }
+
+    /// A tiered module is reachable, which for a long time it was not.
+    ///
+    /// `kernels-vulkan` names a tiered build `<entrypoint>.<tag>.spv` and
+    /// every store here is keyed by file stem, so the cooperative-matrix
+    /// build of `qmm` is under `qmm.coopmat`. A plan states `qmm`. While the
+    /// lookup took only a symbol it could not reach the tiered file at all,
+    /// and all 146 coopmat modules were dead on every device.
+    ///
+    /// Nothing failed while they were: the device still REPORTED the tier,
+    /// the shell still set it and the pipeline cache still keyed on it. This
+    /// is the assertion that says the file is what changes, because it is the
+    /// only part that was ever wrong.
+    #[test]
+    fn a_tier_selects_the_module_compiled_for_it() {
+        let m = store();
+        assert_eq!(m.code("qmm", Capability::Coopmat), Some(&[2u8][..]));
+        assert_eq!(m.code("qmm", Capability::Fp16), Some(&[3u8][..]));
+        assert_eq!(m.code("qmm", Capability::Baseline), Some(&[1u8][..]));
+    }
+
+    /// A tier the entrypoint was not compiled at falls back, rather than
+    /// refusing.
+    ///
+    /// This is what "tiers are additive" means and it is most of the tree:
+    /// `rope` has no coopmat build and never will, and a device at the top
+    /// tier must still get its baseline module. A lookup that returned `None`
+    /// here would refuse to fire an entire model on the best hardware.
+    #[test]
+    fn a_tier_without_a_module_falls_back_to_the_one_below() {
+        let m = store();
+        assert_eq!(m.code("rope", Capability::Coopmat), Some(&[4u8][..]));
+        assert_eq!(m.code("rope", Capability::Fp16), Some(&[4u8][..]));
+    }
+
+    /// A tier never reaches ABOVE itself.
+    ///
+    /// A baseline device asking for `qmm` must get the baseline module even
+    /// though a coopmat one is sitting in the same map -- the store is a
+    /// directory listing and says nothing about what this device can load.
+    /// Handing it `qmm.coopmat` is a module that names a capability the
+    /// device did not enable, which is a validation error and not a slow
+    /// answer.
+    #[test]
+    fn a_lower_tier_never_reaches_a_higher_ones_module() {
+        let m = store();
+        assert_eq!(m.code("qmm", Capability::Baseline), Some(&[1u8][..]));
+        let only_high: BTreeMap<String, Vec<u8>> =
+            [("qmm.coopmat".to_owned(), vec![2])].into_iter().collect();
+        assert_eq!(only_high.code("qmm", Capability::Baseline), None);
+        assert_eq!(only_high.code("qmm", Capability::Fp16), None);
+    }
 }

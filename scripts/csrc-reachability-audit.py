@@ -86,12 +86,16 @@ KEYWORDS = {
 # The `extern "C"` roots that are not shim entries. Each is named by Rust
 # somewhere under `crates/driver-cuda/src` or `crates/*/tests`, which is what
 # makes it an entry point rather than a leftover.
+# THE SEVEN `pie_x_*` PLAN-LIFECYCLE ROOTS ARE GONE. They were
+# `pie_x_{make,destroy}_{decode,prefill}_plan`,
+# `pie_x_set_decode_plan_int_base` and the two
+# `pie_x_plan_attention_flashinfer_{decode,prefill}_bf16` planners, defined by
+# `driver-cuda/csrc/attn/plan_lifecycle.cpp` and
+# `csrc/attn/attention_flashinfer.cu`. North star §5 step 7 deleted both files
+# and the whole of `driver-cuda/csrc/`; their Rust replacements are
+# `fire::flashinfer_fa2::{DecodePlanCache, PrefillPlanCache}` and
+# `bind::{DecodePlan, PrefillPlan}`, which cross no ABI at all.
 DIRECT_ROOTS = (
-    "pie_x_destroy_decode_plan", "pie_x_destroy_prefill_plan",
-    "pie_x_make_decode_plan", "pie_x_make_prefill_plan",
-    "pie_x_plan_attention_flashinfer_decode_bf16",
-    "pie_x_plan_attention_flashinfer_prefill_bf16",
-    "pie_x_set_decode_plan_int_base",
     "gemma4_audio_encode", "gemma4_vision_encode", "qwen3vl_scatter",
     "set_device_memory_allocator", "set_device_tensor_memory_callback",
     "allocate_device_memory", "free_device_memory", "alloc_logging_enabled",

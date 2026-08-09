@@ -252,16 +252,27 @@ pub struct YarnOriginalParams {
 /// — a driver-internal launcher, so the mirror serves the bridge rather
 /// than any DSL row. Three `u32`s; the C++ defaults them to zero and so
 /// does [`Default`] here.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct StructuredMaskParams {
-    /// `StructuredMaskKind`'s numeric value.
-    pub kind: u32,
-    /// Sliding-window extent, when the kind has one.
-    pub window: u32,
-    /// Attention-sink width, when the kind has one.
-    pub sink: u32,
-}
+///
+/// **RE-EXPORTED, no longer defined here.** The one definition is
+/// `kernels_cuda_new::x::attn::params::StructuredMaskParams`, in the crate
+/// that owns `attn`'s device text, for the reason `x/xqa.rs` gives for
+/// `KvCacheList`: `unit!` has to NAME the type to declare
+/// `attn::device::pack_structured_mask`, and `driver-cuda` depends on
+/// `kernels-cuda-new` rather than the other way round. A mirror in two
+/// crates is a layout assertion that can drift.
+///
+/// It nearly did. `pack_dense_mask.cuh:29-50` argues that two definitions of
+/// this POD are acceptable *because* `pack_dense_mask.cu` `static_assert`ed
+/// `sizeof`, `alignof` and all three offsets across them — and that `.cu` and
+/// its `.hpp` are deleted, so from that day the two agreed by luck. They did
+/// agree: `kind@0 window@4 sink@8`, `sizeof=12 alignof=4`, MEASURED out of
+/// NVRTC's PTX by `nvrtc-probes/attn_structured_mask.py` against the surviving
+/// `attn::device::StructuredMaskParams`. Kept as a re-export and not deleted
+/// because [`kernels::Ty::needs_mirror`] answers true for
+/// `Ty::StructuredMasks` — `Ty::rust()` spells it as the unqualified `*const
+/// StructuredMaskParams`, so a generated binding only compiles in a module
+/// that has this name in scope, and [`ffi`] below is that module.
+pub use kernels_cuda_new::x::attn::params::StructuredMaskParams;
 
 /// The activation the fused CUTLASS MoE runs between its two grouped GEMMs.
 ///
@@ -317,64 +328,24 @@ pub mod ffi {
     use crate::weights::weight_view::WeightView;
     include!(concat!(env!("OUT_DIR"), "/launch_bindings.rs"));
 
-    // The HAND-WRITTEN extras (`csrc/launch_extras.cpp`): plan-cache
-    // lifecycle the generated shim cannot express. `pie_x_*`, never
-    // `pie_k_*` — the generated namespace stays the table's alone.
-    unsafe extern "C" {
-        /// `make_decode_plan().release()` — the caller owns the result and
-        /// returns it through [`pie_x_destroy_decode_plan`].
-        pub unsafe fn pie_x_make_decode_plan() -> *mut ::core::ffi::c_void;
-        /// The factory's deleter.
-        pub unsafe fn pie_x_destroy_decode_plan(cache: *mut ::core::ffi::c_void);
-        /// `set_decode_plan_int_base` — where the plan's int arrays sit
-        /// inside the workspace's `int_buffer`.
-        pub unsafe fn pie_x_set_decode_plan_int_base(cache: *mut ::core::ffi::c_void, bytes: usize);
-        /// The prefill factory, `release()`d like the decode one.
-        pub unsafe fn pie_x_make_prefill_plan() -> *mut ::core::ffi::c_void;
-        /// Its deleter.
-        pub unsafe fn pie_x_destroy_prefill_plan(cache: *mut ::core::ffi::c_void);
-        /// The prefill prepare: FlashInfer's planner over the fire's HOST
-        /// CSRs (query indptr, page indptr, last-page lens).
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn pie_x_plan_attention_flashinfer_prefill_bf16(
-            cache: *mut ::core::ffi::c_void,
-            qo_indptr_h: *const u32,
-            kv_page_indptr_h: *const u32,
-            kv_last_page_lens_h: *const u32,
-            total_tokens: ::core::ffi::c_int,
-            num_requests: ::core::ffi::c_int,
-            num_q_heads: ::core::ffi::c_int,
-            num_kv_heads: ::core::ffi::c_int,
-            head_dim: ::core::ffi::c_int,
-            page_size: ::core::ffi::c_int,
-            workspace: AttentionWorkspaceView,
-            stream: *mut ::core::ffi::c_void,
-            enable_cuda_graph: bool,
-            window_left: ::core::ffi::c_int,
-            full_attention_variant: bool,
-            hnd_layout: bool,
-            causal_mask: bool,
-            custom_mask: bool,
-            wants_prefill_score: bool,
-        );
-        /// The decode prepare: FlashInfer's planner over the fire's HOST
-        /// page-indptr, into the cache and the workspace.
-        pub unsafe fn pie_x_plan_attention_flashinfer_decode_bf16(
-            cache: *mut ::core::ffi::c_void,
-            kv_page_indptr_h: *const u32,
-            num_requests: ::core::ffi::c_int,
-            num_q_heads: ::core::ffi::c_int,
-            num_kv_heads: ::core::ffi::c_int,
-            head_dim: ::core::ffi::c_int,
-            page_size: ::core::ffi::c_int,
-            workspace: AttentionWorkspaceView,
-            stream: *mut ::core::ffi::c_void,
-            enable_cuda_graph: bool,
-            full_attention_variant: bool,
-            hnd_layout: bool,
-            window_left: ::core::ffi::c_int,
-        );
-    }
+    // THE HAND-WRITTEN EXTRAS ARE GONE. Seven `pie_x_*` declarations stood
+    // here -- the decode and prefill plan-cache factories, their two
+    // deleters, `set_decode_plan_int_base`, and the two planners -- against
+    // `driver-cuda/csrc/attn/plan_lifecycle.cpp` and
+    // `csrc/attn/attention_flashinfer.cu`, both DELETED by north star §5
+    // step 7.
+    //
+    // Their own header said why they existed: *"a `unique_ptr` with a custom
+    // deleter"*, which a C ABI cannot express. The replacement caches are
+    // `fire::flashinfer_fa2::{DecodePlanCache, PrefillPlanCache}` -- plain
+    // Rust structs whose deleter is `Drop` -- so the reason is not merely
+    // ported, it is retired. `bind::DecodePlan` and `bind::PrefillPlan` keep
+    // the same handle API over a `Box::into_raw` pointer.
+    //
+    // Nothing else was ever declared here: the generated `pie_k_*` bindings
+    // above are `kernels_cuda_new::abi`'s alone, and the six FlashInfer FA2
+    // rows are on `execution::RUST_SERVED`, so `emit_c_shim` no longer emits
+    // forwarders for them either.
 }
 
 #[cfg(feature = "bridge")]
@@ -397,11 +368,19 @@ pub mod ffi {
 /// a shim entry `abi::emit_c_shim` generated from
 /// `table::driver_internal`'s `envelope_seed` row. **Both are gone**: the
 /// `.cu` is deleted, the row is deleted, and the launch is
-/// [`crate::fire::envelope::seed_empty`] — a driver-owned
+/// [`kernels_cuda_new::x::layout::envelope_seed_empty`] — a driver-owned
 /// `kernels::Launch` over a `LaunchRule::Unstated` JIT row. The signature
 /// here does not change, so no caller of this function does.
 ///
-/// The [`crate::fire::envelope::Envelope`] answer is dropped rather than
+/// **The two `.cast()`s are the port's one caller-visible change.** The
+/// planes are `*mut u16` in this driver — a `TensorSpec` of raw halfwords —
+/// and `*mut bf16` in the declaration, because the declaration carries the
+/// `.cuh`'s own type and the typecheck translation unit compares whole
+/// parameter types. The cast is where those two spellings meet, and it is
+/// here rather than inside the host program so that the program's parameter
+/// list still reads as the kernel's.
+///
+/// The [`Fired`](kernels_cuda_new::x::Fired) answer is dropped rather than
 /// returned, and that is this function's own decision rather than an
 /// oversight: the C++ launcher returned `void` and its guard was silent, the
 /// callers in `pools/kv_cache_live.rs` pass extents the cache allocated
@@ -418,9 +397,9 @@ pub fn seed_envelopes_empty(
     stream: crate::device::StreamRef<'_>,
 ) {
     let _ = unsafe {
-        crate::fire::envelope::seed_empty(
-            env_min,
-            env_max,
+        kernels_cuda_new::x::layout::envelope_seed_empty(
+            env_min.cast(),
+            env_max.cast(),
             num_pages,
             num_kv_heads,
             head_dim,

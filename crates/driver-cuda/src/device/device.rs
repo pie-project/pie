@@ -125,6 +125,35 @@ impl Device {
         self.attribute(rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount)
     }
 
+    /// `cudaDevAttrMaxSharedMemoryPerMultiprocessor`, in bytes.
+    ///
+    /// `prefill.cuh:4213-4215` reads it, and
+    /// [`kernels_cuda_new::fa2::Device`] carries it because the FA2 prefill
+    /// geometry snaps `NUM_MMA_KV` down against it. It lives here rather than
+    /// beside the launcher for §7's reason: `device/` is the only place this
+    /// driver spells a vendor attribute name.
+    ///
+    /// # Errors
+    ///
+    /// If the attribute query fails.
+    pub fn max_shared_memory_per_sm(&self) -> Result<i32> {
+        self.attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerMultiprocessor)
+    }
+
+    /// `cudaDevAttrMaxSharedMemoryPerBlockOptin`, in bytes.
+    ///
+    /// `prefill.cuh:4216-4218`. The OPT-IN limit, not
+    /// `cudaDevAttrMaxSharedMemoryPerBlock`: the FA2 prefill kernels raise
+    /// their dynamic allocation past the default 48 KB, so the default limit
+    /// would refuse geometries the device will actually run.
+    ///
+    /// # Errors
+    ///
+    /// If the attribute query fails.
+    pub fn max_shared_memory_per_block_optin(&self) -> Result<i32> {
+        self.attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerBlockOptin)
+    }
+
     /// Whether this device supports the virtual-memory management API that
     /// [`crate::device::Arena`] is built on.
     ///

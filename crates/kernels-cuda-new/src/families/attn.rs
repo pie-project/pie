@@ -84,7 +84,8 @@
 //!   `tests/launch_rules.rs::mod transcribed::pins` pins both launcher lines
 //!   so the refusal's citation cannot rot.
 //! * `attn/split_packed`'s `split_qkv_devwin` shares its sibling's grid
-//!   arithmetic and not its INPUTS — see [`SPLIT_PACKED_SIGS`], which is the
+//!   arithmetic and not its INPUTS — see
+//!   [`crate::x::attn::split_packed`], which is the
 //!   one place in this file where a ported rule computes the right shape from
 //!   the wrong numbers.
 //! * `attn/dsv4_compress`'s `combine_attn_outputs` had TWO blockers and has
@@ -121,15 +122,27 @@
 //!   which is exact and associative modulo 2^32, so any correct fold order
 //!   produces the same bits — not "close to CUB", the same integer. The file
 //!   is [`PAGE_COMPACT`] now, with a row for each of its two kernels.
-//! * `attn/pack_dense_mask.cu` takes a `StructuredMaskParams` defined in its
+//! * `attn/pack_dense_mask.cu` took a `StructuredMaskParams` defined in its
 //!   host `.hpp`, which NVRTC cannot include. The header carries a device
-//!   MIRROR of that struct, and the duplication is checked rather than
-//!   trusted: FIVE `static_assert`s in `pack_dense_mask.cu` pin `sizeof`,
+//!   MIRROR of that struct, and the duplication WAS checked rather than
+//!   trusted: FIVE `static_assert`s in `pack_dense_mask.cu` pinned `sizeof`,
 //!   `alignof` and the offset of all three fields (`kind`, `window`, `sink`)
 //!   against the host type. A negative control transposing two fields fired
-//!   exactly the two offset assertions and nothing else, which is what makes
-//!   this a check and not a comment. The obstacle that remains is neither of
-//!   the two above — see the next section.
+//!   exactly the two offset assertions and nothing else, which is what made
+//!   this a check and not a comment.
+//!
+//!   **Both the `.cu` and the `.hpp` are deleted, so those five assertions
+//!   are gone, and the root has CROSSED INTO FN-WORLD as
+//!   [`crate::x::attn::pack_dense_mask`] — unit only, no contract and no bind,
+//!   because nothing in the tree launches either kernel any more.** The one
+//!   surviving mirror is [`crate::x::attn::params::StructuredMaskParams`],
+//!   whose layout is MEASURED out of NVRTC's PTX (`sizeof=12 alignof=4`,
+//!   `kind@0 window@4 sink@8`, `nvrtc-probes/attn_structured_mask.py`) rather
+//!   than transcribed, and which `driver-cuda/src/bind/abi.rs` now re-exports
+//!   so that two definitions cannot drift again. The measurement agreed with
+//!   both transcriptions field for field.
+//! * The obstacle that remains is neither of the two above — see the next
+//!   section.
 //!
 //! # The limit that stopped three split files from having rows, and is gone
 //!
@@ -147,7 +160,10 @@
 //! * `attn/pack_dense_mask.cuh`'s `pack_dense_mask` and `pack_structured_mask`
 //!   -- `pack_dense_mask.cu:94` and `:110`, both `<<<B, 128, 0, stream>>>`,
 //!   which is [`LaunchRule::PerRowNarrow`] to the digit. The geometry was
-//!   never the blocker; the spelling was. See [`PACK_DENSE_MASK`].
+//!   never the blocker; the spelling was. Both rows have since CROSSED, and
+//!   `DeviceKernel::PLAIN` crossed with them —
+//!   [`crate::x::attn::pack_dense_mask`] states it on both, for the reason
+//!   this bullet gives.
 //! * `attn/mla_paged.cuh`'s `write_mla` -- `mla_paged.cu:111`,
 //!   `<<<total_tokens, 256, 0, stream>>>`, which is [`LaunchRule::PerRow`] to
 //!   the digit, and whose fire's `Dims::rows` is the token count because
@@ -288,9 +304,12 @@
 //! # The row the ahead-of-time build never had
 //!
 //! `attn::logit_softcap_f16`. The template was already there; a second
-//! numeric format cost the line below rather than a translation unit's worth
-//! of `cicc` — which is the measurement `norm/elementwise.cuh` made first and
-//! the reason this design was worth the migration.
+//! numeric format cost one line rather than a translation unit's worth of
+//! `cicc` — which is the measurement `norm/elementwise.cuh` made first and
+//! the reason this design was worth the migration. **Both softcap rows have
+//! since crossed** to [`crate::x::attn::softcap`], where the f16 one is still
+//! a device row with no contract, for the same reason it was a row with no
+//! consumer here: no trace says it yet.
 //!
 //! # The sm90 prefill: no row, no unit, and the specification it needs
 //!
@@ -414,40 +433,26 @@ use crate::unit::Unit;
 // how.
 // ===========================================================================
 
-/// `attn`'s logit cap, at both numeric formats.
-pub const SOFTCAP: Unit = Unit {
-    name: "attn/softcap",
-    root: include_str!("../../csrc/src/attn/softcap.cuh"),
-    rows: SOFTCAP_ROWS,
-    options: &[],
-};
+// `SOFTCAP` CROSSED INTO FN-WORLD as [`crate::x::attn::softcap::SOFTCAP`],
+// once `Facts::final_logit_softcap()` existed to source its cap. Both of its
+// rows went — the bf16 one that has a contract and the f16 one that does
+// not — because a unit is the whole of a root's device text and half a root
+// is a second compilation of the same file.
 
-/// The attention-sink pair, both rows: the log2→ln rebase and the per-head
-/// rescale that reads it.
-pub const ATTN_SINK: Unit = Unit {
-    name: "attn/attn_sink",
-    root: include_str!("../../csrc/src/attn/attn_sink.cuh"),
-    rows: ATTN_SINK_ROWS,
-    options: &[],
-};
-
-/// K3's residual-block blend.
-pub const ATTN_RES: Unit = Unit {
-    name: "attn/attn_res",
-    root: include_str!("../../csrc/src/attn/attn_res.cuh"),
-    rows: ATTN_RES_ROWS,
-    options: &[],
-};
-
-/// glm5's sparse-attention index network. One row of three: the other two
-/// want a block sized on a head count and a shared-memory budget sized on the
-/// sequence.
-pub const DSA_INDEXER: Unit = Unit {
-    name: "attn/dsa_indexer",
-    root: include_str!("../../csrc/src/attn/dsa_indexer.cuh"),
-    rows: DSA_INDEXER_ROWS,
-    options: &[],
-};
+/// The attention-sink pair and K3's residual blend CROSSED INTO FN-WORLD.
+///
+/// `ATTN_SINK` and `ATTN_RES` are [`crate::x::attn::attn_sink::ATTN_SINK`]
+/// and [`crate::x::attn::attn_res::ATTN_RES`], declared beside the `fn`s that
+/// fire them. Their measurements travelled with them — the 0.693 the LSE
+/// rebase prevents, `PerHeadElementwise`'s axis order, and `PerRow`-not-`Rms`
+/// with the thirty-two unused bytes that argument turns on.
+// `DSA_INDEXER` CROSSED INTO FN-WORLD as
+// [`crate::x::attn::dsa_indexer::DSA_INDEXER`], unit-only. All three host
+// programs were already Rust in `driver-cuda/src/fire/dsa_indexer.rs` and
+// stayed there; none of the three rows crossed, because a row is a claim
+// about a trace and these three are fired by a host `fn` that already exists.
+// See the deleted `DSA_INDEXER_ROWS`' crossing note below for the whole of
+// what travelled.
 
 /// The reference attention kernels and MTP's hidden-state plumbing. Two rows
 /// of five; the `.cuh` names the obstacle for each of the other three.
@@ -458,32 +463,26 @@ pub const ATTENTION_NAIVE: Unit = Unit {
     options: &[],
 };
 
-/// flashinfer's supported head widths, reached by padding — and reached
-/// back out of by stripping.
+/// flashinfer's supported head widths CROSSED INTO FN-WORLD, and closed a
+/// measured defect on the way.
 ///
-/// A unit that could not exist until [`LaunchRule::PerHead`] did. Both
-/// kernels were extracted, proved NVRTC-clean and left rowless, and a rowless
-/// unit is refused rather than compiled: `every_unit_compiles_and_every_row_
-/// resolves` asserts `!unit.rows.is_empty()`, because a cubin nothing can
-/// fire is one cached per architecture for nobody.
-pub const HEAD_DIM_PAD: Unit = Unit {
-    name: "attn/head_dim_pad",
-    root: include_str!("../../csrc/src/attn/head_dim_pad.cuh"),
-    rows: HEAD_DIM_PAD_ROWS,
-    options: &[],
-};
-
-/// The fused QKV product, taken apart into three packed operands.
+/// `HEAD_DIM_PAD` is [`crate::x::attn::head_dim_pad::HEAD_DIM_PAD`]. The
+/// argument this doc carried — that a rowless unit is refused rather than
+/// compiled, `every_unit_compiles_and_every_row_resolves` asserting
+/// `!unit.rows.is_empty()`, because a cubin nothing can fire is one cached
+/// per architecture for nobody — is unchanged and now lives there.
 ///
-/// One row of the header's two, and the missing one is not a missing rule —
-/// see [`SPLIT_PACKED_SIGS`]. Rowless until [`LaunchRule::SplitPacked`]
-/// landed, and a unit for the same reason [`HEAD_DIM_PAD`] is.
-pub const SPLIT_PACKED: Unit = Unit {
-    name: "attn/split_packed",
-    root: include_str!("../../csrc/src/attn/split_packed.cuh"),
-    rows: SPLIT_PACKED_ROWS,
-    options: &[],
-};
+/// What changed is the head count. `LaunchRule::PerHead` evaluated
+/// `per_head(dims.rows, dims.kv_heads)`, reading a context field neither row
+/// mentioned; the `fn` is handed `num_heads` and has no way to reach a KV
+/// head count. `crate::x::attn::per_head`'s doc carries the measurement.
+// `SPLIT_PACKED` CROSSED INTO FN-WORLD as
+// [`crate::x::attn::split_packed::SPLIT_PACKED`], and it crossed as a UNIT
+// AND NOTHING ELSE — no contract and no bind, because both of its kernels
+// already had host programs and neither host is a bind. `split_qkv_bf16` is
+// [`crate::x::driver_internal::split_qkv_bf16`], the fourth arrangement;
+// `split_qkv_bf16_devwin` keeps its table row and
+// `driver-cuda/src/fire/split_packed.rs`.
 
 /// The paged-KV CSR compactor: quest's page-eviction gather.
 ///
@@ -589,322 +588,126 @@ static PAGE_COMPACT_SIGS: [KernelSig; 2] = [
         ]),
 ];
 
-/// Two formats of one template.
-pub static SOFTCAP_ROWS: &[DeviceKernel] = &[
-    DeviceKernel {
-        sig: &SOFTCAP_SIGS[0],
-        template_path: "attn::device::logit_softcap",
-        elem: "device::bf16",
-    },
-    // The row the ahead-of-time build never had. See the module header.
-    DeviceKernel {
-        sig: &SOFTCAP_SIGS[1],
-        template_path: "attn::device::logit_softcap",
-        elem: "device::f16",
-    },
-];
+// `SOFTCAP_ROWS`/`SOFTCAP_SIGS` CROSSED INTO FN-WORLD, both rows, with
+// every measurement they carried:
+//
+// * `Elementwise` IS the launcher this replaced — `(n + 255) / 256` blocks
+//   of 256, with an empty `n` refused rather than launched;
+// * the `!(cap > 0.f)` half of that launcher's guard, which was the row's
+//   `Source::CtxNonZero("final_logit_softcap")` and is now
+//   `Cx::final_logit_softcap` plus a `fn`-level re-check for callers that
+//   arrive without a `Cx`;
+// * the reciprocal that moved INTO the kernel and is the same bits, because
+//   `--prec-div=true` makes `1.f / cap` the correctly-rounded fp32 quotient
+//   on the device exactly as it was on the host and `--fmad=false` keeps the
+//   multiply from being contracted;
+// * `in_place = &[(0, 0)]` and what `Buffers::assign` was relying on while
+//   the row said nothing — the alias set with one member, the widening that
+//   reached nothing, and the sampler reading an uncapped previous fire;
+// * **the f16 row the ahead-of-time build never had**, which is the module
+//   header's own example of what a JIT buys: a second numeric format costs a
+//   line rather than a `cicc` invocation. It crossed as a device row with no
+//   contract, because no trace says it yet.
+//
+// They are `crate::x::attn::softcap`'s now, and the two-formats-one-width
+// hazard §3.2 names — bf16 and f16 are the same width and the same C spelling,
+// so these two rows differed only in a symbol string — is answered there by
+// `*mut bf16` and `*mut f16` being unrelated Rust types.
 
-#[rustfmt::skip]
-static SOFTCAP_SIGS: [KernelSig; 2] = [
-    // Caps the logits WHERE THEY LIE — one buffer, no destination, which is
-    // what `in_place` states and what `Buffers::assign` was already relying
-    // on. `Elementwise` IS the launcher this replaces: `(n + 255) / 256`
-    // blocks of 256, and an empty `n` refused rather than launched.
-    //
-    // `cap` is `CtxNonZero`, so a model that states no cap does not bind
-    // this kernel at all — the `!(cap > 0.f)` half of the launcher's guard,
-    // moved to the only place that can answer it before a launch exists.
-    // The reciprocal the launcher used to compute moved INTO the kernel and
-    // is the same bits; `attn/softcap.cuh` records why.
-    kernel!(logit_softcap "attn::logit_softcap_bf16",
-        file = Some("attn/softcap.cuh"),
-        launch = LaunchRule::Elementwise,
-        in_place = &[(0, 0)],
-        operands = operands![
-            x: BufMut <- Source::Out(0),
-            cap: F32 <- Source::CtxNonZero("final_logit_softcap"),
-            n: Usize <- Source::OutElements(0),
-        ]),
-    // A DIFFERENT symbol for a different numeric format, because a symbol is
-    // what a text states and a text that says `softcap` must not get to
-    // choose its own precision. Every other word is the row above's.
-    kernel!(logit_softcap_f16 "attn::logit_softcap_f16",
-        file = Some("attn/softcap.cuh"),
-        launch = LaunchRule::Elementwise,
-        in_place = &[(0, 0)],
-        operands = operands![
-            x: BufMut <- Source::Out(0),
-            cap: F32 <- Source::CtxNonZero("final_logit_softcap"),
-            n: Usize <- Source::OutElements(0),
-        ]),
-];
+// `ATTN_SINK_ROWS`/`ATTN_SINK_SIGS` and `ATTN_RES_ROWS`/`ATTN_RES_SIGS`
+// CROSSED INTO FN-WORLD, whole, with every measurement they carried:
+//
+// * the LSE rebase's 0.693 — *"without it the sigmoid argument was off by
+//   0.693, which matched HF's top-1 on most prompts and then degenerated
+//   greedy decoding after a few steps"*;
+// * `elem = "attn::device::f32"` and why it is not `device::f32` — the
+//   prelude has no such alias and `Elem` has no `float` specialisation to
+//   hang one on;
+// * `n: Usize` and not `I32`, because the kernel's parameter is
+//   `device::usize` and the twin's `int` was the launcher's signature;
+// * `PerHeadElementwise`'s axis order — the ROW is `grid.x` and the head is
+//   `grid.y`, the transpose of `PerHead`'s, and `q_heads` and not `kv_heads`
+//   because the tensor being rescaled is the attention OUTPUT;
+// * `N` and `num_q_heads` staying operands though the geometry recovers
+//   both, because they are the kernel's own bounds check and its row stride
+//   and an operand list shorter than the `__global__`'s is a `void**` the
+//   driver reads past;
+// * `PerRow` and not `Rms` for the blend, with the thirty-two bytes of
+//   dynamic shared memory `Rms` asks for that no launcher passes and no
+//   kernel reads;
+// * `B` as an operand over an operand — `Width(In(1)) / Width(Out(0))`, not
+//   a plan dimension and not a param.
+//
+// They are `crate::x::attn`'s now, in the `unit!` beside the `fn`s that fire
+// them and in the doc comments of those `fn`s.
 
-/// Both of the templates `attn/attn_sink.cuh` holds.
-pub static ATTN_SINK_ROWS: &[DeviceKernel] = &[
-    DeviceKernel {
-        sig: &ATTN_SINK_SIGS[0],
-        template_path: "attn::device::lse_log2_to_ln",
-        // NOT `device::f32` — the prelude has no such alias, and `Elem` has no
-        // `float` specialisation to hang one on. `attn::device::f32` is declared
-        // in the `.cuh` beside the kernel that is the only thing asking for it.
-        elem: "attn::device::f32",
-    },
-    DeviceKernel {
-        sig: &ATTN_SINK_SIGS[1],
-        template_path: "attn::device::attn_sink_rescale",
-        elem: "device::bf16",
-    },
-];
-
-#[rustfmt::skip]
-static ATTN_SINK_SIGS: [KernelSig; 2] = [
-    // FlashInfer publishes its LSE in log2 and the sink correction works in
-    // ln. A unit conversion, stated so a reader never has to guess which base
-    // an LSE is in — and the drift it prevents is measured: without it the
-    // sigmoid argument was off by 0.693, which matched HF's top-1 on most
-    // prompts and then degenerated greedy decoding after a few steps.
-    //
-    // The rebase is in place on the value it names: `Out(0)` is the
-    // statement's result and `In(0)` is the same buffer, so the element count
-    // is the result's own extent. `n` is `Usize` where the twin said `I32`,
-    // because the kernel's parameter is `device::usize` — the twin's `int`
-    // was the launcher's signature, not the kernel's.
-    kernel!(lse_log2_to_ln "attn::lse_log2_to_ln",
-        file = Some("attn/attn_sink.cuh"),
-        launch = LaunchRule::Elementwise,
-        operands = operands![
-            lse: F32sMut <- Source::Out(0),
-            n: Usize <- Source::OutElements(0),
-        ]),
-    // `PerHeadElementwise`, and this launcher is the one the rule was derived
-    // from: `dim3 grid(N, num_q_heads)` with
-    // `block = (head_dim < 32) ? 32 : (head_dim > 128 ? 128 : head_dim)`,
-    // which is `eval`'s `[rows, q_heads, 1]` and `clamp(head_dim, 32, 128)`
-    // to the digit. The ROW is `grid.x` and the head is `grid.y` here, which
-    // is the transpose of `PerHead`'s — the two axis orders are the kernels'
-    // and not a convention, and a rule read off the wrong one runs the same
-    // block count over the wrong cells.
-    //
-    // `q_heads` and not `kv_heads`, because the tensor this rescales is the
-    // attention OUTPUT: one row per query head. The rule reads
-    // `Dims::q_heads` for exactly that reason and a grouped-query fire has
-    // two head counts to pick the wrong one from.
-    //
-    // `N` and `num_q_heads` stay operands though the rule recovers both.
-    // They are the kernel's own `if (t >= N || h >= num_q_heads) return;`
-    // and its row stride `num_q_heads * head_dim`; an operand list shorter
-    // than the `__global__`'s parameter list is a `void**` the driver reads
-    // past. What left is the stream, which was never one.
-    //
-    // In place on the output it corrects, which is what lets the o_proj GEMM
-    // and the residual add downstream read rescaled activations without a
-    // copy. `lse` is the dispatch's SECOND result — `In(1)`, a value only a
-    // sink layer declares — and the sinks are the layer's learned weight.
-    kernel!(attention_sink_rescale "attn::attention_sink_rescale_bf16",
-        file = Some("attn/attn_sink.cuh"),
-        launch = LaunchRule::PerHeadElementwise,
-        in_place = &[(0, 0)],
-        operands = operands![
-            o: BufMut <- Source::Out(0),
-            lse: F32s <- Source::In(1),
-            sinks: Buf <- Source::Weight(0),
-            N: I32 <- Source::Rows,
-            num_q_heads: I32 <- Source::Ctx("num_q_heads"),
-            head_dim: I32 <- Source::Ctx("head_dim"),
-        ]),
-];
-
-/// K3's blend, at bf16.
-pub static ATTN_RES_ROWS: &[DeviceKernel] = &[DeviceKernel {
-    sig: &ATTN_RES_SIGS[0],
-    template_path: "attn::device::attn_res_blend",
-    elem: "device::bf16",
-}];
-
-#[rustfmt::skip]
-static ATTN_RES_SIGS: [KernelSig; 1] = [
-    // `Rms` — one block per token, 256 wide, the row width read by a stride
-    // loop. The rule also hands the kernel 32 bytes of dynamic shared memory
-    // for `block_sum`'s warp scratch, which this kernel does not use: its
-    // reduction is a static `__shared__`. A rule per unused allocation is not
-    // a trade worth making.
-    //
-    // `T` is gone from the operand list where the twin states it. It did two
-    // jobs: a bound check, which is now the rule's grid promise, and a block
-    // stride, which survives as `block_rows`. The launcher's
-    // `block_rows > 0 ? block_rows : T` default is `Source::Rows`, which is
-    // the value that ternary produced on every call site that existed.
-    kernel!(attn_res_blend "attn::attn_res_blend_bf16",
-        file = Some("attn/attn_res.cuh"),
-        launch = LaunchRule::PerRow,
-        // `PerRow`, not `Rms`. The launcher is `<<<T, kThreads=256, 0>>>` in
-        // `attn/attn_res.cu`, and `Rms` requests thirty-two bytes of dynamic
-        // shared memory that no launcher here passes and no kernel here
-        // reads -- `block_sum`'s warp buffer, which this shape has no
-        // reduction to need. Harmless in effect and wrong as a contract:
-        // a rule is meant to REPRODUCE its launcher, and one that asks
-        // for memory the launcher did not is a rule nobody can check
-        // against the `<<<>>>` it came from.
-        operands = operands![
-            prefix: Buf <- Source::In(0),
-            blocks: Buf <- Source::In(1),
-            norm_weight: Buf <- Source::In(2),
-            proj_weight: Buf <- Source::In(3),
-            out: BufMut <- Source::Out(0),
-            // AN OPERAND OVER AN OPERAND, not a plan dimension. `B` is how
-            // many blocks the packed input holds, which is its width divided
-            // by the output's — the two are in the same statement, so the row
-            // can say it. A row that guessed a param would launch the right
-            // kernel over the wrong rectangle.
-            B: I32 <- Source::Div(&Source::Width(&Source::In(1)), &Source::Width(&Source::Out(0))),
-            H: I32 <- Source::OutWidth(0),
-            block_rows: I32 <- Source::Rows,
-            eps: F32 <- Source::Ctx("eps"),
-        ]),
-];
-
-/// The index network's LayerNorm-plus-RoPE and its top-k mask, at bf16.
-pub static DSA_INDEXER_ROWS: &[DeviceKernel] = &[
-    // THE QUERY ROTATION HAS A ROW NOW. `dsa_indexer.cu`'s header said the
-    // other two were "waiting on a launch rule"; this one waits no longer,
-    // because it does not need one. Its block width is
-    // `round_up(n_heads, 32)` with a one-warp floor -- a statement PARAMETER
-    // and not a rectangle, so no `Dims` carries it and no rule can state it.
-    // `LaunchRule::Unstated` says that, and
-    // `driver-cuda/src/fire/dsa_indexer.rs::q_rope_block` is the arithmetic.
-    DeviceKernel {
-        sig: &DSA_INDEXER_SIGS[2],
-        template_path: "attn::device::index_q_rope",
-        elem: "device::bf16",
-    },
-    DeviceKernel {
-        sig: &DSA_INDEXER_SIGS[0],
-        template_path: "attn::device::index_knorm_rope",
-        elem: "device::bf16",
-    },
-    // `template <class T>` and nothing else — `kBlock` is a file-scope
-    // `constexpr int` the kernel strides by, not a template argument, so
-    // there is no non-type argument to cite and the 256 the rule launches
-    // has to agree with `dsa_indexer.cuh`'s `kBlock` instead. It does.
-    DeviceKernel {
-        sig: &DSA_INDEXER_SIGS[1],
-        template_path: "attn::device::index_topk_mask",
-        elem: "device::bf16",
-    },
-];
-
-#[rustfmt::skip]
-static DSA_INDEXER_SIGS: [KernelSig; 3] = [
-    // UNSOURCED, exactly as the twin is. A source is a claim about where a
-    // value comes from at fire time, and a guessed one binds the wrong buffer
-    // with nothing to report it — so the sources arrive when the statement
-    // that fires this kernel does, not before.
-    //
-    // `tokens` is gone: `Rms` opens one block per row and that IS `tokens`.
-    // `head_dim` stays, because the kernel strides over it and no rule the
-    // grid states recovers a row's width for a kernel whose row is one head.
-    // §60.6's SYMBOL SPLIT: this row was `attn::dsa_index_knorm_rope_bf16`,
-    // the same string `table::attn` carries, which made the table symbol
-    // unit-hosted and so unwalkable (§52.11). The launcher in
-    // `dsa_indexer.cu` could not be taken over while the two names were one.
-    // `_bf16` is dropped as well as `_dev` added: this is
-    // `template <typename T>` and the ROW picks `T`.
-    kernel!(dsa_index_knorm_rope "attn::dsa_index_knorm_rope_dev",
-        file = Some("attn/dsa_indexer.cuh"),
-        launch = LaunchRule::PerRow,
-        // `PerRow`, not `Rms`. The launcher is `<<<tokens, kBlock=256, 0>>>` in
-        // `attn/dsa_indexer.cu`, and `Rms` requests thirty-two bytes of dynamic
-        // shared memory that no launcher here passes and no kernel here
-        // reads -- `block_sum`'s warp buffer, which this shape has no
-        // reduction to need. Harmless in effect and wrong as a contract:
-        // a rule is meant to REPRODUCE its launcher, and one that asks
-        // for memory the launcher did not is a rule nobody can check
-        // against the `<<<>>>` it came from.
-        operands = operands![
-            idx_k: BufMut, k_norm_weight: Buf, k_norm_bias: Buf, positions: I32s,
-            head_dim: I32, rope_dim: I32, theta: F32, eps: F32,
-        ]),
-    // THE CAUSAL TOP-K MASK, and the row `dsa_indexer.cuh` said no rule
-    // stated. `LaunchRule::RowScores` is that rule, and
-    // `runtime::launch::row_scores` was ported FROM this launcher:
-    //
-    // ```text
-    // if (tokens <= 0) return;
-    // const std::size_t smem = static_cast<std::size_t>(tokens) * sizeof(float);
-    // device::index_topk_mask<bf16><<<tokens, device::kBlock, smem, stream>>>(...);
-    // ```
-    //
-    // `kBlock` is 256 and `RowScores` launches 256, so grid, block AND the
-    // shared allocation agree for every rectangle: `rows * 4` bytes is
-    // `tokens * sizeof(float)` written twice.
-    //
-    // **The shared allocation is why this is not `Rms` and not `PerRow`.**
-    // The kernel declares `extern __shared__ float logit[]` and fills
-    // `logit[0..nkeys)` where `nkeys = blockIdx.x + 1` — one float per KEY,
-    // and every key of this fire is a row of it. At `Rms`' thirty-two bytes
-    // the last row of a 4 096-token prefill would select its top-k from eight
-    // floats it wrote and 4 088 it did not; at `PerRow`'s zero, from none.
-    // Neither faults. `dsa_indexer.cuh` states the consequence in its own
-    // words — *"a launch that under-sizes shared memory does not fail, it
-    // reads another block's floats"* — and that is a wrong mask, which is a
-    // wrong attention, which nothing downstream checks.
-    //
-    // `N` STAYS AN OPERAND although `RowScores` opens the grid over it. The
-    // rule recovers the GRID; the kernel needs the number a second time, as
-    // the pitch of `mask` (`mrow = mask + i * N`) and as the bound of its
-    // causal zero-fill. An extent a rule recovers is not an operand — an
-    // extent a kernel ADDRESSES with is.
-    //
-    // Unsourced, exactly as the twin is: `n_heads`, `head_dim` and `topk`
-    // reach the ahead-of-time row from `Source::Param`, and a JIT row that
-    // guessed which statement parameter carried which would bind three
-    // integers in an order nothing reports.
-    // §60.6's symbol split, for the twin's reason. This one cost more to
-    // leave joined than the twin did: the `table::attn` row is FULLY sourced,
-    // so it was a live shim entry reaching a live launcher, and the only way
-    // to free the `.cu` was to make the row takeable.
-    kernel!(dsa_index_topk_mask "attn::dsa_index_topk_mask_dev",
-        file = Some("attn/dsa_indexer.cuh"),
-        launch = LaunchRule::RowScores,
-        whole = true,
-        operands = operands![
-            idx_q: Buf,
-            idx_k: Buf,
-            idx_w: Buf,
-            mask: U8sMut,
-            n: I32,
-            n_heads: I32,
-            head_dim: I32,
-            topk: I32,
-        ]),
-    // `dsa_indexer.cu:36` -- `device::index_q_rope<bf16><<<tokens, block, 0,
-    // stream>>>(idx_q, positions, n_heads, head_dim, rope_dim, theta)`, with
-    // `:34-35` above it:
-    //
-    // ```text
-    // :34   int block = ((n_heads + 31) / 32) * 32;
-    // :35   if (block < 32) block = 32;
-    // ```
-    //
-    // ONE THREAD PER HEAD, rounded up to a whole warp. That is why the row is
-    // `LaunchRule::Unstated` and not `PerRow`: `PerRow` fixes 256 and this
-    // block is 32 for a 24-head indexer, so a rule stating it would launch
-    // eight times the threads the kernel bounds itself against -- harmless
-    // for correctness and wrong as a contract, which is the same objection
-    // the twin above raises against `Rms`.
-    //
-    // Unsourced, for the twins' reason: `n_heads`, `head_dim` and `rope_dim`
-    // reach the ahead-of-time row from statement parameters, and a JIT row
-    // that guessed which parameter carried which would bind three integers
-    // in an order nothing reports.
-    kernel!(dsa_index_q_rope "attn::dsa_index_q_rope_dev",
-        file = Some("attn/dsa_indexer.cuh"),
-        launch = LaunchRule::Unstated,
-        operands = operands![
-            idx_q: BufMut, positions: I32s, n_heads: I32, head_dim: I32,
-            rope_dim: I32, theta: F32,
-        ]),
-];
+// `DSA_INDEXER_ROWS` and `DSA_INDEXER_SIGS` DELETED, unit-only crossing —
+// the device text is `crate::x::attn::dsa_indexer`'s and the three host
+// programs never left `driver-cuda/src/fire/dsa_indexer.rs`.
+//
+// **No row crossed and none could.** A `table::` row is a claim about what a
+// TRACE may say; these three kernels are fired by Rust that already exists
+// and is already correct. Two of the three rows were unsourced — `n_heads`,
+// `head_dim`, `rope_dim` and `topk` arrive on `Source::Param`, which is the
+// statement's parameter channel, and *"a JIT row that guessed which statement
+// parameter carried which would bind three integers in an order nothing
+// reports"*. The third, `dsa_index_topk_mask`, IS fully sourced in
+// `table::attn` and its row stays there; only the device text moved.
+//
+// Everything these rows argued travelled to the new home, in the module doc
+// and in the three `fn` docs beside the declarations:
+//
+// * `LaunchRule::PerRow` and NOT `Rms` for `knorm_rope`. The launcher is
+//   `<<<tokens, kBlock = 256, 0>>>`; `Rms` requests thirty-two bytes of
+//   dynamic shared memory that no launcher here passes and no kernel here
+//   reads — `block_sum`'s warp buffer, which this shape has no reduction to
+//   need, because its reduction is a static `__shared__ float red[256]`.
+//   Harmless in effect and wrong as a contract: *"a rule is meant to
+//   REPRODUCE its launcher, and one that asks for memory the launcher did not
+//   is a rule nobody can check against the `<<<>>>` it came from."*
+// * `LaunchRule::Unstated` for `q_rope`, and WHY no rule can state it:
+//   `dsa_indexer.cu:34-35` is `block = round_up(n_heads, 32)` with a one-warp
+//   floor. ONE THREAD PER HEAD. Every rule that sizes a block on a row sizes
+//   it on the row's WIDTH, and `idx_q`'s row is `n_heads * head_dim` — the
+//   two differ by 64 or 128, so `RouteRows` would open 128× the block. The
+//   block is a statement PARAMETER, not a rectangle. In fn-world the
+//   objection evaporates: a `Launch` is a `fn`'s literal.
+// * `LaunchRule::RowScores` for `topk_mask`, and that
+//   `runtime::launch::row_scores` was ported FROM this launcher — grid, block
+//   and the dynamic allocation all agree, `rows * 4` being
+//   `tokens * sizeof(float)` written twice. **The shared allocation is why it
+//   is neither `Rms` nor `PerRow`**: the kernel declares
+//   `extern __shared__ float logit[]` and fills `logit[0..nkeys)` where
+//   `nkeys = blockIdx.x + 1` — one float per KEY. At `Rms`' thirty-two bytes
+//   the last row of a 4 096-token prefill would select its top-k from eight
+//   floats it wrote and 4 088 it did not; at `PerRow`'s zero, from none.
+//   Neither faults. *"A launch that under-sizes shared memory does not fail,
+//   it reads another block's floats"* — a wrong mask, a wrong attention, and
+//   nothing downstream checks it.
+// * `N` STAYS AN OPERAND although the grid opens over it, because the kernel
+//   needs it a second time as the pitch of `mask` (`mrow = mask + i * N`) and
+//   as the bound of its causal zero-fill. **An extent a rule recovers is not
+//   an operand — an extent a kernel ADDRESSES with is.** Conversely `tokens`
+//   is absent from `knorm_rope`, because one block per row IS `tokens` and
+//   the kernel never addresses with it.
+// * §60.6's SYMBOL SPLIT on all three. The device symbols are
+//   `attn::dsa_index_{knorm_rope,q_rope,topk_mask}_dev`; `table::attn` still
+//   carries `attn::dsa_index_knorm_rope_bf16`, `attn::dsa_index_q_rope_bf16`
+//   and `attn::dsa_index_topk_mask`. `_bf16` is DROPPED as well as `_dev`
+//   added, because these are `template <class T>` and the ROW picks `T`.
+//   `fire/dsa_indexer.rs:45-61` holds both halves of each pair as constants
+//   side by side and is the only thing that bridges them.
+// * `template <class T>` and nothing else on `topk_mask` — `kBlock` is a
+//   file-scope `constexpr int` the kernel strides by, not a template
+//   argument, so there is no non-type argument to cite and the 256 a launcher
+//   opens has to agree with `dsa_indexer.cuh`'s `kBlock` instead. It does.
+//
+// `DSA_INDEXER_ROWS` was `pub static`; swept for both consumer sets — the
+// symbol strings and the identifier — across `crates/model/src`,
+// `model-compiler/src/{dsl.rs,lower.rs}`, the hand-written `ffi::pie_k_*`
+// arms and every `include_str!`/`#include` of `dsa_indexer.cuh`. The only
+// reader was `DSA_INDEXER` itself, and the only `include_str!` is now
+// `x::attn::dsa_indexer`'s.
 
 /// MTP's input shift, the reference attention, and MTP's pending-state stash.
 pub static ATTENTION_NAIVE_ROWS: &[DeviceKernel] = &[
@@ -1047,299 +850,128 @@ static ATTENTION_NAIVE_SIGS: [KernelSig; 3] = [
         ]),
 ];
 
-/// `attn/head_dim_pad.cuh`'s two instantiations.
-static HEAD_DIM_PAD_ROWS: &[DeviceKernel] = &[
-    DeviceKernel {
-        sig: &HEAD_DIM_PAD_SIGS[0],
-        template_path: "attn::device::pad_head_dim",
-        elem: "device::bf16",
-    },
-    DeviceKernel {
-        sig: &HEAD_DIM_PAD_SIGS[1],
-        template_path: "attn::device::strip_head_dim",
-        elem: "device::bf16",
-    },
-];
+// `HEAD_DIM_PAD_ROWS`/`HEAD_DIM_PAD_SIGS` CROSSED INTO FN-WORLD with their
+// two constants, and the readings they carried are restated where the `fn`s
+// are: `head_dim_pad.cu`'s `dim3 grid(num_heads, num_tokens)` with the head
+// on `grid.x` and the row on `grid.y`; the 128 as a KERNEL REQUIREMENT and
+// not a tuning number, because both kernels stride `d += kPadBlock`, so a
+// narrower block leaves padding unzeroed on the way in and a head's tail
+// unread on the way out and NEITHER FAILS, BOTH ANSWER; `num_tokens` and the
+// stream leaving the operand list while `num_heads` stays; and WHICH SIDE IS
+// PACKED being whichever end is `head_dim` wide, which is what
+// `PACKED_HEADS_IN` and `PACKED_HEADS_OUT` were two constants for rather than
+// one expression written twice.
+//
+// `table::attn`'s copies of those two constants went with the two table rows
+// in the same change. `crate::x::attn`'s `PAD_HEAD_DIM` and
+// `STRIP_HEAD_DIM` binds are where the two divisions are now written.
 
-/// The contracts, in [`HEAD_DIM_PAD_ROWS`]' order.
-///
-/// Both are `LaunchRule::PerHead`, and `head_dim_pad.cu` is the launcher
-/// `runtime::launch::per_head` cites — `dim3 grid(num_heads, num_tokens)`,
-/// `dim3 block(kPadBlock)`, which `eval` returns as `[kv_heads, rows, 1]` and
-/// `[128, 1, 1]`. **The head is `grid.x` and the row is `grid.y`**, the
-/// transpose of every other head-shaped rule in the vocabulary, because that
-/// is the axis order these two kernels read.
-///
-/// The 128 is the kernels' requirement and not a tuning number: both stride
-/// `d += kPadBlock`, the compile-time constant, so a narrower block never
-/// visits the columns above it — which for `pad_head_dim` is padding that was
-/// never zeroed, and for `strip_head_dim` a head whose tail keeps whatever the
-/// destination held. Neither fails; both answer.
-///
-/// `num_tokens` and the stream leave both rows: the first is `grid.y` and the
-/// second was never an operand. Everything the `__global__` declares stays,
-/// including `num_heads` — the rule puts the count on an axis the kernels do
-/// not read it back from, so a row without it is a `void**` one entry short.
-///
-/// Which side is PACKED is whichever end is `head_dim` wide — the input on
-/// the way in, the output on the way out — so the head count divides out of
-/// the packed side and the padded width is the other side over that count.
-/// Both readings are the ahead-of-time rows', kept verbatim.
-#[rustfmt::skip]
-static HEAD_DIM_PAD_SIGS: [KernelSig; 2] = [
-    kernel!(pad_head_dim "attn::pad_head_dim_bf16",
-        file = Some("attn/head_dim_pad.cuh"),
-        launch = LaunchRule::PerHead,
-        operands = operands![
-            packed: Buf <- Source::In(0),
-            padded: BufMut <- Source::Out(0),
-            num_heads: I32 <- PACKED_HEADS_IN,
-            head_dim: I32 <- Source::CtxNonZero("head_dim"),
-            head_dim_padded: I32 <- Source::Div(
-                &Source::Width(&Source::Out(0)),
-                &PACKED_HEADS_IN,
-            ),
-        ]),
-    kernel!(strip_head_dim "attn::strip_head_dim_bf16",
-        file = Some("attn/head_dim_pad.cuh"),
-        launch = LaunchRule::PerHead,
-        operands = operands![
-            padded: Buf <- Source::In(0),
-            packed: BufMut <- Source::Out(0),
-            num_heads: I32 <- PACKED_HEADS_OUT,
-            head_dim: I32 <- Source::CtxNonZero("head_dim"),
-            head_dim_padded: I32 <- Source::Div(
-                &Source::Width(&Source::In(0)),
-                &PACKED_HEADS_OUT,
-            ),
-        ]),
-];
+// `SPLIT_PACKED_ROWS`/`SPLIT_PACKED_SIGS` CROSSED INTO FN-WORLD, both rows,
+// with every measurement they carried:
+//
+// * `SplitPacked`'s grid over the INPUT width (`q_dim + 2 * kv_dim`) being
+//   WIDER than the launcher's over `max(q_dim, kv_dim)`, and why that is
+//   safe in this direction and only this one — *"every loop strides by
+//   `blockDim.x * gridDim.x` and bounds itself on its own output width, so
+//   extra blocks contribute nothing but a shorter loop"*, while a grid
+//   narrower than an output leaves the tail of every row unwritten;
+// * six operands and not eight for the host-window form: `n_tokens` is the
+//   rule's `grid.y` and the stream was never an operand, and the two widths
+//   come off what is WRITTEN because a `[N, q + 2 * kv]` row cannot say where
+//   the cut falls;
+// * seven and not eight for the device-window form, where `n_max` is the
+//   grid's second axis and never reaches the kernel;
+// * **both halves of why `split_qkv_devwin` gets no rule and no `Source`** —
+//   `grid.y` is the FIRE's lane count (`Ctx("rows_total")`) and not the
+//   statement's rectangle, so under a peel the rule's `Dims::rows` would be
+//   the tail's length while the kernel compares an ABSOLUTE `blockIdx.y`
+//   against the device window and the rows past that length keep the
+//   previous fire's bytes; and its buffers are BASE pointers by contract
+//   while the binder resolves `In`/`Out` THROUGH the statement's window,
+//   which is the double-window the `.cuh` refuses. Neither is an objection
+//   to a DEVICE row, which is why both rows crossed and neither became a
+//   bind.
+//
+// The two-symbol arrangement crossed with them: the device row is
+// `attn::split_qkv_devwin` and the table row is
+// `attn::split_qkv_bf16_devwin`, bridged by `SPLIT_DEVWIN_SYMBOL` and
+// `SPLIT_DEVWIN_DEVICE` in `driver-cuda/src/fire/split_packed.rs`.
 
-/// The heads of whichever side of a pad is `head_dim` wide.
-///
-/// Two constants rather than one expression written twice, because the pad
-/// and the strip read them off OPPOSITE ends and a copy that drifted would
-/// count heads on the padded side — where the divisor is `head_dim_padded`,
-/// so the count comes out short and the launch covers a prefix of the heads.
-const PACKED_HEADS_IN: Source =
-    Source::Div(&Source::Width(&Source::In(0)), &Source::CtxNonZero("head_dim"));
-/// See [`PACKED_HEADS_IN`].
-const PACKED_HEADS_OUT: Source =
-    Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim"));
-
-/// `attn/split_packed.cuh`'s one instantiation.
-static SPLIT_PACKED_ROWS: &[DeviceKernel] = &[
-    DeviceKernel {
-        sig: &SPLIT_PACKED_SIGS[0],
-        template_path: "attn::device::split_qkv",
-        elem: "device::bf16",
-    },
-    // THE TWIN HAS A ROW NOW. The paragraph below says "`split_qkv_devwin`
-    // has no row, and its geometry is not why", and both of its objections
-    // are objections to a `LaunchRule` and to the JIT BINDER -- `grid.y` from
-    // `Dims::rows` instead of the fire's lane count, and `In`/`Out` resolved
-    // through the statement's window on top of pointers that are BASE
-    // pointers by contract. Neither is an objection to a DEVICE row.
-    // `driver-cuda/src/fire/split_packed.rs` states `grid.y = n_max` because
-    // it is handed `n_max`, and `fire::hand::fire` binds the pointers it is
-    // given without re-windowing them. `LaunchRule::Unstated` is the row
-    // saying that: the geometry is the driver's and no rule claims it.
-    DeviceKernel {
-        sig: &SPLIT_PACKED_SIGS[1],
-        template_path: "attn::device::split_qkv_devwin",
-        elem: "device::bf16",
-    },
-];
-
-/// The contract, and the twin that does not get one.
-///
-/// `SplitPacked`, whose arithmetic `runtime::launch` derived from this very
-/// launcher: `dim3 grid(xblocks, n_tokens)` at 256 threads. The rule's
-/// `grid.x` is deliberately WIDER — `ceil(in_width / 256)` over the packed
-/// `q_dim + 2 * kv_dim` where the launcher used `ceil(max(q_dim, kv_dim) /
-/// 256)` — and `split_packed.cuh` licensed that before the port existed:
-/// *"every loop below strides by `blockDim.x * gridDim.x` and bounds itself
-/// on its own output width, so extra blocks contribute nothing but a shorter
-/// loop."* Wider is safe in this direction and only this one; a grid narrower
-/// than an output leaves the tail of every row unwritten.
-///
-/// **`split_qkv_devwin` has no row, and its geometry is not why.** The rule
-/// computes the same `dim3(xblocks, rows)` for it — the launcher is cited
-/// beside this one — but it computes it from the wrong numbers, twice over:
-///
-/// * `grid.y` is `n_max`, which the ahead-of-time row sources from
-///   `Ctx("rows_total")` — the FIRE's lane count — while a rule reads
-///   `Dims::rows`, the statement's rectangle. The two are equal until a peel
-///   splits, and a peel's tail region is the only place this symbol is ever
-///   stated. Under the split, `grid.y` would be the tail's length while the
-///   kernel compares an ABSOLUTE `blockIdx.y` against the device window, so
-///   the rows past that length are never visited and Q, K and V keep the
-///   previous fire's bytes there.
-/// * Its buffers are BASE pointers by contract — the window lives in device
-///   memory so a captured graph can replay across row splits without
-///   re-recording — and the JIT binder resolves `In`/`Out` THROUGH the
-///   statement's window. The kernel would window pointers the binder had
-///   already offset, which is the double-window the `.cuh` names.
-///
-/// Neither is something a `LaunchRule` can carry, so the row is absent rather
-/// than approximate and the launcher in `split_packed.cu` stays.
-#[rustfmt::skip]
-static SPLIT_PACKED_SIGS: [KernelSig; 2] = [
-    // `n_tokens` is the rule's `grid.y` and the stream was never an operand:
-    // eight arguments become six. The two widths come off what is WRITTEN and
-    // not off the packed operand — a `[N, q + 2 * kv]` row cannot say where
-    // the cut falls, and both results can.
-    kernel!(split_qkv "attn::split_qkv_bf16",
-        file = Some("attn/split_packed.cuh"),
-        launch = LaunchRule::SplitPacked,
-        operands = operands![
-            packed: Buf <- Source::In(0),
-            q_out: BufMut <- Source::Out(0),
-            k_out: BufMut <- Source::Out(1),
-            v_out: BufMut <- Source::Out(2),
-            q_dim: I32 <- Source::OutWidth(0),
-            kv_dim: I32 <- Source::OutWidth(1),
-        ]),
-    // `split_packed.cu:46` -- `device::split_qkv_devwin<bf16><<<grid, BLOCK,
-    // 0, stream>>>(packed, q_out, k_out, v_out, win_d, q_dim, kv_dim)`, with
-    // `:45`'s `dim3 grid(xblocks, n_max)` above it. SEVEN operands: `n_max`
-    // is the grid's second axis and never reaches the kernel, and the stream
-    // was never an operand.
-    //
-    // `LaunchRule::Unstated` for the reason the doc comment above gives at
-    // length: the rule would compute the same rectangle from the wrong
-    // numbers. Unsourced for the second half of the same reason -- `In`/`Out`
-    // resolve THROUGH the statement's window and these four are base pointers
-    // by contract, so a `Source` here would state the double-window the
-    // `.cuh` refuses. The driver states the geometry and passes the bases.
-    kernel!(split_qkv_devwin "attn::split_qkv_devwin",
-        file = Some("attn/split_packed.cuh"),
-        launch = LaunchRule::Unstated,
-        operands = operands![
-            packed: Buf, q_out: BufMut, k_out: BufMut, v_out: BufMut,
-            win_d: U32s, q_dim: I32, kv_dim: I32,
-        ]),
-];
-
-/// The custom-mask packers: a dense byte-per-cell mask packed to
-/// FlashInfer's bitmap ABI, and the same ABI materialised straight out of a
-/// causal / sliding-window / sink descriptor.
-///
-/// **The unit that could not exist while `instantiation()` could only spell
-/// `path<...>`.** Both kernels are plain `__global__`s — every buffer is
-/// `u8`/`u32`/`i32` mask metadata and the block width reaches them as
-/// `blockDim.x` — so neither has a type or a compile-time value to abstract
-/// over, and `pack_dense_mask.cuh` refused to invent one on
-/// `mxfp4_marlin.cuh`'s precedent: *"a width parameter would be a lie that
-/// compiles."* That header named the other way out in the same sentence —
-/// *"the rows wait on a real argument or on an `instantiation()` that needs
-/// none"* — and [`DeviceKernel::PLAIN`] is that, measured rather than
-/// assumed. **No device text changed for these two rows.**
-///
-/// The geometry was never the blocker and the header says so: both launch
-/// `<<<B, 128, 0, stream>>>`, one block per lane at a fixed 128 threads with
-/// a stride loop over that lane's output bytes, which is
-/// [`LaunchRule::PerRowNarrow`] to the digit. The 128 is not a preference
-/// here the way it is for the audio tower — nothing folds warp partials, so
-/// the width is not a numerics contract — but it is still the launcher's, and
-/// a rule that widened it to 256 would state a launch this tree does not
-/// make.
-pub const PACK_DENSE_MASK: Unit = Unit {
-    name: "attn/pack_dense_mask",
-    root: include_str!("../../csrc/src/attn/pack_dense_mask.cuh"),
-    rows: PACK_DENSE_MASK_ROWS,
-    options: &[],
-};
-
-/// `attn/pack_dense_mask.cuh`'s two kernels, both named by their bare
-/// qualified path.
-///
-/// `elem` is [`DeviceKernel::PLAIN`] and not `""`: the constant is the row's
-/// STATEMENT that this `__global__` has no template parameter list, and the
-/// empty string is what an unfilled field looks like. The distinction is not
-/// decoration — it is checked by the compiler on this box, in both
-/// directions, and `examples/argform_probe.rs` holds the measurement:
-/// `plain<device::bf16>` is `type name is not allowed` and a bare template
-/// path is `cannot determine which instance of function template ... is
-/// intended`. So a row that states the wrong one of the two fails
-/// `tests/units.rs`, with NVRTC's own sentence.
-static PACK_DENSE_MASK_ROWS: &[DeviceKernel] = &[
-    DeviceKernel {
-        sig: &PACK_DENSE_MASK_SIGS[0],
-        template_path: "attn::device::pack_dense_mask",
-        elem: DeviceKernel::PLAIN,
-    },
-    DeviceKernel {
-        sig: &PACK_DENSE_MASK_SIGS[1],
-        template_path: "attn::device::pack_structured_mask",
-        elem: DeviceKernel::PLAIN,
-    },
-];
-
-/// The two contracts, each its launcher's minus the stream.
-///
-/// **These two symbols are `table::driver_internal`'s and not
-/// [`crate::table`]'s**, which is why they do not move
-/// `examples/migration_status`: a driver-internal row is one no trace can
-/// state — `FirePageMask` picks the packer, the DSL surface has no statement
-/// for it — and `driver_internal` is deliberately outside `KERNELS` for that
-/// reason. The symbol is still the launcher's own, spelled the same string in
-/// both tables, because `driver-cuda`'s dispatch is what reads it.
-///
-/// Every operand is unsourced, for the reason [`PAGE_COMPACT_SIGS`]'s are:
-/// `mask_indptr` is a host-built prefix sum the driver owns, `packed` is a
-/// pre-zeroed driver allocation, and `p_page` is the dense mask's row stride.
-/// No [`Source`] spells any of the three, and a fire hands them directly.
-///
-/// `b` stays an operand even though [`LaunchRule::PerRowNarrow`] opens the
-/// grid over it. The kernel READS it — `if (b >= B) return;` and
-/// `if (request >= B) return;` are the first lines of both — so a row that
-/// dropped it on the grounds that the rule recovers it would hand the kernel
-/// whatever the previous launch left in that slot. `PAGE_COMPACT_SIGS` keeps
-/// `num_requests` for the same reason.
-#[rustfmt::skip]
-static PACK_DENSE_MASK_SIGS: [KernelSig; 2] = [
-    // `pack_dense_mask.cu:94` -- `device::pack_dense_mask<<<B, BLOCK, 0, stream>>>`
-    // with `constexpr int BLOCK = 128` at `:93`.
-    kernel!(pack_dense_mask "attn::pack_dense_mask",
-        file = Some("attn/pack_dense_mask.cuh"),
-        launch = LaunchRule::PerRowNarrow,
-        operands = operands![
-            kvm_dense: U8s, klen: U32s, qo_indptr: U32s, mask_indptr: I32s,
-            packed: U8sMut, b: I32, p_page: I32,
-        ]),
-    // `pack_dense_mask.cu:110` -- `device::pack_structured_mask<<<B, block, 0,
-    // stream>>>` with `constexpr int block = 128` at `:109`.
-    //
-    // `masks` is `Ty::StructuredMasks`, which `runtime::args`' `is_pointer`
-    // does not admit and `emit::crossing` therefore refuses — so this row
-    // compiles and resolves and has NO generated entry point yet, which the
-    // emitter records as a comment naming the operand. That is the honest
-    // state: the descriptor array IS a device pointer, and saying so is a
-    // change to the `Ty` vocabulary rather than to this row.
-    kernel!(pack_structured_mask "attn::pack_structured_mask",
-        file = Some("attn/pack_dense_mask.cuh"),
-        launch = LaunchRule::PerRowNarrow,
-        operands = operands![
-            positions: U32s, klen: U32s, qo_indptr: U32s, mask_indptr: I32s,
-            masks: StructuredMasks, packed: U8sMut, b: I32,
-        ]),
-];
+// `PACK_DENSE_MASK` CROSSED INTO FN-WORLD -- `crate::x::attn::pack_dense_mask`,
+// as a UNIT AND NOTHING ELSE. Its two `DeviceKernel::PLAIN` rows went with it;
+// there is no `contract!` and no `bind!`, because nothing in the tree launches
+// either kernel. `driver-cuda/tests/launch_abi.rs:651-654` is the evidence and
+// the verdict: *"`pack_dense_mask` and `pack_structured_mask` stood here and
+// are GONE with `attn/pack_dense_mask.cu`, its `.hpp` and their two
+// `table::driver_internal` rows. Empty consumer set on all five channels; not
+// ported, per §60.1."* `driver-cuda/src/fire/page_mask.rs` plans the sideband
+// arena and compacts the page CSR; it launches neither.
+//
+// EVERY MEASUREMENT THAT STOOD HERE, and where it is now:
+//
+// * The GEOMETRY. `pack_dense_mask.cu:93-94` -- `constexpr int BLOCK = 128`
+//   then `device::pack_dense_mask<<<B, BLOCK, 0, stream>>>` -- and `:109-110`,
+//   `constexpr int block = 128` then `device::pack_structured_mask<<<B, block,
+//   0, stream>>>`. One block per lane at a fixed 128 threads with a stride
+//   loop over that lane's output bytes, which is `LaunchRule::PerRowNarrow` to
+//   the digit. And the caveat: the 128 is not a preference here the way it is
+//   for the audio tower -- nothing folds warp partials, so the width is not a
+//   numerics contract -- but it is still the launcher's, and a rule that
+//   widened it to 256 would state a launch this tree does not make. Carried
+//   into the `pack_dense_mask` module doc; no `fn` writes that `Launch` today
+//   because nothing fires these.
+//
+// * `DeviceKernel::PLAIN` and not `""`. The constant is the row's STATEMENT
+//   that this `__global__` has no template parameter list; the empty string is
+//   what an unfilled field looks like. Checked by NVRTC in both directions and
+//   `examples/argform_probe.rs` holds it: `plain<device::bf16>` is *"type name
+//   is not allowed"*, a bare template path is *"cannot determine which
+//   instance of function template ... is intended"*. Both rows still state it,
+//   so `tests/units.rs` still checks it. NO DEVICE TEXT CHANGED, then or now.
+//
+// * `b` STAYS AN OPERAND even though the grid opens over it. Both kernels READ
+//   it -- `if (b >= B) return;` and `if (request >= B) return;` are the first
+//   lines of each -- so a declaration that dropped it on the grounds that the
+//   rule recovers it would hand the kernel whatever the previous launch left
+//   in that slot. `PAGE_COMPACT_SIGS` keeps `num_requests` for the same
+//   reason, and that sentence is why this one is repeated there.
+//
+// * EVERY OPERAND UNSOURCED, for the reason `PAGE_COMPACT_SIGS`' are:
+//   `mask_indptr` is a host-built prefix sum the driver owns, `packed` is a
+//   pre-zeroed driver allocation, and `p_page` is the dense mask's row stride.
+//   No `Source` spells any of the three. That is why the two rows were
+//   `table::driver_internal`'s and not `crate::table`'s, and why they did not
+//   move `examples/migration_status`: a driver-internal row is one no trace
+//   can state -- `FirePageMask` picked the packer, the DSL surface has no
+//   statement for it.
+//
+// * `masks` WAS THE BLOCKER, from both sides. `Ty::StructuredMasks` is a `Ty`
+//   that `runtime::args`' `is_pointer` does not admit, so `emit::crossing`
+//   refused it and the row had NO generated entry point -- the emitter
+//   recorded that as a comment naming the operand. The honest state was: the
+//   descriptor array IS a device pointer, and saying so is a change to the
+//   `Ty` vocabulary rather than to the row. Fn-world does not need that
+//   change: `Abi` is an open set of impls and `is_pointer` is not consulted,
+//   so `crate::x::attn::params` writes one impl and the declaration under it
+//   is the first statement of this kernel's full signature that anything
+//   checks.
+//
+// Nothing here may name the same root: a second `unit!` over the same text
+// compiles it twice and `unit_of` answers with whichever won.
 
 /// The units the small half of `attn` compiles.
 ///
 /// Separate from [`UNITS`] so the heavy half can be appended without either
 /// list being rewritten — see the marker at the end of this file.
 pub const UNITS_SMALL: &[Unit] = &[
-    SOFTCAP,
-    ATTN_SINK,
-    ATTN_RES,
-    DSA_INDEXER,
+    // `SOFTCAP`, `ATTN_SINK`, `ATTN_RES`, `HEAD_DIM_PAD`, `PACK_DENSE_MASK`
+    // and `DSA_INDEXER` CROSSED INTO FN-WORLD — `crate::x::attn`, whose
+    // `UNITS` `families::ALL` lists beside this one. Their device text, their
+    // rows and their host programs are all there; nothing here may name the
+    // same roots, because a second `unit!` over the same text compiles it
+    // twice and `unit_of` would answer with whichever won.
     ATTENTION_NAIVE,
-    HEAD_DIM_PAD,
-    SPLIT_PACKED,
     PAGE_COMPACT,
-    PACK_DENSE_MASK,
 ];
 
 /// The units `attn` compiles: the small half's, then the heavy half's.
@@ -1469,7 +1101,7 @@ const EMPTY: Unit = Unit { name: "", root: "", rows: &[], options: &[] };
 //    `SdpaVector`'s `(rows + 256) * 4` gets wrong by adding the block to the
 //    wrong extent. What still blocks the ROWS is the OPERANDS: both kernels
 //    take `device::KvScheme` and `device::KvDType` BY VALUE
-//    (`attention_naive_paged.cuh:141` and `:152`, `enum class … : u8`), and
+//    (`attention_naive_paged.cuh:187` and `:198`, `enum class … : u8`), and
 //    `kernels::Ty` has no variant for an enum class — `runtime::args`' whole
 //    bindable set is the pointer kinds plus `I32 | U32 | F32 | Usize | I64 |
 //    Bool | Stream`. Adding one is a change to `crates/kernels/src/lib.rs`
@@ -1480,6 +1112,28 @@ const EMPTY: Unit = Unit { name: "", root: "", rows: &[], options: &[] };
 //  * `attention_mla_naive.cu` keeps its `cudaFuncSetAttribute` opt-in to
 //    200 KB of shared memory behind a `std::call_once` — host state no
 //    `LaunchRule` can carry — so it is not split either.
+//
+//    **THIS REFUSAL IS CLOSED AND IT WAS WRONG TWICE OVER.** The file is
+//    split; the unit is `MLA_NAIVE` at the end of this file and its two rows
+//    are `attn::mla_naive_paged` and `attn::mla_mma_paged`. Both halves of
+//    the objection failed: the opt-in is not host state a rule has to carry
+//    (`runtime::module::raise_dynamic_smem_cap` performs it inside
+//    `KernelModule::fire`, once per `(CUdevice, CUfunction)` above a 48 KiB
+//    high-water mark, driven by `Launch::smem` alone), and the 200 KB was
+//    never reachable — the scalar kernel's allocation is `(8 * CKV + 16) * 4`
+//    against a `CKV <= 512` refusal, so 16 448 bytes is its ceiling, a third
+//    of the default it was said to exceed.
+//
+//    Worth recording WHY it read as a blocker for so long, because the shape
+//    recurs: the sentence names a real mechanism (`std::call_once`) and a
+//    real number (200 KB) and is refutable on both, but nobody refuted it,
+//    because a refusal that cites C++ looks like a measurement of the C++.
+//    It was a measurement of what the RULE could carry, made before the
+//    runtime grew the thing that carries it — and it was never re-asked. The
+//    actual blocker was in neither half and is not mentioned: the file was
+//    MIXED, two `__global__`s and four host functions with `<mutex>`,
+//    `<stdexcept>` and `<cuda_runtime.h>` in one header, so it could not be a
+//    unit root at all no matter what any rule could state.
 //
 // `attention_flashinfer*.cu` and `attention_xqa*.cu` are out of scope by
 // construction: FlashInfer migrates by vendoring its own headers (§14, and
@@ -1980,6 +1634,7 @@ pub const UNITS_HEAVY: &[Unit] = &[
     ATTN_SCORE_FOLD,
     ATTN_SCORE_POST,
     ATTN_XQA,
+    MLA_NAIVE,
 ];
 
 /// The reference paged attention — `attention_naive_paged.cuh`'s two rows.
@@ -2046,9 +1701,12 @@ pub const ATTENTION_NAIVE_PAGED: Unit = Unit {
 /// is a SHARED-MEMORY contract, not a tuning constant: the launcher asks for
 /// `(head_dim + BLOCK) * sizeof(float)` and the kernel cuts the tail of that
 /// allocation into exactly `BLOCK` reduction slots
-/// (`attention_naive_paged.cuh:334-336`). A row at another width would read
+/// (`attention_naive_paged.cuh:402-404`). A row at another width would read
 /// slots nothing wrote. [`crate::runtime::launch`]'s `PAGED_BLOCK` states the
-/// same number on the geometry side and says so at greater length.
+/// same number on the geometry side and says so at greater length — including
+/// that the `.cu` named above is DELETED, that the 128 was read off it while
+/// it existed, and that the surviving oracle is the `.cuh`'s `template <int
+/// BLOCK>` plus the instantiation string NVRTC checks.
 #[rustfmt::skip]
 static ATTENTION_NAIVE_PAGED_ROWS: &[DeviceKernel] = &[
     DeviceKernel {
@@ -2076,7 +1734,7 @@ static ATTENTION_NAIVE_PAGED_ROWS: &[DeviceKernel] = &[
 /// `attention_naive_paged.cu:208-209` hands `nullptr` twice where
 /// `attention_naive_paged_custom` at `:255-256` hands a real mask. Absence
 /// there means *"causal, not custom"*, and the kernel's own
-/// `use_custom_mask = custom_mask != nullptr` at `attention_naive_paged.cuh:339`
+/// `use_custom_mask = custom_mask != nullptr` at `attention_naive_paged.cuh:393`
 /// is what reads it.
 ///
 /// Both are `| null` and both are real; naming the difference here is the
@@ -2115,9 +1773,18 @@ static ATTENTION_NAIVE_PAGED_SIGS: [KernelSig; 2] = [
     //
     // The two `static_cast`s are the mirror correspondence this row's two new
     // `Ty`s reproduce: the host enum cannot cross NVRTC (its header pulls
-    // `<cstdint>`), so `attention_naive_paged.cuh:140` and `:151` declare
-    // device mirrors and `attention_naive_paged.cu` `static_assert`s every
+    // `<cstdint>`), so `attention_naive_paged.cuh:187` and `:198` declare
+    // device mirrors and `driver-cuda/tests/enum_mirrors.rs` asserts every
     // enumerator of both. A row naming the mirror is naming a checked type.
+    //
+    // THAT CHECK USED TO BE `attention_naive_paged.cu`'s `static_assert`s and
+    // the file is deleted; the conclusion above is unchanged and the pair
+    // being checked is now the LIVE one. Those asserts compared host C++
+    // against the device mirror, and under NVRTC no host enum reaches a launch
+    // -- the operand this row builds is Rust's `KvCacheScheme`/`DType`. The
+    // replacement compares Rust against the `.cuh` directly and found the
+    // drift the old pair could not see: two `DType` enumerators, `MXFP4_PACKED`
+    // and `E8M0`, were never mirrored at all.
     kernel!(attention_naive_paged "attn::attention_naive_paged",
         file = Some("attn/attention_naive_paged.cuh"),
         launch = LaunchRule::PagedScores,
@@ -2664,8 +2331,9 @@ static QKV_FUSED_SIGS: [KernelSig; 11] = [
 /// `elem` is [`DeviceKernel::PLAIN`] — the row's statement that
 /// `attn::device::write_mla` has no template parameter list, as against the
 /// empty string, which is what an unfilled field looks like. See
-/// [`PACK_DENSE_MASK_ROWS`] for the two refusals that make the distinction
-/// checkable rather than conventional.
+/// [`crate::x::attn::pack_dense_mask`] for the two refusals that make the
+/// distinction checkable rather than conventional; that module took the
+/// measurement with it when `PACK_DENSE_MASK` crossed.
 static MLA_PAGED_ROWS: &[DeviceKernel] = &[
     DeviceKernel {
         sig: &MLA_PAGED_SIGS[0],
@@ -4565,7 +4233,14 @@ pub const XQA_SMEM_BYTES: u32 = 79_488;
 /// patch set as paid. This gap is very likely what the second half of that
 /// quote was pointing at, and it is shared: anything reaching bf16 packed
 /// arithmetic or fp8x2 conversion hits it, not just XQA.
-pub static XQA_LATTICE: [XqaVariant; 6] = [
+/// **`const` and not `static`, so [`crate::x::xqa`] can read it in a `const`
+/// initialiser.** The five enrolled `Unit`s take their `name` and their
+/// per-member `-D` set straight out of this table rather than restating
+/// either, which is the only way two spellings of one option set cannot
+/// drift; a `static` may not be read by a `const`, and that restriction is
+/// the whole of the change. Nothing here is mutable, nothing takes its
+/// address, and there is no code consumer outside this file and that module.
+pub const XQA_LATTICE: [XqaVariant; 6] = [
     XqaVariant {
         unit: "attn/attention_xqa_mha_gqa2_p32",
         options: &[
@@ -4666,4 +4341,204 @@ pub static XQA_LATTICE: [XqaVariant; 6] = [
                   maps through `cuTensorMapEncodeTiled`, which is a second \
                   and larger host-to-Rust port than `launchMHA` was.",
     },
+];
+
+// ===========================================================================
+// `attn/attention_mla_naive` — the Blackwell MLA fallback, now a unit.
+//
+// The refusal recorded above ("`attention_mla_naive.cu` keeps its
+// `cudaFuncSetAttribute` opt-in to 200 KB of shared memory behind a
+// `std::call_once` -- host state no `LaunchRule` can carry -- so it is not
+// split either") is CLOSED, and it was wrong on both halves:
+//
+//  * The opt-in is not host state a rule has to carry. `runtime::module`'s
+//    `raise_dynamic_smem_cap` performs it inside `KernelModule::fire`, once
+//    per `(CUdevice, CUfunction)` above a 48 KiB high-water mark, driven by
+//    `Launch::smem` and nothing else. The north star §5 step 1 `smem_opt_in`
+//    field is the author's side of that same fact.
+//  * The 200 KiB was never needed. `attention_mla_naive.cuh:251`'s allocation
+//    is `(8 * CKV + 16) * 4` and `:228` refuses `CKV > 512`, so the largest
+//    request the scalar kernel can make is 16 448 bytes — a third of the
+//    48 KiB default. The measurement is preserved in
+//    `driver-cuda/src/fire/mla_naive.rs::NAIVE_OPT_IN_BYTES_UNREACHED` with
+//    that arithmetic; the tensor-core kernel's 100 032 IS above the default
+//    and IS raised.
+//
+// The real blocker was neither: the file was MIXED. Two `__global__`s and
+// four host functions in one header, opening `<mutex>`, `<stdexcept>`,
+// `<string>` and `<cuda_runtime.h>`, so it could not be a unit root at all.
+// The host half now lives in `kernels-cuda/csrc/src/attn/attention_mla.cu`
+// (and in Rust at `driver-cuda/src/fire/mla_naive.rs`), and what is left
+// compiles.
+//
+// PROBED, NVRTC 13.0, `sm_89`, under this crate's own numerics contract
+// (`--fmad=false --prec-div=true --prec-sqrt=true`) and the CARRIED header
+// set only — `csrc/{src,shim,vendor}`, no toolkit include path:
+//
+// ```text
+//   rc = 0, 0 errors
+//   117 621 bytes of PTX, 2 .entry
+//     _ZN15pie_cuda_driver7kernels4attn9mla_naive22mla_naive_paged_kernelE...
+//     _ZN15pie_cuda_driver7kernels4attn9mla_naive10mma_detail20mla_mma_paged_kernelE...
+// ```
+//
+// It needed three new shim headers and they are measured, not assumed: the
+// same text compiled with `/usr/local/cuda/include` answering
+// `cuda_pipeline.h`, `math_constants.h` and `cstring` produced **byte-identical
+// PTX**, register allocation included. See `csrc/shim/cuda_pipeline.h`, which
+// carries the comparison and the one PTX operand it turned on.
+//
+// A FOURTH FINDING, from the same probe: the file called `std::memcpy` and
+// never included `<cstring>`. Under nvcc `<cuda_runtime.h>` supplied it
+// transitively; under NVRTC it is an error no include path can fix, because
+// the include was never written. The set nvcc accepted was not the set the
+// file declared.
+// ===========================================================================
+
+/// The naive/Blackwell paged MLA pair: a scalar kernel and a tensor-core one.
+///
+/// **Two rows, one root, and they are ALTERNATIVES rather than a sequence.**
+/// The C++ launcher tries the tensor-core kernel first
+/// (`attention_mla_naive.cuh:218`) and falls through to the scalar one; the
+/// host program that replaces it, [`driver-cuda`'s `fire::mla_naive`], plans
+/// one or the other and fires exactly once. Nothing composes them, so there
+/// is no `execution::Step` and no intermediate buffer.
+///
+/// # Why this pair exists at all
+///
+/// `attention_mla.cu:150-157`, which is the only place it is argued and must
+/// not be lost with the file:
+///
+/// > FlashInfer's FA2 `BatchMLAPagedAttention` (a cooperative kernel) produces
+/// > zero output on sm_100; the ecosystem (sglang/vllm) routes Blackwell MLA
+/// > to trtllm/cutlass/ragged kernels instead. This is a correctness-first,
+/// > arch-agnostic latent-space MLA: one block per (token, head), flash-style
+/// > online softmax over the paged ckv/kpe cache. Output is in the kv_lora
+/// > latent space (same as the FA2 path), so the rest of the MLA forward
+/// > (latent_to_v, o_proj) is unchanged.
+///
+/// The selector is a device query — `cudaDevAttrComputeCapabilityMajor >= 10`
+/// at `attention_mla.cu:56-62` — and it is NOT one of these rows' business:
+/// it chooses between this pair and FlashInfer's MLA, which is a different
+/// symbol in a different unit that does not exist yet.
+///
+/// # Options: none, and the `#ifndef` defaults are why
+///
+/// `PIE_MLA_MMA_BK`, `_WARPS`, `_STAGES` and `_MINBLK` are all `#ifndef`
+/// guarded with their defaults in the header (`:302-322`), so the unit needs
+/// no `-D` to compile at the shape everything currently runs. Putting them in
+/// `Unit::options` would be the hook that file's own doc warns against: they
+/// are not options this unit needs and the others must not have, they are
+/// tuning constants with one live value, and `Unit::cache_key` spanning them
+/// would make a cubin cache key out of a number nobody varies. If a second
+/// tile is ever wanted it is a second unit with a second root, the way
+/// `XQA_LATTICE` spells its six.
+pub const MLA_NAIVE: Unit = Unit {
+    name: "attn/attention_mla_naive",
+    root: include_str!("../../csrc/src/attn/attention_mla_naive.cuh"),
+    rows: MLA_NAIVE_ROWS,
+    options: &[],
+};
+
+/// The two `__global__`s, by their qualified paths.
+///
+/// Both are `DeviceKernel::PLAIN`: neither has a template parameter list, so
+/// there is nothing for `elem` to pick and the bare qualified path is what
+/// NVRTC lowers and `cuModuleGetFunction` resolves. `MLA_PAGED_ROWS[0]` is the
+/// same case and makes the argument at length.
+///
+/// The paths are two levels deeper than most of this file's, and that is the
+/// header's own nesting rather than a convention: the pair lives in
+/// `pie_cuda_driver::kernels::attn::mla_naive`, and the tensor-core kernel is
+/// inside a further `mma_detail` that also holds its `ld_a`/`ld_b_v`/`mma_m16n8k16`
+/// helpers.
+static MLA_NAIVE_ROWS: &[DeviceKernel] = &[
+    DeviceKernel {
+        sig: &MLA_NAIVE_SIGS[0],
+        template_path: "attn::mla_naive::mla_naive_paged_kernel",
+        elem: DeviceKernel::PLAIN,
+    },
+    DeviceKernel {
+        sig: &MLA_NAIVE_SIGS[1],
+        template_path: "attn::mla_naive::mma_detail::mla_mma_paged_kernel",
+        elem: DeviceKernel::PLAIN,
+    },
+];
+
+/// The two contracts, which are the kernels' parameters and not the launcher's.
+///
+/// **Both are `LaunchRule::Unstated`, and the two rectangles are why.**
+///
+/// ```text
+/// attention_mla_naive.cuh:265   dim3 grid(total_tokens, num_heads / G);      block 256
+/// attention_mla_naive.cuh:725   dim3 grid(num_heads / kBM, total_tokens);    block 256
+/// ```
+///
+/// Same block, and the grids are TRANSPOSES of each other — tokens on x for
+/// the scalar kernel, tokens on y for the tensor-core one. No rule states
+/// either, and a rule that stated one would be actively wrong for the other
+/// while looking right: `grid.y` is capped at 65 535 and `grid.x` is not, so
+/// the transpose decides which of tokens and head blocks may exceed 65 535.
+/// Both are built by the driver in `fire::mla_naive::plan`, which is
+/// `MLA_PAGED`'s `mla_prepare` arrangement for the same reason.
+///
+/// The scalar kernel's `G` is the case `execution::Control::Supplies`' own doc
+/// names — *"passed to the kernel AND divides the head axis of the grid"* —
+/// and it is not merely unstated but UNSTATEABLE by a formula: `:241-249`
+/// SEARCHES for it, halving from 8 until the grid reaches `kMlaWaveTarget =
+/// 296` blocks. A rule computes; this looks.
+///
+/// **Unsourced on every operand**, which is `MLA_PAGED_SIGS`' §60.7 case: the
+/// rows exist so the unit can be enrolled and the symbols resolved, and
+/// `crate::abi` skips a row with any `Source::Unbound` operand whole, so no
+/// dispatch arm is generated and nothing reaches them except
+/// `fire::mla_naive` by name through `hand::fire`.
+///
+/// **No `_bf16` suffix on either**, for `attn::write_mla`'s reason: a format
+/// suffix claims a choice, and there is no template parameter here to have
+/// chosen with — every buffer is `__nv_bfloat16` in the kernels' own
+/// declarations.
+static MLA_NAIVE_SIGS: [KernelSig; 2] = [
+    // `attention_mla_naive.cuh:66-78` — nineteen parameters, ending in `G`.
+    //
+    // `index_mask` is nullable and `attn/attention_mla.hpp:36-38` says what
+    // null means and what the non-null case is restricted to:
+    //
+    // > DSA top-k mask for the naive path: [num_query_tokens, mask_stride]
+    // > uint8 (1=attend). Applied to in-batch keys (j < mask_stride). Null =
+    // > dense. Only valid for single-request pure prefill (key j == batch
+    // > token j).
+    //
+    // That last sentence is a correctness precondition no type states, so it
+    // travels here and in `fire::mla_naive::NaivePtrs::index_mask`.
+    kernel!(mla_naive_paged "attn::mla_naive_paged",
+        file = Some("attn/attention_mla_naive.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_nope: Buf, q_pe: Buf, ckv_pages: Buf, kpe_pages: Buf,
+            qo_indptr: U32s, kv_page_indices: U32s, kv_page_indptr: U32s,
+            kv_last_page_lens: U32s, o: BufMut,
+            index_mask: U8s | null, index_mask_stride: I32,
+            r: I32, h: I32, ckv: I32, kpe: I32, page_size: I32,
+            sm_scale: F32, causal: Bool, g: I32,
+        ]),
+    // `attention_mla_naive.cuh:420-431` — sixteen parameters, and the three
+    // MISSING ones are the contract's most informative feature: there is no
+    // `ckv`, no `kpe` and no `G`. The tensor-core kernel is compiled AGAINST
+    // `kCkv = 512` and `kKpe = 64` (`:330-331`) because the `mma.sync`
+    // fragment shapes are written for them, and its head group is fixed at
+    // `kBM = 16` (`:324`). That is exactly why `mla_mma_supported` (`:698`)
+    // COMPARES those three rather than forwarding them: the predicate is the
+    // only place the shape is checked, and passing them would imply a
+    // generality the `ld_b_v`/`ld_a` offsets do not have.
+    kernel!(mla_mma_paged "attn::mla_mma_paged",
+        file = Some("attn/attention_mla_naive.cuh"),
+        launch = LaunchRule::Unstated,
+        operands = operands![
+            q_nope: Buf, q_pe: Buf, ckv_pages: Buf, kpe_pages: Buf,
+            qo_indptr: U32s, kv_page_indices: U32s, kv_page_indptr: U32s,
+            kv_last_page_lens: U32s, o: BufMut,
+            index_mask: U8s | null, index_mask_stride: I32,
+            r: I32, h: I32, page_size: I32, sm_scale: F32, causal: Bool,
+        ]),
 ];

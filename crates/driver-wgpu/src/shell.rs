@@ -551,6 +551,39 @@ impl Shell {
     /// [`Launched::Exhausted`] or [`Launched::Impossible`] — and not an error,
     /// because a full cache is a scheduling fact rather than a fault.
     pub fn launch(&mut self, frame: &driver_api::FrameSubmission) -> Result<Launched, Unlaunched> {
+        if let Some(refused) = self.admit(frame)? {
+            return Ok(refused);
+        }
+
+        // Every step converted before any is fired. A frame whose third step
+        // does not close its CSR would otherwise have appended the first two
+        // steps' keys, and the scheduler's retry of the same frame would append
+        // them twice.
+        let mut work = Vec::with_capacity(frame.steps.len());
+        for step in &frame.steps {
+            work.push(self.prepare(&step.plan)?);
+        }
+
+        let mut out = Vec::with_capacity(work.len());
+        for (requests, tokens) in &work {
+            out.push(self.serve(requests, tokens)?);
+        }
+        Ok(Launched::Ran(out))
+    }
+
+    /// Make room for a frame, or say why there is none.
+    ///
+    /// `Ok(None)` is the admitted case. `Ok(Some(..))` is one of the two
+    /// refusals, which are answers rather than errors -- see [`Self::launch`],
+    /// whose first half this is.
+    ///
+    /// # Errors
+    ///
+    /// A frame of no steps, or a pool that will not grow.
+    pub fn admit(
+        &mut self,
+        frame: &driver_api::FrameSubmission,
+    ) -> Result<Option<Launched>, Unlaunched> {
         if frame.steps.is_empty() {
             return Err(Unlaunched::Malformed("a frame of no steps".to_string()));
         }
@@ -561,63 +594,81 @@ impl Shell {
         // would have the scheduler permanently drop work it had correctly
         // admitted, because the pool had been idle.
         if need > self.pool.ceiling(&self.device) {
-            return Ok(Launched::Impossible);
+            return Ok(Some(Launched::Impossible));
         }
         if need > self.pool.shape().pages {
             self.pool
                 .resize(&self.device, need)
                 .map_err(|e| Unlaunched::Unstepped(crate::turns::Unstepped::Failed(e)))?;
         }
+        Ok(None)
+    }
 
-        // Every step converted before any is fired. A frame whose third step
-        // does not close its CSR would otherwise have appended the first two
-        // steps' keys, and the scheduler's retry of the same frame would append
-        // them twice.
-        let mut work = Vec::with_capacity(frame.steps.len());
-        for step in &frame.steps {
-            step.plan
-                .validate_geometry()
-                .map_err(|e| Unlaunched::Malformed(format!("this frame's geometry: {e}")))?;
-            step.plan
-                .validate_kv_writes(self.pool.shape().page_size)
-                .map_err(|e| Unlaunched::Malformed(format!("this frame's KV writes: {e}")))?;
-            // Before any conversion: a plan naming something this driver does
-            // not implement is refused by the field's own name rather than
-            // served without it. See `frames::unserved_in`.
-            if let Some(what) = crate::frames::unserved_in(&step.plan) {
-                return Err(Unlaunched::Unserved(what));
-            }
-            work.push((requests_of(&step.plan)?, tokens_of(&step.plan)?));
+    /// One admitted step's plan, checked and converted but not fired.
+    ///
+    /// # Errors
+    ///
+    /// [`Unlaunched`] naming the CSR that does not close, or the field this
+    /// driver does not serve.
+    pub fn prepare(
+        &self,
+        plan: &driver_api::LaunchPlan,
+    ) -> Result<(Vec<crate::resources::Request>, Vec<Vec<u32>>), Unlaunched> {
+        plan.validate_geometry()
+            .map_err(|e| Unlaunched::Malformed(format!("this frame's geometry: {e}")))?;
+        plan.validate_kv_writes(self.pool.shape().page_size)
+            .map_err(|e| Unlaunched::Malformed(format!("this frame's KV writes: {e}")))?;
+        // Before any conversion: a plan naming something this driver does
+        // not implement is refused by the field's own name rather than
+        // served without it. See `frames::unserved_in`.
+        if let Some(what) = crate::frames::unserved_in(plan) {
+            return Err(Unlaunched::Unserved(what));
         }
+        Ok((requests_of(plan)?, tokens_of(plan)?))
+    }
 
-        let mut out = Vec::with_capacity(work.len());
-        for (requests, tokens) in &work {
-            let borrowed: Vec<&[u32]> = tokens.iter().map(Vec::as_slice).collect();
-            let serving = Serving {
-                plan: &self.text.decode,
-                prefill: &self.text.prefill,
-                geometry: self.text.geometry,
-                tier: self.tier,
-            };
-            let mut held = Held {
-                book: &mut self.book,
-                pool: &mut self.pool,
-                weights: &self.weights,
-            };
-            out.push(
-                serving
-                    .over(
-                        &self.device,
-                        &mut self.pipelines,
-                        &self.modules,
-                        &mut held,
-                        requests,
-                        &borrowed,
-                    )
-                    .map_err(Unlaunched::Unstepped)?,
-            );
-        }
-        Ok(Launched::Ran(out))
+    /// Fire one prepared step.
+    ///
+    /// # Why this half is separate
+    ///
+    /// A frame whose steps are DEVICE-RESOLVED cannot be converted all at
+    /// once: step `n + 1`'s tokens are what step `n`'s program puts on a
+    /// channel, and they do not exist until step `n` has both fired and had
+    /// its program run. Such a frame is driven a step at a time --
+    /// prepare, fire, run the program, prepare the next -- which is what
+    /// these two halves are for. A frame of ordinary host-wire steps keeps
+    /// the stronger order [`Self::launch`] states.
+    ///
+    /// # Errors
+    ///
+    /// [`Unlaunched::Unstepped`] for a fire the device refused.
+    pub fn serve(
+        &mut self,
+        requests: &[crate::resources::Request],
+        tokens: &[Vec<u32>],
+    ) -> Result<Step, Unlaunched> {
+        let borrowed: Vec<&[u32]> = tokens.iter().map(Vec::as_slice).collect();
+        let serving = Serving {
+            plan: &self.text.decode,
+            prefill: &self.text.prefill,
+            geometry: self.text.geometry,
+            tier: self.tier,
+        };
+        let mut held = Held {
+            book: &mut self.book,
+            pool: &mut self.pool,
+            weights: &self.weights,
+        };
+        serving
+            .over(
+                &self.device,
+                &mut self.pipelines,
+                &self.modules,
+                &mut held,
+                requests,
+                &borrowed,
+            )
+            .map_err(Unlaunched::Unstepped)
     }
 
     /// Give `to` a copy of `from`'s history.

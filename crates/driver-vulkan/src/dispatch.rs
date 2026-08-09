@@ -114,6 +114,28 @@ pub enum Undispatchable {
         /// How many the module's block or push range has room for.
         room: usize,
     },
+    /// The row names a scalar this driver cannot work out. See
+    /// [`crate::binding::Misplaced::Unresolved`].
+    Unresolved {
+        /// The symbol whose row named it.
+        symbol: String,
+        /// Which operand, counting from zero.
+        at: usize,
+        /// The operand's name, as the row spells it.
+        name: &'static str,
+        /// The `kernels::Source` variant, rendered.
+        source: String,
+    },
+    /// The row walks the KV cache with strides and no page table, and this
+    /// driver's pool is paged. See [`crate::binding::Misplaced::Contiguous`].
+    Contiguous {
+        /// The symbol whose row named it.
+        symbol: String,
+        /// Which operand, counting from zero.
+        at: usize,
+        /// The operand's name, as the row spells it.
+        name: &'static str,
+    },
     /// The rule and dims do not describe a grid.
     Ungeometric {
         /// Why.
@@ -168,6 +190,22 @@ impl std::fmt::Display for Undispatchable {
             Self::Scalars { stated, room } => {
                 write!(f, "{stated} scalars stated, room for {room}")
             }
+            Self::Unresolved {
+                symbol,
+                at,
+                name,
+                source,
+            } => write!(
+                f,
+                "`{symbol}` operand {at} (`{name}`) is sourced from {source}, \
+                 which this driver does not know how to work out"
+            ),
+            Self::Contiguous { symbol, at, name } => write!(
+                f,
+                "`{symbol}` operand {at} (`{name}`) is a contiguous KV stride, \
+                 and this driver's pool is paged: the row would read real \
+                 memory at the wrong tokens"
+            ),
             Self::Conditional { symbol, cond } => {
                 write!(f, "`{symbol}` sits under unevaluated guard {cond}")
             }
@@ -224,7 +262,7 @@ fn stated(lowered: &Lowered, launch: &Launch, index: Option<u8>) -> Option<u32> 
 ///
 /// # What each of the three overrides is held by
 ///
-/// `grid_param` fires 1788 times over this tree's six texts -- the number the
+/// `grid_param` fires 2220 times over this tree's six texts -- the number the
 /// walk pins as `overridden`, and it was 710 when this note was first written
 /// against three of them. A driver that read only the fire would
 /// normalise over the wrong width every one of those times and produce
@@ -388,6 +426,17 @@ pub fn plan_one<'a, R: Resolve>(
         crate::binding::Misplaced::Count { stated, push, .. } => {
             Undispatchable::Scalars { stated, room: push }
         }
+        crate::binding::Misplaced::Contiguous { at, name } => Undispatchable::Contiguous {
+            symbol: symbol.to_owned(),
+            at,
+            name,
+        },
+        crate::binding::Misplaced::Unresolved { at, name, source } => Undispatchable::Unresolved {
+            symbol: symbol.to_owned(),
+            at,
+            name,
+            source,
+        },
     })?;
 
     // The plan's operands, PLUS the slot a parameter block takes, have to be

@@ -231,7 +231,14 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
         // ONE threadgroup whatever the rows: see [`Rule::RouterSort`].
         Rule::RouterSort => shapes::route_sort(dims.n_experts),
         Rule::RouteRows => shapes::route_rows(dims.width, rows),
-        Rule::RoutedQmv => shapes::routed_qmv(dims.width, dims.experts_per_token, rows),
+        // `dims.axis`, not `dims.width`: the ROUTED projections' output is a
+        // whole token's `k` results end to end (`[Tokens, k * out]`), because
+        // the activation between them is elementwise over that whole run and
+        // an elementwise grid is `width * rows`. The matvec's own row axis is
+        // `out` alone, and it is the statement's `out_vec_size` — which is
+        // what `grid_param` on those rows makes `axis` be. A row that states
+        // no `grid_param` still reads `width` here, unchanged.
+        Rule::RoutedQmv => shapes::routed_qmv(dims.axis, dims.experts_per_token, rows),
         // The CUDA-only shapes, now TWENTY-ONE. Listed by name rather than
         // caught by a wildcard, so that a variant added to `LaunchRule`
         // tomorrow is a compile error here — which is the property

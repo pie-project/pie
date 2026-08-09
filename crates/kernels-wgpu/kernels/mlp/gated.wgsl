@@ -171,49 +171,81 @@ fn store_half(i: u32, value: f32) {
     }
 }
 
-// 16x16 and not 256x1, mirroring both siblings' launch: this is the one variant
-// whose rows are NARROW -- `ple_dim` is 256 elements, so 128 words -- and a
-// 256-wide workgroup would leave half of every row's lanes idle.
-@compute @workgroup_size(16, 16)
+// 256x1 and flat, because that is what this row's rule says.
+//
+// # Why this was 16x16, and why that was wrong
+//
+// This body mirrored both siblings' `local_size` -- 16x16, reading `gid.y` as
+// the row -- on the reasoning that PLE rows are NARROW (`ple_dim` is 256
+// elements, 128 words) and a 256-wide workgroup leaves half of every row's
+// lanes idle. The reasoning is fine and the shape was not: the ROW states
+// `LaunchRule::Elementwise`, which is `[width * rows, 1, 1]`. One workgroup on
+// y then covers 16 rows and every row past 15 is never dispatched. Measured at
+// 21 rows on a 4090: row 16 came back holding the sentinel it was born with,
+// and the dispatch SUCCEEDED. gemma's PLE reaches this with `rows` = the
+// fire's token count, so any prefill longer than sixteen tokens was silently
+// dropping most of its per-layer embeddings.
+//
+// The rule is shared with `kernels-metal`, where a threadgroup is sized at
+// dispatch and `Elementwise` is correct, so changing the ROW would be a change
+// to three tables and three drivers to fix one body. Changing the BODY to
+// match the rule it already states is local, and this is that.
+//
+// `gid.x` is therefore a flat ELEMENT index over `rows * width`, not a word
+// index. Word ownership is recovered below rather than assumed, so the fast
+// whole-word store survives: exactly one lane writes each word.
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let m = gid.y;
-    if (m >= params.rows) { return; }
+    let n = gid.x;
+    if (n >= params.rows * params.width) { return; }
+    let m = n / params.width;
+    let k = n % params.width;
 
     // Three operands with three pitches, so only the OUTPUT's word is a unit of
     // ownership; the gate and the up rows are addressed per element and may sit
-    // at any parity. `gid.x` counts words of the output row, so the host's x
-    // extent is `ceil(width / 2)` and not `width`.
+    // at any parity.
+    //
+    // Ownership is derived from the ABSOLUTE output offset rather than from
+    // the lane number, because a row starts at `m * out_pitch` and an odd pitch
+    // puts an odd row's first element in a word's UPPER half. So the three
+    // cases below are: this lane owns the whole word, this lane owns one half
+    // of a word it shares with a neighbouring ROW, or the lane before it
+    // already wrote the word they share.
+    //
+    // Exactly one lane writes each word. The `k > 0` in the last case is what
+    // makes that true: a lane on an odd absolute offset is the second half of a
+    // pair the even lane already stored, UNLESS it is the row's first element,
+    // in which case the even half belongs to the previous row.
     let base_o = m * params.out_pitch;
     let base_g = m * params.gate_pitch;
     let base_u = m * params.up_pitch;
-    let word = (base_o >> 1u) + gid.x;
+    let at = base_o + k;
+    let word = at >> 1u;
+    let value = activate(gate_at(base_g + k), up_at(base_u + k));
 
-    let lo = word * 2u;
-    let hi = lo + 1u;
-    let has_lo = lo >= base_o && lo < base_o + params.width;
-    let has_hi = hi < base_o + params.width;
-    if (has_lo && has_hi) {
-        // Both elements are this row's, so this invocation owns the word: one
-        // write, no read-modify-write, nothing to race.
-        let k = lo - base_o;
-        atomicStore(&out_[word], pie_pack_bf16(
-            activate(gate_at(base_g + k), up_at(base_u + k)),
-            activate(gate_at(base_g + k + 1u), up_at(base_u + k + 1u)),
-        ));
-    } else if (has_hi) {
-        // The row begins in this word's UPPER half, which only an odd
-        // `out_pitch` produces. The lower half is then the previous row's, and
-        // that row's invocation is writing it concurrently, so this half goes
-        // through the compare-exchange.
-        let k = hi - base_o;
-        store_half(hi, activate(gate_at(base_g + k), up_at(base_u + k)));
-    } else if (has_lo) {
-        // The row's last element is this word's LOWER half. The upper half is
-        // either this row's PADDING -- nobody's, since `out_pitch > width` --
-        // or the next row's first element when the pitch is odd and tight. The
-        // CAS is correct for both and the branch does not have to know which.
-        let k = lo - base_o;
-        store_half(lo, activate(gate_at(base_g + k), up_at(base_u + k)));
+    if ((at & 1u) == 0u) {
+        if (k + 1u < params.width) {
+            // Both halves are this row's and this lane's: one plain store, no
+            // read-modify-write, nothing to race. The lane for `k + 1` sees an
+            // odd offset with `k > 0` and returns.
+            atomicStore(&out_[word], pie_pack_bf16(
+                value,
+                activate(gate_at(base_g + k + 1u), up_at(base_u + k + 1u)),
+            ));
+        } else {
+            // The row's last element sits in a word's lower half. The upper
+            // half is either padding -- nobody's, when `out_pitch > width` --
+            // or the NEXT row's first element when the pitch is tight. The
+            // compare-exchange is correct for both and does not have to know
+            // which.
+            store_half(at, value);
+        }
+    } else if (k == 0u) {
+        // The row begins in this word's upper half, which only an odd
+        // `out_pitch` produces. The lower half is the previous row's and that
+        // row's lane is writing it concurrently, so this half goes through the
+        // compare-exchange.
+        store_half(at, value);
     }
 }
 

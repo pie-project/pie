@@ -10,13 +10,30 @@
 //! this crate did not write ran device code on this crate's stream.
 //!
 //! **That first test now proves a different chain, and deliberately.**
-//! `quant::cast_fp32_to_bf16` is in `device::JIT_DISPATCHED`, so
-//! `emit_c_shim` emits no `pie_k_quant_cast_fp32_to_bf16` and
-//! `quant/dtype_cast.cu` is deleted; the launcher is
-//! `driver_cuda::fire::dtype_cast::cast_fp32_to_bf16`, which fires the row
+//! `quant::cast_fp32_to_bf16` was in `device::JIT_DISPATCHED`, so
+//! `emit_c_shim` emitted no `pie_k_quant_cast_fp32_to_bf16` and
+//! `quant/dtype_cast.cu` is deleted; the launcher was
+//! `driver_cuda::fire::dtype_cast::cast_fp32_to_bf16`, which fired the row
 //! through NVRTC. The round trip it smokes is therefore the JIT one — unit
 //! compiled, `Args::bind` agreed with the row, `cuLaunchKernel` ran on this
 //! crate's stream — and it is the same claim about the same bytes.
+//!
+//! **And once more, for the third and last time.** §5 step 5 took `quant`
+//! into fn-world: there is no row in `JIT_DISPATCHED`, no `LaunchRule`, and
+//! no `fire::dtype_cast` — the launcher is
+//! [`kernels_cuda_new::x::quant::cast_fp32_to_bf16`], which computes
+//! `Launch::flat(n, 256)` itself and calls `x::fire::fire`. Every link of the
+//! chain the paragraph above names is still exercised (unit compiled,
+//! `Args::bind` agreed with the row, `cuLaunchKernel` ran on this crate's
+//! stream) and one is added: the host program returns `Fired`, so this test
+//! now also proves that a launch which HAPPENED says so, which the two
+//! earlier spellings both returned `()` for.
+//!
+//! The pointer types are the other change and they are not cosmetic. The
+//! `pie_k_*` entry and `fire::dtype_cast` both took `*const c_void`; the host
+//! program takes `*const f32` and `*mut bf16`, so this test's `alloc` handles
+//! are cast at the call and a source/destination swap is a type error rather
+//! than 64 wrong halves.
 //!
 //! Skipped without a device, like every GPU test here.
 
@@ -78,14 +95,18 @@ fn a_generated_binding_reaches_a_real_kernel() {
         .expect("h2d");
     let d_dst = alloc.alloc(src.len() * 2).expect("dst alloc");
 
-    unsafe {
-        driver_cuda::fire::dtype_cast::cast_fp32_to_bf16(
-            d_src.as_ptr(),
-            d_dst.as_ptr(),
+    let fired = unsafe {
+        kernels_cuda_new::x::quant::cast_fp32_to_bf16(
+            d_src.as_ptr().cast(),
+            d_dst.as_ptr().cast(),
             src.len(),
             stream.as_ref().as_raw().cast(),
-        );
-    }
+        )
+    };
+    assert!(
+        matches!(fired, kernels_cuda_new::x::Fired::Launched),
+        "the host program declined a 64-element cast: {fired:?}"
+    );
 
     let mut back = vec![0u8; src.len() * 2];
     d_dst.copy_to_host(&mut back, stream.as_ref()).expect("d2h");
@@ -2157,9 +2178,6 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
-            if name.ends_with("conv_bias") {
-                return None; // the 0.8B conv has no bias — the null path
-            }
             Some(if name == "embed" {
                 self.embed
             } else if name.contains("a_log") {
@@ -2714,9 +2732,6 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
-            if name.ends_with("conv_bias") {
-                return None;
-            }
             Some(if name == "embed" {
                 self.embed
             } else if name.contains("a_log") {

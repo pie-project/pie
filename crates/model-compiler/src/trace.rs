@@ -254,6 +254,28 @@ pub enum GuardPred {
     TokensLE(u32),
     /// `N > k` (the cached-prefill floor). Wire kind 2, payload `k`.
     TokensGT(u32),
+    /// `N % k == 0` with `k != 0`: the fire's token rows are a WHOLE NUMBER
+    /// of `k`-row tiles. Wire kind 10, payload `k`.
+    ///
+    /// # Why a threshold could not stand in for this
+    ///
+    /// [`Self::TokensGT`] guarded `llama_like`'s projection for as long as
+    /// that guard existed, on the reasoning that a GEMM whose tile is `BM`
+    /// needs at least `BM` rows. It needs more than that: `qmm_t`'s header
+    /// states *"the driver only selects this kernel when `M % BM == 0` … so
+    /// every tile is full and the row count lives in the grid"*, and there is
+    /// no `M` argument to shorten a tile with. `TokensGT(BM - 1)` therefore
+    /// admitted every count above the tile that the tile does not divide —
+    /// fifteen in sixteen — to an arm no driver can launch:
+    ///
+    /// ```text
+    /// PartialTile { rows: 35, tile: 16 }
+    /// ```
+    ///
+    /// on a 35-token prompt, on Metal, Vulkan and wgpu alike. This is the
+    /// predicate that guard wanted, and it needs no companion: for a non-zero
+    /// token count, `N % k == 0` already implies `N >= k`.
+    TokensMultipleOf(u32),
     /// The fire's attached programs read attention scores at `OnAttn`
     /// (`StageHooks::wants_attn_score`) — the score-capturing attention
     /// dispatch runs instead of the plain one. Wire kind 3, payload
@@ -313,6 +335,11 @@ impl GuardPred {
             GuardPred::HasStageHooks => (5, 0),
             GuardPred::HasLora => (6, 0),
             GuardPred::WindowOne => (7, 0),
+            // 10 and not 8, because 8 and 9 are `driver-cuda`'s two Peel
+            // slots. They were placed "above the GuardPred wire range" when
+            // that range ended at 7; a guard added at 8 would have quietly
+            // become a Peel in the device predicate word.
+            GuardPred::TokensMultipleOf(k) => (10, k),
         }
     }
 }
@@ -617,6 +644,32 @@ pub enum OpKind {
         /// the deployment, and they stay the arm's parameters.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         params: Vec<u32>,
+        /// Params the FIRE decides — `(index, Shape)`, meaning the scalar
+        /// at `params[index]` is that shape's ELEMENT COUNT for the fire
+        /// being lowered rather than the constant sitting there.
+        ///
+        /// The exception [`Self::Launch::params`]'s rule needs. A number
+        /// belongs in `params` only when no shape spells it, and a number
+        /// a shape DOES spell must not be copied there — a copy of an
+        /// extent is an extent that can disagree with itself. But some
+        /// kernels take an extent as a scalar because they bound a loop
+        /// with it, and until the lowering could answer, the text had to
+        /// write a constant and hope.
+        ///
+        /// Measured on `mlx-community/gpt-oss-20b-MXFP4-Q4`. `route_sort`
+        /// scans `expert_ids[0 .. p.n]` and the text set `n` to
+        /// `n_experts * experts_per_token` — a property of the DEPLOYMENT,
+        /// 128 where the fire's pairs were 16. The kernel read 112 entries
+        /// past that region and into `perm`, which the same kernel is
+        /// concurrently writing, so the same fire over the same weights
+        /// gave 0, 6 and 208,004 NaNs on three runs.
+        ///
+        /// So the channel exists rather than the constant: the lowering
+        /// knows the fire's token count, the shapes already say what an
+        /// extent is a function of, and the driver reads an ordinary
+        /// param.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        param_extents: Vec<(u8, Shape)>,
     },
     /// The one branch a lowered trace may carry: a CHAIN of arms over
     /// per-fire RUNTIME INPUTS ([`GuardPred`], closed vocabulary) — the
@@ -1354,12 +1407,42 @@ impl TraceBuilder {
         inputs: Vec<ValueId>,
         out_shapes: Vec<(Shape, DType)>,
     ) -> Vec<ValueId> {
+        self.launch_with_extents(
+            kernel,
+            weights,
+            state,
+            params,
+            Vec::new(),
+            inputs,
+            out_shapes,
+        )
+    }
+
+    /// [`Self::launch_with_params`], plus the scalars whose value is an
+    /// extent the FIRE decides — see [`OpKind::Launch::param_extents`].
+    ///
+    /// The constants left in `params` at those indices are read by nothing
+    /// once a lowering has run, and they are written as zero for that
+    /// reason: a plausible-looking constant beside a channel that
+    /// overwrites it is the state this argument exists to end.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_with_extents(
+        &mut self,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        params: Vec<u32>,
+        param_extents: Vec<(u8, Shape)>,
+        inputs: Vec<ValueId>,
+        out_shapes: Vec<(Shape, DType)>,
+    ) -> Vec<ValueId> {
         self.push(
             OpKind::Launch {
                 kernel: kernel.to_string(),
                 weights,
                 state,
                 params,
+                param_extents,
             },
             inputs,
             out_shapes,

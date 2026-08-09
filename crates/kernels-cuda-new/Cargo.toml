@@ -70,6 +70,18 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
     "driver",
     "runtime",
     "nvrtc",
+    # `x::gemm`'s host programs. The dense autotuner and the plan cache are
+    # `cublasLtMatmul` and nothing else, and `x::gemm::dense` issues them —
+    # they came in from `driver-cuda/src/fire/gemm.rs` in §5 step 5 and the
+    # calls did not change, only the crate they live in.
+    #
+    # Enabling these generates BINDINGS, not link flags:
+    # `fallback-dynamic-loading` still resolves every symbol with `dlopen` on
+    # first use, so **a box with no CUDA toolkit still builds** — the property
+    # `driver-cuda` has had since the first cuBLAS call and the one that is
+    # easiest to break by reaching for a linked symbol instead.
+    "cublas",
+    "cublaslt",
     "fallback-dynamic-loading",
 ] }
 

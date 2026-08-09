@@ -27,6 +27,50 @@
 //! answer and neither format is in it. A driver that reported `fp8_native`
 //! from a device extension would be promising a kernel that does not exist.
 
+/// The facts a device cannot make worse.
+///
+/// Every field here is either a constant of this backend or the weakest
+/// answer the Vulkan specification permits a device to give, so a caller
+/// holding these is never promised something a real device would then
+/// decline. [`of`] starts from this and overwrites only the two fields it
+/// takes from a device.
+///
+/// It exists because the seam's verbs are worth testing where there is no
+/// GPU. Ten of them never touch a device -- the registry five, the two
+/// refusals, and the three "before `load_model`" errors -- and an `impl` that
+/// compiles proves only that a method EXISTS: `todo!()`, `unimplemented!()`
+/// and a silent `Ok(())` all type-check, and the last would take a KV copy
+/// the scheduler then believes happened.
+///
+/// `storage_alignment` is 256 rather than a smaller number because it is a
+/// requirement on the CALLER: the engine lays its arena out at multiples of
+/// this and [`Bound::at`](crate::binding) refuses a sub-range without it. 256
+/// is the largest `minStorageBufferOffsetAlignment` the specification allows,
+/// so it is the only value that cannot under-promise.
+#[must_use]
+pub fn floor() -> driver_api::DeviceFacts {
+    driver_api::DeviceFacts {
+        abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
+        backend: BACKEND.to_string(),
+        // The pessimistic half: a device that turns out to be unified only
+        // ever makes a copy this said would be needed unnecessary.
+        unified_memory: false,
+        fp8_native: false,
+        native_mxfp4_moe: false,
+        storage_alignment: GUARANTEED_STORAGE_ALIGNMENT,
+        storage_max_tile_bytes: 0,
+        storage_tile_map_mask: 0,
+        page_size: PAGE_SIZE,
+    }
+}
+
+/// The weakest `minStorageBufferOffsetAlignment` a caller may assume.
+///
+/// The specification's guaranteed MAXIMUM for the limit, which makes it the
+/// safe floor for a caller that must satisfy it. A real device reports its
+/// own, and every device this crate has met reports less.
+pub const GUARANTEED_STORAGE_ALIGNMENT: u32 = 256;
+
 /// The facts, read from `device`.
 ///
 /// # Panics
@@ -37,12 +81,7 @@
 #[must_use]
 pub fn of(device: &crate::device::Device) -> driver_api::DeviceFacts {
     driver_api::DeviceFacts {
-        abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
-        backend: BACKEND.to_string(),
         unified_memory: device.unified(),
-        // See the module doc: a table fact, not a device one.
-        fp8_native: false,
-        native_mxfp4_moe: false,
         // `minStorageBufferOffsetAlignment`, which is the alignment
         // `Bound::at` refuses a sub-range for not having. Stating a different
         // number here would mean the engine's arena laid tensors out at
@@ -51,14 +90,13 @@ pub fn of(device: &crate::device::Device) -> driver_api::DeviceFacts {
         // The cast cannot lose: the limit is at most 256 on every device the
         // specification allows, and its guaranteed maximum is 256.
         storage_alignment: device.min_storage_offset() as u32,
-        // NOT a tile map. Both are zero on `driver-metal` for the same reason
-        // they are zero here: the loader's `TileMap` instructions are executed
-        // host-side by `model-loader`, and what reaches this driver is bytes.
-        // A non-zero `storage_max_tile_bytes` would be a promise to accept a
-        // sparse residency plan nothing here implements.
-        storage_max_tile_bytes: 0,
-        storage_tile_map_mask: 0,
-        page_size: PAGE_SIZE,
+        // Everything else is this backend's answer rather than this device's:
+        // `fp8_native` and `native_mxfp4_moe` are table facts (see the module
+        // doc), and both tile fields are zero for the reason `driver-metal`'s
+        // are -- the loader executes `TileMap` host-side, so what reaches this
+        // driver is bytes, and a non-zero `storage_max_tile_bytes` would
+        // promise a sparse residency plan nothing here implements.
+        ..floor()
     }
 }
 

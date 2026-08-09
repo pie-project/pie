@@ -48,8 +48,11 @@
 #include "mha.h"
 #include "mhaUtils.cuh"
 #include "mha_components.cuh"
-#include "mma.cuh"
-#include "utils.cuh"
+// PIE: upstream spells these two bare; FlashInfer's `mma.cuh` and
+// PIE: `utils.cuh` answer to the same literal spellings in NVRTC's flat
+// PIE: include namespace. See `mha_components.cuh` for the whole note.
+#include "xqa/mma.cuh"
+#include "xqa/utils.cuh"
 #ifndef GENERATE_CUBIN
 #include <cuda_runtime.h>
 

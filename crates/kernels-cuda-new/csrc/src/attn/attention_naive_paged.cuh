@@ -2,9 +2,16 @@
 //
 // Two `__global__`s, the five `__device__` helpers only they call, and the two
 // enum mirrors the cache descriptor is read through. No host code:
-// `attention_naive_paged.cu` includes this and keeps all FOUR `<<<>>>`, so the
-// ahead-of-time build and NVRTC compile ONE text. §21.7 is the record of what
+// `attention_naive_paged.cu` included this and kept all FOUR `<<<>>>`, so the
+// ahead-of-time build and NVRTC compiled ONE text. §21.7 is the record of what
 // two texts cost.
+//
+// THAT `.cu` IS DELETED, so there is no second compiler and no second text --
+// this header IS the kernel now, read only by NVRTC. The four launchers went
+// first, as unreached (§43/§56); the file that held them went with the enum
+// `static_assert`s it ended up being, and those are
+// `crates/driver-cuda/tests/enum_mirrors.rs`. Nothing about the device text
+// changed in either step.
 //
 // # What these two are
 //
@@ -41,10 +48,20 @@
 //     `instantiation()` needs a template to name.
 //
 // **Exactly one value is instantiated anywhere: 128.** All four launchers in
-// `attention_naive_paged.cu` open `dim3 block(BLOCK)` with `constexpr int
-// BLOCK = 128` and size shared memory as `(head_dim + BLOCK) * sizeof(float)`.
+// `attention_naive_paged.cu` opened `dim3 block(BLOCK)` with `constexpr int
+// BLOCK = 128` and sized shared memory as `(head_dim + BLOCK) * sizeof(float)`.
 // A row must cite that, per §17.6 -- take the value from the ahead-of-time
 // launcher, do not guess it.
+//
+// THAT `.cu` IS DELETED and the 128 is not. Past tense above is the only edit
+// this deletion makes to the paragraph: the value was READ off the launcher
+// while the launcher existed, which is what §17.6 asks, and a measurement does
+// not expire because its witness was retired. It now lives in two places that
+// are checked against each other rather than against C++ --
+// `runtime::launch::PAGED_BLOCK` and `LaunchRule::PagedScores` -- and the
+// history is `git log --follow crates/kernels-cuda/csrc/src/attn/
+// attention_naive_paged.cu`, which is the provenance policy
+// `families/vision.rs:44-50` states for exactly this case.
 //
 // `acc[]` was a literal `float acc[8]` with the comment "upper bound:
 // 1024/128". It is now `acc[(kMaxHeadDim + BLOCK - 1) / BLOCK]`, which is 8 at
@@ -58,11 +75,27 @@
 // host compiler for the `shim.cpp` ABI, so neither can cross into a file NVRTC
 // must read. `quant/mxfp4_marlin.cuh` set the precedent of mirroring a host
 // enum -- but it kept the two in step with a COMMENT, which is a grep away
-// from being wrong. `attention_naive_paged.cu` instead `static_assert`s every
+// from being wrong. `attention_naive_paged.cu` instead `static_assert`ed every
 // enumerator of both mirrors against the host original, so a renumbering that
-// would silently decode fp8 pages as int8 is a compile error in the one
-// translation unit that sees both spellings. That is the same bridge
+// would silently decode fp8 pages as int8 was a compile error in the one
+// translation unit that saw both spellings. That is the same bridge
 // `pack_dense_mask.cu` builds for its mirrored struct.
+//
+// THE CHECK MOVED AND GOT STRONGER; it did not lapse, and the difference
+// matters because the sentence above understated the problem. There were
+// THREE spellings, not two: Rust (`driver-cuda/src/bind/abi.rs`'s
+// `KvCacheScheme`, `driver-cuda/src/dtype.rs`'s `DType`), host C++
+// (`attn/kv_cache_view.hpp`, `tensor.hpp`) and these mirrors. Under NVRTC the
+// LIVE pair is Rust -> device: the host C++ enums no longer reach a kernel
+// launch at all, so the `static_assert`s were comparing a bystander against
+// the mirror while the pair that can actually renumber a page went unchecked.
+// `crates/driver-cuda/tests/enum_mirrors.rs` checks Rust against THIS FILE
+// directly, by text scan, in the idiom `kernels-cuda/tests/sources.rs` already
+// uses -- and writing it found the drift it was written to find: `DType` had
+// twelve enumerators against `KvDType`'s ten, `MXFP4_PACKED` and `E8M0` never
+// mirrored, against the rule stated below. That was fixed by completing the
+// mirror. The one thing given up is the compiler as the oracle; what is gained
+// is that the oracle now watches the pair that renumbers.
 //
 // # Which launcher becomes a row, and which does not
 //
@@ -77,6 +110,18 @@
 // failure §17 warns about. All four are stated for whoever writes them, with
 // the line they were read from.
 //
+// ALL FOUR LAUNCHERS AND THE FILE THAT HELD THEM ARE NOW DELETED, and the
+// section stands as written because it is a REFUSAL and a refusal outlives its
+// occasion. Two rows do exist for these kernels today --
+// `families::attn::ATTENTION_NAIVE_PAGED` -- and they are dispatched from
+// `runtime::launch`'s `PagedScores`/`PagedScoresDecode`, which are the
+// three-axis and two-axis rules this paragraph said `attn.rs` did not have.
+// They were written, named for what they compute, and pinned; they were not
+// bent onto an existing name, which is the thing refused above. The lines the
+// four were read from are `git log --follow crates/kernels-cuda/csrc/src/attn/
+// attention_naive_paged.cu` and the evidence block in
+// `kernels-cuda/csrc/CMakeLists.txt`.
+//
 // # Linkage
 //
 // **Template-only.** Both `__global__`s are `template <int BLOCK>`, so no host
@@ -88,8 +133,9 @@
 //
 // `<cmath>`, `<cstdint>`, `<stdexcept>` and `<string>` were the external
 // includes and all four are gone -- the fixed-width names come from `device::`,
-// and `throw` lives in the `.cu` with `check_head_dim_supported`. What remains
-// is `<cuda_fp16.h>`, `<cuda_bf16.h>` and `<cuda_fp8.h>`, three of the seven
+// and `throw` lived in the `.cu` with `check_head_dim_supported`, which went
+// with the launchers (`new-horizon.md` §56: a refusal with no home) before the
+// `.cu` itself did. Nothing in this header throws, which is what NVRTC needs. What remains// is `<cuda_fp16.h>`, `<cuda_bf16.h>` and `<cuda_fp8.h>`, three of the seven
 // spellings §15 makes resolve to NVIDIA's headers under nvcc and to this
 // workspace's shims under NVRTC.
 //
@@ -160,6 +206,14 @@ enum class KvDType : u8 {
     FP8_E4M3 = 7,
     FP8_E5M2 = 8,
     INT4_PACKED = 9,
+    // Added when `driver-cuda`'s `DType` grew them. Neither is switched on
+    // here and neither ever will be -- an MXFP4 weight is unpacked before it
+    // reaches a paged-attention kernel, and E8M0 is a block-scale companion,
+    // never a tensor a kernel reads as a value. They are mirrored because the
+    // rule above says every enumerator is, and because the rule's whole point
+    // is that appending is safe right up until someone inserts.
+    MXFP4_PACKED = 10,
+    E8M0 = 11,
 };
 
 /// The bound `acc[]` is sized against, and the largest head dim these two

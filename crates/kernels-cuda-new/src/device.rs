@@ -205,7 +205,8 @@ use kernels::kernel;
 use kernels::operands;
 
 /// AltUp's epsilon, which is the ALGORITHM's and not the model's -- the same
-/// constant, and the same argument, as [`crate::table::norm`]'s.
+/// constant, and the same argument, as `table/norm.rs`'s was. (That table is deleted; `norm` is
+/// `x::norm` now.)
 const ALTUP_EPS: f32 = 1e-5;
 
 /// One kernel a row can state, as a template and the type to instantiate it
@@ -686,14 +687,19 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // dispatcher went on calling the shim -- so `altup_aux.cu` kept its own
     // copy of all six kernels AND their launchers, and the two could drift
     // with every test passing on whichever half it exercised.
-    "norm::compute_rms_bf16",
-    "norm::magnitude_rescale_bf16",
-    "norm::mean_streams_bf16",
-    "norm::altup_unpack_predict_coefs",
-    "norm::altup_unpack_correct_coefs",
-    "norm::tanh_bf16",
-    // The pointwise pair's scalar half (§10.8).
-    "norm::scalar_mul_bf16",
+    // Tier A's six and the pointwise scalar half stood here —
+    // `compute_rms_bf16`, `magnitude_rescale_bf16`, `mean_streams_bf16`,
+    // `altup_unpack_predict_coefs`, `altup_unpack_correct_coefs`,
+    // `tanh_bf16` and `scalar_mul_bf16` (the pointwise pair's scalar half,
+    // §10.8). They are `x::norm` fns now.
+    //
+    // `device::ALTUP_AUX` and `device::ELEMENTWISE` above STAY. They are Tier
+    // A pilot rows with their own live consumer set — `kernels-cuda`'s
+    // `norm_device.rs`, `bind/{nvrtc,launch,device}.rs`,
+    // `driver-cuda/tests/tier_a_pilot.rs` — and they are not in
+    // `table::TABLES`, so `x::norm`'s rows cannot collide with them.
+    // `families/norm.rs` only ever POINTED its `ALTUP_AUX`/`ELEMENTWISE`
+    // units at these; `x::norm` includes the same `.cuh` text directly.
     // BATCH 1 -- `layout`, the rows that state their sources. §37.
     //
     // The first rows dispatched since the list was written, and the reason
@@ -745,10 +751,35 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // no dispatch and claims none") -- one page away from a list that would
     // have broken on it. Being unable to say where an argument comes from
     // and having no caller to ask turned out to be the same fact twice.
-    "layout::gather_bf16_rows",
-    "layout::split_bf16_rows",
-    "layout::split_qwen_gdn_ba_bf16",
-    "layout::transpose_bf16_nld_to_lnd",
+    // `layout`'s four stood here — `gather_bf16_rows`, `split_bf16_rows`,
+    // `split_qwen_gdn_ba_bf16` and `transpose_bf16_nld_to_lnd`. §5 step 5
+    // took `layout` into fn-world and nothing is ROUTED any more, for
+    // `rope`'s reason below: a contract carries no `operands` and no
+    // `LaunchRule`, so there is no row for a dispatcher to switch on and no
+    // generated arm to name. `x::layout::ENTRIES` binds five of the seven
+    // directly.
+    //
+    // The four paragraphs above survive as the reasoning that got these four
+    // here, and none of it is retracted — but two of its claims are now
+    // discharged rather than merely true:
+    //
+    //   * "a row must also SAY WHERE ITS ARGUMENTS COME FROM. Four of
+    //     layout's eight did not" — in fn-world a row says nothing about
+    //     arguments at all, because the `fn`'s parameter list is where they
+    //     come from. The four §54 deleted are `x::layout`'s public host
+    //     `fn`s now: `concat_bf16_rows`, `copy_if_valid_slot`,
+    //     `deinterleave_rows_bf16` and `deinterleave_vec_bf16`, callable and
+    //     un-stateable, which is exactly the ladder §1 draws.
+    //   * "`tests/launch_rules.rs` fires `copy_if_valid_slot` as the tree's
+    //     only witness for `LaunchRule::Single`" — that witness is GONE with
+    //     the row, and its `<<<1, 256>>>` is now the literal `Launch` in
+    //     `x::layout::copy_if_valid_slot`. Nothing else in the tree states
+    //     `Rule::Single`, so that test breaks and the repair is to read the
+    //     geometry off the `fn`.
+    //
+    // `layout::split_q_gate_bf16` is NOT one of the four and stays in this
+    // list further down: it is `x::driver_internal`'s host program, whose
+    // device row `x::layout` declares.
     // BATCH 2 -- `mlp`, the whole ready set of the unit, and the first batch
     // landed on MEASURED parity rather than on argument. §40.
     //
@@ -777,17 +808,29 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // fixtures do not use benign data: `env-audit` measured benign data
     // showing 0 difference everywhere while wide exponents exposed five real
     // bytes at three shapes.
-    "mlp::chunked_geglu_tanh_bf16",
-    "mlp::chunked_situ_bf16",
-    "mlp::chunked_swiglu_clamp_bf16",
-    "mlp::gaussian_topk_bf16",
-    "mlp::geglu_tanh_bf16",
-    "mlp::gpt_oss_glu_bf16",
-    "mlp::relu2_bf16",
-    "mlp::sigmoid_dot_scalar_gate_add_bf16",
-    "mlp::situ_bf16",
-    "mlp::swiglu_bf16",
-    "mlp::swiglu_clamp_bf16",
+    // `mlp`'s eleven STOOD HERE, and every word of BATCH 2 above is still
+    // true — the parity run happened, the 33 shapes still matched, the 57
+    // exponents were still the reason it is a measurement. §5 step 5 took
+    // `mlp` into fn-world and nothing is ROUTED any more, for `rope`'s
+    // reason further down: a contract carries no `operands` and no
+    // `LaunchRule`, so there is no row for a dispatcher to switch on and no
+    // generated arm to name. `x::mlp::ENTRIES` binds all twelve directly.
+    //
+    // The twelfth, `mlp::chunked_swiglu_bf16`, was held by `mlp/swiglu.cu`
+    // and stood in the batch below with the other `Unstated` rows; it is
+    // gone with them and for the same reason.
+    //
+    // What the batch's parity claim becomes is worth stating exactly,
+    // because it is the one thing this deletion could quietly discard.
+    // `jit_parity.rs` fired the same `BoundLaunch` through `bind::dispatch`
+    // and `bind::dispatch_jit_probe` — two paths that exist only while a row
+    // has both a shim entry and a generated arm. A fn-world kernel has
+    // neither: one host `fn`, one `x::fire::fire`, one NVRTC compile. So the
+    // test is not failing, it is UNSTATEABLE, and the 0-differing-bytes
+    // result is now a historical measurement about the archive rather than a
+    // standing invariant. It is recorded here because deleting the last
+    // thing that could re-run it is exactly when a reader needs to be told
+    // that is what happened.
     // BATCH 3 -- `norm/rmsnorm`, the unit whose GRID has been wrong before.
     //
     // Five of the unit's eight rows. `rmsnorm_bf16` and `rmsnorm_strided_bf16`
@@ -825,11 +868,12 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // width of 320 -- five heads, not a power of two -- which is the axis the
     // rule splits on and the one every `Rms` shape collapses. 18 shapes, 0
     // differing bytes.
-    "norm::residual_add_rmsnorm_bf16",
-    "norm::rmsnorm_gated_bf16",
-    "norm::rmsnorm_gemma_bf16",
-    "norm::rmsnorm_no_scale_bf16",
-    "norm::rmsnorm_residual_add_bf16",
+    // `norm`'s five stood here — `residual_add_rmsnorm_bf16`,
+    // `rmsnorm_gated_bf16`, `rmsnorm_gemma_bf16`, `rmsnorm_no_scale_bf16` and
+    // `rmsnorm_residual_add_bf16`. The 18-shape fixture measurement above is
+    // theirs and is kept: it is the reason `x::norm::rows_per_head` refuses
+    // rather than guesses when the head width is absent, and the 320-wide
+    // five-head shape is the one it was written against.
     // BATCH 4 -- five small units, and the first rows this migration HELD
     // BACK on measured evidence rather than on a C++ caller. §40.
     //
@@ -854,9 +898,16 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // absent: its arm guards on `gdn.is_some() && join_out(spec, 0, frame,
     // resolver)`, so proving it needs a `GdnCtx` and an output resolved as a
     // REGION, neither of which the parity fixtures can state yet.
-    "attn::attention_sink_rescale_bf16",
-    "attn::attn_res_blend_bf16",
-    "attn::logit_softcap_bf16",
+    // `attn::attention_sink_rescale_bf16` and `attn::attn_res_blend_bf16`
+    // STOOD HERE and are `crate::x::attn`'s now. A ported row loses its
+    // shim entry structurally — its contract states no `operands`, which
+    // `abi::stated()` drops — so a hand-maintained membership beside it
+    // would be a list that has to be kept in step with a property the
+    // types already carry.
+    // `attn::logit_softcap_bf16` STOOD HERE and is `crate::x::attn`'s now.
+    // It is the SECOND of the three poison-proved rows the block below
+    // measures to cross, which changes nothing about that measurement and is
+    // said here so a reader does not go looking for the entry it describes.
     // THREE ROWS BELOW WERE PROVED AGAINST POISON, AND THE WINDOW HAS CLOSED.
     //
     // `attn::lse_log2_to_ln`, `mlp::gaussian_topk_bf16` and
@@ -903,12 +954,32 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // is proved byte-identical by §8 -- but this file should not claim a
     // comparison that no longer exists. It is the clearest demonstration
     // this session produced of why the harness had to come first.
-    "attn::lse_log2_to_ln",
-    "norm::altup_correct_bf16",
-    "norm::altup_predict_bf16",
-    "ssm::bf16_to_fp32",
-    "ssm::fp32_to_bf16",
-    "ssm::l2norm_scale_bf16_to_fp32",
+    // ... and `attn::lse_log2_to_ln` CROSSED INTO FN-WORLD before that
+    // re-proof could happen. The paragraph above is why the row was never
+    // re-compared and it is kept whole, because the reason it could not be
+    // is unchanged: the archive's launcher is deleted and `lse_log2_to_ln`
+    // is no longer a member of `pie_cuda_driver::kernels::attn`. What is
+    // different is that the host program is now visible Rust —
+    // `crate::x::attn::lse_log2_to_ln` — rather than a generated arm.
+    // `norm::altup_correct_bf16` and `norm::altup_predict_bf16` stood here.
+    // Both are `x::norm` fns; both are `none:` arms, because `Cx` has no
+    // query for `DispatchCtx::altup_streams` or `altup_active`.
+    // `ssm`'s three stood here — `bf16_to_fp32`, `fp32_to_bf16` and
+    // `l2norm_scale_bf16_to_fp32`, the "3 of 4" of `ssm/gated_delta_net_prep`
+    // the BATCH 4 header above counts. The 33-shape, 0-differing-byte
+    // measurement is theirs as much as `attn`'s and `norm`'s and is kept
+    // where it is. §5 step 5 crossed `ssm` into fn-world and nothing is
+    // ROUTED any more — a contract carries no `operands` and no
+    // `LaunchRule`, so there is no row for a dispatcher to switch on — and
+    // all three are `bind!`s in `x::ssm::gated_delta_net_prep`.
+    //
+    // The FOURTH, `ssm::repeat_interleave_heads_fp32`, is the one the header
+    // above says is absent for want of a `GdnCtx` and a REGION-resolved
+    // output. **It is a bind now and it is bound**, because a `bind!` body
+    // reads `Cx` directly: the region half is `cx.arg_out(0)` and the
+    // `GdnCtx` half is the `Cx::gdn()` query this port asks the floor for.
+    // The unsourced ROW was the obstacle, not the statement — the same thing
+    // `norm`'s `hc_*` note records two batches above.
     // BATCH 5 -- two rows, and the third one is why the batch is two.
     //
     // `attn/kimi_mla` states three rows; `moe/topk_sigmoid` states one. All
@@ -981,15 +1052,20 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // link for the shim edge, and `cargo check` toolkit-free.
     "attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
     "attn::attention_naive_paged",
-    "mlp::chunked_swiglu_bf16",
+    // `mlp::chunked_swiglu_bf16` stood here — the one row of `mlp`'s twelve
+    // that was NOT in BATCH 2, because `mlp/swiglu.cu` still called it. It
+    // went into fn-world with the other eleven and is
+    // `x::mlp::chunked_swiglu_bf16` now.
     "moe::topk_sqrtsoftplus_bf16",
     "moe::token_batched_weighted_sum_bf16",
     "moe::token_batched_weighted_sum_add_bf16",
     "moe::gather_moe_aligned_inputs_bf16",
     "moe::moe_align_decode",
-    "norm::attn_sink_correction_bf16",
-    "norm::per_head_rmsnorm_bf16",
-    "norm::hc_expand_bf16",
+    // `norm`'s three stood here — `attn_sink_correction_bf16`,
+    // `per_head_rmsnorm_bf16` and `hc_expand_bf16`, the three §43.9 routed by
+    // DELETING their launchers. All three are host `fn`s in `x::norm` now,
+    // which is the first time their geometry is written anywhere but a
+    // `LaunchRule`.
     "quant::mxfp4_moe_gate_up_decode_bf16",
     "quant::mxfp4_moe_down_decode_bf16",
     "quant::wna16_gate_up_decode_bf16",
@@ -1001,18 +1077,24 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // to switch on and no generated arm to name. `x::rope::ENTRIES` binds
     // eight of the twelve directly, which is what this list was a
     // hand-maintained approximation of.
-    "ssm::repeat_interleave_heads_fp32",
-    "ssm::recurrent_gated_delta_step_batched",
-    "ssm::recurrent_gated_delta_step_batched_state_bf16",
-    "ssm::recurrent_gated_delta_step_batched_gqa",
-    "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa",
-    "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
-    "ssm::nemotron_prepare_mamba_params",
-    "ssm::nemotron_prepare_mamba_dt_da",
-    "ssm::zamba_rmsnorm_gated_bf16",
-    "ssm::causal_conv1d_update_batched_bf16",
-    "ssm::kda_gate_beta_bf16",
-    "ssm::kda_o_norm_gated_bf16",
+    // `ssm`'s twelve stood here — `repeat_interleave_heads_fp32`, the three
+    // `recurrent_gated_delta_step_batched{,_state_bf16,_gqa}`, the two
+    // `chunk_gated_delta_prefill_batched_warp_tiled_gqa{,_state_bf16}`,
+    // `nemotron_prepare_mamba_params`, `nemotron_prepare_mamba_dt_da`,
+    // `zamba_rmsnorm_gated_bf16`, `causal_conv1d_update_batched_bf16`,
+    // `kda_gate_beta_bf16` and `kda_o_norm_gated_bf16`. They are gone for
+    // `rope`'s reason above: §5 step 5 crossed `ssm` into fn-world and
+    // nothing is ROUTED any more, so there is no row for a dispatcher to
+    // switch on and no generated arm to name. `x::ssm::ENTRIES` binds
+    // twenty-three of its twenty-seven directly, which is what this list was
+    // a hand-maintained approximation of.
+    //
+    // ALL TWELVE ARE BOUND. That is worth stating because it is the largest
+    // block on this list and because the join this batch describes —
+    // unit hosts the text, every operand states a `Source`, no C++ caller —
+    // is exactly the join `unit!` plus a `bind!` body makes unnecessary: the
+    // text is `include_str!`'d beside the declaration, the operands come off
+    // `Cx` in the body, and there is no C++ launcher left to call.
 
     // BATCH: THE ROWS WHOSE UNIT AND SOURCES WERE BOTH ALREADY THERE.
     //
@@ -1091,29 +1173,71 @@ pub static JIT_DISPATCHED: &[&str] = &[
     "attn::dsv4_compress_gather_paged_bf16",
     "attn::dsv4_store_comp_entries_bf16",
     "attn::kimi_split_q_b_bf16",
-    "attn::pad_head_dim_bf16",
+    // `attn::pad_head_dim_bf16` and `attn::strip_head_dim_bf16` STOOD HERE.
+    // Both crossed into `crate::x::attn`, and the crossing is what closed
+    // the `LaunchRule::PerHead` head-count defect their routing had made
+    // reachable: the rule read `dims.kv_heads` and the kernels address
+    // with the packed side's own head count, which at 12 heads of 64
+    // against 6 KV heads differs in 6,100 of 12,544 bytes for the pad and
+    // 4,588 of 9,472 for the strip. `crate::x::attn::per_head` carries the
+    // measurement.
     "attn::split_qkv_bf16",
-    "attn::strip_head_dim_bf16",
     "layout::split_q_gate_bf16",
-    "mlp::sigmoid_gate_inplace_bf16",
+    // `mlp::sigmoid_gate_inplace_bf16` stood here and is the ONE `mlp`
+    // symbol that is not `x::mlp`'s to bind: `x::mlp`'s `unit!` declares the
+    // device row, because the text is `mlp/swiglu.cuh` and rows stay where
+    // the device text is, but the host program is
+    // `x::driver_internal::sigmoid_gate_inplace_bf16`, which fires it by
+    // symbol through `x::fire::fire`. `x::mlp` therefore states NO contract
+    // for it, so with `table::mlp` deleted there is no `KernelSig` left for
+    // `emit_rust_dispatch` to build an arm from and this line would trip
+    // `driver-cuda/build.rs`'s `armless` check.
+    //
+    // `layout::split_q_gate_bf16` one line up is the same arrangement and
+    // has NOT been taken out, which this pass did not do and will not do —
+    // it is `x::layout`/`x::driver_internal`'s, not `mlp`'s. Its own
+    // header says *"its table row is `table::driver_internal`'s"* and
+    // `table::driver_internal` is gone, so on the reading above that line is
+    // already armless. Recorded, not repaired, because a deletion is a claim
+    // about a consumer set and this is not my consumer set to re-derive.
     "moe::apply_per_expert_scale_bf16",
     "moe::topk_softmax_bf16",
-    "norm::add_bias_bf16",
-    "norm::residual_add_bf16",
-    "norm::rmsnorm_bf16",
-    "norm::rmsnorm_gated_fp32_in_bf16",
-    "norm::rmsnorm_strided_bf16",
-    "quant::bf16_to_fp16",
-    "quant::cast_fp32_to_bf16",
-    "quant::dequant_fp8_e4m3_to_bf16",
-    "quant::dequant_fp8_e4m3_to_bf16_per_channel",
-    "quant::dequant_fp8_e4m3_to_bf16_per_group",
-    "quant::dequant_mxfp4_to_bf16",
-    "quant::dequant_wna16_int4b8_to_bf16",
-    "quant::mxfp4_scales_to_marlin_e8m0",
-    "quant::quantize_bf16_to_fp8_e4m3_per_channel",
-    "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
-    "quant::scale_rows_bf16",
+    // `norm`'s five stood here — `add_bias_bf16`, `residual_add_bf16`,
+    // `rmsnorm_bf16`, `rmsnorm_gated_fp32_in_bf16` and
+    // `rmsnorm_strided_bf16`. `norm` crossed into fn-world (§5 step 5) and
+    // nothing is ROUTED any more, for `rope`'s and `quant`'s reason: a
+    // contract carries no `operands`, so `abi.rs`'s `stated()` drops the row
+    // before `emit_c_shim` sees it and there is no `KernelSig` left for
+    // `emit_rust_dispatch` to build an arm from. Leaving the lines would trip
+    // `driver-cuda/build.rs`'s `armless` check.
+    // `quant`'s eleven STOOD HERE, and the four paragraphs above are the
+    // argument that put them here — the four `gemm.cpp` call sites, the
+    // §10.10 census for the shim half, and the deliberate refusal to delete
+    // `quant/dequant_fp8.cu:20,30,44` and `quant/dequant_fp4.cu:23` in the
+    // same change. None of it is retracted. §5 step 5 took `quant` into
+    // fn-world and nothing is ROUTED any more, for `rope`'s reason above: a
+    // contract carries no `operands` and no `LaunchRule`, so there is no row
+    // for a dispatcher to switch on and no generated arm to name.
+    // `x::quant::ENTRIES` binds all eleven directly — eleven contracts,
+    // eleven binds, not one `none:` arm, which is the first family in the
+    // sweep where every stated symbol got a host program.
+    //
+    // `cast_fp32_to_bf16` and `scale_rows_bf16` are the pair BATCH 7 named
+    // as the live instance of a hand arm linking against a shim entry a
+    // routed row deletes. §54 rewired that caller to `fire::dtype_cast`;
+    // this change deletes `fire/dtype_cast.rs` in its turn and points
+    // `fire/lora.rs` at `x::quant::{cast_fp32_to_bf16, scale_rows_bf16}`.
+    // The hazard the paragraph describes is now unreachable rather than
+    // avoided: there is no shim entry to link against and no `pie_k_*` name
+    // to write, because a fn-world row states no `operands` at all.
+    //
+    // The four routed MoE decode GEMVs further up — `mxfp4_moe_gate_up`,
+    // `mxfp4_moe_down`, `wna16_gate_up`, `wna16_down` — carry a `quant::`
+    // symbol and are NOT part of this and did NOT move. Their device text is
+    // `quant/dequant_fp4.cuh` and `quant/dequant_wna16.cuh`, so `x::quant`
+    // hosts their rows and states their `KernelSig`s verbatim, but their
+    // CONTRACTS are `table::moe`'s and their `LaunchRule`s are real, so they
+    // are still rule-driven and still need every line above.
 ];
 
 /// [`ELEMENTWISE`]'s rows that [`JIT_DISPATCHED`] names, as the emitters take
@@ -2011,7 +2135,15 @@ const fn scalar(ty: kernels::Ty) -> bool {
 /// pending" and there is no such state — the row either states its arms or
 /// it does not exist.
 pub static SPECIALISED: &[&[&Specialisation]] = &[
-    crate::families::norm::SPECIALISATIONS,
+    // `families::norm::SPECIALISATIONS` stood here — one entry,
+    // `RMSNORM_STRIDED_VEC8`, and the row that made this a slice of slices.
+    // `norm` crossed into fn-world (§5 step 5) and a specialisation is not a
+    // thing a ported family has: its six-term predicate is an `if` in
+    // `x::norm::strided_bf16` and the two arms it chose between are two
+    // `raw::` calls in the same body. The sweep it carried — 2048/2816/5376
+    // by scalar256/scalar512/vec256/vec512/vec1024, and the −38%/−49%/−53%
+    // against the shipping scalar — moved with the `fn`.
+    //
     // The five `attn/kv_paged.cuh` appenders — `write_kv`,
     // `write_kv_at_positions`, `write_kv_explicit`, `write_kv_explicit_devwin`
     // and `copy_kv_cells`, each `template <bool HND_LAYOUT>` and each chosen
@@ -2053,7 +2185,8 @@ pub fn specialisation(symbol: &str) -> Option<&'static Specialisation> {
 /// written, when those two WERE the tables, and false from the first family
 /// unit onwards. [`crate::unit::UNITS`] is `families::ALL` concatenated, and
 /// `device::ALTUP_AUX`/`device::ELEMENTWISE` are merely the `rows` of two
-/// units in [`crate::families::norm::UNITS`] — so the old body was a strict
+/// units in `families::norm::UNITS` (now `x::norm::UNITS`) — so the old body
+/// was a strict
 /// subset of this one, by 15 families to 2.
 ///
 /// It mattered in exactly one place and it mattered a lot:
@@ -2244,6 +2377,17 @@ mod tests {
     /// and the four extents the rules recover -- which is to say every one
     /// of them was a fact the table already held, spelled a second time
     /// because a C++ function had no other way to receive it.
+    ///
+    /// # THE TWIN SIDE IS A LITERAL NOW, AND WHY
+    ///
+    /// `crate::table::norm::KERNELS` was the other half of this sum and it is
+    /// deleted: `norm` crossed into fn-world (§5 step 5) and a contract
+    /// states no `operands`, so there is nothing left to count. The measured
+    /// **31** is kept as a literal rather than dropped, because it is the
+    /// whole of what this test asserts — the six launcher signatures in
+    /// `table/norm.rs` carried 31 operands between them and these six rows
+    /// carry 21. Recomputing it from `x::norm::SIGS` would give 0 and prove
+    /// nothing.
     #[test]
     fn tier_a_rows_are_shorter_than_their_twins() {
         let mine: usize = ALTUP_AUX
@@ -2251,11 +2395,11 @@ mod tests {
             .filter(|k| k.sig.symbol != "norm::tanh_f16")
             .map(|k| k.sig.operands.len())
             .sum();
-        let twins: usize = crate::table::norm::KERNELS
-            .iter()
-            .filter(|t| ALTUP_AUX.iter().any(|k| k.sig.symbol == t.symbol))
-            .map(|k| k.operands.len())
-            .sum();
+        // `table/norm.rs`'s `compute_rms`, `magnitude_rescale`,
+        // `mean_streams`, `altup_unpack_predict_coefs`,
+        // `altup_unpack_correct_coefs` and `tanh`, summed at the commit
+        // before the table was deleted: 6 + 6 + 6 + 5 + 5 + 3.
+        let twins: usize = 31;
         assert_eq!(ALTUP_AUX.len(), 7, "six ported kernels and the fp16 extra");
         assert_eq!((twins, mine), (31, 21));
     }

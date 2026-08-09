@@ -1,7 +1,7 @@
 //===-- slot_ops.cuh - the two slot-conditional memory ops -----------===//
 //
-// Two `__global__`s. `slot_ops.cu` includes this file and keeps its two
-// launchers, so exactly one definition of each kernel exists in the tree.
+// Two `__global__`s. `slot_ops.cu` IS DELETED (`cd5cebd3d`) and took both of
+// its launchers with it, so this file is the only text either kernel has.
 //
 // # Why neither is a row yet
 //
