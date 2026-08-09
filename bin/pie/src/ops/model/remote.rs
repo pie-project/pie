@@ -781,3 +781,191 @@ fn auth_headers() -> Result<HeaderMap> {
     }
     Ok(headers)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use super::*;
+
+    struct TestServer {
+        url: Url,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl TestServer {
+        fn start(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&requests);
+            thread::spawn(move || {
+                for response in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).unwrap();
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            });
+            Self { url, requests }
+        }
+    }
+
+    fn response(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        response
+    }
+
+    fn inner(signed_url: Url, endpoint: Url, size_bytes: u64) -> Arc<Inner> {
+        Arc::new(Inner {
+            repo: "owner/model".to_string(),
+            revision: "commit".to_string(),
+            endpoint,
+            client: reqwest::Client::new(),
+            resolver: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            files: vec![Arc::new(RemoteFile {
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                signed_url: AsyncMutex::new(signed_url),
+                refresh: AsyncMutex::new(()),
+            })],
+            counters: Counters::new(),
+        })
+    }
+
+    fn request(range: Range<u64>) -> RangeRequest {
+        RangeRequest {
+            ordinal: 7,
+            file_id: 0,
+            range,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_only_the_exact_requested_range() {
+        let server = TestServer::start(vec![response(
+            "206 Partial Content",
+            &[("Content-Range", "bytes 1-3/5")],
+            "bcd",
+        )]);
+        let result = fetch_range(
+            inner(server.url.clone(), server.url.clone(), 5),
+            request(1..4),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.ordinal, 7);
+        assert_eq!(result.bytes, b"bcd");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_mismatched_content_range() {
+        let server = TestServer::start(vec![response(
+            "206 Partial Content",
+            &[("Content-Range", "bytes 0-2/5")],
+            "abc",
+        )]);
+        let error = fetch_range(
+            inner(server.url.clone(), server.url.clone(), 5),
+            request(1..4),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("returned Content-Range"));
+    }
+
+    #[tokio::test]
+    async fn retries_429_within_the_fixed_attempt_budget() {
+        let server = TestServer::start(vec![
+            response(
+                "429 Too Many Requests",
+                &[("Retry-After", "0")],
+                "",
+            ),
+            response(
+                "206 Partial Content",
+                &[("Content-Range", "bytes 1-3/5")],
+                "bcd",
+            ),
+        ]);
+        let source = inner(server.url.clone(), server.url.clone(), 5);
+        let result = fetch_range(Arc::clone(&source), request(1..4))
+            .await
+            .unwrap();
+        assert_eq!(result.bytes, b"bcd");
+        assert_eq!(source.counters.retries_429.load(Ordering::Relaxed), 1);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_a_different_commit() {
+        let server = TestServer::start(vec![response(
+            "302 Found",
+            &[
+                ("Location", "/signed"),
+                ("X-Repo-Commit", "other-commit"),
+                ("X-Linked-Size", "5"),
+            ],
+            "",
+        )]);
+        let resolver = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let error = resolve_signed_url(
+            &resolver,
+            &server.url,
+            "owner/model",
+            "commit",
+            "model.safetensors",
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("expected commit"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_expiry_refreshes_resolve_the_shard_once() {
+        let server = TestServer::start(vec![response(
+            "302 Found",
+            &[
+                ("Location", "/fresh-signed-url"),
+                ("X-Repo-Commit", "commit"),
+                ("X-Linked-Size", "5"),
+            ],
+            "",
+        )]);
+        let rejected = Url::parse("http://127.0.0.1:1/expired").unwrap();
+        let source = inner(rejected.clone(), server.url.clone(), 5);
+        let file = Arc::clone(&source.files[0]);
+        let (first, second) = tokio::join!(
+            refresh_url(&source, &file, &rejected),
+            refresh_url(&source, &file, &rejected)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(source.counters.url_refreshes.load(Ordering::Relaxed), 1);
+        assert!(file
+            .signed_url
+            .lock()
+            .await
+            .path()
+            .ends_with("fresh-signed-url"));
+    }
+}
