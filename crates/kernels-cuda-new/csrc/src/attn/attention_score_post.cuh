@@ -90,6 +90,26 @@
 // are `Execution::Walk` rows in `src/execution.rs`; the walk is what the
 // driver owns, and this is what it launches.
 //
+// # THE CONSTRAINT IS NOW VACUOUS, and the named includer does not exist
+//
+// `crates/driver-cuda/csrc/attn/attention_flashinfer.cu` was deleted with the
+// whole of `crates/driver-cuda/csrc`. This header has ZERO includers, so
+// "exactly one" is satisfied by zero and the rule protects nothing.
+//
+// That is the harmless half. The harmful half is that the paragraph above
+// reads as an instruction -- it names a permitted includer, and a reader who
+// needs to include this header will go looking for that file, or worse,
+// recreate it. The measurement is still true and still worth keeping (a
+// non-template `__global__` in a `.cuh` really does collide at link on the
+// second includer); what expired is the file it was pinned against. Keep the
+// argument, do not act on the address.
+//
+// Nothing here is at risk while the count is zero. The constraint becomes
+// live again the moment ANY translation unit includes this file, which under
+// the JIT means a `unit!` root -- and this header is one
+// (`families::attn::ATTENTION_SCORE_POST`), where NVRTC compiles it alone and
+// the question does not arise.
+//
 // # A unit now, and the premise that changed
 //
 // This section used to read "No unit, and that is deliberate rather than

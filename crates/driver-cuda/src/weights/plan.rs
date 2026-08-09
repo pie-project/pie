@@ -137,6 +137,73 @@ mod tests {
         assert_eq!(cuda_storage_target(0, 0).tp_size, 1);
     }
 
+    /// The device fact this asserts is `false` has a MEASUREMENT behind it,
+    /// and this is where it lives now.
+    ///
+    /// The assertion's message says the native GEMM "would want a Marlin
+    /// repack no kernel here implements", which is true and is not the whole
+    /// reason. The rest was in `kernels-cuda/csrc/src/kernels_manifest.hpp`'s
+    /// sm_100 quarantine block — **archive text, deleted at north star step
+    /// 6** — whose closing line reads *"`new-horizon.md` §47 holds the
+    /// argument and this comment holds the measurement."* That division is
+    /// accurate and it is a single point of failure twice over: §47 held no
+    /// numbers, and that comment goes with the archive at step 6. Both halves
+    /// were on the losing side of the deletion. So it is carried here,
+    /// in a crate that survives and a file that is committed.
+    ///
+    /// (The first draft of this note said `.wiki/` "is not tracked by this
+    /// repository at all". Half right and the wrong half: `.wiki/` is its own
+    /// git repository — 154 tracked files, its own history — and the parent's
+    /// `git add` refuses only because the nested repo owns those paths. The
+    /// placement stands on a better reason than the one it was made for: **a
+    /// measurement beside the assertion that depends on it is read by the
+    /// person who needs it, and a measurement in a document is read by
+    /// whoever happens to be reading that document.**)
+    ///
+    /// THE QUESTION. Do the Marlin MXFP4 MoE kernels produce correct values
+    /// on sm_100? Measured on a B200 with gpt-oss-20b: decode under this
+    /// lowering emitted uniform garbage (`nasquorashBR @@ Put ShortfacesInte
+    /// Imper fmt Ind tass`), a **0% function-word rate against 39%** for the
+    /// same prompt on vLLM and SGLang, while the routed-dequant GEMV answered
+    /// correctly at **314 tok/s** on the same build. Bisected against CUDA
+    /// graph capture: corrupt both captured and eager, correct both ways with
+    /// the GEMV, so the lowering was the only variable. The generated kernel
+    /// set is sm80-shaped (`sm80_kernel_bfloat16_fe2m1f_bfloat16.cu`) and was
+    /// never exercised above sm_90.
+    ///
+    /// WHY IT IS PROBABLY A NO-QUESTION. The root cause was found afterwards
+    /// and it is not the kernel. Two bugs in the lowering ABOVE the GEMM,
+    /// both architecture-independent, corrupted sm_80 in exactly the way
+    /// described for sm_100. (1) The MXFP4 group scales were transposed
+    /// TWICE — the loader already publishes them in Marlin's order and the
+    /// mixtral path transposed them again; mean relative error against a host
+    /// reference at gpt-oss's shape was **0.0017 correct against 0.9350
+    /// double-transposed**, i.e. uncorrelated output. (2) `d_marlin_act`'s
+    /// padding tail was never initialised, and `0 * NaN` is NaN, so one NaN
+    /// pattern poisoned a whole fp32-accumulated output row. After both fixes
+    /// sm_80 measured **0/64** degenerate requests at 32-wide and **0/16** at
+    /// concurrency 1, against **8–12/32** and **2/16** before, and the kernel
+    /// measured correct on sm_80 (0.0017 to 0.0023 mean relative error across
+    /// E ∈ {1, 4, 32}, top_k ∈ {1, 4}).
+    ///
+    /// HOW TO ANSWER IT NOW. Only by re-vendoring, so it is a precondition on
+    /// that work rather than a test anyone can run today: whoever restores a
+    /// native MXFP4 MoE lowering re-tests sm_100 FIRST, before re-adding any
+    /// quarantine, and only re-adds one if it is actually dirty. The original
+    /// instruction — *"RE-TEST sm_100 with `PIE_CUDA_NATIVE_MXFP4_MOE=1` and
+    /// drop this if it is clean"* — cannot be followed as written: the
+    /// variable is gone with the function that read it and the kernels are
+    /// gone with the vendored tree.
+    ///
+    /// AND THE CHEAPER READING. The quarantine's justification was that the
+    /// gate above it answered `true` on Blackwell whether or not Marlin was
+    /// built, so without it every sm_100 deployment served gpt-oss as garbage
+    /// by default. That gate answers `false` unconditionally now and the
+    /// lowering has no kernels behind it, so the failure mode the quarantine
+    /// guarded is unreachable by construction. **What is open is not a risk;
+    /// it is an unmeasured fact about hardware nobody here has** — which is
+    /// why this is a doc comment on an assertion rather than an `#[ignore]`d
+    /// test pretending it could ever run.
     #[test]
     fn the_target_states_the_device_and_nothing_optimistic() {
         let t = cuda_storage_target(0, 1);

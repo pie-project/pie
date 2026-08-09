@@ -31,7 +31,10 @@
 //! A filesystem walk and a text scan, so it runs anywhere: no GPU, no toolkit,
 //! and no build of the archive it describes.
 
-use std::collections::HashSet;
+// `std::collections::HashSet` was here, for the two-way containment between
+// the `.cu` on disk and the `.cu` the CMakeLists named. Both sides of that
+// containment are now empty and the test that held it is
+// `the_archive_compiles_nothing`, which compares against a constant.
 use std::path::{Path, PathBuf};
 
 fn csrc() -> PathBuf {
@@ -105,104 +108,110 @@ fn walk_ext(dir: &Path, root: &Path, ext: &str, out: &mut Vec<String>) {
 
 /// Every `src/**.cu` in the archive, as a path relative to `csrc`.
 ///
-/// # The floor is `>= 1`, and it was `> 40`
+/// # The floor was `>= 1`, and it was `> 40` before that. It is now ZERO,
+/// # and zero is the answer rather than the absence of one
 ///
 /// `> 40` was measured when 71 `.cu` files were on disk, and it is the shape
 /// `a_split_file_uses_the_header_it_was_split_into` already corrected in its
 /// own guard: *"A guard against a vacuous pass must not be satisfiable only
 /// while the thing it guards is broken."* This population SHRINKS BY
-/// DELETION as the migration finishes — 71, then 40, then 16, and 15 with
-/// `attn/kv_paged.cu` gone — so a fixed floor asserts that the work is
-/// incomplete and goes red on its own success. It had already: the tree
-/// passed under 40 several passes before this one.
+/// DELETION as the migration finishes — 71, then 40, then 16, 15 with
+/// `attn/kv_paged.cu` gone, 1 with `attention_mla.cu` gone — so a fixed floor
+/// asserts that the work is incomplete and goes red on its own success. It
+/// had already: the tree passed under 40 several passes before this one.
 ///
-/// What the guard is actually for is one failure and it is binary. `walk_ext`
+/// The `>= 1` that replaced it was the same mistake one order of magnitude
+/// smaller, and it survived only because nobody expected the last one to go.
+/// `moe/flashinfer_moe.cu` was it, and it went with the fused CUTLASS MoE.
+///
+/// So the guard cannot live here any more, and the reason is worth stating
+/// rather than deleting: what it was FOR is one binary failure — `walk_ext`
 /// takes a path, and a path that stops resolving yields an empty vector and
-/// makes every caller below pass by iterating nothing — the §21.2 failure
-/// this file names twice. `>= 1` catches exactly that and nothing else,
-/// which is all the walk can honestly claim.
+/// makes every caller below pass by iterating nothing (the §21.2 failure this
+/// file names twice). That failure mode is real and did not go away. It is
+/// caught for the population that is still non-empty, by `device_headers`'
+/// own floor, and asserted DIRECTLY for this one by
+/// `the_archive_compiles_nothing` — which checks that the count is zero
+/// against a `csrc/src` that demonstrably still has files in it, so a walk
+/// resolving nowhere is distinguishable from a tree with no `.cu`.
 fn cu_on_disk() -> Vec<String> {
-    let out = sources_with("cu");
-    assert!(
-        !out.is_empty(),
-        "the walk under `csrc/src` found no `.cu` at all, so every check \
-         below iterates an empty set and passes without looking"
-    );
-    out
+    sources_with("cu")
 }
 
-/// Every `src/**.cu` path the CMakeLists names, however it names it.
+/// THE ARCHIVE COMPILES NOTHING, AND THERE IS NO CMAKE TO COMPILE IT WITH.
 ///
-/// A substring scan rather than a parse: the file has conditionals, `set()`
-/// indirections and several `add_library` calls, and what is asked is only
-/// whether the path APPEARS. A path in a branch not taken still counts — the
-/// question is "did someone forget it entirely", not "is it compiled in this
-/// configuration", and answering the second would mean evaluating cmake.
-fn cu_in_cmake() -> HashSet<String> {
-    let text = std::fs::read_to_string(csrc().join("CMakeLists.txt")).expect("read CMakeLists");
-    text.split_whitespace()
-        .map(|t| t.trim_matches(|c: char| c == '"' || c == ')' || c == '(').to_string())
-        .filter(|t| t.starts_with("src/") && t.ends_with(".cu"))
-        .chain(interpolated(&text))
-        .collect()
-}
-
-/// Paths the CMakeLists builds rather than spells.
+/// This test replaces a pair — `every_cu_on_disk_is_in_the_build` and
+/// `every_cu_in_the_build_is_on_disk` — and what happened to the pair is the
+/// point rather than an accident.
 ///
-/// `attention_flashinfer_hd${_pie_hd}.cu` is one path per head dim, chosen by
-/// a loop over `PIE_ATTN_HEAD_DIM` — a literal scan sees a name with a `${}`
-/// in it and no file. Rather than evaluate cmake, the prefix before the first
-/// `${` is taken and any file that starts with it counts as named.
+/// They were a two-way containment between the `.cu` files on disk and the
+/// `.cu` paths `csrc/CMakeLists.txt` named: neither set could hold a member
+/// the other did not. That is exactly the right check while there IS a build,
+/// and it went green the whole way down — 71 files, 40, 16, 15, 1 — because
+/// a containment between two shrinking sets is satisfied most easily by both
+/// of them being empty. The last `.cu`, `moe/flashinfer_moe.cu`, was 817
+/// lines with **zero** `__global__`, zero `<<<`, zero `__device__`: a host
+/// program with a `.cu` extension. It is Rust now, and with it went the only
+/// thing `pie_flashinfer_cutlass_moe` compiled.
 ///
-/// This is the one place the scan is approximate, and it is approximate in
-/// the safe direction: it can only ever call a file NAMED, never missing.
-fn interpolated(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split_whitespace()
-        .map(|t| t.trim_matches(|c: char| c == '"' || c == ')' || c == '('))
-        .filter(|t| t.starts_with("src/") && t.contains("${") && t.ends_with(".cu"))
-        .flat_map(|pattern| {
-            let prefix = pattern.split("${").next().unwrap_or("").to_string();
-            sources_with("cu")
-                .into_iter()
-                .filter(move |p| !prefix.is_empty() && p.starts_with(&prefix))
-        })
-}
-
-/// A `.cu` on disk that the build does not compile is a kernel that silently
-/// is not there.
+/// `add_library(pie_kernels_cuda STATIC …)` had no sources of its own by
+/// then. Its entire content was
+/// `target_sources(… $<TARGET_OBJECTS:pie_flashinfer_cutlass_moe>)`, so the
+/// archive did not survive the object library and need retiring separately —
+/// it was empty the moment that target went, and an `add_library` with no
+/// sources is a CMake error rather than a small target. **The file was
+/// deleted, not trimmed.**
+///
+/// So the containment becomes an equality with a constant, and the constant
+/// is zero on both sides. Stated as three separate facts, because they fail
+/// for three different reasons and a reader deserves to know which:
+///
+///   1. No `.cu` under `csrc/src`. A new one is a kernel that nothing
+///      compiles — there is no ahead-of-time CUDA compiler in this workspace
+///      any more — so it would be silently absent, which is the failure the
+///      deleted pair existed to catch, now caught one step earlier.
+///   2. No `csrc/CMakeLists.txt`. Its return is `enable_language(CUDA)`
+///      returning, which is nvcc returning.
+///   3. `csrc/src` is NOT EMPTY. This is what the deleted `>= 1` floor was
+///      really for: a walk whose root stopped resolving reports zero `.cu`
+///      too, and (1) alone cannot tell that apart from success. The `.hpp`
+///      host interfaces and `kernels.def` are still there and still read —
+///      by `kernels-cuda-new`'s `source.rs`, and by the `cc::Build` that
+///      compiles the generated shim — so a zero above is a measurement
+///      rather than a broken path.
 #[test]
-fn every_cu_on_disk_is_in_the_build() {
-    let listed = cu_in_cmake();
-    let missing: Vec<String> = cu_on_disk()
-        .into_iter()
-        .filter(|p| !listed.contains(p))
-        .collect();
+fn the_archive_compiles_nothing() {
+    let stray = cu_on_disk();
     assert!(
-        missing.is_empty(),
-        "these .cu files exist and nothing compiles them, so the kernels in \
-         them are absent from the archive with no diagnostic:\n  {}",
-        missing.join("\n  ")
+        stray.is_empty(),
+        "a `.cu` is back under `csrc/src`, and nothing in this workspace \
+         compiles `.cu` ahead of time any more — no CMake, no nvcc. The \
+         kernels in it are absent with no diagnostic, which is the exact \
+         failure the CMake containment pair used to catch:\n  {}",
+        stray.join("\n  ")
     );
-}
 
-/// And the other direction, so the pair is total.
-#[test]
-fn every_cu_in_the_build_is_on_disk() {
-    let on_disk: HashSet<String> = cu_on_disk().into_iter().collect();
-    let dangling: Vec<String> = cu_in_cmake()
-        .into_iter()
-        // A stub is chosen by a `set()` on a feature; both spellings appear
-        // in the text and only one has a file in any configuration.
-        // A stub is chosen by a `set()` on a feature; both spellings appear
-        // and only one has a file in any configuration. A `${}` is a pattern
-        // rather than a path, and `interpolated` has already expanded it into
-        // the files it names.
-        .filter(|p| !on_disk.contains(p) && !p.contains("_stub") && !p.contains("${"))
-        .collect();
+    let cmake = csrc().join("CMakeLists.txt");
     assert!(
-        dangling.is_empty(),
-        "the build names these and they are not there:\n  {}",
-        dangling.join("\n  ")
+        !cmake.exists(),
+        "{cmake:?} is back. It held `enable_language(CUDA)`, the CPM fetch \
+         that cloned and patched FlashInfer, and the two `add_library` calls, \
+         and it was the last thing in the workspace that invoked nvcc. If an \
+         ahead-of-time CUDA compile is genuinely wanted again, that is a \
+         decision to argue in `new-horizon.md`, not a file to restore."
+    );
+
+    // (3) — the anti-vacuity half, and it must NOT be keyed on `.cu`.
+    let src = csrc().join("src");
+    let populated = std::fs::read_dir(&src)
+        .map(|entries| entries.count() > 0)
+        .unwrap_or(false);
+    assert!(
+        populated,
+        "{src:?} does not read, or is empty. Both assertions above are then \
+         vacuously true and this test passes by looking at nothing — the \
+         §21.2 failure. The `.hpp` host interfaces and `kernels.def` live \
+         here and are still read."
     );
 }
 
@@ -1634,7 +1643,63 @@ fn no_file_lost_a_launch_in_the_split() {
     // So the blocker moved from a missing capability to an unwritten
     // registration, in a directory this pass does not own. Neither is a
     // reason to widen this scan or to move the number.
-    const EXPECTED: usize = 2;
+    // ── FOUR. SIX FILES LEAVE AND THE COUNT DOES NOT MOVE ───────────────
+    //
+    // Walked fresh over the tree as it stands, by this function's own rule,
+    // never as a delta:
+    //
+    //   attn     2 across  1    moe      0 across  1
+    //   comm/gemm/layout/norm/rope/sample/ssm/vision: no `.cu` at all
+    //
+    //                                          TOTAL    2 across  2
+    //
+    // `+0 launches, -6 files`, and the six are the whole XQA archive:
+    // `attn/attention_xqa.cu`, `attn/attention_xqa_gqa2.cu`,
+    // `attn/attention_xqa_gqa2_p16.cu`, `attn/attention_xqa_gqa4.cu`,
+    // `attn/attention_xqa_gqa8.cu` and `attn/attention_xqa_gqa8_sm90.cu`,
+    // with `attn/attention_flashinfer_hopper_stub.cpp` — not a `.cu`, never
+    // in this count — chained to them because it was the non-sm90 definition
+    // of the symbol `attention_xqa_gqa8.cu:156` called. Six files and 1459
+    // lines of nvcc gone for zero movement in `total`, which is the shape
+    // this census has now seen four times: XQA's launches were never `<<<>>>`
+    // in these files. Every one of them went through
+    // `launchMHAFlashInfer`/`launchHopperF8MHA` in `csrc/vendor/xqa/`, which
+    // this scan has never walked. The count is a floor on nvcc, not a measure
+    // of it, and six files can leave without touching it.
+    //
+    // THE `TWO` ENTRY'S CORRECTION IS NOW SPENT ON ONE SIDE. It said XQA
+    // needed *"the floor AND the six-member enrolment on top of it —
+    // `unit!`, `contract!` and `bind!` ... which are not written."* They are
+    // written: `kernels-cuda-new/src/x/xqa.rs` enrols FIVE of the six as
+    // `Unit`s (the sm90 member is not ready and its absence is argued in
+    // `kernels-cuda/csrc/CMakeLists.txt`, from the call graph), declares one
+    // `contract!` over all five rows, and binds it to a `none:` arm. The
+    // `kernel!` row in `kernels-cuda-new/src/table/attn.rs` was deleted in
+    // the same change — which is the mechanism that let the `.cu` go, and it
+    // is NOT the `RUST_SERVED` one the CMakeLists predicted: the symbol
+    // crossed to fn-world, so `emit_c_shim` has no row at all to emit for.
+    //
+    // `EXPECTED` IS NOW ZERO AND THIS CRATE LAUNCHES NOTHING. The last two
+    // were `attn/attention_mla.cu:110` and `:188`, its NAIVE arm, and the
+    // file is deleted with `attn/attention_mla.hpp`.
+    //
+    // The previous entry named the two things holding it and both landed:
+    // the `unit!`/`contract!`/`bind!` for `attn::dispatch_attention_mla_bf16`
+    // (`x/attn.rs::mla_fa2` and `x::attn::ATTENTION_MLA`), and the FA2 HOST
+    // program, which is written -- `crate::plan::mla` is the scheduler,
+    // `MlaPlanInfo` the plan, and the COOPERATIVE launch is
+    // `runtime::module::fire_ex` with `CU_LAUNCH_ATTRIBUTE_COOPERATIVE` over
+    // a `csrc/shim/cooperative_groups.h` that `mla.cuh:1061`'s
+    // `this_grid().sync()` resolves against. None of it is a `<<<>>>`, which
+    // is why this number goes to zero rather than moving.
+    //
+    // A ZERO IS NOT THE SAME KIND OF NUMBER AS A TWO and the assertion below
+    // now reads differently: a RISE from zero is a new `<<<>>>` in a crate
+    // that has no reason to grow one, and the honest response is to ask why
+    // it is not in `kernels-cuda-new` as device text. `moe/flashinfer_moe.cu`
+    // is NOT counted here -- it is a generated CUTLASS translation unit in a
+    // separate target and `fimoe-rust`'s to retire.
+    const EXPECTED: usize = 0;
     assert_eq!(
         total, EXPECTED,
         "the tree executes {total} launches across {files} files, not {EXPECTED}. \
@@ -1808,60 +1873,73 @@ fn pinned(text: &str, file: &str, line: usize, want: &str, what: &str) {
 /// `families::moe`'s `topk_softmax` row and in `new-horizon.md` §52.
 #[test]
 fn the_audited_launchers_read_no_environment_variable() {
-    for rel in [
-        // `gemm/gemv.cu` was the first name in this list and is DELETED: its
-        // two `__global__` templates are `kernels-cuda-new/csrc/src/gemm/
-        // gemv.cuh` (NVRTC compiles them) and its host launcher is
-        // `driver-cuda/src/fire/gemv.rs`. Both §36 findings went with it and
-        // NEITHER was dropped — `PIE_GEMV_SPLITK_MAX_ROWS` is
-        // `fire::gemv::SPLIT_K_MAX_ROWS`, still 4096, and
-        // `PIE_GEMV_B200_TUNING`'s replacement is
-        // `fire::gemv::unroll_depth`, which asks
-        // `device::Device::compute_capability` and nothing else.
-        //
-        // This test can no longer see either. It reads `csrc/src`, and the
-        // guarantee now lives in a `.cuh` outside this crate and in Rust; the
-        // Rust half carries the measurement (the 5-byte and 3-byte
-        // wide-exponent disagreements) in its own doc comment so the next
-        // reader meets it where the decision is made. Nothing here is a
-        // weaker claim about the OTHER two files.
-        // `attn/attention_flashinfer_hopper.cu` was the second name in this
-        // list and is DELETED — 392 lines, the FA3/sm_90 prefill funnel — so
-        // this test can no longer read it, and reading a deleted file is a
-        // panic rather than a failure, which is why the name had to come out
-        // rather than be left as documentation.
-        //
-        // ITS §36 FINDING IS NOT DROPPED, it is out of scope the way
-        // `gemm/gemv.cu`'s two are, and it moved further than they did.
-        // `PIE_CUDA_DISABLE_HOPPER_EXTENDED` became `constexpr bool
-        // kHopperExtendedShapes = true` in that file, and now it is prose on
-        // `driver-cuda/src/fire/flashinfer_fa2_dispatch.rs`'s
-        // `Decline::Sm90Unported` — the refusal that stands where the file
-        // stood. Everything the pin below used to hold is stated there:
-        // that `true` is exactly `getenv(...) == nullptr` because nothing in
-        // this repository ever set the variable; that a capability answered
-        // per launch is answered too late to be refusable; that the
-        // `set_hopper_extended_shapes(bool)` seam was written and WITHDRAWN
-        // for having no caller; and the one real run the predicate was worth
-        // (gemma-4-26B-A4B at 1k context, attention 4.19 ms -> 2.73 ms,
-        // 122.5 -> 144.1 tok/s, output unchanged).
-        //
-        // The `.cpp` stub below is what is left of that pair on disk, and it
-        // takes the loop's place rather than emptying it: a `for` over an
-        // empty array is a test that passes by having nothing to check.
-        "attn/attention_flashinfer_hopper_stub.cpp",
-        // `comm/custom_all_reduce.cu` was the second name here and is
-        // DELETED. Its three `getenv` helpers took the variable's name as a
-        // parameter and NOTHING CALLED THEM, so there was no finding to
-        // carry across -- unlike `gemv.cu`'s two, which both survive as Rust
-        // constants. `driver-cuda/src/fire/all_reduce.rs` reads no
-        // environment variable at all, and the tuning data the file did
-        // carry (`kMaxBlocks = 36`, `threads = 512`, the 2 MiB fusion
-        // alignment, the 256 barrier flags, the Lamport cap and the NCCL
-        // crossover ladder) is stated there as named constants with their
-        // derivations, not as knobs.
-    ] {
-        let text = read_src(rel);
+    // THE LIST BECAME A WALK. The entry in the ledger below asked for
+    // exactly this and named the trigger: the last archive `.cu` this loop
+    // could name was `moe/flashinfer_moe.cu`, another agent is porting it,
+    // and `read_src` PANICS on a name that is gone — so the loop would have
+    // crashed on the file's absence, which is the worst of the three
+    // outcomes because a crash reads as a broken test rather than as a
+    // finished migration.
+    //
+    // A walk also covers the half of the guard a list never could. A list
+    // checks the files someone remembered to add. The thing actually being
+    // guarded is a `getenv` arriving in a translation unit NOBODY ADDED —
+    // a new `.cu`, or a deleted one coming back. `launches_in_tree` and
+    // `every_cu_on_disk_is_in_the_build` walk for that reason and this
+    // joins them.
+    //
+    // `.cpp` is walked too, and that is not padding. The archive's `.cpp`
+    // surface was never in the list, and `gemm/gemm.cpp` — 2,216 lines,
+    // zero `__global__`, zero `<<<>>>` — is exactly the shape that carries
+    // host policy and therefore exactly the shape that carries a selector.
+    // There are zero `.cpp` under `csrc/src` as this is written; the walk
+    // says so by finding none, which is a different statement from a list
+    // that never asked.
+    let walked: Vec<String> = sources_with("cu")
+        .into_iter()
+        .chain(sources_with("cpp"))
+        .collect();
+
+    // WHAT ZERO FILES MEANS, stated rather than left to be discovered.
+    //
+    // `cu_on_disk()` is deliberately NOT used here, even though it is the
+    // walk this file already owns, because it asserts the walk is non-empty
+    // — and that assert expires at nvcc-zero, which is the outcome this
+    // whole migration is driving at. For its own callers the assert is
+    // right: they check a property OF the `.cu` files, and an empty set
+    // passes them vacuously.
+    //
+    // Here the property has the opposite shape. "No surviving translation
+    // unit reads the environment" is SATISFIED by there being no surviving
+    // translation unit, not skipped by it. An empty walk is this test's
+    // success condition, and the regression it might be mistaken for — a
+    // `.cu` coming back — is caught by a different assertion in this file
+    // that walks the same directory and compares it to the build.
+    //
+    // So there is no non-empty guard here, on purpose, and this paragraph
+    // is the record of that choice: a later pass that "fixes" the missing
+    // guard re-arms the bomb this edit defused.
+
+    // NO FILE IS ALLOWED TO CARRY `#include <cstdlib>` AND NONE DOES, which
+    // is a different statement from the one this list used to make.
+    //
+    // Its single member was `attn/attention_mla.cu:4`, which included
+    // `<cstdlib>` and used NOTHING from it -- zero `getenv`, and zero `abs`,
+    // `malloc`, `free`, `atoi`, `exit` or `abort` in the whole file. The
+    // allowance existed because a vestigial include is not evidence of a
+    // selector, and because the file belonged to another pass mid-port:
+    // *"removing a line from another agent's file during a port is how two
+    // passes collide."*
+    //
+    // That pass finished and deleted the file, so the exemption goes with
+    // it rather than being inherited. An empty list here is the same kind
+    // of fact as `EXPECTED = 0` above: the property is satisfied, not
+    // skipped.
+    const CSTDLIB_ALLOWED: &[&str] = &[];
+
+    for rel in &walked {
+        let text = std::fs::read_to_string(csrc().join(rel))
+            .unwrap_or_else(|e| panic!("{rel} reads: {e}"));
         let offenders = env_reads(&text);
         assert!(
             offenders.is_empty(),
@@ -1873,12 +1951,165 @@ fn the_audited_launchers_read_no_environment_variable() {
              call inside a `.cu`.",
             offenders.join("\n")
         );
+        if !CSTDLIB_ALLOWED.contains(&rel.as_str()) {
+            assert!(
+                !text.contains("#include <cstdlib>"),
+                "{rel} included <cstdlib> for its `std::getenv`; the include coming \
+                 back is the selector coming back.\n\
+                 If this file genuinely needs <cstdlib> for something that is not a \
+                 selector, the edit is to add it to `CSTDLIB_ALLOWED` above WITH the \
+                 measurement that earns it — which symbol it uses — and not to \
+                 loosen this assertion."
+            );
+        }
+    }
+
+    // THE ALLOWANCE IS SELF-RETIRING, which is why it is a checked list and
+    // not a special case buried in the loop. Both arms below fail into a
+    // one-line edit, and both fail LOUDLY at the moment the exemption stops
+    // being earned rather than quietly keeping it forever.
+    for rel in CSTDLIB_ALLOWED {
+        let path = csrc().join(rel);
         assert!(
-            !text.contains("#include <cstdlib>"),
-            "{rel} included <cstdlib> for its `std::getenv`; the include coming \
-             back is the selector coming back"
+            path.exists(),
+            "`{rel}` is allowed to keep `#include <cstdlib>` and IS NOT ON DISK. \
+             The allowance outlived its file, which is how a walk quietly stops \
+             walking: the next thing to land at that path inherits an exemption \
+             nobody granted it. The whole fix is to delete the `{rel}` line from \
+             `CSTDLIB_ALLOWED` above — and if this fired because the archive \
+             reached nvcc-zero, that deletion is the last edit this test wants."
+        );
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{rel} reads: {e}"));
+        assert!(
+            text.contains("#include <cstdlib>"),
+            "`{rel}` no longer includes <cstdlib>, so its allowance above is stale \
+             and the fix is to delete that line. A stale allowance is not inert: it \
+             is a standing exemption held open for a file that has already earned \
+             its way back under the check."
         );
     }
+
+    // ===================== THE LEDGER =====================
+    // What the list named while it was a list, and where each name went.
+    // These entries are the "was here and IS DELETED" records for files this
+    // test used to read; the walk above replaces the ITERATION, not the
+    // findings, and a finding deleted with its loop is a measurement lost.
+
+    // `gemm/gemv.cu` was the first name in this list and is DELETED: its
+    // two `__global__` templates are `kernels-cuda-new/csrc/src/gemm/
+    // gemv.cuh` (NVRTC compiles them) and its host launcher is
+    // `driver-cuda/src/fire/gemv.rs`. Both §36 findings went with it and
+    // NEITHER was dropped — `PIE_GEMV_SPLITK_MAX_ROWS` is
+    // `fire::gemv::SPLIT_K_MAX_ROWS`, still 4096, and
+    // `PIE_GEMV_B200_TUNING`'s replacement is
+    // `fire::gemv::unroll_depth`, which asks
+    // `device::Device::compute_capability` and nothing else.
+    //
+    // This test can no longer see either. It reads `csrc/src`, and the
+    // guarantee now lives in a `.cuh` outside this crate and in Rust; the
+    // Rust half carries the measurement (the 5-byte and 3-byte
+    // wide-exponent disagreements) in its own doc comment so the next
+    // reader meets it where the decision is made. Nothing here is a
+    // weaker claim about the OTHER two files.
+    // `attn/attention_flashinfer_hopper.cu` was the second name in this
+    // list and is DELETED — 392 lines, the FA3/sm_90 prefill funnel — so
+    // this test can no longer read it, and reading a deleted file is a
+    // panic rather than a failure, which is why the name had to come out
+    // rather than be left as documentation.
+    //
+    // ITS §36 FINDING IS NOT DROPPED, it is out of scope the way
+    // `gemm/gemv.cu`'s two are, and it moved further than they did.
+    // `PIE_CUDA_DISABLE_HOPPER_EXTENDED` became `constexpr bool
+    // kHopperExtendedShapes = true` in that file, and now it is prose on
+    // `driver-cuda/src/fire/flashinfer_fa2_dispatch.rs`'s
+    // `Decline::Sm90Unported` — the refusal that stands where the file
+    // stood. Everything the pin below used to hold is stated there:
+    // that `true` is exactly `getenv(...) == nullptr` because nothing in
+    // this repository ever set the variable; that a capability answered
+    // per launch is answered too late to be refusable; that the
+    // `set_hopper_extended_shapes(bool)` seam was written and WITHDRAWN
+    // for having no caller; and the one real run the predicate was worth
+    // (gemma-4-26B-A4B at 1k context, attention 4.19 ms -> 2.73 ms,
+    // 122.5 -> 144.1 tok/s, output unchanged).
+    //
+    // The `.cpp` stub below is what is left of that pair on disk, and it
+    // takes the loop's place rather than emptying it: a `for` over an
+    // empty array is a test that passes by having nothing to check.
+    //
+    // `attn/attention_flashinfer_hopper_stub.cpp` WAS THAT NAME AND IS
+    // NOW DELETED TOO, chained to the six `attention_xqa*.cu` it was the
+    // non-sm90 half of; the account is in
+    // `kernels-cuda/csrc/CMakeLists.txt`. It carried no `getenv` and no
+    // §36 finding — it was in this list for the reason stated directly
+    // above, to keep the loop non-empty, and that reason is why it has to
+    // be REPLACED and not merely removed. `read_src` panics on a missing
+    // file, so leaving the name would have turned this test into a crash
+    // and removing it alone would have turned it into a pass over
+    // nothing.
+    //
+    // THE NOTE, AS WRITTEN, when this loop still had a name to lose:
+    // ITS REPLACEMENT IS THE LAST ARCHIVE `.cu` THAT IS NOT LEAVING IN
+    // THIS PASS. Two remained when this line was written —
+    // `attn/attention_mla.cu` and `moe/flashinfer_moe.cu` — and only one
+    // is eligible: `attention_mla.cu` is deleted in this same pass, and
+    // it also has `#include <cstdlib>` at line 4, which the second
+    // assertion below is a plain `contains` for, so it would have failed
+    // this test rather than passed it. `moe/flashinfer_moe.cu` reads no
+    // environment variable, and its line 5 records the six headers it
+    // used to include (`<cstdlib>` among them) in PROSE, which the
+    // `contains` deliberately does not match because the string it looks
+    // for is the `#include` line and not the header name.
+    //
+    // WHEN THAT FILE GOES — and it is being ported, in another agent's
+    // pass — this loop has no archive `.cu` left to name and the choice
+    // above stops being available. The answer then is to WALK `csrc/src`
+    // rather than to list it, which is what `launches_in_tree` already
+    // does eight lines' worth of code away; that keeps the guard alive
+    // over a directory that is empty today and might not be tomorrow,
+    // which is the actual thing being guarded — nvcc coming back with a
+    // `getenv` in it.
+    //
+    // ITS REPLACEMENT IS A WALK, WHICH IS WHAT THE NOTE BELOW ASKED FOR
+    // and the code above now does. The note is kept as written because
+    // its reasoning is the reason the change happened; two of its facts
+    // have since expired and are corrected here rather than left to read
+    // as current.
+    //
+    // FIRST CORRECTION. The note said `attention_mla.cu` "is deleted in
+    // this same pass". IT WAS NOT. It is the last archive `.cu` besides
+    // this one, its two `<<<>>>` are the device text behind
+    // `attn::dispatch_attention_mla_bf16`, and the crossing that retires
+    // it belongs to `sweep-attn` — the mirror landed (`x/attn.rs`,
+    // `MLAParams` at 288/8 through an untagged `by_value!`) and the FA2
+    // host program is still unwritten. A prediction in a comment is a
+    // prediction; this one is now a record of having been wrong.
+    //
+    // SECOND CORRECTION, and it is the reason the walk needs an
+    // allowance at all. The note reasoned that `attention_mla.cu` "would
+    // have failed this test rather than passed it" because of its
+    // `#include <cstdlib>` at line 4. That was true of a `contains` and
+    // false of the file: it has ZERO `getenv`, and zero `abs`, `malloc`,
+    // `free`, `atoi`, `exit` or `abort` — the include is VESTIGIAL and
+    // uses nothing it declares. So the file was never disqualified on
+    // the merits; the proxy was. `CSTDLIB_ALLOWED` above records that
+    // measurement, and the reason it is an allowance rather than a
+    // one-line deletion is ownership, not doubt.
+    //
+    // The general point outlives both: a list checks the files someone
+    // remembered to name, and the thing guarded is a `getenv` arriving
+    // in a `.cu` NOBODY NAMED.
+    // `comm/custom_all_reduce.cu` was the second name here and is
+    // DELETED. Its three `getenv` helpers took the variable's name as a
+    // parameter and NOTHING CALLED THEM, so there was no finding to
+    // carry across -- unlike `gemv.cu`'s two, which both survive as Rust
+    // constants. `driver-cuda/src/fire/all_reduce.rs` reads no
+    // environment variable at all, and the tuning data the file did
+    // carry (`kMaxBlocks = 36`, `threads = 512`, the 2 MiB fusion
+    // alignment, the 256 barrier flags, the Lamport cap and the NCCL
+    // crossover ladder) is stated there as named constants with their
+    // derivations, not as knobs.
+
 
     // What replaced them, pinned like any other transcription. A tuned
     // constant that names its default, and a device attribute — which is a

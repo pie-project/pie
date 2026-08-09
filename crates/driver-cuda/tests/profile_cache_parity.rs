@@ -519,8 +519,9 @@ fn the_rust_cache_matches_the_cpp_transcript() {
     assert_eq!(
         fnv1a64(bytes),
         GOLDEN_FNV1A64,
-        "transcript differs from the C++; run tests/oracle/profile_cache/run.sh \
-         with PC_ORACLE_OUT set and diff against it"
+        "transcript differs from the C++ oracle, which cannot be re-run to diff \
+         against (see `oracle_census.rs`): the golden is the only record of \
+         it, so a divergence is THIS crate changing, not the oracle."
     );
 }
 

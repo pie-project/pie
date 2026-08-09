@@ -56,15 +56,26 @@
 //! re-export so its own shim generator and `driver-cuda`'s tests spell it
 //! unchanged.
 //!
-//! ## A sibling of [`crate::emit`], not a submodule of it
+//! ## It was a sibling of `crate::emit`, and is now the survivor
 //!
-//! They read the same rows to opposite ends, and merging them would produce a
-//! generator that has to be told which build it is serving on every call.
-//! [`crate::emit`] writes typed Rust over `runtime::fire` — the JIT's direct
-//! surface, for rows NVRTC compiles. This writes C++ and `extern "C"` for
-//! rows an archive already holds. Two generators over one table is what keeps
-//! a symbol's contract single; a hierarchy between them would claim one is a
-//! detail of the other, and neither is.
+//! They read the same rows to opposite ends, and merging them would have
+//! produced a generator that has to be told which build it is serving on
+//! every call. `crate::emit` wrote typed Rust over `runtime::fire` — the
+//! JIT's direct surface, for rows NVRTC compiles. This writes C++ and
+//! `extern "C"` for rows an archive already holds.
+//!
+//! North star §6 half A retired `emit.rs`: its surface had **one caller in
+//! the tree**, a single line in `tests/fire.rs`, because the direct-call
+//! surface is written by hand in [`crate::x`] now. This file is not retired
+//! with it, and the asymmetry is the whole reason they were siblings: the
+//! typed Rust it generated was replaceable by a `fn` a person writes, and an
+//! `extern "C" pie_k_*` forwarding into a `.cu` is not — it is an ABI, and it
+//! lives exactly as long as the archive does. It dies with `bridge`, which
+//! dies when `table::ROW_TABLES` empties.
+//!
+//! Two generators over one table is what kept a symbol's contract single; a
+//! hierarchy between them would have claimed one is a detail of the other,
+//! and neither was.
 //!
 //! ## What this file may name
 //!
@@ -2464,7 +2475,24 @@ mod stated_rows {
     fn a_fully_stated_row_emits_a_branch() {
         let tables: &[&[kernels::KernelSig]] = &[
             crate::table::attn::KERNELS,
-            crate::table::moe::KERNELS,
+            // `crate::table::moe::KERNELS` stood here and left for the same
+            // reason, one round later than the rest: §5 step 5 took `moe`'s
+            // nine roots into fn-world, and the four rows that outlived the
+            // family — routed `quant::` decode GEMVs, filed under `moe`
+            // because `table/` was organised by who DISPATCHES — crossed
+            // after them. `x::quant`'s fifteen contracts derive rows with no
+            // operands, so repointing this at `x::quant::SIGS` would leave a
+            // list that cannot fail.
+            //
+            // **`table::attn::KERNELS` is the only fully stated table left in
+            // the tree**, so this test now rests entirely on it. That is a
+            // narrower base than it reads as, and the way it ends matters:
+            // when `attn` crosses, the walk finds no row, `missing` is empty,
+            // and the assertion below PASSES while asserting nothing —
+            // which is the same vacuous shape the `gemm` paragraph refuses.
+            // So the loop counts what it examined and the count is asserted;
+            // without that, the last crossing in the tree would turn this
+            // test green by emptying it.
             // `crate::table::gemm::KERNELS` stood here and left for the
             // reason below: §5 step 5 took `gemm` into fn-world, and
             // `x::gemm`'s twelve contracts derive rows with no operands.
@@ -2497,9 +2525,11 @@ mod stated_rows {
             // twenty-seven contracts derive rows with no operands.
         ];
         let mut missing = Vec::new();
+        let mut examined = 0usize;
         for table in tables {
             let text = super::emit_rust_dispatch(&[table], &crate::device::jit_dispatched());
             for k in table.iter().filter(|k| !k.operands.is_empty()) {
+                examined += 1;
                 let declining: Vec<String> = k
                     .operands
                     .iter()
@@ -2518,6 +2548,12 @@ mod stated_rows {
         assert!(
             missing.is_empty(),
             "every operand of these rows binds and none emitted a branch: {missing:?}"
+        );
+        assert!(
+            examined > 0,
+            "no fully stated row was examined; every table in the list has crossed into \
+             fn-world and this check is vacuous. Delete it — do not repoint it at a \
+             `SIGS` list, for the reason written above `table::gemm::KERNELS`."
         );
     }
 

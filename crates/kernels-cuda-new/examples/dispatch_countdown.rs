@@ -41,48 +41,29 @@ use kernels_cuda_new::{KernelSig, abi, device, table, unit};
 
 /// The tables `driver-cuda/build.rs` hands the emitters, in its order.
 ///
-/// Duplicated from there on purpose and checked by nothing, because the
-/// alternative is `driver-cuda` depending on this example or this example on
-/// a build script's private function. What it costs if it drifts is one row
-/// reported ARMLESS that is armed — visible the moment it is routed, since
-/// `routed_rows_have_an_arm` reads the real one.
+/// [`table::TABLES`] — `ROW_TABLES ++ x::SIGS`. Both this list and
+/// `build.rs`'s were written out family by family, duplicated on purpose and
+/// **checked by nothing**, and the note here said what that cost if it
+/// drifted: *"one row reported ARMLESS that is armed"*.
+///
+/// It drifted, and by more than a row. Between them the two hand lists were
+/// missing `x::moe`'s twenty contracts, `x::attn`'s and `x::xqa`'s — three
+/// whole families outside the census, reading exactly like three families
+/// that had not crossed yet. `moe` went missing the moment it crossed,
+/// because `table::moe::KERNELS` was still named here and survived the
+/// family it was named for.
+///
+/// Both are `TABLES` now, so there is nothing left to keep in step: the
+/// duplication is gone rather than synchronised.
+///
+/// THE SECOND TABLE IS STILL GONE and `TABLES` did not miss it. It was
+/// `table::driver_internal::DRIVER_KERNELS` — launchers the driver fires
+/// with no DSL statement — and §5 step 5 took its six rows to
+/// `x::driver_internal` as plain `fn`s with **no `contract!`**, so there is
+/// no `SIGS` either: a family with no contract declares no signatures, and
+/// the launchers are called directly and need no entry point.
 fn tables() -> Vec<&'static [KernelSig]> {
-    vec![
-        table::attn::KERNELS,
-        // `rope` crossed into fn-world; its twelve contracts derive their
-        // rows, and they state no operands, so every one of them counts
-        // as ARMLESS-by-design here rather than as a row awaiting a
-        // `Source`. Kept in the walk so the census still sees them.
-        kernels_cuda_new::x::rope::SIGS,
-        // `norm`'s twenty-eight, from `x::norm::SIGS`, for `x::rope::SIGS`'
-        // reason above. `table::norm::KERNELS` stood here until §5 step 5.
-        kernels_cuda_new::x::norm::SIGS,
-        // `mlp`'s twelve and `quant`'s eleven, from their `contract!`
-        // blocks, for `x::rope::SIGS`' reason above.
-        kernels_cuda_new::x::mlp::SIGS,
-        // `gemm`'s twelve, from `x::gemm::SIGS`, for `x::rope::SIGS`' reason
-        // above. `table::gemm::KERNELS` stood here until §5 step 5.
-        kernels_cuda_new::x::gemm::SIGS,
-        table::moe::KERNELS,
-        // `ssm`'s twenty-seven, from `x::ssm::SIGS`, for `x::rope::SIGS`'
-        // reason above. `table::ssm::KERNELS` stood here until §5 step 5.
-        kernels_cuda_new::x::ssm::SIGS,
-        kernels_cuda_new::x::quant::SIGS,
-        // `layout`'s seven, `sample`'s one and `adapter`'s one, from their
-        // `contract!` blocks, for `x::rope::SIGS`' reason above.
-        kernels_cuda_new::x::layout::SIGS,
-        kernels_cuda_new::x::sample::SIGS,
-        kernels_cuda_new::x::adapter::SIGS,
-        // THE SECOND TABLE IS GONE, and there is nothing to append in its
-        // place. It was `table::driver_internal::DRIVER_KERNELS` — launchers
-        // the driver fires with no DSL statement — and §5 step 5 took its six
-        // rows to `x::driver_internal` as plain `fn`s with **no `contract!`**,
-        // so there is no `SIGS` either: a family with no contract declares no
-        // signatures, and the launchers are called directly and need no entry
-        // point. `driver-cuda/build.rs`'s `tables()` — the list this one
-        // mirrors — records the same deletion in the same words, which is
-        // what keeps the two in step.
-    ]
+    table::TABLES.to_vec()
 }
 
 /// The symbols a C++ translation unit still CALLS, with the caller.

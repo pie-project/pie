@@ -5,7 +5,7 @@
 //! `invoke_stage_hook` with a recording execute. This test replays the
 //! same script and requires the transcripts to be byte-identical.
 //!
-//! Run `tests/oracle/stage_hooks/run.sh` to regenerate
+//! `tests/oracle/stage_hooks/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated
 //! [`GOLDEN_FNV1A64`]. The pinned value is the **C++'s** hash.
 //!
 //! The C++ `context` pointer maps to the trait impl's `self`: the

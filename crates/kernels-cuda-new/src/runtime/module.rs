@@ -410,6 +410,172 @@ impl KernelModule {
         }
     }
 
+    /// Fire `symbol`'s entry through `cuLaunchKernelEx`, with a thread-block
+    /// cluster and/or programmatic dependent launch.
+    ///
+    /// # Why a third launch path, and not a fourth field on `Launch`
+    ///
+    /// Because `Launch` is `eval`'s return type and every family in the tree
+    /// builds one. Widening it to carry a cluster would put two fields that
+    /// exactly one family sets into the vocabulary of every family that does
+    /// not, and `eval`'s rules — which are about grid extents — would have to
+    /// answer a question about clusters that none of them has. The cluster is
+    /// a property of the KERNEL, fixed at instantiation, not of the shape
+    /// being launched; a per-launch geometry field is the wrong home for a
+    /// per-instantiation constant.
+    ///
+    /// So this takes the geometry the same way the other two do and the
+    /// cluster separately, and the families that do not need it never see it.
+    ///
+    /// # What the attributes are for
+    ///
+    /// `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION` is required, not optional, for
+    /// a kernel compiled with a cluster: a `GemmUniversal` whose
+    /// `ClusterShape` is anything but `(1,1,1)` uses `cluster.sync()` and
+    /// distributed shared memory, and launching it without the attribute is a
+    /// hang or a fault rather than a diagnosed refusal. This tree's one such
+    /// kernel is at `(1,1,1)` today, where the attribute is a no-op — which
+    /// is exactly the configuration under which forgetting it costs nothing
+    /// and therefore the configuration in which it gets forgotten. It is
+    /// passed anyway.
+    ///
+    /// `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` is the host
+    /// half of programmatic dependent launch. The device half is the pair of
+    /// intrinsics already in `csrc/shim/cuda_runtime.h` —
+    /// `cudaGridDependencySynchronize` and `cudaTriggerProgrammaticLaunchCompletion`,
+    /// both as inline PTX. **Both halves are needed and neither diagnoses the
+    /// other's absence**: a kernel that calls `griddepcontrol.wait` under a
+    /// launch that did not ask for PDL waits for a dependency that will never
+    /// be signalled, and a launch that asks for PDL over a kernel that never
+    /// triggers completion simply serialises as before. That asymmetry — one
+    /// side hangs, the other silently does nothing — is why they are
+    /// described together here rather than each where it lives.
+    ///
+    /// # Errors
+    ///
+    /// As [`KernelModule::fire_raw`], plus [`Error::Driver`] if the driver
+    /// refuses the attribute set — which is what an unsupported cluster on
+    /// this device looks like.
+    ///
+    /// # Safety
+    ///
+    /// As [`KernelModule::fire_raw`]: `args` must be a live array of pointers
+    /// to argument cells, one per kernel parameter, each of the parameter's
+    /// exact type and layout, valid for the duration of the call. **Nothing
+    /// checks this.**
+    pub unsafe fn fire_ex(
+        &self,
+        symbol: &'static str,
+        launch: Launch,
+        cluster: Option<[u32; 3]>,
+        programmatic_dependent: bool,
+        cooperative: bool,
+        args: &mut [*mut std::ffi::c_void],
+        stream: Stream<'_>,
+    ) -> Result<(), Error> {
+        let Some(function) = self.entry(symbol) else {
+            return Err(Error::Missing { unit: self.unit, symbol });
+        };
+        if launch.grid.contains(&0) || launch.block.contains(&0) {
+            return Err(Error::Geometry { symbol, why: Ungeometric::Empty });
+        }
+        // A cluster of zero in any mode is the same emptiness the grid check
+        // catches, and the driver reports it as an invalid VALUE rather than
+        // an invalid geometry -- an error naming the attribute array, not the
+        // dimension that was zero.
+        if let Some(dim) = cluster
+            && dim.contains(&0)
+        {
+            return Err(Error::Geometry { symbol, why: Ungeometric::Empty });
+        }
+        if launch.smem > DEFAULT_DYNAMIC_SMEM {
+            raise_dynamic_smem_cap(function, launch.smem)?;
+        }
+
+        let mut attrs: [dr::CUlaunchAttribute; 3] = unsafe { std::mem::zeroed() };
+        let mut n = 0usize;
+        if let Some(dim) = cluster {
+            attrs[n].id = dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+            attrs[n].value.clusterDim = dr::CUlaunchAttributeValue_union__bindgen_ty_1 {
+                x: dim[0],
+                y: dim[1],
+                z: dim[2],
+            };
+            n += 1;
+        }
+        if programmatic_dependent {
+            attrs[n].id =
+                dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+            attrs[n].value.programmaticStreamSerializationAllowed = 1;
+            n += 1;
+        }
+        // A GRID-WIDE BARRIER IS A LAUNCH MODE, NOT A HEADER.
+        //
+        // `csrc/shim/cooperative_groups.h` refuses to provide `this_grid()`
+        // and says why: a `grid.sync()` that spun on a counter would deadlock
+        // the moment the grid outgrew the device, and one that returned
+        // immediately would let stage two read stage one's partial outputs.
+        // Its closing sentence names this line as the precondition — *"when
+        // MLA's second stage is wanted, the work is a launch rule and a
+        // `cuLaunchCooperativeKernel` in `runtime::fire`, and the four lines
+        // that would go here are the LAST of it rather than the first."*
+        //
+        // This is that. `CU_LAUNCH_ATTRIBUTE_COOPERATIVE` on `cuLaunchKernelEx`
+        // is the same mode `cuLaunchCooperativeKernel` sets, reached through
+        // the config struct instead of a second entry point — which is why it
+        // is a third slot here rather than a fourth launch path.
+        //
+        // **The caller owns residency, and it is not checkable here.** The
+        // barrier is only safe when every block is resident at once, and this
+        // function knows the grid but not how many blocks the device can hold
+        // for *this* function's register and shared-memory footprint — that is
+        // `cuOccupancyMaxActiveBlocksPerMultiprocessor` against the live
+        // `CUfunction`. `x::attn::mla_fa2` sizes its grid at `num_sm` blocks,
+        // resident by construction; a caller that does not is asking for a
+        // hang rather than an error, and the driver will not say so.
+        if cooperative {
+            attrs[n].id = dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+            attrs[n].value.cooperative = 1;
+            n += 1;
+        }
+
+        let config = dr::CUlaunchConfig {
+            gridDimX: launch.grid[0],
+            gridDimY: launch.grid[1],
+            gridDimZ: launch.grid[2],
+            blockDimX: launch.block[0],
+            blockDimY: launch.block[1],
+            blockDimZ: launch.block[2],
+            sharedMemBytes: launch.smem,
+            hStream: stream.as_raw().cast(),
+            // A null array with a zero count is what "no attributes" IS to
+            // the driver; passing a pointer to a zeroed slot with count 0
+            // would also work and would leave a reader wondering whether the
+            // slot meant something.
+            attrs: if n == 0 { std::ptr::null_mut() } else { attrs.as_mut_ptr() },
+            numAttrs: n as std::ffi::c_uint,
+        };
+
+        // SAFETY: `function` came from a module this value owns and outlives
+        // the call; `config` and `attrs` live to the end of this scope and
+        // `cuLaunchKernelEx` copies what it needs before returning; the
+        // geometry is non-zero by the checks above; the argument cells are
+        // the caller's obligation, stated on this function.
+        let code = unsafe {
+            dr::cuLaunchKernelEx(
+                std::ptr::addr_of!(config),
+                function,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if code == dr::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(refused("cuLaunchKernelEx", code))
+        }
+    }
+
     /// `cuOccupancyMaxActiveBlocksPerMultiprocessor` for one of this module's
     /// entries.
     ///

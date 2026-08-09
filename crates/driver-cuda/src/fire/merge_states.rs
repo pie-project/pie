@@ -54,6 +54,33 @@
 //! kernel is not rowed. If a variant with `use_softmax = false` is ever
 //! added, this paragraph is what has to change first.
 //!
+//! # A merge's CALLERS live on every architecture — carried out of the archive
+//!
+//! This paragraph is a MEASUREMENT and both of its copies were inside
+//! `crates/kernels-cuda`, which north star step 6 deletes. It is repeated
+//! here because this crate survives; `attention_flashinfer_hopper.hpp:71-92`
+//! and `kernels-cuda/csrc/CMakeLists.txt:1071-1082` are the originals and
+//! they go when the archive does.
+//!
+//! The deleted `attention_merge_states.cu` was compiled UNCONDITIONALLY
+//! rather than under `PIE_CUDA_FLASHINFER_HOPPER_SOURCE`, and the reasoning
+//! for putting it under the gate — the KV split producing its inputs is the
+//! **sm90 prefill's**, so nothing can reach a merge on an architecture where
+//! that unit is stubbed — is **true on sm_80 and sm_90 and FALSE on sm_100.**
+//! There the DECODE KV-split path (`use_full_split` in the old `mixtral.cpp`,
+//! and the two sliding-window sites in `gemma4.cpp`) calls a decode dispatch
+//! that is built on every architecture and then merges. On Blackwell the
+//! dispatch succeeded and the merge **threw**, poisoning the driver on the
+//! first fire and taking gpt-oss and gemma-4 down with it.
+//!
+//! That is a statement about where a merge's callers live, not about where a
+//! merge is fast, and it is why neither [`merge_states`] nor
+//! [`variable_length`] may acquire an architecture gate. A gate here does not
+//! degrade to a slower path; it degrades to a throw on the machine the split
+//! is most likely to be enabled for. The refusals in this module are shape
+//! refusals for that reason and there is no `compute_capability` read
+//! anywhere in it.
+//!
 //! # A refusal is a refusal, never a fallback
 //!
 //! `DISPATCH_HEAD_DIM`'s `default:` is `throw std::invalid_argument`. An

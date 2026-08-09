@@ -10,7 +10,7 @@
 //! transcripts to be byte-identical, the per-process window sweep
 //! included (here the pure `_from` form answers it).
 //!
-//! Run `tests/oracle/attn_score/run.sh` to regenerate [`GOLDEN_FNV1A64`].
+//! `tests/oracle/attn_score/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`].
 //! The pinned value is the **C++'s** hash — see that constant for why the
 //! regenerator no longer runs and what that costs.
 

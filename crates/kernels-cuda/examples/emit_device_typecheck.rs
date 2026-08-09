@@ -51,11 +51,34 @@
 //! `nvcc -iquote` is rejected outright (`nvcc fatal: Unknown option
 //! '-iquote'`), which is why it must go through `-Xcompiler` and why a probe
 //! reaches for `-I` and gets a quiet wrong answer instead of a loud one.
-//! `csrc/CMakeLists.txt` spells the archive's copy the same awkward way, for
-//! the same measured reason.
+//! `csrc/CMakeLists.txt` spelled the archive's copy the same awkward way, for
+//! the same measured reason — and that file is DELETED, with the archive it
+//! configured and the `enable_language(CUDA)` that was the last thing in this
+//! workspace to look for nvcc. The `-iquote` measurement is kept because it is
+//! a fact about nvcc rather than about our build, and because this example's
+//! whole subject is which spelling a device compile is handed.
+//!
+//! # Why this names `kernels_cuda_new::` and not `kernels_cuda::`
+//!
+//! It used to read `kernels_cuda::abi::emit_device_typecheck(
+//! kernels_cuda::norm_device::ENTRIES)`, through two one-line `pub use`
+//! shims in this crate's `src/`. Both are deleted, and the reason is the
+//! shape `lib.rs` already names four instances of.
+//!
+//! `lib.rs` records the sweep that emptied it: *"Across the whole workspace
+//! there is not one `use kernels_cuda`, not one `kernels_cuda::` outside a
+//! doc comment."* That was measured over `src/` and `tests/` and **it did not
+//! include `examples/`** — so the one live consumer of the re-exports was the
+//! one directory the census did not walk, and `src/lib.rs` was left with no
+//! `mod` declaration for the two files this line reached through. The paths
+//! it named had already stopped existing.
+//!
+//! A fifth instance of "a reason that is written down, is checkable, and is
+//! false", found the same way as the other four: by running the discriminator
+//! across the whole set instead of the part that was in front of us.
 
 fn main() {
-    match kernels_cuda::abi::emit_device_typecheck(kernels_cuda::norm_device::ENTRIES) {
+    match kernels_cuda_new::abi::emit_device_typecheck(kernels_cuda_new::device::ALTUP_AUX) {
         Ok(text) => print!("{text}"),
         Err(why) => {
             eprintln!("emit_device_typecheck: {why}");

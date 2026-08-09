@@ -215,7 +215,9 @@ fn ctx_of(cublas: *mut c_void) -> DispatchCtx {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    }
+          moe_ptrs: std::cell::Cell::new(None),
+      moe_ptrs: std::cell::Cell::new(None),
+}
 }
 
 // ── the shape table, spelled as the oracle spells it ───────────────────────

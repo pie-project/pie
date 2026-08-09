@@ -214,12 +214,13 @@
 macro_rules! unit {
     (
         $(#[$umeta:meta])*
-        unit $unit:ident = $uname:literal, text = $utext:expr, file = $ufile:literal;
+        unit $unit:ident = $uname:literal, text = $utext:expr, file = $ufile:literal
+             $(, options = $uopts:expr)? ;
         $(
             $(#[$fmeta:meta])*
             fn $fname:ident = $path:literal $(<$($g:ident),+ $(,)?>)? (
                 $($pname:ident : $pty:ty),* $(,)?
-            ) $(where $($wty:ty),+ $(,)?)? {
+            ) $(, cooperative = $coop:literal)? $(where $($wty:ty),+ $(,)?)? {
                 $(
                     $(#[$rmeta:meta])*
                     // `where` before the binding group, because `[` opens an
@@ -236,7 +237,22 @@ macro_rules! unit {
             name: $uname,
             root: $utext,
             rows: ROWS,
-            options: &[],
+            // EMPTY UNLESS THE ROOT SAYS OTHERWISE, and until `mla_fa2` no
+            // root did. It hard-coded `&[]` on the reasoning that a
+            // compile-option list is a property of the recipe rather than of
+            // a unit — true for eleven families and false for the twelfth:
+            // `attn/attention_mla_fa2.cuh` needs
+            // `--device-as-default-execution-space` and produces **sixteen
+            // errors without it** (one in `shim/type_traits`, seven in
+            // `cascade.cuh`, eight in `prefill.cuh`).
+            //
+            // So the option is not a recipe preference, it is a fact about
+            // that root's text, and it belongs where the text is named. The
+            // default stays `&[]` because a unit that states nothing should
+            // compile with what every other unit compiles with — an option
+            // that had to be repeated per unit would be a recipe wearing a
+            // declaration.
+            options: $crate::unit_options!($($uopts)?),
         };
 
         /// The units this family compiles.
@@ -302,9 +318,19 @@ macro_rules! unit {
                 $(where $($wty: $crate::x::Abi,)+)?
                 {
                     unsafe {
-                        $crate::x::fire::fire(
+                        $crate::x::fire::fire_ex(
                             symbol,
                             launch,
+                            // FALSE UNLESS THE `fn` LINE SAYS OTHERWISE.
+                            // A cooperative launch is a property of the
+                            // KERNEL — `mla.cuh:1061`'s two stages are
+                            // separated by a `this_grid().sync()` and every
+                            // other kernel in the tree syncs no further than
+                            // its block — so it is declared beside the
+                            // template path rather than passed at the call
+                            // site, where a caller could forget it and get a
+                            // wrong answer instead of a compile error.
+                            $crate::unit_cooperative!($($coop)?),
                             // `arg` borrows. For a scalar or a pointer that
                             // is a copy either way; for a by-value aggregate
                             // the borrow is of THIS binding, which lives
@@ -527,5 +553,36 @@ macro_rules! bind {
     };
     (@entry $name:ident { none: $why:expr }) => {
         $crate::x::Entry { contract: &$name, bind: None, unbound: Some($why) }
+    };
+}
+
+/// `&[]` or the caller's list — [`unit!`]'s optional `options =` clause.
+///
+/// A `macro_rules!` fragment cannot be conditionally substituted inside a
+/// struct literal field, because `$(...)?` around the field would make the
+/// field itself optional and `Unit` has no `..Default`. So the choice is
+/// pushed into a helper with two arms, which is the shape the language
+/// actually offers.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! unit_options {
+    () => {
+        &[]
+    };
+    ($opts:expr) => {
+        $opts
+    };
+}
+
+/// `false` or the caller's literal — [`unit!`]'s optional `cooperative =`
+/// clause, for [`unit_options!`]'s reason.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! unit_cooperative {
+    () => {
+        false
+    };
+    ($coop:literal) => {
+        $coop
     };
 }

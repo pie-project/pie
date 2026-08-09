@@ -7,7 +7,8 @@ byte:
 
     1. strip every `// PIE:` marker, its continuation comments, the
        `#ifndef __CUDACC_RTC__` under it and that directive's matching
-       `#endif` -- keeping the guarded BODY, which is upstream's;
+       `#endif` -- keeping the guarded BODY, which is upstream's, and
+       DISCARDING the `#else` branch, if any, which is ours;
     2. rewrite every `#include <pie/...>` back to the spelling upstream
        wrote, using the map in `tests/vendor_manifest.rs`.
 

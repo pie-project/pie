@@ -8,7 +8,7 @@
 //! as run.sh sweeps `PIE_LORA_GROUPED=0` across processes — and requires
 //! the transcripts to be byte-identical.
 //!
-//! Run `tests/oracle/lora_stage/run.sh` to regenerate
+//! `tests/oracle/lora_stage/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated
 //! [`GOLDEN_FNV1A64`]. The pinned value is the **C++'s** hash.
 //!
 //! Addresses are fabricated with the ORACLE'S OWN assignment rules (the

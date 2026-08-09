@@ -1158,43 +1158,36 @@ pub static WALKED: &[Walk] = &[
     //                   `gemm::act_x_wt_bf16` against it. `gemm.cpp:2102` was the LAST C++ caller \
     //                   of `quant::dequant_mxfp4_to_bf16`, which is why this row moving is what \
     //                   lets that one be routed. Now `driver-cuda/src/bind/quant_gemm.rs`",
-    // ── moe: a shape test that chooses between our kernel and cuBLAS ──────
+    // ── moe: THE NARROWEST WALK IN THE TABLE, AND IT IS GONE TOO ─────────
     //
-    // The narrowest walk in the table, and it is here because the bar is
-    // about the SHAPE of the control flow and not about its size. The host
-    // decides, from numbers known only at fire time, whether this kernel
-    // runs at all; the alternative is a different implementation of the same
-    // arithmetic. That is a `Switch` with two arms, one of which is "not
-    // this one" — which is exactly the case `Walk::refuses` exists to make
-    // impossible to write as a silent fallback.
-    Walk {
-        symbol: "moe::moe_grouped_gemm_bf16",
-        control: Control::Switch { on: "moe_grouped_gemm_bf16_supported(M, N, K)" },
-        refuses: &[
-            "`M != kFrag` -- the kernel computes exactly one 16-row fragment per block and \
-             has no tail path, so a taller rectangle is not a slower shape but a wrong one",
-            "`K > kShortK` (512) -- the one refusal here that is a MEASUREMENT rather than a \
-             correctness bound: `gate_up K=2048` was 11.08 -> 11.98 ms against cuBLAS and is \
-             left on cuBLAS, while `down K=256` was 7.94 -> 5.91 and is taken",
-            "`N % kNTile != 0` -- `grid.x` is `N / kNTile` with no rounding, and the kernel \
-             bounds-checks neither a short grid nor a long one",
-            "`K % kFrag != 0` -- the mainloop steps K by a fragment and never checks a \
-             remainder",
-            "`max_blocks <= 0` -- an empty padded batch, which is `grid.y`",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_grouped_gemm.cu:18-45` -- a support predicate \
-                  that decides between this kernel and cuBLAS, and one `<<<>>>` on \
-                  `dim3(N / kNTile, max_blocks)` that no `LaunchRule` states, because \
-                  `max_blocks` is a host bound on a padded batch and not an extent of any \
-                  operand. The program is Rust now -- `driver-cuda/src/fire/moe.rs` driving \
-                  the JIT'd `moe/moe_grouped_gemm` unit -- and the `.cu` is deleted. It stays \
-                  a row because the SYMBOL is still `table::moe`'s: `RUST_SERVED` names it, \
-                  `emit_c_shim` drops the entry, and `emit_dispatch` writes the arm. The unit \
-                  it drives is rowed as `moe::moe_grouped_gemm_wmma_bf16` and NOT as this \
-                  symbol, because `tests::a_walk_is_only_a_walk` asserts a walked symbol has \
-                  no unit -- a walk may DRIVE JIT'd kernels, it may not BE one, and \
-                  `sample::lm_head_gemv_argmax_int8` two entries down splits the same way",
-    },
+    // `moe::moe_grouped_gemm_bf16` stood here, and it was here because the
+    // bar is about the SHAPE of a control flow and not its size: the host
+    // decided, from numbers known only at fire time, whether this kernel ran
+    // at all, and the alternative was a different implementation of the same
+    // arithmetic. A `Switch` with two arms, one of which is "not this one" —
+    // exactly the case `Walk::refuses` existed to stop anyone writing as a
+    // silent fallback.
+    //
+    // It crossed with `moe`, and it is deleted on the argument the block
+    // below makes for the other nine. The switch is `x::moe::supported(m, n,
+    // k)` now — three comparisons the reader can read — and the "not this
+    // one" arm is `Refusal::Wide`, a value the caller cannot drop where a
+    // fallback a walk could only DESCRIBE was one an implementation could
+    // silently take.
+    //
+    // ITS OTHER ARM IS WHY `moe::build_moe_ptrs_aligned_bf16` IS A DRIVER
+    // OP, and the cross-link is worth a sentence because the two entries sat
+    // 200 lines apart and neither of them said it. The arm this symbol takes
+    // when `supported()` refuses is BATCHED cuBLAS, and batched cuBLAS is
+    // the only reader of the six device pointer arrays that build produces.
+    // That reader is a LOWERING of this symbol and not a statement of it:
+    // the grouped GEMM's operand list is `(a, weight_base, c, expert_ids)`
+    // and names no pointer array anywhere. Six results with no stated
+    // consumer are six values `lower.rs:1911`'s liveness frees at the first
+    // op past the build, so declaring them would hand the fallback bytes the
+    // next allocation owns — a wrong answer, not a refusal. The arrays are
+    // the driver's arena instead, and [`SERVED`] carries the symbol.
+
     // ── sample: an occupancy query, a growing scratch, and two kernels ────
     //
     // GONE, and not to a walk. `sample` crossed into fn-world (§5 step 5)
@@ -1356,10 +1349,11 @@ pub static WALKED: &[Walk] = &[
 
     // ── moe/moe_dispatch.cu AND moe/dsv4_routing.cu, both DELETED ────────
     //
-    // Five of `moe_dispatch.cu`'s eight came first; the last three follow
-    // here, with `dsv4_routing.cu`'s one. **The block that stood here said
-    // the last four could not move, and it was right about every mechanism
-    // and wrong about the conclusion.** It read: each is already unit-hosted
+    // Five of `moe_dispatch.cu`'s eight came first; the last three followed
+    // here, with `dsv4_routing.cu`'s one, and the block below deletes what
+    // is left of all nine. **The block that stood here said the last four
+    // could not move, and it was right about every mechanism and wrong about
+    // the conclusion.** It read: each is already unit-hosted
     // (`LaunchRule::PerRow`, `Rms`, `RouterSort`, `RowsFlat`),
     // `a_walk_is_only_a_walk` refuses a walked symbol that a unit hosts, and
     // `JIT_DISPATCHED` is barred because `emit_rust_dispatch` skips a row
@@ -1381,203 +1375,125 @@ pub static WALKED: &[Walk] = &[
     // `__global__`, so the host program moved to
     // `driver-cuda/src/fire/flashinfer_moe.rs` and what stayed is a five-
     // function `extern "C"` seam that instantiates CUTLASS templates.
-    Walk {
-        symbol: "moe::scatter_add_weighted_bf16",
-        control: Control::Supplies { what: "num_routed -- the grid extent, which is not one of the kernel's five operands at all: the __global__ reads blockIdx.x and has no bound to test it against" },
-        refuses: &[
-            "`num_routed <= 0` -- `moe_dispatch.cu:34`, and it is the ONLY term the \
-             launcher tested. A `hidden <= 0` guard was never there: the kernel's \
-             stride loop simply does not execute, so an empty row is a launch that \
-             writes nothing rather than a fault, and the port reproduces the one \
-             term rather than tidying it into two",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_dispatch.cu:29-41` -- one launch of \
-                  `scatter_add_weighted<bf16>` at `:35-36` on \
-                  `<<<num_routed, device::kDispatchBlock, 0, stream>>>`. The BLOCK WIDTH \
-                  IS CONTRACT and not tuning: the kernel strides `for (h = threadIdx.x; \
-                  h < hidden; h += kDispatchBlock)` by the FILE-SCOPE CONSTANT and not by \
-                  `blockDim.x`, so a launch at any other width leaves a slice of every \
-                  row uncomputed while the guard-free loop double-adds the rest, on a \
-                  read-modify-write. `LaunchRule::PerRow` states the same rectangle and \
-                  stays on the device row `moe::scatter_add_weighted_dev_bf16`; what it \
-                  cannot state is `num_routed`, which the fire's `Dims::rows` is only \
-                  equal to when the statement's lowering counted ROUTED SLOTS rather \
-                  than tokens -- a precondition the row writes down and nothing checks. \
-                  Now `driver-cuda/src/fire/moe_dispatch.rs`",
-    },
-    Walk {
-        symbol: "moe::moe_bucket_exact",
-        control: Control::Supplies { what: "smem = (3 * num_experts + 1) * sizeof(i32) -- a dynamic shared allocation sized from an OPERAND, and thirty-three words fewer than LaunchRule::RouterSort computes" },
-        refuses: &[
-            "`num_routes <= 0 || num_experts <= 0` -- `moe_dispatch.cu:128`, and \
-             `num_experts` is load-bearing TWICE here: it is the extent the sort \
-             buckets over AND the operand the shared slab is sized from, so a zero \
-             would ask for a four-byte allocation and let thread 0 scan past it",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_dispatch.cu:119-135` -- one launch of \
-                  `moe_bucket_exact<i32>` at `:132` on `<<<1, BS, smem, stream>>>` with \
-                  `BS = 1024` at `:129` and `smem` at `:130-131`. ONE BLOCK whatever the \
-                  routing, because the scan is block-wide and the counters live in that \
-                  slab: a grid with a row axis would run N copies of the sort, each \
-                  zeroing what the others accumulate, and NOTHING FAILS -- the \
-                  permutation is still a permutation and the mixture answers with tokens \
-                  delivered to experts the router did not choose. The smem is the reason \
-                  this one genuinely needed the split: `RouterSort` states `(3E + 34) * \
-                  4` because the PADDED sort next door allocates 32 warp partials and a \
-                  running base, and this scan is serial on thread 0 and allocates \
-                  neither. Over-allocating dynamic shared memory is legal and \
-                  under-allocating is a launch failure, so the rule is safe on the device \
-                  row and the launcher's own `(3E + 1) * 4` is what the Rust states. Now \
-                  `driver-cuda/src/fire/moe_dispatch.rs`",
-    },
-    Walk {
-        symbol: "moe::add_moe_route_bias_bf16",
-        control: Control::Supplies { what: "cols and out_stride -- the bias's width and the staging's pitch, the two operands the row leaves unsourced because no fire holds either as an extent of a value it named" },
-        refuses: &[
-            "`num_routes <= 0 || cols <= 0` -- `moe_dispatch.cu:141`. The second term \
-             is the one worth keeping: `cols` is the BIAS's width, so a zero means \
-             there is no bias to add rather than an empty rectangle, and the launcher \
-             answered both with the same silent return",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_dispatch.cu:137-147` -- one launch of \
-                  `add_moe_route_bias<bf16>` at `:142-143` on `<<<num_routes, \
-                  device::kDispatchBlock, 0, stream>>>`. Unlike its neighbour this kernel \
-                  strides by `blockDim.x`, so it is width-agnostic and \
-                  `LaunchRule::Rms` states the rectangle exactly -- which is why §60.2 \
-                  called this the cheapest of the three and said it needed only sourcing. \
-                  It does not. `cols` is the bias's row width and `out_stride` the \
-                  route-major staging's pitch, and GPT-OSS is the reason they differ: it \
-                  publishes expert biases at the UNPADDED intermediate width while the \
-                  packed weights are padded to a multiple of 128, so the two strides \
-                  disagree and Marlin's own bias epilogue cannot be used. A fire that \
-                  splits a fused bias holds neither number as an extent of a value, so \
-                  sourcing them would be inventing an edge in the trace. The host \
-                  supplies all six. Now `driver-cuda/src/fire/moe_dispatch.rs`",
-    },
-    Walk {
-        symbol: "moe::hash_route_lookup",
-        control: Control::Supplies { what: "tid2eid and vocab_size -- a [vocab, K] table keyed by TOKEN ID and its first extent, neither of which is an extent of any value the fire's rectangle carries" },
-        refuses: &[
-            "`tokens <= 0 || top_k <= 0` -- `dsv4_routing.cu:36`, and the SECOND term \
-             is not redundant: a batch of tokens routed to zero experts writes no \
-             `topk_idx` row at all, and the kernel's own guard is on `tokens` only",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/dsv4_routing.cu:22-46` -- one launch of \
-                  `hash_route_lookup<bf16>` at `:40` on `<<<grid, kDsv4Block, 0, \
-                  stream>>>`, `grid = (tokens + kDsv4Block - 1) / kDsv4Block` at `:39` \
-                  and `kDsv4Block = 256` at `:20`. ONE THREAD PER TOKEN, and the \
-                  launcher said so in its own words: the kernel's whole body is a table \
-                  read and a K-long gather, where its sibling `topk_sqrtsoftplus` gives a \
-                  token a BLOCK because it stages `num_experts` logits and reduces them. \
-                  `LaunchRule::RowsFlat` was ported FROM this `<<<>>>` and states it \
-                  digit for digit, so the geometry was never the blocker; `tid2eid` was. \
-                  DeepSeek-V4 routes on a hash of the token id, so the expert INDICES \
-                  come from a checkpoint table and only the WEIGHTS come from the router \
-                  logits -- and no `Source` names a table keyed by something the fire's \
-                  rectangle does not carry. Now \
-                  `driver-cuda/src/fire/dsv4_routing.rs`",
-    },
-    Walk {
-        symbol: "moe::moe_gate_up_decode_gemv_bf16",
-        control: Control::Supplies { what: "routes = num_tokens * top_k, N = 2 * I_moe, and the expert stride (long long)N * H -- three products of two operands each, none of which is an extent of a value" },
-        refuses: &[
-            "`routes <= 0 || H <= 0 || N <= 0` -- `moe_dispatch.cu:99`, an empty \
-             rectangle before a zero grid reaches the driver",
-            "`H % kMoeVecWidth != 0` -- `moe_dispatch.cu:99`. NOT an optimisation \
-             gate: the kernel's reduction loads `float4`, so a K that is not a \
-             multiple of 8 bf16 makes every row after the first start unaligned. The \
-             C++ RETURNED here and the port refuses in the same words, because a \
-             silent return leaves the expert activation whatever the arena had",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_dispatch.cu:85-110` -- one launch of \
-                  `moe_decode_gemv_by_token<bf16>` at `:105` on \
-                  `grid((N + kGemvWarps - 1) / kGemvWarps, routes)`, `block(32, kGemvWarps)`, \
-                  `kGemvWarps = 4`. A TWO-DIMENSIONAL BLOCK, which no `LaunchRule` states \
-                  and §10.5 forbids adding one for. The device row is \
-                  `families::moe::MOE_DISPATCH_SIGS[8]`, `LaunchRule::Unstated`. Now \
-                  `driver-cuda/src/fire/moe_dispatch.rs`",
-    },
-    Walk {
-        symbol: "moe::moe_down_decode_gemv_bf16",
-        control: Control::Supplies { what: "routes = num_tokens * top_k and the expert stride (long long)H * I_moe" },
-        refuses: &[
-            "`routes <= 0 || H <= 0 || I_moe <= 0` -- `moe_dispatch.cu:126`",
-            "`I_moe % kMoeVecWidth != 0` -- `moe_dispatch.cu:127`, the same `float4` \
-             alignment claim as the gate/up form, over the OTHER extent: here the \
-             reduction runs over `I_moe` and the output width is `H`, which is why the \
-             divisibility test moved operands between the two launchers",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_dispatch.cu:112-137` -- one launch of \
-                  `moe_decode_gemv_by_route<bf16>` at `:132` on \
-                  `grid((H + kGemvWarps - 1) / kGemvWarps, routes)`, `block(32, kGemvWarps)`. \
-                  The `by_route` twin of the entry above: same body, `ActByToken = false`, \
-                  so the activation is indexed by ROUTE rather than by token. Two symbols \
-                  because two instantiations, not because two geometries. Now \
-                  `driver-cuda/src/fire/moe_dispatch.rs`",
-    },
-    Walk {
-        symbol: "moe::transpose_expert_scales_u8",
-        control: Control::Supplies { what: "a THREE-dimensional grid (ceil(k_groups/32), ceil(n/8), num_experts) over a 2-D block (32, 8)" },
-        refuses: &[
-            "`num_experts <= 0 || n <= 0 || k_groups <= 0` -- `moe_dispatch.cu:190`",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_dispatch.cu:187-199` -- one launch of \
-                  `transpose_expert_scales<u8>` at `:196`. The MXFP4 group-scale \
-                  relayout: `[e][n][kg] -> [e][kg][n]`, one byte per E8M0 scale, which is \
-                  why the instantiation is `u8` and not an activation type. Three grid \
-                  axes and two block axes are both past the `LaunchRule` vocabulary; the \
-                  device row is `LaunchRule::Unstated`. Now \
-                  `driver-cuda/src/fire/moe_dispatch.rs`",
-    },
-    Walk {
-        symbol: "moe::build_moe_ptrs_aligned_bf16",
-        control: Control::Supplies { what: "routed_blocks = max_blocks when either shared-expert base is null -- a HOST MUTATION of an operand, not a grid" },
-        refuses: &[
-            "`max_blocks <= 0` -- `moe_dispatch.cu:245`",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_dispatch.cu:204-250` -- one launch of \
-                  `build_moe_ptrs_aligned<bf16>` at `:249` on \
-                  `grid(ceil(max_blocks / kDispatchBlock))`, 256 wide. The interesting \
-                  line is `:246-248`, which is not a grid at all: if EITHER shared-expert \
-                  base is null the launcher OVERWRITES `routed_blocks` with `max_blocks`, \
-                  so the kernel's `is_shared = (b >= routed_blocks)` is false for every \
-                  block and the shared tail is never addressed. That is a host decision \
-                  about an operand from a POINTER's nullity, which no `Source` can read \
-                  and which is why this is a walk and not a rule. Now \
-                  `driver-cuda/src/fire/moe_dispatch.rs`",
-    },
-    Walk {
-        symbol: "moe::reorder_moe_aligned_output_bf16",
-        control: Control::Switch { on: "moe_vectorizable(src, dst, hidden) && ((uintptr_t)shared_out % 16) == 0 -- hidden % 8 and the 16-byte alignment of THREE allocations" },
-        refuses: &[
-            "`aligned_rows <= 0 || hidden <= 0` -- `moe_dispatch.cu:263`",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/moe/moe_dispatch.cu:252-286` -- TWO `<<<>>>` and \
-                  a host fork. `:277` launches `reorder_moe_aligned_output_vec<bf16>` over \
-                  `grid(aligned_rows, ceil(hidden / 8 / 256))`; `:284` launches the scalar \
-                  `reorder_moe_aligned_output<bf16>` over `grid(aligned_rows, \
-                  ceil(hidden / 256))`. §30 asks whether the arms differ before a branch is \
-                  preserved, and here they DO, structurally rather than by measurement: \
-                  the vector kernel `static_assert`s `sizeof(T) == 2` and \
-                  `reinterpret_cast`s three pointers to `uint4`, so on a base that is not \
-                  16-byte aligned it does not run slower, it faults -- and its third grid \
-                  extent is an eighth of the other's, so the two are not even the same \
-                  rectangle. Both arms are rows: \
-                  `moe::reorder_moe_aligned_output_scalar_bf16` \
-                  and `moe::reorder_moe_aligned_output_vec_bf16`. `:264` is a second host \
-                  edit -- a null `shared_out` forces `shared_row_begin = -1`, which is how \
-                  the kernel is told there is no fold. Now \
-                  `driver-cuda/src/fire/moe_dispatch.rs`",
-    },
+    //
+    // NINE OF THE `because:` CLAUSES BELOW ENDED IN "Now
+    // `driver-cuda/src/fire/moe_dispatch.rs`" (or `dsv4_routing.rs`), THEN
+    // SAID `x::moe`, AND ARE NOW DELETED WITH THE ENTRIES THAT CARRIED THEM.
+    // Both `fire/` modules existed for exactly one step: the port moved the
+    // C++ launchers into them and §5 step 5 moved them again, into `x::moe`'s
+    // twenty host `fn`s, deleting both. The clauses were written at the first
+    // move and nothing re-derived them at the second — the same failure
+    // `bind/service.rs`'s tombstones have, and worth naming rather than
+    // quietly correcting: **a POINTER to where the code went is the part of a
+    // note most likely to rot, because it is the only part that is about the
+    // tree rather than about the kernel.**
+    //
+    // And the repoint was the wrong fix, which took one more edit to see. A
+    // clause that needs correcting every time the code moves is a clause
+    // about the tree, and the tree is the one thing a reader can already
+    // look at. The block below deletes the entries instead.
+    // ── AND ALL NINE ARE GONE, BECAUSE THE FAMILY CROSSED ───────────────
+    //
+    // Nine `Walk`s stood here: `moe::scatter_add_weighted_bf16`,
+    // `moe::moe_bucket_exact`, `moe::add_moe_route_bias_bf16`,
+    // `moe::hash_route_lookup`, `moe::moe_gate_up_decode_gemv_bf16`,
+    // `moe::moe_down_decode_gemv_bf16`, `moe::transpose_expert_scales_u8`,
+    // `moe::build_moe_ptrs_aligned_bf16` and
+    // `moe::reorder_moe_aligned_output_bf16`. §5 step 5 moved all nine host
+    // programs into `x::moe` and the entries did not follow — they were
+    // REPOINTED, and repointing is what let them survive a crossing they
+    // should not have.
+    //
+    // ONE CHECK GOES RED. THE OTHER EIGHT PASS EVERY CHECK THERE IS, AND
+    // THAT is the finding — it is worth more than the deletion.
+    //
+    // The red one is `a_walk_is_only_a_walk`, which refuses a symbol that is
+    // walked AND served. `moe::build_moe_ptrs_aligned_bf16` took
+    // `Service::DriverOp` one table down, and the test is right to refuse
+    // it: a walk and a service are two answers to one question.
+    //
+    // THE OTHER EIGHT WERE NEVER GOING TO BE CAUGHT, by two mechanisms that
+    // each look like the opposite of a problem.
+    //
+    // * `Walk::agrees` refuses a walk whose symbol is not a row — *"is
+    //   walked and is not a row of `table::KERNELS`"* — and `table/moe.rs`
+    //   has been deleted for two edits. It passes anyway, because
+    //   `table::sig` reads `KERNELS`, `KERNELS` is `TABLES` concatenated,
+    //   and `TABLES` is `ROW_TABLES ++ x::SIGS`. The check is satisfied by
+    //   the CONTRACT that replaced the row. That is the floor working
+    //   exactly as designed, and it is why a crossing is invisible from
+    //   here: the one check that reads a table cannot tell the two worlds
+    //   apart, which is the whole point of `table::TABLES` and also the
+    //   reason it can never date a walk.
+    // * `a_walk_is_only_a_walk` ALSO refuses a walked symbol that a unit
+    //   hosts, and all nine are unit-hosted now, in `x::moe`. It passes
+    //   because the device halves carry `_dev`: `hash_route_lookup` walks
+    //   and `hash_route_lookup_dev` compiles, `moe_bucket_exact` walks and
+    //   `moe_bucket_exact_dev` compiles, and so on for all nine on the
+    //   `moe_grouped_gemm_wmma_bf16` precedent §60.6 set. **The suffix split
+    //   was invented to let a walk coexist with the JIT, and it is the same
+    //   mechanism that hides the walk's obsolescence once the host program
+    //   is Rust.** A name chosen to keep two things legal beside each other
+    //   goes on keeping them legal after one of them stops being true.
+    //
+    // So nothing mechanical was ever going to ask for this deletion and no
+    // test will notice it landing. It is a judgement against the placement
+    // rule, and the argument is the next paragraph rather than a red test.
+    //
+    // THE ARGUMENT IS THE PLACEMENT RULE, read in the direction it is least
+    // often read: *data only for what has a reading consumer, and everything
+    // that is only executed is code.* A
+    // `Walk` describes a control flow its reader CANNOT READ — `.cu` text
+    // behind a shim, written down here so a Rust reader knows what the host
+    // does. Once the host program is a Rust `fn` in this crate the reader
+    // can read it, the description has no consumer left, and what remains is
+    // a second spelling of executed code, which decays. The repointing above
+    // IS that decay, caught twice and corrected twice before anyone noticed
+    // the entries had no business being here at all.
+    //
+    // WHERE THE NINE FINDINGS WENT, because a deletion should say:
+    //
+    // * Seven `Control::Supplies` — the `num_routed` grid, the
+    //   `(3 * num_experts + 1) * 4` dynamic shared allocation,
+    //   `cols`/`out_stride`, `tid2eid`/`vocab_size`, the two
+    //   `routes = num_tokens * top_k` products with their expert strides,
+    //   and the 3-D `(k_groups/32, n/8, num_experts)` grid over a `(32, 8)`
+    //   block — are arithmetic in `x::moe`'s host `fn`s, on the line above
+    //   the `Launch` that uses each. None of the seven fits `Launch::flat`
+    //   or `Launch::per_row`, so all seven write the literal, which is
+    //   §5.1's rule and most of the reason it exists.
+    // * `reorder_moe_aligned_output_bf16`'s `Control::Switch` — a
+    //   vectorizability test AND a 16-byte alignment test on THREE
+    //   allocations — is an `if` in that symbol's host `fn` with the
+    //   alignment tests beside it. Two kernels, one symbol, chosen from
+    //   three pointers' low bits.
+    // * `build_moe_ptrs_aligned_bf16`'s `Control::Supplies` is the one that
+    //   was never a grid: `moe_dispatch.cu:246-248`, *if EITHER
+    //   shared-expert base is null, overwrite `routed_blocks` with
+    //   `max_blocks`* — a host decision read off a POINTER's nullity, which
+    //   no `Source` can state and which is why the row left the operand
+    //   unsourced. It is code in that symbol's host `fn` with the
+    //   `:246-248` citation beside it, and `fire::moe_ptrs::Banks`
+    //   documents it for the caller and says in as many words not to
+    //   reproduce it.
+    // * Every `refuses:` string was the launcher's own words and is a
+    //   `Refusal` the `fn` returns now, which is the one of the four that
+    //   got STRONGER: a walk's refusal list is prose a reader checks, and a
+    //   `#[must_use] Fired::Declined` is a value the caller cannot drop.
+    //
+    // WHAT THIS LEAVES FOR THE LAST CROSSING. [`WALKED`] is 24 entries and
+    // all 24 are `attn::`. When `attn` crosses, this list is EMPTY and
+    // `Walk::agrees` is never called on anything — a check of the empty set,
+    // exactly as `the_driver_internal_rows_are_not_statable` was before
+    // `table/mod.rs` retired it — while `no_control_shape_is_unevidenced`
+    // goes RED in that same edit, because every member of every shape will
+    // be gone. That is correct behaviour and not a chore: a shape enum whose
+    // variants have no evidence is vocabulary admitted on nobody's word, and
+    // that test exists to say so out loud rather than to pass vacuously. The
+    // edit that empties this list should delete `Control`, `Walk` and
+    // `Execution::Walk` with it, on the same argument this block makes for
+    // nine entries.
+
 
     // ── ssm/nemotron_h.cu's last two — GONE, and not to a walk ──────────
     //
@@ -1645,7 +1561,8 @@ pub static WALKED: &[Walk] = &[
              cache declaring native storage in a dtype that is not bf16. Nothing is \
              launched in either language",
         ],
-        because: "`driver-cuda/src/fire/kv_paged.rs::write_kv_to_pages`, ported from \
+        because: "`x::attn::kv_paged::write_kv_to_pages` (MOVED out of \
+                   `driver-cuda/src/fire/kv_paged.rs`), ported from \
                   `kernels-cuda/csrc/src/attn/kv_paged.cu:109-153` (now deleted). One \
                   `if (layer.is_native_bf16())` over two programs: the native arm fires \
                   `attn::write_kv_bf16#hnd` or `#nhd` on a grid of \
@@ -1671,7 +1588,8 @@ pub static WALKED: &[Walk] = &[
             "`B <= 0` -- `kv_paged.cu:320`, an empty descriptor, declined silently in the \
              C++ and declined by value here",
         ],
-        because: "`driver-cuda/src/fire/kv_paged.rs::write_kv_explicit_bf16`, ported from \
+        because: "`x::attn::kv_paged::write_kv_explicit_bf16` (MOVED out of \
+                   `driver-cuda/src/fire/kv_paged.rs`), ported from \
                   `kernels-cuda/csrc/src/attn/kv_paged.cu:304-352` (now deleted). A throw, \
                   an empty-extent decline, an instantiation choice on `layer.hnd_layout` \
                   over `attn::write_kv_explicit_bf16_dev#hnd`/`#nhd` at `<<<B, 256>>>`, \
@@ -1739,7 +1657,8 @@ pub static WALKED: &[Walk] = &[
              launched in either language, and it is a distinct `QuantisedDecline` from the \
              two above so the impossible case cannot be read as the empty one",
         ],
-        because: "`driver-cuda/src/fire/kv_paged.rs::dequant_kv_cache_layer_to_bf16_active`, \
+        because: "`x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active` (MOVED out \
+                   of `driver-cuda/src/fire/kv_paged.rs`), \
                   ported from `kernels-cuda/csrc/src/attn/kv_paged.cu:191-261`, which is \
                   DELETED WITH THIS ENTRY -- the file held nothing else. One guard at \
                   `:197`, then ONE grid for all four arms: `page_elems = page_size * \
@@ -1772,26 +1691,32 @@ pub static WALKED: &[Walk] = &[
     // takes as five fields. That is why neither could be a `Source`: a
     // `Source` can hand a value to the kernel and cannot take it apart.
     // ═══ `attn/dsv4_compress.cu` — THE FOUR THAT SURVIVED ═══════════════
-    Walk {
-        symbol: "attn::combine_attn_outputs_bf16",
-        control: Control::Supplies { what: "the BLOCK width, head_dim clamped into [32, 256] -- and NOT into LaunchRule::PerHeadElementwise's [32, 128], which is the whole reason no rule states this" },
-        refuses: &[
-            "`N <= 0` -- an empty batch, and this launcher's grid.x",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/dsv4_compress.cu:57-96` -- one launch of \
-                  `combine_attn_outputs<bf16>` at `:88`, merging two attention outputs and \
-                  their log-sum-exps. The GRID is `PerHeadElementwise` to the digit and \
-                  the BLOCK is not: this clamps into `[32, 256]`, the rule into `[32, \
-                  128]`, so past a 128-wide head the rule answers with half the threads. \
-                  The kernel strides `d += blockDim.x` and reduces nothing, so the \
-                  difference is a slower kernel and never a wrong answer -- which is \
-                  exactly why it must not be rowed: it would agree at deepseek_v4's \
-                  128-wide heads and stop agreeing at the first config that widens one, \
-                  invisibly. The launcher's own comment says so at length and travels into \
-                  the Rust. Device row written in the same change, `Unstated`. Now \
-                  `driver-cuda/src/fire/dsv4_compress.rs`",
-    },
+    // ═══ `attn::combine_attn_outputs_bf16` — CROSSED, AND ITS WALK WITH IT ══
+    //
+    // Its `Walk` STOOD HERE and is retracted rather than moved. The entry
+    // read `Control::Supplies { the BLOCK width, head_dim clamped into
+    // [32, 256] -- and NOT into LaunchRule::PerHeadElementwise's [32, 128],
+    // which is the whole reason no rule states this }`, refusing `N <= 0`
+    // and a unit/row disagreement, and its `because` argued at length that
+    // rowing it would agree at deepseek_v4's 128-wide heads and stop
+    // agreeing at the first config that widened one, invisibly — a slower
+    // kernel and never a wrong answer, so nothing fails and nothing reports.
+    //
+    // **The argument was right and it has stopped being about a
+    // classification.** `Control::Supplies` says a host program computes
+    // something no `Source` can produce; a `fn` computes its own geometry,
+    // so there is nothing left for the classification to describe. The whole
+    // content of this entry was one clamp, and the clamp is now four lines
+    // from the launch in `x::attn::combine_attn`, with the divergence from
+    // `SINK_BLOCK_MAX` stated where a reader of the launch will find it.
+    //
+    // This is `layout::embed`'s shape a second time, one screen down: a
+    // `Walk` whose `Control` was the only thing keeping it out of a row, and
+    // which fn-world dissolves rather than satisfies. `x::attn`'s
+    // `COMBINE_ATTN_OUTPUTS` is the contract, `combine_attn_outputs_bf16`
+    // the host program, and the `table::attn` row and the `RUST_SERVED`
+    // entry went in the same change. `driver-cuda/src/fire/dsv4_compress.rs`
+    // keeps the other three.
     Walk {
         symbol: "attn::dsv4_boundary_meta_decode",
         control: Control::Supplies { what: "the grid, ceil(n / 128), from an element count the kernel also reads as a bound" },
@@ -1858,7 +1783,7 @@ pub static WALKED: &[Walk] = &[
             "a cache carrying envelopes -- PANICS, same reason: envelope maintenance is not windowed on this variant and the host-window form is the caller's answer",
             "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
         ],
-        because: "`kernels-cuda/csrc/src/attn/kv_paged.cu:132-175` -- two `<<<n_max, 256, 0,                   stream>>>` over `write_kv_explicit_devwin<true|false>` at `:158` and                   `:166`, behind two `throw`s and an empty-extent guard. **This is §58's                   case, and §58's answer was incomplete.** §58 read                   `execution::tests::a_walk_is_only_a_walk` against                   `Specialisation::agrees` -- the first wants `unit_of(symbol).is_none()`,                   the second wants `unit_of(self.base)` to RESOLVE -- and concluded a                   `Specialisation` IS the walk, so this symbol needed a caller and not a                   classification. The caller never came, because the only thing that could                   call the Rust is a dispatch arm and only `JIT_DISPATCHED` or `RUST_SERVED`                   makes the emitter write one. §60.6 dissolves the contradiction instead of                   choosing a side: the DEVICE rows are now                   `attn::write_kv_explicit_bf16_devwin_dev` and `WRITE_KV_EXPLICIT_DEVWIN`'s                   `base` moved with them, so the ahead-of-time symbol is unit-free and                   walkable while the `Specialisation` still resolves. The sibling                   `attn::write_kv_explicit_bf16` was already in exactly this arrangement,                   which is the evidence that it is an arrangement and not a hack. The Rust                   was written a pass ago and fires `_dev#hnd`/`_dev#nhd` directly; the row                   is fully sourced, so this moves a LIVE dispatch off the shim. Now                   `driver-cuda/src/fire/kv_paged.rs`",
+        because: "`kernels-cuda/csrc/src/attn/kv_paged.cu:132-175` -- two `<<<n_max, 256, 0,                   stream>>>` over `write_kv_explicit_devwin<true|false>` at `:158` and                   `:166`, behind two `throw`s and an empty-extent guard. **This is §58's                   case, and §58's answer was incomplete.** §58 read                   `execution::tests::a_walk_is_only_a_walk` against                   `Specialisation::agrees` -- the first wants `unit_of(symbol).is_none()`,                   the second wants `unit_of(self.base)` to RESOLVE -- and concluded a                   `Specialisation` IS the walk, so this symbol needed a caller and not a                   classification. The caller never came, because the only thing that could                   call the Rust is a dispatch arm and only `JIT_DISPATCHED` or `RUST_SERVED`                   makes the emitter write one. §60.6 dissolves the contradiction instead of                   choosing a side: the DEVICE rows are now                   `attn::write_kv_explicit_bf16_devwin_dev` and `WRITE_KV_EXPLICIT_DEVWIN`'s                   `base` moved with them, so the ahead-of-time symbol is unit-free and                   walkable while the `Specialisation` still resolves. The sibling                   `attn::write_kv_explicit_bf16` was already in exactly this arrangement,                   which is the evidence that it is an arrangement and not a hack. The Rust                   was written a pass ago and fires `_dev#hnd`/`_dev#nhd` directly. **THE                   NEXT CLAUSE WAS WRONG AND IS CORRECTED IN PLACE:** it said the row is fully                   sourced and that this moves a LIVE dispatch off the shim. `table/attn.rs:292`                   states `Source::Unbound` on ALL NINE operands, and `abi.rs:810` skips a row                   with any `Unbound` operand WHOLE -- so `emit_rust_dispatch` has never written a                   dispatch arm for this symbol, this `RUST_SERVED` entry has never been reached,                   and the `bind::service` shim has never had a caller. The claim is true of the                   SIBLING `attn::write_kv_explicit_bf16` row, which is fully sourced, and was                   written for this one. Corrected rather than deleted because the rest of the                   entry is right and because the sibling still needs it said. The host                   program has MOVED: `kernels-cuda-new/src/x/attn.rs`'s `x::attn::kv_paged`",
     },
     // ═══ `attn/qkv_fused.cu` — THE LAST `attn` DISPATCH ═════════════════
     Walk {
@@ -2267,7 +2192,7 @@ pub static SERVED: &[(&str, Service, &str)] = &[
 
     // ── CUTLASS ───────────────────────────────────────────────────────────
     ("moe::flashinfer_cutlass_moe_bf16",   Service::Cutlass,
-     "THE EXEMPLAR. `csrc/third_party/flashinfer_moe/*.cu` holds 0 `__global__`; `src/moe/flashinfer_moe.cu` holds 0 and calls no kernel of ours; and `cutlass/` is in no source directory of this repo -- CPM fetches it into `target/**/_deps/flashinfer-src/3rdparty/cutlass` at configure time. The kernels are templates in headers we do not have. It returns `bool`, but a service that declines is still a service: the fallback is the CALLER's, not the row's. The 0 `__global__` was read a second time and finished the argument: a file with no device text in it is not device text, so the 817-line HOST program (workspace query, arch probe, autotuner, per-device tactic memo, on-disk tactic cache, dispatch) is `driver-cuda/src/fire/flashinfer_moe.rs` and `src/moe/flashinfer_moe.cu` is a five-function `extern \"C\"` seam over `CutlassMoeFCRunner` with two standard headers. It is on `RUST_SERVED`"),
+     "THE EXEMPLAR. `csrc/third_party/flashinfer_moe/*.cu` holds 0 `__global__`; `src/moe/flashinfer_moe.cu` holds 0 and calls no kernel of ours; and `cutlass/` is in no source directory of this repo -- CPM fetches it into `target/**/_deps/flashinfer-src/3rdparty/cutlass` at configure time. The kernels are templates in headers we do not have. It returns `bool`, but a service that declines is still a service: the fallback is the CALLER's, not the row's. The 0 `__global__` was read a second time and finished the argument: a file with no device text in it is not device text, so the 817-line HOST program (workspace query, arch probe, autotuner, per-device tactic memo, on-disk tactic cache, dispatch) is `driver-cuda/src/fire/flashinfer_moe.rs` and `src/moe/flashinfer_moe.cu` is a five-function `extern \"C\"` seam over `CutlassMoeFCRunner` with two standard headers. It is NOT on `RUST_SERVED`: since `moe` crossed into fn-world this symbol is `x::moe::MOE_FUSED_CUTLASS`, a `contract!` with no `Entry` -- the driver-op shape, the third row of `x/mod.rs`'s registration table -- and `bind::service::moe_flashinfer_cutlass_moe_bf16` is the seam through which it reaches `driver-cuda/src/fire/flashinfer_moe.rs`. The `Service::Cutlass` classification is unchanged and is the only claim this entry makes"),
 
     // ── NCCL: not in this crate at all ────────────────────────────────────
     //
@@ -2322,6 +2247,22 @@ pub static SERVED: &[(&str, Service, &str)] = &[
      "the load half of the same trio, moving the stash back into the workspace"),
     ("pie_lora_qkv_correction",   Service::DriverOp,
      "the driver's own arm: `bind/mod.rs:1895` calls `(*state).apply(ctx.cublas, ...)`, a staged LoRA apply built out of grouped GEMM calls the driver already had. With no adapters staged it does NOTHING, which is an answer a `__global__` could not give"),
+
+    // ── the aligned MoE pointer build, reclassified by re-reading it ──────
+    //
+    // The ONE entry on this list that is a `__global__` and still a driver
+    // op, and the reason is not a device API: it is a LIFETIME. Its six
+    // pointer arrays have no stated consumer -- the batched-cuBLAS fallback
+    // that reads them is a lowering of `moe::moe_grouped_gemm_bf16`, not a
+    // statement -- so declaring them as trace results would hand the plan six
+    // values `lower.rs:1911`'s liveness frees at the first op past the build,
+    // and the GEMM would dereference bytes the next allocation took. Not a
+    // refusal; a wrong answer. So the arrays are the driver's arena, the
+    // symbol takes the third registration shape, and `x::moe` declares a
+    // `contract!` with NO `Entry` -- not even a `none:`, which would shadow
+    // this arm and refuse a live model at load.
+    ("moe::build_moe_ptrs_aligned_bf16", Service::DriverOp,
+     "the aligned MoE leg's step 3 of 8: one launch of `build_moe_ptrs_aligned<bf16>` that bakes three staging bases into six device pointer arrays. It DECLARES `gu_stage`/`act_stage`/`out_stage`, the destinations every op below it writes into, so the aligned leg cannot start without it -- which makes this symbol the gate on retiring `moe::flashinfer_cutlass_moe_bf16`, the only leg qwen3.5 decode takes and the one every aligned-leg condition already falls back FROM. Body: `driver-cuda/src/fire/moe_ptrs.rs`, whose per-fire bump arena carves the six, called from `bind/mod.rs`'s driver-op table beside `pie_lora_qkv_correction`. It had a `Walk` until this entry existed and `a_walk_is_only_a_walk` is right to refuse both -- see the note where that walk stood for where its `Control::Supplies` went"),
 
     // ── the dense GEMMs, reclassified by the step-5 `gemm` port ───────────
     //
@@ -2567,6 +2508,10 @@ pub static RUST_SERVED: &[&str] = &[
     // stated name and the fired name differ by a suffix, and `fire/moe.rs`
     // spells the fired one.
     //
+    // THAT SUFFIX OUTLIVED ITS REASON AND THEN HID ONE — the walk block for
+    // `moe` argues it, because eight stale walks passed every check on the
+    // strength of exactly this split.
+    //
     // **IT LEFT THIS LIST WITH THE FAMILY.** §5 step 5 took `moe` into
     // fn-world as `x::moe`, so `table::sig("moe::moe_grouped_gemm_bf16")`
     // now answers a `Contract::sig` — and a contract states NO operands,
@@ -2808,8 +2753,21 @@ pub static RUST_SERVED: &[&str] = &[
     // SOURCED -- unlike almost every other line in this block, this one moves
     // a live dispatch from the C shim to `bind::service` rather than merely
     // dropping an entry nothing reached.
-    // `attn/dsv4_compress.cu`'s four survivors. All four rows unsourced.
-    "attn::combine_attn_outputs_bf16",
+    // `attn/dsv4_compress.cu`'s four survivors.
+    //
+    // **This comment said "All four rows unsourced" and one of them was
+    // fully sourced.** `attn::combine_attn_outputs_bf16`'s row stated ten
+    // `Source`s -- `In(0..3)`, `Out(0..1)`, `Rows`, `Param(0..1)` and
+    // `Ctx("stream")` -- so it DID generate a dispatch arm and this entry was
+    // moving a live dispatch rather than dropping an entry nothing reached.
+    // The claim was written once for four symbols and re-derived for none,
+    // which is this file's own hazard: a sentence that counts a set is a
+    // count written twice. It is corrected rather than deleted because the
+    // three that remain are unsourced and the sentence is true of them.
+    //
+    // `attn::combine_attn_outputs_bf16` LEFT THIS LIST when it crossed into
+    // fn-world -- `x::attn`'s `COMBINE_ATTN_OUTPUTS`, a contract with a bind
+    // -- and its `Walk` was retracted in the same change. Three remain.
     "attn::dsv4_boundary_meta_decode",
     "attn::dsv4_boundary_meta_paged",
     "attn::attention_compressed_paged_bf16",
@@ -2861,11 +2819,15 @@ pub static RUST_SERVED: &[&str] = &[
     // `bind::service::moe_flashinfer_cutlass_moe_bf16` and
     // `fire/flashinfer_moe.rs` both STAY: they are the driver op.
     //
-    // ONE STALE CLAUSE IS LEFT DELIBERATELY: the `SERVED` entry for this
-    // symbol ends *"It is on `RUST_SERVED`"*, which this edit makes false.
-    // That entry belongs to the agent holding `csrc/src/moe/flashinfer_moe.cu`
-    // and the CUTLASS work behind it, and a two-agent edit to one string is
-    // worse than a sentence that is one round out of date.
+    // THE STALE CLAUSE IS TAKEN. The `SERVED` entry for this symbol ended
+    // *"It is on `RUST_SERVED`"*, which the edit above made false; it was
+    // left one round because the entry sits next to work belonging to the
+    // agent holding `csrc/src/moe/flashinfer_moe.cu`. It now says what is
+    // true -- the driver-op shape, and the `bind::service` seam -- and it
+    // touches no part of the entry that agent's work is about: the
+    // `Service::Cutlass` classification, the 0-`__global__` finding and the
+    // CPM path are all unchanged. A sentence a reader will take as a fact is
+    // worth one careful edit; leaving it was the worse half of the trade.
 
     // ── the P2P all-reduce plane, and the first `SERVED ∩ RUST_SERVED` ────
     //
@@ -3288,11 +3250,22 @@ impl Walk {
         // a test that a symbol is absent from every list, when the symbol is
         // no longer data in any list, is a test of the empty set.
         //
-        // And [`WALKED`] has grown from five to 45. Every one of the 45
-        // resolves through [`table::sig`] today — swept symbol by symbol
-        // against the row tables — so the second disjunct decided nothing
-        // even before its table was deleted: `||` short-circuited on `stated`
-        // for the whole population. Repointing it at anything in `x::` would
+        // And [`WALKED`] grew from five to 45, and is 24 now — every one of
+        // them `attn::`, because §5 has been emptying it a family at a time.
+        // The sentence that stood here said *"every one of the 45 resolves
+        // through [`table::sig`] today"*, and it is STILL TRUE, which is the
+        // interesting part. `moe`'s nine outlived `table/moe.rs` by two
+        // edits and went on resolving, because `table::sig` reads `KERNELS`
+        // and `KERNELS` is `ROW_TABLES ++ x::SIGS`: `stated` quietly stopped
+        // meaning "is a row" and started meaning "is a row OR a contract",
+        // and no sentence anywhere had to change for that to happen. That is
+        // the right answer for every other caller of `table::sig`, and it is
+        // why this check can never date a walk — see the block where those
+        // nine were deleted, which had to be a judgement instead of a red
+        // test. The observation the sentence was making holds for the 24
+        // that are left: the second disjunct decided nothing even before its
+        // table was deleted — `||` short-circuited on `stated` for the whole
+        // population. Repointing it at anything in `x::` would
         // have been worse than deleting it, because there is nothing in `x::`
         // for it to point AT (that is the fourth arrangement, and
         // `x/driver_internal.rs`'s header is the table of the four), so any

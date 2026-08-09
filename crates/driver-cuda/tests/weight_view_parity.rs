@@ -5,7 +5,7 @@
 //! and prints two things: the struct's ABI as `offsetof` sees it, and every
 //! field of every view its five factories produce. This test reproduces both.
 //!
-//! Run `tests/oracle/weight_view/run.sh` to regenerate [`GOLDEN_FNV1A64`].
+//! `tests/oracle/weight_view/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`].
 //!
 //! # Why the ABI half exists
 //!
@@ -316,8 +316,9 @@ fn the_rust_weight_view_reproduces_the_cpp_transcript() {
     assert_eq!(
         fnv1a64(t.as_bytes()),
         GOLDEN_FNV1A64,
-        "transcript differs from the C++ oracle; \
-         run tests/oracle/weight_view/run.sh with WV_ORACLE_OUT set to diff them"
+        "transcript differs from the C++ oracle, which cannot be re-run to diff \
+         against (see `oracle_census.rs`): the golden is the only record of \
+         it, so a divergence is THIS crate changing, not the oracle."
     );
 }
 

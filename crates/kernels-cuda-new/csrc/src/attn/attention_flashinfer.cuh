@@ -90,6 +90,18 @@
 // `attention_flashinfer_hd<N>.cu` translation units include, and it is a
 // different file on purpose. Nothing here belongs to a head_dim.
 //
+// THAT INCLUDER IS GONE, and so are the six. `driver-cuda/csrc` was deleted
+// wholesale and every `attention_flashinfer_hd<N>.cu` with it, which leaves
+// this header at ZERO includers and the "exactly one" rule satisfied
+// vacuously. The measurement stands -- it was taken on this box and the link
+// error is quoted above -- but it is now an argument with no subject, and the
+// address in it is an invitation to recreate a deleted file. Do not.
+//
+// `attention_flashinfer_common.cuh` outlived its own six includers the same
+// way and is the more interesting case: it has no compiler at all now, which
+// is why `launch_rules.rs::the_fa2_specification_has_not_shifted_under_its_
+// citations` exists to hold its line numbers still.
+//
 // It stays a non-template because it has no honest parameter, which is
 // `mla_paged.cuh`'s position on `write_mla` and `mxfp4_marlin.cuh`'s in the
 // words *"a width parameter would be a lie that compiles."* Every buffer is

@@ -879,3 +879,87 @@ cudaError_t AttnHd<HEAD_DIM>::prefill_custom(
 #include "kernels.def"
 
 }  // namespace pie_cuda_driver::kernels::attn
+
+// ── STATUS, APPENDED AT EOF ON PURPOSE ──────────────────────────────────────
+//
+// This block is at the END of the file and must stay there. Roughly thirty
+// live sites cite this file BY LINE NUMBER -- `driver-cuda/src/fire/
+// flashinfer_fa2.rs`, `fire/flashinfer_fa2_dispatch.rs`,
+// `kernels-cuda-new/src/families/fa2.rs`, `src/plan/*.rs`,
+// `csrc/src/attn/fa2.cuh`, two tests -- and NOTHING COMPILES THIS FILE, so an
+// edit that inserts a line above turns thirty accurate citations into thirty
+// confident wrong ones with no compiler and no assertion to catch it.
+// Annotate here, past the last cited line, or not at all.
+//
+// WHAT COMPILES IT: nothing, and nothing will. Measured -- **zero `#include`
+// consumers anywhere in the workspace**, in either crate, in any language.
+// Every archive translation unit that included it was an
+// `attn/attention_flashinfer_hd<N>.cu` and all of them are deleted;
+// `kernels-cuda/csrc/src/attn/attention_flashinfer_hopper.hpp:80` reached the
+// same finding independently. No JIT unit reaches it either, which
+// `kernels-cuda-new/src/source.rs::every_device_include_resolves` states as
+// its one exemption.
+//
+// DOES IT SURVIVE NORTH STAR STEP 6? Yes, and unchanged. It lives in
+// `kernels-cuda-new`, not in the archive. Step 6 deletes
+// `crates/kernels-cuda`, which is where five of its six host includes live --
+// `attn/attention_flashinfer.hpp`, `attn/attention_flashinfer_hopper.hpp`
+// (this file is the ONLY includer of both), `cuda_check.hpp`,
+// `kernels_manifest.hpp`, and `kernels.def` twice. Those includes stop
+// resolving in principle, which costs nothing, because they were already not
+// being resolved by anyone in practice.
+//
+// The `source.rs` exemption used to be argued from *"the archive is what
+// compiles it, and it finds them under `-I .../kernels-cuda/csrc/src`"*. That
+// is a justification with a deletion date. The durable one is above: a file
+// no compiler reads may include whatever it likes.
+//
+// SO WHAT IT IS NOW is the FA2 archive's specification -- the text those
+// thirty citations are citing -- and its job after step 6 is exactly the job
+// it has today. Nothing has to move out of it. What had to move out of the
+// files it INCLUDES is recorded at each of them:
+// `attention_flashinfer_hopper.hpp`'s sm_100 "a merge's callers are
+// everywhere" claim is carried in `driver-cuda/src/fire/merge_states.rs`, and
+// `kernels_manifest.hpp`'s B200 MXFP4 measurement is carried in
+// `driver-cuda/src/weights/plan.rs` (and, untracked, in `new-horizon.md`
+// §47.6).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Addendum: the line numbers are now GATED, and :75 expired ────────────
+//
+// Two things, both appended here rather than edited in above, for the reason
+// this block already gives: twenty-four sites cite this file BY LINE and
+// nothing compiles it, so an insertion anywhere above 878 renumbers them
+// silently.
+//
+// 1. That hazard is no longer unguarded.
+//    `kernels-cuda-new/tests/launch_rules.rs::the_fa2_specification_has_not_
+//    shifted_under_its_citations` pins seven anchor lines -- 79, 197, 432,
+//    591, 711, 801, 878 -- by exact text, spanning the file with no gap wider
+//    than 160 lines. An inserted or deleted line above 878 moves at least one
+//    and the test names it.
+//
+//    It is a SHIFT detector, not a citation checker, and the difference was
+//    measured before it was written: of the twenty-four citations only five
+//    quote a fragment that actually appears in the range they cite (±0 lines);
+//    a ±4-line window reaches thirteen, and the window width is a tuning knob,
+//    not a property. Since a shift moves every anchor below it at once, one
+//    firing pin proves the file moved and twenty-four would prove it no
+//    harder. So the gate's claim is narrow and exactly true: **no line was
+//    inserted or removed above 878.**
+//
+//    Which is why this addendum is here, below 878, and why the next one must
+//    be too.
+//
+// 2. `:75`'s prediction has expired. That line says `attn/kv_cache_view.hpp`
+//    still has archive includers, and the archive's CMakeLists quoted it as
+//    corroboration for keeping that header. Both are now unsupported: this
+//    file has ZERO `#include` consumers anywhere in the workspace -- every
+//    `attention_flashinfer_hd<N>.cu` that included it is deleted -- so
+//    `attention_flashinfer.hpp`, and through it `kv_cache_view.hpp`, are
+//    reached only by text that no compiler will ever read.
+//
+//    The correction is written up at `kernels-cuda/csrc/CMakeLists.txt` near
+//    :926 and :1143. The rule out of it: an `#include` from a translation
+//    unit that cannot be compiled is not a consumer. Line 75 is left as
+//    written -- it was true when taken, and moving it would trip item 1.

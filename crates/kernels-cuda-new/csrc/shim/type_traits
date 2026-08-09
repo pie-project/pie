@@ -103,6 +103,55 @@ struct conditional<false, T, F> {
 template <bool B, class T, class F>
 using conditional_t = typename conditional<B, T, F>::type;
 
+/// SFINAE: a `type` member only when `B`.
+///
+/// Asked for by carried upstream text, not by the closure:
+///
+/// ```text
+///   tensorrt_llm/common/cudaUtils.h:393  ceilDiv's two integral guards
+/// ```
+///
+/// which `csrc/src/moe/moe_glue.cuh` carries verbatim for its one device call
+/// site. It is here rather than dropped from that copy for the charter's
+/// reason: `ceilDiv` without the guard still compiles for `float` and
+/// silently performs a float division, which is a wrong answer where the
+/// whole point of a feature-subset shim is that a gap is a compile error.
+template <bool B, class T = void>
+struct enable_if {};
+template <class T>
+struct enable_if<true, T> {
+  using type = T;
+};
+template <bool B, class T = void>
+using enable_if_t = typename enable_if<B, T>::type;
+
+/// The integral types, and only the ones this tree can present.
+///
+/// `enable_if_t`'s companion at the same site. Enumerated rather than
+/// derived, because the standard's answer includes `char8_t`, `wchar_t`, the
+/// `char16_t`/`char32_t` pair and every cv-qualified spelling of all of them,
+/// and a partial list dressed as the standard trait is the kind of thing that
+/// reads true and answers false. What is here is what a `ceilDiv` argument in
+/// this tree has ever been, plus the sizes that would be a silent narrowing
+/// if omitted. `bool` is included because the standard includes it; nothing
+/// calls it that way.
+template <class T>
+struct is_integral : false_type {};
+template <> struct is_integral<bool> : true_type {};
+template <> struct is_integral<char> : true_type {};
+template <> struct is_integral<signed char> : true_type {};
+template <> struct is_integral<unsigned char> : true_type {};
+template <> struct is_integral<short> : true_type {};
+template <> struct is_integral<unsigned short> : true_type {};
+template <> struct is_integral<int> : true_type {};
+template <> struct is_integral<unsigned int> : true_type {};
+template <> struct is_integral<long> : true_type {};
+template <> struct is_integral<unsigned long> : true_type {};
+template <> struct is_integral<long long> : true_type {};
+template <> struct is_integral<unsigned long long> : true_type {};
+template <class T>
+inline constexpr bool is_integral_v = is_integral<T>::value;
+
 /// SFINAE's discard: any type list, collapsed to `void`.
 ///
 /// Two callers, one from each vendored library: FlashInfer's
@@ -165,6 +214,37 @@ inline constexpr bool is_pointer_v = is_pointer<T>::value;
 template <class T>
 __host__ __device__ constexpr const T& max(const T& a, const T& b) {
   return a < b ? b : a;
+}
+
+/// The smaller of two values, `constexpr`.
+///
+/// The caller the note above asked for, and it arrived with its own
+/// measurement. Not a host dispatch function and not guarded away -- a
+/// **device** compile-time constant, in the body of a `__global__`:
+///
+/// ```text
+/// csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh:1745
+///   constexpr int64_t FINALIZE_ELEM_PER_THREAD =
+///       128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+/// ```
+///
+/// `finalizeMoeRoutingKernel` and `finalizeMoeRoutingNoFillingKernel`, one
+/// site each, and it sizes the `cutlass::Array` every thread of those kernels
+/// loads and stores. So it is the same *shape* of fact that put `max` here --
+/// a compile-time constant that must be evaluated, not a host call that can
+/// be guarded -- reached from the other side of the host/device line.
+///
+/// The 58 host sites the note above measured are untouched by this: they are
+/// still guarded away, and this declaration does not un-guard them. What
+/// changed is that the measurement is no longer "58 sites, all host"; it is
+/// "58 host sites, all guarded, plus two device sites that cannot be".
+///
+/// `const T&` for `max`'s reason, and because the two must keep the same
+/// overload shape or a `std::min(a, b)` and a `std::max(a, b)` on the same
+/// pair of expressions would bind differently.
+template <class T>
+__host__ __device__ constexpr const T& min(const T& a, const T& b) {
+  return b < a ? b : a;
 }
 
 /// A value of `T` in an unevaluated context. Declared and never defined, as

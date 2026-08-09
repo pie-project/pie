@@ -951,11 +951,14 @@ fn elementwise_in(n: u32) -> Launch {
 ///
 /// # The one row this rule has, and where its host went
 ///
-/// `moe::hash_route_lookup_dev` in [`crate::families::moe`] is the only real
-/// member, and its `.cu` is deleted: the host is
-/// `driver-cuda/src/fire/dsv4_routing.rs`, which states the same three
-/// numbers from the same `<<<>>>`. The rule STAYS on the row rather than
-/// being retired with the file. A rule and a Rust launcher stating one
+/// `moe::hash_route_lookup_dev` in `families::moe` was the only real member,
+/// and BOTH are gone now: §5 step 5 took the family into fn-world, where
+/// `x::moe::hash_route_lookup` is the host program and states these three
+/// numbers itself from the same `<<<>>>` `fire::dsv4_routing.rs` did. The
+/// `_dev` suffix went with them — it existed because a symbol may not be
+/// both walked and unit-hosted, and a `unit!` kernel with a host `fn` beside
+/// it is neither. The rule STAYS in the vocabulary rather than being retired
+/// with its last row. A rule and a Rust launcher stating one
 /// rectangle is a check and not a duplication — either can be read against
 /// the other, which is exactly what nothing could do while the transcription
 /// lived only in a `.cu` nobody diffed against it.

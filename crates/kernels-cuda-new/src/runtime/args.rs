@@ -428,6 +428,25 @@ const fn is_pointer(ty: Ty) -> bool {
             | Ty::BufArrayOutMut
             | Ty::U8Array
             | Ty::I32Array
+            // A by-POINTER aggregate, and the only one on this list whose
+            // `Ty::needs_mirror()` is also true. Those two properties are
+            // independent and the pair here is what proves it: `needs_mirror`
+            // asks "is there a Rust/device struct pair to keep in sync", and
+            // this list asks "does a launch marshal it as eight bytes of
+            // address". `pack_dense_mask.cuh:193` takes
+            // `const StructuredMaskParams* __restrict__ masks` and
+            // `kernels::Ty::cpp` has spelled it `*const StructuredMaskParams`
+            // since it was written, so both answers are yes.
+            //
+            // It was omitted, and the omission cost a refusal rather than a
+            // wrong launch — which is the direction `bind::device::scalar`'s
+            // doc promises: a `Ty` on neither list is refused BEFORE a launch,
+            // so the two lists drifting apart can only add refusals. Adding a
+            // genuine pointer removes one. Adding a by-VALUE aggregate here
+            // would be the other direction and would write eight bytes where
+            // the kernel reads a struct; that is what `by_value!` and
+            // `ArgValue::Bytes` exist for.
+            | Ty::StructuredMasks
     )
 }
 
@@ -591,6 +610,19 @@ impl Args {
     /// array — while the driver is reading it.
     pub(crate) fn as_raw(&mut self) -> *mut *mut c_void {
         self.slots.as_mut_ptr()
+    }
+
+    /// The same array as a slice, for `cuLaunchKernelEx`.
+    ///
+    /// [`Args::as_raw`] answers `cuLaunchKernel`, which takes a bare
+    /// `void**`; `cuLaunchKernelEx` is reached through
+    /// `runtime::module::KernelModule::fire_ex`, whose signature is a slice
+    /// because its other caller builds the array by hand. **Same storage,
+    /// same `&mut` borrow, same guarantee** — the driver reads the cells
+    /// during the call and this borrow is what stops the `Vec` being pushed
+    /// to while it does.
+    pub(crate) fn slots_mut(&mut self) -> &mut [*mut c_void] {
+        &mut self.slots
     }
 }
 

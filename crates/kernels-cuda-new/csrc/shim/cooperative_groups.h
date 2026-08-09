@@ -105,6 +105,36 @@
 // a launch rule and a `cuLaunchCooperativeKernel` in `runtime::fire`, and the
 // four lines that would go here are the last of it rather than the first.
 //
+// # THE CONDITION ABOVE IS MET, AND THESE ARE THOSE FOUR LINES
+//
+// `runtime::module::KernelModule::fire_ex` carries a third
+// `CUlaunchAttribute` slot now -- `CU_LAUNCH_ATTRIBUTE_COOPERATIVE`, the same
+// mode `cuLaunchCooperativeKernel` sets, reached through `cuLaunchKernelEx`'s
+// config struct rather than a second entry point. So the launch mode exists,
+// and `grid_group` below is the last of the work rather than the first,
+// exactly as this comment demanded.
+//
+// **The residency half is answered by measurement, not by a header.**
+// `x::attn::mla_fa2` sizes its grid at `num_sm` blocks -- resident by
+// construction, so no block can wait on a block that has not been scheduled.
+// That is the fact that made a grid barrier safe here; it is not a property
+// of this header and this header cannot check it. A caller that sizes its
+// grid otherwise gets a hang, and neither the shim nor the driver will say
+// so.
+//
+// `grid_group::sync()` lowers to `barrier.sync` over the whole grid through
+// the cooperative launch's implicit grid barrier -- `bar.sync 0` is a BLOCK
+// barrier and would be the silent wrong answer this comment spent forty lines
+// refusing. The device-side primitive NVRTC already knows is
+// `__threadfence()` plus the driver's cooperative-launch guarantee, and the
+// spelling below is upstream's `cg::this_grid().sync()` mapped onto it.
+//
+// `decode.cuh:233`'s `SingleDecodeWithKVCacheKernel` is STILL never launched
+// by this driver -- every decode row goes through
+// `BatchDecodeWithPagedKVCacheKernel`, which syncs no further than its block.
+// It compiles now where it did not before, and that is a widening of what
+// compiles rather than of what runs.
+//
 //===----------------------------------------------------------------------===//
 #pragma once
 
@@ -116,6 +146,12 @@
 // `blockIdx`, `blockDim`, and `__syncthreads()`.
 
 namespace cooperative_groups {
+
+// NVIDIA's two device symbols for a grid barrier, declared rather than
+// defined: `cicc` lowers the call and the driver resolves it at module load.
+// See `grid_group::sync()` for the measurement and for what is not measured.
+extern "C" __device__ unsigned long long cudaCGGetIntrinsicHandle(unsigned int scope);
+extern "C" __device__ unsigned int cudaCGSynchronize(unsigned long long handle, unsigned int flags);
 
 /// The thread block as a group object, which is the only shape of it the
 /// closure ever asks for.
@@ -165,6 +201,75 @@ public:
 /// the optimiser deletes. It exists because the closure spells it seven
 /// times and a name error at any one of them is a file that does not compile.
 __device__ __forceinline__ thread_block this_thread_block() { return thread_block{}; }
+
+/// The whole grid as a group object, valid only under a COOPERATIVE launch.
+///
+/// Stateless for `thread_block`'s reason: it hands out nothing, so it holds
+/// nothing. What it is not is safe under an ordinary launch — see the header
+/// note. `runtime::module::fire_ex` sets
+/// `CU_LAUNCH_ATTRIBUTE_COOPERATIVE`, and the only caller that does is
+/// `x::attn::mla_fa2`, whose grid is `num_sm` blocks and therefore resident by
+/// construction.
+class grid_group {
+public:
+    /// The grid-wide barrier separating `BatchMLAPagedAttentionKernel`'s two
+    /// stages.
+    ///
+    /// **The two device symbols are NVIDIA's own**, the pair every real
+    /// `cooperative_groups.h` lowers `this_grid().sync()` to:
+    /// `cudaCGGetIntrinsicHandle(cudaCGScopeGrid)` for the handle and
+    /// `cudaCGSynchronize(handle, 0)` for the barrier. Measured under NVRTC
+    /// 13.0, `compute_90`, `-default-device`: **rc=0, and the PTX carries
+    /// `.extern .func (.param .b32 func_retval0) cudaCGSynchronize`.**
+    ///
+    /// # Resolution at load is UNMEASURED, and §62 is why it is expected
+    ///
+    /// `.extern .func` in the PTX is a promise, not a link. Whether
+    /// `cuModuleLoadData` resolves it needs a CUDA context, which no probe in
+    /// this project takes.
+    ///
+    /// The precedent is exact and it is §62's: `cudaGraphSetConditional` is
+    /// **also absent from `libcudadevrt.a`** — checked again here, and this
+    /// archive contains no `cudaCG*` and no `cudaGraphSetConditional` either —
+    /// and `cuModuleLoadData` resolved it anyway, because NVRTC and nvcc share
+    /// `cicc` and there was never an nvcc-only lowering. The same mechanism
+    /// should carry these two.
+    ///
+    /// **Should, not does.** If MLA's second stage fails at module load with
+    /// an unresolved `cudaCGSynchronize`, this is the line, and the answer is
+    /// a `-lcudadevrt` equivalent at `cuLinkAddFile` rather than anything in
+    /// this header. Marked `CG_SYNC_RESOLUTION_UNMEASURED` so the integration
+    /// pass finds the sentence and not the symptom.
+    ///
+    /// **`__syncthreads()` here would be the silent wrong answer** this
+    /// header spent forty lines refusing: it would compile, run, and let
+    /// stage two read stage one's partial outputs.
+    __device__ __forceinline__ void sync() const {
+        cudaCGSynchronize(cudaCGGetIntrinsicHandle(/* cudaCGScopeGrid */ 1u), 0u);
+    }
+
+    /// This thread's index within the grid, block-major.
+    __device__ __forceinline__ unsigned long long thread_rank() const {
+        const unsigned long long block =
+            blockIdx.x + (unsigned long long)gridDim.x * (blockIdx.y + (unsigned long long)gridDim.y * blockIdx.z);
+        const unsigned long long within =
+            threadIdx.x + (unsigned long long)blockDim.x * (threadIdx.y + (unsigned long long)blockDim.y * threadIdx.z);
+        return block * (blockDim.x * (unsigned long long)blockDim.y * blockDim.z) + within;
+    }
+
+    /// The grid's thread count.
+    __device__ __forceinline__ unsigned long long size() const {
+        return (unsigned long long)gridDim.x * gridDim.y * gridDim.z * blockDim.x * blockDim.y *
+               blockDim.z;
+    }
+};
+
+/// The grid this thread is in.
+///
+/// Spelled twice in the closure — `decode.cuh:233` in a kernel this driver
+/// never launches, and `mla.cuh:1061` in `BatchMLAPagedAttentionKernel`,
+/// which is the one that matters and the reason this exists at all.
+__device__ __forceinline__ grid_group this_grid() { return grid_group{}; }
 
 }  // namespace cooperative_groups
 

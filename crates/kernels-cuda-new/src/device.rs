@@ -988,25 +988,59 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // `topk_sigmoid` at `experts = 4, k = 2` where the routing table is
     // narrower than a warp.
     //
-    // `attn::kimi_split_q_b_bf16` is HELD, and the harness is the only reason
-    // anyone knows to hold it. The row's extent is `total <- InElements(0)`
-    // -- the input's element count -- but `LaunchRule::Elementwise` sizes the
-    // grid from `width_of(b, n_in + 0)`, the FIRST OUTPUT's width. This row
-    // splits a q projection into `q_nope` and `q_pe`, so its input is
-    // strictly wider than out 0 by construction, and the JIT under-covers by
-    // exactly that ratio: at 6 rows of 8 heads (nope 128, rope 64) it wrote 4
-    // of 6 rows, leaving 4,082 of 12,544 bytes of `q_nope` and 2,041 of 6,400
-    // of `q_pe` still holding the poison fill. The archive's launcher reads
-    // the same `total` the row states, which is why the two disagree.
+    // `attn::kimi_split_q_b_bf16` was HELD HERE, and the harness is the only
+    // reason anyone knew to hold it. The row's extent is `total <-
+    // InElements(0)` -- the input's element count -- but
+    // `LaunchRule::Elementwise` sizes the grid from `width_of(b, n_in + 0)`,
+    // the FIRST OUTPUT's width. This row splits a q projection into `q_nope`
+    // and `q_pe`, so its input is strictly wider than out 0 by construction,
+    // and the JIT under-covers by exactly that ratio: at 6 rows of 8 heads
+    // (nope 128, rope 64) it wrote 4 of 6 rows, leaving 4,082 of 12,544 bytes
+    // of `q_nope` and 2,041 of 6,400 of `q_pe` still holding the poison fill.
+    // The archive's launcher reads the same `total` the row states, which is
+    // why the two disagree.
     //
     // It is worth saying how nearly this was missed. The row's third shape --
     // 1 row, 1 head -- agrees in every byte, because 200 elements round up
     // into a 256-thread block that covers all 255 the kernel wanted. One
-    // shape would have certified it. The divergence is now an INVERTED
-    // assertion in `driver-cuda/tests/jit_parity.rs`: if those shapes ever
-    // agree, the test fails and says to route the row.
-    "attn::kimi_split_kv_a_norm_bf16",
-    "moe::topk_sigmoid_bf16",
+    // shape would have certified it.
+    //
+    // **AND THE HOLD DID NOT HOLD.** A later pass -- "BATCH: THE ROWS WHOSE
+    // UNIT AND SOURCES WERE BOTH ALREADY THERE", below -- routed it anyway,
+    // and `kernels-cuda/tests/sources.rs:1034` records the consequence:
+    // `attn/kimi_mla.cu` was deleted because the row was routed, so the
+    // launcher that had the RIGHT extent went and the grid that had the wrong
+    // one stayed. That batch is honest about its own criteria and they are
+    // three -- a unit hosts the text, every operand states a `Source`, no C++
+    // calls the launcher -- and "this symbol is held for a measured
+    // divergence" is not among them. **A join over three facts cannot see a
+    // fourth that lives in a comment.** The paragraph at BATCH 7 naming the
+    // four divergent rows was still here, unchanged, while one of the four
+    // was routed nineteen lines further down.
+    //
+    // It is CLOSED now, and not by a `LaunchRule` fix: both kimi rows crossed
+    // into fn-world as `crate::x::attn::kimi_mla`, where the `fn` forms
+    // `tokens * heads * (nope + rope)` itself -- which is what the deleted
+    // launcher did -- and no rule is consulted. `attn::kimi_split_q_b_bf16`
+    // and `attn::kimi_split_kv_a_norm_bf16` are both GONE FROM THIS LIST
+    // because their `table::attn` rows are gone: a contract carries no
+    // `operands`, so `abi.rs`'s `stated()` drops the row before
+    // `emit_c_shim` sees it, there is no `KernelSig` left for
+    // `emit_rust_dispatch` to build an arm from, and leaving either line
+    // would trip `driver-cuda/build.rs`'s `armless` check.
+    //
+    // The four-divergent-rows paragraph below is left as written. Three of
+    // the four have now been closed by CROSSING rather than by repairing a
+    // rule -- `pad_head_dim`, `strip_head_dim`, `kimi_split_q_b` -- which is
+    // worth noticing as a pattern and not as three coincidences: a launch
+    // written where it is fired has no rule to disagree with.
+    // `moe::topk_sigmoid_bf16` stood here. §5 step 5 took `moe` into
+    // fn-world and it is `x::moe::topk_sigmoid_bf16` now — a `contract!` and
+    // a `bind!`, so `abi.rs`'s `stated()` drops the row before
+    // `emit_c_shim` sees it, there is no `KernelSig` left for
+    // `emit_rust_dispatch` to build an arm from, and leaving the line would
+    // trip `driver-cuda/build.rs`'s `armless` check. The BATCH 5 paragraph
+    // above is left as written; nothing in it is retracted.
     // BATCH 6 -- one row of two, and the one held is held for a reason no
     // gate in this crate could have raised.
     //
@@ -1033,7 +1067,11 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // the block form -- all three shapes agree in EVERY byte. Routing this
     // row would therefore not be a migration but a behaviour change, and the
     // countdown is not worth a silently different expert ranking.
-    "moe::topk_sigmoid_bias_fp32",
+    // `moe::topk_sigmoid_bias_fp32` stood here, and crossed with the rest of
+    // `moe` for the reason under BATCH 5. The `Bool`/`I32` paragraph above
+    // is about the row it was measured beside and stays as written — in
+    // fn-world the question does not arise, because the host `fn` takes the
+    // `__global__`'s own `int` and there is no second spelling to reconcile.
     // BATCH 7 -- EVERY REMAINING ARMED ROW, IN ONE COMMIT.
     //
     // 34 rows carried a generated arm; 30 are here. The four absent are the
@@ -1050,26 +1088,46 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // The other 30 are proven by the build, which is what the four compulsory
     // compiles check: `routed_rows_have_an_arm` for the arm, the `bridge`
     // link for the shim edge, and `cargo check` toolkit-free.
-    "attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
     "attn::attention_naive_paged",
+    // `attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16` stood here, the
+    // first line of the block above. It is `x::attn::QKV_PACKED_POST` now —
+    // contract, bind and a host `fn` — and its line goes for BATCH 5's
+    // reason: a contract states no `operands`, so `emit_c_shim` emits no
+    // entry and there is nothing for a routing list to keep it out of.
+    //
+    // Its DECODE sibling was never on this list and still is not:
+    // `attn::qkv_decode_qk_norm_rope_write_kv_bf16` is served by
+    // `bind::service` out of `driver-cuda/src/fire/qkv_fused.rs`, so the row
+    // stays in `table::attn` and the shim never had an entry to drop.
     // `mlp::chunked_swiglu_bf16` stood here — the one row of `mlp`'s twelve
     // that was NOT in BATCH 2, because `mlp/swiglu.cu` still called it. It
     // went into fn-world with the other eleven and is
     // `x::mlp::chunked_swiglu_bf16` now.
-    "moe::topk_sqrtsoftplus_bf16",
-    "moe::token_batched_weighted_sum_bf16",
-    "moe::token_batched_weighted_sum_add_bf16",
-    "moe::gather_moe_aligned_inputs_bf16",
-    "moe::moe_align_decode",
+    // `moe`'s five stood here — `topk_sqrtsoftplus_bf16`,
+    // `token_batched_weighted_sum_bf16`,
+    // `token_batched_weighted_sum_add_bf16`,
+    // `gather_moe_aligned_inputs_bf16` and `moe_align_decode`. All five
+    // crossed into fn-world with the family and are host `fn`s in `x::moe`,
+    // three of them bound to `Cx` and two — the weighted-sum pair — fired
+    // from `moe_dispatch`'s multi-launch bodies. Their lines go for BATCH
+    // 5's reason: no `operands` on a contract, so no arm, so `armless`.
     // `norm`'s three stood here — `attn_sink_correction_bf16`,
     // `per_head_rmsnorm_bf16` and `hc_expand_bf16`, the three §43.9 routed by
     // DELETING their launchers. All three are host `fn`s in `x::norm` now,
     // which is the first time their geometry is written anywhere but a
     // `LaunchRule`.
-    "quant::mxfp4_moe_gate_up_decode_bf16",
-    "quant::mxfp4_moe_down_decode_bf16",
-    "quant::wna16_gate_up_decode_bf16",
-    "quant::wna16_down_decode_bf16",
+    // `quant`'s LAST FOUR stood here — `mxfp4_moe_gate_up_decode_bf16`,
+    // `mxfp4_moe_down_decode_bf16`, `wna16_gate_up_decode_bf16` and
+    // `wna16_down_decode_bf16`, the routed decode GEMVs. They outlived
+    // `quant`'s other eleven by a round for a filing reason and not a
+    // technical one: their rows were in `table::moe`, because **`table/` is
+    // organised by who DISPATCHES and `x/` by who owns the code**, and a
+    // family's name in one world does not predict its name in the other.
+    // They are `x::quant`'s contracts and binds now, their device text is
+    // two ordinary `unit!` rows in `dequant_fp4` and `dequant_wna16`, and
+    // `table::moe::KERNELS` is empty with their deletion — which is what
+    // takes the second entry out of `table::ROW_TABLES` and leaves `attn`
+    // as the only row world in the tree.
     // `rope`'s three stood here — `rope_standard_table`,
     // `rope_partial_bf16` and `qk_rmsnorm_rope_bf16`. `rope` crossed into
     // fn-world and nothing is ROUTED any more: a contract carries no
@@ -1170,9 +1228,34 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // `driver-cuda/src` has no `pie_k_norm_residual_add_bf16` anywhere. The
     // fourth file under `csrc/src/norm/` is deleted and the directory with
     // it. The header above carries the full argument.
-    "attn::dsv4_compress_gather_paged_bf16",
-    "attn::dsv4_store_comp_entries_bf16",
-    "attn::kimi_split_q_b_bf16",
+    // `attn::dsv4_compress_gather_paged_bf16` and
+    // `attn::dsv4_store_comp_entries_bf16` stood here. Both are
+    // `crate::x::attn`'s `DSV4_COMPRESS_GATHER_PAGED` and
+    // `DSV4_STORE_COMP_ENTRIES` now — contracts with `none:` arms — and their
+    // lines go for BATCH 5's reason: a contract states no `operands`, so
+    // `emit_c_shim` emits no entry and there is nothing to keep out of it.
+    //
+    // Neither was ever fired from either side. Their rows were unsourced, so
+    // `emit_rust_dispatch` skipped them WHOLE; their names are on
+    // `driver-cuda/tests/executor_bind.rs`' UNARMED list; and the reason is
+    // one level further up than a missing arm — `dsl.rs:4684` and `:4702`
+    // record one and two inputs for kernels that read twelve and eight
+    // operands.
+    //
+    // The four OTHER launchers of `attn/dsv4_compress.cuh` were never on this
+    // list and still are not. Three of them —
+    // `dsv4_boundary_meta_decode`, `dsv4_boundary_meta_paged` and
+    // `attention_compressed_paged_bf16` — are `bind::service`-served out of
+    // `driver-cuda/src/fire/dsv4_compress.rs`, which fires the unit's `_dev`
+    // rows by name. The fourth, `combine_attn_outputs_bf16`, has crossed into
+    // `crate::x::attn` and is fired by its own host `fn`, which is a third
+    // way of not being on this list and reaches the same `_dev` row.
+    // `attn::kimi_split_q_b_bf16` STOOD HERE, added by this batch's join over
+    // three facts while a fourth -- its measured divergence, recorded at the
+    // top of this list and never withdrawn -- sat in a comment the join could
+    // not read. It crossed into `crate::x::attn::kimi_mla` with its sibling
+    // and the crossing is what closed the defect; the argument is at the
+    // BATCH 6 note above, beside the numbers.
     // `attn::pad_head_dim_bf16` and `attn::strip_head_dim_bf16` STOOD HERE.
     // Both crossed into `crate::x::attn`, and the crossing is what closed
     // the `LaunchRule::PerHead` head-count defect their routing had made
@@ -1200,8 +1283,19 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // `table::driver_internal` is gone, so on the reading above that line is
     // already armless. Recorded, not repaired, because a deletion is a claim
     // about a consumer set and this is not my consumer set to re-derive.
-    "moe::apply_per_expert_scale_bf16",
-    "moe::topk_softmax_bf16",
+    // `moe`'s last two stood here — `apply_per_expert_scale_bf16` and
+    // `topk_softmax_bf16`, both `x::moe` host `fn`s now.
+    //
+    // BATCH 6's paragraph on the held row is NOT resolved by the crossing
+    // and is not retracted. `x::moe::topk_softmax_bf16` binds the BLOCK
+    // form, which is the one thing the row could name, so the 53/512
+    // divergence at 8x64 stands exactly as measured. What changed is where
+    // the ladder could go: fn-world can express the run-time choice — it is
+    // an `if` in the `fn` — and this port did not make it, because five more
+    // instantiations is a change to what NVRTC compiles and belongs to the
+    // session that measures it. A held row became a stated omission with a
+    // place to land, which is a smaller thing than a fix and a different
+    // thing from nothing.
     // `norm`'s five stood here — `add_bias_bf16`, `residual_add_bf16`,
     // `rmsnorm_bf16`, `rmsnorm_gated_fp32_in_bf16` and
     // `rmsnorm_strided_bf16`. `norm` crossed into fn-world (§5 step 5) and
@@ -1231,13 +1325,17 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // avoided: there is no shim entry to link against and no `pie_k_*` name
     // to write, because a fn-world row states no `operands` at all.
     //
-    // The four routed MoE decode GEMVs further up — `mxfp4_moe_gate_up`,
-    // `mxfp4_moe_down`, `wna16_gate_up`, `wna16_down` — carry a `quant::`
-    // symbol and are NOT part of this and did NOT move. Their device text is
-    // `quant/dequant_fp4.cuh` and `quant/dequant_wna16.cuh`, so `x::quant`
-    // hosts their rows and states their `KernelSig`s verbatim, but their
-    // CONTRACTS are `table::moe`'s and their `LaunchRule`s are real, so they
-    // are still rule-driven and still need every line above.
+    // The four routed MoE decode GEMVs — `mxfp4_moe_gate_up`,
+    // `mxfp4_moe_down`, `wna16_gate_up`, `wna16_down` — DID move, one round
+    // later than the rest of `quant` and for a filing reason: they carry a
+    // `quant::` symbol but their rows were `table::moe`'s, so the crossing
+    // that emptied `quant`'s table left them behind and the one that emptied
+    // `moe`'s did not claim them. Both worlds' names had to be built whole
+    // and intersected before anyone could see them. They are `x::quant`
+    // contracts and binds now, their geometry is three `const fn`s beside
+    // the four host programs, and their `LaunchRule`s are `Unstated` like
+    // every other `unit!` row — the rules themselves stay live for
+    // `kernels-metal`, which still states `RoutedQmv` on three rows.
 ];
 
 /// [`ELEMENTWISE`]'s rows that [`JIT_DISPATCHED`] names, as the emitters take
@@ -2144,11 +2242,22 @@ pub static SPECIALISED: &[&[&Specialisation]] = &[
     // by scalar256/scalar512/vec256/vec512/vec1024, and the −38%/−49%/−53%
     // against the shipping scalar — moved with the `fn`.
     //
-    // The five `attn/kv_paged.cuh` appenders — `write_kv`,
-    // `write_kv_at_positions`, `write_kv_explicit`, `write_kv_explicit_devwin`
-    // and `copy_kv_cells`, each `template <bool HND_LAYOUT>` and each chosen
-    // by a host flag the launcher reads per layer.
-    crate::families::attn::SPECIALISATIONS,
+    // `families::attn::SPECIALISATIONS` stood here next, and was the last —
+    // the five `attn/kv_paged.cuh` appenders (`write_kv`,
+    // `write_kv_at_positions`, `write_kv_explicit`, `write_kv_explicit_devwin`,
+    // `copy_kv_cells`), each `template <bool HND_LAYOUT>`. `attn` crossed
+    // that root into `crate::x::attn::kv_paged` and they went with it.
+    //
+    // **This slice is now empty and that is the terminal state, not a gap.**
+    // A `Specialisation` is row-world's way of saying "one symbol, two
+    // instantiations, a host flag decides" — and fn-world says it with an
+    // `if` in a host `fn`, which is `x/norm.rs:1033`. Every family has
+    // crossed or is crossing; no sixth `SPECIALISATIONS` slice is coming.
+    // The machinery below (`specialisation`, `specialisations`,
+    // `Specialisation::agrees`, `Arm`, `Take`, `Term`) still compiles and
+    // still has `tests/specialise.rs` over it, and it retires when the last
+    // caller of `runtime::fire::selects` does — which is a `runtime/**`
+    // question and therefore the owner's.
 ];
 
 /// Every specialised row, flattened — what a reader and a test want.

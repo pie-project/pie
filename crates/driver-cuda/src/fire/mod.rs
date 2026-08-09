@@ -24,8 +24,17 @@
 /// gated.
 ///
 /// [`tower`]: crate::tower
-#[cfg(feature = "bridge")]
-pub mod flashinfer_moe;
+// `pub mod flashinfer_moe;` was here, under `#[cfg(feature = "bridge")]`. It
+// was the host half of the fused CUTLASS MoE — the workspace query, the arch
+// probe, `CutlassMoeFCRunner<bf16,bf16>` through five `extern "C"` seams, and
+// latterly a Rust `to_underlying_arguments` filling 1,408 measured bytes of
+// `GemmKernel::Params`.
+//
+// It went with the leg it served. **What it leaves behind is one bind**:
+// `moe::build_moe_ptrs_aligned_bf16` declares `gu_stage`/`act_stage`/
+// `out_stage`, the destinations every op in the aligned leg writes into, and
+// it has never had an arm in either world — the fused leg had been covering
+// for it. Until it binds, qwen3.5's MoE has no leg that starts.
 /// `attn/attention_flashinfer.cu`'s PLAN HALF, in Rust — the sixth file this
 /// migration found wearing a `.cu` extension for linkage rather than content:
 /// 1,258 lines with `__global__` 0, `__device__` 0 and one launch, which is
@@ -127,8 +136,10 @@ pub mod attn_score;
 /// `LaunchRule::Unstated` for every row it generates, so the finding above
 /// is no longer a choice a row makes — it is the only thing a device
 /// declaration can say, which is what "no rule states this" always meant.
-/// The two callers in [`kv_paged`] and the one in `bind::abi` call the new
-/// path directly.
+/// The one caller in `bind::abi` calls the new path directly, and the two
+/// that were in [`kv_paged`] moved with their bodies into
+/// `x::attn::kv_paged` — where the call is now a sibling module's, which is
+/// the shape the two `envelope_*` calls always wanted.
 /// `layout/embed.cu`'s one launcher, IN FN-WORLD — and with it the whole of
 /// `kernels-cuda/csrc/src/layout/`, which is now EMPTY. The `VEC` choice is a
 /// 16-byte alignment test on two pointers plus `hidden % 8`, and the extent
@@ -158,12 +169,12 @@ pub mod attention_naive;
 /// third — the causal top-k mask, whose row is FULLY SOURCED — needed the
 /// split so a live dispatch could move off the C shim.
 pub mod dsa_indexer;
-/// `attn/dsv4_compress.cu`'s four surviving launchers, in Rust — the whole
-/// file. Nine went in earlier passes. Three needed only §60.6's symbol split;
-/// `combine_attn_outputs_bf16` needed a device row that had been deliberately
-/// withheld, and the reason it was withheld — the block clamps to 256 where
-/// `PerHeadElementwise` clamps to 128, invisibly — is why the new row is
-/// `LaunchRule::Unstated` and the geometry is the driver's.
+/// `attn/dsv4_compress.cu`'s three surviving launchers, in Rust — the whole
+/// file. Nine went in earlier passes and a tenth,
+/// `combine_attn_outputs_bf16`, has crossed into fn-world as
+/// `kernels_cuda_new::x::attn`'s `COMBINE_ATTN_OUTPUTS`; it is the only one
+/// of the four whose every value came out of the statement. The three that
+/// remain needed §60.6's symbol split and nothing else.
 pub mod dsv4_compress;
 /// `gemm/gemm.cpp`'s HOST PROGRAM, in Rust — **zero `__global__`, zero
 /// `<<<>>>`, 138 cuBLAS/cuBLASLt calls**. Not a kernel file and never was: a
@@ -275,35 +286,31 @@ pub mod launch;
 // `none:` arm: `Cx` cannot be asked whether the deployment renormalises its
 // top-k or by what factor it scales, which is the one thing between it and a
 // bind. `x/moe.rs`'s header states the two-line patch.
-/// `attn/kv_paged.cu`'s device-window explicit KV append and its quantised
-/// appenders — refusals that threw, a `Term::Is` over the page layout, a grid
-/// over the fire's full lane count, and the four-armed `layer.scheme` switch
-/// that `kernels::Ty::Fp8Kind` unblocked.
+/// What is LEFT of `attn/kv_paged.cu`'s host side: the cell move
+/// `serve::transfer` fires, and the two page-view builders the driver's own
+/// plan building consumes.
 ///
-/// **FOUR of the five launchers here are now REACHED**, and §58 is the
-/// reason the fourth took two passes. §58 read `a_walk_is_only_a_walk`
-/// against `Specialisation::agrees` and concluded a specialised symbol wants
-/// no `Walk`, no `RUST_SERVED` entry and no `bind::service` shim — it wants
-/// the device row and the specialisation it already has. True, and it leaves
-/// the Rust unreachable: the only thing that CAN call it is a generated
-/// dispatch arm, and the emitter writes one only for `JIT_DISPATCHED` or
-/// `RUST_SERVED`. "It needs a caller" and "it needs a classification" were
-/// the same sentence.
+/// **The seven appenders and dequanters MOVED** to
+/// `kernels_cuda_new::x::attn::kv_paged`, with `fp4_block_size`,
+/// `max_touched_pages`, and `Fp8Kind` as `fp8_kind_of` over the floor's own
+/// `x::fp8_kind`. The four `Launched`/`Declined` enums did NOT go with them. The head of
+/// [`kv_paged`] states the discriminator that decided it — a driver op is a
+/// symbol whose body needs a driver RESOURCE, and none of the seven does —
+/// and the measurement that let the enums go: all ten call sites consumed
+/// their return with `let _ =`, so `Fired` says strictly more than anything
+/// read.
 ///
-/// §60.6 dissolves it rather than choosing a side. The DEVICE rows for
-/// `write_kv_explicit_bf16_devwin` are `..._devwin_dev` and
-/// `WRITE_KV_EXPLICIT_DEVWIN`'s `base` moved with them, so the ahead-of-time
-/// symbol is unit-free and walkable while the `Specialisation` still
-/// resolves — exactly the arrangement the sibling `write_kv_explicit_bf16`
-/// was already in. `write_kv_to_pages_quantised` stays unreached and is the
-/// genuine §58 case: it is a staging function with a live Rust caller in
-/// this same module, not a row anyone dispatches.
+/// What remains here is the `TryFrom<&KvCacheLayerView> for KvLayer` those
+/// call sites now go through, and the three survivors above.
 ///
-/// `write_kv_to_pages` and `write_kv_explicit_bf16` took the other door:
-/// classified `Execution::Walk`, named in `execution::RUST_SERVED`, reached
-/// through `bind::service`. Both fire the quantised port and
-/// [`envelope`] underneath them, so the two staging functions are live code
-/// with a caller even though their own symbols are not routed.
+/// **The `Specialisation`s that this doc used to argue about are gone.**
+/// §58 read `a_walk_is_only_a_walk` against `Specialisation::agrees` and
+/// concluded a specialised symbol wants no `Walk`, no `RUST_SERVED` entry
+/// and no `bind::service` shim; §60.6 dissolved that by moving the device
+/// rows to `..._dev` names. Both were reasoning about a mechanism no reader
+/// consulted: this module had been picking `#hnd`/`#nhd` in Rust and firing
+/// by name through `hand::fire` the whole time, so `selects()` was asked
+/// about none of the five. `device::SPECIALISED` is empty and terminal.
 pub mod kv_paged;
 /// The fused LM-head GEMV + argmax IS GONE — `sample/argmax.cu`'s last
 /// launcher, and the whole of `csrc/src/sample/`. Two JIT'd kernels with a
@@ -333,13 +340,22 @@ pub mod mla_paged;
 /// **These were the last two launches nvcc could reach, and the whole-tree
 /// census could not see them**: they sat in a `.cuh`, and
 /// `kernels-cuda/tests/sources.rs` counts over `.cu` and `.cpp` because device
-/// text does not launch (`new-horizon.md` §63.3). Not `RUST_SERVED` and not
-/// yet firing: their C++ callers moved down into
-/// `kernels-cuda/csrc/src/attn/attention_mla.cu`, which cannot be deleted
-/// until the OTHER arm of `attn::dispatch_attention_mla_bf16` — FlashInfer's
-/// `BatchMLAPagedAttention`, which passes `MLAParams` by value — can be fired,
-/// and that needs `ArgValue::Bytes`, which only `x::Abi` produces. The same
-/// blocker XQA has.
+/// text does not launch (`new-horizon.md` §63.3).
+///
+/// **`kernels-cuda/csrc/src/attn/attention_mla.cu` IS NOW DELETED** and this
+/// module is the only Rust that reaches these two. The condition stated here
+/// was that the OTHER arm — FlashInfer's `BatchMLAPagedAttention`, which
+/// passes `MLAParams` by value — become fireable; it did, as
+/// `kernels_cuda_new::x::attn::mla_fa2`, over an `x::Abi` `by_value!` whose
+/// untagged arm landed for it. The row went to `x::attn::ATTENTION_MLA` and
+/// took the shim entry with it, and `kernels-cuda/tests/sources.rs`'
+/// `EXPECTED` is 0.
+///
+/// Still not firing, and now for ONE reason rather than two: this arm is
+/// chosen on `cudaDevAttrComputeCapabilityMajor >= 10`, and neither `Cx` nor
+/// the runtime states a compute capability. The contract's `none:` arm names
+/// that plus the three MLA facts `Cx` lacks. **Both host programs are
+/// written; what is missing is the vocabulary to choose between them.**
 pub mod mla_naive;
 // `fire::moe` IS GONE — §5 step 5 took `moe` into fn-world as `x::moe`. It
 // held the routing/gemv/finalize launchers with no doc block of their own;
@@ -352,11 +368,15 @@ pub mod mla_naive;
 // scatter-accumulate. The last three landed after this module's header had
 // spent a section arguing they could not: they are unit-hosted AND their
 // `table::moe` rows are unsourced, which barred `JIT_DISPATCHED` and forced
-// a `_dev` symbol split. The `_dev` split is GONE with the port — `unit!`
-// hosts a `__global__` for the readers and a host `fn` fires it, and neither
-// needs the other's name — and the unsourcedness it was working around is
-// now what it always meant: `none:` arms, `Route::Unbound` at model load
-// with a sentence, and `Control::Supplies` still the reason.
+// a `_dev` symbol split. Both halves of that survive the port and they no
+// longer cost the same thing. The `_dev` names STAY, because seven `moe`
+// symbols are still `execution::Walk` classifications and
+// `a_walk_is_only_a_walk` means a walked symbol may not also be a unit row
+// — but the split is now invisible to every caller: the device name is a
+// `unit!` instantiation string, the stated name is a `contract!`, and the
+// host `fn` between them is the only thing either reader calls. The
+// unsourcedness is what it always meant: `none:` arms, `Route::Unbound` at
+// model load with a sentence, and `Control::Supplies` still the reason.
 //
 // `csrc/src/moe/` is left holding `flashinfer_moe.cu`, which is an
 // `extern "C"` INSTANTIATION SEAM and nothing else — five functions over
@@ -366,6 +386,18 @@ pub mod mla_naive;
 // zero `__global__` to move because it never had any, and
 // `moe::flashinfer_cutlass_moe_bf16` is `x::moe`'s one driver op — a
 // `contract!` with no `Entry`, the third registration shape.
+
+/// `moe::build_moe_ptrs_aligned_bf16` — the aligned MoE leg's pointer build,
+/// and `x::moe`'s SECOND driver op. It became one because the six device
+/// pointer arrays it fills have no stated consumer: the batched-cuBLAS
+/// fallback that reads them is a lowering of `moe::moe_grouped_gemm_bf16`,
+/// not a statement, so declaring them as trace results would hand the plan
+/// six values liveness frees at the next op. The file's header carries the
+/// measurement; the short version is that this is the gate on retiring the
+/// fused CUTLASS leg, because the aligned leg is the only leg left and it
+/// cannot start without this call.
+pub mod moe_ptrs;
+
 /// `attn/page_compact.cu`'s one launcher, in Rust — the whole file. Two
 /// launches on one stream, the second reading the `scratch_counts` buffer the
 /// first fills; `execution::COMPOSED` has stated that pair since the split

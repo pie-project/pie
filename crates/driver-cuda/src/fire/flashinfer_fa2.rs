@@ -246,6 +246,34 @@ impl core::fmt::Display for Decline {
 /// Stated here as well as in [`kernels_cuda_new::families::fa2::HEAD_DIMS`]
 /// because this is the *gate* and that is the *lattice*: they must agree, and
 /// [`the_gate_and_the_lattice_agree`] is what makes them.
+///
+/// # `kernels.def` HAS NO READER LEFT, so the values are carried and not cited
+///
+/// That file states its own consumers — *"Consumed twice … C++ … CMake"* —
+/// and both are gone. `csrc/CMakeLists.txt` is DELETED, and the C++ side is
+/// `kernels_manifest.hpp`, whose only includers are
+/// `kernels-cuda-new/csrc/src/attn/attention_flashinfer_common.cuh` (zero
+/// includers of its own) and a `#include` line inside
+/// `driver-cuda/tests/hf_config_dump/generate.py`'s template, whose output
+/// `.cpp` is not on disk and has no build. It is not swept into the
+/// generated production shim either: `kernels-cuda/build.rs::includes()`
+/// takes every `*.hpp` in the FAMILY directories, and
+/// `kernels_manifest.hpp` sits at `csrc/src/` top level.
+///
+/// So `kernels.def` is the archive's last piece of pure text and it is
+/// deleted with `crates/kernels-cuda`. This citation is therefore to a file
+/// that will not resolve, which is fine for the list — the four values ARE
+/// the content and they are right here — and not fine for the one fact the
+/// citation was carrying alone. That fact, verbatim from `kernels.def:53-56`
+/// so it survives the file:
+///
+/// > 96 is deliberately absent: the prefill dispatch never had a 96 case, so
+/// > a checkpoint that truly reached the kernels with 96 would already fail
+/// > there — which is what made the decode side's `<96>` instantiations
+/// > detectable as dead.
+///
+/// Phi-3-mini's 96 arrives as 128; the head dim is rounded up to one of the
+/// four before it reaches a kernel.
 const HEAD_DIMS: [u32; 4] = [64, 128, 256, 512];
 
 /// `attn_head_dim_instantiated`, `attention_flashinfer.cu:236`.
@@ -1310,7 +1338,13 @@ mod tests {
         for hd in HEAD_DIMS {
             assert!(head_dim_instantiated(hd));
         }
-        assert!(!head_dim_instantiated(96), "96 is deliberately absent; see kernels.def");
+        assert!(
+            !head_dim_instantiated(96),
+            "96 is deliberately absent — the prefill dispatch never had a 96 \
+             case, so a checkpoint reaching the kernels with 96 fails there. \
+             The reason is carried in `HEAD_DIMS`' doc; `kernels.def` is \
+             deleted with the archive and has no reader."
+        );
         assert!(!head_dim_instantiated(0));
     }
 

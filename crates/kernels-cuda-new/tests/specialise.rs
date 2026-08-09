@@ -392,11 +392,22 @@ fn every_specialisation_agrees_with_its_base() {
         spec.agrees().unwrap_or_else(|why| panic!("{why}"));
         n += 1;
     }
-    assert!(n > 0, "the table came across empty, so this proved nothing");
+    // `n == 0` WAS a failure and is now the expected state. `norm`, `moe` and
+    // `attn` were the three families that registered a `SPECIALISATIONS`
+    // slice, and all three have crossed into fn-world, where the flag is a
+    // host `if` over two `raw::` calls (`x/norm.rs:1033`) and a
+    // `Specialisation` is not a thing a ported family has. The loop is kept
+    // rather than deleted because it is written over the REGISTRY and not
+    // over a symbol: a sixth family that specialises tomorrow is covered
+    // without editing this file, which is the whole point of registering per
+    // family. What cannot stay is a literal that turns "nothing is
+    // registered" into "the table came across empty" — those are different
+    // sentences and only one of them is now true.
     assert!(
         device::SPECIALISED.iter().all(|family| !family.is_empty()),
         "a family registered an empty slice; it either specialises or it does not appear"
     );
+    eprintln!("{n} specialisation(s) agree with their base");
 }
 
 /// The base and the variant are two rows of one unit, so one compile serves
@@ -3426,10 +3437,8 @@ fn an_arm_names_a_variant_of_its_own_base() {
             }
         }
     }
-    assert!(
-        checked > 0,
-        "no specialisation has an arm, so this test verified the empty set"
-    );
+    // See `every_specialisation_agrees_with_its_base`: an empty registry is
+    // the terminal state of the migration, not a table that failed to load.
     assert!(
         wrong.is_empty(),
         "an arm names a kernel that is not a variant of its base:\n  {}",

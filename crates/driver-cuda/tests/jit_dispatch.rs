@@ -221,7 +221,8 @@ fn a_routed_row_fires_through_the_drivers_own_dispatcher() {
         rows_total: 0,
         sampling_indices: std::ptr::null(),
         sampled_rows: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     let mut resolver = Nothing;
     dispatch(&bound, &spec, frame, &mut resolver, &ctx, None, None)

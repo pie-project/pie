@@ -71,6 +71,8 @@ use cudarc::cublas::sys::{
 
 use super::DispatchCtx;
 use super::abi::AttentionWorkspaceView;
+use kernels_cuda_new::x::KvLayer;
+
 use super::abi::KvCacheLayerView;
 use super::abi::MlaCacheLayerView;
 
@@ -642,106 +644,36 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // value the fire reports with the symbol named. The symbol left
 // `execution::RUST_SERVED` with the family.
 
-/// `moe::flashinfer_cutlass_moe_bf16` — the fused CUTLASS MoE, and the ONE
-/// `bool`-returning row in the generated shim.
-///
-/// The whole routed block as one call: permute, both grouped GEMMs, the gated
-/// activation and the weighted finalize. `crates/model/src/qwen_3_5/forward/
-/// mod.rs:362` calls `dsl::cuda::moe_fused_cutlass` **unconditionally**, and
-/// the doc above it says *"the fused CUTLASS call is the fourth and the one
-/// decode actually takes."* A survey once reported this symbol uncalled
-/// because the symbol string and the DSL wrapper name are different tokens.
-///
-/// The body is [`crate::fire::flashinfer_moe::bf16`], which carries
-/// `moe/flashinfer_moe.cu`'s measurements beside every constant. Here there
-/// is only the ABI: the operand order is `table::moe`'s `moe_fused_cutlass`
-/// row, verbatim, and `activation` arrives as the `u32` the generated
-/// bindings spell `MoeActivation` as.
-///
-/// # The `bool` is a REFUSAL, and that is why it is not a `bool` underneath
-///
-/// `false` never meant "the kernel failed". It meant the fused path
-/// **declined** — a null operand, a row count outside a configured window, or
-/// a workspace the arch probe says cannot exist here — and the caller is
-/// correct only because it means that. So `fire::flashinfer_moe` answers
-/// `Fused::{Ran, Declined}` and the two-state value is flattened HERE, at the
-/// ABI, because the row's `returns = "bool"` is what `KernelSig` states and
-/// `KernelSig` is unchanged. Anything that is not a refusal — a runner that
-/// will not build, a `setTactic` that fails — panics in the body with the
-/// symbol named rather than arriving here as `false`.
-///
-/// # Why this one is gated
-///
-/// Every other function in this file reaches its library by `dlopen` through
-/// `cudarc`, so nothing links. This one reaches `CutlassMoeFCRunner` through
-/// the five-function `extern "C"` seam that is all that is left of
-/// `csrc/src/moe/flashinfer_moe.cu`, and that seam is in
-/// `libpie_kernels_cuda.a` — which `bridge` is exactly the feature that
-/// links. `every_rust_served_symbol_is_spelled_here` reads this file's TEXT,
-/// so the gate costs the row nothing it had.
-///
-/// # Safety
-///
-/// Every pointer must be a device allocation of the row's shapes on the
-/// current device, live on `stream` until the launch completes; `workspace`
-/// must be writable for `workspace_bytes`.
-#[cfg(feature = "bridge")]
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn moe_flashinfer_cutlass_moe_bf16(
-    _ctx: &DispatchCtx,
-    activation: u32,
-    input: *const u16,
-    token_selected_experts: *const i32,
-    token_final_scales: *const f32,
-    fc1_expert_weights: *const u16,
-    fc2_expert_weights: *const u16,
-    output: *mut u16,
-    workspace: *mut u8,
-    workspace_bytes: usize,
-    unpermuted_row_to_permuted_row: *mut i32,
-    num_rows: i32,
-    hidden_size: i32,
-    inter_size: i32,
-    num_experts: i32,
-    experts_per_token: i32,
-    tp_size: i32,
-    tp_rank: i32,
-    stream: *mut c_void,
-) -> bool {
-    // The C++ `to_cutlass_activation` ended in `case Relu2: default:`, so an
-    // enumerator this driver has not been taught became `Relu2` rather than
-    // an error. Reproduced, and not widened: a port may not invent a check
-    // the archive never made.
-    let activation = match activation {
-        1 => super::abi::MoeActivation::Swiglu,
-        2 => super::abi::MoeActivation::Geglu,
-        _ => super::abi::MoeActivation::Relu2,
-    };
-    // SAFETY: the caller's obligation, above.
-    let fused = unsafe {
-        crate::fire::flashinfer_moe::bf16(
-            activation,
-            input,
-            token_selected_experts,
-            token_final_scales,
-            fc1_expert_weights,
-            fc2_expert_weights,
-            output,
-            workspace,
-            workspace_bytes,
-            unpermuted_row_to_permuted_row,
-            num_rows,
-            hidden_size,
-            inter_size,
-            num_experts,
-            experts_per_token,
-            tp_size,
-            tp_rank,
-            stream,
-        )
-    };
-    matches!(fused, crate::fire::flashinfer_moe::Fused::Ran)
-}
+// `moe::flashinfer_cutlass_moe_bf16` STOOD HERE, as
+// `pub unsafe fn moe_flashinfer_cutlass_moe_bf16`, and is DELETED with the
+// fused CUTLASS leg it was the seam to.
+//
+// It was the driver-op shape entire: a `contract!` in `x::moe` with no
+// `Entry`, reached by name through this wrapper into
+// `fire::flashinfer_moe::bf16`, because the body needed a workspace query, an
+// allocation and an arch probe -- a device surface `Cx` must not grow. That
+// shape is what made the retirement a deletion rather than an unpicking:
+// nothing but this function reached it, so removing the leg removed the
+// whole reachable set.
+//
+// The decision was the owner's, on a measurement: carrying CUTLASS so NVRTC
+// could compile the GEMM is a 505-file, 13,891,303-byte `include_str!`
+// closure, against the 429-file, 4,376,255-byte carry this tree already
+// refused in writing for cub. Same mechanism, 3.2x a line already drawn.
+//
+// **What it leaves behind is one bind, and it is not optional.**
+// `moe::build_moe_ptrs_aligned_bf16` declares `gu_stage`/`act_stage`/
+// `out_stage` -- the destinations every op in the aligned leg writes into --
+// and it has never had an arm in either world. Every condition that turned
+// the fused leg off already returned the aligned one, so this deletion makes
+// the aligned leg the ONLY leg, and it cannot start until that binds.
+//
+// One behaviour is recorded rather than carried, because it is gone with the
+// only caller that could reach it: the C++ `to_cutlass_activation` ended in
+// `case Relu2: default:`, so an enumerator this driver had not been taught
+// became `Relu2` rather than an error. This wrapper reproduced that and did
+// not widen it. Only `Swiglu` was ever reachable through the statement, so
+// nothing observed the other two.
 
 // `sample::lm_head_gemv_argmax_int8` — `sample/argmax.hpp:37` — STOOD HERE,
 // as `pub unsafe fn sample_lm_head_gemv_argmax_int8`, and is DELETED.
@@ -912,16 +844,37 @@ pub unsafe fn moe_flashinfer_cutlass_moe_bf16(
 
 // `moe::build_moe_ptrs_aligned_bf16` STOOD HERE, as `pub unsafe fn
 // moe_build_moe_ptrs_aligned_bf16`, and is DELETED. `x::moe` keeps the host
-// program -- twenty parameters, six of them pointer arrays -- and declares
-// the symbol a `none:`, because the aligned staging is the driver's arena
-// and not the trace's.
+// program -- twenty-one parameters, six of them pointer arrays -- and the
+// symbol is a DRIVER OP: a `contract!` with no `Entry` at all,
+// `Service::DriverOp` in `execution::SERVED`, a body in `fire::moe_ptrs` and
+// an arm in `bind/mod.rs`'s driver-op table. It was a `none:` arm for one day
+// in between, and the day is the interesting part -- see the gate the arm's
+// comment carries.
+//
+// THE REASON IS THE SENTENCE THIS COMMENT ALREADY HAD and it did not change:
+// **the aligned staging is the driver's arena and not the trace's.** What
+// changed is what follows from it. Six pointer arrays with no stated
+// consumer -- their only reader is the batched-cuBLAS arm INSIDE
+// `moe_grouped_gemm_bf16`, a lowering and not a statement -- are six trace
+// values `lower.rs:1911` frees at the first op past the build, so declaring
+// them would hand that reader bytes the next allocation owns. A wrong
+// answer, not a refusal.
 
 
 // `moe::reorder_moe_aligned_output_bf16` STOOD HERE, as `pub unsafe fn
 // moe_reorder_moe_aligned_output_bf16`, and is DELETED. `x::moe` keeps the
 // host program, including the vectorisability fork that chooses between two
-// symbols before a single launch, and declares the symbol a `none:` until
-// `Cx` can be asked for an operand's row count.
+// symbols before a single launch, and it BINDS: `Cx::in_rows` landed in
+// a41a1df0a and the arm reads `cx.in_rows(1)` for the sorted map's row
+// count. This comment said `none: until Cx can be asked for an operand's
+// row count` for as long as that was true and for a day after it was not,
+// which is the failure mode a tombstone has: it is written beside the
+// deletion and nothing re-derives it when the sentence it names comes true.
+// `x::moe`'s four remaining `none:` arms are `add_moe_route_bias`,
+// `transpose_expert_scales`, `moe_bucket_exact` and `scatter_add_weighted`;
+// fourteen bind and two are driver ops. It said FIVE until
+// `build_moe_ptrs_aligned` took `Service::DriverOp`, which is this same
+// paragraph's subject happening to this same paragraph.
 
 // `ssm_build_nemotron_moe_ptrs_decode_batched_bf16` AND
 // `ssm_build_nemotron_moe_ptrs_aligned_bf16` STOOD HERE, filed with `moe/`
@@ -963,7 +916,8 @@ pub unsafe fn moe_flashinfer_cutlass_moe_bf16(
 /// `if (layer.is_native_bf16())` over two programs: the native bf16 appender
 /// with its envelope refresh, and the five-way `switch (layer.scheme)`.
 ///
-/// Body: [`crate::fire::kv_paged::write_kv_to_pages`]. Classified
+/// Body: [`kernels_cuda_new::x::attn::kv_paged::write_kv_to_pages`], MOVED.
+/// Classified
 /// `execution::Execution::Walk` — `Control::Switch { on: "layer.scheme" }` —
 /// before it was taken over, which is what
 /// `every_taken_over_row_was_classified_first` requires.
@@ -999,12 +953,21 @@ pub unsafe fn attn_write_kv_to_pages(
     row_valid: *const u8,
     first_token: i32,
 ) {
+    // The layer view, as the seventeen facts the moved body takes. The `Err`
+    // arm is stated once for all four entries in this file: it means a
+    // producer put a dtype in a KV page that `KvDType` says a KV page cannot
+    // hold (`fire/kv_paged.rs`'s `TryFrom` argues it). Nothing is launched,
+    // which is what the bind arm replacing this entry will also do, because
+    // `Cx::kv_layer()` returns `None` on exactly the same input.
+    let Ok(layer) = KvLayer::try_from(&layer) else {
+        return;
+    };
     // SAFETY: forwarded unchanged; the caller's assertion is this function's.
     let _ = unsafe {
-        crate::fire::kv_paged::write_kv_to_pages(
-            layer,
-            k_curr,
-            v_curr,
+        kernels_cuda_new::x::attn::kv_paged::write_kv_to_pages(
+            &layer,
+            k_curr.cast(),
+            v_curr.cast(),
             qo_indptr,
             kv_page_indices,
             kv_page_indptr,
@@ -1025,7 +988,8 @@ pub unsafe fn attn_write_kv_to_pages(
 /// offset rather than deriving them from the CSR, and the envelope refresh
 /// behind it merges from that descriptor instead of from the page list.
 ///
-/// Body: [`crate::fire::kv_paged::write_kv_explicit_bf16`]. Classified
+/// Body: [`kernels_cuda_new::x::attn::kv_paged::write_kv_explicit_bf16`],
+/// MOVED. Classified
 /// `Execution::Walk` first — the conditional second launch is the control
 /// flow, and `families/attn.rs`' `_dev` symbol split is what makes
 /// `unit_of("attn::write_kv_explicit_bf16")` `None` so §52.11 holds.
@@ -1049,10 +1013,20 @@ pub unsafe fn attn_write_kv_explicit_bf16(
     stream: *mut c_void,
     row_valid: *const u8,
 ) {
+    let Ok(layer) = KvLayer::try_from(&layer) else {
+        return;
+    };
     // SAFETY: forwarded unchanged; the caller's assertion is this function's.
     let _ = unsafe {
-        crate::fire::kv_paged::write_kv_explicit_bf16(
-            layer, k_curr, v_curr, w_page, w_off, b, stream, row_valid,
+        kernels_cuda_new::x::attn::kv_paged::write_kv_explicit_bf16(
+            &layer,
+            k_curr.cast(),
+            v_curr.cast(),
+            w_page,
+            w_off,
+            b,
+            stream,
+            row_valid,
         )
     };
 }
@@ -1065,7 +1039,9 @@ pub unsafe fn attn_write_kv_explicit_bf16(
 /// only reads bf16 can read them. A five-way `switch (layer.scheme)`, one
 /// launch per arm, one grid for all four.
 ///
-/// Body: [`crate::fire::kv_paged::dequant_kv_cache_layer_to_bf16_active`].
+/// Body:
+/// [`kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active`],
+/// MOVED.
 /// Classified `execution::Execution::Walk` — `Control::Switch { on:
 /// "layer.scheme" }` — before it was taken over, which is what
 /// `every_taken_over_row_was_classified_first` requires. It is the third
@@ -1076,7 +1052,7 @@ pub unsafe fn attn_write_kv_explicit_bf16(
 ///
 /// [`attn_dispatch_attention_flashinfer_decode`] and the three other FA2
 /// entry points below call
-/// `crate::fire::kv_paged::dequant_kv_cache_layer_to_bf16_active` DIRECTLY,
+/// `x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active` DIRECTLY,
 /// because the C++ they replaced did: `attention_flashinfer.cu:648`, `:675`,
 /// `:1098` and `:1244` were C++ calling C++ by symbol with no shim between,
 /// and a dispatch cannot be inserted into the middle of another dispatch's
@@ -1092,7 +1068,7 @@ pub unsafe fn attn_write_kv_explicit_bf16(
 ///
 /// # Declines, and why nothing here reports one
 ///
-/// [`crate::fire::kv_paged::WriteKvQuantised::Declined`] is returned for a
+/// A `Fired::Declined` is returned for a
 /// native-bf16 layer, an empty batch, and a `Native` scheme reached at the
 /// switch. All three mean NOTHING WAS LAUNCHED AND NOTHING NEEDED TO BE —
 /// the C++ spelled the first two `return` and the third `break` — so the
@@ -1118,10 +1094,13 @@ pub unsafe fn attn_dequant_kv_cache_layer_to_bf16_active(
     num_pages_in_batch: i32,
     stream: *mut c_void,
 ) {
+    let Ok(layer) = KvLayer::try_from(&layer) else {
+        return;
+    };
     // SAFETY: forwarded unchanged; the caller's assertion is this function's.
     let _ = unsafe {
-        crate::fire::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-            layer,
+        kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+            &layer,
             kv_page_indices,
             num_pages_in_batch,
             stream,
@@ -1533,37 +1512,13 @@ pub unsafe fn attn_dsa_index_topk_mask(
     };
 }
 
-/// `attn::combine_attn_outputs_bf16` — was `attn/dsv4_compress.hpp`, and that
-/// file is DELETED with its `.cu`.
-///
-/// Body: [`crate::fire::dsv4_compress::combine_attn_outputs_bf16`]. The block
-/// clamp is `[32, 256]` and `LaunchRule::PerHeadElementwise`'s is `[32, 128]`,
-/// which is why no row states this geometry.
-///
-/// # Safety
-///
-/// The caller's; every pointer is a device address live across the launch.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn attn_combine_attn_outputs_bf16(
-    _ctx: &DispatchCtx,
-    o1: *const c_void,
-    lse1: *const f32,
-    o2: *const c_void,
-    lse2: *const f32,
-    o_out: *mut c_void,
-    lse_out: *mut f32,
-    n: i32,
-    num_heads: i32,
-    head_dim: i32,
-    stream: *mut c_void,
-) {
-    // SAFETY: forwarded unchanged; the caller's assertion is this function's.
-    let _ = unsafe {
-        crate::fire::dsv4_compress::combine_attn_outputs_bf16(
-            o1, lse1, o2, lse2, o_out, lse_out, n, num_heads, head_dim, stream,
-        )
-    };
-}
+// `attn_combine_attn_outputs_bf16` STOOD HERE, and it is gone rather than
+// moved: the symbol crossed into fn-world as
+// `kernels_cuda_new::x::attn`'s `COMBINE_ATTN_OUTPUTS`, so its `table::attn`
+// row is deleted, `emit_rust_dispatch` writes no arm that could call this,
+// and a seam with nothing on either side of it is not a seam. Its
+// `RUST_SERVED` entry and its `execution::WALKED` classification went in the
+// same change.
 
 /// `attn::dsv4_boundary_meta_decode` — was `attn/dsv4_compress.hpp`, and that
 /// file is DELETED with its `.cu`.
@@ -1572,7 +1527,7 @@ pub unsafe fn attn_combine_attn_outputs_bf16(
 ///
 /// # Safety
 ///
-/// [`attn_combine_attn_outputs_bf16`]'s.
+/// The caller's; every pointer is a device address live across the launch.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn attn_dsv4_boundary_meta_decode(
     _ctx: &DispatchCtx,
@@ -1600,7 +1555,7 @@ pub unsafe fn attn_dsv4_boundary_meta_decode(
 ///
 /// # Safety
 ///
-/// [`attn_combine_attn_outputs_bf16`]'s.
+/// [`attn_dsv4_boundary_meta_decode`]'s.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn attn_dsv4_boundary_meta_paged(
     _ctx: &DispatchCtx,
@@ -1635,7 +1590,7 @@ pub unsafe fn attn_dsv4_boundary_meta_paged(
 ///
 /// # Safety
 ///
-/// [`attn_combine_attn_outputs_bf16`]'s.
+/// [`attn_dsv4_boundary_meta_decode`]'s.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn attn_attention_compressed_paged_bf16(
     _ctx: &DispatchCtx,
@@ -1736,7 +1691,9 @@ pub unsafe fn attn_qkv_decode_qk_norm_rope_write_kv_bf16(
 /// DEVICE rows to `_dev`, which the sibling `attn::write_kv_explicit_bf16`
 /// had already done. Its row is fully sourced, so this moves a live dispatch.
 ///
-/// Body: [`crate::fire::kv_paged::write_kv_explicit_bf16_devwin`].
+/// Body:
+/// [`kernels_cuda_new::x::attn::kv_paged::write_kv_explicit_bf16_devwin`],
+/// MOVED.
 ///
 /// # Safety
 ///
@@ -1756,10 +1713,20 @@ pub unsafe fn attn_write_kv_explicit_bf16_devwin(
     stream: *mut c_void,
     row_valid: *const u8,
 ) {
+    let Ok(layer) = KvLayer::try_from(&layer) else {
+        return;
+    };
     // SAFETY: forwarded unchanged; the caller's assertion is this function's.
     let _ = unsafe {
-        crate::fire::kv_paged::write_kv_explicit_bf16_devwin(
-            layer, k_curr, v_curr, w_page, w_off, win_d, n_max, stream,
+        kernels_cuda_new::x::attn::kv_paged::write_kv_explicit_bf16_devwin(
+            &layer,
+            k_curr.cast(),
+            v_curr.cast(),
+            w_page,
+            w_off,
+            win_d,
+            n_max,
+            stream,
             row_valid,
         )
     };
@@ -1981,15 +1948,21 @@ pub unsafe fn attn_dispatch_attention_flashinfer_decode(
     // producer of this pointer and it hands out its own boxed cache.
     let plan = unsafe { &*cache.cast::<fa2::DecodePlanCache>() };
 
-    // SAFETY: forwarded unchanged; `:675`.
-    let _ = unsafe {
-        crate::fire::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-            kv_layer,
-            kv_page_indices_d,
-            plan.num_pages_in_batch,
-            stream,
-        )
-    };
+    // The dequant prelude, moved. A layer whose dtype `KvDType` does not
+    // name skips the prelude and the attention below still runs — which is
+    // the shape the `Declined` it used to return already had, because every
+    // one of these four call sites consumed that return with `let _ =`.
+    if let Ok(l) = KvLayer::try_from(&kv_layer) {
+        // SAFETY: forwarded unchanged; `:675`.
+        let _ = unsafe {
+            kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+                &l,
+                kv_page_indices_d,
+                plan.num_pages_in_batch,
+                stream,
+            )
+        };
+    }
 
     let bufs = fa2_buffers(
         q,
@@ -2096,15 +2069,21 @@ pub unsafe fn attn_dispatch_attention_flashinfer_decode_capture(
     // SAFETY: as above.
     let plan = unsafe { &*cache.cast::<fa2::DecodePlanCache>() };
 
-    // SAFETY: forwarded unchanged; `:648`.
-    let _ = unsafe {
-        crate::fire::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-            kv_layer,
-            kv_page_indices_d,
-            plan.num_pages_in_batch,
-            stream,
-        )
-    };
+    // The dequant prelude, moved. A layer whose dtype `KvDType` does not
+    // name skips the prelude and the attention below still runs — which is
+    // the shape the `Declined` it used to return already had, because every
+    // one of these four call sites consumed that return with `let _ =`.
+    if let Ok(l) = KvLayer::try_from(&kv_layer) {
+        // SAFETY: forwarded unchanged; `:648`.
+        let _ = unsafe {
+            kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+                &l,
+                kv_page_indices_d,
+                plan.num_pages_in_batch,
+                stream,
+            )
+        };
+    }
 
     let bufs = fa2_buffers(
         q,
@@ -2418,15 +2397,21 @@ pub unsafe fn attn_dispatch_attention_flashinfer_prefill_custom(
     } else {
         0
     };
-    // SAFETY: forwarded unchanged.
-    let _ = unsafe {
-        crate::fire::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-            kv_layer,
-            kv_page_indices_d,
-            num_pages_in_batch,
-            stream,
-        )
-    };
+    // The dequant prelude, moved. A layer whose dtype `KvDType` does not
+    // name skips the prelude and the attention below still runs — which is
+    // the shape the `Declined` it used to return already had, because every
+    // one of these four call sites consumed that return with `let _ =`.
+    if let Ok(l) = KvLayer::try_from(&kv_layer) {
+        // SAFETY: forwarded unchanged.
+        let _ = unsafe {
+            kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+                &l,
+                kv_page_indices_d,
+                num_pages_in_batch,
+                stream,
+            )
+        };
+    }
 
     let bufs = fa2_buffers(
         q,
@@ -2538,15 +2523,21 @@ pub unsafe fn attn_attention_flashinfer_prefill(
 
     // `:1098`.
     let num_pages_in_batch = kv_h[num_requests as usize] as i32;
-    // SAFETY: forwarded unchanged.
-    let _ = unsafe {
-        crate::fire::kv_paged::dequant_kv_cache_layer_to_bf16_active(
-            kv_layer,
-            kv_page_indices_d,
-            num_pages_in_batch,
-            stream,
-        )
-    };
+    // The dequant prelude, moved. A layer whose dtype `KvDType` does not
+    // name skips the prelude and the attention below still runs — which is
+    // the shape the `Declined` it used to return already had, because every
+    // one of these four call sites consumed that return with `let _ =`.
+    if let Ok(l) = KvLayer::try_from(&kv_layer) {
+        // SAFETY: forwarded unchanged.
+        let _ = unsafe {
+            kernels_cuda_new::x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(
+                &l,
+                kv_page_indices_d,
+                num_pages_in_batch,
+                stream,
+            )
+        };
+    }
 
     let mut plan = fa2::PrefillPlanCache::new();
     let device = fa2::plan_device();

@@ -1,5 +1,40 @@
 //! XQA's fire-wide prepare: the host half of `attn/attention_xqa.cu`, in Rust.
 //!
+//! # Every `attention_xqa*.cu:NNN` citation below is a line in a DELETED file
+//!
+//! Said once here rather than forty times inline, which is the same device
+//! [`super::mla_naive`] uses. The six archive translation units this file is
+//! the host half of —
+//!
+//! ```text
+//!   csrc/src/attn/attention_xqa.cu           436 lines
+//!   csrc/src/attn/attention_xqa_gqa2.cu      194
+//!   csrc/src/attn/attention_xqa_gqa2_p16.cu  194
+//!   csrc/src/attn/attention_xqa_gqa4.cu      194
+//!   csrc/src/attn/attention_xqa_gqa8.cu      244
+//!   csrc/src/attn/attention_xqa_gqa8_sm90.cu 197
+//! ```
+//!
+//! — are **deleted**, along with `csrc/src/attn/attention_flashinfer_hopper_stub.cpp`,
+//! which was chained to them. Their line numbers were correct against the last
+//! commit that contained them, `0dc8e9e9b`, and `git show
+//! 0dc8e9e9b:crates/kernels-cuda/csrc/src/attn/attention_xqa.cu` is how a
+//! reader checks one. The full account — what each held, where its host
+//! program went, why the row deletion rather than `RUST_SERVED` is the
+//! mechanism, and which header had to STAY (`attn/attention_xqa.hpp`, two
+//! oracle `#include`rs and no callers) — is in
+//! `kernels-cuda/csrc/CMakeLists.txt`.
+//!
+//! The citations are kept rather than stripped because each one is evidence
+//! for a decision made here, and a decision whose evidence has been deleted is
+//! a decision no one can re-check. They are **quotations from history**, not
+//! pointers into the tree; nothing automated should try to resolve them.
+//!
+//! The device text is not deleted and did not move to history: it is
+//! `kernels-cuda-new/csrc/src/attn/attention_xqa_mha.cuh` over
+//! `csrc/vendor/xqa/`, enrolled as five NVRTC units by
+//! `kernels_cuda_new::x::xqa::UNITS`.
+//!
 //! # The specification of this program, in four terms
 //!
 //! Written against the code below so a reader can check the code against a
@@ -554,6 +589,55 @@ pub enum XqaMember {
     /// never the one that runs. Both are kept because the forward is the
     /// archive's structure and collapsing it would delete the record of a
     /// body that exists.
+    ///
+    /// **This is the one member nothing can host, and [`pick`] no longer
+    /// answers it.** The archive `.cu` is deleted with the other five, and
+    /// the sixth entry of `families::attn::XQA_LATTICE` is **not** enrolled
+    /// by `kernels_cuda_new::x::xqa::UNITS` — measured, at `compute_90a`:
+    /// `std::pair` in device code at `xqa/mha_sm90.cu:1980` raises twelve
+    /// diagnostics from one line, `csrc/shim/cuda.h` declares no
+    /// `CUtensorMap` for `xqa/tensorMap.h` to declare against, and the
+    /// archive unit compiled `<xqa/tensorMap.cpp>`, which is HOST code
+    /// driving `cuTensorMapEncodeTiled` and a second port rather than a
+    /// detail of this one.
+    ///
+    /// [`enrolled`] answers `false` for it and [`pick`] filters on that, so
+    /// the refusal is BY CONSTRUCTION and not by this paragraph. What used to
+    /// be here was a note saying the gate was owed; it is written.
+    ///
+    /// # Why the variant survives a body it does not have
+    ///
+    /// Deleting it was the other option and it is worse, for three reasons
+    /// that are all about what the enum is FOR:
+    ///
+    /// 1. **It would not answer the dispatch question, only hide it.**
+    ///    [`dispatch`] must still say something for `(8, 32)` at `major >= 9`.
+    ///    Without this variant the only spellings are `Some(Gqa8Page32)` — a
+    ///    silent fallback to a different kernel on exactly the devices XQA
+    ///    runs on — or `None`, which erases the fact that Hopper had a
+    ///    distinct body at all. Both are worse than naming it and refusing.
+    ///
+    /// 2. **The enum mirrors the lattice, and the mirror is the check.**
+    ///    `XQA_LATTICE` has six members; this enum has six variants;
+    ///    `x::xqa::UNITS` has five and [`enrolled`] says which five. Five
+    ///    variants against six lattice entries would leave the gap expressed
+    ///    nowhere in Rust — and `x/xqa.rs`'s own test asserts that no unit
+    ///    hosts this entry, which is a claim about a member that would then
+    ///    have no name on this side.
+    ///
+    /// 3. **[`entry`] is the only Rust statement of the symbol.**
+    ///    `kernel_mha_xqa_gqa8_sm90_bf16_p32_h128` is what a re-enablement
+    ///    has to export, and after the `.cu` deletion this is where that name
+    ///    lives.
+    ///
+    /// A variant that reads as a supported configuration IS a hazard — the
+    /// answer is to make it unreachable by construction and say so at every
+    /// place a reader arrives, not to delete the record.
+    ///
+    /// [`dispatch`]: XqaMember::dispatch
+    /// [`enrolled`]: XqaMember::enrolled
+    /// [`entry`]: XqaMember::entry
+    /// [`pick`]: XqaMember::pick
     Gqa8Page32Sm90,
 }
 
@@ -582,15 +666,63 @@ impl XqaMember {
         }
     }
 
-    /// The shape that picks this member, or `None` for a shape outside the
-    /// lattice — `attention_xqa.cu:290-436`'s dispatch chain.
+    /// Whether any NVRTC unit hosts this member's [`entry`], and therefore
+    /// whether firing it can reach a body at all.
     ///
-    /// `major` is the device's compute capability major, and it is a
-    /// parameter rather than a query because `attention_xqa_gqa8.cu:96`'s
-    /// forward to the Hopper body is a dispatch decision, not a device fact
-    /// this function should be reaching out for.
+    /// **This is a mirror of `kernels_cuda_new::x::xqa::UNITS`, and it is a
+    /// mirror by hand because the two crates do not depend in that
+    /// direction** — `kernels-cuda-new` knows nothing of `driver-cuda`, and
+    /// `driver-cuda` reaching into `x::xqa::UNITS` to count `Unit`s at
+    /// runtime would be asking a question the enrolment already answered at
+    /// compile time. The list there is five entries; the list here is the
+    /// same five spelled as `true`.
+    ///
+    /// Five of six, and the sixth is the whole reason this function exists.
+    /// `families::attn::XQA_LATTICE` has six members and
+    /// `x::xqa::UNITS` enrols five: `Gqa8Page32Sm90` is measured NOT READY at
+    /// `compute_90a` — `std::pair` in device code at `xqa/mha_sm90.cu:1980`
+    /// raises twelve diagnostics from one line, `csrc/shim/cuda.h` declares
+    /// no `CUtensorMap` for `xqa/tensorMap.h` to declare against, and the
+    /// archive unit compiled `<xqa/tensorMap.cpp>`, which is HOST code
+    /// driving `cuTensorMapEncodeTiled` and a second port rather than a
+    /// detail of this one. The archive `.cu` that used to define it is
+    /// deleted with the other five.
+    ///
+    /// **Flipping this to `true` is the whole re-enablement.** [`pick`] reads
+    /// it and nothing else does, so a Hopper unit landing in `x::xqa::UNITS`
+    /// needs exactly one edit here and no dispatch surgery.
+    ///
+    /// [`entry`]: XqaMember::entry
+    /// [`pick`]: XqaMember::pick
     #[must_use]
-    pub fn pick(head_group_ratio: i32, page_size: i32, major: i32) -> Option<Self> {
+    pub const fn enrolled(self) -> bool {
+        match self {
+            Self::Gqa2Page32
+            | Self::Gqa2Page16
+            | Self::Gqa4Page32
+            | Self::Gqa5Page32
+            | Self::Gqa8Page32 => true,
+            Self::Gqa8Page32Sm90 => false,
+        }
+    }
+
+    /// The archive's dispatch chain, faithfully — which member a shape
+    /// SELECTS, with no question asked about whether it can run.
+    ///
+    /// `attention_xqa.cu:290-436`'s `if`/`else if` over `head_group_ratio`,
+    /// and `attention_xqa_gqa8.cu:96`'s forward to the Hopper body. `major`
+    /// is a parameter rather than a query because that forward is a dispatch
+    /// decision, not a device fact this function should be reaching out for.
+    ///
+    /// **Separate from [`pick`] on purpose.** This function is the RECORD of
+    /// what the archive did and is what a reader checks the deleted C++
+    /// against; [`pick`] is what the driver may act on. Collapsing them would
+    /// mean either losing the record or letting the record be fired, and the
+    /// two are different jobs.
+    ///
+    /// [`pick`]: XqaMember::pick
+    #[must_use]
+    pub fn dispatch(head_group_ratio: i32, page_size: i32, major: i32) -> Option<Self> {
         match (head_group_ratio, page_size) {
             (2, 32) => Some(Self::Gqa2Page32),
             (2, 16) => Some(Self::Gqa2Page16),
@@ -602,6 +734,53 @@ impl XqaMember {
             (8, 32) => Some(Self::Gqa8Page32),
             _ => None,
         }
+    }
+
+    /// The member this shape selects AND that something can host — `None` for
+    /// a shape outside the lattice and `None` for a member nothing hosts.
+    ///
+    /// # The gate is here rather than at the fire, and that is the change
+    ///
+    /// [`dispatch`] answers [`XqaMember::Gqa8Page32Sm90`] on `major >= 9`,
+    /// which is what the archive did and what the deleted C++ says. Nothing
+    /// hosts that entry now. Firing it would reach `x::fire::fire`, find no
+    /// unit for the symbol, and **panic naming the symbol** — a good failure,
+    /// but a failure, and one reachable from a function that already holds
+    /// every fact needed to refuse: the shape, the device major, and
+    /// [`enrolled`]. Refusing here turns a panic deep in the JIT into a
+    /// `None` at the top of the plan, which [`plan_decode`] renders as
+    /// [`DecodeDecline::MemberNotEnrolled`].
+    ///
+    /// # What it does NOT do, and why that is the point
+    ///
+    /// It does **not** fall back to [`XqaMember::Gqa8Page32`], the Ampere/Ada
+    /// body, which is enrolled and would run. That was the tempting edit and
+    /// it is the wrong one twice over. The archive never ran that body above
+    /// `major >= 9`, so choosing it is a silent change of kernel on exactly
+    /// the devices XQA is enabled for; and `attention_xqa.cu:237-240` (quoted
+    /// in [`decode_supported`]) records that the non-Hopper instantiations
+    /// *compile* but were kept off SM89 serving because runs could spin after
+    /// graph capture. A fallback would be a wrong answer that looks like a
+    /// supported configuration, which is the failure mode this whole
+    /// migration is against — and a wrong answer is worse than a refusal even
+    /// when the refusal costs a capability.
+    ///
+    /// # The consequence, stated so nobody discovers it
+    ///
+    /// [`decode_supported`] ends in `major >= 9`, so XQA decode is offered
+    /// ONLY on Hopper and above; this function now refuses `ratio == 8` there.
+    /// **Head-group ratio 8 therefore has no XQA decode at all**, on any
+    /// device, until a Hopper unit is enrolled. Ratios 2, 4 and 5 are
+    /// unaffected. It costs nothing today — `xqa_decode` is `false` at every
+    /// construction site in `crates/model/src`, so [`plan_decode`] has no
+    /// caller — and the day it has one, this refuses rather than launching a
+    /// body nobody has measured on Hopper.
+    ///
+    /// [`dispatch`]: XqaMember::dispatch
+    /// [`enrolled`]: XqaMember::enrolled
+    #[must_use]
+    pub fn pick(head_group_ratio: i32, page_size: i32, major: i32) -> Option<Self> {
+        Self::dispatch(head_group_ratio, page_size, major).filter(|m| m.enrolled())
     }
 }
 
@@ -672,8 +851,16 @@ pub fn decode_supported(
     let ratio = num_q_heads / num_kv_heads;
     // `xqa_ratio_supported` is the lattice's own membership test; asking
     // `XqaMember::pick` is the same question with one fewer place to be wrong.
-    // `major` is not consulted for membership here — the 8-at-32 pair answers
-    // either way — so the Hopper floor below is the only device gate.
+    //
+    // `major` IS consulted here, and it was not when this line was written.
+    // `pick` now filters on `XqaMember::enrolled`, and the one unenrolled
+    // member is `Gqa8Page32Sm90`, which `dispatch` selects for the 8-at-32
+    // pair exactly when `major >= 9`. So this call refuses ratio 8 on Hopper
+    // and above — and since the last line of this function is `major >= 9`,
+    // that means **ratio 8 has no XQA decode on any device**. Deliberate, and
+    // argued at `pick`: the alternative was falling back to the Ampere/Ada
+    // body on devices the archive never ran it on. The Hopper floor below is
+    // no longer the only device gate, and this comment used to say it was.
     if XqaMember::pick(ratio, XQA_PAGE_SIZE, major).is_none() {
         return false;
     }
@@ -715,6 +902,21 @@ pub enum DecodeDecline {
     /// force — [`XqaDecode`] is `#[must_use]` — without making a routing
     /// decision an exception.
     UnsupportedShape,
+    /// The shape selects a lattice member that no NVRTC unit hosts.
+    ///
+    /// Distinct from [`Self::UnsupportedShape`] because the two are different
+    /// facts with different fixes: an unsupported shape is a shape XQA never
+    /// covered, and this is a shape XQA covered with a body that has not been
+    /// ported. Today it is exactly one case —
+    /// [`XqaMember::Gqa8Page32Sm90`], head-group ratio 8 on `major >= 9` —
+    /// and [`XqaMember::enrolled`] is the one place that says so.
+    ///
+    /// The C++ had no equivalent: every member of the lattice was in the
+    /// archive, so "selected but not hosted" could not arise. It arises now
+    /// because enrolment is per-unit and one unit did not make it, which is a
+    /// JIT-shaped failure that an ahead-of-time archive could only have
+    /// spelled as a link error.
+    MemberNotEnrolled,
     /// The float workspace cannot hold the page table, the sequence lengths
     /// and XQA's scratch.
     ///
@@ -909,9 +1111,18 @@ pub fn plan_decode(
     }
 
     let ratio = num_q_heads / num_kv_heads;
-    let Some(member) = XqaMember::pick(ratio, page_size, major) else {
+    // `dispatch` rather than `pick`, so the two refusals stay apart: a shape
+    // outside the lattice and a member the JIT does not host are different
+    // answers with different fixes, and `pick`'s `None` cannot tell them
+    // apart. `decode_supported` above has already refused the first case for
+    // `page_size == XQA_PAGE_SIZE`; this is the same test at the actual page
+    // size the caller passed.
+    let Some(member) = XqaMember::dispatch(ratio, page_size, major) else {
         return XqaDecode::Declined(DecodeDecline::UnsupportedShape);
     };
+    if !member.enrolled() {
+        return XqaDecode::Declined(DecodeDecline::MemberNotEnrolled);
+    }
 
     // The same carve the prepare wrote, read back rather than recomputed —
     // the page table the decode reads has to be the one the prepare filled,

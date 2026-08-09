@@ -30,7 +30,10 @@
 //! of exactly one block, a two-dimensional block, dynamic shared memory sized
 //! from an operand VALUE, or a vectorised twin chosen at run time from a
 //! pointer's alignment. Each `.cuh` says which and why beside the kernel, and
-//! [`kernels_cuda_new::families::moe`] groups them.
+//! [`kernels_cuda_new::x::moe`] groups them — §5 step 5 took the family into
+//! fn-world, so the units are six inline `pub mod`s there, one per `.cuh`
+//! root, and the geometry each of those twenty-nine needs is a host `fn`
+//! rather than a rule.
 //!
 //! NVRTC PARSES those templates as part of the unit that holds them and does
 //! not instantiate them, and a template that only fails when instantiated is
@@ -38,7 +41,7 @@
 //! all, whose fragment types do not exist until an element type is supplied.
 //! So the second table instantiates all twenty-nine anyway, through rows this
 //! probe owns and nothing fires — carried here rather than in
-//! [`kernels_cuda_new::families::moe`] because a `Unit` with rows in it is a
+//! [`kernels_cuda_new::x::moe`] because a `Unit` with rows in it is a
 //! claim that the rows can be LAUNCHED, and these cannot.
 //! `LaunchRule::Unstated` is the honest spelling of that: the row has not
 //! said.
@@ -512,7 +515,10 @@ mod probe {
 
         println!("\nthe units, and the rows they state:\n");
         let mut stated: Vec<Report> = Vec::new();
-        for unit in kernels_cuda_new::families::moe::UNITS {
+        // `families::moe::UNITS` stood here; §5 step 5 took the family into
+        // fn-world and `x::moe::UNITS` is the same list, concatenated from
+        // the six inline modules that hold the six `unit!` invocations.
+        for unit in kernels_cuda_new::x::moe::UNITS {
             stated.push(probe(unit, arch));
         }
         table(&stated);

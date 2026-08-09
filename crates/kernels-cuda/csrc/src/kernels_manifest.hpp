@@ -185,5 +185,44 @@ constexpr const char* attn_decode_gqa_list() {
 //   lowering has no kernels behind it, so the failure mode the quarantine
 //   guarded is unreachable by construction. What is open is not a risk; it is
 //   an unmeasured fact about hardware nobody here has.
+//
+// ── THE MEASUREMENT IS NO LONGER ONLY HERE ───────────────────────────────────
+//
+// The sentence four paragraphs up -- *"`new-horizon.md` §47 holds the argument
+// and this comment holds the measurement"* -- was an accurate division of
+// labour and a single point of failure, because THIS FILE IS ARCHIVE TEXT and
+// north star step 6 deletes the archive. §47 held the audit and no numbers; the
+// numbers were here and nowhere else, so the pair would have read as fully
+// documented right up until the deletion took half of it.
+//
+// The measurement is now carried in
+// `crates/driver-cuda/src/weights/plan.rs`, on the assertion
+// `the_target_states_the_device_and_nothing_optimistic` -- which is the test
+// that pins `native_mxfp4_moe: false`, so it is the reader who needs the
+// numbers. That crate survives step 6 AND is tracked by git.
+//
+// `new-horizon.md` §47.6 carries it too and is the better read, but it is not
+// the home: `.wiki/` IS tracked -- it is its own git repository, 154 files
+// with their own history, and the parent's `git add` refuses only because the
+// nested repo owns those paths. (An earlier draft of this block said "zero
+// files tracked". Wrong, and it reached the right placement anyway.) The
+// reason `weights/plan.rs` is the home is better than the one first given:
+// **a measurement beside the assertion that depends on it is read by the
+// person who needs it; a measurement in a document is read by whoever happens
+// to be reading that document.** Both copies exist; that one is the one that
+// will be read at the moment it matters.
+//
+// Nothing here has been removed -- a second copy is the point -- and if the
+// copies ever disagree, `weights/plan.rs` is the one that will still exist.
+// This block otherwise goes when the archive goes and takes nothing live with
+// it.
+//
+// Surfaced while reconciling `attention_flashinfer_common.cuh`'s six host
+// includes against step 6: this file is one of them, and its only other
+// includer is `driver-cuda/tests/hf_config_dump/generate.py:202`, which EMITS
+// the `#include` into generated C++ rather than compiling it. The rule worth
+// keeping is that **"§N holds the argument, this comment holds the
+// measurement" is the exact sentence that should trigger a check of which
+// side of a deletion each half is on.**
 
 }  // namespace pie_cuda_driver

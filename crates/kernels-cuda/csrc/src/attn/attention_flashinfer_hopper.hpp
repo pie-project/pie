@@ -81,6 +81,36 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
 // includes this header (it has no compiler now, but it is the anchor forty
 // Rust doc comments cite by line).
 //
+// ── BOTH REASONS HAVE NOW BEEN OVERTAKEN, AND THE SECOND ONE TWICE ──────────
+//
+// FIRST: "the argument list a re-added row has to match" is superseded.
+// `driver-cuda/src/fire/merge_states.rs` exists and implements BOTH cascade
+// launchers in Rust, and it went further than the recipe below — it found
+// that the specification named the wrong one. `MergeStates` serves only the
+// single-request paths; both batched dispatches call
+// `VariableLengthMergeStates`, and folding a ragged batch with a uniform
+// chunk count reads another row's partials and returns a wrong answer no
+// assertion catches. So the declaration below is no longer the shape to
+// match; it is the shape that would have been silently wrong to match.
+//
+// SECOND: `attention_flashinfer_common.cuh` includes this header and HAS NO
+// COMPILER — measured since, and stronger than "now": it has zero `#include`
+// consumers anywhere in the workspace, and this header plus
+// `attn/attention_flashinfer.hpp` are the only two files whose ONLY includer
+// it is. The chain's head is dangling, so this whole subtree is unreachable
+// as code and reachable only as text. That also discharges a constraint the
+// XQA pass recorded as live — *"`attention_flashinfer_hopper.hpp` is not
+// chained to the stub and must outlive it"* — which was true while the
+// non-sm90 arm was a compile target and is now true of nothing.
+//
+// THE ONE THING HERE THAT MUST NOT DIE WITH THIS FILE is the paragraph
+// below's last sentence, and it is a measurement rather than a plan: the
+// decode KV-split path reaches a merge on EVERY architecture, so whatever
+// serves this row next must not be arch-gated. `CMakeLists.txt:1071-1082`
+// holds the long form and `CMakeLists.txt` is in this crate, so both copies
+// were inside the dying tree. It is now carried in
+// `driver-cuda/src/fire/merge_states.rs`, which is not.
+//
 // A declaration with no definition is legal until something ODR-uses it, and
 // nothing does. If you are re-adding this: the row wants a RUST body over
 // `flashinfer/attention/cascade.cuh`, which `kernels-cuda-new/csrc/vendor`

@@ -5118,7 +5118,38 @@ pub mod cuda {
     /// The unpadded counterpart of [`Self::moe_align`], writing exact
     /// per-expert counts the host reads to build cuBLAS grouped shapes.
     /// `whole` for the same reason: the sort is over all routes.
-    pub fn moe_bucket_exact(topk_idx: &Val, num_experts: u32, top_k: u32) -> (Val, Val) {
+    ///
+    /// Returns `(sorted_route_ids, route_to_sorted_row, counts)` — the
+    /// permutation, its inverse, and the per-expert totals.
+    ///
+    /// # The third result is new, and its absence was a wrong-answer bug
+    /// waiting on a caller
+    ///
+    /// **This declared two results and the kernel writes three buffers.**
+    /// `moe_dispatch.cuh:907`'s parameter list is `topk_idx,
+    /// sorted_route_ids, route_to_sorted_row, counts_out, num_routes,
+    /// num_experts`, and `route_to_sorted_row` was named nowhere in this
+    /// crate — not here, not in the row that used to carry the symbol.
+    ///
+    /// A binding written from a two-result statement has one buffer with no
+    /// declared home, so it passes a null, and the store at `:952` is
+    /// `route_to_sorted_row[r] = out;` with **no null guard**. That is the
+    /// difference from [`Self::moe_align`], whose otherwise identical
+    /// inverse map is written behind `if (route_to_aligned_row != nullptr)`
+    /// and whose third result is therefore genuinely optional. Here it is
+    /// not optional: the declaration is what makes the buffer exist, and
+    /// without it the fire does not answer wrongly, it writes to null.
+    ///
+    /// **The order is the KERNEL's and not the convenient one.** `counts` is
+    /// the interesting output and was the second of two; it is the third of
+    /// three now, because a declaration list whose order matches the
+    /// parameter list is one a binding can read straight down. The cost of
+    /// the other choice is on record in this family: `moe::hash_route_lookup`
+    /// deleted a row that stated no `Source` on any operand, and the only
+    /// surviving statement of which input was which was `dsl.rs`'s own
+    /// argument vector.
+    pub fn moe_bucket_exact(topk_idx: &Val, num_experts: u32, top_k: u32) -> (Val, Val, Val) {
+        let routes = Shape(vec![Dim::Tokens, Dim::Const(top_k)]);
         let outs = record_many(
             &topk_idx.t,
             topk_idx.layer,
@@ -5126,14 +5157,16 @@ pub mod cuda {
             vec![],
             vec![topk_idx.id],
             vec![
-                (Shape(vec![Dim::Tokens, Dim::Const(top_k)]), DType::I32),
+                (routes.clone(), DType::I32),
+                (routes, DType::I32),
                 (Shape(vec![Dim::Const(num_experts)]), DType::I32),
             ],
         );
         let mut it = outs.into_iter();
-        let sorted = it.next().expect("the bucket states two outputs");
-        let counts = it.next().expect("the bucket states two outputs");
-        (sorted, counts)
+        let sorted = it.next().expect("the bucket states three outputs");
+        let inverse = it.next().expect("the bucket states three outputs");
+        let counts = it.next().expect("the bucket states three outputs");
+        (sorted, inverse, counts)
     }
 
     /// `kernels::ssm::build_nemotron_moe_ptrs_aligned_bf16`: the pointer

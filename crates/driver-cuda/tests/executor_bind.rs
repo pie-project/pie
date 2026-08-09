@@ -1403,31 +1403,19 @@ fn every_lowered_symbol_has_an_arm() {
     // the generator is the claim, and reading `OUT_DIR` would make this
     // pass or fail on whether a build script had run.
     let generated = kernels_cuda_new::abi::emit_rust_dispatch(
-        &[
-            kernels_cuda_new::table::attn::KERNELS,
-            // `rope`'s rows are derived from its `contract!` block now; they
-            // state no operands, so this walk sees them and emits nothing,
-            // which is the same answer as before for a different reason.
-            kernels_cuda_new::x::rope::SIGS,
-            // `norm`'s twenty-eight, from `x::norm::SIGS`, for
-            // `x::rope::SIGS`' reason above; `table::norm::KERNELS` stood
-            // here until §5 step 5.
-            kernels_cuda_new::x::norm::SIGS,
-            // `mlp`'s twelve and `quant`'s eleven, derived from their
-            // `contract!` blocks, for `x::rope::SIGS`' reason above.
-            kernels_cuda_new::x::mlp::SIGS,
-            kernels_cuda_new::x::gemm::SIGS,
-            kernels_cuda_new::table::moe::KERNELS,
-            // `ssm`'s twenty-seven, derived from its `contract!` block, for
-            // `x::rope::SIGS`' reason above. `table::ssm::KERNELS` stood
-            // here until §5 step 5 took the family into fn-world.
-            kernels_cuda_new::x::ssm::SIGS,
-            kernels_cuda_new::x::quant::SIGS,
-            // `layout`'s seven and `sample`'s one, derived from their
-            // `contract!` blocks, for `x::rope::SIGS`' reason above.
-            kernels_cuda_new::x::layout::SIGS,
-            kernels_cuda_new::x::sample::SIGS,
-        ],
+        // `table::TABLES` — `ROW_TABLES ++ x::SIGS`, the list a model load
+        // is answered from.
+        //
+        // Nine lists were named here one by one and FOUR FAMILIES WERE
+        // MISSING: `x::moe`'s twenty contracts, `x::attn`'s, `x::xqa`'s and
+        // `x::adapter`'s one. `moe` fell out the moment it crossed, because
+        // `table::moe::KERNELS` was still in the list and outlived the family
+        // it named. A hand list is a set that is correct until someone
+        // forgets, and an absence from it looks exactly like a family that
+        // has not crossed yet — which is why this one lasted. The scrape
+        // below counts generated branches, so a missing family did not fail
+        // the test; it made it smaller.
+        kernels_cuda_new::table::TABLES,
         &[],
     );
     for line in generated.lines() {

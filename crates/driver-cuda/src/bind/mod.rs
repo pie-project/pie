@@ -1265,6 +1265,39 @@ pub struct DispatchCtx {
     /// the state outlives the fire on the caller's side (the plan
     /// state's `lora_staged` slot) and the ctx carries no lifetime.
     pub lora: Option<(*const crate::fire::lora::LoraFireState, *mut c_void)>,
+    /// The six device pointer arrays `moe::build_moe_ptrs_aligned_bf16`
+    /// carved for the grouped GEMMs below it.
+    ///
+    /// # A `Cell`, and the reason is that `lora`'s shape does not transfer
+    ///
+    /// `lora` is the precedent for *state one arm builds and another
+    /// consumes*, and it is filled **at construction** — the plan state holds
+    /// the staged adapter before the fire begins. This cannot be: the build
+    /// is **step 3 of 8** of the aligned MoE lowering, so the value does not
+    /// exist when the ctx is made.
+    ///
+    /// And every dispatch arm receives `ctx: &DispatchCtx`. **A plain field
+    /// would be `None` forever** — provisioned-looking and never written,
+    /// which is worse than the thread-local it replaces, because the
+    /// thread-local at least worked. So: interior mutability, written through
+    /// the shared reference the arms already hold.
+    ///
+    /// # What it buys over the thread-local
+    ///
+    /// `fire::moe_ptrs`' `thread_local!` was correct and said so: the build
+    /// is step 3, both grouped GEMMs are below it in the same lowering, on
+    /// the same thread, in issue order. **What made it a seam is that nothing
+    /// stated the lifetime** — the next layer's build overwrote the cell, and
+    /// it was only correct because this layer's GEMMs sat between the two.
+    ///
+    /// Here the lifetime is the ctx's, which is the fire's, and the struct
+    /// says so. A second layer gets a second ctx.
+    ///
+    /// `None` on every fire outside a qwen3.5 MoE layer. Raw pointers inside,
+    /// for `lora`'s reason: the arrays live in `fire::moe_ptrs`' per-thread
+    /// arena, which outlives the fire on the caller's side, and this struct
+    /// carries no lifetime.
+    pub moe_ptrs: std::cell::Cell<Option<crate::fire::moe_ptrs::Arrays>>,
     /// WHICH ROWS this fire samples, device-resident `[sampled_rows]` i32.
     ///
     /// A prefill's readout is one distribution per request and its stream
@@ -2276,6 +2309,32 @@ pub fn dispatch<R: Resolver>(
                 .as_deref()
                 .and_then(|n| resolver.weight(n))
                 .unwrap_or(core::ptr::null());
+            // The suffix reach, resolved once for the same reason `w_named`
+            // is: a `Resolver` is `&mut` and `Facts` is not. THE SUFFIX SET
+            // IS FIXED AND SHORT BY MEASUREMENT — `quant`'s routed MXFP4 pair
+            // is the only family that reaches by suffix, and it reaches
+            // exactly these three (`weight_names.rs:505`). A statement that
+            // names none of them gets three nulls and `Facts::weight_suffixed`
+            // filters them, which costs one scan of three entries per fire
+            // and no allocation.
+            //
+            // Listing them here rather than deriving them from the row is
+            // deliberate: `Source::WeightSuffix(s)` is going away with the
+            // row world, and the fn-world spelling of the same fact is a
+            // string literal in a bind body. A fourth suffix is a line here
+            // and a line there, and the compiler will not connect them --
+            // which is why the list is beside the argument rather than in a
+            // header.
+            let bank = spec.weight.as_deref();
+            let mut suffixed = |suffix: &str| -> *const c_void {
+                bank.and_then(|b| resolver.weight(&format!("{b}{suffix}")))
+                    .unwrap_or(core::ptr::null())
+            };
+            let w_suffixed: [(&'static str, *const c_void); 3] = [
+                ("_scales", suffixed("_scales")),
+                ("_gate_bias", suffixed("_gate_bias")),
+                ("_up_bias", suffixed("_up_bias")),
+            ];
             let fire = facts::Fire {
                 bound,
                 spec,
@@ -2285,6 +2344,7 @@ pub fn dispatch<R: Resolver>(
                 rows,
                 w_named,
                 w_named2,
+                w_suffixed: &w_suffixed,
             };
             return entry
                 .call(&kernels_cuda_new::x::Cx::new(&fire), ctx.stream)
@@ -2375,10 +2435,16 @@ pub fn dispatch<R: Resolver>(
     //
     // So the third shape: `execution::Service::DriverOp` — already data,
     // already read by the migration census — becomes `Route::Driver`, and
-    // this match is the driver-op table it names. It has one member here
+    // this match is the driver-op table it names. It has TWO members here
     // and two more in the verify path, it holds no device text, and it does
     // NOT retire with the step-5 sweep. Step 6 deletes the GENERATED match
     // beside it; this one stays and gets a better name.
+    //
+    // The second member arrived with `moe`'s crossing and it widens the
+    // shape rather than repeating it: `moe::build_moe_ptrs_aligned_bf16` IS
+    // a `__global__`, so the "a `Cx` cannot hand over a device API" argument
+    // above does not apply to it at all. What it cannot hand over is a
+    // LIFETIME — see the arm.
     match bound.kernel {
         // args: [act, y] with beta 0, or [act, resid_in, y] with beta 1 —
         // the residual fold, where the output aliases the residual's
@@ -2480,6 +2546,102 @@ pub fn dispatch<R: Resolver>(
         // layer's projection input), the staged state + scratch ride the
         // ctx. The LAYER is the op tag's — never `param1`, the bug the
         // C++'s first live A/B caught.
+        // args: [expert_ids, aligned_in] + the THREE staging buffers it
+        // declares + [gate_up_bank, down_bank] — `BoundLaunch::args` is
+        // inputs, outputs, weights in the trace's stated order, and
+        // `dsl::cuda::build_moe_ptrs_aligned` states two, three and two.
+        //
+        // THE THIRD DRIVER OP, and the only one that is a `__global__`. It is
+        // here for a LIFETIME and not for a device API: the six device
+        // pointer arrays it fills have no stated consumer — their only reader
+        // is the batched-cuBLAS arm inside `moe::moe_grouped_gemm_bf16`,
+        // which is a LOWERING of that symbol and not a statement of it — so
+        // six declared-but-unread results are six values `lower.rs:1911`'s
+        // liveness frees at the first op past this one, and the GEMM would
+        // dereference bytes the next allocation owns. A wrong answer, not a
+        // refusal. `fire::moe_ptrs` carves them from the driver's own arena
+        // instead, and `execution::SERVED` carries the classification.
+        //
+        // It DECLARES the aligned staging, which is why it cannot be skipped
+        // on a leg that takes it: step 3 of 8, and steps 4 through 8 all
+        // write into buffers this statement named.
+        "moe::build_moe_ptrs_aligned_bf16" => {
+            need(7)?;
+            let (expert_ids, aligned_in) = (bound.args[0], bound.args[1]);
+            let stage = crate::fire::moe_ptrs::Stage {
+                gate_up: bound.args[2].ptr,
+                act: bound.args[3].ptr,
+                out: bound.args[4].ptr,
+            };
+            // THE SHARED PAIR IS NULL ON THIS LEG AND THAT IS NOT A GAP.
+            // `moe_mlp_body_aligned_cuda` runs the shared expert as its own
+            // dense `gemm::act_x_w` pair (`forward/mod.rs:240-242`, under
+            // `shared_expert_intermediate > 0`), so the aligned build never
+            // addresses a shared tail. Passing null is what makes the host
+            // program's rewrite — `routed_blocks = max_blocks`,
+            // `moe_dispatch.cu:246-248` — the identity it is here, and
+            // `routed_blocks` below is that same value stated rather than
+            // relied upon.
+            let banks = crate::fire::moe_ptrs::Banks {
+                gate_up: bound.args[5].ptr.cast_const(),
+                down: bound.args[6].ptr.cast_const(),
+                shared_gate_up: std::ptr::null(),
+                shared_down: std::ptr::null(),
+            };
+            // `MOE_ALIGNED_BLOCK` at `model/src/qwen_3_5/forward/mod.rs:18`,
+            // and the same 16 `x::moe::supported` requires of the grouped
+            // GEMM's `M` (`FRAG`). `max_blocks` is DERIVED from the padded
+            // rectangle rather than read as `MOE_MAX_BLOCKS`, because the
+            // rectangle is what the arrays have to cover and a constant that
+            // agreed with it by construction would still be a second copy.
+            const BLOCK: u32 = 16;
+            let aligned_rows = bound.rows.end - bound.rows.start;
+            if aligned_rows == 0 || aligned_rows % BLOCK != 0 {
+                return Err(DispatchRefusal::ShapeDeclined {
+                    kernel: bound.kernel.to_string(),
+                    why: format!(
+                        "the aligned rectangle is {aligned_rows} rows, which is not a whole \
+                         number of {BLOCK}-row blocks -- the padded batch and the block size \
+                         disagree, and `max_blocks <= 0` is the only shape the launcher itself \
+                         refuses"
+                    ),
+                });
+            }
+            let max_blocks = i32::try_from(aligned_rows / BLOCK).expect("block count fits i32");
+            let bounds = crate::fire::moe_ptrs::Bounds {
+                max_blocks,
+                block_size: i32::try_from(BLOCK).expect("16"),
+                hidden: i32::try_from(bound.args[4].width).expect("hidden fits i32"),
+                moe_intermediate: i32::try_from(bound.args[3].width)
+                    .expect("moe_intermediate fits i32"),
+                routed_blocks: max_blocks,
+            };
+            // SAFETY: every pointer is a bound arg of this launch — device
+            // allocations of the shapes the statement declares, live on
+            // `ctx.stream` for the fire.
+            let built = unsafe {
+                crate::fire::moe_ptrs::build_for_fire(
+                    expert_ids.ptr.cast_const(),
+                    aligned_in.ptr.cast_const(),
+                    banks,
+                    stage,
+                    bounds,
+                    ctx.stream,
+                )
+            };
+            if let crate::fire::moe_ptrs::Built::Declined(why) = built {
+                // A DECLINE HERE MUST BE AN ERROR AND NOT A QUIET RETURN.
+                // Nothing after this op can run: the two GEMMs read arrays
+                // that were never written, and the swiglu between them
+                // writes into staging whose addresses were never baked. That
+                // is `ShapeDeclined`'s own subject — "smoothly wrong is the
+                // failure mode this tree keeps naming".
+                return Err(DispatchRefusal::ShapeDeclined {
+                    kernel: bound.kernel.to_string(),
+                    why: format!("{why:?}"),
+                });
+            }
+        }
         "pie_lora_qkv_correction" => {
             need(2)?;
             // NO ADAPTERS STAGED IS AN ANSWER, not a refusal, and this

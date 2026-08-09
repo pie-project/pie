@@ -595,10 +595,50 @@ mod tests {
     /// g++ and nvcc's host pass, and this set carries no host text at all.
     /// `attn/attention_flashinfer_common.cuh` includes six of them — the
     /// launcher declarations and the manifest FlashInfer's dispatch is
-    /// generated against — and it is a device header only by extension: no
-    /// unit reaches it, the archive is what compiles it, and it finds them
-    /// under `-I …/kernels-cuda/csrc/src`, which the archive's CMake still
-    /// passes and NVRTC has no equivalent of.
+    /// generated against — and it is a device header only by extension.
+    ///
+    /// ## THE REASON THIS WAS WRITTEN WITH HAS EXPIRED. THE EXEMPTION HAS NOT
+    ///
+    /// The sentence here used to read *"no unit reaches it, THE ARCHIVE IS
+    /// WHAT COMPILES IT, and it finds them under
+    /// `-I …/kernels-cuda/csrc/src`, which the archive's CMake still passes
+    /// and NVRTC has no equivalent of."* Half of that is still true and half
+    /// of it is a claim with a deletion date, which is the worse half to
+    /// leave standing: it justifies the exemption out of a fact that step 6
+    /// removes, so the exemption would have gone red for a reason that has
+    /// nothing to do with whether it is correct.
+    ///
+    /// **Measured: `attention_flashinfer_common.cuh` has ZERO `#include`
+    /// consumers anywhere in the workspace.** Not a `.cu`, not a `.cuh`, not
+    /// a `.cpp`, in either crate. Every archive translation unit that used to
+    /// include it was an `attn/attention_flashinfer_hd<N>.cu` and all of them
+    /// are deleted; `attn/attention_flashinfer_hopper.hpp:80` reached the
+    /// same finding independently and states it as *"it has no compiler
+    /// now"*. So the archive is not what compiles it — **nothing** is, and
+    /// nothing has been for some time.
+    ///
+    /// That is a strictly stronger ground for the same exemption and it is
+    /// the one that survives step 6. A file no compiler reads may include
+    /// whatever it likes; the six host includes are not resolved somewhere
+    /// this check cannot see, they are never resolved by anyone. Deleting
+    /// `crates/kernels-cuda` changes nothing about this header, which lives
+    /// in THIS crate and goes on living here.
+    ///
+    /// ## What it is instead, and the one constraint that comes with it
+    ///
+    /// It is the FA2 archive's **specification**, and roughly thirty live
+    /// sites cite it BY LINE NUMBER — `fire/flashinfer_fa2.rs`,
+    /// `fire/flashinfer_fa2_dispatch.rs`, `families/fa2.rs`, `plan/*.rs`,
+    /// `csrc/src/attn/fa2.cuh`, two tests. Every one of those citations is
+    /// into a file in the surviving crate, so they survive with it.
+    ///
+    /// **The constraint nobody had written down: an edit that INSERTS OR
+    /// REMOVES LINES in this file silently invalidates all of them.** There
+    /// is no compiler to catch it, because there is no compiler; there is no
+    /// pinned assertion over it either. A line-shifting edit here is the
+    /// cheapest way in this tree to turn thirty accurate citations into
+    /// thirty confident wrong ones. If it must be annotated, annotate at the
+    /// END of the file, past the last cited line.
     ///
     /// So the rule checked is every include of DEVICE text. A missing `.cuh`
     /// is still a failure here, which is the case that costs a compile on a

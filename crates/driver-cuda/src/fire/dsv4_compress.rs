@@ -1,18 +1,26 @@
-//! `attn/dsv4_compress.cu`'s four surviving launchers, in Rust — and with
+//! `attn/dsv4_compress.cu`'s three surviving launchers, in Rust — and with
 //! them the file.
 //!
 //! Nine launchers went in earlier passes: the unpaged five (a closed cycle of
 //! dead callers), plus `dsv4_compress_gather_paged_bf16` and
 //! `dsv4_store_comp_entries_bf16`, whose shim entries `JIT_DISPATCHED`
-//! already suppressed. These four are the ones with live callers.
+//! already suppressed. Four had live callers; the fourth has since crossed.
 //!
-//! # The block-width finding that had to survive, and did
+//! # THREE, since `combine_attn_outputs_bf16` crossed
 //!
-//! `combine_attn_outputs_bf16` carried the longest comment in the file and it
-//! is a MEASUREMENT, not a note. It is reproduced on
-//! [`combine_attn_outputs_bf16`] in full, and its conclusion is why that
-//! launcher fires a driver-owned [`Launch`] rather than
-//! `LaunchRule::PerHeadElementwise`:
+//! It is `kernels_cuda_new::x::attn::combine_attn_outputs_bf16` now, bound by
+//! that file's `COMBINE_ATTN_OUTPUTS` contract, and its `table::attn` row and
+//! `execution::WALKED` entry went with it. It could go and the other three
+//! could not for one reason: every value it needed came out of the statement,
+//! so a `Cx` can assemble the whole argument list.
+//!
+//! # The block-width finding that had to survive, and did — twice
+//!
+//! `combine_attn_outputs_bf16` carried the longest comment in this file and
+//! it is a MEASUREMENT, not a note. It travelled unabridged into
+//! `x::attn::combine_attn`'s doc, which is now the place to read it. It is
+//! left here in short form because it is the argument that kept that launcher
+//! out of a row for as long as rows lasted, and because the shape recurs:
 //!
 //! > The grid is that rule to the digit — token on `grid.x`, head on `grid.y`
 //! > — and the block is not: this clamps `head_dim` into `[32, 256]` and the
@@ -23,9 +31,11 @@
 //! > would be invisible: a slower kernel, never a wrong answer, so nothing
 //! > fails and nothing reports.
 //!
-//! A driver-owned `Launch` is exactly the shape that finding asks for: the
+//! A hand-built `Launch` is exactly the shape that finding asks for: the
 //! geometry is stated where it can be checked against the `<<<>>>` it came
-//! from, and `SINK_BLOCK_MAX` in `runtime/launch.rs` is left alone.
+//! from, and `SINK_BLOCK_MAX` in `runtime/launch.rs` is left alone. Fn-world
+//! does not change the answer — it changes where the answer lives, from
+//! another crate to four lines above the launch.
 //!
 //! # Two stale sentences in `csrc/**`, corrected in `families/attn.rs` and
 //! restated here
@@ -43,9 +53,6 @@ use std::ffi::c_void;
 
 use kernels_cuda_new::runtime::{ArgValue, Launch};
 
-/// `attn::combine_attn_outputs_bf16` — the table symbol.
-pub const COMBINE_SYMBOL: &str = "attn::combine_attn_outputs_bf16";
-
 /// `attn::dsv4_boundary_meta_decode` — the table symbol.
 pub const META_DECODE_SYMBOL: &str = "attn::dsv4_boundary_meta_decode";
 
@@ -54,9 +61,6 @@ pub const META_PAGED_SYMBOL: &str = "attn::dsv4_boundary_meta_paged";
 
 /// `attn::attention_compressed_paged_bf16` — the table symbol.
 pub const COMPRESSED_PAGED_SYMBOL: &str = "attn::attention_compressed_paged_bf16";
-
-/// `attn::combine_attn_outputs_dev` — the device row.
-const COMBINE_DEVICE: &str = "attn::combine_attn_outputs_dev";
 
 /// `attn::dsv4_boundary_meta_decode_dev` — the device row.
 const META_DECODE_DEVICE: &str = "attn::dsv4_boundary_meta_decode_dev";
@@ -108,91 +112,20 @@ pub enum Dsv4Decline {
     NoHeads,
 }
 
-/// `attn/dsv4_compress.cu:57` — `combine_attn_outputs_bf16`.
-///
-/// Merges two attention outputs and their log-sum-exps into one, which is how
-/// a sparse branch and a dense branch are recombined.
-///
-/// ```text
-/// :64   if (N <= 0) return;
-/// :65   dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(num_heads));
-/// :87   const int block = (head_dim < 32) ? 32 : ((head_dim > 256) ? 256 : head_dim);
-/// :88   device::combine_attn_outputs<device::bf16><<<grid, block, 0, stream>>>(
-/// ```
-///
-/// # THE BLOCK IS 256 HERE AND `LaunchRule::PerHeadElementwise` CAPS AT 128
-///
-/// The C++ carried this and it is carried here unabridged, because it is the
-/// reason this launcher fires a driver-owned geometry rather than a rule:
-///
-/// > The grid is that rule to the digit — token on `grid.x`, head on `grid.y`
-/// > — and the block is not: this clamps `head_dim` into `[32, 256]` and the
-/// > rule clamps into `[32, 128]`, so on a head wider than 128 the rule
-/// > answers with half these threads. The kernel strides `d += blockDim.x`
-/// > and reduces nothing, so the narrower block computes the same bytes in
-/// > two passes; `runtime::launch`'s own `per_head_elementwise` doc names
-/// > this launcher as the second one its clamp was written to serve.
-/// >
-/// > The row is still not written, and this comment is why. A row cites the
-/// > launcher it was checked against, and "checked" means the rule returns
-/// > what the `<<<>>>` returns for the same extents — which these two do only
-/// > while `head_dim <= 128`. Rowing it would put a launch in the table that
-/// > agrees with this line at deepseek_v4's 128-wide heads and stops agreeing
-/// > at the first config that widens one, and the disagreement would be
-/// > invisible: a slower kernel, never a wrong answer, so nothing fails and
-/// > nothing reports. Reconciling it is a decision about `SINK_BLOCK_MAX` in
-/// > `kernels-cuda-new/src/runtime/launch.rs`, which is not this file's to
-/// > make.
-///
-/// It is still not this file's to make. What changed is only that the
-/// launcher is Rust, so the `<<<>>>` and its clamp sit in one language.
-///
-/// # Panics
-///
-/// If the kernel table and this driver disagree; see [`super::hand::fire`].
-///
-/// # Safety
-///
-/// Every pointer is a device address the caller keeps live across the launch,
-/// and `stream` is the caller's stream.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn combine_attn_outputs_bf16(
-    o1: *const c_void,
-    lse1: *const f32,
-    o2: *const c_void,
-    lse2: *const f32,
-    o_out: *mut c_void,
-    lse_out: *mut f32,
-    n: i32,
-    num_heads: i32,
-    head_dim: i32,
-    stream: *mut c_void,
-) -> Dsv4 {
-    // `dsv4_compress.cu:64`.
-    if n <= 0 {
-        return Dsv4::Declined(Dsv4Decline::NoTokens);
-    }
-    // `:87` — clamp into `[32, 256]`, not `[32, 128]`. See the doc comment.
-    let block = head_dim.clamp(32, 256);
-    #[allow(clippy::cast_sign_loss)]
-    let launch = Launch {
-        grid: [n as u32, num_heads.max(0) as u32, 1],
-        block: [block as u32, 1, 1],
-        smem: 0,
-    };
-    let values = [
-        ArgValue::Ptr(o1.cast_mut()),
-        ArgValue::Ptr(lse1.cast_mut().cast()),
-        ArgValue::Ptr(o2.cast_mut()),
-        ArgValue::Ptr(lse2.cast_mut().cast()),
-        ArgValue::Ptr(o_out),
-        ArgValue::Ptr(lse_out.cast()),
-        ArgValue::I32(num_heads),
-        ArgValue::I32(head_dim),
-    ];
-    super::hand::fire(COMBINE_DEVICE, launch, &values, stream);
-    Dsv4::Launched
-}
+// `attn::combine_attn_outputs_bf16` CROSSED INTO FN-WORLD — its host program
+// STOOD HERE and is now `kernels_cuda_new::x::attn::combine_attn_outputs_bf16`,
+// bound by that file's `COMBINE_ATTN_OUTPUTS` contract.
+//
+// It went because it could: alone among this file's four, every value it
+// needed came out of the statement — four operands, two results, the row
+// count and two parameters — so the contract's bind assembles the whole
+// argument list from a `Cx` and nothing is left for a driver-side caller to
+// supply. The other three are here for the reason the module header gives.
+//
+// The block-width measurement travelled with it, unabridged, and is now
+// `x::attn::combine_attn`'s doc. That is the point of the move rather than a
+// side effect of it: the clamp and the launch it applies to are four lines
+// apart in one file, in one crate, and `SINK_BLOCK_MAX` is still left alone.
 
 /// `attn/dsv4_compress.cu:121` — `dsv4_boundary_meta_decode`.
 ///
@@ -215,7 +148,8 @@ pub unsafe fn combine_attn_outputs_bf16(
 ///
 /// # Safety
 ///
-/// [`combine_attn_outputs_bf16`]'s.
+/// Every pointer is a device address the caller keeps live across the launch,
+/// and `stream` is the caller's stream.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn dsv4_boundary_meta_decode(
     positions: *const i32,
@@ -268,7 +202,7 @@ pub unsafe fn dsv4_boundary_meta_decode(
 ///
 /// # Safety
 ///
-/// [`combine_attn_outputs_bf16`]'s.
+/// [`dsv4_boundary_meta_decode`]'s.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn dsv4_boundary_meta_paged(
     positions: *const i32,
@@ -340,7 +274,7 @@ pub unsafe fn dsv4_boundary_meta_paged(
 ///
 /// # Safety
 ///
-/// [`combine_attn_outputs_bf16`]'s.
+/// [`dsv4_boundary_meta_decode`]'s.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn attention_compressed_paged_bf16(
     q: *const c_void,

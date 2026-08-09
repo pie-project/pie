@@ -104,7 +104,6 @@ pub mod attn;
 // replace twenty-seven rows. Four of the twenty-seven are `none:` arms:
 // their rows stated EVERY operand unsourced, so the sentence a load-time
 // refusal prints is the prose those rows were already carrying.
-pub mod moe;
 
 /// Every kernel a lowered declaration may state.
 ///
@@ -166,7 +165,22 @@ pub static TABLES: &[&[KernelSig]] = &concat_lists();
 /// and [`TABLES`] has read `static`s from a `const` context here since
 /// [`total`] was written. Matching that shape exactly means this line adds no
 /// construct the tree has not already compiled.
-static ROW_TABLES: &[&[KernelSig]] = &[attn::KERNELS, moe::KERNELS];
+///
+/// **`moe::KERNELS` left on the commit that crossed `quant`'s four routed
+/// decode GEMVs**, and the shape of that crossing is worth keeping: those
+/// four rows lived in `table/moe.rs` because `moe` DISPATCHED them, while
+/// their host programs live in `x/quant.rs` because `quant` OWNS them. So
+/// `table/moe.rs` outlived `moe` as `quant`'s tenant, and the four lists that
+/// walk everything had been carrying one family's rows under another
+/// family's name for as long as both entries were there. Nothing was wrong
+/// until one had to go.
+///
+/// **`attn` is the last, and its 32 rows are the whole remaining structural
+/// distance in the CUDA lane** — when they go, this list is empty, [`KERNELS`]
+/// is `x::SIGS`, `driver-cuda`'s `bridge` feature is deletable, and with it
+/// `kernels-cuda/native`, which is the only switch over every nvcc and `.cpp`
+/// compile in the workspace.
+static ROW_TABLES: &[&[KernelSig]] = &[attn::KERNELS];
 
 const N_LISTS: usize = ROW_TABLES.len() + crate::x::SIGS.len();
 

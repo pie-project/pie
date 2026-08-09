@@ -6,7 +6,7 @@
 //! acquire/release/begin_fire calls. This test replays the same scripts
 //! against [`SidebandArena`] and requires the transcripts to be equal.
 //!
-//! Run `tests/oracle/sideband_arena/run.sh` to regenerate [`GOLDEN_FNV1A64`].
+//! `tests/oracle/sideband_arena/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`].
 //! The pinned value is the **C++'s** hash, never this file's: a golden taken
 //! from the port would only prove the port agrees with itself.
 //!
@@ -289,8 +289,9 @@ fn the_rust_arena_reproduces_the_cpp_transcript() {
     assert_eq!(
         fnv1a64(t.as_bytes()),
         GOLDEN_FNV1A64,
-        "transcript differs from the C++ oracle; \
-         run tests/oracle/sideband_arena/run.sh with SB_ORACLE_OUT set to diff them"
+        "transcript differs from the C++ oracle, which cannot be re-run to diff \
+         against (see `oracle_census.rs`): the golden is the only record of \
+         it, so a divergence is THIS crate changing, not the oracle."
     );
 }
 

@@ -1,30 +1,44 @@
-//! Generate `api.rs`: one typed Rust function per row, into `OUT_DIR`.
+//! Generate `carried.rs`: the header set NVRTC compiles against, into `OUT_DIR`.
 //!
-//! # Why a build script writes it
+//! # What this script used to be, and why the argument is kept
 //!
-//! The direct-call surface is one function per row, and the rows are Rust
-//! data — `static` arrays of `DeviceKernel`, in this crate's own
-//! `src/families/*.rs` and in `kernels-cuda`. Nothing in the language reads
-//! one of those at compile time: a `macro_rules!` cannot iterate a static,
-//! and a proc-macro would be a third crate that has to depend on the tables
-//! to expand against them, which the tables' own crate cannot then depend on.
-//! A build script can just call the emitter, which is how `kernels-cuda`
-//! already generates its `ffi.rs` and its C shim. The alternative is not a
-//! cleverer macro, it is a hand-written wrapper per row — the thing
-//! `emit_c_shim` exists so that nobody writes.
+//! It generated `api.rs` — one typed Rust function per row — and the whole
+//! header below argued for that. North star §6 half A retired the emitter, so
+//! the argument is history; it is kept rather than deleted because **the same
+//! reasoning still decides `carried.rs`**, which is the half that survived,
+//! and a reader who finds only the conclusion will re-open the question.
 //!
-//! A checked-in `api.rs` with a test that regenerates and diffs it was the
-//! other candidate and it loses on one property: a stale file still COMPILES.
-//! A row whose operands changed under a hand-refreshed façade gives its
-//! callers a function that binds the old list, and `Args::bind` refuses it at
-//! the launch — the run-time failure §12.4 says the generation exists to
-//! convert into a build-time one. Generated into `OUT_DIR`, it cannot be
-//! stale by construction.
+//! The rows are Rust data — `static` arrays of `DeviceKernel`, in this crate's
+//! own `src/families/*.rs` and `src/x/*.rs`. Nothing in the language reads one
+//! of those at compile time: a `macro_rules!` cannot iterate a static, and a
+//! proc-macro would be a third crate that has to depend on the tables to
+//! expand against them, which the tables' own crate cannot then depend on.
+//! A build script can just call the generator.
 //!
-//! # Why the emitter is included by `#[path]`, and why its siblings are too
+//! A checked-in output with a test that regenerates and diffs it was the other
+//! candidate and it loses on one property: **a stale file still COMPILES.**
+//! Generated into `OUT_DIR`, it cannot be stale by construction. That property
+//! is what `carried.rs` needs most — it names the `.cuh` files the JIT carries,
+//! and a stale list is a `NoLoweredName` at first fire on a machine with a GPU,
+//! which is the run-time failure §12.4 says generation exists to convert into a
+//! build-time one.
 //!
-//! A build script cannot depend on the crate it builds, so `src/emit.rs` is
-//! pulled in as a module rather than reached through `kernels_cuda_new::`.
+//! # Why the emitter's argument did NOT survive with it
+//!
+//! `emit.rs` walked `unit::rows()` — the DEVICE row list — and not
+//! `table::ROW_TABLES`. Every fn-world family contributes to it, because a
+//! unit's rows carry the instantiation strings NVRTC lowers, so the generator
+//! was never going to run dry: **the list it read is the list the JIT needs.**
+//! What blocked it was callers, and there was one, in `tests/fire.rs`. The
+//! direct-call surface is written by hand in `src/x/` now, where a wrong
+//! operand is a type error at the call site rather than a row the generator
+//! silently skipped with a comment.
+//!
+//! # Why the modules are included by `#[path]`
+//!
+//! A build script cannot depend on the crate it builds, so `src/device.rs`,
+//! `src/unit.rs`, `src/families/mod.rs` and `src/x/mod.rs` are pulled in as
+//! modules rather than reached through `kernels_cuda_new::`.
 //! `kernels-cuda/build.rs` records the same constraint about `abi.rs` and
 //! draws the consequence in one sentence: *"a module here that reached for a
 //! sibling, or for `crate::`, would have to be pulled in with it."* It then

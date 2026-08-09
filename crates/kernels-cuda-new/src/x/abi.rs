@@ -184,6 +184,45 @@ scalar_abi!(f32, "float", F32, F32);
 scalar_abi!(bool, "bool", Bool, Bool);
 scalar_abi!(i64, "long long", I64, I64);
 scalar_abi!(usize, "std::size_t", Usize, Usize);
+
+/// `__nv_fp8_interpretation_t`, as the kernels take it.
+///
+/// **A newtype rather than `u32`, and `scalar_abi!` cannot spell it.** That
+/// macro writes `ArgValue::$arg(*self)`, which requires the Rust type to *be*
+/// the payload; here the payload is the field. Two lines of the macro's body
+/// would have to become a conversion, and the macro is right not to have one:
+/// every other scalar in this list is its own payload, and a macro that
+/// admitted a conversion would stop proving that.
+///
+/// # Why not `u32`
+///
+/// `u32` compiles, binds, and launches. `Args::bind` passes because
+/// `Ty::U32` and `Ty::Fp8Kind` both marshal four bytes into eight, and the
+/// only thing that would notice is [`typecheck_tu`], which compares
+/// `unsigned int` against `::__nv_fp8_interpretation_t` and is the one reader
+/// that can tell them apart. **That is §3.2's bypass exactly** — two formats
+/// at one width, distinguished by nothing the binder checks — and the whole
+/// argument for `Abi::CPP` existing beside `Abi::TY` is that the spelling is
+/// the check.
+///
+/// `kernels::Ty::cpp` has spelled it `::__nv_fp8_interpretation_t` since it
+/// was written, and `kernels-cuda-new::abi:446` records the measurement that
+/// makes the four bytes safe: the enum is four bytes wide, asserted in the
+/// generated typecheck rather than assumed.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct fp8_kind(pub u32);
+
+impl Abi for fp8_kind {
+    const CPP: &'static str = "::__nv_fp8_interpretation_t";
+    const TY: Ty = Ty::Fp8Kind;
+    #[cfg(feature = "_cuda")]
+    fn arg(&self) -> crate::runtime::ArgValue {
+        crate::runtime::ArgValue::U32(self.0)
+    }
+}
+
 // No scalar `u8`, and not an oversight: `Ty` has no general byte tag — the
 // row world only ever crossed a scalar byte as a semantic enum (`KvScheme`,
 // `KvDType`, both checked against `ArgValue::U8`) — and no fn-world kernel
@@ -264,6 +303,37 @@ ptr_abi!(
     BufMut
 );
 ptr_abi!(i32, "const ::std::int32_t*", I32s, "::std::int32_t*", I32sMut);
+// `moe::hash_route_lookup`'s `tid2eid`, a `[vocab, K]` `const int64_t*` table.
+// `kernels::Ty::I64s` exists and `I64sMut` does not, so the mut spelling
+// reuses `BufMut` exactly as `bf16` and `f16` do above — the asymmetry is the
+// row vocabulary's, not this file's.
+ptr_abi!(i64, "const ::std::int64_t*", I64s, "::std::int64_t*", BufMut);
+// `moe::build_moe_ptrs_aligned`'s six operands, `const T**` and `T**` at
+// `moe_dispatch.cuh:1046-1051`. **The pointee is the POINTER**, which is why
+// these are `ptr_abi!(*const bf16, …)` rather than an impl on
+// `*mut *const c_void`: `CPP` is the DEVICE parameter's spelling, and the
+// device parameter is `const bf16**`, where `Ty::BufArrayOut::cpp()` is
+// `const void**` because that was the deleted C launcher's. `ptr_abi!(bf16, …)`
+// above already carries exactly that split, so this is the established shape.
+//
+// Spelling any of the six `*const c_void` instead would compile, put `Ty::Buf`
+// where `Args::bind` checks, and put `const void*` in the typecheck
+// translation unit where the kernel says `const bf16*` — the bypass that
+// reproduces the deleted rows' `Ty`s and loses the only thing the port added.
+ptr_abi!(
+    *const bf16,
+    "const ::pie_cuda_driver::kernels::device::bf16* const*",
+    BufArrayOut,
+    "const ::pie_cuda_driver::kernels::device::bf16**",
+    BufArrayOut
+);
+ptr_abi!(
+    *mut bf16,
+    "::pie_cuda_driver::kernels::device::bf16* const*",
+    BufArrayOutMut,
+    "::pie_cuda_driver::kernels::device::bf16**",
+    BufArrayOutMut
+);
 // The impl arrives with its first kernel, which is what an open set means
 // (see the note above `scalar_abi!`). `i8`'s is
 // `sample::lm_head_gemv_argmax_int8_bf16`, whose `const int8_t* __restrict__
@@ -507,6 +577,92 @@ macro_rules! by_value {
                  a Ty whose needs_mirror() is true.",
             ),
         );
+        const _: () = assert!(
+            ::core::mem::size_of::<$rust>() == $size,
+            concat!(stringify!($rust), ": sizeof disagrees with the measured ", $cpp),
+        );
+        const _: () = assert!(
+            ::core::mem::align_of::<$rust>() == $align,
+            concat!(stringify!($rust), ": alignof disagrees with the measured ", $cpp),
+        );
+        $(
+            const _: () = assert!(
+                ::core::mem::offset_of!($rust, $field) == $at,
+                concat!(
+                    stringify!($rust), ".", stringify!($field),
+                    ": offset disagrees with the measured ", $cpp, "::", $cname,
+                ),
+            );
+        )*
+    };
+
+    // The untagged arm: an aggregate with no `Ty` that means it.
+    //
+    // The tagged arm above requires `Ty::$tag.needs_mirror()`, and that is a
+    // CLOSED SET OF SIX in a crate three portable backends share. `Abi` is an
+    // open set — any `#[repr(C)]` mirror can implement it — so the tagged arm
+    // gates an open set behind a closed one, and the gate only opened for
+    // `xqa`'s `KvCacheList` because `Ty::KvCacheLayerView` already existed and
+    // already meant roughly the right thing. **Eleven families produced no
+    // second `by_value!`**, and this is why.
+    //
+    // The two ways out were both refused, for reasons already written down:
+    //
+    //  * Borrow a neighbouring tag. `runtime::args`' own doc bars it — "the
+    //    check would pass on a `MLAParams` bound where a `HopperParams` is
+    //    declared and catch nothing." A tag that is approximately right is
+    //    worse than no tag, because it reads as a statement.
+    //  * Add a `Ty` per aggregate. This module's header bars it — "a `Ty`
+    //    variant per aggregate would have been the forty-variant `LaunchRule`
+    //    mistake one level down." And step 9 is measured at shrinking `Ty`,
+    //    not growing it.
+    //
+    // So this arm states no tag at all. `TY` is `Ty::Unstated`'s honest
+    // stand-in: `Ty::MlaPlanCache`, chosen because it is on NEITHER
+    // `is_pointer`'s list NOR `bind::device::scalar`'s, so a walker that did
+    // consult the tag gets `ArgError::Unsupported` — a named refusal, never a
+    // silent accept of eight bytes where two hundred were meant.
+    //
+    // Nothing consults it today. `Args::bind` short-circuits on
+    // `ArgValue::Bytes` before the tag match, every fn-world operand is
+    // `Source::Unbound`, and `typecheck_tu` spells parameters through
+    // `Abi::CPP` rather than `Ty::cpp`. `Abi::TY` dies with `Ty` at step 9,
+    // and this arm is the reason it should: **the field was never carrying a
+    // fact, it was carrying a permission.**
+    //
+    // Everything else is identical to the tagged arm — the same `ArgValue`,
+    // the same `Layout`, the same size/align/offset assertions naming the
+    // same probe. The measurement is the point of the macro and this arm
+    // loses none of it.
+    (
+        $rust:ident as $cpp:literal,
+        untagged,
+        probe = $probe:literal,
+        size = $size:literal, align = $align:literal,
+        { $($field:ident @ $at:literal as $cname:literal),* $(,)? }
+    ) => {
+        impl $crate::x::Abi for $rust {
+            const CPP: &'static str = $cpp;
+            const TY: ::kernels::Ty = ::kernels::Ty::MlaPlanCache;
+            #[cfg(feature = "_cuda")]
+            fn arg(&self) -> $crate::runtime::ArgValue {
+                $crate::runtime::ArgValue::Bytes {
+                    ptr: ::core::ptr::from_ref::<$rust>(self).cast::<u8>(),
+                    len: ::core::mem::size_of::<$rust>(),
+                }
+            }
+        }
+
+        impl $crate::x::ByValue for $rust {
+            const LAYOUT: $crate::x::Layout = $crate::x::Layout {
+                cpp: $cpp,
+                size: $size,
+                align: $align,
+                fields: &[$(($cname, $at)),*],
+                probe: $probe,
+            };
+        }
+
         const _: () = assert!(
             ::core::mem::size_of::<$rust>() == $size,
             concat!(stringify!($rust), ": sizeof disagrees with the measured ", $cpp),

@@ -8,7 +8,7 @@
 //! scripts against [`AttentionWorkspace`] and requires the transcripts to
 //! be byte-identical.
 //!
-//! Run `tests/oracle/attn_ws/run.sh` to regenerate [`GOLDEN_FNV1A64`]. The
+//! `tests/oracle/attn_ws/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`]. The
 //! pinned value is the **C++'s** hash, never this file's.
 //!
 //! The C++ move-assignment maps to `b.release(&mut ops); b = a;` here —

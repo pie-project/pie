@@ -100,10 +100,15 @@ pub mod marlin;
 // not cover. Its `SPECIALISATIONS` went with it — `RMSNORM_STRIDED_VEC8`'s
 // six-term predicate is an `if` in `x::norm::strided_bf16`.
 // `families::quant` IS GONE — §5 step 5 took it into fn-world as `x::quant`,
-// seven roots, thirty-eight device rows and fifteen host programs. Two of the
-// seven join a `unit!`'s rows to hand-written ones: `table::moe`'s four routed
-// MoE decode GEMVs live in `quant`'s headers but are fired rule-driven, so
-// `x::quant` keeps their `KernelSig`s verbatim and concatenates.
+// seven roots, thirty-eight device rows and nineteen host programs. Two of
+// the seven joined a `unit!`'s rows to hand-written ones for a round:
+// `table::moe`'s four routed MoE decode GEMVs live in `quant`'s headers but
+// were fired rule-driven, so `x::quant` kept their `KernelSig`s verbatim and
+// concatenated. **That join is gone.** The four crossed in their own pass,
+// `table::moe` is empty, and the two units are ordinary `unit!`s again —
+// which retires the standing ask for a `unit!` form that appends foreign
+// rows, because the only caller it ever had did not want to append rows, it
+// wanted to finish a port.
 // `families::sample` IS GONE — §5 step 5 took it into fn-world as
 // `x::sample`. Its "five things no row says" table moved with it and is now
 // a table of where each one went, all five into one host `fn`.
@@ -142,11 +147,27 @@ pub mod vision;
 pub static ALL: &[&[Unit]] = &[
     crate::x::adapter::UNITS,
     // BOTH HALVES OF `attn`, and the pair is the shape of a family mid-port:
-    // three roots have crossed and twenty have not, and a root is in exactly
+    // eleven roots have crossed and nine have not, and a root is in exactly
     // one of the two lists — a second `unit!` naming the same text would
     // compile it twice and `unit_of` would answer with whichever won.
+    //
+    // The eleventh, `attn/attention_mla_fa2`, is in the first list without
+    // ever having been in the second: it is a NEW `.cuh`, an NVRTC root
+    // written in `fa2.cuh`'s idiom so six rows can name upstream's
+    // `BatchMLAPagedAttentionKernel`. The file it replaces is
+    // `crates/kernels-cuda/csrc/src/attn/attention_mla.cu`, which holds no
+    // device text at all.
     crate::x::attn::UNITS,
     attn::UNITS,
+    // The XQA lattice's FIVE enrolled members, in their own module rather
+    // than in either `attn` list above: the six option sets and the
+    // by-value `KVCacheList` mirror are one subject, `x/xqa.rs` is where
+    // that subject lives, and a root's units belong with the mirror that
+    // makes their parameter list expressible. The sixth member
+    // (`attn/attention_xqa_mha_gqa8_p32_sm90`) is deliberately absent — see
+    // `families::attn::XQA_LATTICE`'s last entry, which is the only place
+    // the reason is argued.
+    crate::x::xqa::UNITS,
     cascade::UNITS,
     fa2::UNITS,
     crate::x::gemm::UNITS,
@@ -155,6 +176,11 @@ pub static ALL: &[&[Unit]] = &[
     marlin::UNITS,
     crate::x::mlp::UNITS,
     crate::x::moe::UNITS,
+    // `crate::x::moe_glue::UNITS` was here and went with the fused CUTLASS
+    // leg. Its six kernels were that leg's machinery — expand, both
+    // finalizes, both activations, and the stride computation — and the
+    // aligned leg they were supposed to fall back to runs on `x::moe`'s
+    // twenty contracts instead.
     crate::x::norm::UNITS,
     crate::x::quant::UNITS,
     crate::x::rope::UNITS,

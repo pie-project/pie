@@ -460,7 +460,8 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
     let dplan = DispatchPlan::new(&plan, &l);
 
     // Walk until the first kernel without an arm, remembering where the
@@ -1323,7 +1324,8 @@ fn zero_weight_decode(leg: Leg) {
         // and the hooked one's regions between them cover every row.
         peel_window: peel_win.device_ptr(),
         rows_total: ROWS as i32,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     // ── The walk: every launch, no refusals allowed. ──
     let mut resolver = Live {
@@ -1907,7 +1909,8 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     let mut embed_out = None;
     let mut logits_value: Option<ValueId> = None;
@@ -2441,7 +2444,8 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     // ── The walk. ──
     let mut resolver = Live {
@@ -2989,7 +2993,8 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     let mut resolver = Live {
         embed: embed_dev.as_ptr(),
@@ -3455,7 +3460,8 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     let mut resolver = Live {
         embed: embed_dev.as_ptr(),
@@ -4651,7 +4657,8 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     // Launch by launch, syncing after each: a wrong dimension read from
     // the wrong operand is an illegal address, and this is what names it.
@@ -5040,7 +5047,8 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     let mut resolver = Live {
         embed: embed_dev.as_ptr(),

@@ -46,7 +46,7 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use kernels_cuda_new::x::{Facts, KvLayer, Plan, Rows, Slab, Yarn};
+use kernels_cuda_new::x::{Facts, KvDType, KvLayer, KvScheme, Plan, Rows, Slab, Yarn};
 
 use super::{AttnCtx, BoundLaunch, DispatchCtx, GdnCtx, LaunchSpec};
 
@@ -78,6 +78,16 @@ pub struct Fire<'a> {
     pub w_named: *const c_void,
     /// The second named weight, resolved the same way.
     pub w_named2: *const c_void,
+    /// Weights the statement names by SUFFIX, resolved once by the caller.
+    ///
+    /// `w_named`'s reason, for a set that is not two: `quant`'s routed MXFP4
+    /// pair reaches `_scales`, `_gate_bias` and `_up_bias` on one fire, and
+    /// `weight_names.rs:505` records that the trace states none of them. So
+    /// this is a slice rather than two more fields — the arity is the
+    /// statement's, not the struct's.
+    ///
+    /// Empty for every fire that names no suffix, which is most of them.
+    pub w_suffixed: &'a [(&'static str, *const c_void)],
 }
 
 impl Fire<'_> {
@@ -121,6 +131,126 @@ impl Facts for Fire<'_> {
 
     fn weight(&self, i: usize) -> Option<*mut c_void> {
         self.arg(self.spec.n_in + self.spec.n_out + i)
+    }
+
+    /// Whether the router renormalises its top-k weights.
+    ///
+    /// `DispatchCtx` has carried this since `bind/mod.rs:1179`, filled from
+    /// `model.deployment.norm_topk_prob` at `fire/launch.rs:3435`. The row
+    /// world reached it as `Source::Ctx("moe_norm_topk")` and the generated
+    /// dispatcher rendered it `ctx.moe_norm_topk`; this is the same field
+    /// reached the fn-world way.
+    ///
+    /// Always `Some`: the field is a `bool` with a deployment default, not an
+    /// optional fact, so a refusal here would be inventing an absence.
+    fn moe_norm_topk(&self) -> Option<bool> {
+        Some(self.ctx.moe_norm_topk)
+    }
+
+    /// The router's routed scaling factor.
+    ///
+    /// [`Facts::moe_norm_topk`]'s pair, carried the same way and `Some` for
+    /// the same reason.
+    fn moe_routed_scaling(&self) -> Option<f32> {
+        Some(self.ctx.moe_routed_scaling)
+    }
+
+    /// The `i`th input's row count.
+    ///
+    /// **This is `self.rows`, and the index is checked rather than used.**
+    /// `bind/mod.rs:1596`'s `rows_of(b, i, rows)` — which every generated arm
+    /// called for `Source::InRows` — is `{ let _ = (b, i); rows }`: every
+    /// operand of a fire spans the same already-narrowed region, and the
+    /// parameter exists so a future per-operand narrowing has a place to go.
+    ///
+    /// The bound is kept anyway, because `Cx::in_rows` refuses with
+    /// `Refusal::Absent` and an out-of-range index IS an absent operand. A
+    /// method that answered `self.rows` for `i = 99` would report a row count
+    /// for a buffer the fire does not have.
+    fn in_rows(&self, i: usize) -> Option<i32> {
+        (i < self.spec.n_in).then_some(self.rows)
+    }
+
+    /// The attention workspace this fire was given.
+    ///
+    /// `AttnCtx::workspace`, which is the DECODE workspace. `prefill_workspace`
+    /// is a second field and this query does not choose between them — the
+    /// two families that asked both name the decode one, and a query that
+    /// picked by guessing which phase a fire is in would be inventing a fact.
+    fn attn_workspace(&self) -> Option<AttnWorkspace> {
+        let w = self.attn?.workspace;
+        Some(AttnWorkspace {
+            float_buffer: w.float_buffer,
+            float_bytes: w.float_bytes,
+            int_buffer: w.int_buffer,
+            int_bytes: w.int_bytes,
+        })
+    }
+
+    /// The softmax scale this fire was planned with.
+    fn sm_scale(&self) -> Option<f32> {
+        Some(self.attn?.sm_scale)
+    }
+
+    /// `write_kv_to_pages`' first-token scalar.
+    ///
+    /// **All four of these have a producer**, which is what separates them
+    /// from [`Facts::mla_layer`]: `AttnCtx` has carried them since before
+    /// fn-world existed, and the queries were the missing half rather than
+    /// the fill.
+    fn first_token(&self) -> Option<i32> {
+        Some(self.attn?.first_token)
+    }
+
+    /// The pages this fire's CSR names, which the dequant staging walks.
+    fn num_pages_in_batch(&self) -> Option<i32> {
+        Some(self.attn?.num_pages_in_batch)
+    }
+
+    /// Per-row target page for this fire's KV append.
+    ///
+    /// Null is absence rather than a value: a fire that appends no KV carries
+    /// a null here, and a body that took the pointer anyway would index it.
+    fn w_page_d(&self) -> Option<*const u32> {
+        let p = self.attn?.w_page_d;
+        (!p.is_null()).then_some(p)
+    }
+
+    /// Per-row offset-in-page for the append. [`Facts::w_page_d`]'s pair, and
+    /// null-checked for the same reason.
+    fn w_off_d(&self) -> Option<*const u32> {
+        let p = self.attn?.w_off_d;
+        (!p.is_null()).then_some(p)
+    }
+
+    /// gpt-oss's clamped-GLU ceiling.
+    ///
+    /// `DispatchCtx` has carried it since `bind/mod.rs:1193`. Always `Some`:
+    /// a config value with a deployment default is not an optional fact.
+    fn glu_limit(&self) -> Option<f32> {
+        Some(self.ctx.glu_limit)
+    }
+
+    /// The clamped GLU's alpha, carried the same way.
+    fn glu_alpha(&self) -> Option<f32> {
+        Some(self.ctx.glu_alpha)
+    }
+
+    /// A weight the statement names by suffix.
+    ///
+    /// A linear scan, and it should stay one: the longest `w_suffixed` any
+    /// fire carries is three. A map would cost an allocation per fire to
+    /// avoid two comparisons.
+    ///
+    /// **Absence is not an error here** — see [`Cx::weight_suffixed`]. Two of
+    /// `quant`'s three suffixes are nullable and one is not, in the same bind
+    /// body, so the caller names the refusal.
+    fn weight_suffixed(&self, suffix: &str) -> Option<*mut c_void> {
+        self.w_suffixed
+            .iter()
+            .find(|(s, _)| *s == suffix)
+            .map(|(_, p)| p.cast_mut())
+            .filter(|p| !p.is_null())
     }
 
     /// The weights a statement names by NAME rather than by position.
@@ -351,6 +481,8 @@ impl Facts for Fire<'_> {
     /// read into the argument list, and a guard cannot bind"*. A `fn` can
     /// bind, so they are one method and the pair's whole reason is gone.
     fn kv_layer(&self) -> Option<KvLayer> {
+        use crate::bind::abi::KvCacheScheme as S;
+        use crate::dtype::DType as D;
         let v = self.attn?.layers.get(self.layer_index())?;
         Some(KvLayer {
             k_pages: v.k_pages,
@@ -359,6 +491,39 @@ impl Facts for Fire<'_> {
             head_dim: v.head_dim,
             num_kv_heads: v.num_kv_heads,
             hnd: v.hnd_layout,
+            // The two enums are TRANSLATED rather than transmuted, and the
+            // fallthrough is deliberate on each. `KvScheme` mirrors all five
+            // of `KvCacheScheme`, so its `_` is unreachable and says so;
+            // `KvDType` mirrors five of `DType`'s twelve, because a KV page
+            // is never `Int4Packed` or `Mxfp4Packed` — those are weight
+            // representations — so its `_` is a producer that reached a state
+            // the mirror says it cannot, and refusing is the honest answer.
+            scheme: match v.scheme {
+                S::Native => KvScheme::Native,
+                S::Fp8PerTensor => KvScheme::Fp8PerTensor,
+                S::Int8PerTokenHead => KvScheme::Int8PerTokenHead,
+                S::Fp8PerTokenHead => KvScheme::Fp8PerTokenHead,
+                S::Fp4Block => KvScheme::Fp4Block,
+            },
+            storage_dtype: match v.storage_dtype {
+                D::Bf16 => KvDType::Bf16,
+                D::Fp16 => KvDType::Fp16,
+                D::Int8 => KvDType::Int8,
+                D::Fp8E4M3 => KvDType::Fp8E4M3,
+                D::Fp8E5M2 => KvDType::Fp8E5M2,
+                _ => return None,
+            },
+            block_size: v.block_size,
+            num_pages: v.num_pages,
+            k_scales: v.k_scales,
+            v_scales: v.v_scales,
+            k_bf16_pages: v.k_bf16_pages,
+            v_bf16_pages: v.v_bf16_pages,
+            k_env_min: v.k_env_min,
+            k_env_max: v.k_env_max,
+            // Answered, not handed over as inputs — see the fields' docs.
+            has_envelopes: v.has_envelopes(),
+            is_native_bf16: v.is_native_bf16(),
         })
     }
 

@@ -54,7 +54,17 @@ use std::path::{Path, PathBuf};
 /// added is the case this file exists to catch, and it cannot be silenced by
 /// forgetting to edit a list.
 const FLOOR: &[&str] = &[
-    "abi", "contract", "cx", "launch", "macros", "fire", "xqa",
+    // `xqa` was here and left on the commit that gave it a `unit!` and a
+    // `contract!`. It qualified while it held only `KvCacheList`'s mirror and
+    // `by_value!` support — `sweep-norm` checked that independently: *"`git
+    // log` shows `x/xqa.rs` has exactly one commit, has always been 197
+    // lines, and has never contained a `unit!` or `contract!`."*
+    //
+    // Leaving it here after it became a family would have been the same bug
+    // this file exists to catch, from the other side: a hollow-family check
+    // that exempts a real family reports green for the case it was written
+    // for.
+    "abi", "contract", "cx", "launch", "macros", "fire",
 ];
 
 fn x_dir() -> PathBuf {
@@ -391,3 +401,35 @@ fn fn_world_files() -> Vec<std::path::PathBuf> {
     out.sort();
     out
 }
+
+// A GATE FOR "every unit's root `.cuh` is on disk" WAS WRITTEN HERE AND
+// DELETED, and the reason is worth more than the gate would have been.
+//
+// The class is real and the motivation was sound: seven `.cu` and a `.cpp`
+// went in one commit and four more in another, from concurrent workers who
+// are forbidden to build, and `tests/units.rs` would only catch a missing
+// root by compiling it — on a machine with a GPU, the slowest place to find
+// out.
+//
+// **But the class cannot exist.** `Unit::root` is not a path, it is the
+// file's CONTENTS, carried by `include_str!`, and `unit.rs` says why at the
+// field: *"which is what makes a moved file a compile error here rather than
+// a missing one at run time."* Deleting a unit's root breaks `cargo build`,
+// not a test. The language is the gate.
+//
+// The draft was also WRONG, and in a way worth recording. It derived the
+// filename from `Unit::name`, which is documented as "its root's path under
+// `csrc/src` without the extension" — true for every hand-written family and
+// false for `families::fa2`, whose 56 units are macro-generated as
+// `attn/fa2_decode_hd128_g4` and share ONE root, `attn/fa2.cuh`. The gate
+// would have been red on 56 units the day it landed.
+//
+// An earlier draft was worse: it scanned the crate's text for `name:` with a
+// regex and reported TEN missing roots, all false — `Layout`'s `hnd`/`nhd`,
+// `source.rs`'s single-letter fixtures, and `unit.rs`'s deliberately-absent
+// `norm/nowhere`. **A gate whose subject is approximately right reports
+// failures that are approximately real, which is worse than no gate: it
+// trains its reader to skim.**
+//
+// If a check is ever wanted here, its subject is `unit::UNITS[..].root`
+// against nothing — there is nothing to check it against, which is the point.

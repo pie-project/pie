@@ -204,19 +204,27 @@ pub static KERNELS: &[KernelSig] = &[
             sm_scale: F32 <- Source::Attn("sm_scale"),
             lse_out: F32sMut <- Source::Attn("lse_out_d"),
         ]),
-    // XQA: its prepare is fire-wide (R-shaped), so the kernel cannot be
-    // given a row window — `whole`. And no capture variant of it
-    // exists, so it cannot publish scores — `lacks Scores`. Both are
-    // hand-written rules today: the first is the model body's
-    // `window_one && c.xqa_decode` test, the second a C++ throw.
-    kernel!(xqa_decode "attn::attention_xqa_decode_bf16_prepared",
-        whole = true, needs = Prepare::FireWide, lacks = &[Cap::Scores],
-        operands = operands![
-            q: Buf, k_pages: BufMut, v_pages: BufMut, o: BufMut, num_requests: I32,
-            num_q_heads: I32, num_kv_heads: I32, head_dim: I32, page_size: I32,
-            max_pages_per_seq: I32, workspace: AttentionWorkspaceView,
-            stream: Stream, sm_scale: F32,
-        ]),
+    // XQA's row IS DELETED and its symbol has crossed to fn-world:
+    // `crate::x::xqa::XQA_DECODE_BF16_PREPARED`, declared beside the five
+    // `Unit`s that compile `attn/attention_xqa_mha.cuh` and the
+    // `KVCacheList<true>` mirror that made their parameter list
+    // expressible. What the row said, kept because the contract cannot
+    // carry it: *"its prepare is fire-wide (R-shaped), so the kernel cannot
+    // be given a row window — `whole`. And no capture variant of it exists,
+    // so it cannot publish scores — `lacks Scores`. Both are hand-written
+    // rules today: the first is the model body's `window_one &&
+    // c.xqa_decode` test, the second a C++ throw."* `whole`, `needs` and
+    // `lacks` are `Contract` fields and survive verbatim; the C++ throw does
+    // not, because the file that threw it is deleted.
+    //
+    // THIS DELETION IS WHAT PERMITTED THE SIX `.cu` TO GO. The symbol
+    // stated `operands`, was in neither `device::JIT_DISPATCHED` nor
+    // `execution::RUST_SERVED`, and therefore kept a `pie_k_xqa_decode`
+    // entry out of `abi::emit_c_shim` — of which
+    // `src/attn/attention_xqa.cu` was the definition. Deleting the file
+    // without deleting this row is a link error; deleting this row without
+    // adding the contract is `Route::Unknown` at model load. Three atomic
+    // edits, and this is the third.
     kernel!(qkv_decode_fused "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
         operands = operands![
             packed: Buf <- Source::In(0),
@@ -550,20 +558,42 @@ pub static KERNELS: &[KernelSig] = &[
             out_pos: I32sMut, out_req: I32sMut, out_rope: I32sMut,
             n: I32, num_requests: I32, ratio: I32, stream: Stream, row_valid: U8s,
         ]),
-    // Both address through `kv_page_indptr` and the boundary arrays.
-    kernel!(dsv4_compress_gather_paged "attn::dsv4_compress_gather_paged_bf16", whole = true,
-        operands = operands![
-            state_kv: Buf, state_score: Buf, ape: F32s, boundary_pos: I32s,
-            boundary_req: I32s, kv_page_indices: U32s, kv_page_indptr: U32s,
-            out: BufMut, num_entries: I32, head_dim: I32, ratio: I32, coff: I32,
-            page_size: I32, stream: Stream,
-        ]),
-    kernel!(dsv4_store_comp_entries "attn::dsv4_store_comp_entries_bf16", whole = true,
-        operands = operands![
-            entries: Buf, comp_kv_pages: BufMut, boundary_pos: I32s,
-            boundary_req: I32s, kv_page_indices: U32s, kv_page_indptr: U32s,
-            num_entries: I32, head_dim: I32, page_size: I32, stream: Stream,
-        ]),
+    // `attn::dsv4_compress_gather_paged_bf16` AND
+    // `attn::dsv4_store_comp_entries_bf16` CROSSED INTO FN-WORLD as
+    // `crate::x::attn`'s `DSV4_COMPRESS_GATHER_PAGED` and
+    // `DSV4_STORE_COMP_ENTRIES`, both UNBOUND, with the whole of
+    // `attn/dsv4_compress.cuh` as `x::attn::dsv4_compress`'s unit.
+    //
+    // `whole = true` and no `sink` travelled unchanged. Nine paged rows above
+    // state `sink = Some("kv.pages")` and these two never did, because they
+    // write the COMPRESSED cache and this vocabulary has one name for the
+    // fine-grained one. That absence is a statement and it is kept as one.
+    //
+    // WHY UNBOUND, and it is not a `Cx` gap. `dsl::cuda`'s two wrappers
+    // (`dsl.rs:4684`, `:4702`) record ONE and TWO inputs and no parameters
+    // for kernels that read twelve and eight operands, so `state_kv`,
+    // `state_score`, `ape`, `boundary_req`, `ratio` and `coff` have no
+    // operand to be bound from. Both symbols are on
+    // `driver-cuda/tests/executor_bind.rs`' UNARMED list and both were in
+    // `device::JIT_DISPATCHED`, so neither had a shim entry, and both rows
+    // were unsourced, so `abi` skipped them WHOLE and generated no dispatch.
+    // Nothing fired them here and nothing fires them there; what moved is the
+    // device text and a written host program waiting on a statement.
+    //
+    // THREE OTHER ROWS OF THIS ROOT STAY, immediately below and above:
+    // `dsv4_boundary_meta_decode`, `dsv4_boundary_meta_paged` and
+    // `attention_compressed_paged` are served by
+    // `driver-cuda/src/fire/dsv4_compress.rs` through `bind::service`, which
+    // is `qkv_decode_fused`'s arrangement exactly. They fire the `_dev`
+    // symbols of the unit that just moved, by name, through `hand::fire` —
+    // so the §60.6 symbol split is carried VERBATIM into fn-world and
+    // renaming any of the three is a panic at the first deepseek_v4 fire.
+    //
+    // THERE WERE FOUR. `combine_attn_outputs` has since crossed, and the
+    // difference between it and these three is worth one sentence because it
+    // is the whole of what makes a bind possible: its row sourced every
+    // operand from the statement, and each of theirs needs a value the
+    // statement does not carry.
     // `qo_indptr` + `kv_page_indptr`, like every other paged attention here.
     // No capture variant, so it cannot publish scores; it does publish an LSE,
     // which is what the combine below consumes.
@@ -576,22 +606,23 @@ pub static KERNELS: &[KernelSig] = &[
             num_q_heads: I32, head_dim: I32, ratio: I32, page_size: I32,
             sm_scale: F32, stream: Stream,
         ]),
-    // Two attention halves and their LSEs, merged. Four operands, two
-    // results, and the head geometry off the first result --
-    // `[Tokens, heads, head_dim]`.
-    kernel!(combine_attn_outputs "attn::combine_attn_outputs_bf16",
-        operands = operands![
-            o1: Buf <- Source::In(0),
-            lse1: F32s <- Source::In(1),
-            o2: Buf <- Source::In(2),
-            lse2: F32s <- Source::In(3),
-            o_out: BufMut <- Source::Out(0),
-            lse_out: F32sMut <- Source::Out(1),
-            N: I32 <- Source::Rows,
-            num_heads: I32 <- Source::Param(0),
-            head_dim: I32 <- Source::Param(1),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
+    // `attn::combine_attn_outputs_bf16` CROSSED INTO FN-WORLD —
+    // `crate::x::attn`'s `COMBINE_ATTN_OUTPUTS`, a contract with a bind.
+    //
+    // The row stated ten sources and every one of them came out of the
+    // statement: `In(0..3)`, `Out(0..1)`, `Rows`, `Param(0..1)` and the
+    // stream. It was still not a row the executor could fire, because the
+    // BLOCK width is `clamp(head_dim, 32, 256)` and no `LaunchRule` says
+    // that -- `PerHeadElementwise` clamps into `[32, 128]` and would run the
+    // same bytes in half the threads, a slower kernel and never a wrong
+    // answer, which is why it could never be caught. So the row lived beside
+    // an `execution::WALKED` entry whose whole content was
+    // `Control::Supplies { the BLOCK width }`.
+    //
+    // A `fn` supplies its own geometry, so the classification had nothing
+    // left to describe and both artefacts go together. The clamp is now four
+    // lines from the launch, in `x::attn::combine_attn`, with the divergence
+    // from `SINK_BLOCK_MAX` stated where a reader of the launch will find it.
     // `attn::lse_log2_to_ln` and `attn::attn_res_blend_bf16` CROSSED INTO
     // FN-WORLD — `crate::x::attn`'s `LSE_LOG2_TO_LN` and `ATTN_RES_BLEND`.
     // The rebase is still in place on the value it names, which is what
@@ -602,36 +633,30 @@ pub static KERNELS: &[KernelSig] = &[
     // The unfused counterpart of `mla_prepare`. `tokens` is their only
     // extent, so unlike the fused prepare they are NOT `whole` -- which is
     // the reason a deployment might bind them instead.
-    // One latent operand split in two: the normed `kv_c` and the
-    // rope-carrying `k_pe`. Both widths are the results' own, and the
-    // source stride is the operand's row width -- which is what makes
-    // the fused q/kv binding readable without being told.
-    kernel!(kimi_split_kv_a_norm "attn::kimi_split_kv_a_norm_bf16",
-        operands = operands![
-            kv_a: Buf <- Source::In(0),
-            norm_weight: Buf <- Source::Weight(0),
-            kv_c: BufMut <- Source::Out(0),
-            k_pe: BufMut <- Source::Out(1),
-            tokens: I32 <- Source::Rows,
-            kv_lora_rank: I32 <- Source::OutWidth(0),
-            qk_rope_dim: I32 <- Source::OutWidth(1),
-            eps: F32 <- Source::Ctx("eps"),
-            stream: Stream <- Source::Ctx("stream"),
-            src_row_stride: I32 <- Source::InWidth(0),
-        ]),
-    // The query's half of the same split. `[Tokens, heads, dim]` on both
-    // results, so every extent is a result's own.
-    kernel!(kimi_split_q_b "attn::kimi_split_q_b_bf16",
-        operands = operands![
-            q_b: Buf <- Source::In(0),
-            q_nope: BufMut <- Source::Out(0),
-            q_pe: BufMut <- Source::Out(1),
-            tokens: I32 <- Source::Rows,
-            heads: I32 <- Source::Param(0),
-            qk_nope_dim: I32 <- Source::Param(1),
-            qk_rope_dim: I32 <- Source::Param(2),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
+    // `attn::kimi_split_kv_a_norm_bf16` and `attn::kimi_split_q_b_bf16`
+    // CROSSED INTO FN-WORLD — `crate::x::attn`'s `KIMI_SPLIT_KV_A_NORM` and
+    // `KIMI_SPLIT_Q_B`. The first FULL crossing of this family since
+    // `softcap`: unit, contracts and binds, so the rows go.
+    //
+    // What the two paragraphs above said is kept where it is now checked.
+    // `kimi_split_kv_a_norm`'s widths are still THE RESULTS' OWN and its
+    // source stride still the operand's row width — the bind reads
+    // `out_width(0)`, `out_width(1)` and `in_width(0)`, in that order — and
+    // it now also REFUSES a stride narrower than the two halves it is being
+    // asked to read out of, which three independent `Source`s could not
+    // compare. `kimi_split_q_b`'s three trailing extents are still `Param`s
+    // and not widths, because `q_b` is one operand of width
+    // `heads * (nope + rope)` and no division recovers three numbers.
+    //
+    // AND THE CROSSING CLOSES A MEASURED WRONG ANSWER. The row above
+    // described the LAUNCHER, which formed the device kernel's `total` from
+    // `Rows` and the three `Param`s. The JIT has no launcher, so it sized
+    // its grid from `LaunchRule::Elementwise` — `rows * out_width(0)` —
+    // which for a kernel that splits one wide tensor into two narrow ones is
+    // short by `rope / (nope + rope)`. At 6 rows of 8 heads, nope 128, rope
+    // 64 it wrote four rows of six. The `fn` forms the product itself, which
+    // is what the launcher did, and `device.rs`'s hold on
+    // `attn::kimi_split_q_b_bf16` is lifted with it.
     // glm5 attends SPARSELY: a small side network scores every (query, key)
     // pair and only the top-k keys per query are attended.
     kernel!(dsa_index_q_rope "attn::dsa_index_q_rope_bf16",
@@ -691,67 +716,22 @@ pub static KERNELS: &[KernelSig] = &[
             kv_last_page_lens: U32s, total_tokens: I32, num_requests: I32,
             stream: Stream, row_valid: U8s,
         ]),
-    // No capture variant of this dispatch exists, so it cannot publish the
-    // score matrix an `attn.out` observer asks for. It does publish an LSE,
-    // which is a different thing and not what the capability names.
+    // `attn::dispatch_attention_mla_bf16` CROSSED INTO FN-WORLD as
+    // `crate::x::attn::ATTENTION_MLA`, carrying `needs = Prepare::MlaPlan` and
+    // `lacks = &[Cap::Scores]` verbatim. Its two arms are now BOTH Rust —
+    // `x::attn::mla_fa2` is FlashInfer's cooperative kernel with its own unit
+    // and a `fire_ex`, and `driver-cuda/src/fire/mla_naive.rs` is the sm_100
+    // pair — which is what let the row go, since a row loses its shim entry
+    // whole or not at all. `csrc/src/attn/attention_mla.cu` went with it, and
+    // with that file the last nvcc-compiled `<<<>>>` in the workspace.
     //
-    // WHAT ITS RUST FORM NEEDS (`new-horizon.md` §50.4 in full). The launcher
-    // `attn/attention_mla.cu` holds zero `__global__`, zero `__device__` and
-    // zero `<<<>>>`: every kernel it reaches is a template inside
-    // `flashinfer::mla::BatchMLAPagedAttention`, so there is no device text to
-    // migrate and the whole file is host program.
-    //
-    //  1. FIRES one `BatchMLAPagedAttention<MASK, 512, 64>` instantiation,
-    //     `MASK` being `kCausal` or `kNone`. The Blackwell arm fires the naive
-    //     paged kernels from `attention_mla_naive.cuh` instead — those are
-    //     ours and are already device text.
-    //  2. INTERMEDIATE: the plan. `MlaPlanCache` holds a `MLAPlanInfo` built
-    //     by an earlier host call and read back here, and the workspace's
-    //     `int_buffer`/`float_buffer` are re-based by byte offsets that plan
-    //     and dispatch must agree on. In Rust that is a driver allocation
-    //     owned across two calls — the "kernels produce intermediate results"
-    //     case, named exactly.
-    //  3. HOST DECIDES `MaskMode` (a bool operand, which `Term::Is` states
-    //     directly); a DEVICE QUERY — a `static` one-shot read of
-    //     `cudaDevAttrComputeCapabilityMajor`, taking the naive path at
-    //     `major >= 10`; and two shape refusals that `throw`. A device query
-    //     choosing among instantiations is not a wall, it is what
-    //     `Specialisation { base, arms }` is for. A refusal stays a refusal.
-    //  4. MISSING: the by-value aggregate. `BatchMLAPagedAttention(params,
-    //     num_blks_x, num_blks_y, stream)` passes ONE `MLAParams<DTypeQ,
-    //     DTypeKV, DTypeO, IdType>` by value, and two of its fields are
-    //     `flashinfer::uint_fastdiv` — a magic/shift pair the host computes
-    //     from `block_size` and `num_heads`. The arithmetic is easy in Rust;
-    //     carrying the struct is what `Ty`/`ArgValue` cannot do. See the note
-    //     on `ArgValue` in `runtime/args.rs`.
-    //
-    // `MlaPlanCacheDeleter::operator()` is not an obstacle: a `unique_ptr`
-    // with a custom deleter is host code, and its Rust form is a type owning
-    // the raw plan pointer with `Drop`.
-    //
-    // THE HEADER GATE: this row clears it. NVRTC sees only the vendored tree
-    // (`Headers::LibraryAndVendor`) — the CPM checkout is a C++ compiler
-    // include path and is on no NVRTC path — and all three of this launcher's
-    // headers (`attention/mla.cuh`, `attention/scheduler.cuh`, `fastdiv.cuh`)
-    // ARE vendored. So its device text is carryable today, which is not true
-    // of the sm90 prefill or of `comm/custom_all_reduce.cu`: `csrc/vendor` has
-    // no `attention/hopper/` and no `comm/` directory at all, so those two are
-    // blocked before a unit can even be written.
-    //
-    // That makes the order for this row: unit, row, THEN the by-value
-    // aggregate, then the Rust launcher in `driver-cuda/src/fire/`. It is
-    // second in the queue behind `merge_attention_states` — which needs no
-    // aggregate — and it is the first LIVE row that the aggregate unblocks.
-    // Until `ArgValue` can carry a struct, no amount of Rust here can fire it.
-    kernel!(attention_mla "attn::dispatch_attention_mla_bf16",
-        needs = Prepare::MlaPlan, lacks = &[Cap::Scores],
-        operands = operands![
-            cache: MlaPlanCache, q_nope: Buf, q_pe: Buf, layer: MlaCacheLayerView,
-            o: BufMut, kv_page_indices_d: U32s, workspace: AttentionWorkspaceView,
-            stream: Stream, lse_out: F32sMut, qo_indptr_d: U32s,
-            kv_page_indptr_d: U32s, kv_last_page_lens_d: U32s, index_mask: U8s,
-            index_mask_stride: I32,
-        ]),
+    // It crossed UNBOUND, and the reason is in the contract's `none:` arm:
+    // four of its fourteen operands are facts `Cx` does not state — the MLA
+    // cache layer, the plan handle, the attention workspace and `sm_scale` —
+    // which is the same sentence `executor_bind.rs:1519` was already using to
+    // explain why nothing arms it. The row never fired; a row that never fires
+    // and holds an nvcc translation unit hostage is worth strictly less than
+    // the contract that replaces it.
     // `attn::logit_softcap_bf16` CROSSED INTO FN-WORLD as
     // `crate::x::attn::LOGIT_SOFTCAP`, once `Facts::final_logit_softcap()`
     // landed to source its cap. The row's argument travelled with it: it caps
@@ -762,36 +742,24 @@ pub static KERNELS: &[KernelSig] = &[
     // member and the widening reached nothing. The head wrote the logits into
     // the arena and the cap ran over `ws.logits`, which is where the sampler
     // then read an uncapped previous fire. `in_place` is on the contract.
-    // Six statements in one launch; the only value that survives is q.
-    kernel!(qkv_packed_post "attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
-        sink = Some("kv.pages"),
-        operands = operands![
-            packed: Buf <- Source::In(0),
-            q_out: BufMut <- Source::Out(0),
-            // The NATIVE pages, not the bf16 mirrors: this one writes the
-            // cache in whatever the cache is.
-            k_pages: BufMut <- Source::KvLayerField("k_pages"),
-            v_pages: BufMut <- Source::KvLayerField("v_pages"),
-            q_weight: Buf <- Source::Weight(0),
-            k_weight: Buf <- Source::Weight(1),
-            positions: I32s <- Source::Positions,
-            kv_page_indices: U32s <- Source::Attn("kv_page_indices_d"),
-            kv_page_indptr: U32s <- Source::Attn("kv_page_indptr_d"),
-            kv_last_page_lens: U32s <- Source::Attn("kv_last_page_lens_d"),
-            row_valid: U8s <- Source::Attn("row_valid_d"),
-            num_rows: I32 <- Source::Rows,
-            num_q_heads: I32 <- Source::Div(
-                &Source::Width(&Source::Out(0)),
-                &Source::KvLayerField("head_dim"),
-            ),
-            num_kv_heads: I32 <- Source::KvLayerField("num_kv_heads"),
-            head_dim: I32 <- Source::KvLayerField("head_dim"),
-            page_size: I32 <- Source::KvLayerField("page_size"),
-            hnd_layout: Bool <- Source::KvLayerField("hnd_layout"),
-            theta: F32 <- Source::CtxByLayer("theta"),
-            eps: F32 <- Source::Ctx("eps"),
-            stream: Stream <- Source::Ctx("stream"),
-        ]),
+    // `attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16` CROSSED INTO
+    // FN-WORLD as `crate::x::attn::QKV_PACKED_POST`, with a REAL bind: every
+    // one of its twenty-one sources is a `Cx` query that already existed, and
+    // ten of them are two — `Cx::kv_layer` carries the five `KvLayerField`
+    // spellings plus `hnd`, and `Cx::plan` carries the three CSR arrays with
+    // `row_valid`. Six statements in one launch and the only value that
+    // survives is q; the rest is the `sink`, which travelled to the contract.
+    //
+    // `num_q_heads` still comes off the RESULT: `packed` is `[N, q + 2·kv]`
+    // and cannot say where the cut falls, `q_out` is `[N, q]` and can.
+    //
+    // Its DECODE sibling `attn::qkv_decode_qk_norm_rope_write_kv_bf16` stays
+    // right here, and that is the `attn::split_qkv_bf16_devwin` arrangement:
+    // its host program is `driver-cuda/src/fire/qkv_fused.rs`, served through
+    // `bind::service`, so the row is what a trace names and the crossing was
+    // the device text alone. Both kernels' text is now
+    // `crate::x::attn::qkv_fused`'s unit, `#rope` and `#norope` suffixes
+    // carried verbatim because that file fires by name.
     // `attn::attention_sink_rescale_bf16` CROSSED INTO FN-WORLD —
     // `crate::x::attn`'s `ATTENTION_SINK_RESCALE`. gpt-oss's sink layers
     // still state it right after the dispatch, so `attn.out` observes the

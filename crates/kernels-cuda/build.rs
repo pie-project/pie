@@ -1,28 +1,35 @@
-//! Build `csrc/` into `libpie_kernels_cuda.a`, and publish what the shell
-//! needs to compile against it.
+//! Generate and compile the launch shim. There is no archive any more.
 //!
-//! Two jobs, and the second is the interesting one. Building the archive is
-//! ordinary. Publishing is not: FlashInfer is fetched and PATCHED by this
-//! crate's CMake — three source patches over a CPM cache shared by every
-//! build directory on the machine — so `driver-cuda` must not fetch it a
-//! second time. Its `batch/workspace.cu` calls FlashInfer's scheduler
-//! directly, so it needs those headers on its include path, and it gets them
-//! from here through cargo's `links` metadata rather than by running the
-//! fetch again.
+//! # What this script used to be, and what deleting it measured
 //!
-//! Everything published below comes out of `pie_kernels_cuda_paths.txt`,
-//! which the CMake writes at generate time. Nothing here re-derives a path
-//! CMake already resolved.
+//! It had two jobs: build `csrc/` into `libpie_kernels_cuda.a` through CMake,
+//! and publish the include paths a consumer needed to compile against it —
+//! FlashInfer's especially, because this crate's CMake FETCHED and PATCHED
+//! FlashInfer (three source patches over a CPM cache shared by every build
+//! directory on the machine) and a second fetch on the cargo side would have
+//! been a second clone, a second patch pass and a second chance to disagree.
 //!
-//! Without the `native` feature this script does nothing at all, which is the
-//! point of the feature: `model-compiler` depends on this crate for the
-//! signature table it re-exports and must never pay nvcc to read it.
+//! Both jobs are gone, and the second went first: `driver-cuda`'s
+//! `pie_attn_flashinfer` target was deleted when its dispatches became rows,
+//! which left the two published keys with no reader. The first went with
+//! `csrc/CMakeLists.txt`, and the measurement is in `build()`:
+//! `add_library(pie_kernels_cuda STATIC …)` had **no sources of its own** —
+//! its whole content was the CUTLASS MoE object library — and `csrc/src` now
+//! holds zero `.cu` and zero `.cpp`. There was nothing left to compile.
+//!
+//! **That was the last nvcc invocation in this workspace.** Not the last
+//! host C++ compile: `shim()` below is a `cc::Build`, and it is next.
+//!
+//! Without the `native` feature this script still does nothing at all, which
+//! remains the point of the feature: `model-compiler` depends on this crate
+//! for the signature table it re-exports, and must not pay a C++ compiler to
+//! read a table.
 //!
 //! # The launch shim
 //!
-//! `native` also generates `shim.cpp` — one `extern "C" pie_k_*` per stated
-//! row, forwarding to the real launcher with its header in scope — and
-//! compiles it into `libpie_launch_shim.a`.
+//! `native` generates `shim.cpp` — one `extern "C" pie_k_*` per stated row
+//! that is NOT JIT-dispatched, forwarding to the real launcher with its
+//! header in scope — and compiles it into `libpie_launch_shim.a`.
 //!
 //! It lives here rather than in a consumer because the shim is the only thing
 //! that DEFINES those symbols, and a symbol may have one definition. While
@@ -33,13 +40,15 @@
 //! number of crates may state them, and `driver-cuda`'s name its own
 //! `#[repr(C)]` mirrors.
 //!
-//! It is BUILT here and LINKED by whoever calls it, which is the same split
-//! `libpie_kernels_cuda.a` already has and not a second arrangement to
-//! remember. `shim()`'s doc has the measurement that forced it.
+//! It is BUILT here and LINKED by whoever calls it. That used to be described
+//! as "the same split `libpie_kernels_cuda.a` already has"; the archive is
+//! gone, so the split is no longer a convention with two instances but a rule
+//! with one, and `shim()`'s doc has the measurement that forced it.
 //!
 //! Everything the shim compiles against is this crate's already — `csrc/src`'s
 //! per-family headers, and nothing out of tree since §47 deleted the vendored
-//! Marlin wrapper — which is the same argument in the other direction.
+//! Marlin wrapper — which is the same argument in the other direction, and is
+//! why `csrc/src` outlived the CMake that used to name every file in it.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -49,9 +58,12 @@ fn main() {
     // would print it on every build.
     //
     // The gate is `#[cfg]` rather than a runtime `CARGO_FEATURE_NATIVE` check
-    // because the `cmake` crate is an OPTIONAL build-dependency: without the
-    // feature it is not in the graph at all, and a runtime check would still
-    // leave `cmake::Config` in the token stream for rustc to fail on.
+    // because `cc` is an OPTIONAL build-dependency: without the feature it is
+    // not in the graph at all, and a runtime check would still leave
+    // `cc::Build` in the token stream for rustc to fail on. The argument was
+    // first written for `cmake::Config` and survives it unchanged, because it
+    // was never about which crate — it is about optional build-dependencies
+    // and token streams.
     #[cfg(feature = "native")]
     native::build();
 }
@@ -216,14 +228,21 @@ mod native {
     /// dispatch calls is undefined — 112 of them, seen as seven only because
     /// `rust-lld` stops at `--error-limit=20`.
     ///
-    /// The control is `pie_kernels_cuda`, which uses the *same* `static=` and
-    /// works: `driver-cuda/build.rs` emits it, `driver_cuda` IS loaded, and
-    /// its rlib carries the CMake objects. So the rule is not about the
-    /// modifier. **The crate that references a symbol is the crate that must
-    /// name the archive defining it**, and for `pie_k_*` that is `driver-cuda`
-    /// — which already states exactly this rule for `libpie_kernels_cuda.a`
-    /// twenty lines below, and now states it for the shim too, in the order a
-    /// once-scanned archive needs.
+    /// The control WAS `pie_kernels_cuda`, which used the *same* `static=`
+    /// and worked: `driver-cuda/build.rs` emitted it, `driver_cuda` IS
+    /// loaded, and its rlib carried the CMake objects. So the rule is not
+    /// about the modifier. **The crate that references a symbol is the crate
+    /// that must name the archive defining it**, and for `pie_k_*` that is
+    /// `driver-cuda`.
+    ///
+    /// The control is gone — the archive was deleted with the CMake that
+    /// built it, and `driver-cuda/build.rs`'s `-lpie_kernels_cuda` with it —
+    /// so the measurement it settled is recorded rather than reproducible.
+    /// That is worth saying plainly: this doc's claim now rests on a
+    /// comparison a reader cannot re-run, and the reason to keep it is that
+    /// it explains a `cargo_metadata(false)` that would otherwise look like
+    /// an oversight. The shim is the only archive left and the only one that
+    /// needs the rule.
     ///
     /// This crate keeps OWNING the shim, for the reason the module header
     /// gives: it is the only definition, and it must be compiled where the
@@ -304,221 +323,97 @@ mod native {
             );
         }
 
-        let csrc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("csrc");
-        for dir in ["CMakeLists.txt", "cmake", "src", "third_party"] {
-            println!("cargo:rerun-if-changed=csrc/{dir}");
-        }
-        // The device headers, which are not under `csrc/` any more: the
-        // `.cuh` files moved to `kernels-cuda-new/csrc/src` and the CMake
-        // reaches them with `-iquote`. Cargo cannot see that, and the failure
-        // it causes is the quiet one -- an edited kernel template, an archive
-        // that is not rebuilt because nothing this script watches changed, and
-        // a `.a` whose kernels are one revision behind the `.cuh` the JIT
-        // compiles from the same bytes.
+        // `csrc/src` alone. There were four entries here — `CMakeLists.txt`,
+        // `cmake`, `src`, `third_party` — and three of them name directories
+        // that no longer exist. What is left is watched because the shim
+        // `#include`s it: `shim()` passes `csrc_src()` to `cc::Build`, and an
+        // edited `.hpp` that did not trigger a rebuild is a shim compiled
+        // against the previous host interface.
+        println!("cargo:rerun-if-changed=csrc/src");
+        // The device headers, which are not under `csrc/` at all: the `.cuh`
+        // files live in `kernels-cuda-new/csrc/src`, which compiles them
+        // through NVRTC. Cargo cannot see the edge, and the failure it causes
+        // is the quiet one -- an edited kernel template and a shim that is not
+        // regenerated because nothing this script watches changed.
         //
-        // Two directories since `csrc/` was cut by role, and the second is
-        // watched for a sharper version of the same reason: `csrc/shim` holds
-        // the headers that answer `<cuda_fp16.h>` and friends, so an edit
-        // there changes what `__half` MEANS in every translation unit the
-        // archive compiles. An archive built against the previous meaning
-        // links against the new one without complaint.
+        // Both directories are still watched, and `csrc/shim`'s reason is now
+        // the SHARPER one rather than the archive's: it holds the headers that
+        // answer `<cuda_fp16.h>` and friends, so an edit there changes what
+        // `__half` MEANS in every translation unit NVRTC compiles, and
+        // `emit_c_shim`'s `jit_dispatched()` list is derived from rows whose
+        // instantiation strings name those types.
         println!("cargo:rerun-if-changed=../kernels-cuda-new/csrc/src");
         println!("cargo:rerun-if-changed=../kernels-cuda-new/csrc/shim");
 
         let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
         shim(&out_dir);
 
-        for var in [
-            "CUDACXX",
-            "CMAKE_CUDA_COMPILER",
-            "CMAKE_CUDA_ARCHITECTURES",
-            "PIE_COMPILER_LAUNCHER",
-            // `PIE_CUDA_BUILD_MARLIN` and `PIE_CUDA_BUILD_MARLIN_MOE` were
-            // here. Both options are gone from `csrc/CMakeLists.txt` with the
-            // two vendored trees they gated (§47), so a rerun keyed on either
-            // is a rerun keyed on a variable no CMake line reads.
-            "CPM_SOURCE_CACHE",
-        ] {
-            println!("cargo:rerun-if-env-changed={var}");
-        }
-
-        let mut cfg = cmake::Config::new(&csrc);
-        cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("kernels-cuda"));
-        // `ptir/tier0.cuh` includes `rng_contract.generated.h`: the bit mapping
-        // tier-0 must reproduce exactly, because tier-1 emits the same RNG
-        // through NVRTC and the two are diffed. That is a CONTRACT, not driver
-        // machinery -- the same shape as `kernels.def` being read by both C++
-        // and CMake -- so it is declared here rather than reached for by a
-        // relative path, exactly as `driver-cuda/build.rs` declares it.
-        let ptir_include = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("tensor-compiler/include");
-        cfg.build_target("pie_kernels_cuda")
-            .define("BUILD_SHARED_LIBS", "OFF")
-            .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
-            .define("PIE_PTIR_INCLUDE_DIR", &ptir_include);
-
-        let build_dir = cfg.build().join("build");
-        emit_link_search_paths(&build_dir);
-
-        // Deliberately NO `cargo:rustc-link-lib=pie_kernels_cuda` here. A static
-        // archive must come after everything that references it on the link
-        // line, and cargo emits a dependency's link directives BEFORE its
-        // dependent's -- so declaring it here would put `-lpie_kernels_cuda`
-        // ahead of `-lpie_driver_cuda_lib`, which is exactly backwards for a
-        // shell that calls kernels. `driver-cuda`'s build.rs names both, in
-        // order. The search paths above do propagate and are the half that
-        // belongs here.
+        // ---------------------------------------------------------------
+        // THE CMAKE HALF STOOD HERE, AND IT IS DELETED. THAT IS NVCC LEAVING
+        // THE WORKSPACE.
         //
-        // AND DELIBERATELY NO `-lpie_launch_shim` EITHER, which is this
-        // round's correction rather than a restatement. The line above used
-        // to say the shim's directive WAS emitted here and that "before every
-        // dependent is exactly where a dependency's directives land". Cargo
-        // does not land them there at all -- see `shim()`'s doc for the
-        // measurement -- and the shim was consequently linked by nothing.
-        // Both archives are named by the crate that calls into them, in the
-        // order a once-scanned archive needs.
-
-        // --- the handoff -------------------------------------------------------
+        // It ran `cmake::Config::new(csrc).build_target("pie_kernels_cuda")`,
+        // walked the build tree for `-L` paths, and republished two include
+        // keys. All three go together, and the reason is a measurement rather
+        // than a preference:
         //
-        // Read as DEP_PIE_KERNELS_CUDA_<KEY> by any crate with a direct
-        // dependency on this one.
+        //   `add_library(pie_kernels_cuda STATIC …)`   0 live source lines
+        //   its only content: `target_sources(… $<TARGET_OBJECTS:
+        //                      pie_flashinfer_cutlass_moe>)`
+        //   `csrc/src/**.cu` on disk                   0
+        //   `csrc/src/**.cpp` on disk                  0
         //
-        // # This published nine keys and one is read
+        // The archive was not a target that survived the CUTLASS MoE object
+        // library and needed retiring in its own pass — it was EMPTY the
+        // moment that library went, and an `add_library` with no sources is a
+        // CMake error rather than a small target. So `csrc/CMakeLists.txt` was
+        // deleted whole: both `add_library` calls, the `CPMAddPackage` that
+        // cloned and patched FlashInfer, the `_SM90_`/`_SM100_` source lists,
+        // the 45 generated instantiation units, and `enable_language(CUDA)`,
+        // which is the line that made this workspace look for nvcc.
         //
-        // The list was `lib`, `include`, `cccl`, `flashinfer`, `marlin`,
-        // `marlin_moe`, `has_marlin`, `has_marlin_moe`, `mamba_sm90` — and
-        // every one of the eight now gone was read by **nobody**, in any
-        // crate, in any feature combination. `LAUNCH_SHIM` (published by
-        // `shim()`, above) is the only key with a consumer:
-        // `driver-cuda/build.rs:573`.
+        // # The three things it published, and where each went
         //
-        // What makes this worth a paragraph rather than a quiet deletion is
-        // the `unwrap_or_else` below. A missing key **panics the build** with
-        // a message insisting that *"the export block and this list have to
-        // name the same keys"* — so eight dead keys were not merely carried,
-        // they were ENFORCED, and CMake was obliged to keep computing eight
-        // paths so that a `println!` could publish them into silence. A
-        // check that fails loudly for an unread value is the most convincing
-        // kind of dead code there is: it looks like a contract.
+        // `rustc-link-search` came from `emit_link_search_paths`, which
+        // walked the CMake build tree for directories holding an archive.
+        // There is no build tree. The one archive this script still produces
+        // is the shim's, and `shim()` prints its own `-L` — deliberately, and
+        // its doc has the measurement for why a `-l` may not go with it.
         //
-        // `lib` went with the other eight, and it is worth one more line
-        // because it is the key that LOOKED load-bearing. CMake does place
-        // `libpie_kernels_cuda.a` under `lib/`, so publishing that path reads
-        // as the archive's own address -- but the search paths do not come
-        // from it. `emit_link_search_paths` walks `build_dir` and prints a
-        // `rustc-link-search` for every directory holding an archive,
-        // precisely because the vendored object libraries land wherever
-        // their `add_library` put them. `driver-cuda/build.rs` says the same
-        // thing from the other side: *"Search paths come from `kernels-cuda`'s
-        // own build script"* -- which is true, and is not this.
+        // `DEP_PIE_KERNELS_CUDA_{FLASHINFER,CCCL}` came from
+        // `read_flashinfer_paths`, reading `pie_kernels_cuda_paths.txt` out of
+        // a `file(GENERATE)` at the bottom of the CMakeLists. Their consumer
+        // was `driver-cuda`'s `pie_attn_flashinfer` `cc::Build`, whose two
+        // `expect`s were deleted with the target itself; a sweep for
+        // `DEP_PIE_KERNELS_CUDA_FLASHINFER` and its CCCL sibling now finds
+        // comments and this one. What makes them worth a paragraph is the
+        // shape of what was left behind: the reader `panic!`ed on a missing
+        // key, insisting that *"the export block and this list have to name
+        // the same keys"* — so CMake was obliged to keep computing two paths
+        // so that a `println!` could publish them into silence, and the check
+        // that enforced it looked exactly like a contract. That is the most
+        // convincing kind of dead code there is, and it is the second time
+        // this same block has produced one: eight earlier keys went the same
+        // way, for the same reason, guarded by the same `panic!`.
         //
-        // So the whole block goes, and with it the `read_paths` call. Nothing
-        // in the tree observes `pie_kernels_cuda_paths.txt` any more; CMake
-        // may go on writing it.
+        // `PIE_KERNELS_CUDA_BUILD_DIR` was a `rustc-env` with no reader in
+        // any crate, in any feature combination.
         //
-        // # ...and then two of them came back, with a reader
+        // # What is left, and when it goes
         //
-        // `flashinfer` and `cccl`, and the sentence above is why they are
-        // worth re-deriving rather than reinstating: they now have a consumer
-        // and it is named. `new-horizon.md` §44 moved
-        // `attn/attention_flashinfer.cu` to `driver-cuda/csrc/attn/` -- its
-        // two score-capture dispatches are host WALKS, a `switch` over
-        // `src/kernels.def` head dims, and a host walk belongs to the driver
-        // -- and that translation unit includes
-        // `attn/attention_flashinfer_common.cuh`, which includes eleven
-        // FlashInfer headers and reaches CCCL through them.
-        //
-        // It reads them from HERE rather than fetching its own, because
-        // FlashInfer is fetched and PATCHED by `csrc/CMakeLists.txt`: a
-        // second `CPMAddPackage` on the cargo side would be a second clone, a
-        // second patch pass over the same shared CPM cache, and a second
-        // chance to disagree -- the generator's own words, one file over.
-        // Two copies of a header set that agree today are two copies that
-        // drift, which is §21.7's measurement wearing a different hat.
-        //
-        // Not the VENDORED tree in `kernels-cuda-new/csrc/vendor/flashinfer`
-        // either, which is the same library at v0.6.15 and would have been
-        // the shorter path. That directory also holds PIE-written files named
-        // `cuda.h`, `cuda_runtime.h`, `cstdint`, `type_traits` and `bit` --
-        // shims that exist so NVRTC has something to answer with -- and an
-        // `-I` at it is searched before the system directories, so the host
-        // compiler's `<cstdint>` would resolve to a device shim. That is the
-        // exact hazard `csrc/CMakeLists.txt` argues `-iquote` for at length.
-        read_flashinfer_paths(&build_dir);
-
-        println!(
-            "cargo:rustc-env=PIE_KERNELS_CUDA_BUILD_DIR={}",
-            build_dir.display()
-        );
+        // `shim()` above, which is a HOST C++ compile (`cc`, not `cmake`) of
+        // a `shim.cpp` this script GENERATES into `OUT_DIR` — there is no
+        // checked-in `.cpp` anywhere in the workspace. It is the forwarding
+        // layer the generated dispatch calls, and it dies with `bridge`, on
+        // the schedule `ROW_TABLES` emptying sets. Two different lines, and
+        // they are worth keeping apart: **this deletion ends nvcc; `attn`'s
+        // ends the host C++ compile.**
     }
 
-    /// Republish the two include-path keys `driver-cuda` compiles against.
-    ///
-    /// `DEP_PIE_KERNELS_CUDA_FLASHINFER` and `DEP_PIE_KERNELS_CUDA_CCCL`,
-    /// each a `:`-joined directory list, straight out of the
-    /// `pie_kernels_cuda_paths.txt` CMake generates.
-    ///
-    /// A hard panic on a missing file or a missing key, in the shape
-    /// `shim()`'s `expect` uses: the consumer is a `cc::Build` whose archive
-    /// is NAMED unconditionally on `driver-cuda`'s link line, so a silently
-    /// absent include path is not a missing optimisation -- it is
-    /// `attention_flashinfer_common.cuh` failing to find
-    /// `<flashinfer/attention/prefill.cuh>`, hundreds of lines into a
-    /// template, in another crate's build output.
-    fn read_flashinfer_paths(build_dir: &Path) {
-        let file = build_dir.join("pie_kernels_cuda_paths.txt");
-        println!("cargo:rerun-if-changed={}", file.display());
-        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| {
-            panic!(
-                "{file:?} does not read ({e}). CMake writes it with `file(GENERATE)` at the \
-                 bottom of `csrc/CMakeLists.txt`, and `driver-cuda`'s `pie_attn_flashinfer` \
-                 target needs the `flashinfer=` and `cccl=` lines out of it to compile \
-                 `attn/attention_flashinfer_common.cuh` at all."
-            )
-        });
-        for key in ["flashinfer", "cccl"] {
-            let value = text
-                .lines()
-                .find_map(|line| line.strip_prefix(&format!("{key}=")))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{file:?} has no `{key}=` line. The `file(GENERATE)` block in \
-                         `csrc/CMakeLists.txt` and this list have to name the same keys."
-                    )
-                });
-            println!("cargo:{key}={value}");
-        }
-    }
-
-    /// Every directory under `build_dir` holding at least one static archive.
-    /// CMake places `pie_kernels_cuda` under `lib/`, but the vendored object
-    /// libraries land wherever their `add_library` put them, and a build-type
-    /// subdirectory appears on multi-config generators.
-    fn emit_link_search_paths(build_dir: &Path) {
-        let mut dirs = std::collections::HashSet::new();
-        walk(build_dir, &mut dirs);
-        for d in &dirs {
-            println!("cargo:rustc-link-search=native={}", d.display());
-        }
-    }
-
-    fn walk(dir: &Path, out: &mut std::collections::HashSet<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        let mut has_archive = false;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "a") {
-                has_archive = true;
-            }
-        }
-        if has_archive {
-            out.insert(dir.to_path_buf());
-        }
-    }
+    // `read_flashinfer_paths`, `emit_link_search_paths` and `walk` STOOD
+    // HERE, and are DELETED with the CMake half that was their only caller.
+    // `build()`'s comment above has the account of what each published and
+    // why nothing reads it. `walk` was a plain directory recursion over the
+    // CMake build tree; it has no second use, and a helper kept for a use it
+    // does not have is how a build script grows a second source of truth.
 }

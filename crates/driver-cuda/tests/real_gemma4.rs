@@ -540,7 +540,8 @@ fn gemma4_matches_transformers_on_real_weights() {
         lora: None,
         peel_window: std::ptr::null(),
         rows_total: 0,
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     let mut logits_value: Option<ValueId> = None;
     for i in 0..l.launches.len() {

@@ -8,7 +8,7 @@
 //! path asks for and in what order. This test reproduces the same sweep
 //! against the ports and requires the transcripts to be equal.
 //!
-//! Run `tests/oracle/caches/run.sh` to regenerate [`GOLDEN_FNV1A64`]. The
+//! `tests/oracle/caches/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`]. The
 //! pinned value is the **C++'s** hash, never this file's: a golden taken from
 //! the port would only prove the port agrees with itself.
 //!

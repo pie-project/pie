@@ -382,3 +382,21 @@ void attention_flashinfer_prefill(
 // `.cu` says why. The `_bf16` form above is the reached one.
 
 }  // namespace pie_cuda_driver::kernels::attn
+
+// ── STATUS, AT EOF BECAUSE THREE SITES CITE THIS FILE BY LINE ───────────────
+//
+// `:13`, `:117` and `:136` are cited from `attention_flashinfer_common.cuh`,
+// `driver-cuda/src/bind/service.rs` and `.wiki/contention/agent-charlie.md`.
+// Inserting a line above renumbers all three, so annotate here.
+//
+// This header's ONLY `#include` consumer is
+// `kernels-cuda-new/csrc/src/attn/attention_flashinfer_common.cuh:24`, and
+// that file has zero `#include` consumers of its own -- nothing compiles it,
+// in either crate, in any language. So the chain's head is dangling and this
+// header is reachable as text only.
+//
+// It dies with the archive at north star step 6 and takes nothing live with
+// it: 384 lines of declarations, zero definitions, zero measurements. The
+// three citations above are historical the moment the file goes, which is a
+// `git show` away and is the same disposition every other retired archive
+// header got.

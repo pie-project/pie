@@ -4,8 +4,10 @@
 //! transcript, same order. The golden is the **C++'s** FNV-1a 64 over its own
 //! output, so this test cannot pass by agreeing with itself.
 //!
-//! Regenerate with `tests/oracle/recurrent/run.sh`; check the mutation
-//! sensitivity of the pin with `tests/oracle/recurrent/mutate.sh`.
+//! `tests/oracle/recurrent/run.sh` can no longer regenerate this — its
+//! inputs were deleted, see `oracle_census.rs`. It and
+//! `tests/oracle/recurrent/mutate.sh`, which measured the pin's sensitivity
+//! to a mutation, are kept as the description of how the golden was taken.
 //!
 //! Set `RS_RUST_OUT=/tmp/rust.txt` here and `RS_ORACLE_OUT=/tmp/cpp.txt` there
 //! to diff the two transcripts line by line.

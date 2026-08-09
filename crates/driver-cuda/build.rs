@@ -67,72 +67,46 @@ mod bridge {
 
     /// Every family table, in the crate's own concatenation order.
     ///
-    /// Named one by one rather than taken from `table::TABLES`, and that is
-    /// the same choice `kernels_cuda::KERNELS`'s re-export made for the same
-    /// reason: a family that appeared silently would be in the concatenation
-    /// and absent from every reader that walks the modules. This is one of
-    /// those readers.
+    /// [`kernels_cuda_new::table::TABLES`] — `ROW_TABLES ++ x::SIGS`, the
+    /// same list `kernels::sig_in` answers a model load from.
+    ///
+    /// # It was named one by one, and the reason it was is the reason it is
+    /// not any more
+    ///
+    /// What stood here: *"Named one by one rather than taken from
+    /// `table::TABLES`, and that is the same choice `kernels_cuda::KERNELS`'s
+    /// re-export made for the same reason: a family that appeared silently
+    /// would be in the concatenation and absent from every reader that walks
+    /// the modules. This is one of those readers."*
+    ///
+    /// The intent was a tripwire — a new family must be added HERE, or its
+    /// absence is loud. **The tripwire never fired once, and by the time it
+    /// was replaced this list was missing three families:** `x::moe`'s twenty
+    /// contracts, `x::attn`'s, and `x::xqa`'s. `moe` crossed while
+    /// `table::moe::KERNELS` was still named here, so the entry survived the
+    /// family and stopped meaning what it said; `xqa` became a family the
+    /// same day. Nothing ever compared the hand list to the concatenation, so
+    /// a family that was MISSING read exactly like a family that had not
+    /// crossed yet — and `routed_rows_are_hosted`, `stray` and `armless` all
+    /// walk this list, so three families were quietly outside every check
+    /// this build script makes.
+    ///
+    /// A hand list is a set that is correct until someone forgets, which is
+    /// the argument `kernels-cuda-new/src/source.rs` already makes about
+    /// header sets. The tripwire it was defending is real and it already
+    /// exists somewhere a crossing cannot avoid it: `x::FAMILIES` and
+    /// `x::SIGS`, one atomic edit, without which the family has no units and
+    /// no signatures at all.
+    ///
+    /// THE SECOND TABLE IS STILL GONE. It was
+    /// `kernels_cuda_new::table::driver_internal::DRIVER_KERNELS` — launchers
+    /// the driver fires with no DSL statement, outside the DSL-surface
+    /// equality — and §5 step 5 took its six rows to `x::driver_internal` as
+    /// plain `fn`s with **no `contract!`**. There is nothing to append and
+    /// nothing for `TABLES` to have missed: a family with no contract
+    /// declares no signatures.
     fn tables() -> Vec<&'static [kernels_cuda_new::KernelSig]> {
-        vec![
-            kernels_cuda_new::table::attn::KERNELS,
-            // `rope`'s twelve, from `x::rope::SIGS` — the same rows, derived
-            // from the `contract!` block in `x::rope` rather than
-            // written out by hand. They state no `operands`, so the shim
-            // emitter drops them (`abi::stated`) and the dispatch emitter
-            // writes no arm for them; they are here so that this reader
-            // still walks every symbol the crate declares, which is what
-            // `armless` and `by_hand` below check.
-            kernels_cuda_new::x::rope::SIGS,
-            // `norm`'s twenty-eight, from `x::norm::SIGS`, for
-            // `x::rope::SIGS`' reason above. `table::norm::KERNELS` stood
-            // here; §5 step 5 took `norm` into fn-world and deleted it. The
-            // count went 26 -> 28 in the move: `norm::add_bias_bf16` and
-            // `norm::rmsnorm_gated_fp32_in_bf16` are lowered
-            // (`model-compiler/src/lower.rs` `OpKind::AddBias` and
-            // `OpKind::RmsnormGated`) and had no ahead-of-time row, so they
-            // reached this reader through `families::norm`'s JIT rows only.
-            kernels_cuda_new::x::norm::SIGS,
-            // `mlp`'s twelve, from `x::mlp::SIGS`, for `x::rope::SIGS`'
-            // reason above.
-            kernels_cuda_new::x::mlp::SIGS,
-            // `gemm`'s twelve, from `x::gemm::SIGS`, for `x::rope::SIGS`'
-            // reason above: derived from the `contract!` block, stating no
-            // `operands`, so the shim emitter drops them and the dispatch
-            // emitter writes no arm — and they are still walked here.
-            kernels_cuda_new::x::gemm::SIGS,
-            kernels_cuda_new::table::moe::KERNELS,
-            // `ssm`'s twenty-seven, from `x::ssm::SIGS`, for `x::rope::SIGS`'
-            // reason above. `table::ssm::KERNELS` stood here; §5 step 5 took
-            // `ssm`'s five roots into fn-world and deleted it. The count is
-            // unchanged at twenty-seven — four of them are `bind!` `none:`
-            // arms, which are contracts all the same and must still be walked
-            // or `check_plan` would stop refusing symbols they declare.
-            kernels_cuda_new::x::ssm::SIGS,
-            // `quant`'s eleven, from `x::quant::SIGS`, for `x::rope::SIGS`'
-            // reason above. The four routed MoE decode GEMVs that carry a
-            // `quant::` symbol are NOT here — their contracts are
-            // `table::moe`'s, which this list already walks, and they still
-            // state operands and still get an arm.
-            kernels_cuda_new::x::quant::SIGS,
-            // `layout`'s seven and `sample`'s one, from their `contract!`
-            // blocks, for `x::rope::SIGS`' reason above. `adapter`'s one is
-            // here for that reason and one more: it never had a `pie_k_`
-            // entry point at all — the LoRA seam is cuBLAS batched GEMMs —
-            // so it was always a row the shim emitter had to skip, and now
-            // it is a row that states no operands and is skipped by the
-            // general mechanism instead of by a special case.
-            kernels_cuda_new::x::layout::SIGS,
-            kernels_cuda_new::x::sample::SIGS,
-            kernels_cuda_new::x::adapter::SIGS,
-            // THE SECOND TABLE IS GONE. It was
-            // `kernels_cuda_new::table::driver_internal::DRIVER_KERNELS` —
-            // launchers the driver fires with no DSL statement, outside the
-            // DSL-surface equality — and §5 step 5 took its six rows to
-            // `x::driver_internal` as plain `fn`s with **no `contract!`**.
-            // There is nothing to append: no rows, and no `SIGS` either,
-            // because a family with no contract declares no signatures. The
-            // launchers are called directly and need no entry point.
-        ]
+        kernels_cuda_new::table::TABLES.to_vec()
     }
 
     fn cuda_home() -> PathBuf {
@@ -773,13 +747,27 @@ mod bridge {
         // head. `every_call_resolves_in_the_shim` above checks only the calls
         // the GENERATED dispatch makes, so it is satisfied by the same fact.
 
-        // The kernels archive the shim forwards into. Search paths come from
-        // `kernels-cuda`'s own build script (the `native` feature this
-        // crate's `bridge` turns on); the `-l` is ours so it lands AFTER the
-        // shim's.
-        println!("cargo:rustc-link-lib=static=pie_kernels_cuda");
+        // THE KERNELS ARCHIVE STOOD HERE:
+        //
+        //     println!("cargo:rustc-link-lib=static=pie_kernels_cuda");
+        //
+        // and it is DELETED, because there is no `libpie_kernels_cuda.a` to
+        // name any more. `add_library(pie_kernels_cuda STATIC …)` had no
+        // sources of its own — its entire content was
+        // `$<TARGET_OBJECTS:pie_flashinfer_cutlass_moe>` — so when the fused
+        // CUTLASS MoE was retired the archive was empty rather than small,
+        // and `csrc/CMakeLists.txt` was deleted whole. A `-l` for an archive
+        // that is not produced is a link error, not a no-op.
+        //
+        // The shim's `-l` a few lines above is unaffected and is now the only
+        // one: `libpie_launch_shim.a` is a HOST C++ compile (`cc`, not
+        // `cmake`) of a `shim.cpp` that `kernels-cuda/build.rs` generates,
+        // and it is what the generated dispatch actually calls. The ordering
+        // note this comment used to carry — "the `-l` is ours so it lands
+        // AFTER the shim's" — described an edge between two archives and has
+        // nothing left to order.
 
-        // The archive's own closure, `driver-cuda/build.rs`'s list minus
+        // The link closure the shim needs, `driver-cuda/build.rs`'s list minus
         // nvrtc (the NVRTC JIT is pipeline code, which stayed C++): dynamic
         // cudart + cublas + cublasLt, the driver-API stub for `cuMem*`, NCCL
         // for the custom all-reduce, and the C++ runtime.

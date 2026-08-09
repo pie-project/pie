@@ -94,6 +94,23 @@ pub mod gemm;
 pub mod layout;
 pub mod mlp;
 pub mod moe;
+// `pub mod moe_glue;` WAS HERE, for six `__global__`s extracted out of
+// `cutlass_fused_moe_kernels.cuh`, and it lived for about four hours.
+//
+// It went with the fused CUTLASS MoE leg, on the owner's decision and this
+// measurement: carrying CUTLASS so the JIT could compile the GEMM is a
+// **505-file, 13,891,303-byte `include_str!` closure**, against the
+// **429-file, 4,376,255-byte** carry this tree already refused in writing for
+// cub (`csrc/src/moe/expert_offsets.cuh:48`). Same mechanism — the carried
+// set is `include_str!`, so it is binary size — and 3.2 times a line already
+// drawn. The nine shim names that made the glue compile without CUTLASS went
+// with it; they existed for these six kernels and nothing else.
+//
+// **The glue was the fused leg's machinery, not the general path's.** The
+// aligned leg runs on `x::moe`'s twenty contracts, and what it is missing is
+// one bind, not these six kernels — see `BUILD_MOE_PTRS_ALIGNED`'s `none:`
+// arm, which is the gate on this retirement being complete rather than
+// merely done.
 pub mod norm;
 pub mod quant;
 pub mod rope;
@@ -104,11 +121,14 @@ pub mod xqa;
 #[cfg(feature = "_cuda")]
 pub mod fire;
 
-pub use abi::{Abi, ByValue, Layout};
+pub use abi::{Abi, ByValue, Layout, fp8_kind};
 pub use contract::{Contract, Entry, Fired, Refusal};
 #[cfg(feature = "_cuda")]
 pub use contract::Route;
-pub use cx::{Cx, Facts, Gdn, KvLayer, Plan, Rows, Slab, Yarn};
+pub use cx::{
+    AttnWorkspace, Cx, Facts, Gdn, KvDType, KvLayer, KvScheme, MlaLayer, MlaPlan, Plan, Rows, Slab,
+    Yarn,
+};
 
 /// Every family that has crossed into fn-world.
 ///
@@ -164,6 +184,19 @@ pub static FAMILIES: &[&[Entry]] = &[
     // two worlds, so the scan below stays disjoint — `x/attn.rs`'s header
     // says which six and why the rest waited.
     attn::ENTRIES,
+    // `xqa` was FLOOR until this line: 197 lines of `KvCacheList` mirror and
+    // `by_value!` support, no `unit!` and no `contract!`, and
+    // `no_hollow_family.rs` exempted it on exactly that basis. It is a family
+    // now — five `Unit`s over `attn/attention_xqa_mha.cuh` and one contract
+    // over all five, because the host program picks the member and fires
+    // once. The archive spelled that choice as six translation units and a
+    // C++ dispatcher; **all seven files are deleted** and the choice lives in
+    // `driver-cuda/src/fire/xqa.rs::XqaMember::pick`.
+    //
+    // The `bind!` is a `none:` arm and its own comment argues three `Cx`
+    // facts rather than one about XQA — the host program is complete and 959
+    // lines, and what it cannot become is a `bind!` body.
+    xqa::ENTRIES,
 ];
 
 /// The [`Entry`] for one symbol, or `None` if no family declares it.
@@ -226,6 +259,31 @@ pub fn entry(symbol: &str) -> Option<&'static Entry> {
 /// declares no `Entry`, `entry()` answers `None`, and the DriverOp arm is
 /// reached. `x/adapter.rs` is the worked example; see [`SIGS`]'s "three
 /// registration shapes".
+///
+/// # WHAT MAKES A SYMBOL A DRIVER OP, and it is not difficulty
+///
+/// **A driver op is a symbol whose body needs a driver RESOURCE** — a cuBLAS
+/// handle, an NCCL communicator, a memory pool, an allocator, an arena. Not
+/// a symbol whose host program is long, and not one whose bind would be
+/// awkward.
+///
+/// The distinction cost a port a wrong answer before it was written down.
+/// `kv_paged`'s four walks were classified as driver ops on the ground that
+/// *"their host programs live in `driver-cuda` and `kernels-cuda-new` cannot
+/// call `driver-cuda`."* **True, and not the reason** — the dependency runs
+/// the other way, and `fire/kv_paged.rs` already calls
+/// `x::layout::envelope_merge_written` from the middle of two of those very
+/// bodies. Every fact those four read is a field of one
+/// `KvCacheLayerView`, so they are a **move**, not a driver op, and the
+/// eleven fields [`Cx::kv_layer`] grew are what the move needed.
+///
+/// `x::gemm`'s twelve are driver ops because `cublasLtMatmul` is across a
+/// seam no [`Cx`] can cross. `moe::flashinfer_cutlass_moe_bf16` was one
+/// because it needed a workspace query, an allocation and an arch probe.
+/// `moe::build_moe_ptrs_aligned_bf16` is one because the six pointer arrays
+/// it carves live in the driver's arena. **In each case the test is the same
+/// and it is answerable in one line: name the resource.** If you cannot,
+/// it is a move.
 ///
 /// This is the only case where a `none:` arm is wrong. Everywhere else a
 /// `none:` is exactly right and is the whole point of [`Route::Unbound`]:
@@ -319,9 +377,12 @@ pub static SIGS: &[&[kernels::KernelSig]] = &[
     norm::SIGS,
     ssm::SIGS,
     // Every `moe` contract, including the one with no [`Entry`]: the fused
-    // CUTLASS block is `execution::RUST_SERVED`'s and `model-compiler` must
+    // CUTLASS block is `fire::flashinfer_moe`'s, and `model-compiler` must
     // still be able to answer "is this a symbol?" once `table::moe`'s row
-    // is gone.
+    // is gone. Being HERE is what answers it — and it is also what took the
+    // symbol off `execution::RUST_SERVED`, since a `Contract::sig` states no
+    // operands and that list exists to drop shim entries a stated row would
+    // otherwise generate.
     moe::SIGS,
     // `gemm` is the third shape entire: twelve contracts, zero entries. Its
     // host programs need a cuBLAS handle, which is a device API with a
@@ -336,4 +397,12 @@ pub static SIGS: &[&[kernels::KernelSig]] = &[
     // serves a symbol, which is the property a partial port is allowed to
     // have.
     attn::SIGS,
+    // The other half of `xqa`'s registration, and the half that decides
+    // whether the symbol resolves at all: `attn::attention_xqa_decode_bf16_
+    // prepared` left `table::attn` in the same change that added the
+    // `contract!`, so between the two edits it was `Route::Unknown`. That is
+    // the `gemm` shape and the reason registration is ATOMIC rather than
+    // ordered — three edits, one commit, or a symbol refuses at model load
+    // with nothing in the diff to say why.
+    xqa::SIGS,
 ];

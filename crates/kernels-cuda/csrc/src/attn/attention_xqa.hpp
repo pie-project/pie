@@ -1,5 +1,46 @@
 #pragma once
 
+// ── STATUS: THIS HEADER DIES WITH THE ARCHIVE, AND ITS CONSUMERS ALREADY DID ──
+//
+// Kept in the pass that deleted the six `attention_xqa*.cu` on the EXISTENCE
+// half of the two-consumer-sets rule: two files `#include` it, so deleting it
+// would have been a compile break rather than a clean removal. The include
+// edge is real --
+//
+//   driver-cuda/tests/oracle/llama_like_cfg/oracle.cpp:37
+//   driver-cuda/tests/oracle/llama_like_prepare/oracle.cpp:35
+//
+// -- and it resolves through those oracles' `-I "$ROOT/crates/kernels-cuda/
+// csrc/src"`. What was not checked at the time, and is the whole finding
+// here: **NEITHER ORACLE CAN BE COMPILED.** Both `run.sh` open
+// `set -euo pipefail` and then `cp "$SRC/model/llama_like/llama_like.cpp"`
+// where `SRC="$ROOT/crates/driver-cuda/csrc/src"`. That directory was removed
+// wholesale by commit `4569b9e4b` ("Delete crates/driver-cuda"); the `cp`
+// fails and the script dies TEN LINES BEFORE the `g++` that would have read
+// this header. Seventeen of the twenty-one oracles under
+// `driver-cuda/tests/oracle/` are dead the same way, plus `store/` which dies
+// at g++ on a missing input rather than at `cp`. The tree already knows:
+// `tests/cublas_handle_parity.rs` states the policy -- the goldens are "a
+// permanent record of behaviour that can be READ BUT NOT RE-DERIVED", and
+// `run.sh` is kept "as the description of how it was taken rather than as a
+// command anyone can issue."
+//
+// THE RULE, because it generalises and it cost a wrong answer here: **an
+// `#include` from a translation unit that cannot be compiled is not a
+// consumer.** An existence-consumer set is the set of compilers that will
+// read the include, not the set of files that contain one. This is the same
+// shape as "an absence guard over a deleted file is vacuously true forever":
+// an edge that can never be traversed proves nothing, and it looks exactly
+// like an edge that can.
+//
+// So the keep was right on the evidence gathered and wrong on the evidence
+// not gathered, and the correct disposition is unchanged anyway: this file is
+// `crates/kernels-cuda/csrc/src/**`, it goes when the archive goes at north
+// star step 6, and it takes nothing live with it. What it carried that had to
+// outlive it is discharged below and recorded in
+// `driver-cuda/src/fire/xqa.rs`, which is in a crate that survives.
+// ─────────────────────────────────────────────────────────────────────────────
+
 #include <cstdint>
 
 #include <cuda_runtime.h>
@@ -33,11 +74,38 @@ int xqa_decode_page_bucket(int max_pages_per_seq);
 // static initializer, which only covers whichever device is current when that
 // static runs, so under TP>1 other ranks' devices may never get it, and that
 // the fix is to call the warmup after `cudaSetDevice` on each rank before any
-// graph capture. That is a real hazard and it is now UNADDRESSED IN THIS TREE:
-// the two warmups with bodies went with §44.4, the five per-ratio ones in the
-// `.cu`'s `detail` block were declarations over nothing, and no Rust does it
-// either. Kept as prose so the port that finishes XQA knows there is a
-// `cudaFuncSetAttribute` per device owed. `new-horizon.md` §50.9.
+// graph capture.
+//
+// THAT HAZARD IS DISCHARGED. The paragraph used to end "That is a real hazard
+// and it is now UNADDRESSED IN THIS TREE ... Kept as prose so the port that
+// finishes XQA knows there is a `cudaFuncSetAttribute` per device owed." The
+// port that finishes XQA has happened and it is owed nothing:
+// `kernels-cuda-new/src/runtime/module.rs`'s `raise_dynamic_smem_cap` issues
+// `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, ...)`
+// from inside `KernelModule::fire`, keyed
+// `(cuCtxGetDevice(), CUfunction::addr())` against a high-water mark, for any
+// launch whose `smem` exceeds 48 KiB. XQA's is 79,488
+// (`driver-cuda/src/fire/xqa.rs::XQA_SMEM_BYTES`), so every XQA fire goes
+// through it.
+//
+// THE KEY IS THE WHOLE ARGUMENT, so it is worth stating rather than citing.
+// The defect was never "the attribute is not set", it was "it is set once, on
+// whichever device happened to be current". `cuCtxGetDevice` reads the
+// CALLING THREAD'S current context at the moment of the fire. Rank 1 fires on
+// rank 1's context, misses rank 0's cache entry, and raises rank 1's device.
+// A per-process static initializer cannot express that and a warmup entry
+// point was the only way to work around it, which is why the warmups existed.
+// They are not owed because the thing they worked around is gone.
+// `driver-cuda/src/fire/xqa.rs:507-515` is the durable half of this record --
+// durable because it is in a crate that outlives this one. `new-horizon.md`
+// §50.9 is now a closed item and should be read with this paragraph.
+//
+// A REMAINING GAP, SO IT IS NOT READ AS CLOSED TOO: nothing raises the cap
+// BEFORE a graph capture, because nothing raises it before a fire. The
+// original prose asked for the warmup "before any graph capture" and that
+// half is unaddressed -- the first fire inside a capture is the first fire.
+// It is a different hazard from the TP>1 one and it belongs to whoever
+// captures XQA, not to whoever ported it.
 //
 // `prepare_attention_xqa_decode_bf16` WAS declared here too, and it is the
 // last thing to leave this archive that had a `__global__` behind it. Its

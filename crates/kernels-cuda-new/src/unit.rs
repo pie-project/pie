@@ -308,7 +308,8 @@ impl Demands {
 
 /// The units that demand something other than [`Demands::DEFAULT`].
 ///
-/// **Two entries, and the first covers 56 units** — see the prefix rule below.
+/// **Three entries, two of them prefixes, and the first covers 56 units** —
+/// see the prefix rule below.
 ///
 /// It was empty until the FA2 lattice landed, and that emptiness was a
 /// measurement rather than a placeholder: every unit declared before it
@@ -318,11 +319,14 @@ impl Demands {
 /// `<flashinfer/attention/prefill.cuh>`, which reach the whole 1.7 MB patched
 /// vendor closure, so they demand [`Headers::LibraryAndVendor`].
 ///
-/// `crate::families::cascade` is the second and the last, for now. Its one
+/// `crate::families::cascade` is the second. Its one
 /// unit `#include`s `<flashinfer/attention/cascade.cuh>` — the OTHER half of
 /// FA2's split path, the fold that turns `tmp_v`/`tmp_s` into `o` — which
 /// reaches `cp_async.cuh`, `math.cuh`, `utils.cuh` and `state.cuh`, all
-/// vendored. Every other unit still demands nothing.
+/// vendored. `crate::x::xqa` is the third and is the entry the XQA lattice's
+/// own doc predicted: five units on one root that reaches
+/// `csrc/vendor/xqa/`'s fifteen-file closure. Every other unit still demands
+/// nothing.
 ///
 /// The one file that would ALSO be here — `moe/moe_grouped_gemm_tile` — is
 /// deliberately not a unit yet, and adding it here without adding the unit
@@ -459,6 +463,26 @@ const DEMANDS: &[(&str, Demands)] = &[
     // see a key that was never added.
     (
         "attn/attention_xqa_mha_*",
+        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+    ),
+    // The fourth, and the second exact key.
+    //
+    // `crate::x::attn::mla_fa2`'s one unit compiles
+    // `csrc/src/attn/attention_mla_fa2.cuh`, whose two vendored includes are
+    // `<flashinfer/attention/mla.cuh>` and `<flashinfer/attention/mla_params.cuh>`,
+    // and the first of those includes `prefill.cuh` at its line 33 — so the
+    // closure is `attn/fa2_*`'s, reaching `cascade.cuh`, `scheduler.cuh`,
+    // `permuted_smem.cuh`, `fastdiv.cuh` and the rest. None of it is
+    // reachable from `Headers::Library`.
+    //
+    // EXACT and not folded into a widened `attn/*`, for `cascade/merge_states`'
+    // reason: one unit, one name, and a rename is a compile error rather than
+    // a prefix that silently matches nothing else. It is deliberately NOT
+    // merged with `attn/fa2_*` either, even though the two demand the same
+    // set — they are different families with different roots, and a shared
+    // key would stop naming what it covers.
+    (
+        "attn/attention_mla_fa2",
         Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
     ),
 ];

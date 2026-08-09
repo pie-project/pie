@@ -6,7 +6,7 @@
 //! tensor allocations each configuration makes. This test reproduces the same
 //! sweep against [`KvCacheLayout`] and requires the transcripts to be equal.
 //!
-//! Run `tests/oracle/kv_cache/run.sh` to regenerate [`GOLDEN_FNV1A64`]. The
+//! `tests/oracle/kv_cache/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`]. The
 //! pinned value is the **C++'s** hash, never this file's: a golden taken from
 //! the port would only prove the port agrees with itself.
 
@@ -566,8 +566,10 @@ fn the_kv_cache_allocation_matches_the_cpp_byte_for_byte() {
     assert_eq!(
         fnv1a64(sw.out.as_bytes()),
         GOLDEN_FNV1A64,
-        "transcript diverged from the C++; set KV_RUST_OUT and diff against \
-         tests/oracle/kv_cache/run.sh's KV_ORACLE_OUT"
+        "transcript diverged from the C++. The oracle cannot be re-run to diff \
+         against (see `oracle_census.rs`), so the golden is the only record \
+         of the C++ and a divergence is THIS crate changing. Set KV_RUST_OUT \
+         and read the transcript against the pin."
     );
 }
 

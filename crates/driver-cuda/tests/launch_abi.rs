@@ -124,8 +124,10 @@ use std::process::Command;
 
 use driver_cuda::bind::abi::{
     AttentionWorkspaceView, HopperPrefillPlan, KvCacheLayerView, MlaCacheLayerView,
-    YarnOriginalParams,
 };
+// `YarnOriginalParams` left with its record — its C++ declaration went with
+// `attn/mla_paged.hpp` and there is nothing here to assert it against. The
+// Rust type is still live; see the note in `records()`.
 // `Operand` and `Ty` left with the mutation suite — see the header.
 use kernels::KernelSig;
 use kernels_cuda_new::abi::Record;
@@ -353,14 +355,14 @@ fn norm_headers() -> Vec<String> {
 // The claim the test actually protected — that a stated row describes a real
 // launcher — survived in `every_norm_row_states_its_launcher_exactly` until
 // §5 step 5 took `norm` too (see the note above this one), and survives in
-// `the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers` below,
+// `the_stated_quant_layout_and_gemm_rows_describe_their_launchers` below,
 // which is deliberately NOT a whole-family assertion for exactly this reason.
 // What replaces it for `mlp` is `driver-cuda/build.rs`'s `armless` check and
 // the `x::mlp` host programs themselves: `gpt_oss_glu_bf16`'s three defaults
 // are now three Rust parameters with types, which is the ladder §1 draws.
 
-/// `quant`'s and `moe`'s rows, and the STATED half of `layout`'s and
-/// `gemm`'s.
+/// `quant`'s, `layout`'s and `gemm`'s rows — all three DERIVED now, which
+/// is a state this test has to be read carefully in.
 ///
 /// `gemm`'s scaled entry points are here because 1b made them
 /// spellable: the storage a weight is in used to reach the dispatcher
@@ -381,8 +383,26 @@ fn norm_headers() -> Vec<String> {
 ///     which the operand vocabulary has no kind for yet.
 ///
 /// What IS stated compiles, which is the claim this test can make.
+///
+/// # `moe` was the fourth table and is gone, and with it the last STATED
+/// row this walk had
+///
+/// `table::moe::KERNELS` held four routed `quant::` decode GEMVs after §5
+/// step 5 emptied it of `moe::` rows — filed there because **`table/` was
+/// organised by who DISPATCHES and `x/` by who owns the code** — and they
+/// were the only entries left in this array that stated `operands`. They
+/// are `x::quant` contracts now, and `x::quant::SIGS` was already the first
+/// element, so nothing is appended in their place.
+///
+/// **So `shim_over` is walking three derived lists and emitting nothing at
+/// all.** That is not a failure and it is not a pass either: the compile
+/// half now compiles an empty file, exactly as `the_mlp_rows_*` did before
+/// it was deleted two notes above. It is kept rather than deleted for one
+/// reason — the header list below is still a real claim, that every header
+/// these families' launchers live in is includable — and it will stop being
+/// worth keeping the moment that claim moves somewhere that re-derives it.
 #[test]
-fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
+fn the_stated_quant_layout_and_gemm_rows_describe_their_launchers() {
     // `table::gemm::KERNELS` was the third; `x::gemm::SIGS` is the same
     // twelve symbols derived from the `contract!` block.
     //
@@ -392,14 +412,14 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
     // walk still sees every symbol these headers cover — which is what makes
     // `"layout/embed.hpp"` below an include for a family whose rows no
     // longer reach it, rather than an include that lost its rows silently.
-    let tables: [&'static [KernelSig]; 4] = [
+    let tables: [&'static [KernelSig]; 3] = [
         // `table::quant::KERNELS` was the first; `x::quant::SIGS` is its
-        // eleven symbols derived from the `contract!` block, stating no
-        // `operands` for the same reason `layout`'s and `gemm`'s do.
+        // FIFTEEN symbols derived from the `contract!` block, stating no
+        // `operands` for the same reason `layout`'s and `gemm`'s do. It was
+        // eleven until the four `table::moe` tenants joined it.
         kernels_cuda_new::x::quant::SIGS,
         kernels_cuda_new::x::layout::SIGS,
         kernels_cuda_new::x::gemm::SIGS,
-        kernels_cuda_new::table::moe::KERNELS,
     ];
     let headers = [
         // `quant/dequant_fp4.hpp`, `quant/dequant_fp8.hpp` and
@@ -727,7 +747,7 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         // is deleted with the launcher. Same reason the list already records
         // for `copy_kv_cells_bf16` and `set_decode_plan_int_base`:
         // `mentions_word` reads all of `driver-cuda/src`, and
-        // `fire::kv_paged::write_kv_to_pages_bf16` is that word — a ported
+        // `x::attn::kv_paged::write_kv_to_pages_bf16` is that word — a ported
         // name left standing here fails the `Orphaned` arm for a launcher
         // that is not orphaned but simply no longer C++.
         ("dispatch_attention_flashinfer_decode_bf16",   NoRow::KernelsInternal),
@@ -1514,9 +1534,49 @@ fn records() -> Vec<Record> {
             total_tokens, num_requests, num_q_heads, num_kv_heads, head_dim,
             page_size, window_left, causal, valid,
         }),
-        kernels_cuda_new::record!(YarnOriginalParams => "::pie_cuda_driver::kernels::attn::YarnOriginalParams" {
-            factor, beta_fast, beta_slow, attention_factor, original_max_position,
-        }),
+        // `YarnOriginalParams` STOOD HERE AND ITS C++ RECORD DOES NOT EXIST.
+        //
+        // It was declared in `attn/mla_paged.hpp`, deleted with its `.cu` by
+        // `244df6054`. `MIRROR_HPPS` lost that entry in the same change, and
+        // the comment left there reasoned about `MlaCacheLayerView` finding
+        // another home in `attn/mla_cache_view.hpp` — correctly — and did not
+        // ask the same question about the second record the header declared.
+        // There is now no `struct YarnOriginalParams` anywhere under either
+        // `csrc` tree.
+        //
+        // **This reproduced, exactly, the bug `MIRROR_HPPS`' own doc was
+        // written to prevent.** One positive case red on an undeclared type,
+        // and the three mutation cases GREEN for the wrong reason — they
+        // assert a TU fails to compile, and it was failing on the missing
+        // declaration rather than on the mutation.
+        // `records_are_declared_in_the_headers_that_are_included` is the
+        // check that would have caught the deletion, and it names the record.
+        //
+        // It is removed rather than repointed because there is nothing to
+        // repoint to, and the layout claim has no counterparty left:
+        //
+        //   * the row that spelled it, `attn::mla_prepare_bf16`, is in
+        //     `execution::RUST_SERVED`, so `emit_c_shim` emits no entry and
+        //     the generated shim never names the type;
+        //   * the fn-world launcher `driver-cuda/src/fire/mla_paged.rs` does
+        //     not pass a struct at all — `yarn_factor`, `yarn_low_dim`,
+        //     `yarn_high_dim` and `yarn_mscale` cross as four separate
+        //     `ArgValue::F32`, which is the shape
+        //     `kernels-cuda-new/csrc/src/attn/mla_paged.cuh:251-254` declares;
+        //   * nothing under `kernels-cuda-new/csrc` declares or uses it.
+        //
+        // The Rust `bind::abi::YarnOriginalParams` stays, and its remaining
+        // user is `bind::abi::ffi` — which is `#[cfg(feature = "bridge")]`,
+        // so the mirror retires on exactly the schedule these headers do.
+        // `fire/mla_paged.rs` does NOT use it: that file's `YarnOriginal` is
+        // its own type and the only mention of this one is in a doc comment
+        // at `:102`, describing the C++ signature the row used to have.
+        //
+        // `kernels::Ty::YarnOriginalParams` still spells
+        // `"const ::pie_cuda_driver::kernels::attn::YarnOriginalParams*"` for
+        // the shim. It is inert, not broken: the row is `RUST_SERVED`, so
+        // `emit_c_shim` drops the entry before that string is ever written.
+        // It would become a shim compile error the moment the row came back.
     ]
 }
 
@@ -1538,12 +1598,283 @@ const MIRROR_HPPS: &[&str] = &[
     // launcher header only included it.
 ];
 
+/// The five headers this test compiles, and they OUTLIVE THE ARCHIVE.
+///
+/// [`MIRROR_HPPS`] is four entries; the transitive closure of the generated TU
+/// is five — `attn/kv_cache_view.hpp` includes `tensor.hpp`. All five live in
+/// `crates/kernels-cuda/csrc`, which north star step 6 deletes when `bridge`
+/// goes and `ROW_TABLES` empties.
+///
+/// **This test does not go with it.** It needs `g++`, `-I csrc`, and the
+/// two-file stub tree beside it; it needs no nvcc, no `bridge`, no `native`
+/// and nothing from the archive's CMakeLists. So the step-6 sweep will find
+/// five headers whose only `#include`rs are dead archive text and conclude
+/// they are unreachable — a grep for `#include "tensor.hpp"` cannot see this
+/// consumer, because the include lines exist only in the text
+/// [`kernels_cuda_new::abi::emit_layout_assertions`] generates.
+///
+/// # The rule, both halves, because this is now the only copy in a crate that
+/// # survives
+///
+/// The first half was written during the archive sweep: **an `#include` from
+/// a translation unit that cannot be compiled is not a consumer.** It retired
+/// several keep-claims resting on includes from deleted `.cu` files and from
+/// `oracle.cpp`s whose `run.sh` die at their first `cp` — see
+/// `tests/oracle_census.rs`.
+///
+/// This test is the **dual, and it was found by the first half getting these
+/// five wrong**: a translation unit that CAN be compiled need not contain a
+/// literal `#include` anywhere in the tree. Both halves are the same mistake —
+/// counting text instead of counting compilations — and they fail in opposite
+/// directions. The first overcounts an edge that exists and can never be
+/// traversed. The second undercounts an edge that is traversed every
+/// `cargo test` and cannot be grepped.
+///
+/// The write-ups that stood beside the affected headers, in the archive's
+/// `CMakeLists.txt` and in `csrc/src/attention_workspace_view.hpp`, are in
+/// files scheduled for deletion; the CMakeLists copy was already lost to a
+/// concurrent rewrite within the hour. **This is the copy that is meant to
+/// survive**, and it is here rather than in a document for the reason
+/// `weights/plan.rs` records: a measurement beside the assertion that depends
+/// on it is read by the person who needs it.
+///
+/// The check is path existence, so it fires BEFORE `g++` does and says why,
+/// instead of leaving a compile error whose cause is three indirections away.
+/// It is also self-retiring in the useful direction: move a mirror's C++
+/// record to a surviving crate and this fails, which is the moment to ask
+/// whether the header still needs to exist at all.
+const CLOSURE_SURVIVES_STEP_6: &[&str] = &[
+    "attn/kv_cache_view.hpp",
+    "attention_workspace_view.hpp",
+    "attn/mla_cache_view.hpp",
+    "attn/attention_flashinfer_hopper.hpp",
+    // Not in `MIRROR_HPPS`; reached through `attn/kv_cache_view.hpp`, which
+    // is why a list of the four would have missed it.
+    "tensor.hpp",
+];
+
+/// The headers the layout assertions need are still on disk.
+#[test]
+fn the_mirrored_headers_outlive_the_archive_that_holds_them() {
+    let root = csrc();
+    let gone: Vec<&str> = CLOSURE_SURVIVES_STEP_6
+        .iter()
+        .copied()
+        .filter(|h| !root.join(h).is_file())
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "{gone:?} is missing from `kernels-cuda/csrc/src`.\n  \
+         These are compiled by `the_mirrors_have_the_layout_the_cpp_has`, \
+         through `#include` lines that `emit_layout_assertions` GENERATES — \
+         so nothing in the tree greps as including them and a sweep reading \
+         `#include` edges alone will call them unreachable. They are not: \
+         this test needs only `g++` and the stub tree, and survives the \
+         archive's deletion at north star step 6.\n  They do NOT need a home \
+         outside `kernels-cuda`: see \
+         `the_mirrors_have_the_layout_the_cpp_has` — after `bridge` nothing \
+         makes a competing claim about these layouts, so this suite and these \
+         headers retire together rather than moving."
+    );
+}
+
+/// The other generated include set, and the one nothing was watching.
+///
+/// `kernels-cuda/build.rs::shim()` — feature `native`, which `bridge` is the
+/// only thing that turns on — builds the production `libpie_launch_shim.a`.
+/// Its `includes()` does **not** ask which rows survived: it `read_dir`s each
+/// family directory and takes EVERY `*.hpp`, then `emit_c_shim` writes one
+/// `#include "<dir>/<name>"` line per entry. So a header dropped into
+/// `csrc/src/attn/` joins a production compile with nothing naming it.
+///
+/// That is the same blind spot as [`CLOSURE_SURVIVES_STEP_6`] and it was
+/// found a turn later, on the same file: `attention_workspace_view.hpp` was
+/// twice written up as having no compilable consumer, and it has TWO — this
+/// shim and the g++ TU above. `attn/attention_xqa.hpp` and
+/// `attn/attention_flashinfer.hpp` were written up as dead and are compiled
+/// here every `native` build.
+///
+/// The general statement, which is what makes it checkable rather than
+/// anecdotal: **`kernels_cuda_new::abi` is the tree's `#include` generator.**
+/// Three emitters write `#include` text — `emit_c_shim`,
+/// `emit_device_typecheck`, `emit_layout_assertions` — and no grep can
+/// consult them, because their filenames are Rust `&[&str]`s and `read_dir`
+/// results.
+///
+/// # The two compilers end on different schedules
+///
+/// The shim dies when `ROW_TABLES` empties and `bridge` goes. The g++ TU
+/// above does not: it needs `g++`, the two-file stub tree and `-I csrc/src`,
+/// and nothing from the archive's CMakeLists. So membership in `MIRROR_HPPS`
+/// is what decides whether an `attn` header survives step 6, and that is not
+/// arbitrary — a header is in it because a `#[repr(C)]` mirror claims to have
+/// its layout, and the mirror is what crosses. `attention_flashinfer_hopper`
+/// being in it is what discharges the constraint that it must outlive the
+/// non-sm90 stub it defined.
+///
+/// This list is the shim-only remainder: in the generated shim, not in
+/// `MIRROR_HPPS`, and therefore deleted with `bridge` rather than moved.
+const SHIM_ONLY_ATTN_HPPS: &[&str] = &["attention_flashinfer.hpp", "attention_xqa.hpp"];
+
+/// Every header the production shim compiles has been classified.
+///
+/// The partition is the point. `MIRROR_HPPS` says which `attn` headers a
+/// Rust mirror pins; [`SHIM_ONLY_ATTN_HPPS`] says which are host declarations
+/// the shim forwards through. A header in neither is one that joined a
+/// production compile by being dropped into a directory, which is exactly the
+/// way all three of this file's misses happened.
+///
+/// Self-retiring: when `csrc/src/attn/` empties, both lists must be empty and
+/// this says so rather than passing vacuously.
+///
+/// # Why `attn` and not the whole shim set
+///
+/// `includes()` sweeps twelve directories and three still hold headers:
+/// `attn` (5), `vision` (5), `rope` (1). Only `attn`'s are partitioned here,
+/// because only `attn` has headers on both sides of step 6 — some pinned by a
+/// `#[repr(C)]` mirror and some not. `vision` and `rope` have no mirror at
+/// all, so every one of theirs is shim-only and goes with `bridge`; a table
+/// listing them would have one column and assert nothing. If a `vision` or
+/// `rope` record ever gains a mirror, that is the moment this partition wants
+/// to cover all three directories.
+#[test]
+fn no_attn_header_joins_the_generated_shim_unclassified() {
+    let dir = csrc().join("attn");
+    let mut found: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{dir:?} is readable: {e}"))
+        .filter_map(|e| {
+            let n = e.ok()?.file_name().to_string_lossy().into_owned();
+            n.ends_with(".hpp").then_some(n)
+        })
+        .collect();
+    found.sort();
+
+    let classified = |n: &str| {
+        MIRROR_HPPS.iter().any(|m| m.strip_prefix("attn/") == Some(n))
+            || SHIM_ONLY_ATTN_HPPS.contains(&n)
+    };
+    let unclassified: Vec<&String> = found.iter().filter(|n| !classified(n.as_str())).collect();
+    assert!(
+        unclassified.is_empty(),
+        "csrc/src/attn/{unclassified:?} is compiled by the production shim and \
+         classified nowhere.\n  `kernels-cuda/build.rs::includes()` sweeps \
+         EVERY `*.hpp` in this directory into the generated `shim.cpp` — it \
+         does not read the row tables — so a header lands in a `cc` compile \
+         with nothing in the tree naming it.\n  Say which it is: a mirror \
+         header goes in `MIRROR_HPPS` and survives step 6 because \
+         `launch_abi` compiles it with g++; a host declaration goes in \
+         `SHIM_ONLY_ATTN_HPPS` and is deleted with `bridge`."
+    );
+
+    let stale: Vec<&&str> =
+        SHIM_ONLY_ATTN_HPPS.iter().filter(|n| !found.iter().any(|f| f.as_str() == **n)).collect();
+    assert!(
+        stale.is_empty(),
+        "{stale:?} is listed shim-only and is not in csrc/src/attn/.\n  \
+         Drop the entry — the header is gone and the row describes nothing."
+    );
+}
+
+/// Every mirrored record is DECLARED in a header the assertions include.
+///
+/// The gate that was missing. `records()` names a C++ type;
+/// [`MIRROR_HPPS`] names the headers `emit_layout_assertions` `#include`s.
+/// Nothing tied the two together, so deleting a header could orphan a record
+/// — and did: `attn/mla_paged.hpp` went with its `.cu` in `244df6054` and
+/// took `struct YarnOriginalParams` with it, while the record stayed in
+/// `records()` for two more sweeps.
+///
+/// # Why the compiler was not enough
+///
+/// It is what `MIRROR_HPPS`' own doc warns about, and the warning did not
+/// save it. [`the_mirrors_have_the_layout_the_cpp_has`] goes red on an
+/// undeclared type, which is loud but says only "g++ did not like the
+/// generated TU". The three mutation cases go **green**, because they assert
+/// the TU fails to compile and it does — on the missing declaration, not on
+/// the mutation. So the net effect of orphaning a record is one confusing
+/// failure and three tests that stop testing anything, which is strictly
+/// worse than the plain failure.
+///
+/// This fires first, before any compiler runs, and names the record and the
+/// headers it was looked for in.
+///
+/// # What it asserts
+///
+/// That the tag — the last `::` segment of the record's C++ path — appears
+/// as `struct <Tag>` in one of the `MIRROR_HPPS` texts. Not a parse: a
+/// declaration this suite depends on is a plain `struct X {` line in a
+/// hand-written header, and a gate whose subject is approximately right
+/// reports failures that are approximately real. If a record is ever
+/// declared some other way (a template, a `using`), this fires and the right
+/// answer is to say so here rather than to loosen the match.
+#[test]
+fn records_are_declared_in_the_headers_that_are_included() {
+    let texts: Vec<(&str, String)> = MIRROR_HPPS
+        .iter()
+        .map(|h| {
+            let p = csrc().join(h);
+            let t = std::fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("{p:?} is a mirror header and does not read: {e}"));
+            (*h, t)
+        })
+        .collect();
+
+    for r in records() {
+        let tag = r.cpp.rsplit("::").next().unwrap_or(r.cpp);
+        let needle = format!("struct {tag} ");
+        let brace = format!("struct {tag}{{");
+        assert!(
+            texts.iter().any(|(_, t)| t.contains(&needle) || t.contains(&brace)),
+            "`{}` is asserted against a C++ record that is declared in none of \
+             MIRROR_HPPS {MIRROR_HPPS:?}.\n  A record whose header was deleted \
+             does not just fail: the mutation cases assert a TU FAILS to \
+             compile, so they pass on the missing declaration and stop testing \
+             the mutation.\n  Either add the header that declares `{tag}` to \
+             MIRROR_HPPS, or — if nothing declares it any more — delete the \
+             record. The layout claim needs a counterparty; without one there \
+             is nothing for the mirror to disagree with.",
+            r.cpp
+        );
+    }
+}
+
 /// A `#[repr(C)]` mirror really does have the C++ record's layout.
 ///
 /// This is the claim that decides whether a POD operand is a port or a
 /// wrapper. If it holds, `KvCacheLayerView` crosses the boundary as itself —
 /// no accessor shims, no field-by-field constructor, no copy — and every
 /// other descriptor in the launcher surface is the same kind of thing.
+///
+/// # This claim RETIRES WITH `bridge`, and the headers go with the archive
+///
+/// The question asked of step 6 was whether the five headers
+/// [`CLOSURE_SURVIVES_STEP_6`] names need a home outside `kernels-cuda`,
+/// since `del-archive` deletes the crate they live in. **They do not**, and
+/// the reason is that this claim's subject is an ABI rather than a file.
+///
+/// Measured, after `bridge`:
+///
+///   * the generated shim is the only thing that ever passed these structs
+///     across a C++ boundary, and it dies with `native`;
+///   * `kernels-cuda-new/csrc` — the carried NVRTC set — DECLARES none of
+///     them. `attention_flashinfer_common.cuh` names three and has zero
+///     includers; `attention_xqa.cuh` names `AttentionWorkspaceView` once,
+///     in a comment about host arithmetic;
+///   * a struct that really does cross to NVRTC goes through `by_value!`,
+///     and the tree has exactly one instance — `x/xqa.rs`'s `KvCacheList`,
+///     a vendored XQA type under `csrc/vendor/xqa/`, none of these.
+///
+/// So after `bridge` there is no second description of these layouts, and
+/// moving the headers into `driver-cuda/tests/` would keep this suite
+/// checking a Rust struct against a transcription owned by the test that
+/// checks it. That is the `attn/attention_naive_paged.cu` defect this
+/// migration already retired once: its `static_assert`s were kept as "the
+/// only mechanical link in the chain" after the pair they compared had
+/// stopped being the live pair.
+///
+/// The live pair for a struct that crosses is Rust ↔ carried device text,
+/// and `by_value!` is where that is asserted. This suite is the live pair
+/// for as long as the shim compiles, and not one commit longer.
 #[test]
 fn the_mirrors_have_the_layout_the_cpp_has() {
     let tu = kernels_cuda_new::abi::emit_layout_assertions(&records(), MIRROR_HPPS);

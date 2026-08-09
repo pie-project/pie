@@ -42,7 +42,7 @@
 //
 // # What is deliberately NOT here
 //
-// `offsetof`, `NULL`, `max_align_t`, `std::byte`. A grep over everything that
+// `NULL`, `max_align_t`, `std::byte`. A grep over everything that
 // reaches this file names none of them. `csrc/shim/cstdint` argues the
 // discipline: a shim that grows to the standard's surface becomes a second set
 // of promises to disagree with the first, and the disagreement is silent.
@@ -50,6 +50,42 @@
 // `size_t` and `ptrdiff_t` are NOT typedef'd here either -- NVRTC's preamble
 // already declares both in the global namespace, and naming them again would
 // be a redefinition rather than a courtesy. This file only re-exports them.
+//
+// # `offsetof` -- added and REMOVED the same day; the measurement is kept
+//
+// `csrc/src/moe/moe_glue.cuh` restated probe `C20`'s measured layout of
+// `TmaWarpSpecializedGroupedGemmInput` as ten `static_assert`s -- a hazard
+// converted to a build error -- and that needs `offsetof` in a **constant
+// expression**. That file is deleted with the fused CUTLASS MoE
+// (`new-horizon.md` §71), so the macro has no asking site and is not defined
+// below: the shim is a floor, and only additions that close a gap belong in
+// it.
+//
+// The measurement stays, because unlike the seven `cutlass/` headers that
+// went with it **this one is a fact about NVRTC rather than about CUTLASS**,
+// and the next carried header that restates an upstream struct will need it.
+// Probe `C22`, CARRIED order, one struct, six candidates:
+//
+// ```text
+//   __builtin_offsetof(S, d)                 rc=6  "type name is not allowed"
+//   offsetof(S, d)          (unprefixed)     rc=6  "type name is not allowed"
+//   (unsigned long)(&((S*)0)->d)             rc=6  "must have a constant value"
+//   (char*)&((S*)0)->d - (char*)(S*)0        rc=6  "must have a constant value"
+//   (char*)&s_.d - (char*)&s_   (extern S)   rc=6  "must have a constant value"
+//   __INTADDR__(&((S*)0)->d)                 rc=0
+// ```
+//
+// `__INTADDR__` is EDG's intrinsic, and NVRTC's frontend is EDG. The pointer
+// forms are the ones the offset *probes* in `nvrtc-probes/` use, and they work
+// there for the opposite reason: a `__constant__` initialiser is folded into
+// `.b8` bytes rather than evaluated as a constant expression by the front end.
+// **The same expression is legal in one position and not the other**, which is
+// why this was a row rather than a note saying "use the probe's trick" -- and
+// why re-adding it needs no new probe. The one line is:
+//
+// ```c
+//   #define offsetof(T, F) __INTADDR__(&(((T*)0)->F))
+// ```
 
 #ifndef PIE_NVRTC_CSTDDEF_
 #define PIE_NVRTC_CSTDDEF_

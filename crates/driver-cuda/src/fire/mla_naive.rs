@@ -135,17 +135,33 @@
 //! the mma arm supports 65 535 tokens and 2^31 head blocks. Both are stated as
 //! the C++ stated them.
 //!
-//! # What blocks this module from replacing the C++
+//! # What blocked this module from replacing the C++, and what is left
 //!
-//! Not size, and not this file. `attn::dispatch_attention_mla_bf16` is one row
-//! with TWO arms — this naive one, and `flashinfer::mla::BatchMLAPagedAttention
-//! <MASK, 512, 64>` for everything below sm_100. A row loses its shim entry
-//! whole or not at all, so both arms must be Rust before either can be. The
-//! FA2 arm passes ONE `MLAParams<DTypeQ, DTypeKV, DTypeO, IdType>` **by
-//! value**, which is `runtime::args::ArgValue::Bytes`, which
-//! `Args::bind`'s own comment says only `x::Abi` produces. That is the
-//! identical blocker XQA's `KVCacheList` has, in a different family, and one
-//! `Abi` capability clears both.
+//! **IT HAS REPLACED IT.** `kernels-cuda/csrc/src/attn/attention_mla.cu` is
+//! deleted and this module is the only thing that reaches either of these two
+//! kernels.
+//!
+//! The blocker recorded here was that `attn::dispatch_attention_mla_bf16` is
+//! one row with TWO arms — this naive one for sm_100, and
+//! `flashinfer::mla::BatchMLAPagedAttention<MASK, 512, 64>` for everything
+//! below it — and that a row loses its shim entry whole or not at all, so both
+//! arms had to be Rust before either could be. The FA2 arm passed ONE
+//! `MLAParams<DTypeQ, DTypeKV, DTypeO, IdType>` **by value**, which is
+//! `runtime::args::ArgValue::Bytes`, which only `x::Abi` produces. That was
+//! the identical blocker XQA's `KVCacheList` had, and one `Abi` capability
+//! did clear both: `by_value!` grew an UNTAGGED arm and
+//! `kernels_cuda_new::x::attn::mla_params` measured `MLAParams` at 288/8.
+//! The FA2 arm is now `kernels_cuda_new::x::attn::mla_fa2`, unit and all, and
+//! the row crossed to `x::attn::ATTENTION_MLA`.
+//!
+//! **WHAT IS LEFT IS THE ARM CHOICE AND NOTHING ELSE.** `attention_mla.cu:150`
+//! made it on `cudaDevAttrComputeCapabilityMajor >= 10`, because FA2 MLA
+//! writes ZERO OUTPUT on sm_100 — a wrong answer, not a fault. Neither `Cx`
+//! nor `kernels-cuda-new`'s runtime states a compute capability, and `Cx`
+//! states none of the MLA cache layer, the plan handle, the attention
+//! workspace or `sm_scale` either. So the contract is a `none:` arm, which
+//! names all five, and this module still waits on a caller — as it always
+//! has, and now for a reason that is one query list rather than a capability.
 //!
 //! Everything in THIS module is unblocked: every operand of both kernels is a
 //! pointer, an `i32`, an `f32` or a `bool`.

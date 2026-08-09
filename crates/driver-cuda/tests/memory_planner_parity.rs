@@ -7,7 +7,7 @@
 //! grid through the Rust port and requires the transcripts to be
 //! byte-identical, then pins the **C++'s** FNV-1a 64 hash of it.
 //!
-//! Run `tests/oracle/memory_planner/run.sh` to regenerate the golden.
+//! `tests/oracle/memory_planner/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated the golden.
 //!
 //! # Why this test exists in this shape
 //!
@@ -1052,7 +1052,9 @@ fn the_rust_planner_reproduces_the_cpp_transcript_byte_for_byte() {
     assert_eq!(
         fnv1a64(sw.out.as_bytes()),
         GOLDEN_FNV1A64,
-        "transcript diverged from the C++. Set MP_RUST_OUT=/tmp/rust.txt and \
-         MP_ORACLE_OUT=/tmp/cpp.txt, run tests/oracle/memory_planner/run.sh, and diff."
+        "transcript diverged from the C++. The oracle cannot be re-run to diff \
+         against (see `oracle_census.rs`), so the golden is the only record \
+         of the C++ and a divergence is THIS crate changing. Set \
+         MP_RUST_OUT=/tmp/rust.txt and read the transcript against the pin."
     );
 }

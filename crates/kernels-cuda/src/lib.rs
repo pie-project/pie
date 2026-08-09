@@ -82,6 +82,42 @@
 // `kernels_cuda::ffi` has no caller — `driver-cuda` generates its own `ffi`
 // module against its own `#[repr(C)]` mirrors.
 //
+// # THE SENTENCE ABOVE WAS FALSE FOR A DAY, AND THE WAY IT WAS FALSE IS THE
+// # FIFTH INSTANCE OF WHAT IT IS ABOUT
+//
+// It is true now. It was not true when it was written. `examples/
+// emit_device_typecheck.rs:58` read
+//
+//     kernels_cuda::abi::emit_device_typecheck(kernels_cuda::norm_device::ENTRIES)
+//
+// — a live, compiled `kernels_cuda::`, outside a doc comment, naming both
+// re-export files. **The census that produced "zero" walked `src/` and
+// `tests/` and did not walk `examples/`.**
+//
+// The consequence was not a stale comment. It was a target that could not
+// build: the sweep deleted every `pub use` from this file AND left no `mod
+// abi;` / `mod norm_device;`, so `src/abi.rs` and `src/norm_device.rs`
+// compiled in no target, and the one line that named them through the crate
+// root named two paths that did not exist. `cargo check --all-targets` on
+// this crate had a hard error in it, in the directory the census skipped.
+//
+// Both files are deleted; the example names `kernels_cuda_new::abi` and
+// `kernels_cuda_new::device::ALTUP_AUX` directly, which is what the two
+// `pub use`s resolved to anyway. `Cargo.toml`'s `[build-dependencies]` block
+// carried the matching false reason — *"`build.rs` still reaches `src/abi.rs`
+// through `#[path]`"* — against `build.rs`'s own *"THERE IS NO `#[path]`
+// INCLUDE HERE ANY MORE"*, and is corrected there.
+//
+// So this file's own diagnosis applies to this file's own sweep: *"a reason
+// that is written down, is checkable, and is false."* The discriminator was
+// right and was not run across the whole set — which is the same failure, one
+// level up, as verifying that nine symbols have ROWS without checking that
+// each row has an ARM.
+//
+// `record!`, `ffi`, `abi` and `norm_device` are all gone. The claim above now
+// holds against `src/`, `tests/`, `examples/` and `build.rs` together, which
+// is the set it always meant.
+//
 // `build.rs` in this very crate already said so, in a doc comment written
 // two refactors ago: *"no crate in the workspace names `kernels_cuda:: any
 // more"*. Both statements were in the tree at once. The re-exports were kept

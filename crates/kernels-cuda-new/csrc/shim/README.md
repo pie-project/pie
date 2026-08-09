@@ -158,6 +158,31 @@ negotiated one. Nothing below removes or rewrites an existing entry.
 | `type_traits`    | `std::max`                                         | `cutlass/epilogue/collective/sm100_epilogue_array_tma_warpspecialized.hpp:242`       |
 | `cuda_runtime.h` | `cudaGridDependencySynchronize()`                  | eleven of CUTLASS's fused-MoE `__global__`s, first statement                          |
 | `cuda_runtime.h` | `cudaTriggerProgrammaticLaunchCompletion()`        | the same eleven, last statement                                                       |
+| `cuda_runtime_api.h` | the whole file (forwards to `cuda_runtime.h`)  | `cute/util/debug.hpp:38`, reached from `cute/tensor.hpp` — the first line of every CUTLASS unit |
+
+`cuda_runtime_api.h` was added a turn later than the four above, by
+`moe-cutlass`, and its own header comment carries the argument for forwarding
+rather than declaring. It is worth recording *how* it was missed for so long,
+because the answer is not "nobody included it":
+
+**every CUTLASS probe in this project until `G3` ran with
+`/usr/local/cuda/include` ahead of `csrc/shim`.** C1b, C4, C5, C6, C13, C14,
+T2–T4, E1–E4 — all of them resolved this header, and `cuda_fp16.h`, and
+everything else, out of the *toolkit*. That is §62.10 for the third time and
+its sharpest instance: the include order under which the CUTLASS probes pass
+is an order production cannot enter, so a green probe said nothing about
+whether the carried set was complete.
+
+The same probe found a gap that is **not** additive and is therefore not
+closed here: CCCL's `extended_data_types.h:50` forward-declares
+`struct __half;` under `__has_include(<cuda_fp16.h>)`, and this shim's
+`cuda_fp16.h:236` makes `__half` an *alias* to the one canonical device type.
+An alias and a struct forward-declaration of one name cannot coexist, and in
+production the shim **is** `<cuda_fp16.h>`. Options and the reason none was
+taken unilaterally are recorded at
+`driver-cuda::fire::flashinfer_moe::params::CCCL_FP16_CONFLICTS_WITH_SHIM_ALIAS`
+— it touches the canonical-type identity `fa2` and `xqa` are built on, so it
+is a decision rather than an addition.
 
 `std::void_t` was on CUTLASS's list too
 (`epilogue/thread/linear_combination_bias_elementwise.h:77`) and was **already
@@ -174,3 +199,100 @@ be read as one decision.
 `pie_device.cuh`, `pie_fp8.cuh`, `pie_half2.cuh`, `pie_mma.cuh` — PIE's own
 device text under PIE's own names. Those are not impersonating anything; they
 are in `csrc/src`. A file belongs here when **the name is somebody else's**.
+
+## Retired with the CUTLASS MoE, 2026-08-14 (`new-horizon.md` §71, §72)
+
+**Seven files were added here and deleted the same day, and the deletion is the
+result rather than a retraction.** `cutlass/{array.h, functional.h,
+numeric_types.h, numeric_conversion.h, epilogue/thread/activation.h}`,
+`cutlass_extensions/epilogue/thread/fused_activations.h` and
+`cute/util/type_traits.hpp` answered nine device-side CUTLASS names for
+`csrc/src/moe/moe_glue.cuh`, FlashInfer's six MoE glue kernels extracted for
+NVRTC. Measured against the carried set with the shim first: **`rc=0`,
+142,701 bytes of PTX, seven `.weak .entry`** — the extraction worked.
+
+Then the fused CUTLASS MoE was retired outright, its traffic went to the
+general (aligned) path, and the general path has its own glue kernels
+(`gather_moe_aligned_inputs`, `chunked_swiglu`, `reorder_moe_aligned_output`,
+`token_batched_weighted_sum_add`) which are already rowed and already fire.
+`moe_glue.cuh` lost its only consumer, and these seven files lost theirs.
+
+**They are deleted rather than kept for a future caller,** because of the
+hazard stated below and still true: the carried set is one flat namespace
+searched ahead of everything else, so a partial `cutlass/array.h` found first
+is strictly worse than no `cutlass/array.h` at all. A file here is a *floor*,
+and a floor with nothing standing on it is a trapdoor.
+
+`cstddef`'s `offsetof` went with them for the same reason — `moe_glue.cuh`'s
+ten `static_assert`s were its only asking site. The measurement behind it is
+kept below, because unlike the other seven **it is a fact about NVRTC, not
+about CUTLASS**, and the next carried header that restates an upstream struct
+will need it.
+
+Several rows in the two older sections keep their entries and lose their
+asking sites: `type_traits`'s `std::min` (asked by
+`finalizeMoeRoutingKernel:1745`), `std::enable_if`/`is_integral` (`cudaUtils.h`'s
+`ceilDiv`), `std::is_pointer`/`is_pointer_v` and `std::max` (CUTLASS's two sm90
+/sm100 array epilogues), `limits`'s `numeric_limits<float>::infinity()` (the
+activation adaptors), and `cuda_runtime_api.h`'s whole forwarding file
+(`cute/util/debug.hpp:38`). They are **kept**, because each is a plain
+standard-library or toolkit name that any carried header may reach for, and
+unlike a `cutlass/` path none of them can shadow a real header with a partial
+one.
+
+`cuda_runtime.h`'s two PDL intrinsics are **not** in that category: they have
+live askers across the carried attention and MoE kernels and are unaffected.
+
+### The measurement that outlives the row: `offsetof` under NVRTC
+
+`__INTADDR__` is the only spelling that works. Six were tried (probe
+`nvrtc-probes/cutlass_moe_832_c22_offsetof.py`):
+
+| spelling | rc | diagnostic |
+| --- | --- | --- |
+| `__builtin_offsetof(S, d)` | 6 | *type name is not allowed* |
+| `offsetof(S, d)` unprefixed | 6 | *type name is not allowed* |
+| `(unsigned long)(&((S*)0)->d)` | 6 | *must have a constant value* |
+| `(char*)&((S*)0)->d - (char*)(S*)0` | 6 | *must have a constant value* |
+| `(char*)&s_.d - (char*)&s_`, `extern S s_` | 6 | *must have a constant value* |
+| `__INTADDR__(&((S*)0)->d)` | **0** | — |
+
+NVRTC's front end is EDG; `__INTADDR__` is its intrinsic. **The row worth
+keeping is the fifth-and-third:** those pointer-difference spellings are
+exactly what every offset probe in `nvrtc-probes/` is built on, and they work
+*there* — because a `__constant__` initialiser is folded to `.b8` bytes rather
+than evaluated as a constant expression. The same text is legal in one
+position and rejected in the other, so an instrument that works is not
+evidence that the construct is legal.
+
+### The findings that outlive the seven files
+
+Both are in `new-horizon.md` §72 in full; the short forms, because this is
+where someone re-adding a `cutlass/` shim would stand:
+
+**`cutlass::Array<bf16, N>` is a bit-packed proxy container, not `T[N]`.**
+`Array<T, N, RegisterSized = sizeof_bits<T>::value >= 32>` sends every 16-bit
+element type to `array_subbyte.h`'s specialisation, whose `Storage` is
+`unsigned int`. Measured: `sizeof(Array<bf16,8>) == 16`, **`alignof == 4`**,
+where a transcription writing `bf16 storage[8]` gets align 2.
+
+**`PropagateNaN` is load-bearing.** `ReLu` passes `true`, which emits
+`max.NaN.f32` rather than `max.f32`. A one-parameter `minimum`/`maximum` is a
+silent wrong answer everywhere.
+
+**`GELU_taylor` has a `float` specialisation that is a different function from
+the generic.** The PTX difference was published as NVRTC reassociating behind
+a folded constant `0f3D122279`, and withdrawn: it is
+`float(0.7978845608028654 * 0.044715)`, written out longhand at
+`activation.h:652`. A specialisation you did not look for reads exactly like
+an optimiser you cannot argue with.
+
+### The shadowing hazard, stated once and now acted on
+
+The carried set is one flat namespace searched ahead of everything else. A
+file here named `cutlass/array.h` *is* `cutlass/array.h` for every carried
+translation unit. So if a later pass decides to carry real CUTLASS, nothing
+partial may be left in its path — which is why the seven are gone rather than
+dormant, and why `csrc/vendor/cutlass_extensions/` (one patched file, carried
+but unreached) was deleted in the same change. Its two-line frontend fix is
+recorded in `new-horizon.md` §72.6, which is the only place it now exists.

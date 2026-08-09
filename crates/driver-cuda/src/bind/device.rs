@@ -249,6 +249,12 @@ const fn is_pointer(ty: Ty) -> bool {
             | Ty::BufArrayOutMut
             | Ty::U8Array
             | Ty::I32Array
+            // See `kernels_cuda_new::runtime::args::is_pointer` for the
+            // measurement. The two lists are byte-identical and must stay so:
+            // this one refuses a launch and that one refuses a bind, and a
+            // `Ty` accepted by one and refused by the other is a symbol that
+            // binds in one crate and not the other.
+            | Ty::StructuredMasks
     )
 }
 

@@ -3512,7 +3512,8 @@ pub(crate) fn step_impl(
         // the word says the whole fire.
         peel_window: peel_window_ptr,
         rows_total: i32::try_from(rows).unwrap_or(0),
-    };
+            moe_ptrs: std::cell::Cell::new(None),
+};
 
     lap("bind");
     // THE TAIL'S OWN STATE, when the lowering peeled. `peel_start` is

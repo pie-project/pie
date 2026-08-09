@@ -1,6 +1,20 @@
 #!/bin/bash
 # Regenerate the golden for tests/lora_stage_parity.rs — gate-lora slice A.
 #
+# THIS SCRIPT CANNOT RUN, and it is kept as the description of how the golden
+# was taken rather than as a command anyone can issue — the policy in
+# tests/cublas_handle_parity.rs, the row in tests/oracle_census.rs. It has
+# TWO missing inputs now, not one:
+#
+#   line 26  $SRC/model/llama_like/llama_like.cpp   deleted by 4569b9e4b with
+#            the whole of crates/driver-cuda/csrc. `set -euo pipefail` stops
+#            here, which is why the census row names this one.
+#   line 29  ../llama_like_prepare/stub/            deleted with that oracle,
+#            which was RETIRED for having no golden of its own. See
+#            oracle_census.rs' RETIRED. Do NOT recreate the stub tree to make
+#            this line resolve: line 26 fails three lines earlier and the
+#            subject both of them compile is gone either way.
+#
 # The prepare oracle's construction: the whole real llama_like.cpp over the
 # SHARED llama_like_prepare stub tree, --gc-sections, only the staging path
 # driven. Replaced: the DeviceBuffer allocator (deterministic bases — the

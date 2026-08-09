@@ -12,6 +12,14 @@
 //! whole, because a host program that fires a JIT kernel by symbol has no
 //! reason to live in the driver.
 //!
+//! **Both of those files are DELETED**, and `table/moe.rs` outlived this one
+//! by a round for a reason worth keeping: after its twenty `moe::` rows left,
+//! it still held four `quant::` ones — the routed MoE decode GEMVs — because
+//! **`table/` was organised by who DISPATCHES and `x/` by who owns the
+//! code**. It survived as `quant`'s tenant, not as `moe`'s remainder. Those
+//! four are `x::quant` contracts now, `table::moe` is gone, `pub mod moe`
+//! with it, and `table::ROW_TABLES` is `attn` alone.
+//!
 //! `fire/flashinfer_moe.rs` does NOT move, and the "one driver op" section
 //! below is why.
 //!
@@ -44,27 +52,43 @@
 //! measurements are below, in full, because a port that consumes a
 //! measurement is a regression even if it compiles.
 //!
-//! # `csrc/src/moe/` has no launchers left, and four symbols are `_dev` for
-//!   it
+//! # `csrc/src/moe/` has no launchers left, and ten symbols are `_dev` for it
 //!
 //! `moe/moe_dispatch.cu` and `moe/dsv4_routing.cu` are deleted with their
 //! headers. Everything below that reads as *"the launcher does X"* is history
 //! about a file, kept in the present tense of the `<<<>>>` it transcribes,
 //! because a transcription that starts hedging stops being checkable.
 //!
-//! Four device rows carry `_dev` symbols — `scatter_add_weighted`,
-//! `moe_bucket_exact`, `add_moe_route_bias` and `hash_route_lookup` — because
-//! in the row world their ABI symbols were `Execution::Walk` and
-//! `a_walk_is_only_a_walk` refuses a walked symbol that a unit hosts. **In
-//! fn-world that law no longer bites**: a `bind!` arm is not a `Walk`, and
-//! the `fn` and the row may share a name. The strings are kept anyway, and
-//! that is deliberate rather than inertia — `unit_of`, `Unit::row`,
-//! `x::fire::fire` and `examples/unit_probe_moe.rs` all resolve by string,
-//! and renaming four device symbols to tidy away a law that no longer applies
-//! would be a rename with no reader asking for it. The reason is now history;
-//! the strings are still the interface.
+//! Several device rows carry `_dev` symbols — `scatter_add_weighted`,
+//! `moe_bucket_exact`, `add_moe_route_bias`, `transpose_expert_scales`,
+//! `build_moe_ptrs_aligned`, `hash_route_lookup` and the four
+//! `expert_offsets` phases — because their ABI symbols WERE
+//! `Execution::Walk` classifications in `execution.rs` and
+//! `a_walk_is_only_a_walk` refuses a walked symbol that a unit also hosts.
 //!
-//! # The one driver op: `moe::flashinfer_cutlass_moe_bf16`
+//! **That law has gone and the names stay.** `moe`'s ten `WALKED` entries
+//! are deleted: §5 step 5 moved every one of their host programs into this
+//! file, and a description of a control flow the reader can now read has no
+//! reading consumer left. Nothing keeps these symbols out of a unit any
+//! more.
+//!
+//! The names stay because renaming buys nothing and costs a sweep. The
+//! device name is a `unit!` instantiation string, the stated name is a
+//! `contract!`, the host `fn` between them is the only thing either reader
+//! calls, and `unit_of`, `Unit::row`, `x::fire::fire` and
+//! `examples/unit_probe_moe.rs` all resolve by string.
+//!
+//! WORTH KNOWING WHY THE SPLIT OUTLIVED ITS REASON, because it is the sharp
+//! end of that deletion and `execution.rs` argues it where the entries
+//! stood: eight of the ten walks were stale for two edits and passed every
+//! mechanical check, and this suffix is why. It existed to let a walk sit
+//! beside a unit, and it went on doing exactly that after the walk stopped
+//! being true. **A name chosen to keep two things legal beside each other
+//! keeps them legal after one of them stops being true.**
+//!
+//! # TWO driver ops, and the second one arrived by re-reading a refusal
+//!
+//! ## `moe::flashinfer_cutlass_moe_bf16`
 //!
 //! `csrc/src/moe/flashinfer_moe.cu` is still C++ and is the last
 //! ahead-of-time compile in the tree. Its host program reaches
@@ -86,12 +110,58 @@
 //! becomes that op's body. `moe/expert_offsets.cuh` — the routing front-end
 //! it drives — IS this file's, and its four rows are below.
 //!
-//! # What this port needs from the floor, and does not take
+//! ## `moe::build_moe_ptrs_aligned_bf16`
+//!
+//! The aligned leg's pointer build, and it reached this shape from the other
+//! direction: it was a `none:` arm, and before that an unsourced row, so it
+//! has **never had an arm in either world**. Its sentence asked for a dtype —
+//! *"an array of device addresses has no dtype in this vocabulary"* — and
+//! that ask was wrong in a way worth keeping.
+//!
+//! The six pointer arrays have **no stated consumer**. What reads them is the
+//! batched-cuBLAS fallback inside `moe::moe_grouped_gemm_bf16`, which is a
+//! LOWERING of that statement and not a statement of its own; the grouped
+//! GEMM's parameter list names no pointer array. Six trace results nothing
+//! reads are freed by `lower.rs:1911`'s liveness at the first op past the
+//! build, so the dtype would have bought a declaration that is a wrong answer
+//! rather than a refusal. Stating them properly means stating an operand only
+//! ONE of two lowerings reads — the thing this migration exists to retire.
+//!
+//! So the arrays stay the driver's arena and the symbol takes the same shape
+//! as the fused call above it. Body: `driver-cuda/src/fire/moe_ptrs.rs`. Its
+//! call site is `bind/mod.rs`'s driver-op table, beside
+//! `pie_lora_qkv_correction`.
+//!
+//! **This is the gate on retiring the fused CUTLASS leg**, and the reason is
+//! one sentence: every condition in `forward/mod.rs:341-349` that turns the
+//! fused leg off already returns `moe_mlp_body_aligned_cuda`, so deleting the
+//! fused leg does not add a case — it makes the aligned leg the ONLY leg, and
+//! the aligned leg cannot start without this call. The pointer build DECLARES
+//! `gu_stage`/`act_stage`/`out_stage`, the three destinations every op below
+//! it writes into. It is not an optimisation, it is step 3 of 8.
+//!
+//! # What this port needed from the floor, asked for, and got
 //!
 //! Six lines in three files this family may not edit, and **every one of them
-//! is a fact or a type the row world already carried** and `Cx`/`Abi` has not
-//! caught up with. Nothing below is written here; six live symbols refuse at
-//! load until they are, and each one's `none:` sentence names its own:
+//! was a fact or a type the row world already carried** and `Cx`/`Abi` had not
+//! caught up with. **All six landed as `a41a1df0a`**, with the three matching
+//! `impl Facts for Fire` methods. Nothing below was written here, and the ask
+//! is kept rather than deleted because the ask is the record.
+//!
+//! **THE TWO HALVES COST DIFFERENT THINGS AND THE READER MUST NOT AVERAGE
+//! THEM.** The three `x/cx.rs` lines were LOAD-TIME: without them six live
+//! symbols answered `Route::Unbound` with the sentence their `none:` arm
+//! carried, and everything else in this file worked. The three `x/abi.rs`
+//! lines were COMPILE-TIME: `unit!` derives each row's operand list from the
+//! host `fn`'s parameter types through `Abi::TY`, so a parameter whose type
+//! has no `impl Abi` is a missing-trait error and **THIS FILE DID NOT COMPILE
+//! UNTIL THEY LANDED**. That was stated here, at the top, rather than
+//! discovered: the alternative was to spell those five parameters
+//! `*mut c_void` and `*mut *const c_void`, which compiles today, produces the
+//! very `Ty`s the deleted rows carried — and puts `void*` in the typecheck
+//! translation unit where the kernel says `int64_t*` and `const bf16**`. The
+//! bypass with no type error anywhere is the thing this migration exists to
+//! remove, so the ask was made instead of taken:
 //!
 //! ```text
 //!   x/cx.rs    query!(moe_norm_topk -> bool,     "whether the router renormalises its top-k");
@@ -104,8 +174,8 @@
 //!                                    "…device::bf16**",       BufArrayOutMut);
 //! ```
 //!
-//! with the three matching methods on `impl Facts for Fire` in
-//! `driver-cuda/src/bind/facts.rs`, which is where every `Cx` query bottoms
+//! and the three matching methods on `impl Facts for Fire` landed with them
+//! in `driver-cuda/src/bind/facts.rs`, which is where every `Cx` query bottoms
 //! out.
 //!
 //! **The two router constants** are `Source::Ctx("moe_norm_topk")` and
@@ -115,18 +185,24 @@
 //! (`driver-cuda/src/bind/mod.rs:1179`, filled from
 //! `model.deployment.norm_topk_prob` at `driver-cuda/src/fire/launch.rs:3435`),
 //! so the `Facts` methods are `Some(self.ctx.moe_norm_topk)` and
-//! `Some(self.ctx.moe_routed_scaling)`. Without them `topk_sigmoid`,
-//! `topk_sqrtsoftplus`, `topk_sigmoid_bias` and `hash_route_lookup` cannot
-//! bind — the first three fire today — so they are `none:` arms and the
-//! sentence says which two words are missing. `x/layout.rs` got four `Cx`
-//! queries this way and the process is the same one.
+//! `Some(self.ctx.moe_routed_scaling)` — **always `Some`**, because they are
+//! deployment constants with defaults rather than optional facts, and a
+//! refusal would invent an absence. With them `topk_sigmoid`,
+//! `topk_sqrtsoftplus`, `topk_sigmoid_bias` and `hash_route_lookup` BIND;
+//! three of the four fire today. `x/layout.rs` got four `Cx` queries this way
+//! and the process is the same one.
 //!
 //! **`in_rows`** is `Source::InRows(1)`, which the aligned path's gather and
 //! reorder both read for `aligned_rows` — the padded rectangle's height, an
 //! operand's own extent that no width, param or context field carries. The
-//! driver computes it for every generated arm already (`rows_of(b, i, rows)`
-//! in `bind/mod.rs`), so the `Facts` method is that expression and the two
-//! arms become binds the day it lands.
+//! driver computed it for every generated arm already (`rows_of(b, i, rows)`
+//! in `bind/mod.rs`), so the `Facts` method is that expression with the index
+//! bound-checked — `(i < self.spec.n_in).then_some(self.rows)`, because
+//! `Cx::in_rows` refuses with `Refusal::Absent` and an out-of-range index IS
+//! an absent operand. **Reproducing the row exactly is how the two binds
+//! surfaced that `rows_of` ignores its index**, so `Source::InRows(1)` and
+//! `Source::Rows` have always rendered the same number; the gather's arm
+//! states it where two adjacent arguments make it legible.
 //!
 //! **The `i64` pointer** is `hash_route_lookup`'s `tid2eid`, a `[vocab, K]`
 //! `const int64_t*` table. `kernels::Ty::I64s` exists and `I64sMut` does not,
@@ -306,54 +382,86 @@
 //! -enable-tile -default-device`. `kTileN`/`kTileK` want to be set per row —
 //! 32x128 at gate_up, 32x32 at down — which is what `opts` is for.
 //!
-//! # ELEVEN `none:` arms, and SIX OF THEM FIRE TODAY
+//! # FOUR `none:` arms, and NOT ONE OF THEM FIRES
 //!
 //! A `none:` says the symbol is declared, callable as a `fn`, and unsourceable
 //! from a statement — it surfaces as `Route::Unbound` at model load with the
-//! sentence written beside it. Eleven of this family's twenty contracts have
-//! one, eight bind, and the twentieth is the driver op. **This is the number
-//! to read the port by**, so it is split by what is actually missing:
+//! sentence written beside it. Four of this family's twenty contracts have
+//! one, fourteen bind, and the other TWO are driver ops. **This is the
+//! number to read the port by**, and it was ELEVEN for one round:
 //!
 //! ```text
-//!   FIVE that never fired -- no `Source` on at least one operand, so
-//!   `emit_rust_dispatch` skipped the row whole and wrote no arm, and no
-//!   hand arm in `driver-cuda/src/bind/mod.rs` names any of them:
+//!   FOUR that never fired, and still do not -- no `Source` on at least one
+//!   operand, so `emit_rust_dispatch` skipped the row whole and wrote no arm,
+//!   and no hand arm in `driver-cuda/src/bind/mod.rs` names any of them:
 //!
-//!     add_moe_route_bias_bf16    `cols` is the bias's own row width
+//!     add_moe_route_bias_bf16    `out_stride` is a PITCH, not an extent
 //!     transpose_expert_scales_u8 the statement has NO inputs at all
-//!     moe_bucket_exact           nothing names `route_to_sorted_row`
-//!     scatter_add_weighted_bf16  `num_routed` is the grid and not an operand
-//!     build_moe_ptrs_aligned_bf16 twenty parameters, six pointer arrays, and
-//!                                the aligned arena is the driver's
+//!     moe_bucket_exact           a caller -- the third result is declared now
+//!     scatter_add_weighted_bf16  the launch count is a device readback
 //!
-//!   FOUR ROUTERS blocked on two `Cx` queries that do not exist --
-//!   `moe_norm_topk` and `moe_routed_scaling`, both `Source::Ctx` in the row
-//!   world and both already in `DispatchCtx`:
+//!   A FIFTH stood here and left the list UPWARD, not by a floor patch:
+//!   `build_moe_ptrs_aligned_bf16` said "an array of device addresses has no
+//!   dtype", and the answer turned out not to be a dtype at all. The six
+//!   arrays have no stated CONSUMER -- the batched-cuBLAS fallback that reads
+//!   them is a lowering of `moe_grouped_gemm`, not a statement -- so
+//!   declaring them would hand the plan six values `lower.rs:1911`'s liveness
+//!   frees at the next op, and the GEMM would dereference bytes the next
+//!   allocation took. It is a driver op now, body in `fire/moe_ptrs.rs`. Of
+//!   the eleven it is the only one that left by being RE-READ, and it is the
+//!   one that mattered most: it is the gate on retiring the fused CUTLASS
+//!   leg, because that leg is the only one qwen3.5 decode takes and every
+//!   condition that turns it off already falls to the aligned leg -- which
+//!   cannot start without this call.
 //!
-//!     topk_sigmoid_bf16          FIRES TODAY (kimi_k2, kimi_k3, glm_5)
-//!     topk_sigmoid_bias_bf16     FIRES TODAY (nemotron_h)
-//!     topk_sqrtsoftplus_bf16     FIRES TODAY (deepseek_v4)
-//!     hash_route_lookup          FIRES TODAY (deepseek_v4)
+//!   Each arm's sentence now ends in WHAT WOULD MAKE IT FIRE, and the four
+//!   answers are four different things -- a pitch, a caller from the weight
+//!   loader, a caller from anywhere, and a device-side bound. Two
+//!   of the four said the wrong thing until the binds next door made the
+//!   reachable numbers obvious: `add_moe_route_bias` and `moe_bucket_exact`
+//!   both blamed the ROUTE COUNT, which is `rows * in_width` for each of
+//!   them exactly as it is for `moe_align_decode`.
 //!
-//!   TWO ALIGNED-PATH arms blocked on one `Cx` query that does not exist --
-//!   `in_rows(i)`, which is `Source::InRows(1)` and which the driver already
-//!   computes as `rows_of(b, i, rows)` for every generated arm:
+//!   AND ONE OF THE FOUR MOVED WITHIN THE DAY. `moe_bucket_exact` read
+//!   "two results declared, three buffers written" until `dsl.rs:5121` was
+//!   given its third, in the kernel's own parameter order; what is left is
+//!   that nothing calls it. The gap it named was real and is closed, which
+//!   is the difference between a `none:` arm that records a defect and one
+//!   that records a wait.
 //!
-//!     gather_moe_aligned_inputs_bf16   FIRES TODAY (qwen_3_5)
-//!     reorder_moe_aligned_output_bf16  FIRES TODAY (qwen_3_5)
+//!   SIX MORE were `none:` when this file first landed, blocked on three `Cx`
+//!   queries that did not exist. `a41a1df0a` landed all three and they are
+//!   binds below -- kept here as the record of what a `none:` costs while it
+//!   stands, because five of the six were LIVE:
+//!
+//!     topk_sigmoid_bf16          FIRES (kimi_k2, kimi_k3, glm_5)
+//!     topk_sigmoid_bias_fp32     FIRES (nemotron_h)
+//!     topk_sqrtsoftplus_bf16     FIRES (deepseek_v4)      } moe_norm_topk +
+//!     hash_route_lookup          no caller: see below     } moe_routed_scaling
+//!     gather_moe_aligned_inputs_bf16   FIRES (qwen_3_5)   } in_rows(1)
+//!     reorder_moe_aligned_output_bf16  FIRES (qwen_3_5)   }
 //! ```
 //!
-//! **SIX LIVE SYMBOLS REFUSE AT LOAD UNTIL THE THREE `Cx` QUERIES LAND.**
-//! That is a regression and it is stated rather than worked around, because
-//! the alternative is to invent a fact `Cx` does not have. The precedent is
-//! exact and it is the largest one in the tree: `norm` shipped
-//! `norm::rmsnorm_bf16`, the most-fired kernel there is, as a `none:` arm
-//! naming `Facts::per_head_dim()` (`x/norm.rs:3258`). The floor block at the
-//! top of this file is the patch, six lines, and each sentence beside a
-//! `none:` below names its own missing query so the reader who hits the
-//! `Route::Unbound` is told what to add and not merely that it is unbound.
+//! **`hash_route_lookup` DOES NOT FIRE, and the first version of this list
+//! said it did.** `dsl::cuda::hash_route_lookup` exists
+//! (`model-compiler/src/dsl.rs:4826`) and `crates/model/src` calls it from
+//! nowhere; the only thing that would is `deepseek_v4`'s `hash_routed`, which
+//! is `false` at both construction sites (`spec.rs:202`, `mod.rs:134`) and
+//! read at neither. It is bound anyway — every operand it takes is now
+//! sourceable and a bind is the truth about it — but it is bound UNEXERCISED,
+//! which is a weaker claim than the other five carry and is said here rather
+//! than left to look the same.
 //!
-//! The five that never fired are the older shape: a `none:` is what they
+//! **FIVE LIVE SYMBOLS REFUSED AT LOAD FOR ONE ROUND**, between this file
+//! landing and `a41a1df0a`. That was a regression, and it was stated rather
+//! than worked around because the alternative was to invent a fact `Cx` did
+//! not have. The precedent is exact and it is the largest one in the tree:
+//! `norm` shipped `norm::rmsnorm_bf16`, the most-fired kernel there is, as a
+//! `none:` arm naming `Facts::per_head_dim()` (`x/norm.rs:3258`). Each
+//! sentence named its own missing query, which is what made the patch six
+//! lines rather than an investigation.
+//!
+//! The four that never fired are the older shape: a `none:` is what they
 //! already do, said out loud — the `sample` precedent at
 //! `driver-cuda/src/bind/service.rs:815`.
 //!
@@ -671,6 +779,18 @@ pub mod topk_softmax {
 /// routing indices are i32")` that a declaration naming any other type would
 /// trip at compile rather than at fire. The `u8` one is the MXFP4 group-scale
 /// relayout, where the element is an E8M0 exponent byte.
+///
+/// **The one `printf` in this family, and it is covered.**
+/// `moe_dispatch.cuh:857-860` guards a `printf` with
+/// `#if defined(PIE_MOE_ALIGN_REPORT)`, which nothing in the tree defines.
+/// It is recorded here because it is the near-miss of the sweep that found
+/// `attn`'s `std::memcpy` with no `<cstring>` — nvcc supplied that header
+/// transitively and NVRTC does not — and of all 89 carried `.cuh` this was
+/// the only other file with a host-library call in its text. NVRTC's implicit
+/// preamble declares `printf`, and the guard is never on, so it costs
+/// nothing; a future edit that turns the guard into an unconditional call
+/// would be relying on the preamble rather than on an include, which is the
+/// shape that broke `attn`.
 ///
 /// The file's other ten templates are carried as device text with no row:
 /// `build_dual_gemm_ptrs` (`<<<1, 1>>>`), `build_moe_ptrs_decode`
@@ -1372,8 +1492,11 @@ const fn per_row(rows: u32) -> Launch {
 /// `moe/topk_softmax.cu` did not merely return on it — it THREW,
 /// `std::runtime_error("topk_softmax_bf16: num_experts exceeds MAX_EXPERTS")`.
 /// A throw is not a spelling fn-world has: the four `fn`s below answer
-/// `Refusal::Narrow` and the fire declines, which is the same fact reported
-/// where §0 wants it.
+/// `Refusal::Wide { what, at, max: MAX_EXPERTS }` and the fire declines, which
+/// is the same fact reported where §0 wants it. `Wide` is the right variant
+/// because 512 is exactly what `Wide` describes — a ceiling the compiled unit
+/// cannot exceed — and its sentence, *"is {at}, above the {max} this unit was
+/// compiled for"*, is the throw's message with the number in it.
 const MAX_EXPERTS: i32 = 512;
 
 // ---------------------------------------------------------------------------
@@ -1427,9 +1550,10 @@ pub unsafe fn topk_sigmoid_bf16(
         return Fired::Declined(Refusal::Empty { what: "tokens" });
     }
     if e > MAX_EXPERTS {
-        return Fired::Declined(Refusal::Narrow {
-            what: "num_experts, within the router's 512-wide shared arrays",
+        return Fired::Declined(Refusal::Wide {
+            what: "num_experts, which the router stages in shared memory",
             at: e,
+            max: MAX_EXPERTS,
         });
     }
     unsafe {
@@ -1485,9 +1609,10 @@ pub unsafe fn topk_sqrtsoftplus_bf16(
     // apply to it and reproducing the check there would refuse a launch that
     // is fine.
     if e > MAX_EXPERTS {
-        return Fired::Declined(Refusal::Narrow {
-            what: "num_experts, within the router's 512-wide shared arrays",
+        return Fired::Declined(Refusal::Wide {
+            what: "num_experts, which the router stages in shared memory",
             at: e,
+            max: MAX_EXPERTS,
         });
     }
     unsafe {
@@ -1630,9 +1755,10 @@ pub unsafe fn topk_softmax_bf16(
     }
     // What the deleted launcher threw on. See [`MAX_EXPERTS`].
     if num_experts > MAX_EXPERTS {
-        return Fired::Declined(Refusal::Narrow {
-            what: "num_experts, within the router's 512-wide shared arrays",
+        return Fired::Declined(Refusal::Wide {
+            what: "num_experts, which the router stages in shared memory",
             at: num_experts,
+            max: MAX_EXPERTS,
         });
     }
     unsafe {
@@ -1686,9 +1812,10 @@ pub unsafe fn topk_sigmoid_bias_fp32(
         return Fired::Declined(Refusal::Empty { what: "tokens" });
     }
     if num_experts > MAX_EXPERTS {
-        return Fired::Declined(Refusal::Narrow {
-            what: "num_experts, within the router's 512-wide shared arrays",
+        return Fired::Declined(Refusal::Wide {
+            what: "num_experts, which the router stages in shared memory",
             at: num_experts,
+            max: MAX_EXPERTS,
         });
     }
     unsafe {
@@ -1766,30 +1893,56 @@ pub unsafe fn apply_per_expert_scale_bf16(
 /// that has to run the general path does not care which of the two reasons
 /// sent it there, and the reason is in the `what`.
 ///
-/// # `Narrow` for an upper bound
+/// # Which refusal, and which direction
 ///
 /// `Refusal::Narrow`'s sentence ends *"below the kernel's smallest unit of
-/// work"*, which is not the direction `K > 512` or `N % 64 != 0` fails in.
-/// The `what` is therefore written as the REQUIREMENT rather than as the
-/// extent, so the sentence reads as a statement about the requirement being
-/// missed. That is the established phrasing — `norm`'s *"a row count that
-/// fits a grid"* (`x/norm.rs:1194`) and `attn`'s `at: i32::MAX`
-/// (`x/attn.rs:470`) are both upper bounds spelled this way — and this port
-/// follows it rather than asking the floor for a sixth variant.
+/// work"*, and `Refusal::Wide`'s *"above the {max} this unit was compiled
+/// for"*. The four conjuncts here fail in three different directions and are
+/// spelled accordingly:
+///
+/// - `K > 512` is a CEILING — above it cuBLAS wins — so it is
+///   [`Refusal::Wide`] with `max: SHORT_K`.
+/// - `M != 16` is TWO refusals sharing one line of C++: `M > 16` is `Wide`
+///   with `max: FRAG`, `M < 16` is `Narrow`. One `!=` collapsed them, and
+///   collapsing them again in Rust would put a direction in the `what` that
+///   the variant contradicts.
+/// - `N % 64` and `K % 16` are DIVISIBILITY, which has no direction at all —
+///   `N = 100` is neither too wide nor too narrow for a 64-wide tile, it is
+///   off the grid. These stay [`Refusal::Narrow`], whose `what` names the
+///   requirement (*"in whole 64-wide tiles"*) rather than an extent, and
+///   `Wide` would be a worse fit because there is no `max` to report.
+///
+/// The upper bounds used to be `Narrow` with the requirement in the `what` —
+/// the phrasing `norm` (`x/norm.rs:1194`) and `attn` (`x/attn.rs:470`) had
+/// to invent before the floor had a variant for it. It has one now.
 ///
 /// # Errors
 ///
 /// The conjunct that failed, with the extent that failed it.
 #[cfg(feature = "_cuda")]
 pub const fn supported(m: i32, n: i32, k: i32) -> Result<(), Refusal> {
-    if m != FRAG {
-        return Err(Refusal::Narrow { what: "M, which must be exactly one 16-row fragment", at: m });
+    // `m != kFrag` in one line of C++ is TWO refusals in two directions, and
+    // the floor now spells both. A taller rectangle is `Wide` -- the kernel
+    // computes exactly one 16-row fragment per block and has no tail path --
+    // and a shorter one is `Narrow`, below that fragment.
+    if m > FRAG {
+        return Err(Refusal::Wide {
+            what: "M, which must be exactly one 16-row fragment",
+            at: m,
+            max: FRAG,
+        });
+    }
+    if m < FRAG {
+        return Err(Refusal::Narrow {
+            what: "M, which must be exactly one 16-row fragment",
+            at: m,
+        });
     }
     if n <= 0 || k <= 0 {
         return Err(Refusal::Empty { what: "the N by K rectangle" });
     }
     if k > SHORT_K {
-        return Err(Refusal::Narrow { what: "K, within the 512 cuBLAS wins above", at: k });
+        return Err(Refusal::Wide { what: "K, above which cuBLAS wins", at: k, max: SHORT_K });
     }
     if n % N_TILE != 0 {
         return Err(Refusal::Narrow { what: "N, in whole 64-wide tiles", at: n });
@@ -3093,6 +3246,16 @@ contract! {
     /// `dsl.rs:4272` passes as input 1 and re-declares as result 0; without
     /// the pair the planner may hand result 0 a fresh buffer that nothing
     /// ever writes. The claim is the `.cuh`'s: `topk_w[i] *= scale[e]`.
+    ///
+    /// **THE CLAIM IS AHEAD OF ITS USE AND THAT IS SAID RATHER THAN GUESSED.**
+    /// `dsl::cuda::apply_per_expert_scale` exists and no model calls it:
+    /// nothing under `crates/model/src` names the wrapper and nothing names
+    /// the symbol, so no planner has ever been handed this pair and no fire
+    /// has ever tested whether it honours it. The pair is stated because the
+    /// kernel read-modify-writes and the shape of that fact does not depend
+    /// on a caller arriving; what it does mean is that the FIRST caller is
+    /// also the first check, and a planner that ignores `in_place` would
+    /// surface there and not here.
     APPLY_PER_EXPERT_SCALE = "moe::apply_per_expert_scale_bf16" as apply_per_expert_scale {
         in_place: &[(0, 1)],
     }
@@ -3131,16 +3294,78 @@ contract! {
     /// permutation is computed over ALL routes in the fire, so a statement
     /// addressed through `sorted_route_ids` cannot take a row window — the
     /// window would name different routes than the sort did.
+    ///
+    /// The deleted row's third result carried a claim worth keeping:
+    /// *"`route_to_aligned_row` is BOUND, where the arm passed null. The
+    /// statement declares three results and the arena places all three; the
+    /// inverse map is the one this leg's combine does not read, and 'declared
+    /// but not written' is a claim the declaration does not make."* In
+    /// fn-world it is simply the fourth parameter and the caller decides,
+    /// which is the same answer reached by not having the question.
     MOE_ALIGN = "moe::moe_align_decode" as moe_align {
         whole: true,
     }
 
     /// Gather the aligned rectangle's rows from the token-ordered input.
+    ///
+    /// # What the row world could not say here, and what is left
+    ///
+    /// The deleted row headed a note titled *"THE THREE THAT REMAIN
+    /// UNSTATED"*, and its blocker was arithmetic: *"they take the ROUTE
+    /// count and `top_k` as separate arguments, and neither is reachable
+    /// here … Both numbers ARE in the aligned dim's packed word. What is
+    /// missing is a way to say 'the fire's rows times a number packed in a
+    /// dim', and the table deliberately has no arithmetic: an expression
+    /// language here is one more place a binding can be wrong, checked by
+    /// nothing."*
+    ///
+    /// **A `bind!` body IS that expression language, and it is checked by the
+    /// compiler**, so two thirds of the blocker went at once: `num_routes` is
+    /// `cx.rows().count * top_k`, which is what `Source::RoutesOfParam(0)`
+    /// meant, and `top_k` rides the param channel exactly as the row said.
+    /// The last third was one number no arithmetic over the fire's rows can
+    /// reach — `aligned_rows`, the PADDED rectangle's height, which is
+    /// `Source::InRows(1)` on the row and an operand's own extent. That was
+    /// the single missing `Cx` query this arm's `none:` named, it is
+    /// `Cx::in_rows` since `a41a1df0a`, and it is why three unstated rows
+    /// became one unstated fact and then one bind.
     GATHER_MOE_ALIGNED_INPUTS = "moe::gather_moe_aligned_inputs_bf16" as gather_moe_aligned_inputs {
         whole: true,
     }
 
-    /// Fill the six pointer arrays the batched GEMMs read.
+    /// Fill the six pointer arrays the batched GEMMs read — and DECLARE the
+    /// three staging buffers everything below the build writes into.
+    ///
+    /// # The second contract here with no [`Entry`](crate::x::Entry)
+    ///
+    /// A driver op, for the same reason `MOE_FUSED_CUTLASS` above is one and
+    /// by a different road. This symbol was a `none:` arm and had been
+    /// unsourced in the deleted row before that, so it has never had an arm
+    /// in either world; what changed is not the gap but the reading of it.
+    ///
+    /// **The six arrays have no stated consumer.** They are read by the
+    /// batched-cuBLAS fallback INSIDE `moe::moe_grouped_gemm_bf16`, which is
+    /// a lowering of that statement and not a statement of its own — the
+    /// grouped GEMM's parameter list is `(a, weight_base, c, expert_ids)` and
+    /// names no pointer array. So the dtype the old sentence asked for would
+    /// not have been enough and would not even have been safe: six trace
+    /// results nothing reads are freed by `lower.rs:1911`'s liveness at the
+    /// first op past the build, and the batched GEMM would dereference
+    /// pointer arrays whose bytes the next allocation took. A wrong answer,
+    /// not a refusal, and the same failure `lower.rs:1949` records for the
+    /// rotated `k`. Stating them properly means stating an operand only ONE
+    /// of two lowerings reads, which is what this migration is retiring.
+    ///
+    /// So: `contract!` yes, `Entry` no, and **no `none:` arm** — a `none:`
+    /// here would put an `Entry` in `x::moe::ENTRIES`, and `x/mod.rs`'s "THE
+    /// ONE OVERLAP" says an `Entry` shadows the `DriverOp` arm and turns a
+    /// symbol that fires into `Route::Unbound` at model load. The body is
+    /// `driver-cuda/src/fire/moe_ptrs.rs`; the arm that calls it belongs in
+    /// `bind/mod.rs`'s driver-op table, beside `pie_lora_qkv_correction`.
+    ///
+    /// `whole: true` stays and is now load-bearing twice: the build fixes
+    /// where the aligned staging LIVES, so a row window over it would name
+    /// addresses the two GEMMs below do not have.
     BUILD_MOE_PTRS_ALIGNED = "moe::build_moe_ptrs_aligned_bf16" as build_moe_ptrs_aligned {
         whole: true,
     }
@@ -3219,27 +3444,26 @@ contract! {
 // What happens when a trace says it
 // ---------------------------------------------------------------------------
 
-// NINETEEN arms for twenty contracts. `MOE_FUSED_CUTLASS` has none, on
-// purpose and by the third registration shape: an `Entry` here would shadow
-// the driver op that already fires it.
+// EIGHTEEN arms for twenty contracts. `MOE_FUSED_CUTLASS` and
+// `BUILD_MOE_PTRS_ALIGNED` have none, on purpose and by the third
+// registration shape: an `Entry` here — a bind OR a `none:` — would shadow
+// the driver op that fires the symbol, and `Route::Unbound` refuses a live
+// model at load.
 //
-// EIGHT bind, ELEVEN refuse, and the eleven fall into three groups the
-// reader should not have to sort by hand:
+// FOURTEEN bind, FOUR refuse, and the four are one group rather than three:
+// their rows stated no `Source` on at least one operand, so there was
+// nothing to derive a binding from, no arm was ever generated, and nothing
+// fires them today either. A `none:` here is what they already did, said out
+// loud.
 //
-// * FOUR routers and a table lookup are blocked on the same two deployment
-//   constants — `moe_norm_topk` and `moe_routed_scaling`. Four of these
-//   fire today through a generated arm that reads `ctx.moe_norm_topk` and
-//   `ctx.moe_routed_scaling` straight off `DispatchCtx`. `Cx` has neither
-//   query, so the port cannot spell what the row spelled, and the honest
-//   outcome is a load-time refusal with the sentence rather than a bind that
-//   guesses. The patch is two `query!`s and two `Facts` methods over fields
-//   the driver already holds; it is stated exactly in this file's header.
-// * TWO members of the aligned path are blocked on an operand's ROW COUNT,
-//   which `Cx` also cannot ask for and which the driver's own `rows_of`
-//   already computes for every generated arm.
-// * FIVE were never bound at all: their rows stated no `Source` on any
-//   operand, so there was nothing to derive a binding from and nothing
-//   fires them today either.
+// It was EIGHT and ELEVEN for one round. The other six were blocked on three
+// `Cx` queries the row world had and the floor did not — `moe_norm_topk` and
+// `moe_routed_scaling` for the four routers, `in_rows(i)` for the aligned
+// path's gather and reorder — and five of the six were live, so the port
+// shipped a stated regression rather than a bind that guessed a deployment
+// constant. `a41a1df0a` landed the three queries and the three `Facts`
+// methods under them; these six arms are the other half of that change, and
+// the header's floor block is kept as the record of the ask.
 #[cfg(feature = "_cuda")]
 bind! {
     MOE_GROUPED_GEMM => { cx, stream => {
@@ -3279,57 +3503,135 @@ bind! {
         .ok()
     }},
 
-    ADD_MOE_ROUTE_BIAS => { none: "Nothing states this kernel's three \
-        numbers. The route count is the gap moe::moe_bucket_exact names -- \
-        the kernel does not take an operand shaped [Tokens, top_k], so \
-        there is nothing to read the product off. The other two are the \
-        destination rectangle's column count and its row PITCH, and a \
-        stride is the caller's arithmetic rather than an operand's extent: \
-        no Source spells one and no Cx query answers one. Needs a lowering \
-        that states the route count and the destination pitch" },
+    ADD_MOE_ROUTE_BIAS => { none: "Nothing states the destination's row \
+        PITCH, and that is the whole of it. Two of this kernel's three \
+        numbers are reachable and an earlier version of this sentence said \
+        otherwise: dsl.rs:4300 passes topk_idx as input 1, so num_routes is \
+        the fire's rows times that operand's own width, exactly as \
+        moe::moe_align_decode's is, and cols is the result's own width. \
+        out_stride is not reachable -- the kernel writes a slice of a wider \
+        rectangle, and a stride is the caller's arithmetic rather than an \
+        operand's extent, so no Source spelled one and no Cx query answers \
+        one. WHAT WOULD MAKE IT FIRE: a lowering that states the \
+        destination pitch, and then a model that calls the wrapper, \
+        because today nothing under crates/model/src does" },
 
     TRANSPOSE_EXPERT_SCALES => { none: "Weight preparation is not a trace \
-        statement. This rewrites a checkpoint's per-expert group-scale \
-        planes from [experts, k_groups, n] to [experts, n, k_groups] once, \
-        over weights, before any fire exists; its row stated no Source on \
-        any of its five operands because there is no statement to read one \
-        from. The host fn above is the whole of what this symbol needs, and \
-        driver-cuda's weight loader is the caller that should have it. \
-        Needs nothing from the trace" },
+        statement, and this one is the proof: dsl.rs:4418 records it with \
+        inputs vec![], THE ONLY STATEMENT IN THIS FAMILY WITH NO INPUTS AT \
+        ALL. It rewrites a checkpoint's per-expert group-scale planes from \
+        [experts, k_groups, n] to [experts, n, k_groups] once, over \
+        weights, before any fire exists; its row stated no Source on any of \
+        its five operands because there is no statement to read one from, \
+        and its three numbers are the RESULT's three dims where Cx answers \
+        only a width. WHAT WOULD MAKE IT FIRE: nothing from the trace, ever \
+        -- it wants the driver-op shape, a call from driver-cuda's weight \
+        loader with the host fn above as its body, which is where \
+        moe::flashinfer_cutlass_moe_bf16 already sits. A none: here is \
+        permanent unless that call is written" },
 
-    TOPK_SQRTSOFTPLUS => { none: "Cx has no query for the deployment's two \
-        router constants. The deleted row read Source::Ctx(\"moe_norm_topk\") \
-        and Source::Ctx(\"moe_routed_scaling\") -- both are load-time config \
-        the driver already holds and the generated arm read straight off \
-        DispatchCtx -- and without them this fn would renormalize a \
-        checkpoint that does not and scale its router weights by a one it \
-        invented. Needs `Facts::moe_norm_topk() -> bool` and \
-        `Facts::moe_routed_scaling() -> f32` with the two Cx queries over \
-        them; this file's header states the patch" },
+    TOPK_SQRTSOFTPLUS => { cx, stream => {
+        // `Source::Or(&Source::Weight(0), &Source::Lit(Lit::Null))` was the
+        // deleted row's fourth operand, and its comment is the claim: A
+        // FAMILY WITHOUT A CORRECTION BIAS STATES NO FOURTH OPERAND, and
+        // the kernel reads a null as "there is none". `Cx::weight` refuses
+        // where the row branched, so the `Or` is spelled here. This is the
+        // ONE place in this file a `?` is deliberately not written, and it
+        // is not the escape `Cx::weight_bias`'s doc warns about: the row
+        // stated the alternative, the alternative is a literal null, and
+        // three of the four checkpoints that fire this kernel have no bias.
+        let correction_bias =
+            cx.weight(0).map_or(core::ptr::null(), |w| w.cast_const().cast::<f32>());
+        // The two deployment constants, `Cx` queries since `a41a1df0a` --
+        // `Source::Ctx("moe_norm_topk")` and `Source::Ctx("moe_routed_scaling")`
+        // on the deleted row, `ctx.moe_norm_topk` and `ctx.moe_routed_scaling`
+        // in the arm it generated. Both always answer `Some`.
+        unsafe {
+            topk_sqrtsoftplus_bf16(
+                cx.arg_in(0)?.cast_const().cast::<bf16>(),
+                cx.arg_out(0)?.cast::<i32>(),
+                cx.arg_out(1)?.cast::<f32>(),
+                correction_bias,
+                cx.rows().count,
+                cx.in_width(0)?,
+                cx.out_width(0)?,
+                cx.moe_norm_topk()?,
+                cx.moe_routed_scaling()?,
+                stream,
+            )
+        }
+        .ok()
+    }},
 
-    HASH_ROUTE_LOOKUP => { none: "Cx has no query for the deployment's two \
-        router constants, exactly as for moe::topk_sqrtsoftplus_bf16 -- the \
-        route comes from the table and the WEIGHTS still come through the \
-        same renormalize-and-scale tail. Everything else this kernel takes \
-        is reachable: the table is the statement's weight, the vocabulary \
-        is Cx::vocab, the expert count is the logits' width and top_k is \
-        the result's. Needs `Facts::moe_norm_topk()` and \
-        `Facts::moe_routed_scaling()`" },
+    HASH_ROUTE_LOOKUP => { cx, stream => {
+        // THE OPERAND ORDER HERE IS THE STATEMENT'S, NOT THE KERNEL'S, and
+        // the two differ. The deleted row listed the kernel's parameters in
+        // the kernel's order and stated NO `Source` on any of them, so it
+        // never generated an arm and nothing recorded which input was
+        // which. `dsl.rs:4826` does: `vec![token_ids.id, logits.id]`, so
+        // TOKEN IDS ARE INPUT 0 AND THE LOGITS ARE INPUT 1 -- which makes
+        // `num_experts` the width of input 1 and not of input 0, the one
+        // place a reader porting from the parameter list would get it
+        // backwards. The table is the statement's single weight
+        // (`vec![table.to_string()]`).
+        unsafe {
+            hash_route_lookup(
+                cx.arg_in(0)?.cast_const().cast::<i32>(),
+                cx.weight(0)?.cast_const().cast::<i64>(),
+                cx.arg_in(1)?.cast_const().cast::<bf16>(),
+                cx.arg_out(0)?.cast::<i32>(),
+                cx.arg_out(1)?.cast::<f32>(),
+                cx.rows().count,
+                cx.vocab()?,
+                cx.in_width(1)?,
+                cx.out_width(0)?,
+                cx.moe_norm_topk()?,
+                cx.moe_routed_scaling()?,
+                stream,
+            )
+        }
+        .ok()
+    }},
 
-    TOPK_SIGMOID_BIAS => { none: "Cx has no query for the deployment's two \
-        router constants -- same operand contract as \
-        moe::topk_sigmoid_bf16, fp32 logits and a mandatory correction \
-        bias. Needs `Facts::moe_norm_topk()` and \
-        `Facts::moe_routed_scaling()`" },
+    TOPK_SIGMOID_BIAS => { cx, stream => {
+        // The bias is `Source::Weight(0)` FLAT, with no `Or` and no null
+        // alternative -- nemotron_h is the one family whose router cannot
+        // run without one -- so this is the one router arm where the weight
+        // carries a `?` and a checkpoint that lacks it refuses.
+        unsafe {
+            topk_sigmoid_bias_fp32(
+                cx.arg_in(0)?.cast_const().cast::<f32>(),
+                cx.weight(0)?.cast_const().cast::<f32>(),
+                cx.arg_out(0)?.cast::<i32>(),
+                cx.arg_out(1)?.cast::<f32>(),
+                cx.rows().count,
+                cx.in_width(0)?,
+                cx.out_width(0)?,
+                cx.moe_norm_topk()?,
+                cx.moe_routed_scaling()?,
+                stream,
+            )
+        }
+        .ok()
+    }},
 
-    MOE_BUCKET_EXACT => { none: "No statement names this kernel's route \
-        count. moe::moe_align_decode reads its own from topk_idx's element \
-        count, because that operand IS [Tokens, top_k] and holds exactly \
-        the product; this kernel does not take topk_idx, and giving it a \
-        dataflow edge to an operand it never reads would be a lie about the \
-        trace. The number is in the aligned dim's packed word and no Source \
-        and no Cx query spells `the fire's rows times a number packed in a \
-        dim`. Needs a lowering that states the route count" },
+    MOE_BUCKET_EXACT => { none: "AHEAD OF A CALLER, AND NO LONGER AHEAD OF \
+        A DECLARATION. The statement declared TWO results while the kernel \
+        writes THREE buffers: moe_dispatch.cuh:907 takes topk_idx, \
+        sorted_route_ids, route_to_sorted_row, counts_out, and the inverse \
+        map was named nowhere in this crate. Passing a null for it would \
+        not be a wrong answer but a write to null -- the store at :952 has \
+        no null guard, which is the one place this kernel differs from its \
+        padded twin, whose route_to_aligned_row IS guarded and IS therefore \
+        optional. dsl.rs:5121 declares three now, in the kernel's own \
+        parameter order, so a binding reads straight down: sorted_route_ids, \
+        route_to_sorted_row, counts. The route count was NOT the gap and an \
+        earlier version of this sentence said it was: topk_idx IS input 0 \
+        and IS [Tokens, top_k], so num_routes reads exactly as \
+        moe::moe_align_decode's does, and num_experts is the THIRD result's \
+        own extent now that counts has moved behind the inverse map. WHAT \
+        WOULD MAKE IT FIRE: a caller. Nothing under crates/model/src names \
+        this symbol, and a bind nothing exercises is a claim nothing checks" },
 
     MOE_ALIGN => { cx, stream => {
         // `num_routes` is `topk_idx`'s element count: the operand IS
@@ -3358,50 +3660,135 @@ bind! {
         .ok()
     }},
 
-    GATHER_MOE_ALIGNED_INPUTS => { none: "Cx has no query for an operand's \
-        ROW COUNT. The deleted row read Source::InRows(1) for \
-        aligned_rows -- the padded rectangle's height, which is \
-        sorted_route_ids' own extent and which no width, no param and no \
-        context field carries. Every other number here is reachable: the \
-        route count is the fire's rows times the param'd top_k, the hidden \
-        width is the result's own, and shared_row_begin is the -1 every \
-        call site in the tree passes. Needs `Facts::in_rows(i) -> \
-        Option<i32>` and the Cx query over it, which is the `rows_of(b, i, \
-        rows)` the driver already computes for every generated arm" },
+    GATHER_MOE_ALIGNED_INPUTS => { cx, stream => {
+        // `Source::RoutesOfParam(0)`, which `abi.rs:1136` rendered
+        // `rows.saturating_mul(spec.params[0])`: the one product that is
+        // neither an operand's extent nor a load-time number, and the
+        // arithmetic a `bind!` body may write where the table could not.
+        let top_k = i32::try_from(cx.param(0)?).unwrap_or(0);
+        //
+        // WHAT THE BIND MAKES VISIBLE AND THE ROW HID. `aligned_rows` was
+        // `Source::InRows(1)` and `num_tokens` was `Source::Rows`, two
+        // spellings the doc on the `fn` above says name different numbers:
+        // *"`num_tokens` is the FIRE's rows and not the grid's -- the two
+        // differ here"*. They render to the SAME value: `bind/mod.rs:1596`
+        // is `fn rows_of(b, i, rows) { let _ = (b, i); rows }`, and
+        // `Facts::in_rows` is that function, bound-checked. So the padded
+        // rectangle's height has been the token count since the row
+        // shipped. This port reproduces it exactly -- it changes no number
+        // that reaches the device -- and states it here because two
+        // adjacent arguments are where it is legible and two `operands![]`
+        // lines are where it was not. The height lives in
+        // `Dim::MoeAlignedRoutes`, which is the compiler's and not `Cx`'s;
+        // fixing it is `rows_of`'s job, and the index it already ignores is
+        // where that fix goes.
+        unsafe {
+            gather_moe_aligned_inputs_bf16(
+                cx.arg_in(0)?.cast_const().cast::<bf16>(),
+                cx.arg_in(1)?.cast_const().cast::<i32>(),
+                cx.arg_out(0)?.cast::<bf16>(),
+                cx.rows().count.saturating_mul(top_k),
+                cx.in_rows(1)?,
+                top_k,
+                cx.out_width(0)?,
+                // `Source::Lit(Lit::I32(-1))`: the -1 every call site in the
+                // deleted tree passed, stated once here.
+                -1,
+                cx.rows().count,
+                stream,
+            )
+        }
+        .ok()
+    }},
 
-    BUILD_MOE_PTRS_ALIGNED => { none: "The aligned staging is the driver's \
-        arena and not the trace's. This takes thirteen device addresses -- \
-        six of them buffers no statement declares -- plus the block \
-        geometry and the routed-block count, and its row stated no Source \
-        on any of its twenty operands because there was none to state. It \
-        is the one refusal in this family a model text reaches \
-        (crates/model/src/qwen_3_5/forward/mod.rs, the aligned leg every \
-        fire outside the fused CUTLASS bound takes), and today that call \
-        ends in a fire-time no-arm rather than a load-time refusal: the \
-        outcome moves earlier and gains this sentence. Needs a lowering \
-        that declares the aligned staging as results" },
+    // `BUILD_MOE_PTRS_ALIGNED` STOOD HERE as a `none:` arm and is GONE, and
+    // the sentence it held is the contract's now. It did not become a bind:
+    // it became `x::moe`'s SECOND DRIVER OP, so it must have no `Entry` at
+    // all. An `Entry` — a bind OR a `none:` — shadows `route()`'s `DriverOp`
+    // arm (`x/mod.rs`, "THE ONE OVERLAP"), and for this symbol that is not a
+    // theoretical cost: the shadowed answer is `Route::Unbound`, which
+    // refuses the model at load for a symbol the driver-op table fires.
+    //
+    // The five arms this file shipped with are four: `add_moe_route_bias`,
+    // `transpose_expert_scales`, `moe_bucket_exact` and
+    // `scatter_add_weighted`. Twenty symbols, fourteen binds, two driver
+    // ops, four refusals.
+    //
+    // The dtype the old sentence asked for was the wrong ask, and finding
+    // out why is the only part worth keeping: the six arrays have no stated
+    // CONSUMER, so a dtype buys a declaration that `lower.rs:1911`'s
+    // liveness frees at the next op. `fire/moe_ptrs.rs` is the body and the
+    // contract above carries the argument.
 
-    REORDER_MOE_ALIGNED_OUTPUT => { none: "Cx has no query for an operand's \
-        ROW COUNT -- the same aligned_rows the gather needs, read here off \
-        the input rather than the output because one row of the aligned \
-        rectangle IS the hidden width. Needs `Facts::in_rows(i) -> \
-        Option<i32>`" },
+    REORDER_MOE_ALIGNED_OUTPUT => { cx, stream => {
+        let top_k = i32::try_from(cx.param(0)?).unwrap_or(0);
+        // `hidden` reads off the INPUT where the gather reads off its
+        // OUTPUT, and the deleted row's comment is why: *"The RESULT is
+        // `[Tokens, top_k, hidden]`, so its row width is `top_k * hidden`
+        // and not this. The OPERAND is `[aligned, hidden]` -- one row of
+        // the aligned rectangle IS the hidden width."* Taking
+        // `cx.out_width(0)` here launches `top_k` times too wide.
+        //
+        // `aligned_rows` carries the same finding the gather states.
+        unsafe {
+            reorder_moe_aligned_output_bf16(
+                cx.arg_in(0)?.cast_const().cast::<bf16>(),
+                cx.arg_in(1)?.cast_const().cast::<i32>(),
+                cx.arg_out(0)?.cast::<bf16>(),
+                cx.rows().count.saturating_mul(top_k),
+                cx.in_rows(1)?,
+                cx.in_width(0)?,
+                -1,
+                cx.rows().count,
+                // `Source::Lit(Lit::Null)`: this leg writes no shared
+                // output, and the row passed the same null.
+                core::ptr::null_mut(),
+                stream,
+            )
+        }
+        .ok()
+    }},
 
-    SCATTER_ADD_WEIGHTED => { none: "Nothing states the routed-row count. \
-        dst_idx is the permutation's, route-global, and the trace does not \
-        carry it -- the same gap moe::moe_bucket_exact names. Needs a \
-        lowering that states the route count" },
+    SCATTER_ADD_WEIGHTED => { none: "THE LAUNCH COUNT IS A DEVICE READBACK, \
+        so this is not one statement and no lowering makes it one. \
+        dsl.rs:6868, at the combine that IS stated: `the per-expert \
+        scatter_add_weighted_bf16 loop is the OTHER combine, and it is not \
+        stated here: it runs once per expert with a row count the host \
+        learned from a device readback, which is a launch count no \
+        declaration fixes`. num_routed is that count and it is the GRID -- \
+        the kernel reads its row from blockIdx.x and does not take it as a \
+        parameter -- and dst_idx is route-global besides, so a row window \
+        is not a route window. A wrapper exists (dsl.rs:5795) and nothing \
+        calls it. WHAT WOULD MAKE IT FIRE: not a Source and not a Cx query. \
+        Either a kernel that takes its own bound and handles the empty case \
+        on the device -- which is what §5.1 says a refusal that cannot be \
+        hoisted actually is -- or a driver op that owns the loop and the \
+        synchronise it needs" },
 
-    TOPK_SIGMOID => { none: "Cx has no query for the deployment's two \
-        router constants. The deleted row read Source::Ctx(\"moe_norm_topk\") \
-        and Source::Ctx(\"moe_routed_scaling\"), and the correction bias \
-        through Source::Or(Weight(0), Null) so that a family without one \
-        states no fourth operand -- that part Cx answers, since a weight \
-        that is not there is a refusal this arm could turn into a null. \
-        What it cannot answer is whether this checkpoint renormalizes its \
-        top-k and by what factor it scales, and inventing either changes \
-        every routed token's weight. Needs `Facts::moe_norm_topk()` and \
-        `Facts::moe_routed_scaling()`" },
+    TOPK_SIGMOID => { cx, stream => {
+        // The same row as `TOPK_SQRTSOFTPLUS` operand for operand, and the
+        // `Or` on the bias is read there. This is the most-fired member of
+        // the family -- kimi_k2, kimi_k3 and glm_5 all route through it --
+        // and it was the largest of the eleven `none:` arms this port
+        // shipped with.
+        let correction_bias =
+            cx.weight(0).map_or(core::ptr::null(), |w| w.cast_const().cast::<f32>());
+        unsafe {
+            topk_sigmoid_bf16(
+                cx.arg_in(0)?.cast_const().cast::<bf16>(),
+                cx.arg_out(0)?.cast::<i32>(),
+                cx.arg_out(1)?.cast::<f32>(),
+                correction_bias,
+                cx.rows().count,
+                cx.in_width(0)?,
+                cx.out_width(0)?,
+                cx.moe_norm_topk()?,
+                cx.moe_routed_scaling()?,
+                stream,
+            )
+        }
+        .ok()
+    }},
 
     TOPK_SOFTMAX => { cx, stream => {
         unsafe {
@@ -3518,7 +3905,7 @@ mod tests {
 
     use super::{MOE_ALIGNED_BLOCK_MAX, MOE_ALIGNED_BLOCK_MIN, moe_aligned_block};
     #[cfg(feature = "_cuda")]
-    use super::{Refusal, supported};
+    use super::{FRAG, Refusal, SHORT_K, supported};
 
     /// The shipping shapes from the launcher's own measurement table.
     #[cfg(feature = "_cuda")]
@@ -3532,7 +3919,7 @@ mod tests {
         // else -- 11.08 ms -> 11.98 ms when it was not.
         assert_eq!(
             supported(16, 2048, 2048),
-            Err(Refusal::Narrow { what: "K, within the 512 cuBLAS wins above", at: 2048 })
+            Err(Refusal::Wide { what: "K, above which cuBLAS wins", at: 2048, max: SHORT_K })
         );
     }
 
@@ -3540,9 +3927,23 @@ mod tests {
     #[cfg(feature = "_cuda")]
     #[test]
     fn every_conjunct_is_its_own_decline() {
+        // The two directions of `m != kFrag` are two refusals, and a test
+        // that only ever passed the taller one is how a backwards `Narrow`
+        // survives review.
         assert_eq!(
             supported(32, 2048, 256),
-            Err(Refusal::Narrow { what: "M, which must be exactly one 16-row fragment", at: 32 })
+            Err(Refusal::Wide {
+                what: "M, which must be exactly one 16-row fragment",
+                at: 32,
+                max: FRAG,
+            })
+        );
+        assert_eq!(
+            supported(8, 2048, 256),
+            Err(Refusal::Narrow {
+                what: "M, which must be exactly one 16-row fragment",
+                at: 8,
+            })
         );
         assert_eq!(supported(16, 0, 256), Err(Refusal::Empty { what: "the N by K rectangle" }));
         assert_eq!(supported(16, 2048, 0), Err(Refusal::Empty { what: "the N by K rectangle" }));

@@ -803,7 +803,21 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 8; ++mma_d) {
         if (q_idx < q_len) {
+// PIE: `.template` must be followed by a TEMPLATE-ID, and `store_128b` is an
+// ordinary member function of `smem_t`. nvcc's frontend accepts the stray
+// keyword; NVRTC 13.0 rejects it at both `-std=c++17` and `-std=c++20`,
+// measured in isolation away from FlashInfer entirely. `carried.rs` walks
+// `csrc/`, so this file has shipped to every JIT compile for months and
+// nothing ever instantiated a path that reached this line -- a dependency
+// satisfied by accident reads exactly like one satisfied on purpose. With the
+// token dropped, all six MLA instantiations lower: rc=0, 306-530 KB of PTX.
+// Upstream's spelling is kept under the guard so NOTICE's transform restores
+// the file. See also `:847`, the same expression in the finalise loop.
+#ifndef __CUDACC_RTC__
           o_smem.template store_128b(o_smem_offset_w, o_partial_ptr);
+#else
+          o_smem.store_128b(o_smem_offset_w, o_partial_ptr);
+#endif
         }
         o_partial_ptr += 8 * upcast_size<DTypeO>();
         o_smem_offset_w = o_smem.template advance_offset_by_column<8>(o_smem_offset_w, mma_d);
@@ -844,7 +858,13 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 8; ++mma_d) {
         if (q < q_len) {
+// PIE: the same stray `template` keyword as `:806`, in the finalise loop. Both
+// sites, and only these two in the file.
+#ifndef __CUDACC_RTC__
           o_smem.template store_128b(o_smem_offset_w, o_final_ptr);
+#else
+          o_smem.store_128b(o_smem_offset_w, o_final_ptr);
+#endif
         }
         o_final_ptr += 8 * upcast_size<DTypeO>();
         o_smem_offset_w = o_smem.template advance_offset_by_column<8>(o_smem_offset_w, mma_d);
