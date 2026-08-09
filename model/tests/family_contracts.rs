@@ -1156,11 +1156,7 @@ fn deepseek_v4_checkpoint() -> CheckpointMetadata {
 }
 
 fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
-    // The pinned Flash checkpoint (60d8d707) declares routed-expert scales as
-    // F8_E8M0: w1/w3 [2048, 128], w2 [4096, 64]. A converted `.zt` preserves
-    // that logical dtype. The older golden fixture above deliberately models
-    // the raw-byte variant as U8, so its U8 -> E8M0 Transmute is meaningful and
-    // cannot reproduce an identity node against imported metadata.
+    // Match the pinned Flash import's E8M0 scales at H=4096 and I=2048.
     let (hidden, intermediate) = (4096, 2048);
     let mut ck = Checkpoint::new();
     ck.push("embed_tokens.weight", &[128, hidden], bf16());

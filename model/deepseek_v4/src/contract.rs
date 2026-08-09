@@ -18,13 +18,7 @@ fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))
 }
 
-/// Read an MXFP4 scale tensor as E8M0 without inventing an identity node.
-///
-/// The raw-byte checkpoint form exposes scales as `U8`, so interpreting their
-/// E8M0 meaning requires a `Transmute`. Typed checkpoint metadata, including a
-/// converted `.zt` artifact, exposes the same bytes as `E8M0`; when its shape
-/// also matches, the source already says the whole truth and the contract
-/// algebra deliberately refuses a no-op `Transmute`.
+/// Raw checkpoints expose scales as `U8`; typed imports expose them as `E8M0`.
 fn e8m0_factors(expr: Expr, raw: &RawTensor, shape: Vec<i64>) -> Result<Expr, Error> {
     if !is_raw(&raw.encoding, DType::U8) && !is_raw(&raw.encoding, DType::E8M0) {
         return fail(format!(
