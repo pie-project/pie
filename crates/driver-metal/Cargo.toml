@@ -23,7 +23,30 @@ path = "src/lib.rs"
 # `lib.rs`, where `unsafe_code` can be left out of the list.
 
 [features]
+# There is deliberately NO default. `cargo test -p driver-metal` with no
+# features builds and tests the PORTABLE half -- `layout/` and `lowering/`,
+# everything that is a function of the plan's numbers rather than of the
+# device -- and that is the whole reason this is a feature rather than
+# `cfg(target_vendor = "apple")`:
+#
+#   A platform cfg cannot be tested. A feature can.
+#
+# On macOS `target_vendor = "apple"` is always true, so the portable half is
+# never compiled; on Linux it is always false, so the Apple half never is.
+# NO MACHINE BUILDS BOTH, and no single job can catch a reference across the
+# boundary -- which is exactly how three such errors got in and stayed
+# (`.wiki/driver/real-metal-north-star.md` §7). With a feature, one macOS
+# runner builds both sides, on the machine the people who work on this crate
+# actually use.
+#
+# `default = []` is load-bearing rather than a preference: a default would
+# have to be turned OFF to reach the portable half, and rule 4 of
+# `.wiki/driver/north-star.md` is that if a check can be skipped it will be.
 default = []
+
+# The Metal 4 stack this driver is written against. Gates `src/gpu/` -- the
+# one `#[cfg]` -- and every device test target.
+metal-4 = []
 
 # Portable, so it goes in the plain dependency table rather than the Apple one:
 # `facts.rs` reads a descriptor document and needs no GPU to do it.
@@ -191,3 +214,141 @@ tensor-compiler = { path = "../tensor-compiler" }
 # behind `model`'s `forward` feature -- which the driver itself does not need,
 # so it is enabled here rather than in the dependency table above.
 model = { path = "../model", default-features = false, features = ["contract", "forward"] }
+
+# `required-features` keeps `cargo test -p driver-metal` with no feature to
+# the portable half, rather than failing to build the device targets. It is
+# the mechanism `driver-cuda/Cargo.toml` already uses for `_cuda`, and the
+# reason the same job can run the crate both ways on one runner.
+#
+# The tests NOT listed here are the portable ones -- `portable_half`,
+# `mod_audit`, `model_bind`, `model_dispatch`, `polymorphism`,
+# `family_registry` -- and that list is the claim this file makes about what
+# needs no GPU.
+
+[[test]]
+name = "device_archive"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_checkpoint_names"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_compile"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_constants"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_dispatch"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_elastic"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_external"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_feedback"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_fire"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_fused"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_grouped"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_handle"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_icb"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_keepalive"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_kernels"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_memory"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_oracle"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_pool"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_pso"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_real_weights"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_region"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_ring"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_runtime"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_smoke"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_split_qkv"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_steps"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_tables"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_text_fire"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_timestamps"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_timing"
+required-features = ["metal-4"]
+
+[[test]]
+name = "real_kernels"
+required-features = ["metal-4"]
+
+[[test]]
+name = "text_conformance"
+required-features = ["metal-4"]

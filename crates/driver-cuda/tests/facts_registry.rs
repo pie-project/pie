@@ -23,7 +23,7 @@
 
 use std::collections::BTreeSet;
 
-use driver_cuda::facts::openable_model_types;
+use model::deployment_cuda::openable_model_types;
 
 /// Model types the loader can author but this shell cannot yet open.
 ///
@@ -109,7 +109,7 @@ mod fire_class {
     use driver_api::local::{
         PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD, PieStepDesc, PieU8Slice, PieU32Slice,
     };
-    use driver_cuda::serve::fire_class_of;
+    use driver_cuda::gpu::serve::fire_class_of;
     use model_compiler::trace::FireClass;
 
     fn u32s(v: &[u32]) -> PieU32Slice {

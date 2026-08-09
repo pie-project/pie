@@ -34,7 +34,7 @@
 
 use std::fmt::Write as _;
 
-use driver_cuda::store::KvCacheFormat;
+use driver_cuda::layout::KvCacheFormat;
 
 /// FNV-1a 64 of the **C++** oracle's stdout over [`dump`]'s grid.
 ///

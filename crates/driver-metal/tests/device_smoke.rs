@@ -34,13 +34,26 @@
 //!
 //! # Written down rather than lost
 //!
-//! Two claims no current test makes:
+//! Two claims no current test made:
 //!
 //!   1. **A thousand tokens.** `a_thousand_tokens_decode_without_a_wedge_or_
 //!      a_nan` ran a long generation and watched for a hang or a NaN. The
-//!      generation gate runs four tokens.
-//!   2. **Two requests in one fire, isolated from each other.** Every current
-//!      device gate runs one request.
+//!      generation gate runs four tokens. Still open.
+//!   2. ~~**Two requests in one fire, isolated from each other.**~~ **Closed**
+//!      by `device_real_weights::a_request_prefills_the_same_way_beside_
+//!      another_one`, which prefills a prompt alone and again beside a longer
+//!      unrelated one and holds both distributions bit-identical. It needs no
+//!      reference, and it checks the SECOND request as well as the first —
+//!      attention is causal, so the first request is insensitive to a leak by
+//!      construction and comparing only it would prove nothing.
 //!
-//! Both want the generic executor, a small checkpoint, and time -- not a
+//!      Worth recording what this reached that the retired smokes could not.
+//!      Every device gate in this crate ran either one request holding every
+//!      token or one request PER token, a decode fleet. Several requests each
+//!      holding several tokens — the shape a served frame takes whenever two
+//!      prompts arrive together — was staged by nothing, so
+//!      `stage_prefill_fleet` is a third staging shape and the gap was in the
+//!      harness rather than in the driver.
+//!
+//! The first wants the generic executor, a small checkpoint, and time — not a
 //! per-family layer.

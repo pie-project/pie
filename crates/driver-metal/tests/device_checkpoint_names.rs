@@ -29,14 +29,13 @@
 //!     it demanded a linear-attention block of a stack that has no linear
 //!     layers.
 
-#![cfg(target_vendor = "apple")]
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use driver_metal::metal::Context;
-use driver_metal::model::load::load;
-use driver_metal::model::resolve::{Names, Store};
+use driver_metal::gpu::Context;
+use driver_metal::gpu::weights::load::load;
+use driver_metal::lowering::resolve::{Names, Store};
 use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::families::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Arg, Fire, Row, lower};
@@ -132,7 +131,7 @@ fn the_checkpoint_answers_the_names_the_text_states() {
     let mut store = Store::new(Names::mlx(), &loaded.tensors, &named);
     let mut missing: BTreeSet<String> = BTreeSet::new();
     for name in names_the_text_states(&facts, &metal) {
-        use driver_metal::model::executor::Resolver as _;
+        use driver_metal::lowering::executor::Resolver as _;
         if store.weight(&name).is_none() {
             missing.insert(name);
         }

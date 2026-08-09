@@ -14,11 +14,11 @@
 //!
 //! [`real_kernels`]: ../real_kernels/index.html
 
-#![cfg(target_vendor = "apple")]
 
 use std::path::PathBuf;
 
-use driver_metal::{Compiler, Context, Error};
+use driver_metal::Error;
+use driver_metal::gpu::{Compiler, Context};
 
 /// An entry point no kernel defines.
 ///
@@ -73,7 +73,7 @@ fn every_shipped_kernel_compiles_on_this_device() {
 
     let mut rejected = Vec::new();
     for path in &files {
-        let source = driver_metal::shader::read_source(path)
+        let source = driver_metal::layout::shader::read_source(path)
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         match compiler.compile(&context, &source, NO_SUCH_ENTRY) {
             // The library built and the entry point does not exist, which is

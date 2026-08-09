@@ -11,8 +11,8 @@
 //!
 //! Skipped without a device, like every GPU test here.
 
-use driver_cuda::cuda::{Allocator, OwnedStream};
-use driver_cuda::launch::ffi;
+use driver_cuda::gpu::device::{Allocator, OwnedStream};
+use driver_cuda::gpu::bind::abi::ffi;
 
 mod common;
 use common::{device_or_skip, gpu_guard};
@@ -32,7 +32,7 @@ use common::{device_or_skip, gpu_guard};
 /// it reads.
 fn attention_landing(
     l: &model_compiler::lower::Lowered,
-    dplan: &driver_cuda::model::executor::DispatchPlan,
+    dplan: &driver_cuda::gpu::bind::DispatchPlan,
     fi: usize,
 ) -> Option<usize> {
     use model_compiler::lower::Arg;
@@ -91,7 +91,7 @@ fn a_generated_binding_reaches_a_real_kernel() {
 /// bit-checkable on the host.
 #[test]
 fn a_driver_internal_binding_seeds_the_envelope_tier() {
-    use driver_cuda::store::kv_cache_live::{KvCacheDeviceOps, LiveKvCacheOps};
+    use driver_cuda::gpu::pools::kv_cache_live::{KvCacheDeviceOps, LiveKvCacheOps};
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("driver-internal envelope seed") else { return };
@@ -105,7 +105,7 @@ fn a_driver_internal_binding_seeds_the_envelope_tier() {
     d_min.memset(0, stream.as_ref()).expect("zero min");
     d_max.memset(0, stream.as_ref()).expect("zero max");
 
-    let alloc = driver_cuda::cuda::Allocator::new();
+    let alloc = driver_cuda::gpu::device::Allocator::new();
     let mut ops = LiveKvCacheOps::new(stream.as_ref().as_raw().cast(), &alloc);
     ops.envelope_seed(d_min.as_ptr().cast(), d_max.as_ptr().cast(), 2, 2, 4);
     ops.stream_synchronize();
@@ -131,7 +131,7 @@ fn a_driver_internal_binding_seeds_the_envelope_tier() {
 /// re-deriving the indexing the score oracle already pinned.
 #[test]
 fn the_live_score_ops_upload_memset_and_fold() {
-    use driver_cuda::model::attn_score::{LiveScoreOps, ScoreOps};
+    use driver_cuda::gpu::fire::attn_score::{LiveScoreOps, ScoreOps};
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("live score ops") else { return };
@@ -189,7 +189,7 @@ fn the_live_score_ops_upload_memset_and_fold() {
 /// slab landing device-resident with its values intact.
 #[test]
 fn the_live_lora_ops_cast_and_upload_the_slab() {
-    use driver_cuda::model::lora::{LiveLoraOps, LoraOps};
+    use driver_cuda::gpu::fire::lora::{LiveLoraOps, LoraOps};
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("live lora ops") else { return };
@@ -237,8 +237,8 @@ fn the_live_lora_ops_cast_and_upload_the_slab() {
 fn the_executor_prefix_runs_the_anchor_decode_on_device() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
-    use driver_cuda::model::executor::{
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::bind::{
         DispatchCtx, DispatchPlan, DispatchRefusal, Frame, Resolver, bind, dispatch,
     };
     use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
@@ -288,10 +288,10 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
     let ids_host: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
 
     struct Live {
-        embed: driver_cuda::cuda::DeviceBuffer,
-        ones: driver_cuda::cuda::DeviceBuffer,
-        zeros: driver_cuda::cuda::DeviceBuffer,
-        ids: driver_cuda::cuda::DeviceBuffer,
+        embed: driver_cuda::gpu::device::DeviceBuffer,
+        ones: driver_cuda::gpu::device::DeviceBuffer,
+        zeros: driver_cuda::gpu::device::DeviceBuffer,
+        ids: driver_cuda::gpu::device::DeviceBuffer,
         named: BTreeMap<ValueId, *mut std::ffi::c_void>,
     }
     impl Resolver for Live {
@@ -443,8 +443,8 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
 /// own smoke before any attention arm consumes the plan.
 #[test]
 fn the_decode_planner_plans_a_real_geometry() {
-    use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::model::executor::DecodePlan;
+    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::gpu::bind::DecodePlan;
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("decode planner") else { return };
@@ -657,7 +657,7 @@ enum Leg {
     /// which is the property a cached exec has to have and the one no
     /// other leg asks for: every leg above replays the fire it captured.
     ///
-    /// A capture bakes ADDRESSES, and the whole `FireArrays` design is
+    /// A capture bakes ADDRESSES, and the whole `Scratch` design is
     /// the claim that only addresses are baked — the contents are
     /// refreshed per fire. If a capture baked contents instead, this leg
     /// returns the FIRST fire's answer for the second fire's tokens:
@@ -675,11 +675,11 @@ enum Leg {
 fn zero_weight_decode(leg: Leg) {
     use std::collections::BTreeMap;
 
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::launch::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::model::executor::{
+    use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::gpu::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run, run_captured,
     };
     use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
@@ -765,7 +765,7 @@ fn zero_weight_decode(leg: Leg) {
             }
         }
     }
-    let mut named_bufs: BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer> = named_widths
+    let mut named_bufs: BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer> = named_widths
         .iter()
         .map(|(&v, &w)| {
             let mut b = alloc.alloc(ROWS * w as usize * 2).expect("pin");
@@ -778,7 +778,7 @@ fn zero_weight_decode(leg: Leg) {
         embed: *const std::ffi::c_void,
         ones: *const std::ffi::c_void,
         zeros: *const std::ffi::c_void,
-        named: &'a mut BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer>,
+        named: &'a mut BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer>,
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -797,7 +797,7 @@ fn zero_weight_decode(leg: Leg) {
 
     // ── The fire's KV side: pools, views, CSRs, write descriptors. ──
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)> =
+    let pools: Vec<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)> =
         (0..LAYERS)
             .map(|_| {
                 let mut k = alloc.alloc(plane).expect("k pool");
@@ -919,7 +919,7 @@ fn zero_weight_decode(leg: Leg) {
     // the shell prepares.
     let kv_indptr_h: Vec<u32> = (0..=ROWS as u32).collect();
     let kv_lens_h = vec![1u32; ROWS];
-    let mask_plan = driver_cuda::model::page_mask::element_mask::plan_causal(
+    let mask_plan = driver_cuda::gpu::fire::page_mask::element_mask::plan_causal(
         &(0..=ROWS as u32).collect::<Vec<_>>(),
         &kv_indptr_h,
         &kv_lens_h,
@@ -935,7 +935,7 @@ fn zero_weight_decode(leg: Leg) {
             stream.as_ref(),
         )
         .expect("mask csr");
-    let sink_plan = driver_cuda::model::attn_score::plan_score_sink(
+    let sink_plan = driver_cuda::gpu::fire::attn_score::plan_score_sink(
         &kv_indptr_h,
         &kv_lens_h,
         PAGE,
@@ -1044,6 +1044,7 @@ fn zero_weight_decode(leg: Leg) {
         w_off_d: w_off.as_ptr().cast(),
         row_valid_d: row_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
+        score_window: 32,
         window_left: -1,
         window_left_by_layer: Vec::new(),
         logits_soft_cap: 0.0,
@@ -1085,7 +1086,7 @@ fn zero_weight_decode(leg: Leg) {
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
     let mut peel_win =
-        driver_cuda::cuda::PeelWindowWord::new(&alloc).expect("peel window word");
+        driver_cuda::gpu::device::PeelWindowWord::new(&alloc).expect("peel window word");
     // The window is the TAIL's, not the fire's. `_devwin` statements only
     // occur in a peel's tail region, and the word is what tells them which
     // absolute rows are theirs — publishing the whole fire makes the tail
@@ -1161,8 +1162,8 @@ fn zero_weight_decode(leg: Leg) {
         }
     }
     let ran = if matches!(leg, Leg::Captured | Leg::CapturedUnion | Leg::Reused) {
-        use driver_cuda::cuda::{PredicateWord, SupergraphBuilder};
-        use driver_cuda::model::supergraph::fire_predicates;
+        use driver_cuda::gpu::device::{PredicateWord, SupergraphBuilder};
+        use driver_cuda::gpu::fire::recordings::fire_predicates;
 
         // The word is filled and uploaded BEFORE the capture opens: the
         // host decides the fire's bits, the graph reads them.
@@ -1250,7 +1251,7 @@ fn zero_weight_decode(leg: Leg) {
         for has_write_desc in [false, true] {
             arena.memset(0, stream.as_ref()).expect("wipe between lanes");
             preds
-                .set(driver_cuda::cuda::SLOT_HAS_WRITE_DESC, has_write_desc)
+                .set(driver_cuda::gpu::device::SLOT_HAS_WRITE_DESC, has_write_desc)
                 .expect("slot");
             preds.upload(stream.as_ref()).expect("upload");
             stream.as_ref().synchronize().expect("the word lands");
@@ -1292,7 +1293,7 @@ fn zero_weight_decode(leg: Leg) {
             ids.copy_from_host(&bytes, stream.as_ref()).expect("the next fire's tokens");
             arena.memset(0, stream.as_ref()).expect("wipe before the second fire");
             preds
-                .set(driver_cuda::cuda::SLOT_HAS_WRITE_DESC, false)
+                .set(driver_cuda::gpu::device::SLOT_HAS_WRITE_DESC, false)
                 .expect("slot");
             preds.upload(stream.as_ref()).expect("upload");
             stream.as_ref().synchronize().expect("the tokens land");
@@ -1367,11 +1368,11 @@ fn zero_weight_decode(leg: Leg) {
 fn the_full_zero_weight_prefill_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::launch::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::model::executor::{
+    use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::gpu::bind::{
         AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run,
     };
     use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
@@ -1445,7 +1446,7 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
             }
         }
     }
-    let named_bufs: BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer> = named_widths
+    let named_bufs: BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer> = named_widths
         .iter()
         .map(|(&v, &w)| {
             let mut b = alloc.alloc(TOKENS * w as usize * 2).expect("pin");
@@ -1458,7 +1459,7 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         embed: *const std::ffi::c_void,
         ones: *const std::ffi::c_void,
         zeros: *const std::ffi::c_void,
-        named: &'a BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer>,
+        named: &'a BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer>,
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -1477,7 +1478,7 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
 
     // Two requests: tokens [0,3) and [3,7), one page each.
     let plane = (2 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)> =
+    let pools: Vec<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)> =
         (0..LAYERS)
             .map(|_| {
                 let mut k = alloc.alloc(plane).expect("k pool");
@@ -1579,6 +1580,7 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         w_off_d: core::ptr::null(),
         row_valid_d: row_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
+        score_window: 32,
         window_left: -1,
         window_left_by_layer: Vec::new(),
         logits_soft_cap: 0.0,
@@ -1707,11 +1709,11 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
 fn the_hybrid_zero_weight_decode_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::launch::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::model::executor::{
+    use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::gpu::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, Resolver, run,
     };
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
@@ -1828,7 +1830,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
             }
         }
     }
-    let mut named_bufs: BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer> = named_widths
+    let mut named_bufs: BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer> = named_widths
         .iter()
         .map(|(&v, &w)| {
             let mut b = alloc.alloc(ROWS * w as usize * 4).expect("pin");
@@ -1844,7 +1846,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         ones_f32: *const std::ffi::c_void,
         zeros_f32: *const std::ffi::c_void,
         zeros: *const std::ffi::c_void,
-        named: &'a mut BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer>,
+        named: &'a mut BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer>,
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -1882,7 +1884,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     // ── KV pools for the SIX full-attention layers; placeholder views
     // (never dereferenced) at the GDN indices. ──
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<Option<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)>> =
+    let pools: Vec<Option<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)>> =
         (0..LAYERS)
             .map(|i| {
                 if !hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
@@ -1931,7 +1933,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     // layers, slot-indirected. ──
     let conv_stride = (CONV_K * CONV_DIM) as usize;
     let state_stride = (V_H * K_D * V_D) as usize;
-    let gdn_slabs: Vec<Option<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)>> =
+    let gdn_slabs: Vec<Option<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)>> =
         (0..LAYERS)
             .map(|i| {
                 if hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
@@ -2053,6 +2055,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         w_off_d: w_off.as_ptr().cast(),
         row_valid_d: row_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
+        score_window: 32,
         window_left: -1,
         window_left_by_layer: Vec::new(),
         logits_soft_cap: 0.0,
@@ -2126,7 +2129,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     }
     let per_launch_sync = std::env::var("HYBRID_SMOKE_SYNC").is_ok();
     let ran = if per_launch_sync {
-        use driver_cuda::model::executor::{bind, dispatch};
+        use driver_cuda::gpu::bind::{bind, dispatch};
         for (i, launch) in l.launches.iter().enumerate() {
             let kernel = l.kernels[launch.kernel as usize].clone();
             let bound = bind(&l, launch, frame, &mut resolver)
@@ -2196,11 +2199,11 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
 fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::launch::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::model::executor::{
+    use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::gpu::bind::{
         AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
     };
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
@@ -2313,7 +2316,7 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
             }
         }
     }
-    let mut named_bufs: BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer> = named_widths
+    let mut named_bufs: BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer> = named_widths
         .iter()
         .map(|(&v, &w)| {
             let mut b = alloc.alloc(TOKENS * w as usize * 4).expect("pin");
@@ -2329,7 +2332,7 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         ones_f32: *const std::ffi::c_void,
         zeros_f32: *const std::ffi::c_void,
         zeros: *const std::ffi::c_void,
-        named: &'a mut BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer>,
+        named: &'a mut BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer>,
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -2363,7 +2366,7 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     }
 
     let plane = (2 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<Option<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)>> =
+    let pools: Vec<Option<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)>> =
         (0..LAYERS)
             .map(|i| {
                 if !hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
@@ -2410,7 +2413,7 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
 
     let conv_stride = (CONV_K * CONV_DIM) as usize;
     let state_stride = (V_H * K_D * V_D) as usize;
-    let gdn_slabs: Vec<Option<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)>> =
+    let gdn_slabs: Vec<Option<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)>> =
         (0..LAYERS)
             .map(|i| {
                 if hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
@@ -2520,6 +2523,7 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         w_off_d: core::ptr::null(),
         row_valid_d: row_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
+        score_window: 32,
         window_left: -1,
         window_left_by_layer: Vec::new(),
         logits_soft_cap: 0.0,
@@ -2651,11 +2655,11 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
 fn the_nemotron_zero_weight_decode_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::launch::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::model::executor::{
+    use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::gpu::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, Resolver, run,
     };
     use model::nemotron_h::forward::facts::NemotronHFacts;
@@ -2733,7 +2737,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
             }
         }
     }
-    let mut named_bufs: BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer> = named_widths
+    let mut named_bufs: BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer> = named_widths
         .iter()
         .map(|(&v, &w)| {
             let mut b = alloc.alloc(ROWS * w.max(1) as usize * 4).expect("pin");
@@ -2746,7 +2750,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         embed: *const std::ffi::c_void,
         ones: *const std::ffi::c_void,
         zeros: *const std::ffi::c_void,
-        named: &'a mut BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer>,
+        named: &'a mut BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer>,
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -2765,7 +2769,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
 
     // ── KV pools (uniform; only the attention layer reads its own). ──
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)> =
+    let pools: Vec<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)> =
         (0..LAYERS)
             .map(|_| {
                 let mut k = alloc.alloc(plane).expect("k pool");
@@ -2804,7 +2808,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     // ── The mamba slabs: one slot per request on layers 0/2/4. ──
     let conv_stride = (CONV_K * CONV_DIM) as usize;
     let state_stride = (M_HEADS * STATE * M_HEAD_DIM) as usize;
-    let slabs: Vec<Option<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)>> =
+    let slabs: Vec<Option<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)>> =
         (0..LAYERS as u32)
             .map(|i| {
                 use model::nemotron_h::forward::facts::NemotronLayerKind;
@@ -2921,6 +2925,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         w_off_d: w_off.as_ptr().cast(),
         row_valid_d: row_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
+        score_window: 32,
         window_left: -1,
         window_left_by_layer: Vec::new(),
         logits_soft_cap: 0.0,
@@ -2990,7 +2995,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     }
     let per_launch_sync = std::env::var("NEMOTRON_SMOKE_SYNC").is_ok();
     let ran = if per_launch_sync {
-        use driver_cuda::model::executor::{bind, dispatch};
+        use driver_cuda::gpu::bind::{bind, dispatch};
         for (i, launch) in l.launches.iter().enumerate() {
             let kernel = l.kernels[launch.kernel as usize].clone();
             let bound = bind(&l, launch, frame, &mut resolver)
@@ -3060,7 +3065,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
 /// where the anchors say.
 #[test]
 fn the_qwen3vl_tower_fires_through_the_bridge() {
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("qwen3_vl tower fire") else { return };
@@ -3291,12 +3296,12 @@ fn the_gemma4_vision_tower_encodes_through_the_bridge() {
 /// as the arithmetic is.
 #[test]
 fn the_lora_apply_lands_its_deltas_on_device() {
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
-    use driver_cuda::model::lora::{
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::fire::lora::{
         LORA_SITE_Q, LORA_SITE_V, LiveLoraOps, LoraFireState, LoraForm, LoraLaneView,
         LoraOps, LoraStageArena, LoraStageRows, LoraTable,
     };
-    use driver_cuda::model::sideband_arena::{DeviceMemory, LiveDeviceMemory};
+    use driver_cuda::gpu::fire::sideband_arena::{DeviceMemory, LiveDeviceMemory};
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("lora apply") else { return };
@@ -3476,7 +3481,7 @@ fn the_lora_apply_lands_its_deltas_on_device() {
     );
     stream.as_ref().synchronize().expect("the corrections retire");
 
-    let read = |buf: &driver_cuda::cuda::DeviceBuffer| {
+    let read = |buf: &driver_cuda::gpu::device::DeviceBuffer| {
         let mut back = vec![0u8; buf.len()];
         buf.copy_to_host(&mut back, stream.as_ref()).expect("d2h");
         stream.as_ref().synchronize().expect("sync");
@@ -3532,12 +3537,12 @@ fn the_lora_apply_lands_its_deltas_on_device() {
 /// slice is zero in both, so the layer-tag claim holds here too.
 #[test]
 fn the_lora_grouped_path_lands_its_deltas_on_device() {
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
-    use driver_cuda::model::lora::{
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::fire::lora::{
         LORA_SITE_Q, LiveLoraOps, LoraFireState, LoraForm, LoraLaneView, LoraOps,
         LoraStageArena, LoraStageRows, LoraTable,
     };
-    use driver_cuda::model::sideband_arena::{DeviceMemory, LiveDeviceMemory};
+    use driver_cuda::gpu::fire::sideband_arena::{DeviceMemory, LiveDeviceMemory};
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("lora grouped apply") else { return };
@@ -3708,11 +3713,11 @@ fn the_lora_grouped_path_lands_its_deltas_on_device() {
 fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::launch::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::model::executor::{
+    use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::gpu::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
     };
     use model::gemma3n::forward::facts::{Gemma3nAltUpFacts, Gemma3nAttnFacts, Gemma3nFacts};
@@ -3795,7 +3800,7 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
             }
         }
     }
-    let named_bufs: BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer> = named_widths
+    let named_bufs: BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer> = named_widths
         .iter()
         .map(|(&v, &w)| {
             let mut b = alloc.alloc(ROWS * (w.max(1) as usize) * 4).expect("pin");
@@ -3808,7 +3813,7 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         embed: *const std::ffi::c_void,
         ones: *const std::ffi::c_void,
         zeros: *const std::ffi::c_void,
-        named: &'a BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer>,
+        named: &'a BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer>,
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -3826,7 +3831,7 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     }
 
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)> =
+    let pools: Vec<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)> =
         (0..LAYERS)
             .map(|_| {
                 let mut k = alloc.alloc(plane).expect("k pool");
@@ -3915,6 +3920,7 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         w_off_d: w_off.as_ptr().cast(),
         row_valid_d: row_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
+        score_window: 32,
         window_left: -1,
         window_left_by_layer: Vec::new(),
         logits_soft_cap: 0.0,
@@ -4042,11 +4048,11 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
 fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::cuda::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::launch::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::model::executor::{
+    use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::gpu::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
     };
     use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
@@ -4136,7 +4142,7 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
             }
         }
     }
-    let named_bufs: BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer> = named_widths
+    let named_bufs: BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer> = named_widths
         .iter()
         .map(|(&v, &w)| {
             let mut b = alloc.alloc(ROWS * (w.max(1) as usize) * 4).expect("pin");
@@ -4150,7 +4156,7 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         ones: *const std::ffi::c_void,
         zeros: *const std::ffi::c_void,
         table: *const std::ffi::c_void,
-        named: &'a BTreeMap<ValueId, driver_cuda::cuda::DeviceBuffer>,
+        named: &'a BTreeMap<ValueId, driver_cuda::gpu::device::DeviceBuffer>,
     }
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -4174,7 +4180,7 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
     }
 
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::cuda::DeviceBuffer, driver_cuda::cuda::DeviceBuffer)> =
+    let pools: Vec<(driver_cuda::gpu::device::DeviceBuffer, driver_cuda::gpu::device::DeviceBuffer)> =
         (0..LAYERS)
             .map(|_| {
                 let mut k = alloc.alloc(plane).expect("k pool");
@@ -4263,6 +4269,7 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         w_off_d: w_off.as_ptr().cast(),
         row_valid_d: row_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
+        score_window: 32,
         window_left: -1,
         window_left_by_layer: Vec::new(),
         logits_soft_cap: 0.0,

@@ -6,7 +6,7 @@
     "tp_size": 1,
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
-    "tile_map_mask": 213,
+    "tile_map_mask": 133,
     "native_mxfp4_moe": false,
     "fusion_mask": 1,
     "encode_scratch_dtype": "BF16",
@@ -1519,7 +1519,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -1581,7 +1582,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -1643,7 +1645,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -1705,7 +1708,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -1774,7 +1778,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -1836,7 +1841,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -1898,7 +1904,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -1967,7 +1974,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -2029,7 +2037,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -2091,7 +2100,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -2153,7 +2163,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -2222,7 +2233,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -2284,7 +2296,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },
@@ -2346,7 +2359,8 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0
+          "scale_factor_bits": 0,
+          "kernel": "quant::quantize_bf16_to_fp8_e4m3_per_channel"
         }
       }
     },

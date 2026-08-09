@@ -29,17 +29,16 @@
 //! failure this crate was built to make impossible to miss, arriving in its
 //! own executor.
 
-#![cfg(target_vendor = "apple")]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use driver_metal::metal::{Compiler, Context, allocate};
-use driver_metal::model::dispatch::Geometry;
-use driver_metal::model::encode::Pipelines;
-use driver_metal::model::executor::{Resolver, Slice};
-use driver_metal::model::frame::{Step, lower_step};
-use driver_metal::model::run::run;
+use driver_metal::gpu::{Allocation, Compiler, Context};
+use driver_metal::lowering::dispatch::Geometry;
+use driver_metal::gpu::bind::encode::Pipelines;
+use driver_metal::lowering::executor::{Resolver, Slice};
+use driver_metal::lowering::frame::{Step, lower_step};
+use driver_metal::gpu::fire::run::run;
 use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::families::llama_like::forward::llama_like_metal;
 use model_compiler::trace::{FireClass, ValueId};
@@ -86,7 +85,7 @@ impl Resolver for Sentinels {
     fn kv(&mut self, _: u16, _: bool) -> Option<Slice> {
         Some(self.slice)
     }
-    fn fire(&mut self, _: driver_metal::model::executor::FireTable) -> Option<Slice> {
+    fn fire(&mut self, _: driver_metal::lowering::executor::FireTable) -> Option<Slice> {
         Some(self.tables)
     }
 
@@ -95,8 +94,8 @@ impl Resolver for Sentinels {
     /// `page_size = 0` is what hung this test for sixty seconds: the paged
     /// attention divides by it, and the zeroed page CSR that makes the scan
     /// terminate does not save a kernel that never gets to the scan.
-    fn pool(&mut self, which: driver_metal::model::executor::FireTable) -> Option<u32> {
-        use driver_metal::model::executor::FireTable as F;
+    fn pool(&mut self, which: driver_metal::lowering::executor::FireTable) -> Option<u32> {
+        use driver_metal::lowering::executor::FireTable as F;
         Some(match which {
             F::KvHeadStride => 128,
             F::KvSeqStride => 128 * 8,
@@ -113,9 +112,13 @@ impl Resolver for Sentinels {
 /// CSR that says "no pages". A garbage one walks pages until the GPU is
 /// abandoned, which is how this test first found out its kernels had started
 /// doing real work.
-fn zeroed(context: &Context) -> driver_metal::metal::Handle {
-    use driver_metal::region::Region as _;
-    let h = allocate(context, 1 << 20, "zeroed fire tables").expect("a table region");
+///
+/// Returns the `Allocation`, not a `Handle`: the caller has to own the region
+/// for as long as the fire binds it, and this used to hand back a view of one
+/// nobody owned.
+fn zeroed(context: &Context) -> Allocation {
+    use driver_metal::layout::region::Region as _;
+    let h = Allocation::new(context, 1 << 20, "zeroed fire tables").expect("a table region");
     // SAFETY: freshly allocated, nothing encoded against it yet.
     unsafe { h.zero(0, 1 << 20).expect("it zeroes") };
     h
@@ -181,7 +184,7 @@ fn a_mixture_fires_on_the_device_through_the_same_executor() {
         lowered.kernels
     );
 
-    let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -266,7 +269,7 @@ fn gpt_oss_fires_on_the_device_through_the_same_executor() {
     let swiglu = lowered.kernels.iter().filter(|k| k.contains("swiglu")).count();
     assert!(swiglu > 0, "and its own activation: {:?}", lowered.kernels);
 
-    let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -353,7 +356,7 @@ fn gemmas_side_network_fires_on_the_device() {
         );
     }
 
-    let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -424,7 +427,7 @@ fn the_whole_metal_text_fires_on_the_device() {
 
     // 256 MiB: wider than any tensor this text names, so a bound operand is
     // never the reason a dispatch fails.
-    let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -515,7 +518,7 @@ fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
     );
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -547,7 +550,8 @@ fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
 /// This is the same allocation with its arguments taken from the frame.
 #[test]
 fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
-    use driver_metal::model::kv::{Pool, Shape, translate};
+    use driver_metal::gpu::pools::kv::{Pool, translate};
+    use driver_metal::layout::kv::Shape;
 
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
@@ -601,9 +605,9 @@ fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
 /// rows toward the front, so source and destination overlap.
 #[test]
 fn a_move_plan_slides_rows_without_smearing_them() {
-    use driver_metal::model::kv::{Pool, Shape};
-    use driver_metal::region::Region as _;
-    use driver_metal::store::{CellCopy, CellMovePlan};
+    use driver_metal::gpu::pools::kv::Pool;
+    use driver_metal::layout::kv::Shape;
+    use driver_metal::layout::{CellCopy, CellMovePlan};
 
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
@@ -629,10 +633,8 @@ fn a_move_plan_slides_rows_without_smearing_them() {
     // Each row is its own byte, so a misplaced one names itself.
     let total = shape.layer_bytes_at(0) as usize;
     let src: Vec<u8> = (0..total).map(|i| (i / row) as u8).collect();
-    unsafe {
-        layer.k.write(0, &src).expect("the pattern fits");
-        layer.v.write(0, &src).expect("and into v");
-    }
+    layer.k.write(0, &src).expect("the pattern fits");
+    layer.v.write(0, &src).expect("and into v");
 
     // Slide page 1 onto page 0 — the overlapping case a compaction makes.
     let page = shape.page_bytes().expect("a uniform pool");
@@ -646,8 +648,9 @@ fn a_move_plan_slides_rows_without_smearing_them() {
     })
     .expect("the move runs");
 
-    let read = |h: &driver_metal::metal::Handle| -> Vec<u8> {
-        unsafe { std::slice::from_raw_parts(h.contents().as_ptr().cast::<u8>(), total) }.to_vec()
+    let read = |p: &driver_metal::gpu::pools::kv::Pages| -> Vec<u8> {
+        let at = p.host_span(0, total as u64).expect("the pages are addressable");
+        unsafe { std::slice::from_raw_parts(at.as_ptr().cast_const(), total) }.to_vec()
     };
     for (name, got) in [("k", read(&layer.k)), ("v", read(&layer.v))] {
         // Page 0 now holds what page 1 held: rows 2 and 3.
@@ -702,7 +705,7 @@ fn two_whole_text_fires_are_in_flight_at_once() {
     );
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -720,34 +723,34 @@ fn two_whole_text_fires_are_in_flight_at_once() {
     // `run_keeping_arena` builds — has no timeline to compare against and no
     // allocator ring to alternate, so it could not pipeline even in
     // principle.
-    let mut stepper = driver_metal::metal::Stepper::new(&context).expect("a stepper");
+    let mut stepper = driver_metal::gpu::Stepper::new(&context).expect("a stepper");
     // ONE pool too, for the same reason: reuse across fires is what makes an
     // address stable, and a fresh pool per fire is the allocation it replaces.
-    let scratch = driver_metal::metal::Scratch::new();
+    let scratch = driver_metal::gpu::Scratch::new();
     // No regions registered, so `record` refuses every operand and `submit`
     // falls back to encoding -- which is the behaviour this test wants, and
     // is also the fallback a deployment that has not registered its regions
     // gets. Both fires still commit.
-    let mut regions = driver_metal::metal::Regions::new();
-    let mut recordings = driver_metal::metal::Recordings::new();
+    let mut regions = driver_metal::gpu::Regions::new();
+    let mut recordings = driver_metal::gpu::Recordings::new();
 
-    let mut machine = driver_metal::model::run::Machine {
+    let mut machine = driver_metal::gpu::fire::run::Machine {
         context: &context,
         compiler: &compiler,
         pipelines: &mut pipelines,
         stepper: &mut stepper,
         scratch: &scratch,
         regions: &mut regions,
-        recordings: &mut recordings,
+        recordings: Some(&mut recordings),
     };
     let first =
-        driver_metal::model::run::submit(&mut machine, &lowered, geometry(), &mut store)
+        driver_metal::gpu::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
             .expect("the first fire commits");
 
     // Committed, not waited for. The second is planned, staged, bound and
     // committed with the first still outstanding.
     let second =
-        driver_metal::model::run::submit(&mut machine, &lowered, geometry(), &mut store)
+        driver_metal::gpu::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
             .expect("the second fire commits while the first is outstanding");
 
     // TWO regions, not one. The pool must not hand the second fire the arena

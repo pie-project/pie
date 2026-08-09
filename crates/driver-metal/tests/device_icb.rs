@@ -48,8 +48,8 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use driver_metal::metal::{Compiler, Context, allocate};
-use driver_metal::region::Region as _;
+use driver_metal::gpu::{Allocation, Compiler, Context};
+use driver_metal::layout::region::Region as _;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLDevice, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
@@ -87,10 +87,10 @@ fn a_fire_can_be_recorded_once_and_replayed() {
     // Two outputs and two addends: command 0 writes `a` with 7, command 1
     // writes `b` with 9. If the commands do NOT carry their own bindings,
     // both land in one place and the assertion below says so.
-    let a = allocate(&context, 16 * 4, "icb probe a").expect("a region");
-    let b = allocate(&context, 16 * 4, "icb probe b").expect("a region");
-    let seven = allocate(&context, 4, "icb probe 7").expect("a region");
-    let nine = allocate(&context, 4, "icb probe 9").expect("a region");
+    let a = Allocation::new(&context, 16 * 4, "icb probe a").expect("a region");
+    let b = Allocation::new(&context, 16 * 4, "icb probe b").expect("a region");
+    let seven = Allocation::new(&context, 4, "icb probe 7").expect("a region");
+    let nine = Allocation::new(&context, 4, "icb probe 9").expect("a region");
     // SAFETY: freshly allocated, nothing encoded against them.
     unsafe {
         a.zero(0, a.len()).expect("zeroes");
@@ -103,10 +103,10 @@ fn a_fire_can_be_recorded_once_and_replayed() {
     // too, the probe is wrong; if it works and the ICB does not, the ICB is
     // the finding.
     {
-        let table = driver_metal::metal::ArgumentTable::new(&context, 2).expect("a table");
+        let table = driver_metal::gpu::ArgumentTable::new(&context, 2).expect("a table");
         table.bind_address(0, a.gpu_address()).expect("binds");
         table.bind_address(1, seven.gpu_address()).expect("binds");
-        let mut stepper = driver_metal::metal::Stepper::new(&context).expect("a stepper");
+        let mut stepper = driver_metal::gpu::Stepper::new(&context).expect("a stepper");
         stepper
             .run(|encoder| {
                 encoder.set_pipeline(&pipeline);
@@ -206,7 +206,7 @@ fn execute(
     icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>,
     count: usize,
 ) {
-    let mut stepper = driver_metal::metal::Stepper::new(context).expect("a stepper");
+    let mut stepper = driver_metal::gpu::Stepper::new(context).expect("a stepper");
     stepper
         .run(|encoder| {
             encoder.execute_commands(icb, 0..count)
@@ -214,7 +214,7 @@ fn execute(
         .expect("the ICB executes");
 }
 
-fn read(handle: &driver_metal::metal::Handle) -> Vec<u32> {
+fn read(handle: &driver_metal::gpu::Handle) -> Vec<u32> {
     // SAFETY: the fire has retired, so the host owns the bytes.
     let bytes = unsafe {
         std::slice::from_raw_parts(handle.contents().as_ptr().cast::<u8>(), 16 * 4)
@@ -234,11 +234,11 @@ fn read(handle: &driver_metal::metal::Handle) -> Vec<u32> {
 /// The number it prints is the one `.wiki/driver/graph-metal.md` is about.
 #[test]
 fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
-    use driver_metal::metal::{Regions, Stepper, record};
-    use driver_metal::model::dispatch::{Geometry, plan};
-    use driver_metal::model::encode::{Params, Pipelines, encode};
-    use driver_metal::model::executor::{Frame, Slice};
-    use driver_metal::model::run::{table, table_width};
+    use driver_metal::gpu::{Regions, Stepper, record};
+    use driver_metal::lowering::dispatch::{Geometry, plan};
+    use driver_metal::gpu::bind::encode::{Params, Pipelines, commands, encode};
+    use driver_metal::lowering::executor::{Frame, Slice};
+    use driver_metal::lowering::dispatch::{table, table_width};
     use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::families::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, Row, lower};
@@ -274,9 +274,9 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
 
     // One big region answers every name, and it is REGISTERED so the
     // recording can turn an address back into a buffer.
-    let backing = allocate(&context, 256 << 20, "sentinels").expect("a region");
-    let arena = allocate(&context, (lowered.arena_bytes as u64).max(1), "arena").expect("arena");
-    let zeros = allocate(&context, 1 << 20, "fire tables").expect("a region");
+    let backing = Allocation::new(&context, 256 << 20, "sentinels").expect("a region");
+    let arena = Allocation::new(&context, (lowered.arena_bytes as u64).max(1), "arena").expect("arena");
+    let zeros = Allocation::new(&context, 1 << 20, "fire tables").expect("a region");
     // SAFETY: freshly allocated, nothing encoded against it.
     unsafe { zeros.zero(0, zeros.len()).expect("zeroes") };
     let mut store = Everything {
@@ -307,7 +307,7 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
         plan(&lowered, table(), frame, geometry, &mut store).expect("the fire plans");
     let params = Params::stage(&context, &dispatches).expect("scalars stage");
     let argtable =
-        driver_metal::metal::ArgumentTable::new(&context, table_width(&dispatches))
+        driver_metal::gpu::ArgumentTable::new(&context, table_width(&dispatches))
             .expect("an argument table");
     pipelines
         .ensure(&context, &compiler, &dispatches)
@@ -321,11 +321,15 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
     // The stand-in for an operand that addresses nothing -- `dispatch::bind`
     // answers unfilled slots with address zero, and a recorded command binds
     // a buffer rather than an address.
-    let nothing = allocate(&context, 1 << 16, "nothing").expect("a region");
+    let nothing = Allocation::new(&context, 1 << 16, "nothing").expect("a region");
     regions.set_null(&nothing);
 
-    let recording = record(&context, &pipelines, &params, &regions, &dispatches)
-        .expect("the fire records");
+    // Lowered, then recorded: `record` no longer knows what a `Dispatch` is,
+    // which is the layering `.wiki/driver/real-metal-north-star.md` §9 asks
+    // for. This test still compares the ICB against the encode below, so the
+    // two walks are held equal by output rather than by reading them.
+    let lowered = commands(&pipelines, &params, &dispatches).expect("the fire lowers");
+    let recording = record(&context, &regions, &lowered).expect("the fire records");
     assert_eq!(recording.commands(), dispatches.len());
 
     let mut stepper = Stepper::new(&context).expect("a stepper");
@@ -403,38 +407,72 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
         "a replay that is not cheaper than the encode it replaces is the whole \
          proposition failing: encode={encoded:?} replay={replayed:?}"
     );
+
+    // ---- the fallback is one failure, not four ----
+    //
+    // `submit` used to end in `.ok()`, so every way of failing to record
+    // meant "encode instead". Three of the four are bugs, and swallowing
+    // them is the worst available outcome: the answers stay RIGHT and the
+    // step gets 374x slower, so nothing ever reports it.
+    //
+    // The fire above records, so this is the same fire with one thing wrong
+    // at a time.
+
+    // Swallowed. An operand in no registered allocation is a deployment that
+    // has not registered its regions -- un-optimised, not broken, because
+    // the encode path binds addresses and does not care.
+    let unregistered = Regions::new();
+    let err = record(&context, &unregistered, &lowered)
+        .expect_err("nothing is registered, so nothing resolves to a buffer");
+    assert!(
+        matches!(err, driver_metal::Error::Unrecordable { .. }),
+        "an unresolvable operand is the ONE case a caller may swallow, and it \
+         has to be able to tell: got {err:?}"
+    );
+
+    // NOT swallowed. `pipelines.ensure` ran above; a symbol with no pipeline
+    // after it means the plan drifted from what was compiled, which is a bug
+    // that must reach the caller rather than becoming a slow success.
+    let empty = Pipelines::new(std::path::PathBuf::from("/nonexistent"));
+    let err = commands(&empty, &params, &dispatches)
+        .expect_err("an empty cache has no pipeline for any symbol");
+    assert!(
+        !matches!(err, driver_metal::Error::Unrecordable { .. }),
+        "a missing pipeline is drift, not an un-registered region -- reporting \
+         it as `Unrecordable` puts it back in the `.ok()` that hid it: got {err:?}"
+    );
 }
 
 /// Answers every name with one generous region — this test is about host
 /// cost, and `model_bind.rs` owns whether the names resolve.
 struct Everything {
-    slice: driver_metal::model::executor::Slice,
+    slice: driver_metal::lowering::executor::Slice,
     /// The fire's tables, ZEROED and kept separate from the weights. A page
     /// CSR of seeded bytes walks pages until the GPU is abandoned -- measured,
     /// a 60-second timeout.
-    tables: driver_metal::model::executor::Slice,
+    tables: driver_metal::lowering::executor::Slice,
 }
 
-impl driver_metal::model::executor::Resolver for Everything {
-    fn weight(&mut self, _: &str) -> Option<driver_metal::model::executor::Slice> {
+impl driver_metal::lowering::executor::Resolver for Everything {
+    fn weight(&mut self, _: &str) -> Option<driver_metal::lowering::executor::Slice> {
         Some(self.slice)
     }
     fn named(
         &mut self,
         _: model_compiler::trace::ValueId,
-    ) -> Option<driver_metal::model::executor::Slice> {
+    ) -> Option<driver_metal::lowering::executor::Slice> {
         Some(self.slice)
     }
-    fn kv(&mut self, _: u16, _: bool) -> Option<driver_metal::model::executor::Slice> {
+    fn kv(&mut self, _: u16, _: bool) -> Option<driver_metal::lowering::executor::Slice> {
         Some(self.slice)
     }
     fn fire(
         &mut self,
-        _: driver_metal::model::executor::FireTable,
-    ) -> Option<driver_metal::model::executor::Slice> {
+        _: driver_metal::lowering::executor::FireTable,
+    ) -> Option<driver_metal::lowering::executor::Slice> {
         Some(self.tables)
     }
-    fn pool(&mut self, _: driver_metal::model::executor::FireTable) -> Option<u32> {
+    fn pool(&mut self, _: driver_metal::lowering::executor::FireTable) -> Option<u32> {
         Some(128)
     }
 }

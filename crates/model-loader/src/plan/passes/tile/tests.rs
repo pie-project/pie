@@ -25,6 +25,13 @@ fn facts(source_dtype: DType, rows: u64, cols: u64, max_tile_bytes: u64) -> Tile
         compact_source: true,
         shape: Some((rows, cols)),
         max_tile_bytes,
+        // The kernel-selection facts. This fixture is an `Encode` from a
+        // checkpoint source, so the first two are what that means — a
+        // quantized destination has no plain dtype, and bytes on disk are
+        // never rewritten in place — and the third belongs to `Scale`.
+        dest_dtype: None,
+        in_place: false,
+        blocked_scale: false,
     }
 }
 

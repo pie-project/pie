@@ -114,8 +114,15 @@ default = []
 # rather than a build error.
 driver-cuda = ["dep:driver-cuda", "driver-cuda/cuda-13", "driver-cuda/abi"]
 # The Rust Metal shell's seam. No archive and no `extern "C"`: this one is a
-# library call, so the feature owes nothing but the dependency.
-driver-metal = ["dep:driver-metal"]
+# library call, so the feature owes nothing but the dependency and the
+# driver's own device gate.
+#
+# `driver-metal/metal-4` is NOT optional here. That crate deliberately has no
+# default feature, so that `cargo test -p driver-metal` reaches its portable
+# half; a consumer that wants the serving path has to say so. Omitting it
+# makes `driver_metal::gpu` an unresolved path IN THIS CRATE, which is the
+# better place to find out.
+driver-metal = ["dep:driver-metal", "driver-metal/metal-4"]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in

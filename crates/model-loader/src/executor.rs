@@ -16,3 +16,12 @@
 pub mod arena;
 pub mod host;
 pub mod sink;
+
+/// The CUDA arena, and the load-time transforms that run on the device.
+///
+/// Behind `feature = "cuda"`, which is off by default. The gate is this one
+/// line: [`arena::ArenaBacking`] is already the seam between deciding a load
+/// and performing it, so [`host`] does not branch on whether a GPU is present
+/// and does not learn that one can be.
+#[cfg(feature = "cuda")]
+pub mod cuda;

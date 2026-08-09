@@ -7,7 +7,8 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_metal::{Compiler, Context, Error, Heap, MAX_BINDINGS, Stepper, Tables};
+use driver_metal::Error;
+use driver_metal::gpu::{Compiler, Context, Heap, MAX_BINDINGS, Stepper, Tables};
 
 const HEAP_BYTES: u64 = 1 << 20;
 const COUNT: usize = 256;

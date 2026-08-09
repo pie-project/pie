@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::families::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{CondRegion, Fire, GuardMode, Launch, Lowered, Row, lower_with};
-use driver_cuda::model::supergraph::predicate_of;
+use driver_cuda::gpu::fire::recordings::predicate_of;
 use model_compiler::trace::FireClass;
 
 fn lowered(class: FireClass, rows: usize, guards: GuardMode) -> Lowered {
@@ -80,7 +80,7 @@ fn the_union_keeps_a_well_formed_tree() {
             r.parent
         );
         assert!(
-            (r.slot as usize) < driver_cuda::cuda::PRED_SLOTS,
+            (r.slot as usize) < driver_cuda::gpu::device::PRED_SLOTS,
             "node {i} names predicate slot {}, outside the device word",
             r.slot
         );

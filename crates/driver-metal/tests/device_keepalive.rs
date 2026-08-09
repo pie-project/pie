@@ -15,7 +15,8 @@
 
 use std::time::{Duration, Instant};
 
-use driver_metal::{Context, Error, Keepalive, MIN_DEPTH, MIN_THREADGROUPS};
+use driver_metal::Error;
+use driver_metal::gpu::{Context, Keepalive, MIN_DEPTH, MIN_THREADGROUPS};
 
 /// Small enough that a dispatch retires quickly -- the tests below want many
 /// submissions in a short window, not a busy GPU.

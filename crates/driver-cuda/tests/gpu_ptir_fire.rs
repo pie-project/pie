@@ -26,10 +26,11 @@
 //! → `ptir::Runtime::compile` (NVRTC) → `ptir::Prepared::build` → launch.
 //! That is every step the engine takes, with nothing stubbed.
 
-use driver_cuda::cuda::{Allocator, OwnedStream};
-use driver_cuda::ptir;
-use driver_cuda::ptir::{
-    ChannelShape, Control, Disk, Prepared, Rings, Runtime, Target, launch_control, nvrtc,
+use driver_cuda::gpu::device::{Allocator, OwnedStream};
+use driver_cuda::gpu::program;
+use driver_cuda::gpu::program::run::Lane;
+use driver_cuda::gpu::program::{
+    ChannelShape, Control, Disk, Prepared, Rings, Runtime, Target, launch_control, compile,
 };
 use driver::tensor_ir::DType;
 use driver::{Extents, Versions, adopt_launch_package};
@@ -123,7 +124,7 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
     let directory = std::env::temp_dir().join(format!("pie-ptir-fire-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     let disk = Disk::at(&directory);
-    let architecture = nvrtc::arch_flag(major, minor);
+    let architecture = compile::arch_flag(major, minor);
 
     let mut runtime = Runtime::new(disk.clone());
     let compiled = runtime
@@ -136,7 +137,7 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
                 major,
                 minor,
                 device: u64::try_from(device.ordinal()).unwrap_or(0),
-                nvrtc: nvrtc::version().expect("nvrtc"),
+                nvrtc: compile::version().expect("nvrtc"),
             },
         )
         .unwrap_or_else(|failure| panic!("the program must compile: {}", failure.reason()));
@@ -171,7 +172,7 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
     // real compiled program: it used to hardcode `&[0]` and `&[1]`, which
     // is right for this two-channel epilogue and says nothing about a
     // program whose local slots and global indices differ.
-    let sets = ptir::bridge::stage_channels(stage_plan).expect("the plan binds its slots");
+    let sets = driver_cuda::gpu::program::channel::stage_channels(stage_plan).expect("the plan binds its slots");
     assert_eq!(sets.need_full, vec![0], "the seeded input");
     assert_eq!(sets.need_empty, vec![1], "the reader");
     assert_eq!(sets.put, vec![1]);
@@ -204,7 +205,13 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
         ..Extents::default()
     };
     let prepared =
-        Prepared::build(&alloc, stage_plan, &rings, extents, stream.as_ref()).expect("prepare");
+        Prepared::build(
+            &alloc,
+            stage_plan,
+            &[Lane { rings: &rings, extents }],
+            stream.as_ref(),
+        )
+        .expect("prepare");
     for stage in compiled.stages.iter() {
         for region in stage.regions.iter() {
             prepared
@@ -462,14 +469,27 @@ fn every_lane_binds_its_own_row_of_the_logits() {
     ];
     let rings = Rings::new(&alloc, &shapes, stream.as_ref()).expect("rings");
 
-    let extents = Extents {
-        row_count: 4,
-        token_count: 4,
-        sampled_rows: 4,
-        ..Extents::default()
-    };
-    let mut prepared =
-        Prepared::build(&alloc, stage_plan, &rings, extents, stream.as_ref()).expect("prepare");
+    // TWO LANES, with DIFFERENT extents. The second is what makes this a
+    // multi-lane test rather than a single-lane one run twice: the lanes
+    // of a real group submit different token counts, and a table laid out
+    // for one lane has every lane after the first reading the previous
+    // lane's tail — with every field a plausible number.
+    let lane_extents = [
+        Extents { row_count: 4, token_count: 4, sampled_rows: 4, ..Extents::default() },
+        Extents { row_count: 2, token_count: 2, sampled_rows: 2, ..Extents::default() },
+    ];
+    // TWO MEMBERS, and both name THIS session's rings — which is the
+    // single-instance case. A grouped fire across instances would give
+    // each `Lane` its own, and the fire takes the pairing precisely so
+    // that a caller cannot group them and silently share channels.
+    let mut prepared = Prepared::build(
+        &alloc,
+        stage_plan,
+        &lane_extents.map(|extents| Lane { rings: &rings, extents }),
+        stream.as_ref(),
+    )
+    .expect("prepare");
+    assert_eq!(prepared.lanes(), 2, "a fire has as many lanes as it was given extents");
 
     // Unbound is address zero, which is the state this test exists to end.
     let (base, ..) = prepared
@@ -499,11 +519,10 @@ fn every_lane_binds_its_own_row_of_the_logits() {
         .expect("bind");
     stream.as_ref().synchronize().expect("sync");
 
-    // Over the lanes the fire ACTUALLY has, which is one today — multi-lane
-    // grouping is the first thing `ptir::fire`'s header says it does not do.
-    // Written against `lanes()` rather than a constant so that the day
-    // grouping lands, this covers it instead of passing for the wrong
-    // reason.
+    // Over the lanes the fire ACTUALLY has. Written against `lanes()`
+    // rather than a constant so that it covers whatever the fire was
+    // given — which is now two, and was one when the fire could only be
+    // one.
     for lane in 0..prepared.lanes() {
         let (base, mode, width, stride, offset) = prepared
             .intrinsic_binding(IntrinsicId::Logits, lane, stream.as_ref())
@@ -541,8 +560,8 @@ fn every_lane_binds_its_own_row_of_the_logits() {
 /// disagreement here cannot be rounding.
 #[test]
 fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
-    use driver_cuda::ptir::bridge::{HostChannel, stage_channels};
-    use driver_cuda::ptir::session::{Fired, Session};
+    use driver_cuda::gpu::program::channel::{HostChannel, stage_channels};
+    use driver_cuda::gpu::program::session::{Fired, Session};
 
     let _gpu = gpu_guard();
     let Some(device) = device_or_skip("PTIR session") else {
@@ -583,7 +602,7 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
     let directory = std::env::temp_dir().join(format!("pie-ptir-session-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     let disk = Disk::at(&directory);
-    let architecture = nvrtc::arch_flag(major, minor);
+    let architecture = compile::arch_flag(major, minor);
     let mut runtime = Runtime::new(disk.clone());
     let compiled = runtime
         .compile(
@@ -595,7 +614,7 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
                 major,
                 minor,
                 device: u64::try_from(device.ordinal()).unwrap_or(0),
-                nvrtc: nvrtc::version().expect("nvrtc"),
+                nvrtc: compile::version().expect("nvrtc"),
             },
         )
         .unwrap_or_else(|f| panic!("compiles: {}", f.reason()));
@@ -661,7 +680,7 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
                 // skipped and nothing reads address zero.
                 (0, 0, 0),
                 |lane| lane,
-                Extents { row_count: 1, token_count: 1, sampled_rows: 1, ..Extents::default() },
+                &[Extents { row_count: 1, token_count: 1, sampled_rows: 1, ..Extents::default() }],
                 &alloc,
                 stream.as_ref(),
             )

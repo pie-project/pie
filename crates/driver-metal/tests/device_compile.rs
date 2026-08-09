@@ -11,7 +11,7 @@
 //! the failure rate from three runs in six to none, while changing nothing
 //! about the damage.
 
-use driver_metal::{Compiler, Context};
+use driver_metal::gpu::{Compiler, Context};
 
 const THREADS: usize = 8;
 

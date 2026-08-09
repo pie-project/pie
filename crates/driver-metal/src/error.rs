@@ -117,6 +117,34 @@ pub enum Error {
         working_set: u64,
     },
 
+    /// This fire cannot be RECORDED, and encoding it is correct.
+    ///
+    /// The only failure in this crate that a caller is meant to swallow, and
+    /// it has its own variant so that swallowing it is a `match` rather than
+    /// an `.ok()`.
+    ///
+    /// Recording is an optimisation: replaying an indirect command buffer
+    /// costs 39.8 us where encoding the same 424 dispatches costs 14.87 ms.
+    /// But an ICB binds BUFFERS, so it can only be made once every region a
+    /// fire's operands point into has been registered — and a caller that
+    /// has not registered its weights is not broken, it is un-optimised. The
+    /// encode path binds addresses and does not care.
+    ///
+    /// **Everything else `record` can fail at is a bug.** A symbol with no
+    /// compiled pipeline means the plan drifted from what was compiled; a
+    /// dispatch that states scalars with nothing staged means the plan
+    /// drifted from what was staged; a device that declines an ICB is a
+    /// device failure. Under one variant and an `.ok()`, all four arrived as
+    /// "fall back to encoding", so three real faults became a 374x
+    /// regression and no message. That is the whole reason this variant
+    /// exists: the fallback is now the narrow case, by name.
+    Unrecordable {
+        /// What could not be turned into a command, for the message.
+        what: &'static str,
+        /// Why not.
+        message: String,
+    },
+
     /// A launch program the interpreter cannot run.
     ///
     /// Distinct from every other variant because nothing here is the
@@ -129,15 +157,39 @@ pub enum Error {
         /// What the interpreter could not make sense of.
         message: String,
     },
+
+    /// A request this backend does not serve, for a reason the machine has
+    /// nothing to do with.
+    ///
+    /// The seam's own refusals, and they are all one shape: a verb called
+    /// before `load_model` allocated what it needs, a checkpoint whose family
+    /// no Metal text states, a boot config with no `[model] descriptor`, a
+    /// verb this backend does not implement. Nothing is exhausted, nothing
+    /// failed to compile, and no device declined anything — the fix is in the
+    /// deployment or in the call order, never in the machine.
+    ///
+    /// That is exactly the distinction [`Error::Create`] cannot make. A
+    /// caller looking at "unknown model family" and "the heap declined a
+    /// buffer" wants to do opposite things, and under one variant with 44
+    /// `what` strings the only way to tell them apart is to match on prose.
+    /// This is one of the four remediation-keyed variants
+    /// `.wiki/driver/real-metal-north-star.md` §10 asks for, landed where the
+    /// facade needed it.
+    Unserved {
+        /// Which verb refused, for the message.
+        what: &'static str,
+        /// What it will not serve, and what would change that.
+        message: String,
+    },
 }
 
 /// The channel plane's one failure, adopted rather than translated.
 ///
-/// [`driver_pipeline`] carries a `Program` variant of its own — it is the only
+/// The `driver` crate carries a `Program` variant of its own — it is the only
 /// thing that layer can fail at — and this shell's is the same fact. The
 /// conversion exists so a `?` on a `pipeline::` result lands here without a
 /// match at every call site, which is what makes the extraction of
-/// `src/pipeline/` into its own crate invisible to the code that calls it.
+/// the channel plane into its own crate invisible to the code that calls it.
 impl From<driver::Error> for Error {
     fn from(error: driver::Error) -> Self {
         match error {
@@ -190,6 +242,12 @@ impl fmt::Display for Error {
             ),
             Self::Program { message } => {
                 write!(f, "launch program cannot be interpreted: {message}")
+            }
+            Self::Unrecordable { what, message } => {
+                write!(f, "{what} cannot be recorded, so it was encoded: {message}")
+            }
+            Self::Unserved { what, message } => {
+                write!(f, "driver-metal: {what}: {message}")
             }
             Self::WorkingSetExceeded {
                 requested,

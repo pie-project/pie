@@ -15,9 +15,9 @@
 use std::fmt::Write as _;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::store::kv_cache::{self, KvCacheLayout, LayerSlot, PerLayer};
-use driver_cuda::store::kv_geometry::{self, LayerShapes};
-use driver_cuda::store::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};
+use driver_cuda::gpu::pools::kv_cache::{self, KvCacheLayout, LayerSlot, PerLayer};
+use driver_cuda::layout::kv_geometry::{self, LayerShapes};
+use driver_cuda::layout::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};
 use driver_cuda::tensor::TensorSpec;
 
 /// FNV-1a 64 of the C++ oracle's transcript.

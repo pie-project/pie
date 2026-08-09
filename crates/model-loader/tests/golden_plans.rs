@@ -29,6 +29,7 @@ use model_loader::contract::ModelContract;
 use model_loader::plan::compile as compile_load_plan;
 use model_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
+    TILE_MAP_REPACK,
     compiler_version,
 };
 use model_loader::types::{
@@ -350,6 +351,25 @@ fn awq_checkpoint() -> CheckpointMetadata {
 
 // ── the harness ─────────────────────────────────────────────────────
 
+/// A target that has the Marlin MXFP4 GEMM, and therefore the repack that
+/// feeds it.
+///
+/// The two go together and did not used to have to: `CUDA_TILE_MAP_MASK`
+/// claimed `Repack` for every CUDA target, so setting `native_mxfp4_moe`
+/// alone was enough to compile a repacking plan. That made the mask carry a
+/// capability on behalf of a flag — and the flag is FALSE on every driver in
+/// this tree, because none of them ported the Marlin repack, so the claim was
+/// true of nothing.
+///
+/// Stating both here is what the pairing actually is: a target claiming a
+/// native MXFP4 GEMM is claiming the kernel that builds its operand.
+fn marlin_target(tp_rank: u32, tp_size: u32) -> StorageTarget {
+    let mut target = target(BackendKind::Cuda, tp_rank, tp_size);
+    target.native_mxfp4_moe = true;
+    target.tile_map_mask |= TILE_MAP_REPACK;
+    target
+}
+
 fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
     StorageTarget {
         backend,
@@ -654,12 +674,10 @@ fn gpt_oss_mxfp4_cuda() {
 
 #[test]
 fn gpt_oss_mxfp4_cuda_native_gemm() {
-    let mut target = target(BackendKind::Cuda, 0, 1);
-    target.native_mxfp4_moe = true;
     check(
         "gpt_oss_mxfp4_cuda_native_gemm",
         &gpt_oss_checkpoint(),
-        target,
+        marlin_target(0, 1),
     );
 }
 
@@ -667,12 +685,10 @@ fn gpt_oss_mxfp4_cuda_native_gemm() {
 /// carry, `MarlinMxfp4Weight` and `MarlinMxfp4Scale`, appear in this contract.
 #[test]
 fn gpt_oss_native_mxfp4() {
-    let mut target = target(BackendKind::Cuda, 0, 1);
-    target.native_mxfp4_moe = true;
     check(
         "gpt_oss_native_mxfp4",
         &gpt_oss_native_checkpoint(64),
-        target,
+        marlin_target(0, 1),
     );
 }
 
@@ -684,12 +700,10 @@ fn gpt_oss_native_mxfp4() {
 /// `Expr::Shard` must leave these bytes untouched.
 #[test]
 fn gpt_oss_native_mxfp4_tp1_of_2() {
-    let mut target = target(BackendKind::Cuda, 1, 2);
-    target.native_mxfp4_moe = true;
     check(
         "gpt_oss_native_mxfp4_tp1_of_2",
         &gpt_oss_native_checkpoint(128),
-        target,
+        marlin_target(1, 2),
     );
 }
 

@@ -211,6 +211,19 @@ jobs:
           cargo test -p driver-cuda --features cuda-12
           cargo test -p driver-cuda --features cuda-13
 
+      # The half of driver-cuda that is correct without a GPU. No feature
+      # at all now BUILDS rather than refusing — the `compile_error!` is
+      # down to the one case it was ever about, both CUDA versions at
+      # once. This is the only job that compiles the other side of the
+      # `_cuda` cfg, and without it the gate drifts back to the
+      # subsystem boundary it started at -- which is how `memory_planner`,
+      # `mla_geometry` and `dsv4_geometry` sat parity-tested with zero callers
+      # for months. North-star rule 2: cut by "is this correct without a GPU?",
+      # not by subsystem. The BUILD is the test; the five assertions only
+      # demonstrate that each module is usable rather than merely reachable.
+      - name: cargo test (driver-cuda, portable half, no feature at all)
+        run: cargo test -p driver-cuda
+
       # The one test that cannot live beside the driver. It registers a REAL
       # PTIR program through `pie_cuda_register_program` and fires it, which
       # needs the producer half — `tensor_compiler`'s bind/compile/emit chain
@@ -398,8 +411,27 @@ jobs:
             target
           key: ${{ runner.os }}-driver-metal-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo test (driver-metal)
+      # BOTH halves, on one runner, which is the whole point of `metal-4`
+      # being a feature rather than `cfg(target_vendor = "apple")`:
+      #
+      #   A platform cfg cannot be tested. A feature can.
+      #
+      # On macOS `target_vendor = "apple"` is always true, so the portable
+      # half was never compiled by any job in the tree; on Linux it is always
+      # false, so the Apple half never was. No machine built both, and that is
+      # exactly how three cross-boundary errors got in and stayed
+      # (`.wiki/driver/real-metal-north-star.md` §7). There is still no Linux
+      # job for this crate — `model-loader` pulls `zstd-sys`, a C build that
+      # needs a cross toolchain — and with the feature there does not need to
+      # be one.
+      #
+      # The name says what the green tick means, because a job that tested
+      # nothing and a job that tested the portable half look identical.
+      - name: cargo test (driver-metal, portable half — no GPU)
         run: cargo test -p driver-metal
+
+      - name: cargo test (driver-metal, metal-4)
+        run: cargo test -p driver-metal --features metal-4
 
       # Type-check AND test: the seam's tests run everything that needs no
       # checkpoint, and the checkpoint-gated ones state that they skipped.
@@ -414,8 +446,15 @@ jobs:
           cargo build -p worker \
             --no-default-features --features driver-metal,driver-dummy
 
-      - name: cargo clippy (driver-metal)
+      # Both configurations again: a lint that only fires in one half is a
+      # lint nobody sees.
+      - name: cargo clippy (driver-metal, portable half)
         run: cargo clippy --no-deps -p driver-metal --all-targets -- -D warnings
+
+      - name: cargo clippy (driver-metal, metal-4)
+        run: |
+          cargo clippy --no-deps -p driver-metal --all-targets \
+            --features metal-4 -- -D warnings
 
   pie-worker-cuda:
     name: pie-worker (driver-cuda)

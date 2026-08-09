@@ -18,6 +18,7 @@ pub mod group;
 pub mod index;
 pub mod pass;
 pub mod passes;
+pub mod spans;
 
 pub use crate::extent::{Dim, Extent};
 pub use passes::tile::{
@@ -115,6 +116,57 @@ pub struct StorageTarget {
     /// would be a second rule to keep in sync with the kernel — such a source is
     /// simply not tiled.
     pub block_scale_rows: u32,
+}
+
+impl StorageTarget {
+    /// The target a backend asks for, stated once.
+    ///
+    /// Four sites used to write this literal — both drivers, `pie model build`
+    /// and `pie model import` — and every one of them repeated `256`, `64 MiB`
+    /// and `BF16`. Repetition was not the worst of it: each also restated the
+    /// backend's `tile_map_mask`, so a driver and
+    /// [`passes::tile`](crate::plan::passes::tile) each held an opinion about
+    /// which transforms that device implements, and a test compared the two
+    /// instead of there being one.
+    ///
+    /// The mask comes from [`passes::tile::tile_map_mask`], which is the
+    /// loader's model of the backend and now the only statement of it. That
+    /// inverts the old rule — the driver was the authority and the loader
+    /// checked it — and the reason is that the loader is where the consequence
+    /// lands: it decides which plans compile, and it owns the host fallback
+    /// every claimed transform has to have.
+    ///
+    /// The fields NOT here are the ones a caller genuinely varies:
+    /// `native_mxfp4_moe` and `fusion_mask` are per-request capabilities, and
+    /// `block_scale_rows` belongs to an encode path. Each starts at the
+    /// conservative answer and is set by the caller that knows better.
+    #[must_use]
+    pub fn for_backend(backend: BackendKind, tp_rank: u32, tp_size: u32) -> Self {
+        Self {
+            backend,
+            tp_rank,
+            tp_size: tp_size.max(1),
+            // What cuBLAS wants for a matrix operand and what `cudaMalloc`
+            // itself guarantees, so a view into the arena is as aligned as its
+            // own allocation would have been. Metal's buffers want no less.
+            preferred_alignment: 256,
+            // How much host staging one load-time transform may take at once.
+            max_tile_bytes: 64 * 1024 * 1024,
+            tile_map_mask: passes::tile::tile_map_mask(backend),
+            // FALSE, and the name is the trap. `native_mxfp4_moe` does not mean
+            // "reads MXFP4"; it means "has a native MXFP4 *GEMM*", which in
+            // gpt-oss's contract selects a Marlin REPACK of the expert banks —
+            // work this tree did not port. A driver whose GEMM reads the stored
+            // banks directly wants the other branch, which is this one.
+            native_mxfp4_moe: false,
+            // No fused transcode kernels in this tree.
+            fusion_mask: 0,
+            // The dtype the encode kernels dequantize through, which decides
+            // how many rows of scratch fit in the tile budget.
+            encode_scratch_dtype: DType::BF16,
+            block_scale_rows: 0,
+        }
+    }
 }
 
 impl Default for StorageTarget {
@@ -331,6 +383,31 @@ pub struct TransformSpec {
     /// what they see.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scale_blocks: Vec<i64>,
+    /// The backend entry point this transform runs as, when the target has one
+    /// for these exact operands.
+    ///
+    /// Filled in by [`passes::tile::lower`](crate::plan::passes::tile::lower)
+    /// against the target's own kernel table, and `None` when no row covers
+    /// the operands — a dtype pair with no cast kernel, a uniform `Scale`
+    /// where the kernel wants a per-group operand, an MXFP4 `Encode` whose
+    /// width is not a multiple of its block. Those run on the host, and the
+    /// plan now SAYS which ones will.
+    ///
+    /// This is the field that lets a backing stop deciding. A capability bit
+    /// is per KIND and a kernel is per SHAPE, so a backing asked "can you do
+    /// `Cast`" could only answer for the kind and then decline the operands at
+    /// launch — which made "the loader transforms on the GPU" a claim you had
+    /// to instrument a load to check. Naming the row moves that answer to
+    /// compile time, where the tensor is still in hand to name in the refusal,
+    /// and leaves the backing a lookup.
+    ///
+    /// A `String` rather than a `&'static str` because a plan is serialized and
+    /// cached. The symbol is checked against the target's table when it is
+    /// chosen, so a plan cannot name a row that does not exist; a plan read
+    /// back from an older cache is refused by the compiler hash before it gets
+    /// here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

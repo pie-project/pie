@@ -1,4 +1,4 @@
-//! Differential proof that [`crate::store::planner_policy`] reproduces the
+//! Differential proof that [`crate::layout::planner_policy`] reproduces the
 //! original C++ policy layer exactly.
 //!
 //! This follows the protocol established by `kv_format_parity.rs`: build the
@@ -61,7 +61,7 @@
 //! stronger -- a one-ulp difference in `log2` would survive text rounding at
 //! some precisions but cannot survive this.
 
-use driver_cuda::store::planner_policy::{
+use driver_cuda::layout::planner_policy::{
     MIN_KV_TOKENS_FLOOR, align_up, clamp_pow2_nearest, decode_target, decode_target_for_profile,
     kv_page_size, kv_page_size_candidates, kv_page_size_for_profile, log2_ratio, policy_profiles,
     prefill_candidate_cap, prefill_target, prefill_target_for_profile, target_saturation_score,

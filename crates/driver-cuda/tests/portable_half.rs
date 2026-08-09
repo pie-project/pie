@@ -34,7 +34,7 @@
 /// exhaustive version; this one only has to be a model.
 struct PaperModel;
 
-impl driver_cuda::store::memory_planner::ModelCosts for PaperModel {
+impl driver_cuda::layout::memory_planner::ModelCosts for PaperModel {
     fn per_kv_token_bytes(&self) -> u64 {
         // 8 layers x 4 kv heads x 64 dim x 2 planes x 2 bytes.
         8 * 4 * 64 * 2 * 2
@@ -66,12 +66,12 @@ impl driver_cuda::store::memory_planner::ModelCosts for PaperModel {
 /// has never run a calibration boot.
 struct NoMeasurement;
 
-impl driver_cuda::store::memory_planner::ProfileSource for NoMeasurement {
+impl driver_cuda::layout::memory_planner::ProfileSource for NoMeasurement {
     fn lookup(
         &self,
-        _key: &driver_cuda::store::profile_key::ProfileKey,
-    ) -> driver_cuda::store::memory_planner::ProfileRead {
-        driver_cuda::store::memory_planner::ProfileRead::default()
+        _key: &driver_cuda::layout::profile_key::ProfileKey,
+    ) -> driver_cuda::layout::memory_planner::ProfileRead {
+        driver_cuda::layout::memory_planner::ProfileRead::default()
     }
     fn path(&self) -> String {
         String::new()
@@ -86,7 +86,7 @@ impl driver_cuda::store::memory_planner::ProfileSource for NoMeasurement {
 /// here would have made obvious.
 #[test]
 fn the_memory_planner_plans() {
-    use driver_cuda::store::memory_planner as mp;
+    use driver_cuda::layout::memory_planner as mp;
 
     let cfg = mp::PlannerConfig {
         gpu_mem_utilization: 0.90,
@@ -140,7 +140,7 @@ fn the_memory_planner_plans() {
 /// executor — so this is the ONLY place either of them runs.
 #[test]
 fn the_attention_geometries_resolve() {
-    use driver_cuda::store::{dsv4_geometry, mla_geometry};
+    use driver_cuda::layout::{dsv4_geometry, mla_geometry};
 
     // DeepSeek's numbers: 512 compressed KV, 64 rope.
     let mla = mla_geometry::MlaGeometry::new(8, 128, 16, 512, 64, driver_cuda::DType::Bf16)
@@ -163,7 +163,7 @@ fn the_attention_geometries_resolve() {
 /// is, the other allocates it, and only the second needs a card.
 #[test]
 fn the_kv_geometry_shapes_pages_without_allocating_them() {
-    use driver_cuda::store::{KvCacheFormat, kv_geometry};
+    use driver_cuda::layout::{KvCacheFormat, kv_geometry};
 
     let format = KvCacheFormat::default();
     let bytes = kv_geometry::page_bytes_homogeneous(8, 4, 64, 1, &format);
@@ -172,47 +172,22 @@ fn the_kv_geometry_shapes_pages_without_allocating_them() {
     assert_eq!(bytes, 8 * one, "eight identical layers cost eight pages");
 }
 
-/// The sideband arena's growth rule, without the allocator that serves it.
+/// The KV format's scale planes, which decide how many buffers a
+/// quantised page has — the arithmetic a swap plan is built against.
 ///
-/// `DeviceMemory` is a trait for exactly this reason and the module says
-/// so — *"the growth path frees the old block before it learns whether a
-/// replacement exists, and that ordering is only testable against an
-/// allocator that can be told to fail on cue"*. What this adds is a
-/// BUILD in which that reason is load-bearing rather than merely stated.
+/// This replaced a `SidebandArena` case, and the swap is worth
+/// recording: the arena's growth rule IS portable arithmetic, but the
+/// arena manages DEVICE memory, so it lives in `gpu/fire/` and the
+/// portable half cannot see it. That is the boundary working rather
+/// than failing — the test moved to something on the correct side of
+/// it instead of the module moving to the wrong one.
 #[test]
-fn the_arena_grows_without_a_device() {
-    use driver_cuda::model::sideband_arena::{DeviceMemory, Region, SidebandArena};
+fn the_kv_format_counts_its_planes() {
+    use driver_cuda::layout::KvCacheFormat;
 
-    #[derive(Default)]
-    struct Paper {
-        next: usize,
-        freed: usize,
-    }
-    impl DeviceMemory for Paper {
-        fn alloc(&mut self, bytes: usize) -> Option<*mut std::ffi::c_void> {
-            self.next += bytes.max(1);
-            Some(self.next as *mut std::ffi::c_void)
-        }
-        fn free(&mut self, _ptr: *mut std::ffi::c_void) {
-            self.freed += 1;
-        }
-        fn synchronize(&mut self) -> bool {
-            true
-        }
-    }
-
-    let mut paper = Paper::default();
-    let mut arena = SidebandArena::new();
-    let first = arena
-        .acquire(&mut paper, Region::Mask, 1024)
-        .expect("a fresh arena grows");
-    assert!(!first.is_null());
-    arena.release(Region::Mask);
-    arena
-        .acquire(&mut paper, Region::Mask, 8 << 20)
-        .expect("and grows again past its floor");
-    assert!(paper.freed > 0, "growing retires the old block");
-    arena.destroy(&mut paper);
+    let plain = KvCacheFormat::default();
+    let bytes = driver_cuda::layout::kv_geometry::device_bytes_per_page(&plain, 1, 4, 64);
+    assert!(bytes > 0, "an unquantised page still has a size");
 }
 
 /// The profile cache's number formatting, which exists for byte-parity
@@ -220,6 +195,6 @@ fn the_arena_grows_without_a_device() {
 #[test]
 fn the_json_writer_is_text() {
     let mut out = String::new();
-    driver_cuda::store::dtoa::write_f64(&mut out, 0.1);
+    driver_cuda::layout::dtoa::write_f64(&mut out, 0.1);
     assert_eq!(out, "0.1", "the shortest round-tripping form, not 0.1000000000000000055");
 }

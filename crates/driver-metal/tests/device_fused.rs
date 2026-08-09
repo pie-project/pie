@@ -18,10 +18,9 @@ use driver_api::plan::{
     EmittedKernel, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchRegion, LaunchStage,
     LaunchStagePlan,
 };
-use driver_metal::pipeline::{ExecPlan, StatusOutcome, Versions, adopt_launch_package};
-use driver_metal::{
-    Archives, Context, DeviceInputs, Error, Externals, Pool, Prepare, Runtime, Stepper, Tables,
-};
+use driver_metal::channel::{ExecPlan, StatusOutcome, Versions, adopt_launch_package};
+use driver_metal::Error;
+use driver_metal::gpu::{Archives, Context, DeviceInputs, Externals, Pool, Prepare, Runtime, Stepper, Tables};
 use tensor_ir::op::tags;
 use tensor_ir::registry::Stage;
 

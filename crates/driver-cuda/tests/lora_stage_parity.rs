@@ -1,7 +1,7 @@
 //! Behavioural parity with the C++ lora staging — gate-lora slice A.
 //!
 //! The oracle in `tests/oracle/lora_stage/` compiles the real
-//! `llama_like.cpp` and drives `llama_like_lora_stage` over lane tables:
+//! `llama_like.cpp` and drives `stage_qkv_adapters` over lane tables:
 //! the validation chain, the arena discipline, the casts, the grouping,
 //! the pointer slab, and the fingerprint. This test replays the same
 //! cases — twice, the second pass with the grouped lowering off, exactly
@@ -20,11 +20,11 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
-use driver_cuda::model::lora::{
+use driver_cuda::gpu::fire::lora::{
     LORA_SITE_K, LORA_SITE_Q, LORA_SITE_V, LoraForm, LoraFireState, LoraLaneView, LoraOps,
-    LoraStageArena, LoraStageRows, LoraTable, llama_like_lora_stage,
+    LoraStageArena, LoraStageRows, LoraTable, stage_qkv_adapters,
 };
-use driver_cuda::model::sideband_arena::DeviceMemory;
+use driver_cuda::gpu::fire::sideband_arena::DeviceMemory;
 
 /// FNV-1a 64 of the C++ oracle's transcript.
 const GOLDEN_FNV1A64: u64 = 0x859d5a2da5642b23;
@@ -198,7 +198,7 @@ fn run_stage(
     r.case = name.to_string();
     r.note(&format!("call lanes={} N={total_tokens}", lanes.len()));
     let table = LoraTable { lanes };
-    match llama_like_lora_stage(
+    match stage_qkv_adapters(
         r,
         &mut f.arena,
         Some(&table),
@@ -240,7 +240,7 @@ fn sweep(r: &mut Recorder, grouped: bool) {
     {
         let mut f = Fixture::new(r, 16, K_HK);
         r.case = "a-null".into();
-        let (fp, staged) = llama_like_lora_stage(
+        let (fp, staged) = stage_qkv_adapters(
             r,
             &mut f.arena,
             None,
@@ -261,7 +261,7 @@ fn sweep(r: &mut Recorder, grouped: bool) {
             if staged.is_some() { "set" } else { "null" }
         ));
         let empty = LoraTable { lanes: &[] };
-        let (fp2, _) = llama_like_lora_stage(
+        let (fp2, _) = stage_qkv_adapters(
             r,
             &mut f.arena,
             Some(&empty),

@@ -22,13 +22,11 @@ use driver_api::plan::{
     EmittedKernel, LaunchChannel, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchRegion,
     LaunchStage, LaunchStagePlan,
 };
-use driver_metal::pipeline::{
+use driver_metal::channel::{
     ExecPlan, Reason, StatusOutcome, Ticket, Versions, adopt_launch_package,
 };
-use driver_metal::{
-    Archives, Context, DeviceInputs, Error, Externals, Mode, Pool, Prepare, Ring, Runtime, Stepper,
-    Tables,
-};
+use driver_metal::Error;
+use driver_metal::gpu::{Archives, Context, DeviceInputs, Externals, Mode, Pool, Prepare, Ring, Runtime, Stepper, Tables};
 use tensor_ir::DType;
 use tensor_ir::op::tags;
 use tensor_ir::registry::Stage;

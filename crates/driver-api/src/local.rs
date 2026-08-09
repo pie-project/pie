@@ -2785,7 +2785,7 @@ pub fn validate_create_out_params(caps: *mut PieDriverCaps) -> PieAbiValidationR
 // A Rust crate calling a Rust crate through a C linkage buys nothing and
 // costs the type system: no checking across the call, no lifetimes, and a
 // `*mut PieDriver` where a `&mut Shell` would do. The engine calls
-// `driver_cuda::serve::*` directly now.
+// `driver_cuda::gpu::serve::*` directly now.
 
 unsafe extern "C" {
     pub fn pie_metal_create(

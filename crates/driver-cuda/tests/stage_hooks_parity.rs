@@ -17,8 +17,8 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
-use driver_cuda::model::attn_score::AttentionObservation;
-use driver_cuda::model::stage_hooks::{
+use driver_cuda::gpu::fire::attn_score::AttentionObservation;
+use driver_cuda::gpu::fire::stage_hooks::{
     StageHookExecute, StageHookPoint, StageHookSideband, StageHooks, default_hooks,
     invoke_stage_hook,
 };

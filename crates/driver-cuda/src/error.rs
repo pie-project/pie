@@ -45,6 +45,34 @@ pub enum Error {
         /// The code it returned.
         code: CUresult,
     },
+    /// An allocation this crate could not make, and HOW MUCH it wanted.
+    ///
+    /// The size is the whole reason this is not `Invalid`. A pool that
+    /// answered `PIE_STATUS_EXHAUSTED` could say only *that* it failed;
+    /// an engine deciding whether to evict, shrink the batch or refuse
+    /// the request needs the figure, and the figure was on stderr while
+    /// the caller got `-1`.
+    Exhausted {
+        /// What ran out — `"fire arena"`, `"kv pool"`.
+        what: &'static str,
+        /// Bytes requested.
+        want: usize,
+    },
+    /// A shape this driver has no path for.
+    ///
+    /// DISTINCT FROM `Invalid`, and the distinction is the caller's:
+    /// an invalid argument is the engine's mistake and an unsupported
+    /// shape is this driver's limit. They map to different ABI statuses
+    /// and a scheduler does different things with them — retry the
+    /// request differently, or do not send it here again.
+    ///
+    /// Collapsing the two is not hypothetical: it is what happened when
+    /// `model::deployment::Refusal` first crossed this boundary, and
+    /// `an_unserveable_gqa_ratio_is_refused_at_load` caught it.
+    Unsupported {
+        /// What cannot be served.
+        what: String,
+    },
     /// A precondition this crate checks itself, before any CUDA call. Used
     /// where the C++ shell throws `std::invalid_argument` / `std::runtime_error`.
     Invalid {
@@ -61,11 +89,19 @@ impl Error {
         Self::Invalid { call, reason: reason.into() }
     }
 
+    /// An allocation that could not be made, carrying its size.
+    #[must_use]
+    pub const fn exhausted(what: &'static str, want: usize) -> Self {
+        Self::Exhausted { what, want }
+    }
+
     /// The failing call's name, whichever kind of failure this is.
     pub fn call(&self) -> &'static str {
         match self {
             #[cfg(feature = "_cuda")]
             Self::Runtime { call, .. } | Self::Driver { call, .. } => call,
+            Self::Exhausted { what, .. } => what,
+            Self::Unsupported { .. } => "unsupported",
             Self::Invalid { call, .. } => call,
         }
     }
@@ -83,6 +119,10 @@ impl fmt::Display for Error {
             Self::Runtime { call, code } => write!(f, "{call} failed: {code:?}"),
             #[cfg(feature = "_cuda")]
             Self::Driver { call, code } => write!(f, "{call} failed: {code:?}"),
+            Self::Exhausted { what, want } => {
+                write!(f, "{what}: {want} bytes could not be allocated")
+            }
+            Self::Unsupported { what } => write!(f, "unsupported: {what}"),
             Self::Invalid { call, reason } => write!(f, "{call}: {reason}"),
         }
     }
@@ -111,6 +151,7 @@ pub(crate) fn check_cu(code: CUresult, call: &'static str) -> Result<()> {
 /// go, so it is dropped on the floor exactly as the C++ `~T() noexcept` bodies
 /// drop theirs. Named so that every such site is greppable, which the C++
 /// spelling (a bare `cudaFree(p);` with no check) is not.
+#[cfg(feature = "_cuda")]
 #[inline]
 pub(crate) fn ignore_in_drop<T>(_code: T) {}
 
@@ -142,5 +183,103 @@ mod tests {
             check_rt(cudaError::cudaSuccess, "cudaMemcpyAsync")
         }
         assert_eq!(both().unwrap_err().call(), "cuMemCreate");
+    }
+}
+
+/// The ABI's three-bit summary of an [`Error`].
+///
+/// ONE conversion, and it lives here rather than at each call site so
+/// that a layer returning `Result<_, i32>` is a layer that has thrown
+/// away what happened. `gpu::serve::status_of` is the only caller that
+/// should also LOG — the conversion is the last moment the detail
+/// exists, so the log belongs at the boundary, not at the failure.
+#[cfg(feature = "abi")]
+impl From<Error> for i32 {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Exhausted { .. } => driver_api::PIE_STATUS_EXHAUSTED,
+            Error::Unsupported { .. } => driver_api::PIE_STATUS_UNSUPPORTED,
+            Error::Invalid { .. } => driver_api::PIE_STATUS_INVALID_ARGUMENT,
+            #[cfg(feature = "_cuda")]
+            Error::Runtime { .. } | Error::Driver { .. } => driver_api::PIE_STATUS_DRIVER_ERROR,
+        }
+    }
+}
+
+/// The staging seam's failures, which are CUDA's under another name.
+///
+/// A `From` rather than a rewrite of `StagingError`: that type is what
+/// the workspace's ops trait returns and it is right for that layer.
+/// What was wrong was every CALLER translating it to a bare status by
+/// hand, which is where the reason was lost.
+#[cfg(all(feature = "abi", feature = "_cuda"))]
+impl From<crate::gpu::fire::attention_workspace::StagingError> for Error {
+    fn from(e: crate::gpu::fire::attention_workspace::StagingError) -> Self {
+        Self::invalid("attention workspace", format!("{e:?}"))
+    }
+}
+
+#[cfg(all(feature = "abi", feature = "_cuda"))]
+impl From<crate::gpu::device::cublas::CublasError> for Error {
+    fn from(e: crate::gpu::device::cublas::CublasError) -> Self {
+        Self::invalid("cublas", format!("{e:?}"))
+    }
+}
+
+/// Reading a snapshot off disk. The path is the whole diagnosis, and a
+/// bare `PIE_STATUS_DRIVER_ERROR` discarded it.
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::invalid("io", e.to_string())
+    }
+}
+
+impl From<std::string::FromUtf8Error> for Error {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        Self::invalid("utf8", e.to_string())
+    }
+}
+
+/// The transitive hops `?` needs while callers still return `i32`.
+///
+/// These exist because `From<X> for Error` plus `From<Error> for i32`
+/// is NOT transitive, and every function that still returns a bare
+/// status needs one hop. Each is therefore a MARKER for a signature
+/// that has not been converted — when the last `Result<_, i32>` in
+/// this crate goes, so do these.
+#[cfg(all(feature = "abi", feature = "_cuda"))]
+impl From<crate::gpu::fire::attention_workspace::StagingError> for i32 {
+    fn from(e: crate::gpu::fire::attention_workspace::StagingError) -> Self {
+        Error::from(e).into()
+    }
+}
+
+#[cfg(all(feature = "abi", feature = "_cuda"))]
+impl From<crate::gpu::device::cublas::CublasError> for i32 {
+    fn from(e: crate::gpu::device::cublas::CublasError) -> Self {
+        Error::from(e).into()
+    }
+}
+
+
+/// A checkpoint `crates/model` will not derive a deployment for.
+///
+/// THE CONVERSION IS THE BOUNDARY. `facts_from_hf` used to return
+/// `PIE_STATUS_UNSUPPORTED` directly — the engine's vocabulary,
+/// manufactured by a derivation that has no engine — and moving it into
+/// `crates/model` made that impossible to keep. What crosses now is a
+/// `Refusal`, and this is where it becomes a status.
+impl From<model::deployment::Refusal> for Error {
+    fn from(e: model::deployment::Refusal) -> Self {
+        match e {
+            // A SHAPE, not a bad argument. The engine did nothing
+            // wrong; this driver has no path for the checkpoint.
+            model::deployment::Refusal::Unsupported => {
+                Self::Unsupported { what: e.to_string() }
+            }
+            model::deployment::Refusal::Malformed(_) => {
+                Self::invalid("deployment", e.to_string())
+            }
+        }
     }
 }

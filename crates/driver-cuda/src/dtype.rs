@@ -86,7 +86,7 @@ impl DType {
     /// Storage, not logical: the packed types report 1, because one byte is
     /// what they take, even though it carries two logical values. Callers that
     /// need the logical count divide separately -- which is exactly what
-    /// [`crate::store::KvCacheFormat::storage_head_dim`] does.
+    /// [`crate::layout::KvCacheFormat::storage_head_dim`] does.
     ///
     /// Total rather than a `Result`: the C++ closes an exhaustive `switch`
     /// with `throw std::runtime_error("unknown dtype")`, which is unreachable

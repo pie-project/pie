@@ -5,7 +5,7 @@
 //! binary that included it -- running them several times under confusing
 //! names, and, worse, running them *concurrently with graph captures*.
 
-use driver_cuda::cuda::{COMPILED_MAJOR, Device};
+use driver_cuda::gpu::device::{COMPILED_MAJOR, Device};
 use std::sync::{Mutex, MutexGuard};
 
 /// Serialises all GPU work in a test binary.

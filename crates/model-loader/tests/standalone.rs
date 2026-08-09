@@ -256,12 +256,22 @@ fn the_backend_lowering_reads_its_numbers_off_the_target() {
     let mut offences = Vec::new();
     for (line_no, line) in production_lines(tile) {
         let trimmed = line.trim();
-        // A `const` here is a number the driver never stated. The tile-map masks
-        // are the one exception and are not capability claims: they are the set
-        // of transforms the *loader* knows how to emit, which the driver
-        // intersects with its own.
+        // A `const` here is a number the driver never stated. Two kinds are
+        // not, and the difference is what the rule is about: a NUMBER
+        // describes the device, while a NAME is the loader's own vocabulary
+        // for expressing a transform.
+        //
+        // * the tile-map masks — the set of transforms the *loader* knows how
+        //   to emit, which the driver intersects with its own;
+        // * a kernel symbol (`: &str = "..."`) — which row a chosen transform
+        //   IS. The failure this test exists to catch is a fallback tile size,
+        //   a block-scale granularity, a scratch dtype: quantities that make
+        //   the plan depend on something no caller stated. A symbol cannot be
+        //   one of those, and it is checked from the other end —
+        //   `executor::cuda`'s tests resolve each against
+        //   `kernels_cuda::quant::KERNELS` when the feature is on.
         if trimmed.starts_with("const ") || trimmed.starts_with("pub const ") {
-            if trimmed.contains("TILE_MAP_MASK") {
+            if trimmed.contains("TILE_MAP_MASK") || trimmed.contains(": &str = \"") {
                 continue;
             }
             offences.push(format!("{TILE}:{line_no}: {trimmed}"));

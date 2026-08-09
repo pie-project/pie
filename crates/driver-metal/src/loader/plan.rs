@@ -7,13 +7,16 @@
 //! their lifetime rules disappear; what remains is what the driver alone
 //! knows and must state.
 //!
-//! That is three things. Which tile transforms its kernels implement
-//! ([`METAL_TILE_MAP_MASK`]); its storage constants
-//! ([`metal_storage_target`]); and the loading policy that makes equal
-//! requests author equal contracts ([`compile_load_plan`] states every
-//! field rather than defaulting any). The loader has no opinion of its own:
-//! it refuses a transform outside the mask rather than emitting one the
-//! executor would then have to reject.
+//! That is two things now. Which backend this is ([`metal_storage_target`],
+//! a call into `StorageTarget::for_backend`), and the loading policy that
+//! makes equal requests author equal contracts ([`compile_load_plan`] states
+//! every field rather than defaulting any).
+//!
+//! It was three. The mask of transforms this driver's kernels implement was
+//! stated here AND in `model_loader::plan::passes::tile`, with a test
+//! comparing them; the loader keeps it, because the loader is where the
+//! consequence lands — it decides which plans compile, and it owns the host
+//! fallback every claimed transform must have.
 
 use std::path::Path;
 
@@ -23,57 +26,23 @@ use model::policy::{
     RuntimeQuant,
 };
 use model_loader::checkpoint::read::parse_checkpoint_metadata;
-use model_loader::plan::{self, LoadPlan, StorageTarget, TileMapKind};
+use model_loader::plan::{self, LoadPlan, StorageTarget};
 use model_loader::types::{BackendKind, DType};
 
-/// What this driver's load-time kernels implement, and therefore what the
-/// loader is allowed to emit.
-///
-/// `Scale` decodes a block-scaled scheme to values and `Cast` re-encodes
-/// those values as the affine-U4 the matvecs read; together they are what
-/// lets the published MXFP4 gpt-oss checkpoint load without an offline
-/// conversion. The transforms this driver does not implement — `Reblock`,
-/// `Repack` and the fused kinds — are layouts no kernel here wants.
-///
-/// The loader states the same fact independently
-/// (`model_loader::plan::passes::tile::tile_map_mask`), written beside the
-/// lowering rules where this constant is written beside the kernels. The
-/// relation is one-sided — the driver is the authority on its kernels, so
-/// this mask may be narrower than the loader's model but never wider — and
-/// a test pins it.
-pub const METAL_TILE_MAP_MASK: u32 = TileMapKind::Cast.capability_bit()
-    | TileMapKind::Encode.capability_bit()
-    | TileMapKind::Scale.capability_bit();
-
-/// Metal's buffer-offset alignment, stated once for the loader and the
-/// argument tables alike.
-pub const METAL_PREFERRED_ALIGNMENT: u32 = 256;
-
-/// The transcode tile budget: how much staging a load-time transform may
-/// allocate at once.
-pub const METAL_MAX_TILE_BYTES: u64 = 64 * 1024 * 1024;
-
-/// This device's storage capability, with the constants above filled in.
+/// This device's storage capability.
 ///
 /// One definition, two readers: the device facts published at create time,
 /// and the target supplied with every compile request.
+///
+/// The alignment, the tile budget and the transform mask were stated here as
+/// three constants and stated again in `model_loader::plan::passes::tile`,
+/// with a test comparing the masks. They are `StorageTarget::for_backend`'s
+/// now — one statement, on the side that owns the consequence: the loader
+/// decides which plans compile and owns the host fallback every claimed
+/// transform has to have.
 #[must_use]
 pub fn metal_storage_target() -> StorageTarget {
-    StorageTarget {
-        backend: BackendKind::Metal,
-        tp_rank: 0,
-        tp_size: 1,
-        max_tile_bytes: METAL_MAX_TILE_BYTES,
-        preferred_alignment: METAL_PREFERRED_ALIGNMENT,
-        tile_map_mask: METAL_TILE_MAP_MASK,
-        native_mxfp4_moe: false,
-        fusion_mask: 0,
-        // The dtype the encode kernels dequantize through, which decides how
-        // many rows of scratch fit in the tile budget. A device fact — it is
-        // which kernels were compiled — so it is stated, not assumed.
-        encode_scratch_dtype: DType::BF16,
-        block_scale_rows: 0,
-    }
+    StorageTarget::for_backend(BackendKind::Metal, 0, 1)
 }
 
 /// Did the contract tie the embedding and the head, or ship two tensors?
@@ -151,9 +120,11 @@ pub enum LoadPlanError {
     /// No author claims this `model_type`; the value names it.
     UnknownFamily(String),
     /// The author or the plan compiler refused; the value says why.
+    ///
+    /// Includes a file the plan declares being absent or the wrong size on
+    /// disk: `plan::compile_checked` raises that, and it is a refusal about
+    /// the checkpoint rather than a second kind of failure here.
     Compile(String),
-    /// A file the plan declares is absent or the wrong size on disk.
-    DeclaredFile(String),
 }
 
 impl std::fmt::Display for LoadPlanError {
@@ -168,7 +139,6 @@ impl std::fmt::Display for LoadPlanError {
                  model::contract"
             ),
             LoadPlanError::Compile(err) => write!(f, "load plan: {err}"),
-            LoadPlanError::DeclaredFile(err) => write!(f, "load plan: {err}"),
         }
     }
 }
@@ -229,26 +199,11 @@ pub fn compile_load_plan(
             .ok_or_else(|| LoadPlanError::UnknownFamily(facts.model_type.clone()))?;
     let plan = plan::compile(&metadata, &contract, target.clone())
         .map_err(|err| LoadPlanError::Compile(err.to_string()))?;
-    for file in &plan.files {
-        let path = snapshot_dir.join(&file.path);
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.len() == file.size_bytes => {}
-            Ok(meta) => {
-                return Err(LoadPlanError::DeclaredFile(format!(
-                    "{} is {} bytes on disk, the plan declares {}",
-                    path.display(),
-                    meta.len(),
-                    file.size_bytes
-                )));
-            }
-            Err(err) => {
-                return Err(LoadPlanError::DeclaredFile(format!(
-                    "{}: {err}",
-                    path.display()
-                )));
-            }
-        }
-    }
+    // The plan names the files and states their sizes, so a snapshot that
+    // moved under a plan compiled against it is the loader's refusal to make.
+    // `driver-cuda` carried the same block, bit for bit.
+    model_loader::checkpoint::read::verify_declared_files(&plan, snapshot_dir)
+        .map_err(|err| LoadPlanError::Compile(err.to_string()))?;
     Ok((plan, resolved_moe))
 }
 
@@ -257,32 +212,6 @@ mod tests {
     use model_loader::types::{Encoding, TensorDecl, TensorId, Visibility};
 
     use super::*;
-
-    #[test]
-    fn the_driver_mask_never_claims_a_transform_the_loader_cannot_model() {
-        let loaders_model = model_loader::plan::passes::tile::tile_map_mask(BackendKind::Metal);
-        assert_eq!(
-            METAL_TILE_MAP_MASK & !loaders_model,
-            0,
-            "narrower is fine; wider is a claim about kernels the loader \
-             cannot reason about"
-        );
-    }
-
-    #[test]
-    fn every_transform_this_driver_claims_has_a_host_implementation() {
-        // What lets this driver delegate load-time transcoding to
-        // `model_loader::executor::host` instead of porting the C++
-        // transcode loops: the executor's gate is the convert mask, and
-        // every transform the Metal mask can put in a plan is inside it.
-        // The C++ `transcode.hpp` was a MIRROR of that executor (its own
-        // header says so); the Rust driver calls the original.
-        assert_eq!(
-            METAL_TILE_MAP_MASK & !model_loader::plan::CONVERT_TILE_MAP_MASK,
-            0,
-            "a transform the host executor cannot run would fail at load,              far from this claim"
-        );
-    }
 
     #[test]
     fn the_target_states_the_device_and_nothing_optimistic() {

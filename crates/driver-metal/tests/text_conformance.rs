@@ -23,9 +23,9 @@
 
 use std::collections::BTreeSet;
 
-use driver_metal::model::dispatch::{Geometry, Undispatchable, plan_one};
-use driver_metal::model::executor::{Frame, Resolver, Slice};
-use driver_metal::model::resolve::{Names, Store};
+use driver_metal::lowering::dispatch::{Geometry, Undispatchable, plan_one};
+use driver_metal::lowering::executor::{Frame, Resolver, Slice};
+use driver_metal::lowering::resolve::{Names, Store};
 use model_compiler::lower::{Arg, Fire, Lowered, Row, lower};
 use model_compiler::trace::{FireClass, ForwardPlan, ValueId};
 

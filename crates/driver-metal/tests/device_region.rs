@@ -13,7 +13,8 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_metal::{Compiler, Context, Error, Heap, Pool, Region, Stepper, Tables};
+use driver_metal::{Error, Region};
+use driver_metal::gpu::{Compiler, Context, Heap, Pool, Stepper, Tables};
 
 /// Reads a buffer and reports what it found, so the GPU's view of the host's
 /// writes is the thing under test rather than the host's own view of them.

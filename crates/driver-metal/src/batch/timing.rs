@@ -27,7 +27,7 @@
 
 use std::fmt::Write as _;
 
-use super::abi::Kernel;
+use crate::lowering::abi::Kernel;
 
 /// One dispatch's identity, as the attribution needs it.
 ///

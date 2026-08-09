@@ -50,11 +50,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use driver_cuda::cuda::{Allocator, DeviceBuffer, OwnedStream};
+use driver_cuda::gpu::device::{Allocator, DeviceBuffer, OwnedStream};
 use driver_cuda::dtype::DType;
-use driver_cuda::launch::{KvCacheLayerView, KvCacheScheme};
-use driver_cuda::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-use driver_cuda::model::executor::{AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, Resolver, run};
+use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
+use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+use driver_cuda::gpu::bind::{AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, Resolver, run};
 use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
 use model::gemma_4::forward::gemma4_cuda;
 use model_compiler::lower::{Arg, Fire, Row, lower};
@@ -415,6 +415,7 @@ fn gemma4_matches_transformers_on_real_weights() {
         w_off_d: core::ptr::null(),
         row_valid_d: row_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
+        score_window: 32,
         window_left: -1,
         // Sliding layers window at `sliding_window` 512; full layers run
         // unbounded — `per_layer_window_left`, the C++ parse-time table.
@@ -439,9 +440,9 @@ fn gemma4_matches_transformers_on_real_weights() {
         scales.insert(format!("layer.{n}.ple_norm"), s);
     }
 
-    let mut cublas_ops = driver_cuda::cuda::cublas::LiveCublas;
+    let mut cublas_ops = driver_cuda::gpu::device::cublas::LiveCublas;
     let mut cublas =
-        driver_cuda::cuda::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
+        driver_cuda::gpu::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
             .expect("cublas");
     let ctx = DispatchCtx {
         // Every row sampled, so no compaction is stated and the gather
@@ -503,7 +504,7 @@ fn gemma4_matches_transformers_on_real_weights() {
     let ran = if std::env::var("GEMMA4_AB_TRACE").is_ok() {
         // Launch-by-launch walk with a sync and a last-row norm of the
         // first output after each — the bisection's microscope.
-        use driver_cuda::model::executor::{bind, dispatch};
+        use driver_cuda::gpu::bind::{bind, dispatch};
         for (i, launch) in l.launches.iter().enumerate() {
             let kernel = l.kernels[launch.kernel as usize].clone();
             let bound = bind(&l, launch, frame, &mut resolver)

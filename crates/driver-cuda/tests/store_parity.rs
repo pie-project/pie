@@ -57,11 +57,11 @@
 //! out-of-range index (a caller bug) exactly where the C++ does.
 
 use driver_cuda::dtype::DType;
-use driver_cuda::store::dsv4_geometry::{compress_bytes_per_token, compressor_coff};
-use driver_cuda::store::mla_geometry::MlaGeometry;
-use driver_cuda::store::profile_key::{KEY_FIELDS, ProfileKey, StoredField};
-use driver_cuda::store::recurrent_layout::{RecurrentShape, RecurrentStateLayout};
-use driver_cuda::store::swap_plan::{Direction, Pool, PoolGeometry, SwapPlan};
+use driver_cuda::layout::dsv4_geometry::{compress_bytes_per_token, compressor_coff};
+use driver_cuda::layout::mla_geometry::MlaGeometry;
+use driver_cuda::layout::profile_key::{KEY_FIELDS, ProfileKey, StoredField};
+use driver_cuda::layout::recurrent_layout::{RecurrentShape, RecurrentStateLayout};
+use driver_cuda::layout::swap_plan::{Direction, Pool, PoolGeometry, SwapPlan};
 use std::fmt::Write as _;
 
 /// FNV-1a 64 of the **C++ oracle's** stdout.

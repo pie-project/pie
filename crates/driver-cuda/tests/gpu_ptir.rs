@@ -5,7 +5,7 @@
 //! `cuda-progress.md` records the rule this suite is written under: *"Non-GPU
 //! green is weak evidence. Every dispatch defect found on 2026-08-10 compiled
 //! cleanly and passed the full non-GPU battery."* The unit tests beside
-//! [`ptir::disk`] and [`ptir::module`] pin arithmetic — a cache key, a rounded
+//! [`driver_cuda::gpu::program::cache`] and [`driver_cuda::gpu::program::compile`] pin arithmetic — a cache key, a rounded
 //! launch width — and arithmetic is exactly the class of thing that can be
 //! right in isolation and wrong against a driver.
 //!
@@ -17,7 +17,7 @@
 //!
 //! Skipped without a device, like every other `gpu_*` binary here.
 
-use driver_cuda::ptir::{Disk, Module, disk_key, nvrtc};
+use driver_cuda::gpu::program::{Disk, Module, disk_key, compile};
 
 mod common;
 use common::{device_or_skip, gpu_guard};
@@ -55,10 +55,10 @@ fn a_generated_region_compiles_loads_and_resolves_its_entry() {
         return;
     };
     let (major, minor) = device.compute_capability().expect("compute capability");
-    let (nvrtc_major, nvrtc_minor) = nvrtc::version().expect("NVRTC must be loadable");
+    let (nvrtc_major, nvrtc_minor) = compile::version().expect("NVRTC must be loadable");
     eprintln!("compiling for sm_{major}{minor} with NVRTC {nvrtc_major}.{nvrtc_minor}");
 
-    let cubin = nvrtc::compile(SOURCE, &nvrtc::arch_flag(major, minor))
+    let cubin = compile::compile(SOURCE, &compile::arch_flag(major, minor))
         .expect("a well-formed region must compile");
     assert!(
         cubin.len() > 64,
@@ -92,7 +92,7 @@ fn a_generated_region_compiles_loads_and_resolves_its_entry() {
 /// fire, recompiled each time, is the difference between a slow model and an
 /// unusable one.
 ///
-/// [`Deterministic`]: driver_cuda::ptir::FailureKind::Deterministic
+/// [`Deterministic`]: driver_cuda::gpu::program::FailureKind::Deterministic
 #[test]
 fn a_source_nvrtc_rejects_is_deterministic_and_carries_its_log() {
     let _gpu = gpu_guard();
@@ -101,15 +101,15 @@ fn a_source_nvrtc_rejects_is_deterministic_and_carries_its_log() {
     };
     let (major, minor) = device.compute_capability().expect("compute capability");
 
-    let error = nvrtc::compile(
+    let error = compile::compile(
         "extern \"C\" __global__ void k() { this_symbol_does_not_exist(); }",
-        &nvrtc::arch_flag(major, minor),
+        &compile::arch_flag(major, minor),
     )
     .expect_err("an undeclared identifier must not compile");
 
     assert_eq!(
         error.kind,
-        driver_cuda::ptir::FailureKind::Deterministic,
+        driver_cuda::gpu::program::FailureKind::Deterministic,
         "a source NVRTC rejects will be rejected identically forever; not \
          remembering that is a recompile per fire"
     );
@@ -130,7 +130,7 @@ fn a_missing_entry_is_refused_rather_than_answered_with_a_null_function() {
         return;
     };
     let (major, minor) = device.compute_capability().expect("compute capability");
-    let cubin = nvrtc::compile(SOURCE, &nvrtc::arch_flag(major, minor)).expect("compile");
+    let cubin = compile::compile(SOURCE, &compile::arch_flag(major, minor)).expect("compile");
 
     let error = Module::load(&cubin, "ptir_fused_0000000000000000_r9")
         .expect_err("an entry the cubin does not carry must not resolve");
@@ -148,7 +148,7 @@ fn a_cubin_survives_the_disk_cache_and_still_loads() {
         return;
     };
     let (major, minor) = device.compute_capability().expect("compute capability");
-    let cubin = nvrtc::compile(SOURCE, &nvrtc::arch_flag(major, minor)).expect("compile");
+    let cubin = compile::compile(SOURCE, &compile::arch_flag(major, minor)).expect("compile");
 
     let directory = std::env::temp_dir().join(format!("pie-ptir-gpu-disk-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
@@ -180,11 +180,11 @@ fn a_cubin_survives_the_disk_cache_and_still_loads() {
 
 /// The two control kernels are prebuilt on CUDA, absent from the kernels
 /// archive, and therefore compiled here. This is the test that says the
-/// forty lines of hand-written CUDA in `ptir::control` are legal CUDA — which
+/// forty lines of hand-written CUDA in `driver_cuda::gpu::program::run` are legal CUDA — which
 /// nothing else can, because they never reach a compiler at build time.
 #[test]
 fn the_control_kernels_compile_and_both_entry_points_resolve() {
-    use driver_cuda::ptir::{Control, control};
+    use driver_cuda::gpu::program::{Control, run};
 
     let _gpu = gpu_guard();
     let Some(device) = device_or_skip("PTIR control kernels") else {
@@ -196,10 +196,10 @@ fn the_control_kernels_compile_and_both_entry_points_resolve() {
     let _ = std::fs::remove_dir_all(&directory);
     let disk = Disk::at(&directory);
 
-    let compiled = Control::compile(&disk, &nvrtc::arch_flag(major, minor), "control-test")
+    let compiled = Control::compile(&disk, &compile::arch_flag(major, minor), "control-test")
         .expect("the readiness and commit kernels must compile");
-    assert_eq!(compiled.readiness().entry_name(), control::READINESS_ENTRY);
-    assert_eq!(compiled.commit().entry_name(), control::COMMIT_ENTRY);
+    assert_eq!(compiled.readiness().entry_name(), run::READINESS_ENTRY);
+    assert_eq!(compiled.commit().entry_name(), run::COMMIT_ENTRY);
 
     // Both are single-thread kernels guarded on `threadIdx.x == 0`, so the
     // launch width is irrelevant to correctness — but it must still be a
@@ -210,9 +210,9 @@ fn the_control_kernels_compile_and_both_entry_points_resolve() {
     // The second call must not recompile: the pair belongs to no program, so
     // paying NVRTC for it per program would be the cost this cache exists to
     // avoid.
-    let again = Control::compile(&disk, &nvrtc::arch_flag(major, minor), "control-test")
+    let again = Control::compile(&disk, &compile::arch_flag(major, minor), "control-test")
         .expect("the second compile must be answered from disk");
-    assert_eq!(again.readiness().entry_name(), control::READINESS_ENTRY);
+    assert_eq!(again.readiness().entry_name(), run::READINESS_ENTRY);
 
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -225,8 +225,8 @@ fn the_control_kernels_compile_and_both_entry_points_resolve() {
 /// about a value the device wrote.
 #[test]
 fn the_control_kernels_gate_and_advance_the_device_ring() {
-    use driver_cuda::cuda::{Allocator, OwnedStream};
-    use driver_cuda::ptir::{ChannelShape, Control, Rings, control, launch_control};
+    use driver_cuda::gpu::device::{Allocator, OwnedStream};
+    use driver_cuda::gpu::program::{ChannelShape, Control, Rings, run, launch_control};
     use driver::tensor_ir::DType;
 
     let _gpu = gpu_guard();
@@ -240,7 +240,7 @@ fn the_control_kernels_gate_and_advance_the_device_ring() {
     let directory = std::env::temp_dir().join(format!("pie-ptir-ring-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     let disk = Disk::at(&directory);
-    let kernels = Control::compile(&disk, &nvrtc::arch_flag(major, minor), "ring-test")
+    let kernels = Control::compile(&disk, &compile::arch_flag(major, minor), "ring-test")
         .expect("control kernels compile");
 
     // Two channels: an input holding one f32 lane, and an output. Capacity 1,

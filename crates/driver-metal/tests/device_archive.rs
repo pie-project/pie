@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use driver_metal::{Archived, Archives, Compiler, Context, Math, Request};
+use driver_metal::Request;
+use driver_metal::gpu::{Archived, Archives, Compiler, Context, Math};
 
 /// A scratch cache directory of this test's own.
 ///

@@ -21,16 +21,45 @@
 use crate::plan::index::PlanIndex;
 use crate::plan::{
     FUSION_FP8_TO_MXFP4, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_CAST,
-    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TILE_MAP_SCALE,
+    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_SCALE,
     TileMapKind, TransformFusion,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDecl};
 
-/// The transforms `driver/cuda`'s kernels implement. Mirrored in C++ as
-/// `kCudaTileMapMask`, which is defined in terms of the generated bits rather
-/// than restated, so the two cannot drift.
-pub const CUDA_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_REBLOCK | TILE_MAP_REPACK | TILE_MAP_SCALE;
+/// The `kernels-cuda` rows a load may run on the device, by table symbol.
+///
+/// Named here rather than reached for out of `kernels_cuda`, because the plan
+/// for a CUDA target is compiled on machines that have no CUDA at all — the
+/// import path does it, and so does every test. A plan is a claim about what a
+/// device will do, and making that claim must not require the device's
+/// toolchain.
+///
+/// What keeps them honest is the other side: with `feature = "cuda"` on,
+/// `executor::cuda` calls exactly these and a test resolves each against
+/// `kernels_cuda::quant::KERNELS`. A symbol that stopped existing fails that
+/// build rather than becoming a plan nothing can run.
+pub const CUDA_CAST_FP32_TO_BF16: &str = "quant::cast_fp32_to_bf16";
+pub const CUDA_SCALE_ROWS_BF16: &str = "quant::scale_rows_bf16";
+pub const CUDA_QUANTIZE_BF16_TO_MXFP4: &str = "quant::quantize_bf16_to_mxfp4_e2m1_per_block";
+pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_per_channel";
+
+/// The transforms `driver/cuda`'s kernels implement.
+///
+/// `Repack` and `Reblock` were here and are not, and the correction matters
+/// because this constant is load-bearing twice over: it decides which plans
+/// COMPILE for a CUDA target, and — since a transform reaching the executor
+/// with no host implementation has nowhere to go — which of those can run.
+///
+/// Both were what the C++ `transcode_engine.hpp` had device kernels for. This
+/// tree did not port them, and `Repack` has no host implementation either, so
+/// claiming it meant a checkpoint needing one compiled cleanly and then failed
+/// at execution with nothing but a kind to name. Refusing it here refuses it
+/// with the TENSOR named.
+///
+/// The driver used to restate a narrower mask of its own and a test compared
+/// the two. There is nothing to compare now: this is the one statement, and
+/// `StorageTarget::for_backend` is how a driver gets it.
+pub const CUDA_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
 
 /// The transforms `driver/metal`'s load-time kernels implement. Mirrored in C++
 /// as `kMetalTileMapMask`, which is defined in terms of the generated bits
@@ -84,6 +113,56 @@ pub fn tile_map_mask(backend: BackendKind) -> u32 {
     }
 }
 
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    /// Every transform a device plan may carry has a host implementation.
+    ///
+    /// This lived in `driver-cuda`, comparing the driver's mask against
+    /// `CONVERT_TILE_MAP_MASK`. It comes here with the mask it was checking,
+    /// and it is the property that survives rather than the drift check beside
+    /// it — that one compared two statements of one fact, and there is one
+    /// statement now.
+    ///
+    /// What it buys: turning the device path off — `PIE_LOADER_DEVICE_TRANSFORMS=0`,
+    /// a build without the `cuda` feature, or a plan that named no kernel for
+    /// an instruction — always lands somewhere that can finish the load. It is
+    /// also what lets one plan run into a host arena and a device arena and
+    /// the bytes be compared, which is the only check a load-time kernel gets.
+    #[test]
+    fn every_transform_a_backend_may_lower_has_a_host_implementation() {
+        for backend in [BackendKind::Cuda, BackendKind::Metal, BackendKind::Unknown] {
+            assert_eq!(
+                tile_map_mask(backend) & !crate::plan::CONVERT_TILE_MAP_MASK,
+                0,
+                "{backend:?} may lower a transform with no host implementation, \
+                 which leaves the load with no fallback and no reference to \
+                 check a device answer against"
+            );
+        }
+    }
+
+    /// A kind this crate can name a kernel for is a kind its mask claims.
+    ///
+    /// The other direction is fine and expected — `Reblock` is in the host
+    /// mask with no device kernel anywhere. What must not happen is
+    /// `cuda_kernel` returning a row for a kind `validate_target_support`
+    /// would have refused, because then the plan could never contain the
+    /// instruction the selection was written for.
+    #[test]
+    fn a_kind_the_cuda_selector_can_answer_is_a_kind_the_mask_allows() {
+        for kind in [TileMapKind::Cast, TileMapKind::Scale, TileMapKind::Encode] {
+            assert_ne!(
+                CUDA_TILE_MAP_MASK & kind.capability_bit(),
+                0,
+                "`cuda_kernel` selects a row for {kind:?}, which the CUDA mask \
+                 does not allow into a plan"
+            );
+        }
+    }
+}
+
 /// Everything the lowering rule is allowed to see about one `TileMap`.
 ///
 /// Deliberately not the instruction itself. The plan walking — resolving a
@@ -112,10 +191,27 @@ pub struct TileMapFacts {
     /// silently ignore that.
     pub shape: Option<(u64, u64)>,
     pub max_tile_bytes: u64,
+    /// The dtype the transform WRITES, when the primary output is unquantized.
+    ///
+    /// `None` for a quantized destination, whose scheme is
+    /// [`transform_to`](Self::transform_to) instead — the two are not
+    /// interchangeable, and a `Cast` is exactly the kind for which both sides
+    /// are plain dtypes.
+    pub dest_dtype: Option<DType>,
+    /// Whether the transform rewrites its input where it lies.
+    ///
+    /// The per-row scale kernel multiplies IN PLACE, so a plan whose
+    /// destination is a different buffer is not one it can run. Known here
+    /// because the instruction names both buffers.
+    pub in_place: bool,
+    /// Whether a [`TileMapKind::Scale`] reads per-group factors from an
+    /// operand, rather than multiplying by the uniform constant in
+    /// `scale_factor_bits`.
+    pub blocked_scale: bool,
 }
 
 /// What the lowering decided. Written into the instruction verbatim.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TileLowering {
     /// Rows of the output the driver transforms per launch. `0` means "no
     /// tiling" — do the whole tensor in one pass — which is both the answer for
@@ -123,6 +219,12 @@ pub struct TileLowering {
     /// everything.
     pub rows_per_tile: u32,
     pub fusion: TransformFusion,
+    /// The backend entry point these operands run as, or `None` for the host.
+    ///
+    /// See [`TransformSpec::kernel`](crate::plan::TransformSpec::kernel) for
+    /// why the decision belongs here rather than in the backing that launches
+    /// it.
+    pub kernel: Option<&'static str>,
 }
 
 /// Fill in every backend decision the plan carries.
@@ -159,17 +261,84 @@ pub fn lower(plan: &mut LoadPlan) {
         let lowering = lower_tile_map(&facts, &target);
         tile.rows_per_tile = lowering.rows_per_tile;
         transform.fusion = lowering.fusion;
+        transform.kernel = lowering.kernel.map(str::to_string);
     }
 }
 
 fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering {
     match target.backend {
-        BackendKind::Cuda => cuda_encode(facts, target),
+        BackendKind::Cuda => TileLowering {
+            kernel: cuda_kernel(facts),
+            ..cuda_encode(facts, target)
+        },
         // Metal runs no transforms, and the host executor derives its own
         // tiling from `max_tile_bytes` at run time — which it is allowed to do
         // precisely because it is not the thing whose execution the plan is
         // supposed to determine (`architecture.md` §10.3).
         BackendKind::Metal | BackendKind::Unknown => TileLowering::default(),
+    }
+}
+
+/// Which `kernels-cuda` row runs these operands, or `None` for the host.
+///
+/// **This is the table that used to live in the driver**, as a `run_tile_map`
+/// that took the operands and answered `Ok(false)` when it had no kernel for
+/// them. Two things were wrong with that, and neither was the code:
+///
+/// * a capability bit is per KIND and a kernel is per SHAPE, so the mask could
+///   claim `Cast` and the launch still decline an F16 source. The decline was
+///   correct and invisible — the load finished, the bytes were right, and the
+///   transform had quietly run on the host.
+/// * the facts it decided on are all in the plan. Deciding at launch meant
+///   deciding without the tensor's name, so a refusal could say "this backing
+///   has no kernel for these bytes" where the compiler can say which tensor.
+///
+/// Every rule below is the driver's own, moved and not rewritten. What changes
+/// is when it runs.
+fn cuda_kernel(facts: &TileMapFacts) -> Option<&'static str> {
+    match facts.kind {
+        // The one cast the table implements. Any other dtype pair is refused,
+        // not approximated: a cast with no kernel must never become a copy,
+        // because the bytes would be the source's representation under the
+        // destination's name and no later stage can detect that.
+        TileMapKind::Cast => (facts.source_dtype == Some(DType::F32)
+            && facts.dest_dtype == Some(DType::BF16))
+        .then_some(CUDA_CAST_FP32_TO_BF16),
+        // `scale_rows_bf16` multiplies IN PLACE and reads its factors from an
+        // operand. A uniform factor has no operand to read and the table has no
+        // scalar-multiply row; a destination that is not the source is not what
+        // the kernel does.
+        TileMapKind::Scale => (facts.blocked_scale
+            && facts.in_place
+            && facts.source_dtype == Some(DType::BF16)
+            && facts.dest_dtype == Some(DType::BF16)
+            && facts.shape.is_some())
+        .then_some(CUDA_SCALE_ROWS_BF16),
+        // Runtime quantization. Both rows want a bf16 source and a 2-D shape;
+        // the MXFP4 one additionally wants a width that is a whole number of
+        // its 32-element block, and refuses to guess otherwise.
+        //
+        // Every other target, including the fused FP8->MXFP4 that
+        // `transcode.cu` implements, stays on the host: reaching it needs the
+        // SOURCE's block scales, which an `Encode` whose input is already a
+        // bf16 buffer does not have.
+        TileMapKind::Encode => {
+            let (_, cols) = facts.shape?;
+            if facts.source_dtype != Some(DType::BF16) {
+                return None;
+            }
+            match facts.transform_to {
+                Some(QuantScheme::Mxfp4E2M1E8M0) => {
+                    (cols % 32 == 0).then_some(CUDA_QUANTIZE_BF16_TO_MXFP4)
+                }
+                Some(QuantScheme::Fp8E4M3) => Some(CUDA_QUANTIZE_BF16_TO_FP8),
+                _ => None,
+            }
+        }
+        TileMapKind::Decode
+        | TileMapKind::Transcode
+        | TileMapKind::Reblock
+        | TileMapKind::Repack => None,
     }
 }
 
@@ -185,6 +354,10 @@ fn cuda_encode(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering {
     TileLowering {
         rows_per_tile: encode_rows_per_tile(facts, target),
         fusion: encode_fusion(facts, target),
+        // Not this function's question. `lower_tile_map` asks `cuda_kernel`
+        // and overwrites; stating `None` here rather than answering twice is
+        // what keeps the two decisions from having to agree.
+        ..TileLowering::default()
     }
 }
 
@@ -314,6 +487,7 @@ fn tile_map_facts(
     let StorageInstr::TileMap {
         kind,
         source,
+        dest,
         inputs,
         outputs,
         tile,
@@ -336,7 +510,82 @@ fn tile_map_facts(
             .first()
             .and_then(|buffer| logical_shape(plan, index, *buffer)),
         max_tile_bytes: tile.max_tile_bytes,
+        dest_dtype: outputs
+            .first()
+            .and_then(|buffer| raw_dtype(plan, index, *buffer)),
+        in_place: rewrites_in_place(plan, source.as_ref(), inputs, outputs, dest.as_ref()),
+        blocked_scale: !transform.scale_blocks.is_empty(),
     })
+}
+
+/// The dtype behind a buffer, when its tensor is unquantized.
+///
+/// `None` for a quantized destination rather than its logical dtype: the two
+/// are different claims, and a rule that read "bf16" off an MXFP4 output would
+/// pick a kernel for bytes that are not there.
+fn raw_dtype(plan: &LoadPlan, index: &PlanIndex, buffer: BufferId) -> Option<DType> {
+    match index.buffer_tensor(plan, buffer)?.encoding {
+        Encoding::Raw(dtype) => Some(dtype),
+        Encoding::Quant(_) => None,
+    }
+}
+
+/// Whether the transform's destination is the same bytes as its input.
+///
+/// Answers the question the executor answers with `op.src != op.dst`, and
+/// answers it the same way: by resolving both to arena spans. That is possible
+/// HERE, and only here, because [`lower`] runs after
+/// `assign-persistent-offsets` — a plan reaching this pass has its layout, so
+/// two buffers that were allocated separately and then placed at one offset
+/// are visible as the one operand they became.
+///
+/// A checkpoint source is never in place: its bytes are on disk.
+fn rewrites_in_place(
+    plan: &LoadPlan,
+    source: Option<&SourceExtent>,
+    inputs: &[BufferId],
+    outputs: &[BufferId],
+    dest: Option<&crate::plan::DestExtent>,
+) -> bool {
+    if source.is_some() {
+        return false;
+    }
+    let Some(src) = inputs.first().and_then(|id| span_of(plan, *id)) else {
+        return false;
+    };
+    let dst = match dest {
+        Some(dest) => {
+            let Some((base, _)) = span_of(plan, dest.buffer) else {
+                return false;
+            };
+            (
+                base + dest.offset + dest.stride.base_offset,
+                extent_bytes(&dest.stride),
+            )
+        }
+        None => match outputs.first().and_then(|id| span_of(plan, *id)) {
+            Some(span) => span,
+            None => return false,
+        },
+    };
+    src == dst
+}
+
+/// A buffer's `(arena offset, bytes)`, when it has been placed.
+fn span_of(plan: &LoadPlan, id: BufferId) -> Option<(u64, u64)> {
+    let decl = plan.buffer(id).ok()?;
+    Some((decl.persistent_offset?, decl.bytes))
+}
+
+/// The bytes one extent covers: the product of its counts, times the width of
+/// the contiguous inner block.
+fn extent_bytes(extent: &crate::extent::Extent) -> u64 {
+    extent
+        .dims
+        .iter()
+        .try_fold(1u64, |n, d| u64::try_from(d.count).ok().map(|c| n * c))
+        .unwrap_or(0)
+        * u64::from(extent.element_bytes)
 }
 
 fn source_dtype(

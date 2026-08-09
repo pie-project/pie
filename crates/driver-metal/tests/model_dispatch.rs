@@ -13,10 +13,10 @@
 
 use std::collections::BTreeSet;
 
-use driver_metal::model::dispatch::{
+use driver_metal::lowering::dispatch::{
     Dispatch, Geometry, Undispatchable, dims_of, pipelines_needed, plan_one,
 };
-use driver_metal::model::executor::{Frame, Resolver, Slice};
+use driver_metal::lowering::executor::{Frame, Resolver, Slice};
 use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::families::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Fire, Lowered, Row, lower};
@@ -278,7 +278,7 @@ fn a_rectangles_dims_come_from_the_rectangle_and_the_fire_and_nowhere_else() {
         let low = lowered(class, rows as usize);
         for launch in &low.launches {
             let symbol = low.kernels[launch.kernel as usize].as_str();
-            let sig = kernels::sig_in(driver_metal::model::run::table(), symbol)
+            let sig = kernels::sig_in(driver_metal::lowering::dispatch::table(), symbol)
                 .expect("every symbol this text states has a row");
             let dims = dims_of(sig, &low, launch, geometry());
             assert_eq!(dims.rows, rows, "`{symbol}` at {rows} rows");
@@ -320,7 +320,7 @@ fn the_batched_lane_is_the_row_count_and_not_a_second_vocabulary() {
 /// missing after it is the buffers, not the decisions.
 mod from_a_frame {
     use super::*;
-    use driver_metal::model::frame::{Step, fire_class, lower_step, sig};
+    use driver_metal::lowering::frame::{Step, fire_class, lower_step, sig};
 
     fn plan_for(class: FireClass) -> model_compiler::trace::ForwardPlan {
         llama_like_metal(
@@ -431,7 +431,7 @@ mod from_a_frame {
 mod the_map {
     use std::collections::HashMap;
 
-    use driver_metal::model::resolve::{Names, Store};
+    use driver_metal::lowering::resolve::{Names, Store};
 
     use super::*;
 
@@ -502,8 +502,8 @@ mod the_map {
 mod state {
     use std::collections::HashMap;
 
-    use driver_metal::model::executor::{Resolver, Slice};
-    use driver_metal::model::resolve::{Names, Store};
+    use driver_metal::lowering::executor::{Resolver, Slice};
+    use driver_metal::lowering::resolve::{Names, Store};
 
     use super::*;
 
@@ -564,7 +564,7 @@ mod state {
         // this model's structure — so the ROW names which table and the
         // resolver answers. A kernel wanting them and a driver that KNEW to
         // bind them is the hand-written arm this crate removes.
-        use driver_metal::model::executor::FireTable;
+        use driver_metal::lowering::executor::FireTable;
 
         let low = lowered(FireClass::Decode, 1);
         let (tensors, named) = (HashMap::new(), HashMap::new());
@@ -666,7 +666,7 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
     })
     .expect("the gemma-shaped text lowers");
 
-    let table = driver_metal::model::run::table();
+    let table = driver_metal::lowering::dispatch::table();
     let geometry = Geometry {
         q_heads: 32,
         kv_heads: 16,

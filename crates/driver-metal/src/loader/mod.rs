@@ -4,7 +4,7 @@
 //! [`DecodeGeometry`](crate::batch::DecodeGeometry), compiled and tested on
 //! any host. The Metal side — allocating the heap, binding the argument
 //! tables, staging tensors — layers on top and stays under
-//! `src/metal/`. The ledger is `.wiki/driver/progress-metal.md`.
+//! `gpu/weights/`. The ledger is `.wiki/driver/progress-metal.md`.
 
 mod plan;
 mod slab;

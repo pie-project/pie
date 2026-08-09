@@ -9,11 +9,9 @@
 //!
 //! Requires a Metal 4 GPU, and skips without one.
 
-#![cfg(target_vendor = "apple")]
 
-use driver_metal::{
-    ArgumentTable, Compiler, Context, Error, Granularity, Heap, Stepper, Timestamps, Visibility,
-};
+use driver_metal::Error;
+use driver_metal::gpu::{ArgumentTable, Compiler, Context, Granularity, Heap, Stepper, Timestamps, Visibility};
 
 /// Enough arithmetic that the two marks cannot land in the same tick by the
 /// GPU clock simply not having advanced.

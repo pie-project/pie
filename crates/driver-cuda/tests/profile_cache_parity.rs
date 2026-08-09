@@ -1,4 +1,4 @@
-//! Differential proof that [`driver_cuda::store::profile_cache`] behaves
+//! Differential proof that [`driver_cuda::layout::profile_cache`] behaves
 //! like `store/planner_profile_cache.cpp`.
 //!
 //! `tests/oracle/profile_cache/run.sh` compiles the **real** C++ source --
@@ -20,11 +20,11 @@
 //! transcript can be compared byte for byte. Every other row must match
 //! exactly.
 
-use driver_cuda::store::profile_cache::{
+use driver_cuda::layout::profile_cache::{
     Lookup, ProfileCache, ShapeSample, cache_path, planner_budget_bytes,
     set_planner_budget_bytes,
 };
-use driver_cuda::store::profile_key::{ProfileKey, ProfileShape};
+use driver_cuda::layout::profile_key::{ProfileKey, ProfileShape};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Mutex;

@@ -12,9 +12,9 @@
 //!
 //! Requires a Metal 4 GPU, and skips without one.
 
-#![cfg(target_vendor = "apple")]
 
-use driver_metal::{ArgumentTable, Compiler, Context, Error, Heap, Stepper, Visibility};
+use driver_metal::Error;
+use driver_metal::gpu::{ArgumentTable, Compiler, Context, Heap, Stepper, Visibility};
 
 /// Writes `index + 1` to every element, so the check cannot pass on a buffer
 /// that happens to be a constant -- and cannot pass on a dispatch that ran

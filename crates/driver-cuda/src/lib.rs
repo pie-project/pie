@@ -85,17 +85,29 @@
 )]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-#[cfg(not(any(feature = "cuda-12", feature = "cuda-13", feature = "portable")))]
-compile_error!(
-    "driver-cuda needs exactly one of the `cuda-12` / `cuda-13` features, \
-     e.g. `cargo build -p driver-cuda --features cuda-13`. It selects the \
-     CUDA runtime ABI this build targets, and it must match the `libcudart.so` \
-     that will be loaded at run time. There is no default on purpose: choosing \
-     wrong is a segfault inside the driver, not a build error, so this crate \
-     would rather not build than guess. `--features portable` is the one \
-     exception, and it does not build a driver: it builds the half of this \
-     crate that answers questions no card is needed for."
-);
+// NO `compile_error!` FOR "NO FEATURE", and that is a reversal.
+//
+// It used to refuse to build at all, reasoning that "choosing wrong is a
+// segfault inside the driver, not a build error, so this crate would
+// rather not build than guess". The hazard is real and the conclusion did
+// not follow: choosing wrong means picking cuda-12 on a box that loads
+// cuda-13. It is not the hazard of picking NEITHER — with no feature
+// there is no `cudarc` linked, no `dlopen`, and no segfault reachable.
+//
+// What the error cost was the portable half: ten thousand lines of
+// geometry, budgets and plans that need no card could not be built or
+// tested without naming a CUDA runtime they would never load.
+//
+// A dependent that forgets to pick one is still caught, and in a better
+// place — `gpu::serve` is gated, so `driver_cuda::gpu::serve::pie_cuda_create`
+// is an unresolved path IN THE CONSUMER, at compile time, naming the
+// symbol it wanted.
+//
+// This also retires the `portable` feature, which existed only to opt out
+// of the error below. Cargo features must be additive, and a feature
+// whose job is to SUBTRACT is exactly the shape that breaks under feature
+// unification: one dependent asking for `portable` and another for
+// `cuda-13` would have got both.
 #[cfg(all(feature = "cuda-12", feature = "cuda-13"))]
 compile_error!(
     "driver-cuda needs exactly ONE of `cuda-12` / `cuda-13`, not both. \
@@ -117,62 +129,49 @@ compile_error!(
 #[cfg(feature = "_cuda")]
 pub use cudarc;
 
-// Everything below is gated on a feature being selected, so that a build with
-// none of them reports the `compile_error!` above and nothing else. Left
-// ungated, the same build would bury that one actionable message under a few
-// dozen "cannot find crate `cudarc`" errors from every module that uses it.
 /// UNGATED, and its two CUDA variants are gated instead.
 ///
-/// `Error` is the return type of the whole store layer, so naming
+/// `Error` is the return type of the whole layout layer, so naming
 /// `cudarc` here put every geometry, planner and cache module behind
 /// `_cuda` — see `tests/portable_half.rs`.
 mod error;
 
-#[cfg(feature = "_cuda")]
-pub mod cuda;
 pub mod dtype;
-// The kernel-facing records. They reference no CUDA symbol and the layout
-// proof over them needs no driver, which is why they are not gated: this
-// note used to explain why they were gated anyway, and the explanation was
-// the argument against it.
-pub mod launch;
-
-/// The thirteen `pie_cuda_*` exports — the cutover's door. See the
-/// module doc for the one-provider-per-binary rule.
-#[cfg(feature = "abi")]
-pub mod serve;
-
-/// The checkpoint's bytes onto the device, through `model-loader`'s plan.
-#[cfg(all(feature = "abi", feature = "_cuda"))]
-pub mod loader;
-
-/// What a loaded checkpoint says about the model's shape, and which family
-/// text serves it — the per-family derivations and the `PlannedFamily` trait
-/// the serving path asks them through.
-///
-/// `abi` alone, and deliberately: nothing here names a CUDA symbol. The
-/// gate is the ABI status code a refusing derivation answers with.
-#[cfg(feature = "abi")]
-pub mod facts;
-
-pub mod model;
-/// PTIR on CUDA: NVRTC, cubins, and the compile cache.
-///
-/// The channel plane itself is [`driver_pipeline`] and is shared with the
-/// Metal shell; this is the part that names a CUDA symbol. Gated on `_cuda`
-/// because every file in it calls `cudarc`.
-#[cfg(feature = "_cuda")]
-pub mod ptir;
-/// The geometry, the planner, the caches — and almost none of it names a
-/// CUDA symbol. Eighteen of its twenty-two files name none at all.
-///
-/// UNGATED for that reason (north-star rule 2: cut by "is this correct
-/// without a GPU?", not by subsystem). `kv_cache_live` and
-/// `KvCacheLayout::allocate` are the two places that do call CUDA, and
-/// they carry the gate themselves.
-pub mod store;
-
 pub mod tensor;
+
+/// How big, where, how many — and none of it needs a card.
+///
+/// Geometry, memory budgets, swap plans, the load plan, the profile
+/// cache. The line between this and [`gpu::pools`] is the one the
+/// `Cargo.toml` already drew: `kv_geometry` says what shape the pages
+/// are and `kv_cache` allocates them, and only the second needs a card.
+pub mod layout;
+
+/// THE ONE `#[cfg]`.
+///
+/// Everything that names a CUDA symbol lives under here, and nothing
+/// above here does. That is the whole point of the directory: the gate
+/// used to run per-file through `store/`, `model/` and `tensor.rs`, and
+/// a per-file gate is discipline rather than structure — it holds until
+/// someone adds a file.
+///
+/// Gated on `_cuda` rather than on a version, so a build with no feature
+/// selected compiles the portable half instead of reporting an error
+/// about a runtime it was not asked to pick.
+#[cfg(feature = "_cuda")]
+pub mod gpu;
+
+// `facts.rs`, `config.rs` and `descriptor.rs` are GONE — 1,782 lines
+// into `crates/model` as `deployment_cuda`, `descriptor` and a deleted
+// re-export (§8 row 6). The table of 33 `model_type` rows was the
+// question, and §4's rule is that a driver reads the answer.
+//
+// What comes back is `model::deployment::Deployment`: a value with no
+// family name in it, derived once at load rather than boxed per fire.
+
+/// Every boot knob, parsed once. See the module doc for the three
+/// things ten scattered `env::var` reads cost.
+pub mod boot;
 
 pub use dtype::DType;
 pub use error::{Error, Result};

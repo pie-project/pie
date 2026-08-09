@@ -53,7 +53,30 @@ pub static KERNELS: &[KernelSig] = &[
         grid_param = Some(3),
         axes = &[BF16]),
     // 1 in rope.metal
-    kernel!(neox_freqs_mb "neox_freqs_mb", axes = &[BF16]),
+    // The batched form of the rescaled ladder, and the row a PREFILL on
+    // llama-3.1, llama-3.2 or any YaRN deployment needs. It was bare, so the
+    // statement had nothing to name and named the decode symbol instead — a
+    // single-row kernel over a multi-row grid, which rotates row zero and
+    // leaves every row after it untouched. Rope is the identity at position
+    // zero, so row zero agreed with the reference either way and the failure
+    // was silent.
+    //
+    // Same operands as `neox_freqs_decode`: the row stride the shader needs is
+    // `grid.y * head_dim`, and `Rule::Rope` now takes its head axis from the
+    // tensor being turned, so the grid says it.
+    kernel!(neox_freqs_mb "neox_freqs_mb", file = Some("rope/neox.metal"),
+        launch = kernels::LaunchRule::Rope,
+        operands = kernels::operands![
+            x: BufMut <- kernels::Source::Out(0),
+            position: I32s <- kernels::Source::Positions,
+            scale: F32 <- kernels::Source::ParamF32(0),
+            inv_freq: Buf <- kernels::Source::RopeFrequencies,
+            head_dim: I32 <- kernels::Source::Param(1),
+            mscale: F32 <- kernels::Source::ParamF32(2),
+        ],
+        // See `neox_decode`: the extent is the statement's.
+        grid_param = Some(3),
+        axes = &[BF16]),
     // 1 in rope.metal
     // The batched form, and the same shape: one tensor, per-token positions.
     kernel!(neox_mb "neox_mb", file = Some("rope/neox.metal"), launch = kernels::LaunchRule::Rope,

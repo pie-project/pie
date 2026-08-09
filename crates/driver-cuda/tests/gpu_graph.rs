@@ -10,7 +10,7 @@
 //! Skipped when no device is present.
 
 mod common;
-use driver_cuda::cuda::{Allocator, DeviceBuffer, OwnedStream, StreamRef};
+use driver_cuda::gpu::device::{Allocator, DeviceBuffer, OwnedStream, StreamRef};
 use common::{device_or_skip, gpu_guard};
 
 const N: usize = 1 << 20;

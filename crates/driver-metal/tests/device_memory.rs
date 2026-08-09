@@ -6,7 +6,8 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_metal::{Context, Error, Memory};
+use driver_metal::Error;
+use driver_metal::gpu::{Context, Memory};
 
 fn context() -> Option<Context> {
     match Context::new() {

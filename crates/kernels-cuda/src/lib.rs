@@ -33,6 +33,24 @@ pub mod rope;
 pub mod sample;
 pub mod ssm;
 
+/// The `pie_k_*` entry points, for the rows any caller can state.
+///
+/// `native` builds `libpie_launch_shim.a`, which DEFINES these; this is the
+/// matching declaration, generated from the same rows in the same process, so
+/// a signature cannot drift from what the shim proves against the header.
+///
+/// Restricted to portable rows — see
+/// [`abi::emit_rust_bindings_portable`]. A row taking `KvCacheLayerView` or a
+/// FlashInfer plan is absent, because its declaration would name a
+/// `#[repr(C)]` mirror this crate does not hold. Those belong to the shell,
+/// which generates the full set against its own mirrors; nothing stops two
+/// crates from declaring one symbol, because a declaration is not a
+/// definition.
+#[cfg(feature = "native")]
+pub mod ffi {
+    include!(concat!(env!("OUT_DIR"), "/ffi.rs"));
+}
+
 /// Every kernel a lowered declaration may state.
 ///
 /// The concatenation of the per-family tables, in the order `TABLES` lists

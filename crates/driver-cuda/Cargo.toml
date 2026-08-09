@@ -37,8 +37,8 @@ path = "src/lib.rs"
 # driver rather than a build error -- so the honest thing is to refuse to
 # build until a human says which runtime this binary will meet. `lib.rs`
 # turns the omission into a compile_error that says so.
-cuda-12 = ["_cuda", "cudarc/cuda-12080"]
-cuda-13 = ["_cuda", "cudarc/cuda-13000"]
+cuda-12 = ["_cuda", "cudarc/cuda-12080", "model-loader?/cuda-12"]
+cuda-13 = ["_cuda", "cudarc/cuda-13000", "model-loader?/cuda-13"]
 
 # Private: "some CUDA version was chosen". Modules are gated on this so that a
 # build with no version selected emits one actionable error instead of burying
@@ -46,23 +46,15 @@ cuda-13 = ["_cuda", "cudarc/cuda-13000"]
 # `cargo test` with no features on the same single error.
 _cuda = ["dep:cudarc"]
 
-# NOT a driver. The half of this crate that is correct without a GPU:
-# geometry, the memory planner, the profile cache, the scratch layout, the
-# arena growth rule -- everything whose answer a card does not change.
+# There is deliberately NO `default`, and deliberately no `portable`
+# either. A default would be a guess about someone else's machine; a
+# `portable` feature would be one whose job is to SUBTRACT, which is the
+# shape that breaks under Cargo's feature unification.
 #
-# It exists because north-star rule 2 says to cut by "is this correct
-# without a GPU?" rather than by subsystem, and because the cost of NOT
-# cutting there was measured: `store::memory_planner`, `mla_geometry` and
-# `dsv4_geometry` sat parity-tested with zero callers behind `_cuda`, where
-# no test that could have noticed was able to run. Eighteen of `store`'s
-# twenty-two files name no CUDA symbol at all.
-#
-# The gate now ends at the modules that own device memory (`kv_cache`,
-# `kv_cache_live`, `dsv4_compress_cache`, `attention_workspace`,
-# `supergraph`, `DeviceTensor`, `LiveDeviceMemory`) rather than at the
-# subsystem boundary. `tests/portable_half.rs` is what keeps it there --
-# without a job that builds this way, the gate drifts back.
-portable = []
+# With NO feature this crate builds its portable half — geometry,
+# budgets, plans, the profile cache — and `tests/portable_half.rs` is the
+# target that runs. See `src/lib.rs` for why that is safer than refusing
+# to build, and `src/gpu/mod.rs` for where the line runs.
 
 # The launch bridge (retirement plan phase A): build.rs generates the
 # `extern "C"` shim and the Rust bindings from the kernel table, compiles the
@@ -77,7 +69,7 @@ bridge = ["dep:kernels-cuda"]
 # (retirement plan — "the cutover boundary, measured"). Implies `bridge`
 # (the shell runs the executor). MUTUALLY EXCLUSIVE with linking the C++
 # shell into the same binary: same symbols, one provider.
-abi = ["bridge", "dep:driver-api", "dep:model-loader", "dep:toml", "model/forward", "model/contract"]
+abi = ["bridge", "dep:driver-api", "dep:model-loader", "model/forward", "model/contract"]
 
 [dependencies]
 # The CUDA version is pinned EXPLICITLY rather than through
@@ -148,10 +140,11 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 # nothing of the loader, tracer, or kernels table.
 model = { path = "../model", default-features = false, features = ["config"] }
 
-# `flock` and `open`. The cache's read -> merge -> rename has to be atomic
-# against another process calibrating a different GPU under the same $HOME,
-# and an advisory whole-file lock is what the C++ uses.
-libc = "0.2"
+# NO `libc`. It was here for `flock` and `open` on the profile cache —
+# the read -> merge -> rename has to be atomic against another process
+# calibrating a different GPU under the same $HOME — and `File::lock` is
+# the same advisory whole-file lock with the descriptor's lifetime in the
+# type. Dropping it is what lets `layout/` carry `#![forbid(unsafe_code)]`.
 
 # The executor's input: `lower()`'s flat launch list and the trace types
 # its operands name. Pure Rust — the toolkit-free build is unaffected.
@@ -178,7 +171,11 @@ model-loader = { path = "../model-loader", optional = true }
 # The boot config `create` receives as `config_bytes` — the C++ shell
 # parses the same TOML with toml++; `[model] descriptor` is where an HF
 # snapshot's descriptor path arrives.
-toml = { version = "1.1", optional = true }
+# NOT optional. `boot.rs` parses the driver's knobs out of the boot
+# TOML, and that is portable — it is text, and the answers it produces
+# size things in `layout/`. Making it optional put the one place this
+# driver states its own configuration behind the ABI feature.
+toml = "1.1"
 
 # The bridge's other half: with `bridge` on, the same crate that provides the
 # table also builds `libpie_kernels_cuda.a` (its `native` feature, CMake +
@@ -224,11 +221,66 @@ cc = "1"
 # `required-features` keeps `cargo test` with no CUDA feature reporting the
 # same one error the library does, instead of additionally failing to compile
 # test targets whose imports have all been cfg'd away.
+# The targets that name something under `gpu/`. Declared rather than
+# auto-discovered, because a featureless `cargo test` builds every
+# auto-discovered target and these do not compile without a device
+# selected — which is the whole point of the featureless build.
+#
+# The four NOT here — `dtoa_parity`, `hf_descriptor_parity`,
+# `profile_cache_parity`, `workspace_parity` — are portable and run in
+# that build, which is coverage the crate did not have before.
+[[test]]
+name = "attn_score_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "attn_ws_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "cublas_handle_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "entry_validation"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_plan_load"
+required-features = ["_cuda"]
+
+[[test]]
+name = "kv_cache_live_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "kv_view_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "lora_stage_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "page_mask_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "sideband_arena_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "stage_hooks_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "weight_view_parity"
+required-features = ["_cuda"]
+
 # The one test target with no CUDA feature: it asks whether the portable
 # half is still portable, which is a question only a build can answer.
 [[test]]
 name = "portable_half"
-required-features = ["portable"]
 
 [[test]]
 name = "gpu_smoke"

@@ -26,10 +26,20 @@ path = "src/lib.rs"
 # dev loop must not pay nvcc to look up a symbol's contract. `driver-cuda`
 # turns it on; everyone else takes the table alone.
 default = []
-native = ["dep:cmake"]
+native = ["dep:cmake", "dep:cc"]
 
 [dependencies]
 kernels = { path = "../kernels" }
 
 [build-dependencies]
 cmake = { version = "0.1", optional = true }
+# Compiles the generated `shim.cpp` into `libpie_launch_shim.a`. The shim is
+# the only thing that DEFINES the `pie_k_*` symbols, so it has to be built by
+# the crate that owns the launchers it forwards into — otherwise every crate
+# that wants to call a kernel builds its own copy and a binary linking two of
+# them fails on duplicate definitions.
+cc = { version = "1", optional = true }
+# `build.rs` reads this crate's own tables through `#[path]`, because a build
+# script cannot depend on the crate it builds. The modules it pulls in import
+# nothing but `kernels`, which is what makes that possible.
+kernels = { path = "../kernels" }

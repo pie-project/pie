@@ -26,7 +26,7 @@ use std::mem::offset_of;
 use std::fmt::Write as _;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::model::weight_view::{
+use driver_cuda::gpu::weights::weight_view::{
     QuantKind, QuantMeta, TensorRef, WeightView, make_weight_view,
 };
 

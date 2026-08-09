@@ -63,14 +63,12 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use driver_metal::pipeline::{
+use driver_metal::channel::{
     ExecPlan, HostOp, PassInputs, StatusOutcome, StepOutcome, Ticket, Value, adopt_launch_package,
     encode_wire, host_take, make_host_instance, step,
 };
-use driver_metal::{
-    Archives, Context, DeviceInputs, Error, Externals, Mode, Pool, Prepare, Region, Ring, Runtime,
-    Stepper, Tables,
-};
+use driver_metal::{Error, Region};
+use driver_metal::gpu::{Archives, Context, DeviceInputs, Externals, Mode, Pool, Prepare, Ring, Runtime, Stepper, Tables};
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
 use tensor_compiler::plan::{COMPILER_VERSION, LANE_TABLE_ABI_VERSION, REGION_PLAN_VERSION};
@@ -80,7 +78,7 @@ use tensor_ir::registry::{ModelProfile, Stage};
 use tensor_ir::types::{DType, Shape};
 use tensor_ir::validate::bind;
 
-use driver_metal::pipeline::Versions;
+use driver_metal::channel::Versions;
 
 /// The versions the driver checks a package against, taken from the compiler
 /// that built it. See the module doc: a literal here is the `= 23` bug.
@@ -214,7 +212,7 @@ fn drain_ring(ring: &Ring) -> Option<Value> {
     let bytes = unsafe {
         std::slice::from_raw_parts(cell.contents().cast::<u8>().as_ptr(), ring.cell_bytes())
     };
-    driver_metal::pipeline::decode_wire(bytes, ring.dtype(), ring.numel())
+    driver_metal::channel::decode_wire(bytes, ring.dtype(), ring.numel())
 }
 
 /// What one side of the comparison read back: a value per host-readable
@@ -336,7 +334,7 @@ fn run_both(
             let ring = Rc::new(
                 Ring::new(
                     &f.context,
-                    driver_metal::pipeline::concrete_dtype(decl.dtype),
+                    driver_metal::channel::concrete_dtype(decl.dtype),
                     decl.shape
                         .iter()
                         .map(|&d| d as usize)

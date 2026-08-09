@@ -271,8 +271,15 @@ template <typename T>
 // The same rotation over N token rows.
 //
 // `pos.z` is the row: it reads `position[row]` and strides `x` by the row's
-// whole width, which is `n_heads * head_dim` and NOT derivable from this
-// kernel's grid -- q and k have different head counts and share the kernel.
+// whole width, which is `grid.y * head_dim`.
+//
+// That stride used to arrive as `buffer(6)`, on the reasoning that q and k
+// have different head counts and share the kernel so the grid could not say
+// it. The grid could not say it because the DRIVER launched both over the
+// query head count -- `Rule::Rope` read a fire-wide `q_heads` for a statement
+// that is made once per tensor. It now takes the head axis from the operand
+// it turns, so `grid.y` IS this tensor's head count and the stride follows,
+// exactly as `rope_neox_mb` has always derived it.
 template <typename T>
 [[kernel]] void rope_neox_freqs_mb(
     device T* x                       [[buffer(0)]],  // [N, n_head, head_dim]
@@ -281,16 +288,16 @@ template <typename T>
     const device float* inv_freq      [[buffer(3)]],  // [rotary_dims/2]
     const constant int& head_dim      [[buffer(4)]],
     const constant float& mscale      [[buffer(5)]],
-    const constant int& row_stride    [[buffer(6)]],  // n_heads * head_dim
     uint3 pos  [[thread_position_in_grid]],
     uint3 grid [[threads_per_grid]]) {
   const int i = int(pos.x);
   const int h = int(pos.y);
   const int row = int(pos.z);
   const int half_rd = int(grid.x);
+  const int n_head = int(grid.y);
   rope_neox_freqs_body(
       x, position[row], scale, inv_freq, head_dim, half_rd,
-      mscale, i, h, size_t(row) * size_t(row_stride));
+      mscale, i, h, size_t(row) * size_t(n_head) * size_t(head_dim));
 }
 
 #define instantiate_rope_freqs(name, itype)                        \
@@ -302,6 +309,6 @@ template <typename T>
   [[kernel]] void rope_neox_freqs_mb<itype>(                       \
       device itype*, const device int*, const constant float&,     \
       const device float*, const constant int&, const constant float&, \
-      const constant int&, uint3, uint3);
+      uint3, uint3);
 
 instantiate_rope_freqs(bfloat16, bfloat)

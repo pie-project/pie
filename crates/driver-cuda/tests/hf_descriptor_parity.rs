@@ -19,7 +19,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use driver_cuda::model::descriptor::{
+use model::descriptor::{
     ATTN_HEAD_DIMS, DescriptorError, parse_pie_model_descriptor,
 };
 use serde_json::Value;

@@ -43,7 +43,7 @@ fn every_shipped_shader_splices() {
     assert!(!files.is_empty(), "no .metal found under {}", dir.display());
 
     for path in &files {
-        let out = driver_metal::shader::read_source(path)
+        let out = driver_metal::layout::shader::read_source(path)
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert!(
             !out.contains("#include \""),
@@ -70,7 +70,7 @@ fn splicing_brings_the_header_body_in() {
         .find(|l| l.starts_with("struct ") || l.starts_with("typedef "))
         .map(str::trim);
 
-    let out = driver_metal::shader::read_source(&root).expect("splices");
+    let out = driver_metal::layout::shader::read_source(&root).expect("splices");
     if let Some(marker) = marker {
         assert!(out.contains(marker), "spliced text lost `{marker}`");
     }
@@ -87,7 +87,7 @@ fn system_includes_survive() {
         if want == 0 {
             continue;
         }
-        let out = driver_metal::shader::read_source(&path).expect("splices");
+        let out = driver_metal::layout::shader::read_source(&path).expect("splices");
         // At least: a spliced quoted header brings its own system includes
         // with it (the MLX steel fragments each pull <metal_stdlib>), so the
         // count may grow. What must never happen is a system include being

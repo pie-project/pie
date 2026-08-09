@@ -22,9 +22,9 @@ use std::ffi::c_void;
 use std::rc::Rc;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::store::KvCacheFormat;
-use driver_cuda::store::kv_cache::{KvCacheLayout, PerLayer};
-use driver_cuda::store::kv_cache_live::{ElasticPool, KvCache, KvCacheDeviceOps};
+use driver_cuda::layout::KvCacheFormat;
+use driver_cuda::gpu::pools::kv_cache::{KvCacheLayout, PerLayer};
+use driver_cuda::gpu::pools::kv_cache_live::{ElasticPool, KvCache, KvCacheDeviceOps};
 use driver_cuda::tensor::TensorSpec;
 
 /// FNV-1a 64 of the C++ oracle's transcript.
@@ -175,7 +175,7 @@ impl Harness {
             scalar_num_kv_heads(l),
             scalar_head_dim(l),
             c.format().name(),
-            u8::from(l.page_order() == driver_cuda::store::kv_cache::PageOrder::Hnd),
+            u8::from(l.page_order() == driver_cuda::gpu::pools::kv_cache::PageOrder::Hnd),
             u8::from(c.envelopes_enabled()),
         ));
         for layer in 0..l.num_layers() {

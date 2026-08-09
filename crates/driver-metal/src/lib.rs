@@ -15,14 +15,58 @@
 //! GPU and is only in C++ because it was written next to the part that does.
 //! So the split here is by that line rather than by subsystem:
 //!
-//! * [`bump`], [`region`], [`shader`] and [`tuning`] are portable. They compile and test on any
+//! * [`layout`] and [`lowering`] are portable. They compile and test on any
 //!   host, including the Linux boxes the rest of the workspace is developed
 //!   on, because their inputs are text and integers.
-//! * [`metal`] is Apple-only and is where every `unsafe` message send lives.
+//! * `gpu` is Apple-only and is where every `unsafe` message send lives.
+//!   It is **one** gate, not five: `.wiki/driver/real-metal-north-star.md`
+//!   §6 records what four gates inside one module cost the last time.
 //!
 //! The portable half is not a convenience. It is the half that can be tested
-//! without a GPU, and keeping it importable from a Linux `cargo test` is what
-//! stops it from drifting back into the untestable half.
+//! without a GPU, and keeping it importable is what stops it from drifting
+//! back into the untestable half.
+//!
+//! # The gate is a feature, and that is the point
+//!
+//! `metal-4`, not `cfg(target_vendor = "apple")`, because:
+//!
+//! > **A platform cfg cannot be tested. A feature can.**
+//!
+//! On macOS `target_vendor = "apple"` is always true, so the portable half
+//! was never compiled; on Linux it is always false, so the Apple half never
+//! was. No machine built both, and no single job could catch a reference
+//! across the boundary — which is exactly how three of them got in and
+//! stayed. `cargo test -p driver-metal` builds the portable half and
+//! `--features metal-4` builds all of it, both on the Mac the people who
+//! work on this crate already have.
+//!
+//! There is no default feature on purpose. A default would have to be turned
+//! OFF to reach the portable half, and rule 4 of
+//! `.wiki/driver/north-star.md` is that a check which can be skipped will
+//! be. A consumer that wants the serving path says so — `engine`'s
+//! `driver-metal` feature does, in one line.
+//!
+//! # Where a thing lives
+//!
+//! The `gpu::*` rows are code spans and not links because this table is in
+//! the portable half, which is compiled without them.
+//!
+//! | | |
+//! |---|---|
+//! | [`layout`] | how big, where, how many |
+//! | [`lowering`] | fire shape → symbols, grids, operands |
+//! | `gpu::device` | the only place `queue`, `heap`, `MTLBuffer` are the right words |
+//! | `gpu::weights` | checkpoint → device |
+//! | `gpu::pools` | what `layout` planned, allocated |
+//! | `gpu::bind` | compile the symbols, stage the tables, dispatch |
+//! | `gpu::fire` | what one fire keeps between steps |
+//! | `gpu::program` | user programs: compile, cache, channel, run |
+//! | `gpu::serve` | the transfers the engine asks for |
+//!
+//! [`batch`], [`facts`] and [`model`] are what is left of the driver's model
+//! knowledge. They still spell family names, which
+//! `.wiki/driver/real-metal-north-star.md` §4 states is a fact that failed to
+//! reach the crate that owns it, and they are going to `crates/model` whole.
 //!
 //! # Ownership
 //!
@@ -44,34 +88,46 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod batch;
-pub mod bump;
+pub mod channel;
 mod error;
 pub mod facts;
+pub mod layout;
 pub mod loader;
+pub mod lowering;
 pub mod model;
-pub mod pipeline;
-pub mod region;
-pub mod shader;
-pub mod store;
-pub mod tuning;
 
 pub use error::{Error, Result};
 pub use facts::{ModelFacts, ModelFamily};
-pub use region::Region;
-pub use shader::{Batch, Request};
+pub use layout::{Batch, Region, Request};
 
-#[cfg(target_vendor = "apple")]
-pub mod metal;
+// `metal-4` needs an Apple target: Metal has no implementation elsewhere, so
+// enabling it on Linux would produce a wall of unresolved `objc2` paths
+// instead of a sentence. Build WITHOUT it for the half of this crate that
+// answers questions no GPU changes.
+#[cfg(all(feature = "metal-4", not(target_vendor = "apple")))]
+compile_error!(
+    "`metal-4` needs an Apple target: Metal has no implementation elsewhere. \
+     Build without it for the half of this crate that answers questions no \
+     GPU changes."
+);
 
-#[cfg(target_vendor = "apple")]
-pub use metal::{
-    Archived, Archives, Arena, ArgumentTable, Budget, CHUNK, Compiled, Compiler, Context,
-    DeviceInfo, DeviceInputs, Elastic, Execution, External, Externals, Feedback, Feedbacks,
-    FusedExecutable, Granularity, GroupStats, GroupedExecutable, Handle, Heap, Keepalive,
-    LaneCandidate, M2Command, M3Group, MAX_BINDINGS, MAX_FUSED_CHANNELS, MAX_LANES,
-    MAX_REGIONS_PER_PROGRAM, MAX_REGIONS_PER_STAGE, MIN_DEPTH, MIN_THREADGROUPS, Mapped, Math,
-    Memory, Mode, Need, ORDINAL_BASE, PAGE, Pool, PoolStats, Prepare, PreparedFire, Pressure,
-    ProgramExecutable, ProgramStage, Pso, RegionExecutable, Ring, Runtime, Slot, StageExecutable,
-    StepEncoder, Stepper, THREADS_PER_THREADGROUP, TILE, Tables, Timestamps, Timing, Transient,
-    Visibility, create_elastic, pages_for_bytes,
-};
+#[cfg(feature = "metal-4")]
+pub mod gpu;
+
+// The device half is reached through `gpu::`, and only through it.
+//
+// Sixty-five names used to be re-exported flat from here, so every one of
+// them had two paths: `driver_metal::Stepper` and `driver_metal::gpu::Stepper`
+// named one type. That is §5's "one concept, two names" inside a single
+// crate, and it is what let the engine reach past the seam into whatever it
+// liked -- a facade is only a facade if the alternative is not also public.
+//
+// Nine of the sixty-five had a caller through the flat path. The other
+// fifty-six existed because adding a name to a list is cheaper than deciding
+// where it belongs (`.wiki/driver/real-metal-north-star.md` §9, "everything
+// else goes private").
+//
+// What stays crate-root is the PORTABLE half above: `Error`, the layout
+// types, the model facts. Those answer questions no GPU changes, and they are
+// the same on a machine with no Metal at all.
+// `tests/layering.rs` holds this to the three of them.

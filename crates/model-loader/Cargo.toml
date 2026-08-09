@@ -29,8 +29,54 @@ default = ["testkit"]
 # ever grows a route into the oracle, the worker stops compiling.
 testkit = []
 
+# The device half of the loader: `executor::cuda::CudaArena`, which runs a
+# plan's `Cast`/`Scale`/`Encode` on the GPU instead of staging them back to
+# the host to compute in a loop.
+#
+# OFF by default, and the default is the load-bearing one: without it this
+# crate's whole dependency set is `half`/`ztensor`/`serde`/`thiserror`, and
+# `pie model convert` builds and runs on a machine with no CUDA toolkit. That
+# is not a nicety — it is what makes the host executor the reference the
+# device answer is checked against.
+#
+# `kernels-cuda/native` is what turns nvcc on. It is where the `pie_k_*`
+# symbols are DEFINED (`libpie_launch_shim.a`), so this feature and
+# `driver-cuda/bridge` name one provider between them rather than each
+# building a copy.
+cuda = ["dep:kernels-cuda", "kernels-cuda/native", "dep:cudarc"]
+
+# WHICH CUDA RUNTIME, chosen by the consumer rather than here. This crate
+# names no version of its own: `driver-cuda` offers `cuda-12`/`cuda-13`
+# and a binary picks one, so a hardcoded version here would be a SECOND
+# vote — and Cargo unifies features, so both would win.
+#
+# That is not hypothetical. `cudarc/cuda-12080` was pinned here while
+# `driver-cuda` selected `cuda-13000`; the two unified, cudarc's cublas
+# `sys` module declared every enum twice, and the failure surfaced in
+# `cargo test --doc` rather than anywhere that named a version.
+cuda-12 = ["cuda", "cudarc/cuda-12080"]
+cuda-13 = ["cuda", "cudarc/cuda-13000"]
+
 [dependencies]
 half = "2"
+# The kernel table, and the `pie_k_*` declarations for the rows any caller can
+# state — which the loader's quantize/cast/scale are, being plain pointers and
+# extents. Read `kernels_cuda::ffi`'s doc for why the attention rows are not
+# there.
+kernels-cuda = { path = "../kernels-cuda", default-features = false, optional = true }
+# Runtime only: the arena needs `cudaMemcpyAsync`, `cudaMemsetAsync`,
+# `cudaHostAlloc` and an event. No `driver`, no cublas, no nvrtc — a loader
+# that reached for those would be doing something other than loading.
+#
+# `fallback-dynamic-loading` for the reason `driver-cuda` states: symbols
+# resolve through `dlopen` on first call, so nothing is linked and a build
+# needs no CUDA libraries present.
+# NO VERSION FEATURE HERE — see `cuda-12`/`cuda-13` above.
+cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
+    "std",
+    "runtime",
+    "fallback-dynamic-loading",
+] }
 # The checkpoint readers; the requirement itself lives in the workspace
 # manifest, because releasing them is a two-repo dance.
 ztensor = { workspace = true, features = ["zstd"] }

@@ -1,4 +1,4 @@
-//! Differential proof that [`driver_cuda::store::kv_geometry`] reproduces
+//! Differential proof that [`driver_cuda::layout::kv_geometry`] reproduces
 //! the C++ KV page-geometry functions exactly.
 //!
 //! Same protocol as `kv_format_parity.rs` and `planner_policy_parity.rs`:
@@ -45,8 +45,8 @@
 //! and together, so a port that drops the `per_layer_num_kv_heads` path -- the
 //! fix itself -- cannot pass.
 
-use driver_cuda::store::KvCacheFormat;
-use driver_cuda::store::kv_geometry::{
+use driver_cuda::layout::KvCacheFormat;
+use driver_cuda::layout::kv_geometry::{
     LayerShapes, device_bytes_per_page, page_bytes_homogeneous, page_bytes_per_layer,
 };
 use std::fmt::Write as _;

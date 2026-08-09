@@ -23,7 +23,7 @@
 use std::fmt::Write as _;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::model::workspace::{WorkspaceLayout, WorkspaceShape};
+use driver_cuda::layout::workspace::{WorkspaceLayout, WorkspaceShape};
 
 /// FNV-1a 64 of the C++ oracle's transcript.
 ///

@@ -20,12 +20,12 @@
 use std::fmt::Write as _;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::store::dsv4_compress_cache::DsV4CompressLayout;
-use driver_cuda::store::dsv4_geometry::compress_bytes_per_token;
-use driver_cuda::store::kv_cache::KvCacheLayout;
-use driver_cuda::store::mla_cache::MlaCacheLayout;
-use driver_cuda::store::swap_pool::SwapPoolLayout;
-use driver_cuda::store::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};
+use driver_cuda::gpu::pools::dsv4_compress_cache::DsV4CompressLayout;
+use driver_cuda::layout::dsv4_geometry::compress_bytes_per_token;
+use driver_cuda::gpu::pools::kv_cache::KvCacheLayout;
+use driver_cuda::gpu::pools::mla_cache::MlaCacheLayout;
+use driver_cuda::gpu::pools::swap_pool::SwapPoolLayout;
+use driver_cuda::layout::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};
 use driver_cuda::tensor::TensorSpec;
 
 /// FNV-1a 64 of the C++ oracle's transcript.

@@ -2327,8 +2327,21 @@ pub mod metal {
         // `Source::RopeFrequencies`, so the statement's job is only to say
         // WHICH form this deployment takes.
         let (kernel, params) = if table {
+            // The batched form exists and is the same rotation over N rows.
+            // This branch used to name the decode symbol whatever the fire
+            // was, while the branch below already chose — so a rescaled-ladder
+            // PREFILL dispatched a single-row kernel over a multi-row grid.
+            // `pos.z` is not delivered to a `uint2` thread position, so every
+            // row computed row zero's index and rows one and up were never
+            // rotated at all. Position zero makes rope the identity, so row
+            // zero looked right and nothing said which row was wrong.
+            let stem = if multi_batch {
+                "neox_freqs_mb_bfloat16"
+            } else {
+                "neox_freqs_decode_bfloat16"
+            };
             (
-                "neox_freqs_decode_bfloat16".to_string(),
+                stem.to_string(),
                 // Scale, head width, and YaRN's `mscale` -- one for llama-3,
                 // whose rescaling lives entirely in the frequencies.
                 // The rotary WIDTH last, and the row says so with

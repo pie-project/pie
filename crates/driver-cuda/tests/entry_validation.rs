@@ -32,16 +32,29 @@ use std::collections::BTreeSet;
 
 /// The shell's source, read once.
 ///
-/// EVERY module of it, concatenated. The shell was one file when this test
-/// was written and is six now (`serve/{mod,state,load,launch,encode,
-/// transfer}.rs`), and reading only the one that happens to hold the doors
-/// today would let a new entry point written the old way land next door
-/// and pass. The guarantee is about the whole shell, so the source is.
+/// EVERY module of it, concatenated. The shell was one file when this
+/// test was written, became six, and is now TWO DIRECTORIES —
+/// `gpu/serve/` holds the doors and `gpu/fire/` holds the pass they open
+/// onto. Reading only the one that happens to hold a door today would
+/// let a new entry point written the old way land next door and pass.
+/// The guarantee is about the whole shell, so the source is.
+///
+/// This test has been broken by a move twice. Both times it kept
+/// passing, because a shrinking corpus finds fewer violations rather
+/// than more — which is why the emptiness assertions below are not
+/// decoration.
 fn shell_source() -> String {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/serve");
-    let mut files: Vec<_> = std::fs::read_dir(dir)
-        .expect("the shell's source is beside this test")
-        .filter_map(|e| e.ok().map(|e| e.path()))
+    let dirs = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/gpu/serve"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/gpu/fire"),
+    ];
+    let mut files: Vec<_> = dirs
+        .iter()
+        .flat_map(|dir| {
+            std::fs::read_dir(dir)
+                .expect("the shell's source is beside this test")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+        })
         .filter(|p| p.extension().is_some_and(|x| x == "rs"))
         .collect();
     files.sort();

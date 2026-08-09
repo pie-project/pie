@@ -37,6 +37,7 @@ pub mod image;
 pub mod local;
 pub mod plan;
 pub mod remote;
+pub mod submission;
 pub mod transfer;
 
 pub use adopt::{adopt_emitted_kernels, adopt_package, adopt_region_analysis};
@@ -60,4 +61,5 @@ pub use plan::{
     RS_FLAG_FOLD, RS_FLAG_FOLD_LEN_DEVICE, RS_FLAG_RESET, StateCopyPlan,
 };
 pub use remote::*;
+pub use submission::{FrameSubmission, StepSubmission};
 pub use transfer::{KvDtype, KvExport, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};

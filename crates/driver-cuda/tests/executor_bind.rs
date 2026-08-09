@@ -19,7 +19,7 @@
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 
-use driver_cuda::model::executor::{BindRefusal, Frame, Resolver, bind};
+use driver_cuda::gpu::bind::{BindRefusal, Frame, Resolver, bind};
 use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::families::llama_like::forward::llama_like_cuda;
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
@@ -123,7 +123,7 @@ fn every_launch_of_the_gemma2_deployment_binds() {
         &model::gemma_2::forward::facts::Gemma2Facts::gemma_2_9b(),
         FireClass::Decode,
     );
-    let dp = driver_cuda::model::executor::DispatchPlan::new(&plan, &l);
+    let dp = driver_cuda::gpu::bind::DispatchPlan::new(&plan, &l);
     assert!(
         (0..l.launches.len()).any(|i| {
             dp.spec(i).weight.as_deref().is_some_and(|w| !w.starts_with("scale."))
@@ -560,7 +560,7 @@ fn print_all_deployment_vocabularies() {
             for launch in &l.launches {
                 let _ = bind(&l, launch, frame, &mut r);
             }
-            let dp = driver_cuda::model::executor::DispatchPlan::new(&plan, &l);
+            let dp = driver_cuda::gpu::bind::DispatchPlan::new(&plan, &l);
             for i in 0..l.launches.len() {
                 if let Some(w) = &dp.spec(i).weight {
                     r.weights.insert(w.clone());
@@ -624,7 +624,7 @@ fn print_the_anchor_vocabulary() {
                 let _ = bind(&l, launch, frame, &mut r);
                 let _ = i;
             }
-            let dp = driver_cuda::model::executor::DispatchPlan::new(&plan_of(class), &l);
+            let dp = driver_cuda::gpu::bind::DispatchPlan::new(&plan_of(class), &l);
             for i in 0..l.launches.len() {
                 if let Some(w) = &dp.spec(i).weight {
                     r.weights.insert(w.clone());
@@ -965,7 +965,7 @@ fn every_mark_lowered(rows: usize) -> Lowered {
 #[test]
 fn every_lowered_symbol_has_an_arm() {
     let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/executor.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gpu/bind/mod.rs"),
     )
     .expect("the executor's source");
 
@@ -1219,7 +1219,7 @@ fn print_the_remaining_families_vocabulary() {
 /// silent wrong number on device.
 #[test]
 fn every_pair_form_activation_recovers_its_up_projection() {
-    use driver_cuda::model::executor::DispatchPlan;
+    use driver_cuda::gpu::bind::DispatchPlan;
 
     let cases: Vec<(&str, model_compiler::trace::ForwardPlan, Lowered)> = vec![
         (

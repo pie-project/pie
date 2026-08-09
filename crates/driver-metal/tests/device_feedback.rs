@@ -10,7 +10,8 @@
 
 use std::time::Duration;
 
-use driver_metal::{Compiler, Context, Error, Heap, Stepper, Tables};
+use driver_metal::Error;
+use driver_metal::gpu::{Compiler, Context, Heap, Stepper, Tables};
 
 const HEAP_BYTES: u64 = 1 << 22;
 const LANDING: Duration = Duration::from_secs(10);

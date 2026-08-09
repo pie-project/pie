@@ -22,7 +22,8 @@ use objc2::rc::{Retained, Weak, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLComputePipelineState, MTLDevice};
 
-use driver_metal::{Compiler, Context, Error, Math};
+use driver_metal::Error;
+use driver_metal::gpu::{Compiler, Context, Math};
 
 const TRIVIAL: &str = r"
 #include <metal_stdlib>

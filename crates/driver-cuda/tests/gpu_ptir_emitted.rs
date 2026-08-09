@@ -26,7 +26,7 @@
 //! launched a kernel without them would be asserting against uninitialised
 //! device memory.
 
-use driver_cuda::ptir::{Disk, Runtime, Target};
+use driver_cuda::gpu::program::{Disk, Runtime, Target};
 use driver::{Versions, adopt_launch_package};
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
@@ -126,13 +126,13 @@ fn scratch_disk(name: &str) -> (Disk, std::path::PathBuf) {
     (Disk::at(&directory), directory)
 }
 
-fn target(device: &driver_cuda::cuda::Device) -> Target {
+fn target(device: &driver_cuda::gpu::device::Device) -> Target {
     let (major, minor) = device.compute_capability().expect("compute capability");
     Target {
         major,
         minor,
         device: u64::try_from(device.ordinal()).unwrap_or(0),
-        nvrtc: driver_cuda::ptir::nvrtc::version().expect("NVRTC must be loadable"),
+        nvrtc: driver_cuda::gpu::program::compile::version().expect("NVRTC must be loadable"),
     }
 }
 

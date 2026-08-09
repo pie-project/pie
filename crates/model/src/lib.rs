@@ -107,6 +107,26 @@ pub mod weight_names;
 #[cfg(feature = "contract")]
 pub mod facts;
 
+/// What a driver needs to serve a checkpoint, with no family name in it.
+///
+/// The answer to "what is this model made of", shaped so that a driver
+/// CANNOT ask the question again. See the module doc for why this is a
+/// value rather than the `Box<dyn PlannedFamily>` the drivers built per
+/// fire.
+pub mod deployment;
+
+/// The CUDA shell's per-family derivations, moved out of the driver.
+///
+/// The table of `model_type` rows and the eleven functions that read a
+/// checkpoint into per-family facts. It is here rather than in
+/// `driver-cuda` because §4's rule is that **the driver reads the
+/// answer, never the question** — and a table of `model_type` strings
+/// inside a driver is the question.
+pub mod deployment_cuda;
+
+/// The `pie.model/1` descriptor reader.
+pub mod descriptor;
+
 // ── The shared root: the chat aspect ─────────────────────────────────
 #[cfg(feature = "chat")]
 pub mod decoders;

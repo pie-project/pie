@@ -60,7 +60,7 @@ impl AffineFormat {
     /// would drift and answer for a shader that no longer exists.
     ///
     /// The C++ shell refused an unreadable scheme by name at load
-    /// (`heap_bind.cpp:845-890`, *"no metal kernel here reads '<name>'"*) and
+    /// (`heap_bind.cpp:845-890`, *"no metal kernel here reads `'<name>'`"*) and
     /// nothing did after the port. Without it the failure moves to the first
     /// fire, as the runtime compiler declining a symbol — which is loud, but
     /// arrives after the weights are staged and names a mangled entrypoint

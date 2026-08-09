@@ -6,8 +6,9 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_metal::metal::SMALLEST_CLASS;
-use driver_metal::{Compiler, Context, Error, Pool, Stepper, Tables};
+use driver_metal::gpu::SMALLEST_CLASS;
+use driver_metal::Error;
+use driver_metal::gpu::{Compiler, Context, Pool, Stepper, Tables};
 
 const FILL: &str = r"
 #include <metal_stdlib>
@@ -27,7 +28,7 @@ fn context() -> Option<Context> {
     }
 }
 
-fn read_u32s(t: &driver_metal::Transient, count: usize) -> Vec<u32> {
+fn read_u32s(t: &driver_metal::gpu::Transient, count: usize) -> Vec<u32> {
     // SAFETY: shared storage, wide enough, and the step that wrote it has
     // signalled.
     unsafe { std::slice::from_raw_parts(t.contents().as_ptr().cast::<u32>(), count) }.to_vec()
@@ -198,6 +199,80 @@ fn the_budget_evicts_the_largest_cached_class_first() {
         pool.stats().reuse_hits,
         1,
         "the smallest class was not the one kept"
+    );
+}
+
+#[test]
+fn an_eviction_takes_the_buffer_out_of_the_residency_set() {
+    use objc2_metal::MTLResidencySet;
+
+    let Some(context) = context() else {
+        println!("no Metal device; skipped");
+        return;
+    };
+    // The pool's own counters cannot see this. A residency set holds its own
+    // reference to every allocation it names, so a buffer that is merely
+    // dropped is still resident and still costs its bytes -- `evictions`
+    // would climb while nothing was actually given back. Only the device's
+    // count answers the question, so this test asks the device.
+    let resident = || context.residency().allocationCount();
+
+    let pool = Pool::new(SMALLEST_CLASS * 12);
+    let before = resident();
+    drop(pool.acquire(&context, SMALLEST_CLASS).expect("small"));
+    drop(pool.acquire(&context, SMALLEST_CLASS * 2).expect("medium"));
+    drop(pool.acquire(&context, SMALLEST_CLASS * 4).expect("large"));
+    assert_eq!(
+        resident(),
+        before + 3,
+        "the pool made three buffers; the set should name three more"
+    );
+
+    // Room has to be made for this one, so exactly one buffer is released.
+    let _fresh = pool.acquire(&context, SMALLEST_CLASS * 8).expect("fresh");
+    assert_eq!(pool.stats().evictions, 1, "the setup stopped evicting one");
+    assert_eq!(
+        resident(),
+        before + 3,
+        "one buffer was added and one evicted, so the set should be level; \
+         if it grew, the evicted buffer was dropped without being removed \
+         from the set, which does not free it"
+    );
+}
+
+#[test]
+fn a_pool_that_goes_away_takes_its_buffers_out_of_the_residency_set() {
+    use objc2_metal::MTLResidencySet;
+
+    let Some(context) = context() else {
+        println!("no Metal device; skipped");
+        return;
+    };
+    // The set outlives every pool that registers in it, so dropping a pool is
+    // the one moment where a buffer can be forgotten with nobody left to
+    // notice. Two shapes of that: buffers still cached, and a loan still out.
+    let resident = || context.residency().allocationCount();
+    let before = resident();
+
+    let pool = Pool::new(SMALLEST_CLASS * 64);
+    drop(pool.acquire(&context, SMALLEST_CLASS).expect("cached"));
+    let outstanding = pool.acquire(&context, SMALLEST_CLASS * 2).expect("loan");
+    assert_eq!(resident(), before + 2, "two buffers were made");
+
+    drop(pool);
+    assert_eq!(
+        resident(),
+        before + 1,
+        "the pool was dropped holding one cached buffer, which it should have \
+         unregistered; only the outstanding loan should still be named"
+    );
+
+    drop(outstanding);
+    assert_eq!(
+        resident(),
+        before,
+        "a loan that outlives its pool has nowhere to go home to, so it has \
+         to unregister itself rather than just drop"
     );
 }
 

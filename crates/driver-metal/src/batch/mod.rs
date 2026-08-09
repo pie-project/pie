@@ -1,31 +1,22 @@
-//! The batch subsystem: scheduling, composition, and the forward's shape.
+//! The family ladder, and nothing else any more.
 //!
-//! `csrc/src/batch/` is ~11.6k lines and is mostly not about the GPU: it
-//! derives batch shapes from the CSR view the engine marshals, composes
-//! channel tickets, colors scratch, and only at the end encodes a forward.
-//! The port follows the crate's rule — portable half first, into modules a
-//! Linux `cargo test` reaches — and `.wiki/driver/progress-metal.md` is its ledger.
+//! What was here that is family-neutral has left: the launch ABI is
+//! [`crate::lowering::abi`] and the geometry-derived kernel params are
+//! [`crate::lowering::consts`].
 //!
-//! [`schedule`] is the batch shape: request spans, the token→request
-//! expansion, and the paged-geometry gate that runs before any pool cell can
-//! be addressed. [`mask`] answers whether a wire attention mask says
-//! anything the kernel's own causal predicate does not already enforce.
+//! What remains is the thing `.wiki/driver/real-metal-north-star.md` §3
+//! measures and asks to be deleted rather than moved: `geometry` is a
+//! model definition inside the driver, and `geometry_facts` is the
+//! per-family projection ladder that fills it — *"projecting rather than
+//! branching… the per-family ladder this crate is retiring."* Both go to
+//! `crates/model` with `facts.rs`, and `logits` and `timing` are the two
+//! readback helpers that were parked beside them.
 
-mod abi;
-mod consts;
-mod geometry;
-mod geometry_facts;
-mod logits;
-mod timing;
+pub(crate) mod geometry;
+pub(crate) mod geometry_facts;
+pub(crate) mod logits;
+pub(crate) mod timing;
 
-pub use abi::{
-    ArgmaxParams, ForwardGraphKey, IO_SLOT_COUNT, IoSlot, Kernel, PAGE_BUCKET_GRAN, Region,
-    SCRATCH_POOL,
-};
-pub use consts::{
-    ExpertCombineParams, GatedRmsParams, GdnCoreParams, KN, MoeRouteParams, RmsParams,
-    RouterParams, gdn_core_params, is_qmv, is_routed, qmv_kn,
-};
 pub use geometry::{AffineFormat, DecodeGeometry};
 pub use geometry_facts::{
     GeometryRefused, ROUTER_MAX_EXPERTS, ROUTER_MAX_TOP_K, geometry_from_facts,

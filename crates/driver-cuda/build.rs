@@ -2,24 +2,27 @@
 //!
 //! Without `bridge` this script does nothing at all — the crate's
 //! toolkit-free build is load-bearing for CI and must not learn a CUDA
-//! dependency here. With it, both halves of the flat launch ABI are
+//! dependency here. With it, the Rust half of the flat launch ABI is
 //! generated from the kernel table at build time and never committed:
 //!
-//! * `shim.cpp` — `kernels_cuda::abi::emit_c_shim` over every family table,
-//!   compiled by `cc` against the real headers into `libpie_launch_shim.a`.
-//!   Compiling it is the same proof `tests/launch_abi.rs` runs per family,
-//!   now against the real `cuda_runtime.h` instead of the stub.
-//! * `launch_bindings.rs` — `emit_rust_bindings` over the same tables,
-//!   included by `launch::ffi`. Both halves come from one read of one table
-//!   in one process, so they cannot disagree with each other; the C++
-//!   compiler is what keeps them from disagreeing with the launchers.
+//! * `launch_bindings.rs` — `emit_rust_bindings` over every family table,
+//!   included by `gpu::bind::abi::ffi`. These are DECLARATIONS, which is why
+//!   they live with their caller: they are spelled in this crate's own
+//!   `#[repr(C)]` mirrors (`WeightView`, `DType`, the workspace views), and
+//!   any number of crates may declare one symbol.
+//! * `rust_dispatch.rs` — `emit_rust_dispatch` over the same tables, the
+//!   statement-keyed `match` the binder includes.
 //!
-//! The link directives for the archive live HERE, not in `kernels-cuda`'s
-//! build script, and the order is load-bearing: a static archive is scanned
-//! once, in place, so the shim that references the launchers must precede
-//! `pie_kernels_cuda` on the link line. `cc` emits the shim's directive when
-//! it runs; ours follow. (`driver-cuda/build.rs` documents the same rule for
-//! the C++ shell.)
+//! The C shim that DEFINES those symbols is `kernels-cuda`'s, generated and
+//! compiled by its `native` feature — which `bridge` turns on. A definition
+//! may exist once, so the crate that owns the launchers owns the entry points
+//! forwarding into them; this crate was only ever the first caller.
+//!
+//! The link directives for the archive live HERE, and the order is
+//! load-bearing: a static archive is scanned once, in place, so the shim that
+//! references the launchers must precede `pie_kernels_cuda` on the link line.
+//! `kernels-cuda` emits the shim's directive, and cargo puts a dependency's
+//! ahead of its dependent's; ours follow.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -54,41 +57,6 @@ mod bridge {
         ]
     }
 
-    fn csrc_src() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels-cuda/csrc/src")
-    }
-
-    /// The headers the shim compiles against: every family directory's
-    /// `.hpp`s, plus the vendored Marlin wrapper (`moe`'s one out-of-tree
-    /// row). The union of exactly the per-family lists the launch_abi tests
-    /// prove — each family's set compiles alone there, and the shim is where
-    /// they have to compile TOGETHER.
-    fn includes() -> Vec<String> {
-        let mut out = Vec::new();
-        // `comm` joined when the fused all-reduce landing got a row. It is
-        // the one directory no per-family `launch_abi` case covers, so
-        // nothing proved its headers alone and the shim was the first
-        // thing to ask for them — which is the failure mode the doc above
-        // describes: a family's set compiling alone is not the shim
-        // compiling, and here there was no alone-case either.
-        for dir in [
-            "attn", "rope", "norm", "mlp", "gemm", "moe", "ssm", "quant", "layout", "sample",
-            "vision", "comm",
-        ] {
-            let mut hs: Vec<String> = std::fs::read_dir(csrc_src().join(dir))
-                .unwrap_or_else(|e| panic!("csrc/src/{dir}: {e}"))
-                .filter_map(|e| {
-                    let n = e.ok()?.file_name().into_string().ok()?;
-                    n.ends_with(".hpp").then(|| format!("{dir}/{n}"))
-                })
-                .collect();
-            hs.sort();
-            out.extend(hs);
-        }
-        out.push("../third_party/marlin_moe/marlin_moe_wrapper.hpp".into());
-        out
-    }
-
     fn cuda_home() -> PathBuf {
         std::env::var_os("CUDA_HOME")
             .or_else(|| std::env::var_os("CUDA_PATH"))
@@ -99,13 +67,6 @@ mod bridge {
     pub fn build() {
         let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
         let tables = tables();
-        let includes = includes();
-        let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
-
-        let shim = kernels_cuda::abi::emit_c_shim(&tables, &include_refs)
-            .expect("two rows may not claim one entry point");
-        let shim_path = out_dir.join("shim.cpp");
-        std::fs::write(&shim_path, shim).expect("write shim.cpp");
 
         let bindings = kernels_cuda::abi::emit_rust_bindings(&tables);
         std::fs::write(out_dir.join("launch_bindings.rs"), bindings).expect("write bindings");
@@ -130,16 +91,6 @@ mod bridge {
             );
         }
 
-        // The shim's own directive (`-lpie_launch_shim`) is emitted by `cc`
-        // here, ahead of everything below.
-        cc::Build::new()
-            .cpp(true)
-            .std("c++20")
-            .include(csrc_src())
-            .include(&cuda_include)
-            .file(&shim_path)
-            .compile("pie_launch_shim");
-
         // The supergraph's set-cond kernel, which is the ONE thing in this
         // crate that has to be device code: `cudaGraphSetConditional` is a
         // `__device__` function, so arming a conditional handle from inside a
@@ -150,7 +101,7 @@ mod bridge {
         // that build is `cpp(true)` and this needs nvcc. It goes in
         // `driver-cuda` rather than `kernels-cuda` because its argument
         // is a conditional handle — a shell object — not a tensor; see
-        // `src/cuda/graph.rs`'s header for the same argument.
+        // `src/gpu/device/graph.rs`'s header for the same argument.
         let supergraph = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/supergraph.cu");
         println!("cargo:rerun-if-changed=csrc/supergraph.cu");
         cc::Build::new()

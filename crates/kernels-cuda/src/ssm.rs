@@ -152,30 +152,37 @@ pub static KERNELS: &[KernelSig] = &[
             num_heads: I32 <- Source::Gdn("v_h"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
-    // SOURCED ONCE AND REVERTED, and the reason is not in the row.
+    // SOURCED, and the reason it could not be before is worth keeping:
+    // `dt_bias` is a FOREIGN value — the split's raw table, which this
+    // statement does not carry as an arg — so it needed `Source::Aux`,
+    // and `Aux` was in the vocabulary and in the emitter while the
+    // runtime helper both of them call, `join_aux`, had never been
+    // written. Nothing noticed, because an emitter arm no row reaches
+    // emits no code and a missing symbol that is never emitted never
+    // reaches a compiler.
     //
-    // Every source here is available and correct -- `Aux(3)` for the
-    // PARAMS prep's fp32 bias, which this statement does not mention,
-    // plus the plain ins/outs -- and the emitted branch is the hand arm
-    // line for line. It still never fires: instrumenting `dispatch` shows
-    // control reaching it and `dispatch_generated` never entered for THIS
-    // kernel while entering for the six launches before it in the same
-    // fire. Guard predicates all hold when evaluated by hand at the call
-    // site. Not diagnosed; see the `ns-aux-branch-not-entered` todo.
+    // The symptom was a branch that read correctly "and never fired".
+    // It could not have fired: the crate did not build, and the binary
+    // under test was the previous one. Recorded because it is the
+    // SECOND stale-build mistaken for a live mystery in this table.
     //
-    // `Source::Aux` stays -- it is right, and the next row to want a
-    // foreign value should not have to invent it again.
-    kernel!(nemotron_prepare_mamba_dt_da "ssm::nemotron_prepare_mamba_dt_da",
+    // `Aux(3)` is `dt_bias` in the join's order
+    // `[dt_raw, a, d, dt_bias, dt_pre, da_pre]` — the same index the
+    // hand arm spelled `aux_slot(3, resolver)`. An aux operand does not
+    // raise the arity guard, which is right: it is not one of the
+    // statement's args, and a row demanding it as one would decline
+    // every site.
+kernel!(nemotron_prepare_mamba_dt_da "ssm::nemotron_prepare_mamba_dt_da",
         operands = operands![
-            dt: Buf,
-            a: F32s,
-            dt_bias: F32s,
-            dt_out: F32sMut,
-            da_out: F32sMut,
-            n: I32,
-            num_heads: I32,
-            time_step_min: F32,
-            stream: Stream,
+            dt: Buf <- Source::In(0),
+            a: F32s <- Source::In(1),
+            dt_bias: F32s <- Source::Aux(3),
+            dt_out: F32sMut <- Source::Out(0),
+            da_out: F32sMut <- Source::Out(1),
+            n: I32 <- Source::Rows,
+            num_heads: I32 <- Source::InWidth(0),
+            time_step_min: F32 <- Source::Lit(Lit::F32(0.0)),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // `whole` for both reasons this table collects: it addresses through
     // `slot_ids` and `qo_indptr`, and the scan carries state token to token,

@@ -1,4 +1,4 @@
-//! Differential proof that [`driver_cuda::store::dtoa`] is
+//! Differential proof that [`driver_cuda::layout::dtoa`] is
 //! `nlohmann::json`'s double formatter.
 //!
 //! # What is pinned, and why it is the C++'s hash
@@ -23,7 +23,7 @@
 //! disagree on roughly 0.07% of realistic values, so a port that used `{}`
 //! would silently rewrite entries it never touched.
 
-use driver_cuda::store::dtoa::write_f64;
+use driver_cuda::layout::dtoa::write_f64;
 use std::fmt::Write as _;
 
 /// FNV-1a 64 of `tests/oracle/dtoa/oracle.cpp`'s output.
@@ -145,7 +145,7 @@ fn the_golden_actually_discriminates() {
     assert_eq!(
         native, "46934.81558401242",
         "Rust's own formatter no longer differs here; the premise of \
-         store::dtoa needs rechecking"
+         layout::dtoa needs rechecking"
     );
     text = text.replacen("46934.815584012416", &native, 1);
     assert_ne!(fnv1a64(text.as_bytes()), GOLDEN_FNV1A64);

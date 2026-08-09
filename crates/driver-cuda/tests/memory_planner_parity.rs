@@ -1,4 +1,4 @@
-//! Differential parity for [`driver_cuda::store::memory_planner`] against
+//! Differential parity for [`driver_cuda::layout::memory_planner`] against
 //! the real `store/memory_planner.cpp`.
 //!
 //! The C++ oracle in `tests/oracle/memory_planner/` compiles the shipping
@@ -23,9 +23,9 @@
     reason = "the golden hash is one opaque token; grouping it invites a typo"
 )]
 
-use driver_cuda::store::memory_planner as mp;
-use driver_cuda::store::plan::CudaMemoryPlan;
-use driver_cuda::store::profile_key::{ProfileKey, ProfileShape};
+use driver_cuda::layout::memory_planner as mp;
+use driver_cuda::layout::budget::CudaMemoryPlan;
+use driver_cuda::layout::profile_key::{ProfileKey, ProfileShape};
 use std::fmt::Write as _;
 
 /// FNV-1a 64 of the **C++** transcript.
@@ -512,7 +512,7 @@ impl Sweep {
         // visible to `planner_budget_bytes()`. Harmless in the driver (a
         // throwing planner means no boot at all, so nothing reads it), but it
         // IS the observable behaviour, so the transcript compares it.
-        let budget = driver_cuda::store::profile_cache::planner_budget_bytes();
+        let budget = driver_cuda::layout::profile_cache::planner_budget_bytes();
         self.last_budget = budget;
         let _ = writeln!(self.out, "{id}|{budget}|{out}|{notes}");
     }

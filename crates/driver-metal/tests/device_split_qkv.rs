@@ -5,14 +5,13 @@
 //! operands and the scalars. If the numbers come out right, the scalar channel
 //! works end to end — which is what every `_strided` kernel needs too.
 
-#![cfg(target_vendor = "apple")]
 
 use std::path::PathBuf;
 
-use driver_metal::metal::{ArgumentTable, Compiler, Context, Stepper, allocate};
-use driver_metal::model::dispatch::Dispatch;
-use driver_metal::model::encode::{Params, Pipelines, encode};
-use driver_metal::region::Region as _;
+use driver_metal::gpu::{Allocation, ArgumentTable, Compiler, Context, Stepper};
+use driver_metal::lowering::dispatch::Dispatch;
+use driver_metal::gpu::bind::encode::{Params, Pipelines, encode};
+use driver_metal::layout::region::Region as _;
 
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -44,10 +43,10 @@ fn the_split_puts_every_channel_where_its_width_says() {
     const KV_W: u32 = 2;
     const PACKED: u32 = Q_W + 2 * KV_W;
 
-    let packed = allocate(&context, u64::from(ROWS * PACKED) * 2, "packed").expect("packed");
-    let q = allocate(&context, u64::from(ROWS * Q_W) * 2, "q").expect("q");
-    let k = allocate(&context, u64::from(ROWS * KV_W) * 2, "k").expect("k");
-    let v = allocate(&context, u64::from(ROWS * KV_W) * 2, "v").expect("v");
+    let packed = Allocation::new(&context, u64::from(ROWS * PACKED) * 2, "packed").expect("packed");
+    let q = Allocation::new(&context, u64::from(ROWS * Q_W) * 2, "q").expect("q");
+    let k = Allocation::new(&context, u64::from(ROWS * KV_W) * 2, "k").expect("k");
+    let v = Allocation::new(&context, u64::from(ROWS * KV_W) * 2, "v").expect("v");
 
     // Each element is its own flat index, so a misplaced channel names itself.
     let src: Vec<u16> = (0..ROWS * PACKED).map(|i| bf16(i as f32)).collect();
@@ -72,7 +71,7 @@ fn the_split_puts_every_channel_where_its_width_says() {
         params: params.to_vec(),
         // The row places its params at buffer 4, after the four operands, and
         // as one packed struct — two `u32`s, so four bytes at offset zero.
-        param_slots: vec![driver_metal::model::dispatch::ParamSlot {
+        param_slots: vec![driver_metal::lowering::dispatch::ParamSlot {
             slot: 4,
             at: 0,
             bytes: 4,
@@ -95,7 +94,7 @@ fn the_split_puts_every_channel_where_its_width_says() {
         .run(|encoder| encode(encoder, &table, &pipelines, &staged, std::slice::from_ref(&dispatch)))
         .expect("the fire runs");
 
-    let read = |region: &driver_metal::metal::Handle, n: u32| -> Vec<f32> {
+    let read = |region: &driver_metal::gpu::Handle, n: u32| -> Vec<f32> {
         let mut out = vec![0u16; n as usize];
         let bytes = unsafe {
             core::slice::from_raw_parts(region.contents().as_ptr().cast::<u16>(), n as usize)
@@ -131,9 +130,9 @@ fn the_split_puts_every_channel_where_its_width_says() {
     }
 }
 
-fn bound(address: u64) -> driver_metal::model::executor::BoundArg {
-    driver_metal::model::executor::BoundArg {
-        slice: driver_metal::model::executor::Slice {
+fn bound(address: u64) -> driver_metal::lowering::executor::BoundArg {
+    driver_metal::lowering::executor::BoundArg {
+        slice: driver_metal::lowering::executor::Slice {
             address,
             bytes: 1 << 20,
         },

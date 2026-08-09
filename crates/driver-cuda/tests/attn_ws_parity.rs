@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use driver_cuda::model::attention_workspace::{
+use driver_cuda::gpu::fire::attention_workspace::{
     AttentionWorkspace, StagingError, StagingOps,
 };
 

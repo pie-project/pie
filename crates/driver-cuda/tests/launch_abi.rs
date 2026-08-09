@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use driver_cuda::launch::{
+use driver_cuda::gpu::bind::abi::{
     AttentionWorkspaceView, HopperPrefillPlan, KvCacheLayerView, MlaCacheLayerView,
     YarnOriginalParams,
 };
@@ -275,6 +275,11 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
         "quant/dequant_wna16.hpp",
         "quant/dtype_cast.hpp",
         "quant/mxfp4_marlin.hpp",
+        // The two ENCODE-side quantizers. Their rows landed with the
+        // encode kernels; their header did not land here with them, so
+        // the shim named functions it had not been shown.
+        "quant/quant_bf16_to_fp8.hpp",
+        "quant/quant_bf16_to_mxfp4.hpp",
         "layout/embed.hpp",
         "layout/gather_rows.hpp",
         "layout/slot_ops.hpp",
@@ -1388,7 +1393,7 @@ fn collect_files_named(dir: &Path, name: &str, out: &mut String) {
 /// rather than routing gemma-4's experts through qwen's activation.
 #[test]
 fn the_enum_mirrors_carry_the_cpp_discriminants() {
-    use driver_cuda::launch::{MoeActivation, Mxfp4RowSelect};
+    use driver_cuda::gpu::bind::abi::{MoeActivation, Mxfp4RowSelect};
     let tu = format!(
         "#include <cstdint>\n\
          #include \"moe/flashinfer_moe.hpp\"\n\

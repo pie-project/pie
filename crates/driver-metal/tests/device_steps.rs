@@ -17,7 +17,8 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_metal::{Compiler, Context, Error, Pool, Region, Stepper, Tables};
+use driver_metal::{Error, Region};
+use driver_metal::gpu::{Compiler, Context, Pool, Stepper, Tables};
 
 /// Copies one value into a span, so what a buffer holds says which chunk
 /// wrote it and when.
@@ -313,7 +314,7 @@ fn a_second_step_is_queued_while_the_first_is_still_outstanding() {
         .expect("tag");
 
     let mut stepper = Stepper::new(&context).expect("stepper");
-    let encode = |step: &mut driver_metal::metal::StepEncoder<'_>| {
+    let encode = |step: &mut driver_metal::gpu::StepEncoder<'_>| {
         step.set_pipeline(&pipeline);
         step.set_argument_table_for(&tables, 0)?;
         step.dispatch([PER_CHUNK, 1, 1], [64, 1, 1])

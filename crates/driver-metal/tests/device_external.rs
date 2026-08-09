@@ -11,10 +11,9 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ptr::NonNull;
 
-use driver_metal::metal::page_size;
-use driver_metal::{
-    Compiler, Context, Error, Externals, Mapped, Pool, Region, Stepper, Tables,
-};
+use driver_metal::gpu::page_size;
+use driver_metal::{Error, Region};
+use driver_metal::gpu::{Compiler, Context, Externals, Mapped, Pool, Stepper, Tables};
 
 const FILL: &str = r"
 #include <metal_stdlib>

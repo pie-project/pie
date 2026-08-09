@@ -13,7 +13,7 @@
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
-use driver_cuda::cuda::cublas::{CublasHandle, CublasOps};
+use driver_cuda::gpu::device::cublas::{CublasHandle, CublasOps};
 
 /// FNV-1a 64 of the C++ oracle's transcript.
 const GOLDEN_FNV1A64: u64 = 0x7171daf2be28cd47;

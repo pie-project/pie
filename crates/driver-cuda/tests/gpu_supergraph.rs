@@ -24,7 +24,7 @@
 mod common;
 
 use common::{device_or_skip, gpu_guard};
-use driver_cuda::cuda::{
+use driver_cuda::gpu::device::{
     Allocator, DeviceBuffer, OwnedStream, PredicateWord, StreamRef, SupergraphBuilder,
     SLOT_HAS_LORA,
 };
@@ -172,7 +172,7 @@ fn nesting_holds_to_the_depth_a_guard_chain_needs() {
     let mut preds = PredicateWord::new(&alloc).expect("predicate word");
     let mut out = alloc.alloc(N).expect("out");
 
-    let inner_slot = driver_cuda::cuda::SLOT_HAS_CUSTOM_MASK;
+    let inner_slot = driver_cuda::gpu::device::SLOT_HAS_CUSTOM_MASK;
 
     let exec = {
         let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");

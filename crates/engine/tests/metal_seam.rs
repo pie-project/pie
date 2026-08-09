@@ -32,9 +32,9 @@ fn the_metal_backend_opens_a_device_and_states_what_it_is() {
 
 #[test]
 fn the_verbs_that_need_the_kv_pool_refuse_by_name() {
-    // The hole, stated. Every one of these is above a pool that does not
-    // exist yet; the executor above THEM is complete and device-tested, so
-    // the message says which half is missing.
+    // The ordering, stated. Every one of these is above a pool that does not
+    // exist until `load_model` allocates it, so the refusal names the backend
+    // and the step that was skipped rather than reporting a generic failure.
     let Ok((mut backend, _)) = DriverBackend::metal_create(b"{}") else {
         eprintln!("SKIP: no Metal 4 device");
         return;
@@ -52,15 +52,22 @@ fn the_verbs_that_need_the_kv_pool_refuse_by_name() {
         "and say which order was broken: {text}"
     );
 
-    // `resize_pool` still refuses, and its message says which half is missing
-    // so the next reader does not re-port machinery that is already there.
+    // `resize_pool` refuses too, and for a different reason than it used to:
+    // the resize is wired now (`pool.resize` through the stepper), so what is
+    // missing before a load is the POOL, not the machinery. A refusal that
+    // still described missing machinery would send the next reader to re-port
+    // something that is already there -- which is what this assertion is for.
     let text = match backend.resize_pool(&Default::default()) {
         Err(why) => format!("{why}"),
-        Ok(_) => panic!("the pool is a fixed allocation today"),
+        Ok(_) => panic!("there is no pool to resize before a load"),
     };
     assert!(
-        text.contains("already decide and plan"),
-        "the refusal should say what exists: {text}"
+        text.contains("driver-metal"),
+        "a refusal must name the backend that made it: {text}"
+    );
+    assert!(
+        text.contains("no KV pool") && text.contains("load_model"),
+        "and say what is absent and what would create it: {text}"
     );
 }
 

@@ -48,7 +48,7 @@
 
 use model_loader::group_slot::GroupSlotIndex;
 
-use crate::region::Region;
+use crate::layout::region::Region;
 
 /// One routed tensor kind across every mixture layer.
 ///

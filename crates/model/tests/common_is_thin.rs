@@ -91,10 +91,31 @@ fn family_names() -> Vec<String> {
 const SHARED: &[&str] = &[
     "builder.rs", "decoders.rs", "facts.rs", "instruct.rs", "metadata.rs",
     "mlx.rs", "moe.rs", "policy.rs", "probe.rs",
+    // `deployment.rs` belongs here and the fact that it PASSES is the
+    // whole claim: it is what a driver receives, and a driver that
+    // could read a family name off it could branch on one. The guard
+    // holding here is the same guard `driver-cuda/tests/no_family_names.rs`
+    // holds from the other side.
+    "deployment.rs",
 ];
 /// Root files that name families ON PURPOSE, with the reason each does.
 const NOT_SHARED: &[(&str, &str)] = &[
     ("lib.rs", "the crate doc, which names the generations it declares"),
+    (
+        "deployment_cuda.rs",
+        "THE DISPATCH ITSELF: 33 `model_type` rows and eleven derivations, \
+         moved out of `driver-cuda` so the question is asked in the crate \
+         that is allowed to ask it. Somebody has to switch on `model_type`; \
+         §4's rule is only that a DRIVER must not. What it produces is \
+         `deployment.rs`'s value, which names no family — so the branch \
+         stops here",
+    ),
+    (
+        "descriptor.rs",
+        "the `pie.model/1` READER. Its whole job is to recognise which \
+         family a descriptor describes, which is the question this crate \
+         exists to answer once",
+    ),
     ("contract.rs", "a REGISTRY: model_type -> author is a table of family rows"),
     ("multimodal.rs", "family-aware by design -- it dispatches on a VisionArch"),
     (

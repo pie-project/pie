@@ -574,6 +574,33 @@ impl Ty {
             Ty::StructuredMasks => "*const StructuredMaskParams",
         }
     }
+
+    /// Whether [`rust`](Self::rust) names a type the generated declaration
+    /// does not itself define.
+    ///
+    /// The six below spell an UNQUALIFIED `#[repr(C)]` mirror, so a binding
+    /// using one only compiles inside a module that has that mirror in scope.
+    /// Everything else lands as a primitive or a raw pointer, which any crate
+    /// can state without owning a layout.
+    ///
+    /// The distinction is what lets a row be callable by more than the crate
+    /// that owns the mirrors: `Mxfp4RowSelect`, `MoeActivation` and `Dtype`
+    /// look like struct kinds and are not — they cross as `i32`/`u32`/`u8` —
+    /// so a row using them stays portable. Reading the answer off `rust()`'s
+    /// own spelling rather than off a hand-kept list is what keeps the two
+    /// from drifting when a kind changes how it crosses.
+    #[must_use]
+    pub const fn needs_mirror(self) -> bool {
+        matches!(
+            self,
+            Ty::AttentionWorkspaceView
+                | Ty::KvCacheLayerView
+                | Ty::MlaCacheLayerView
+                | Ty::HopperPrefillPlan
+                | Ty::YarnOriginalParams
+                | Ty::StructuredMasks
+        )
+    }
 }
 
 /// One operand of a launcher, in the position the launcher takes it.

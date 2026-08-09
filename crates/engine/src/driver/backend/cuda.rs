@@ -25,7 +25,7 @@ use ::driver_api::{
 // side used to be C++, and it outlived it. A Rust crate calling a Rust crate
 // through a C linkage gets no type checking across the call, no lifetimes, and
 // a `*mut PieDriver` where a `&mut Shell` would do.
-use driver_cuda::serve::{
+use driver_cuda::gpu::serve::{
     pie_cuda_bind_instance, pie_cuda_close_channel, pie_cuda_close_instance, pie_cuda_copy_kv,
     pie_cuda_copy_state, pie_cuda_create, pie_cuda_destroy, pie_cuda_encode, pie_cuda_launch,
     pie_cuda_load_model, pie_cuda_register_channel, pie_cuda_register_program,

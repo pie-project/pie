@@ -188,6 +188,49 @@ pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetada
     }
 }
 
+/// Check that the files a compiled plan declares are on disk, at the size the
+/// plan read them at.
+///
+/// Lives here rather than beside `plan::compile` because compiling is a pure
+/// function of the metadata and the contract — `tests/standalone.rs` holds
+/// that as a property, and reaching for `std::fs` in `plan.rs` is exactly what
+/// it refuses. Touching the filesystem is this module's job, so the check that
+/// touches it is this module's too.
+///
+/// Both drivers carried this block, bit for bit, after their own
+/// `plan::compile`. It is not a driver's question: the plan names the files
+/// and states their sizes, so a snapshot that moved under a plan compiled
+/// against it is a fact about the checkpoint. Catching it here is the
+/// difference between a named file with two byte counts and a fault in the
+/// middle of a 39 GB read.
+///
+/// # Errors
+///
+/// A file the plan declares is missing, unreadable, or a different size.
+pub fn verify_declared_files(
+    plan: &crate::plan::LoadPlan,
+    snapshot_dir: &Path,
+) -> Result<(), Error> {
+    for file in &plan.files {
+        let path = snapshot_dir.join(&file.path);
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() == file.size_bytes => {}
+            Ok(meta) => {
+                return Err(Error::Checkpoint(format!(
+                    "{} is {} bytes on disk, the plan declares {}",
+                    path.display(),
+                    meta.len(),
+                    file.size_bytes
+                )));
+            }
+            Err(err) => {
+                return Err(Error::Checkpoint(format!("{}: {err}", path.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
