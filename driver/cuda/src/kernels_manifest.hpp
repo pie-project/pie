@@ -69,7 +69,8 @@ constexpr const char* attn_decode_gqa_list() {
 /// older the answer is decided by which Marlin the driver was built with:
 ///
 ///   * the expert-indexed MoE kernel serves a whole layer in one launch, and
-///     is sm80 -- with it the native path wins on Ampere onward;
+///     is sm80 -- with it and its load-time weight repacker, the native path
+///     wins on Ampere onward;
 ///   * the dense, single-problem kernel alone does not qualify. It reaches the
 ///     tensor cores once per expert, so a 32-expert layer becomes 32 serial
 ///     launches: measured 67 tok/s against 747 for the routed dequant path it
@@ -99,9 +100,11 @@ inline bool native_mxfp4_moe_opt_out() {
 }
 
 constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
-#if defined(PIE_CUDA_HAS_MARLIN_MOE)
+#if defined(PIE_CUDA_HAS_MARLIN_MOE) && \
+    defined(PIE_CUDA_HAS_MARLIN_MXFP4_REPACK)
     return cc_major >= 8;
-#elif defined(PIE_CUDA_HAS_MARLIN)
+#elif defined(PIE_CUDA_HAS_MARLIN) && \
+    defined(PIE_CUDA_HAS_MARLIN_MXFP4_REPACK)
     return cc_major >= 10;
 #else
     (void)cc_major;

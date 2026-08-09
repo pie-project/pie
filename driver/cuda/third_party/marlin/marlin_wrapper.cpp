@@ -20,10 +20,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                int thread_n_init, int sms, bool use_atomic_add,
                bool use_fp32_reduce, bool is_zp_float);
 
-void pie_gptq_marlin_repack_w4_no_perm(
-    const std::uint32_t* b_q_weight, std::uint32_t* out,
-    int size_k, int size_n, cudaStream_t stream);
-
 void pie_awq_marlin_repack_w4(
     const std::uint32_t* b_q_weight, std::uint32_t* out,
     int size_k, int size_n, cudaStream_t stream);
@@ -183,19 +179,6 @@ void launch_mxfp4_gemm_w4a16_bf16(
         /*use_atomic_add=*/ false,
         /*use_fp32_reduce=*/ reduce_scratch != nullptr,
         /*is_zp_float=*/    false);
-}
-
-void launch_gptq_repack_w4_no_perm(
-    const void*  qweight_in,
-    void*        repacked_out,
-    int          size_k,
-    int          size_n,
-    cudaStream_t stream)
-{
-    ::marlin::pie_gptq_marlin_repack_w4_no_perm(
-        static_cast<const std::uint32_t*>(qweight_in),
-        static_cast<std::uint32_t*>(repacked_out),
-        size_k, size_n, stream);
 }
 
 void launch_awq_repack_w4(

@@ -21,17 +21,20 @@ use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::plan::{
-    CUDA_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageTarget, compile as compile_load_plan,
+    CUDA_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageInstr, StorageTarget, TileMapKind,
+    compile as compile_load_plan,
 };
 use pie_loader::types::{
-    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, ScaleForm, TensorId,
-    Visibility,
+    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, RepackLayout,
+    ScaleForm, TensorId, Visibility,
 };
 use pie_loader::verify::ContractView;
 
-use pie_model::contract::author;
+use pie_model::contract::{author, author_with_policy};
 use pie_model_common::facts::ModelFacts;
-use pie_model_common::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
+use pie_model_common::policy::{
+    Mxfp4MoePolicy, Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant,
+};
 
 // ── fixture machinery ───────────────────────────────────────────────
 
@@ -1444,6 +1447,84 @@ fn deepseek_v4_eager_imported_mxfp4_metadata_compiles() {
     assert_imported_block_scale_decodes(&contract);
     compile_load_plan(&checkpoint, &contract, target)
         .expect("the eager contract compiles against imported MXFP4 metadata");
+}
+
+#[test]
+fn deepseek_v4_native_cuda_keeps_imported_mxfp4_packed() {
+    let checkpoint = deepseek_v4_imported_checkpoint();
+    let mut target = target(0, 4);
+    target.native_mxfp4_moe = true;
+    let (contract, resolved) = author_with_policy(
+        &facts("deepseek_v4", 1),
+        &checkpoint,
+        &target,
+        &Policy::default(),
+    )
+    .expect("authoring succeeds")
+    .expect("deepseek_v4 has an author");
+
+    assert_eq!(resolved, Mxfp4MoePolicy::NativeGemm);
+    assert_imported_block_scale_decodes(&contract);
+    for half in ["gate", "up", "down"] {
+        let weight_name = format!("layers.0.ffn.experts.{half}.weight");
+        let weight = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == weight_name)
+            .unwrap_or_else(|| panic!("native {half} weight is published"));
+        assert!(
+            matches!(weight.encoding, Encoding::Quant(_)),
+            "native {half} must remain packed, got {:?}",
+            weight.encoding
+        );
+        let scale = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == format!("layers.0.ffn.experts.{half}.scale"))
+            .unwrap_or_else(|| panic!("native {half} scale is published"));
+        assert_eq!(scale.encoding, Encoding::Raw(DType::U8));
+        assert_eq!(
+            scale
+                .scales
+                .as_ref()
+                .map(|scales| (&scales.of, scales.group_size, scales.form)),
+            Some((&weight_name, 32, ScaleForm::RawE8M0))
+        );
+    }
+    assert!(contract.tensors.iter().all(|tensor| {
+        !tensor.name.starts_with("layers.0.ffn.experts.")
+            || tensor.encoding != Encoding::Raw(DType::BF16)
+    }));
+
+    let plan = compile_load_plan(&checkpoint, &contract, target)
+        .expect("the native contract compiles against imported E8M0 metadata");
+    let repacks: Vec<_> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Repack,
+                transform,
+                ..
+            } => transform.repack,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(repacks.len(), 6);
+    assert_eq!(
+        repacks
+            .iter()
+            .filter(|repack| repack.layout == RepackLayout::MarlinMxfp4Weight)
+            .count(),
+        3
+    );
+    assert_eq!(
+        repacks
+            .iter()
+            .filter(|repack| repack.layout == RepackLayout::MarlinMxfp4Scale)
+            .count(),
+        3
+    );
 }
 
 #[test]

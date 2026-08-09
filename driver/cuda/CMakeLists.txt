@@ -939,12 +939,24 @@ if(PIE_CUDA_BUILD_MARLIN)
   # would double-define every template.
   target_sources(pie_driver_cuda_lib PRIVATE
     third_party/marlin/marlin.cu
-    third_party/marlin/gptq_marlin_repack.cu
     third_party/marlin/awq_marlin_repack.cu
     third_party/marlin/marlin_wrapper.cpp)
   target_include_directories(pie_driver_cuda_lib PRIVATE
     third_party/marlin)
   target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
+endif()
+
+# Native MXFP4 MoE weights use Marlin's tile layout even though they never call
+# the dense Marlin GEMM.  Keep the small W4 repacker independent of that costly
+# kernel so the default MoE-only build can execute the load plan it advertises.
+if(PIE_CUDA_BUILD_MARLIN OR PIE_CUDA_BUILD_MARLIN_MOE)
+  target_sources(pie_driver_cuda_lib PRIVATE
+    third_party/marlin/gptq_marlin_repack.cu
+    third_party/marlin/marlin_repack.cpp)
+  target_include_directories(pie_driver_cuda_lib PRIVATE
+    third_party/marlin)
+  target_compile_definitions(pie_driver_cuda_lib PRIVATE
+    PIE_CUDA_HAS_MARLIN_MXFP4_REPACK=1)
 endif()
 
 # The expert-indexed MoE variant of the same kernel. Separate directory and

@@ -43,7 +43,8 @@
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/quant_bf16_to_mxfp4.hpp"
 #include "kernels/transcode.hpp"
-#ifdef PIE_CUDA_HAS_MARLIN
+#if defined(PIE_CUDA_HAS_MARLIN) || \
+    defined(PIE_CUDA_HAS_MARLIN_MXFP4_REPACK)
 #include "marlin_wrapper.hpp"
 #endif
 #endif
@@ -1307,7 +1308,7 @@ private:
         int source_cols,
         int target_cols)
     {
-#if defined(PIE_CUDA_HAS_MARLIN)
+#if defined(PIE_CUDA_HAS_MARLIN_MXFP4_REPACK)
         if (source_cols % 8 != 0 || target_cols % 8 != 0) {
             throw std::runtime_error(
                 "rust storage executor: MarlinMxfp4Weight Repack requires "
@@ -1345,7 +1346,8 @@ private:
         (void)source_cols;
         (void)target_cols;
         throw std::runtime_error(
-            "rust storage executor: MarlinMxfp4Weight Repack requires Marlin");
+            "rust storage executor: MarlinMxfp4Weight Repack requires "
+            "Marlin MXFP4 repack support");
 #endif
     }
 

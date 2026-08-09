@@ -9,9 +9,11 @@
 use pie_loader::checkpoint::RawTensor;
 use pie_loader::contract::{Expr, GroupContract, Scales, TensorContract, TensorType};
 use pie_loader::error::Error;
-use pie_loader::types::{DType, Encoding, QuantGranularity, ScaleForm, TensorId, Visibility};
+use pie_loader::types::{
+    DType, Encoding, QuantGranularity, RepackLayout, ScaleForm, TensorId, Visibility,
+};
 
-use pie_model_common::builder::{Builder, is_raw, mxfp4_encoding};
+use pie_model_common::builder::{Builder, align_up, is_raw, mxfp4_encoding};
 use pie_model_common::policy::{Mxfp4MoePolicy, Mxfp4MoeRequest};
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
@@ -37,16 +39,12 @@ fn e8m0_factors(expr: Expr, raw: &RawTensor, shape: Vec<i64>) -> Result<Expr, Er
 
 /// DeepSeek-V4.
 ///
-/// The routed experts are handed to the driver one of two ways, and this
-/// contract picks which. Dequantized and stacked is what the batched expert
-/// GEMM wants and is the default. Left packed is the fallback: the forward
-/// pass dequantizes a slice per step instead, which is correct and slow, and
-/// is worth taking only when the caller asks for it to hold memory down.
-///
-/// The device rule `resolve_mxfp4_moe` applies is not this family's rule:
-/// it asks whether there are native MXFP4 GEMM kernels to fall back *from*,
-/// and DeepSeek-V4 has none. The choice here is between eager and per-step,
-/// so anything short of an explicit `RoutedDecode` takes the eager path.
+/// The routed experts are handed to the driver in the representation selected
+/// by policy. A native-capable CUDA target keeps FE2M1 values and E8M0 factors
+/// packed for the expert-indexed Marlin MoE. Explicit eager mode keeps the
+/// BF16 stacks, while routed decode leaves the checkpoint tensors packed for
+/// the per-expert fallback. Streaming remains a separate residency choice and
+/// pages BF16 expert groups as before.
 pub fn author_deepseek_v4(b: &mut Builder<'_>) -> Result<(), Error> {
     // Ask where the layers are rather than declare it. This family's
     // released checkpoints name them `layers.<L>.`, not the HF
@@ -55,18 +53,28 @@ pub fn author_deepseek_v4(b: &mut Builder<'_>) -> Result<(), Error> {
     // the forward pass's packed fallback quietly covered for them.
     b.decoder_layer_prefix_any_of(&["model.layers.", "layers."]);
     b.shard_axis_fn(dsv4_shard_axis);
-    b.decide_mxfp4_moe(if b.mxfp4_moe_request() == Mxfp4MoeRequest::RoutedDecode {
-        Mxfp4MoePolicy::RoutedDecode
-    } else {
-        Mxfp4MoePolicy::EagerBf16
-    });
+    // Preserve this family's eager fallback when native kernels are absent,
+    // but honour the ordinary target decision when they are present. An
+    // explicit NativeGemm request is validated by `native_expert_stacks`.
+    let policy = match b.mxfp4_moe_request() {
+        Mxfp4MoeRequest::RoutedDecode => Mxfp4MoePolicy::RoutedDecode,
+        Mxfp4MoeRequest::EagerBf16 => Mxfp4MoePolicy::EagerBf16,
+        Mxfp4MoeRequest::NativeGemm => Mxfp4MoePolicy::NativeGemm,
+        Mxfp4MoeRequest::Auto if b.target().native_mxfp4_moe => Mxfp4MoePolicy::NativeGemm,
+        Mxfp4MoeRequest::Auto => Mxfp4MoePolicy::EagerBf16,
+    };
+    b.decide_mxfp4_moe(policy);
     if b.stream_routed_experts() {
         // Streaming and stacking are alternatives, not layers: a stack is
         // one slab per layer holding every expert, which is exactly the
         // residency the slab is there to avoid.
         streamed_expert_groups(b)?;
-    } else if b.mxfp4_moe() == Mxfp4MoePolicy::EagerBf16 {
-        bf16_expert_stacks(b)?;
+    } else {
+        match b.mxfp4_moe() {
+            Mxfp4MoePolicy::NativeGemm => native_expert_stacks(b)?,
+            Mxfp4MoePolicy::EagerBf16 => bf16_expert_stacks(b)?,
+            Mxfp4MoePolicy::RoutedDecode => {}
+        }
     }
     block_scales_to_fp32(b)?;
     // The dense tail, stated rather than bundled: a family's contract is
@@ -75,6 +83,206 @@ pub fn author_deepseek_v4(b: &mut Builder<'_>) -> Result<(), Error> {
     b.fused_moe_gate_up_tp_slices(false)?;
     b.dense_fused_projection_joins()?;
     b.publish_remaining()
+}
+
+/// Repack each layer's routed experts into the resident layout consumed by
+/// the expert-indexed Marlin MoE kernel.
+///
+/// DeepSeek ships one packed I8 tensor per expert/projection. Marlin consumes
+/// three whole-layer banks, with the local intermediate width padded to 128:
+/// gate/up `[E, Ip, H]` and down `[E, H, Ip]`. The scale repack preserves the
+/// checkpoint's one raw E8M0 factor per 32 values and puts those bytes in the
+/// matching Marlin scale order; no BF16 expert slab exists on this path.
+fn native_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
+    const GROUP: i64 = 32;
+
+    if !b.target().native_mxfp4_moe {
+        return fail(
+            "deepseek_v4 native MXFP4 requested, but target does not support native MXFP4 MoE",
+        );
+    }
+
+    let mut layer = 0u32;
+    loop {
+        let ffn = format!("{}{layer}.ffn.", b.decoder_layer_prefix_value());
+        if b.find(&b.source_name(&format!("{ffn}experts.0.w1.weight")))
+            .is_none()
+        {
+            break;
+        }
+
+        let mut gate = Vec::new();
+        let mut gate_scales = Vec::new();
+        let mut up = Vec::new();
+        let mut up_scales = Vec::new();
+        let mut down = Vec::new();
+        let mut down_scales = Vec::new();
+        let mut consumed: Vec<TensorId> = Vec::new();
+        let mut local_inter = 0i64;
+        let mut hidden = 0i64;
+
+        let mut expert = 0u32;
+        loop {
+            let ep = format!("{ffn}experts.{expert}.");
+            if b.find(&b.source_name(&format!("{ep}w1.weight"))).is_none() {
+                break;
+            }
+            let names = [
+                format!("{ep}w1.weight"),
+                format!("{ep}w1.scale"),
+                format!("{ep}w3.weight"),
+                format!("{ep}w3.scale"),
+                format!("{ep}w2.weight"),
+                format!("{ep}w2.scale"),
+            ];
+            let mut parts = Vec::with_capacity(6);
+            for name in &names {
+                let Some(part) = b.find(&b.source_name(name)) else {
+                    return fail(format!(
+                        "deepseek_v4 native expert stack: {ep} is missing a weight or scale"
+                    ));
+                };
+                parts.push(part);
+            }
+            if [0, 2, 4]
+                .into_iter()
+                .any(|index| !is_raw(&parts[index].encoding, DType::I8))
+            {
+                return fail(format!(
+                    "deepseek_v4 native expert stack: {ep} weights must be packed I8 MXFP4"
+                ));
+            }
+
+            let up_raw = &parts[0].shape;
+            let down_raw = &parts[4].shape;
+            if up_raw.len() != 2 || down_raw.len() != 2 {
+                return fail(format!(
+                    "deepseek_v4 native expert stack: {ep} expects rank-2 expert weights"
+                ));
+            }
+            let inter_full = up_raw[0];
+            let h = up_raw[1] * 2;
+            let inter = b.local_extent(inter_full);
+            if h % GROUP != 0 || inter % GROUP != 0 {
+                return fail(format!(
+                    "deepseek_v4 native expert stack: {ep} expects both expert dims to be a multiple of 32"
+                ));
+            }
+            if down_raw.as_slice() != [h, inter_full / 2] {
+                return fail(format!(
+                    "deepseek_v4 native expert stack: {ep} down shape disagrees with gate/up"
+                ));
+            }
+            if local_inter != 0 && (inter != local_inter || h != hidden) {
+                return fail(format!(
+                    "deepseek_v4 native expert stack: {ep} disagrees with its siblings on shape"
+                ));
+            }
+            local_inter = inter;
+            hidden = h;
+
+            let packed = |b: &Builder<'_>, raw: &RawTensor, shape: Vec<i64>, axis: u8| {
+                b.shard(
+                    Expr::src(&raw.name)
+                        .transmute(TensorType::new(shape.clone(), Encoding::Raw(DType::I8))),
+                    shape,
+                    Some(axis),
+                )
+                .0
+            };
+            let factors = |b: &Builder<'_>, raw: &RawTensor, shape: Vec<i64>, axis: u8| {
+                let expr = e8m0_factors(Expr::src(&raw.name), raw, shape.clone())?;
+                Ok::<Expr, Error>(b.shard(expr, shape, Some(axis)).0)
+            };
+
+            gate.push(packed(b, parts[0], vec![1, inter_full, h / GROUP, 16], 1));
+            gate_scales.push(factors(b, parts[1], vec![1, inter_full, h / GROUP], 1)?);
+            up.push(packed(b, parts[2], vec![1, inter_full, h / GROUP, 16], 1));
+            up_scales.push(factors(b, parts[3], vec![1, inter_full, h / GROUP], 1)?);
+            down.push(packed(
+                b,
+                parts[4],
+                vec![1, down_raw[0], inter_full / GROUP, 16],
+                2,
+            ));
+            down_scales.push(factors(
+                b,
+                parts[5],
+                vec![1, down_raw[0], inter_full / GROUP],
+                2,
+            )?);
+            consumed.extend(parts.iter().map(|part| part.id));
+            expert += 1;
+        }
+
+        if gate.is_empty() {
+            layer += 1;
+            continue;
+        }
+        let experts = gate.len() as i64;
+        let native_inter = align_up(local_inter, 128)?;
+
+        let mut publish = |half: &str,
+                           weights: Vec<Expr>,
+                           scales: Vec<Expr>,
+                           rows: i64,
+                           cols: i64,
+                           encoding: Encoding|
+         -> Result<(), Error> {
+            let weight_name = format!("{ffn}experts.{half}.weight");
+            b.push_repack(
+                weight_name.clone(),
+                Expr::concat(0, weights),
+                RepackLayout::MarlinMxfp4Weight,
+                encoding,
+                vec![experts, rows, cols],
+            );
+            let scale_name = format!("{ffn}experts.{half}.scale");
+            let scale = b.push_repack(
+                scale_name,
+                Expr::concat(0, scales),
+                RepackLayout::MarlinMxfp4Scale,
+                Encoding::Raw(DType::U8),
+                vec![experts, rows, cols / GROUP],
+            );
+            if let Some(scale) = scale {
+                b.set_scales(
+                    scale,
+                    Scales {
+                        of: weight_name,
+                        granularity: QuantGranularity::PerGroup,
+                        group_size: GROUP as u32,
+                        channel_axis: 1,
+                        form: ScaleForm::RawE8M0,
+                    },
+                );
+            }
+            Ok(())
+        };
+        publish(
+            "gate",
+            gate,
+            gate_scales,
+            native_inter,
+            hidden,
+            mxfp4_encoding(1),
+        )?;
+        publish("up", up, up_scales, native_inter, hidden, mxfp4_encoding(1))?;
+        publish(
+            "down",
+            down,
+            down_scales,
+            hidden,
+            native_inter,
+            mxfp4_encoding(2),
+        )?;
+
+        for id in consumed {
+            b.consume(id);
+        }
+        layer += 1;
+    }
+    Ok(())
 }
 
 fn dsv4_shard_axis(name: &str) -> Result<Option<u8>, Error> {
