@@ -955,6 +955,8 @@ if(PIE_CUDA_BUILD_MARLIN OR PIE_CUDA_BUILD_MARLIN_MOE)
     third_party/marlin/marlin_repack.cpp)
   target_include_directories(pie_driver_cuda_lib PRIVATE
     third_party/marlin)
+  target_compile_definitions(pie_driver_cuda_lib PRIVATE
+    PIE_CUDA_HAS_MARLIN_MXFP4_REPACK=1)
 endif()
 
 # The expert-indexed MoE variant of the same kernel. Separate directory and
@@ -1144,6 +1146,14 @@ pie_add_cuda_target(test_swap_pool
 pie_add_cuda_target(test_mxfp4_marlin
   SOURCES tests/test_mxfp4_marlin.cu src/kernels/mxfp4_marlin.cu
   LIBS CUDA::cudart)
+if(PIE_CUDA_BUILD_MARLIN OR PIE_CUDA_BUILD_MARLIN_MOE)
+  pie_add_cuda_target(test_marlin_mxfp4_repack
+    SOURCES tests/marlin_mxfp4_repack_test.cu
+    INCLUDE_DIRS ${PIE_LOADER_INCLUDE_DIR} third_party/marlin
+    LIBS pie_driver_cuda_lib CUDA::cudart)
+  target_compile_definitions(test_marlin_mxfp4_repack PRIVATE
+    PIE_CUDA_HAS_MARLIN_MXFP4_REPACK=1)
+endif()
 pie_add_cuda_target(test_transcode_fused
   SOURCES tests/test_transcode_fused.cu
   LIBS pie_driver_cuda_lib)
