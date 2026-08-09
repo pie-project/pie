@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(feature = "remote-import-xet")]
+use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
@@ -186,6 +188,8 @@ struct Inner {
     endpoint: Url,
     client: reqwest::Client,
     resolver: reqwest::Client,
+    #[cfg(feature = "remote-import-xet")]
+    xet_repo: Option<hf_hub::HFRepository<hf_hub::RepoTypeModel>>,
     files: Vec<Arc<RemoteFile>>,
     counters: Counters,
 }
@@ -199,6 +203,21 @@ pub(crate) struct RemoteSnapshot {
 impl RemoteSnapshot {
     pub(crate) fn open(spec: &str) -> Result<Self> {
         let (repo, requested_revision) = split_spec(spec)?;
+        #[cfg(feature = "remote-import-xet")]
+        let xet_repo = match std::env::var("PIE_REMOTE_IMPORT_TRANSPORT") {
+            Ok(value) if value == "xet" => {
+                let client =
+                    hf_hub::HFClient::new().context("initialize Hugging Face Xet client")?;
+                let (owner, name) = hf_hub::split_id(&repo);
+                Some(client.model(owner, name))
+            }
+            Ok(value) if value == "http" => None,
+            Err(std::env::VarError::NotPresent) => None,
+            Ok(value) => {
+                bail!("PIE_REMOTE_IMPORT_TRANSPORT must be 'http' or 'xet', got {value:?}")
+            }
+            Err(error) => bail!("cannot read PIE_REMOTE_IMPORT_TRANSPORT: {error}"),
+        };
         let endpoint = Url::parse(
             &std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".into()),
         )?;
@@ -328,6 +347,8 @@ impl RemoteSnapshot {
             endpoint,
             client,
             resolver,
+            #[cfg(feature = "remote-import-xet")]
+            xet_repo,
             files,
             counters: Counters::new(),
         });
@@ -484,6 +505,11 @@ async fn fetch_range(inner: Arc<Inner>, request: RangeRequest) -> Result<RangeRe
         .fetch_add(expected_len, Ordering::Relaxed);
     let _in_flight = inner.counters.enter();
 
+    #[cfg(feature = "remote-import-xet")]
+    if inner.xet_repo.is_some() {
+        return fetch_xet_range(Arc::clone(&inner), file, request, expected_len).await;
+    }
+
     for attempt in 0..MAX_ATTEMPTS {
         inner
             .counters
@@ -621,6 +647,94 @@ async fn fetch_range(inner: Arc<Inner>, request: RangeRequest) -> Result<RangeRe
             ordinal: request.ordinal,
             bytes: body.to_vec(),
         });
+    }
+    unreachable!("bounded retry loop returns or errors")
+}
+
+#[cfg(feature = "remote-import-xet")]
+async fn fetch_xet_range(
+    inner: Arc<Inner>,
+    file: Arc<RemoteFile>,
+    request: RangeRequest,
+    expected_len: u64,
+) -> Result<RangeResult> {
+    let repo = inner
+        .xet_repo
+        .as_ref()
+        .expect("Xet range fetch requires an Xet repository");
+    for attempt in 0..MAX_ATTEMPTS {
+        inner
+            .counters
+            .range_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let result = async {
+            let (_, mut stream) = repo
+                .download_file_stream()
+                .filename(file.path.clone())
+                .revision(inner.revision.clone())
+                .range(request.range.clone())
+                .send()
+                .await?;
+            let capacity = usize::try_from(expected_len)
+                .map_err(|_| anyhow!("range length {expected_len} does not fit this machine"))?;
+            let mut bytes = Vec::with_capacity(capacity);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                let next_len = bytes
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or_else(|| anyhow!("Xet range byte count overflows"))?;
+                if next_len > capacity {
+                    bail!(
+                        "{}: Xet range {:?} exceeded expected length {expected_len}",
+                        file.path,
+                        request.range
+                    );
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if bytes.len() as u64 != expected_len {
+                bail!(
+                    "{}: Xet range {:?} returned {} bytes, expected {expected_len}",
+                    file.path,
+                    request.range,
+                    bytes.len()
+                );
+            }
+            Ok::<_, anyhow::Error>(bytes)
+        }
+        .await;
+        match result {
+            Ok(bytes) => {
+                inner.counters.ranges_ok.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .counters
+                    .received_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                inner
+                    .counters
+                    .latency_micros
+                    .lock()
+                    .unwrap()
+                    .push(started.elapsed().as_micros() as u64);
+                return Ok(RangeResult {
+                    ordinal: request.ordinal,
+                    bytes,
+                });
+            }
+            Err(error) if attempt + 1 < MAX_ATTEMPTS => {
+                inner
+                    .counters
+                    .retries_transport
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(file = %file.path, ?error, attempt, "Xet range retry");
+                backoff(attempt, None).await;
+            }
+            Err(error) => {
+                return Err(error).context(format!("Xet range {}", file.path));
+            }
+        }
     }
     unreachable!("bounded retry loop returns or errors")
 }

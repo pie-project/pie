@@ -21,8 +21,9 @@ path = "src/main.rs"
 # bin/pie is the composition root that selects the driver backend; forward the
 # driver flavors to the embedded worker. Remote import is a removable default
 # provisioning surface; enable driver-cuda or driver-metal for real inference.
-default = ["remote-import"]
+default = ["remote-import", "remote-import-xet"]
 remote-import = []
+remote-import-xet = ["remote-import", "dep:futures"]
 driver-cuda = ["pie-worker/driver-cuda"]
 # macOS/Apple Silicon. Without this the `pie` binary has no way to reach the
 # Metal driver at all: `pie-worker`'s `driver-metal` is what links the archive,
@@ -78,6 +79,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # the CLI `model pull` / `runtime install` downloads are synchronous.
 hf-hub = "1.0.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "stream"] }
+futures = { version = "0.3.33", optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tar = "0.4"
 xz2 = "0.1"
