@@ -23,7 +23,7 @@ path = "src/main.rs"
 # provisioning surface; enable driver-cuda or driver-metal for real inference.
 default = ["remote-import", "remote-import-xet"]
 remote-import = []
-remote-import-xet = ["remote-import", "dep:futures"]
+remote-import-xet = ["remote-import", "dep:hf-xet"]
 driver-cuda = ["pie-worker/driver-cuda"]
 # macOS/Apple Silicon. Without this the `pie` binary has no way to reach the
 # Metal driver at all: `pie-worker`'s `driver-metal` is what links the archive,
@@ -78,8 +78,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # lib links zero provisioning machinery). `reqwest` carries `blocking` because
 # the CLI `model pull` / `runtime install` downloads are synchronous.
 hf-hub = "1.0.0"
+# Keep the direct stream-group surface aligned with the hf-hub version tested
+# here; this API is not yet a compatibility boundary of pie itself.
+hf-xet = { version = "=1.6.0", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "stream"] }
-futures = { version = "0.3.33", optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tar = "0.4"
 xz2 = "0.1"

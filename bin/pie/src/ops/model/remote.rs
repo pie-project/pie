@@ -13,15 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-#[cfg(feature = "remote-import-xet")]
-use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 const MAX_ATTEMPTS: usize = 4;
-const DEFAULT_CONCURRENCY: usize = 16;
+const DEFAULT_CONCURRENCY: usize = 32;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RangeRequest {
@@ -44,6 +42,7 @@ pub(crate) struct RemoteFileInfo {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Telemetry {
+    pub(crate) transport: &'static str,
     pub(crate) resolver_calls: u64,
     pub(crate) url_refreshes: u64,
     pub(crate) range_attempts: u64,
@@ -75,12 +74,13 @@ impl Telemetry {
         };
         let seconds = self.elapsed.as_secs_f64().max(f64::EPSILON);
         format!(
-            "remote-import repo={repo} commit={revision} shards={shards} resolver_calls={} \
-             url_refreshes={} range_attempts={} ranges_206={} retries_429={} retries_5xx={} \
+            "remote-import transport={} repo={repo} commit={revision} shards={shards} resolver_calls={} \
+             url_refreshes={} range_attempts={} ranges_ok={} retries_429={} retries_5xx={} \
              retries_auth={} retries_transport={} retries_malformed={} requested_bytes={} \
              received_bytes={} requests_per_second={:.2} bytes_per_second={:.2} \
              latency_us_p50={} latency_us_p95={} latency_us_p99={} latency_us_max={} \
              peak_in_flight={} reorder_peak_tensors={} reorder_peak_bytes={}",
+            self.transport,
             self.resolver_calls,
             self.url_refreshes,
             self.range_attempts,
@@ -117,9 +117,19 @@ struct Sibling {
     size: Option<u64>,
 }
 
+#[cfg(feature = "remote-import-xet")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct XetTokenResponse {
+    access_token: String,
+    exp: u64,
+    cas_url: String,
+}
+
 struct RemoteFile {
     path: String,
     size_bytes: u64,
+    xet_hash: Option<String>,
     signed_url: AsyncMutex<Url>,
     refresh: AsyncMutex<()>,
 }
@@ -189,7 +199,7 @@ struct Inner {
     client: reqwest::Client,
     resolver: reqwest::Client,
     #[cfg(feature = "remote-import-xet")]
-    xet_repo: Option<hf_hub::HFRepository<hf_hub::RepoTypeModel>>,
+    xet_group: Option<xet::xet_session::XetDownloadStreamGroup>,
     files: Vec<Arc<RemoteFile>>,
     counters: Counters,
 }
@@ -204,15 +214,10 @@ impl RemoteSnapshot {
     pub(crate) fn open(spec: &str) -> Result<Self> {
         let (repo, requested_revision) = split_spec(spec)?;
         #[cfg(feature = "remote-import-xet")]
-        let xet_repo = match std::env::var("PIE_REMOTE_IMPORT_TRANSPORT") {
-            Ok(value) if value == "xet" => {
-                let client =
-                    hf_hub::HFClient::new().context("initialize Hugging Face Xet client")?;
-                let (owner, name) = hf_hub::split_id(&repo);
-                Some(client.model(owner, name))
-            }
-            Ok(value) if value == "http" => None,
-            Err(std::env::VarError::NotPresent) => None,
+        let use_xet = match std::env::var("PIE_REMOTE_IMPORT_TRANSPORT") {
+            Ok(value) if value == "xet" => true,
+            Ok(value) if value == "http" => false,
+            Err(std::env::VarError::NotPresent) => false,
             Ok(value) => {
                 bail!("PIE_REMOTE_IMPORT_TRANSPORT must be 'http' or 'xet', got {value:?}")
             }
@@ -324,7 +329,7 @@ impl RemoteSnapshot {
 
             let mut remote_files = Vec::with_capacity(weights.len());
             for file in &mut weights {
-                let (signed_url, resolved_size) =
+                let (signed_url, resolved_size, xet_hash) =
                     resolve_signed_url(&resolver, &endpoint, &repo, &revision, &file.path).await?;
                 if file.size_bytes == 0 {
                     file.size_bytes = resolved_size;
@@ -335,12 +340,19 @@ impl RemoteSnapshot {
                 remote_files.push(Arc::new(RemoteFile {
                     path: file.path.clone(),
                     size_bytes: file.size_bytes,
+                    xet_hash,
                     signed_url: AsyncMutex::new(signed_url),
                     refresh: AsyncMutex::new(()),
                 }));
             }
             Ok::<_, anyhow::Error>((revision, weights, aux, remote_files))
         })?;
+        #[cfg(feature = "remote-import-xet")]
+        let xet_group = if use_xet {
+            Some(runtime.block_on(build_xet_group(&client, &endpoint, &repo, &revision))?)
+        } else {
+            None
+        };
         let inner = Arc::new(Inner {
             repo,
             revision,
@@ -348,7 +360,7 @@ impl RemoteSnapshot {
             client,
             resolver,
             #[cfg(feature = "remote-import-xet")]
-            xet_repo,
+            xet_group,
             files,
             counters: Counters::new(),
         });
@@ -457,7 +469,16 @@ impl RemoteSnapshot {
 
     pub(crate) fn telemetry(&self) -> Telemetry {
         let c = &self.inner.counters;
+        #[cfg(feature = "remote-import-xet")]
+        let transport = if self.inner.xet_group.is_some() {
+            "xet"
+        } else {
+            "http"
+        };
+        #[cfg(not(feature = "remote-import-xet"))]
+        let transport = "http";
         Telemetry {
+            transport,
             resolver_calls: c.resolver_calls.load(Ordering::Relaxed),
             url_refreshes: c.url_refreshes.load(Ordering::Relaxed),
             range_attempts: c.range_attempts.load(Ordering::Relaxed),
@@ -506,7 +527,7 @@ async fn fetch_range(inner: Arc<Inner>, request: RangeRequest) -> Result<RangeRe
     let _in_flight = inner.counters.enter();
 
     #[cfg(feature = "remote-import-xet")]
-    if inner.xet_repo.is_some() {
+    if inner.xet_group.is_some() {
         return fetch_xet_range(Arc::clone(&inner), file, request, expected_len).await;
     }
 
@@ -658,10 +679,14 @@ async fn fetch_xet_range(
     request: RangeRequest,
     expected_len: u64,
 ) -> Result<RangeResult> {
-    let repo = inner
-        .xet_repo
+    let group = inner
+        .xet_group
         .as_ref()
-        .expect("Xet range fetch requires an Xet repository");
+        .expect("Xet range fetch requires an Xet stream group");
+    let xet_hash = file
+        .xet_hash
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: Hub response has no Xet hash", file.path))?;
     for attempt in 0..MAX_ATTEMPTS {
         inner
             .counters
@@ -669,18 +694,14 @@ async fn fetch_xet_range(
             .fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let result = async {
-            let (_, mut stream) = repo
-                .download_file_stream()
-                .filename(file.path.clone())
-                .revision(inner.revision.clone())
-                .range(request.range.clone())
-                .send()
+            let file_info = xet::xet_session::XetFileInfo::new(xet_hash.clone(), file.size_bytes);
+            let mut stream = group
+                .download_stream(file_info, Some(request.range.clone()))
                 .await?;
             let capacity = usize::try_from(expected_len)
                 .map_err(|_| anyhow!("range length {expected_len} does not fit this machine"))?;
             let mut bytes = Vec::with_capacity(capacity);
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
+            while let Some(chunk) = stream.next().await? {
                 let next_len = bytes
                     .len()
                     .checked_add(chunk.len())
@@ -747,7 +768,7 @@ async fn refresh_url(inner: &Inner, file: &RemoteFile, rejected_url: &Url) -> Re
     if *file.signed_url.lock().await != *rejected_url {
         return Ok(());
     }
-    let (url, size) = resolve_signed_url(
+    let (url, size, _) = resolve_signed_url(
         &inner.resolver,
         &inner.endpoint,
         &inner.repo,
@@ -784,7 +805,7 @@ async fn resolve_signed_url(
     repo: &str,
     revision: &str,
     path: &str,
-) -> Result<(Url, u64)> {
+) -> Result<(Url, u64, Option<String>)> {
     let url = resolve_url(endpoint, repo, revision, path)?;
     let response = resolver.head(url.clone()).send().await?;
     if !response.status().is_redirection() {
@@ -806,6 +827,11 @@ async fn resolve_signed_url(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
+    let xet_hash = response
+        .headers()
+        .get("x-xet-hash")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     if let Some(commit) = response
         .headers()
         .get("x-repo-commit")
@@ -814,7 +840,39 @@ async fn resolve_signed_url(
     {
         bail!("{path}: resolver returned commit {commit}, expected {revision}");
     }
-    Ok((signed, size))
+    Ok((signed, size, xet_hash))
+}
+
+#[cfg(feature = "remote-import-xet")]
+async fn build_xet_group(
+    client: &reqwest::Client,
+    endpoint: &Url,
+    repo: &str,
+    revision: &str,
+) -> Result<xet::xet_session::XetDownloadStreamGroup> {
+    let token_url = url_with_segments(endpoint, ["api", "models"])
+        .and_then(|url| url_with_segments(&url, repo.split('/')))
+        .and_then(|url| url_with_segments(&url, ["xet-read-token", revision]))?;
+    let token: XetTokenResponse = client
+        .get(token_url.clone())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let session = xet::xet_session::XetSessionBuilder::new()
+        .with_tokio_handle(tokio::runtime::Handle::current())
+        .build()
+        .map_err(|error| anyhow!("initialize shared Xet session: {error}"))?;
+    session
+        .new_download_stream_group()
+        .map_err(|error| anyhow!("initialize shared Xet stream group: {error}"))?
+        .with_endpoint(token.cas_url)
+        .with_token_info(token.access_token, token.exp)
+        .with_token_refresh_url(token_url.to_string(), auth_headers()?)
+        .build()
+        .await
+        .map_err(|error| anyhow!("initialize shared Xet stream group: {error}"))
 }
 
 fn split_spec(spec: &str) -> Result<(String, String)> {
@@ -947,9 +1005,12 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
+            #[cfg(feature = "remote-import-xet")]
+            xet_group: None,
             files: vec![Arc::new(RemoteFile {
                 path: "model.safetensors".to_string(),
                 size_bytes,
+                xet_hash: None,
                 signed_url: AsyncMutex::new(signed_url),
                 refresh: AsyncMutex::new(()),
             })],
@@ -1042,6 +1103,35 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{error:#}").contains("expected commit"));
+    }
+
+    #[tokio::test]
+    async fn resolver_carries_the_xet_file_hash() {
+        let server = TestServer::start(vec![response(
+            "302 Found",
+            &[
+                ("Location", "/signed"),
+                ("X-Repo-Commit", "commit"),
+                ("X-Linked-Size", "5"),
+                ("X-Xet-Hash", "xet-file-hash"),
+            ],
+            "",
+        )]);
+        let resolver = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let (_, size, xet_hash) = resolve_signed_url(
+            &resolver,
+            &server.url,
+            "owner/model",
+            "commit",
+            "model.safetensors",
+        )
+        .await
+        .unwrap();
+        assert_eq!(size, 5);
+        assert_eq!(xet_hash.as_deref(), Some("xet-file-hash"));
     }
 
     #[tokio::test]
