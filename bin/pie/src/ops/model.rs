@@ -726,5 +726,4 @@ mod tests {
         assert!(!ok);
         assert_eq!(info, "no config");
     }
-
 }

@@ -320,11 +320,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     writer
         .finish()
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
-    reconcile_digests(
-        &out_file,
-        &report.digests,
-        args.integrity_report.as_deref(),
-    )?;
+    reconcile_digests(&out_file, &report.digests, args.integrity_report.as_deref())?;
     if let Some(summary) = source.telemetry() {
         println!("{summary}");
     }
@@ -1204,8 +1200,11 @@ fn write_artifact(
     }
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
-    let total_read_bytes = source_bytes
-        .saturating_add(meta.iter().map(|(_, bytes)| bytes.len() as u64).sum::<u64>());
+    let total_read_bytes = source_bytes.saturating_add(
+        meta.iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>(),
+    );
     let mut read_bytes = 0u64;
     let mut written_bytes = 0u64;
     let mut digests = Vec::with_capacity(entries.len());

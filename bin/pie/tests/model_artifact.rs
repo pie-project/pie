@@ -218,5 +218,8 @@ fn import_refuses_a_tensor_larger_than_the_reorder_ceiling() {
         format!("{error:#}").contains("above the 1024-byte reorder ceiling"),
         "unexpected error: {error:#}"
     );
-    assert!(!artifact.exists(), "a rejected import published an artifact");
+    assert!(
+        !artifact.exists(),
+        "a rejected import published an artifact"
+    );
 }

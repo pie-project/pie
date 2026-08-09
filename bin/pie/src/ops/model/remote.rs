@@ -232,12 +232,7 @@ impl RemoteSnapshot {
                 .iter()
                 .any(|entry| entry.rfilename == "model.safetensors.index.json")
             {
-                let url = resolve_url(
-                    &endpoint,
-                    &repo,
-                    &revision,
-                    "model.safetensors.index.json",
-                )?;
+                let url = resolve_url(&endpoint, &repo, &revision, "model.safetensors.index.json")?;
                 let index: serde_json::Value = client
                     .get(url)
                     .send()
@@ -892,11 +887,7 @@ mod tests {
     #[tokio::test]
     async fn retries_429_within_the_fixed_attempt_budget() {
         let server = TestServer::start(vec![
-            response(
-                "429 Too Many Requests",
-                &[("Retry-After", "0")],
-                "",
-            ),
+            response("429 Too Many Requests", &[("Retry-After", "0")], ""),
             response(
                 "206 Partial Content",
                 &[("Content-Range", "bytes 1-3/5")],
@@ -961,11 +952,12 @@ mod tests {
         second.unwrap();
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
         assert_eq!(source.counters.url_refreshes.load(Ordering::Relaxed), 1);
-        assert!(file
-            .signed_url
-            .lock()
-            .await
-            .path()
-            .ends_with("fresh-signed-url"));
+        assert!(
+            file.signed_url
+                .lock()
+                .await
+                .path()
+                .ends_with("fresh-signed-url")
+        );
     }
 }
