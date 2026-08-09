@@ -18,6 +18,29 @@ fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))
 }
 
+/// Read an MXFP4 scale tensor as E8M0 without inventing an identity node.
+///
+/// The raw-byte checkpoint form exposes scales as `U8`, so interpreting their
+/// E8M0 meaning requires a `Transmute`. Typed checkpoint metadata, including a
+/// converted `.zt` artifact, exposes the same bytes as `E8M0`; when its shape
+/// also matches, the source already says the whole truth and the contract
+/// algebra deliberately refuses a no-op `Transmute`.
+fn e8m0_factors(expr: Expr, raw: &RawTensor, shape: Vec<i64>) -> Result<Expr, Error> {
+    if !is_raw(&raw.encoding, DType::U8) && !is_raw(&raw.encoding, DType::E8M0) {
+        return fail(format!(
+            "deepseek_v4: MXFP4 scale '{}' must be U8 or E8M0, got {:?}",
+            raw.name, raw.encoding
+        ));
+    }
+    let source = TensorType::new(raw.shape.clone(), raw.encoding.clone());
+    let target = TensorType::new(shape, Encoding::Raw(DType::E8M0));
+    Ok(if source == target {
+        expr
+    } else {
+        expr.transmute(target)
+    })
+}
+
 /// DeepSeek-V4.
 ///
 /// The routed experts are handed to the driver one of two ways, and this
@@ -274,13 +297,8 @@ fn bf16_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
                 .0
             };
             let factors = |b: &Builder<'_>, raw: &RawTensor, shape: Vec<i64>, axis: u8| {
-                b.shard(
-                    Expr::src(&raw.name)
-                        .transmute(TensorType::new(shape.clone(), Encoding::Raw(DType::E8M0))),
-                    shape,
-                    Some(axis),
-                )
-                .0
+                let expr = e8m0_factors(Expr::src(&raw.name), raw, shape.clone())?;
+                Ok::<Expr, Error>(b.shard(expr, shape, Some(axis)).0)
             };
 
             gate_up.push(Expr::concat(
@@ -293,8 +311,8 @@ fn bf16_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
             gate_up_scales.push(Expr::concat(
                 1,
                 vec![
-                    factors(b, parts[1], vec![1, inter_full, h / GROUP], 1),
-                    factors(b, parts[3], vec![1, inter_full, h / GROUP], 1),
+                    factors(b, parts[1], vec![1, inter_full, h / GROUP], 1)?,
+                    factors(b, parts[3], vec![1, inter_full, h / GROUP], 1)?,
                 ],
             ));
             down.push(packed(b, parts[4], vec![1, down_raw[0], inter_full], 2));
@@ -303,7 +321,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
                 parts[5],
                 vec![1, down_raw[0], inter_full / GROUP],
                 2,
-            ));
+            )?);
             consumed.extend(parts.iter().map(|part| part.id));
             expert += 1;
         }
@@ -466,14 +484,13 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
             )
             .0
         };
-        let factors = |b: &Builder<'_>, tmpl: &str, shape: Vec<i64>, axis: u8| {
-            b.shard(
-                Expr::src_indexed(b.source_name(&format!("{ffn}{tmpl}")))
-                    .transmute(TensorType::new(shape.clone(), Encoding::Raw(DType::E8M0))),
-                shape,
-                Some(axis),
-            )
-            .0
+        let factors = |b: &Builder<'_>, raw: &RawTensor, tmpl: &str, shape: Vec<i64>, axis: u8| {
+            let expr = e8m0_factors(
+                Expr::src_indexed(b.source_name(&format!("{ffn}{tmpl}"))),
+                raw,
+                shape.clone(),
+            )?;
+            Ok::<Expr, Error>(b.shard(expr, shape, Some(axis)).0)
         };
 
         let internal = |mut tensor: TensorContract| {
@@ -498,16 +515,18 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
                         vec![
                             factors(
                                 b,
+                                proto[1],
                                 "experts.{}.w1.scale",
                                 vec![inter_full, hidden / GROUP],
                                 0,
-                            ),
+                            )?,
                             factors(
                                 b,
+                                proto[3],
                                 "experts.{}.w3.scale",
                                 vec![inter_full, hidden / GROUP],
                                 0,
-                            ),
+                            )?,
                         ],
                     ),
                     vec![2 * inter, hidden / GROUP],
@@ -517,10 +536,11 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
                     "down.scale",
                     factors(
                         b,
+                        proto[5],
                         "experts.{}.w2.scale",
                         vec![down_raw[0], inter_full / GROUP],
                         1,
-                    ),
+                    )?,
                     vec![down_raw[0], inter / GROUP],
                     e8m0,
                 )),

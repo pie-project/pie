@@ -1155,6 +1155,45 @@ fn deepseek_v4_checkpoint() -> CheckpointMetadata {
     ck.finish("deepseek_v4")
 }
 
+fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
+    // The pinned Flash checkpoint (60d8d707) declares routed-expert scales as
+    // F8_E8M0: w1/w3 [2048, 128], w2 [4096, 64]. A converted `.zt` preserves
+    // that logical dtype. The older golden fixture above deliberately models
+    // the raw-byte variant as U8, so its U8 -> E8M0 Transmute is meaningful and
+    // cannot reproduce an identity node against imported metadata.
+    let (hidden, intermediate) = (4096, 2048);
+    let mut ck = Checkpoint::new();
+    ck.push("embed_tokens.weight", &[128, hidden], bf16());
+    let p = "layers.0.";
+    for expert in 0..2 {
+        let e = format!("{p}ffn.experts.{expert}.");
+        for half in ["w1", "w3"] {
+            ck.push(
+                &format!("{e}{half}.weight"),
+                &[intermediate, hidden / 2],
+                Encoding::Raw(DType::I8),
+            );
+            ck.push(
+                &format!("{e}{half}.scale"),
+                &[intermediate, hidden / 32],
+                Encoding::Raw(DType::E8M0),
+            );
+        }
+        ck.push(
+            &format!("{e}w2.weight"),
+            &[hidden, intermediate / 2],
+            Encoding::Raw(DType::I8),
+        );
+        ck.push(
+            &format!("{e}w2.scale"),
+            &[hidden, intermediate / 32],
+            Encoding::Raw(DType::E8M0),
+        );
+    }
+    ck.push("norm.weight", &[hidden], bf16());
+    ck.finish("deepseek_v4_imported")
+}
+
 #[test]
 fn deepseek_v4_eager_cuda() {
     check(
@@ -1179,6 +1218,22 @@ fn deepseek_v4_streamed_cuda() {
         &target(0, 1),
         &policy,
     );
+}
+
+#[test]
+fn deepseek_v4_streamed_imported_mxfp4_metadata_compiles() {
+    let checkpoint = deepseek_v4_imported_checkpoint();
+    let policy = Policy {
+        stream_routed_experts: true,
+        ..Policy::default()
+    };
+    let target = target(0, 4);
+    let contract = author(&facts("deepseek_v4", 1), &checkpoint, &target, &policy)
+        .expect("authoring succeeds")
+        .expect("deepseek_v4 has an author");
+
+    compile_load_plan(&checkpoint, &contract, target)
+        .expect("the streamed contract compiles against imported MXFP4 metadata");
 }
 
 // ═══ The Metal point in policy space: Naming::Mlx, bind in place ═══
