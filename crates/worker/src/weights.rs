@@ -74,19 +74,17 @@ impl Model {
         let checkpoint = model_loader::checkpoint::read::parse_checkpoint_metadata(path)
             .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
 
-        let config = model_loader::checkpoint::read::read_meta(
-            &checkpoint,
-            model::encoding::CONFIG_OBJECT,
-        )?
-        .ok_or_else(|| {
-            anyhow!(
-                "artifact {} carries no {}; it was written when an artifact \
+        let config =
+            model_loader::checkpoint::read::read_meta(&checkpoint, model::encoding::CONFIG_OBJECT)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "artifact {} carries no {}; it was written when an artifact \
                  carried a resolved `pie.model/1` document instead of the \
                  checkpoint's own config. Re-import it with `pie model import`",
-                path.display(),
-                model::encoding::CONFIG_OBJECT,
-            )
-        })?;
+                        path.display(),
+                        model::encoding::CONFIG_OBJECT,
+                    )
+                })?;
 
         let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len());
         for name in tokenizer::canonical::OBJECTS {
@@ -352,7 +350,14 @@ mod tests {
         })
         .unwrap();
         let rebuilt = tokenizer::Tokenizer::from_canonical(&rebuilt).unwrap();
-        assert_eq!(rebuilt.vocab_size(), 2);
+        // AGAINST THE ORIGINAL, not against a number. `from_vocab(["a","b"])`
+        // builds a byte-level tokenizer, so its vocabulary is 258 -- the 256
+        // single-byte tokens plus the two named ones -- and the literal `2`
+        // that used to be here was a guess about the constructor rather than
+        // a claim about the round trip. Comparing the two ends says the thing
+        // this test is named for, and says it whatever the constructor does.
+        let original = tokenizer::Tokenizer::from_vocab(&["a".to_string(), "b".to_string()]);
+        assert_eq!(rebuilt.vocab_size(), original.vocab_size());
     }
 
     /// All of the tokenizer or none of it: half compiled and half probed from

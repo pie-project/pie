@@ -27,6 +27,8 @@
 //! are the same decision seen twice; a projection that emits one per
 //! layer emits both per layer.
 
+// Only the texts name a backend, and only they are gated.
+#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,

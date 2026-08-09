@@ -26,9 +26,9 @@
 //! * elastic sizing of KV/scratch (`alloc_zeroed`'s initial-commit
 //!   parameter) — regions allocate at full size for now.
 
-use std::ptr::NonNull;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::ptr::NonNull;
 
 use model_loader::error::Error as LoaderError;
 use model_loader::executor::Execution;

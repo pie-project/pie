@@ -39,7 +39,12 @@ pub mod spec;
 #[cfg(feature = "forward")]
 pub mod forward;
 
-use std::sync::{Arc, OnceLock};
+// `Arc` is the chat aspect's alone: it is the tokenizer a template
+// is handed and the `dyn Instruct` it is returned as. `OnceLock`
+// widens this generation's rows and every aspect reads that.
+#[cfg(feature = "chat")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::{Advertised, AudioTower, Deployment, Refusal, Towers, VisionTower};
@@ -416,9 +421,7 @@ impl Variant for Gemma4 {
             // what it cannot run, rather than a mis-serving repaired.
             // Without it an off-axis width aborts in `model-compiler`
             // rather than arriving as a sentence.
-            crate::shared::llama_like::project::metal_kernel_refusal(
-                &shape, &facts, load, bind,
-            )?;
+            crate::shared::llama_like::project::metal_kernel_refusal(&shape, &facts, load, bind)?;
             return Ok(crate::shared::llama_like::forward::llama_like_metal(
                 &shape, &facts, class,
             ));
@@ -461,8 +464,11 @@ impl Variant for Gemma4 {
 mod tests {
     use super::{
         ARCH, Deployed, Gemma4, Gemma4Facts, Gemma4Mixture, NORM_EPS, Towers, VARIANTS, Variant,
-        project, rows,
+        rows,
     };
+    // Only the Metal text's tests call the projection by name.
+    #[cfg(feature = "forward")]
+    use super::project;
     use crate::deployment::{AttnOutput, PrefillStyle, Refusal};
 
     fn row(id: &str) -> &'static Gemma4 {

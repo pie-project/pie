@@ -526,7 +526,9 @@ fn load_model_drivers(
         // load. Sharing a directory left `.weights` files sitting in a store
         // that scans for `.zt` and silently ignored them, while `pie cache`
         // reported their size under the store's name.
-        crate::state::weight_cache_dir().to_string_lossy().into_owned()
+        crate::state::weight_cache_dir()
+            .to_string_lossy()
+            .into_owned()
     } else {
         user_cfg.model.weight_cache_dir.clone()
     };
@@ -562,10 +564,7 @@ fn load_model_drivers(
         let ResolvedFlavor::Embedded(flavor) = resolved;
         let mut embedded_base_opts = preflight::build_embedded_options(m, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
-        apply_embedded_calibration(
-            &mut embedded_base_opts,
-            user_cfg.server.calibrate_planner,
-        );
+        apply_embedded_calibration(&mut embedded_base_opts, user_cfg.server.calibrate_planner);
         let resolved_model = weights::resolve(&m.model)
             .with_context(|| format!("resolving the model for {:?}", m.name))?;
         // Lifted once, here, in one open. The drivers get the compiled model
@@ -1285,9 +1284,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        let driver = ::engine::driver::DummyDriver::new(
-            driver_dummy::DummyDriverOptions::default(),
-        );
+        let driver =
+            ::engine::driver::DummyDriver::new(driver_dummy::DummyDriverOptions::default());
         let full_caps = driver.capabilities().clone();
         let mut encode_caps = full_caps.clone();
         encode_caps.total_pages = 0;

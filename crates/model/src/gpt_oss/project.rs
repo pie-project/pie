@@ -8,6 +8,8 @@
 //! second reading of a list the row already implied. The alternation is
 //! a RULE here (`is_sliding`), stated once and projected.
 
+// Only the texts name a backend, and only they are gated.
+#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,

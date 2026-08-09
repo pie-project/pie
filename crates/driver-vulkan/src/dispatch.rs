@@ -222,24 +222,36 @@ fn stated(lowered: &Lowered, launch: &Launch, index: Option<u8>) -> Option<u32> 
 /// that its rule's extent comes from the STATEMENT rather than from the fire.
 /// See this module's own documentation for the case that forces it.
 ///
-/// # One of the three overrides is exercised and two are not
+/// # What each of the three overrides is held by
 ///
-/// `grid_param` fires 710 times over this tree's three texts, all of them
-/// `rms_single_row`'s reduction axis. A driver that read only the fire would
+/// `grid_param` fires 1788 times over this tree's six texts -- the number the
+/// walk pins as `overridden`, and it was 710 when this note was first written
+/// against three of them. A driver that read only the fire would
 /// normalise over the wrong width every one of those times and produce
 /// numbers rather than an error, which is what
 /// `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`
 /// pins with a workgroup total: dropping this line changes that number and
 /// nothing else in the suite.
 ///
-/// `head_param` and `heads_param` fire ZERO times. No row any of the three
-/// texts reaches states either, so the two lines below are transcribed from
-/// `driver-metal` and carried untested. They are here rather than omitted
-/// because the model that needs them -- gemma-4, whose full-attention layers
-/// carry four 512-wide KV heads against its sliding layers' sixteen 256-wide
-/// ones -- is a model this tree already lowers a plan for, just not one of
-/// the three texts measured here. Stated plainly so that nobody reads the
-/// suite passing as evidence they work.
+/// `head_param` and `heads_param` fired ZERO times when this was written, and
+/// this note said so and said the two lines below were transcribed from
+/// `driver-metal` and carried untested. Half of that stopped being true the
+/// day the walk began handing `plan_one` the model's real geometry: across
+/// the six texts, 1056 rows now state a head width and 352 a head count.
+///
+/// The other half stayed true for longer than it looked, and the way it hid
+/// is worth keeping. Counting rows that STATE a head shape does not witness
+/// these lines USING it. Deleting either override left the whole suite green,
+/// because for these six texts the stated value EQUALS the fire's -- the
+/// overrides are no-ops here, and a no-op cannot be caught by a test that
+/// only checks the answer. The model that separates them is gemma-4, whose
+/// full-attention layers carry four 512-wide KV heads against its sliding
+/// layers' sixteen 256-wide ones, and it is not one of the texts measured.
+///
+/// So the walk now hands the same launch a geometry that disagrees on
+/// purpose and requires the answer to come from the row. Deleting either
+/// line fails. Recorded rather than tidied away because "it is counted" read
+/// as "it is checked" for two commits, and those are different claims.
 #[must_use]
 pub fn dims_of(sig: &KernelSig, lowered: &Lowered, launch: &Launch, fire: Geometry) -> Dims {
     // The last widthed operand, which is the launch's last OUTPUT: what sizes
@@ -306,7 +318,7 @@ pub struct Sources<'a, R: Resolve> {
 /// the points, so exact equality finds a row for the few symbols that have no
 /// axis and nothing for the rest.
 ///
-/// Measured before it was fixed: over the three texts, exact matching found a
+/// Measured before it was fixed: over the texts of the day, exact matching found a
 /// row for 432 launches and failed on 3030, across sixteen distinct symbols
 /// that all exist and all have modules built for them. `sig_in` finds all of
 /// them.

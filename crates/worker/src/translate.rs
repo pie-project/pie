@@ -172,8 +172,7 @@ mod tests {
     fn fixture_metadata() -> model::ModelMetadata {
         model::ModelMetadata {
             tokenizer: None,
-            config: br#"{"version":"pie.model/1","vocab_size":32,"num_hidden_layers":2}"#
-                .to_vec(),
+            config: br#"{"version":"pie.model/1","vocab_size":32,"num_hidden_layers":2}"#.to_vec(),
         }
     }
 
@@ -222,6 +221,7 @@ mod tests {
             vocab_size: caps.vocab_size,
             max_model_len: caps.max_model_len,
             arch_name: caps.arch_name.clone(),
+            model_id: caps.model_id.clone(),
             activation_dtype: caps.activation_dtype.clone(),
             snapshot_dir: caps.snapshot_dir.clone(),
             max_forward_tokens: caps.max_forward_tokens,

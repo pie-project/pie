@@ -38,7 +38,7 @@ use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFac
 use model::shared::llama_like::forward::llama_like;
 use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::dsl::WeightRepr;
-use model_compiler::{FireClass, ForwardPlan, HookStage, OpKind};
+use model_compiler::{FireClass, ForwardPlan};
 
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

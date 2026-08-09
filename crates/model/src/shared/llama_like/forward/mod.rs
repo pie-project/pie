@@ -156,7 +156,10 @@ fn all_reduce(
 /// a shard width that does not divide is a trace whose every projection
 /// is quietly wrong, and a `ForwardPlan` has no later place to notice.
 fn shard_divides(f: &LlamaLikeFacts, tp: u32) -> bool {
-    tp > 0 && f.q_heads % tp == 0 && f.kv_heads % tp == 0 && f.intermediate % tp == 0
+    tp > 0
+        && f.q_heads.is_multiple_of(tp)
+        && f.kv_heads.is_multiple_of(tp)
+        && f.intermediate.is_multiple_of(tp)
 }
 
 /// The MLP's projection-and-activation pair, in the spelling this
@@ -1254,7 +1257,7 @@ fn llama_like_cuda_text(
                     // goldens now pin this structure). The fused-post
                     // deployment (window-one only by its predicate) is
                     // the one QKV-inside-the-arms shape.
-                    let hoisted_q = (!fused_post).then(|| general_qkv());
+                    let hoisted_q = (!fused_post).then(&general_qkv);
                     // NOT migrated to `regions`, deliberately. The other
                     // three sites in the tree are, and the goldens prove
                     // the surface changes no traced byte — but this one

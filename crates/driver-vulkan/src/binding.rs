@@ -15,7 +15,7 @@
 //!
 //! It is `rows × width × bytes`: the launch states its row count, and the
 //! operand states its row width and its element size. Measured over every
-//! arena operand three real texts produce in both fire classes -- 9618 of them
+//! arena operand six real texts produce in both fire classes -- 14324 of them
 //! -- every extent lands inside the arena, and the tightest fit has **zero**
 //! bytes to spare. An operand ends exactly where the arena does.
 //!
@@ -380,7 +380,8 @@ pub enum Slot<'a> {
 ///
 /// This is the step the first version of this file did not have, and its
 /// absence was silent: binding a plan's operands positionally agrees with the
-/// row for 1094 of this tree's 3992 rectangles and disagrees for **2898**,
+/// row for 1094 of the 3992 rectangles this tree had when it was measured
+/// and disagrees for **2898**,
 /// across twelve symbols. Every one of those dispatched, and every one bound
 /// a real buffer of a plausible size to the wrong slot.
 ///
@@ -657,6 +658,18 @@ pub fn scalars<R: Resolve>(
             // Zero rather than a refusal, matching `driver-metal`: a pool
             // that has not been built yet has no page size, and the caller
             // that has not built one is not dispatching against it either.
+            //
+            // What lands here was unwatched for a long time and looked
+            // watched. `Pool` answering correctly is checked in `resources`;
+            // the shader addressing correctly is checked in `tests/device.rs`
+            // -- which hand-writes its push constants and so never comes
+            // through here. Between them this line could hand attention a
+            // constant and every test stayed green. `tests/arena.rs`'s
+            // `every_row_naming_a_pool_number_is_handed_that_number_and_not_another`
+            // now pins the whole run for every row in the table that names
+            // one, which is also what makes SWAPPING the two strides a
+            // failure -- the defect with the most plausible output, since
+            // both numbers are present either way.
             run.push(resolver.number(want).unwrap_or(0));
             continue;
         }
@@ -670,6 +683,13 @@ pub fn scalars<R: Resolve>(
                 if matches!(operand.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
                     run.extend_from_slice(stated.get(usize::from(i)..).unwrap_or(&[]));
                 } else {
+                    // The `unwrap_or` is unreachable across every row and
+                    // text measured here -- replacing the zero with a one
+                    // changes nothing, and asserting inside it never fires.
+                    // Kept because the alternative is an index panic on a
+                    // statement that carried fewer scalars than its row
+                    // indexes, which is a plan defect this crate would rather
+                    // report as a short run than as a crash.
                     run.push(stated.get(usize::from(i)).copied().unwrap_or(0));
                 }
             }
@@ -1279,6 +1299,14 @@ pub fn descriptors<'a>(
     // and the descriptor holes are the same slots, on both modules that have
     // either.
     for (at, slot) in out.iter().enumerate() {
+        // `used.get` is never out of range for any module here -- measured,
+        // by asserting inside the fallback and seeing nothing fire. `false`
+        // is still the right default: a slot the reflection did not describe
+        // is one this crate cannot claim the shader reads.
+        // `used.get` is never out of range for any module here -- measured,
+        // by asserting inside the fallback and seeing nothing fire. `false`
+        // is still the right default: a slot the reflection did not describe
+        // is one this crate cannot claim the shader reads.
         if matches!(slot, Slot::Nothing) && declared.used.get(at).copied().unwrap_or(false) {
             return Err(Unlayoutable::Unfilled { at });
         }

@@ -116,6 +116,21 @@ fn geometric() -> Vec<(String, Lowered, driver_vulkan::dispatch::Geometry)> {
             LlamaLikeFacts::qwen3_30b_a3b(),
             LlamaLikeMetalFacts::synthetic(),
         ),
+        (
+            "qwen2_5_1_5b",
+            LlamaLikeFacts::qwen2_5_1_5b(),
+            LlamaLikeMetalFacts::synthetic(),
+        ),
+        (
+            "mistral_7b_v03",
+            LlamaLikeFacts::mistral_7b_v03(),
+            LlamaLikeMetalFacts::synthetic(),
+        ),
+        (
+            "olmo2_1b",
+            LlamaLikeFacts::olmo2_1b(),
+            LlamaLikeMetalFacts::synthetic(),
+        ),
     ] {
         for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 64)] {
             if let Some(low) = lowered(&facts, &metal, class, rows) {
@@ -446,7 +461,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
 ///
 /// A weight and a seam value are not the plan's to place, so this stands in
 /// for the driver's tables with placeholders sized generously. Every arena
-/// operand, though -- 9618 of them across three texts in both fire classes --
+/// operand, though -- 14324 of them across six texts in both fire classes --
 /// goes through the real arithmetic: `rows × width × bytes` from the plan,
 /// checked against the plan's arena and then against 256-byte addressing.
 ///
@@ -533,7 +548,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // Stated so that a plan which stops producing arena operands -- or starts
     // producing far fewer -- cannot make the zero above true by emptiness.
     assert_eq!(
-        arena_operands, 9618,
+        arena_operands, 14324,
         "the texts produced a different number of arena operands than when this \
          was measured, so the zero above is about a different plan"
     );
@@ -544,7 +559,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // end of the arena is refused nowhere and is the exact defect
     // `tests/device.rs` shows corrupting a neighbour. Both change this sum.
     assert_eq!(
-        total, 1_057_900_480,
+        total, 2_322_057_920,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -745,19 +760,28 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// a set of built modules and an arena, how many of its rectangles can be
 /// recorded?
 ///
-/// 3180 of 3992. The other 812 are the six symbols the earlier tests already
-/// record as short of something nobody has built -- `kv_append_paged` and the
-/// two paged-decode attentions want a KV cache and a page table this crate
-/// does not allocate, `neox_mb` and `row_gather` want scalars a driver
-/// derives, `embed_gather_mb_4bit` wants a descriptor the plan does not name.
-/// Nothing NEW refuses, which is the claim: joining three layers that each
-/// pass alone did not introduce a fourth failure.
+/// All 6272, across SIX texts in both fire classes. It began at 3180 of 3992
+/// over three texts, and the 812 that refused were six symbols short of
+/// something nobody had built; each one leaving that list was a defect in
+/// this crate rather than a gap in a plan, and the list is now empty.
+///
+/// Three texts became six by adding `qwen2_5_1_5b`, `mistral_7b_v03` and
+/// `olmo2_1b`, which lower and plan without a single new refusal -- so the
+/// walk grew by 57% and found nothing, which is a weaker result than a
+/// failure and is why it is written down rather than assumed.
+///
+/// `phi3_mini` is NOT here, and its absence is a measurement: it is 96 wide
+/// per head, and `sdpa_paged_decode` is compiled at 64, 128, 256 and 512.
+/// `model-compiler` refuses the plan before this crate sees it. That is not a
+/// driver gap -- `kernels-metal` compiles the same four widths -- so serving
+/// it needs a kernel variant, in both trees, and not a change here.
 ///
 /// The exact totals are asserted rather than a "most of them" threshold, and
 /// building this walk gave three separate reasons to insist on that:
 ///
 /// * the first version found a kernel row by string equality, when the table
-///   states AXES and a plan names POINTS on them. It planned 432 of 3992 and
+///   states AXES and a plan names POINTS on them. It planned 432 of the 3992
+///   this walk had then, and
 ///   reported "no kernel row" for sixteen symbols that all exist and all have
 ///   modules built for them. A threshold test would have called that a pass.
 /// * the second skipped a launch whose module it could not open, so the
@@ -812,8 +836,13 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     let mut pushed = 0u32;
     let mut blocked = 0u32;
     let mut overridden = 0u32;
+    let mut split_rectangles = 0u32;
+    let mut rotary_overridden = 0u32;
+    let mut pool_numbers = 0u32;
+    let mut head_overridden = 0u32;
     let mut heads_overridden = 0u32;
 
+    let mut refused_hollow = 0_u32;
     for (text, low, geometry) in geometric() {
         let buf = driver_vulkan::device::Buffer::placeholder(low.arena_bytes as u64);
         let store = Everything(driver_vulkan::device::Buffer::placeholder(GENEROUS));
@@ -852,6 +881,43 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
             ) {
                 Ok(d) => {
                     planned += 1;
+                    // The same launch against a geometry of ZEROS, which is
+                    // the nastiest input a caller can hand this seam:
+                    // fourteen rule-and-field pairs answer a grid with a zero
+                    // in it (`geometry.rs` pins the set), and an empty grid
+                    // runs nothing and reports success.
+                    //
+                    // None gets through. The measured reason is not
+                    // `plan_one`'s empty-grid check but the row overrides --
+                    // a head-shaped row STATES its head width and head count,
+                    // so the geometry's zeros are replaced before a rule ever
+                    // sees them, and the rows that do not state them refuse
+                    // geometrically instead. So this block does not witness
+                    // that check; it witnesses that no real rectangle can be
+                    // driven to an empty grid from the outside.
+                    if let Ok(hollow) = driver_vulkan::dispatch::plan_one(
+                        &low,
+                        launch,
+                        kernels_vulkan::KERNELS,
+                        driver_vulkan::dispatch::Built {
+                            module,
+                            declared: &declared,
+                        },
+                        driver_vulkan::dispatch::Sources {
+                            arena,
+                            resolver: &store,
+                            min_offset: STRICTEST_ALIGNMENT as u64,
+                        },
+                        driver_vulkan::dispatch::Geometry::default(),
+                    ) {
+                        assert!(
+                            !hollow.groups.contains(&0),
+                            "{text}: `{symbol}` planned {:?} from a geometry of zeros",
+                            hollow.groups
+                        );
+                    } else {
+                        refused_hollow += 1;
+                    }
                     // A grid with a zero in it runs nothing and reports
                     // success, which is the failure this crate refuses
                     // hardest. `plan_one` is supposed to have caught it.
@@ -875,6 +941,18 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                     // one.
                     let sig = kernels::sig_in(kernels_vulkan::KERNELS, symbol)
                         .expect("the walk found a row");
+                    // The VALUE a row states at that slot, not merely that
+                    // it states one. `!=` against a lying fire proves the
+                    // answer did not come from the fire; it does not prove it
+                    // came from the row, and an override off by one survived
+                    // exactly that gap.
+                    let value = |index: Option<u8>| -> Option<u32> {
+                        let i = index?;
+                        let at = launch.params.start as usize + i as usize;
+                        (at < launch.params.end as usize)
+                            .then(|| low.params.get(at).copied().unwrap_or(0))
+                            .filter(|n| *n > 0)
+                    };
                     let states = |index: Option<u8>| {
                         index.is_some_and(|i| {
                             let at = launch.params.start as usize + i as usize;
@@ -885,8 +963,137 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                     if states(sig.grid_param) {
                         overridden += 1;
                     }
-                    if states(sig.head_param) || states(sig.heads_param) {
+                    if states(sig.head_param) {
+                        head_overridden += 1;
+                    }
+                    if states(sig.heads_param) {
                         heads_overridden += 1;
+                    }
+
+                    // THE POOL'S NUMBERS REACH THE SHADER, checked here
+                    // because nothing else was checking it. A row may name a
+                    // number that belongs to the pool rather than to the
+                    // statement -- the KV page size and the cache's two
+                    // strides -- and `binding::scalars` interleaves the
+                    // driver's answer into the run at the row's position.
+                    //
+                    // Replacing either stride with 999 left the whole suite
+                    // green. The walk's resolver answers `None` to every
+                    // number, so all three read as zero here, and the device
+                    // tests that DO know the strides hand-write their push
+                    // constants and never go through this path. Between them
+                    // the seam from `Pool` to the params was unwatched, and a
+                    // wrong stride is not an error -- it is attention reading
+                    // the wrong offsets and returning numbers.
+                    //
+                    // A second resolver with three recognisable answers, run
+                    // beside the real one so no pinned count moves. Distinct
+                    // per number, so a swap fails as loudly as a drop.
+                    struct Sentinels(driver_vulkan::device::Buffer);
+                    impl driver_vulkan::binding::Resolve for Sentinels {
+                        fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
+                            Some(&self.0)
+                        }
+                        fn named(
+                            &self,
+                            _: model_compiler::trace::ValueId,
+                        ) -> Option<&driver_vulkan::device::Buffer> {
+                            Some(&self.0)
+                        }
+                        fn number(&self, which: driver_vulkan::binding::FireNumber) -> Option<u32> {
+                            Some(match which {
+                                driver_vulkan::binding::FireNumber::KvPageSize => 0x0011_1111,
+                                driver_vulkan::binding::FireNumber::KvHeadStride => 0x0022_2222,
+                                driver_vulkan::binding::FireNumber::KvSeqStride => 0x0033_3333,
+                            })
+                        }
+                    }
+                    let wants = |src: kernels::Source| sig.operands.iter().any(|o| o.source == src);
+                    let sentinel_of = |src: kernels::Source| match src {
+                        kernels::Source::KvPageSize => 0x0011_1111u32,
+                        kernels::Source::KvHeadStride => 0x0022_2222,
+                        _ => 0x0033_3333,
+                    };
+                    for src in [
+                        kernels::Source::KvPageSize,
+                        kernels::Source::KvHeadStride,
+                        kernels::Source::KvSeqStride,
+                    ] {
+                        if !wants(src) {
+                            continue;
+                        }
+                        pool_numbers += 1;
+                        let store = Sentinels(driver_vulkan::device::Buffer::placeholder(GENEROUS));
+                        let got =
+                            driver_vulkan::binding::scalars(sig, &low, launch, &declared, &store)
+                                .expect("the row's scalars place");
+                        let bytes = match got {
+                            driver_vulkan::binding::Params::Push(ref b) => b.clone(),
+                            driver_vulkan::binding::Params::Block { ref bytes, .. } => {
+                                bytes.clone()
+                            }
+                            driver_vulkan::binding::Params::None => Vec::new(),
+                        };
+                        let want = sentinel_of(src).to_le_bytes();
+                        assert!(
+                            bytes.windows(4).any(|w| w == want),
+                            "{text}: `{symbol}` names {src:?} and the driver's answer is not in \
+                             the {} bytes it hands the shader",
+                            bytes.len()
+                        );
+                    }
+
+                    // Counting rows that STATE a head shape does not witness
+                    // `dims_of` USING it, and the difference is not academic:
+                    // deleting either override left this whole file green,
+                    // because across these six texts the stated value
+                    // equals the fire's and the two lines are no-ops. The
+                    // model that separates them is gemma-4, which is not one
+                    // of the texts here.
+                    //
+                    // So the fire is made to disagree on purpose. A geometry
+                    // carrying head shapes nothing states is handed to the
+                    // same launch, and `dims_of` must still answer with what
+                    // the row said. Now deleting an override is a failure.
+                    let liar = driver_vulkan::dispatch::Geometry {
+                        head_dim: geometry.head_dim + 7,
+                        kv_heads: geometry.kv_heads + 7,
+                        rotary_dims: geometry.rotary_dims + 1024,
+                        ..geometry
+                    };
+                    let told = driver_vulkan::dispatch::dims_of(sig, &low, launch, liar);
+                    if states(sig.head_param) {
+                        assert_eq!(
+                            Some(told.head_dim),
+                            value(sig.head_param),
+                            "{symbol} states a head width and `dims_of` answered with something else"
+                        );
+                    }
+                    if states(sig.heads_param) {
+                        assert_eq!(
+                            Some(told.kv_heads),
+                            value(sig.heads_param),
+                            "{symbol} states a head count and `dims_of` answered with something else"
+                        );
+                    }
+                    // The same no-op, one field over. A rope row's rotary
+                    // width comes from the STATEMENT because a model may
+                    // rotate only part of its head -- gemma-4 turns 128 of
+                    // 512 -- and for these six texts the stated width
+                    // equals the fire's, so dropping the override changed
+                    // nothing anywhere. 400 rope rectangles state a grid and
+                    // every one of them is now answered from the row.
+                    if matches!(sig.launch, kernels::LaunchRule::SplitPacked) {
+                        split_rectangles += 1;
+                    }
+                    if states(sig.grid_param) && matches!(sig.launch, kernels::LaunchRule::Rope) {
+                        rotary_overridden += 1;
+                        assert_eq!(
+                            Some(told.rotary_dims),
+                            value(sig.grid_param),
+                            "{symbol} states a grid and `dims_of` answered with a different \
+                             rotary width"
+                        );
                     }
 
                     match d.params {
@@ -953,12 +1160,12 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     }
 
     assert_eq!(
-        launches, 3992,
+        launches, 6272,
         "a different number of rectangles is lowered"
     );
-    assert_eq!(planned, 3992, "a different number of rectangles records");
+    assert_eq!(planned, 6272, "a different number of rectangles records");
 
-    // Nothing is refused, so nothing is named. Every rectangle all three
+    // Nothing is refused, so nothing is named. Every rectangle all six
     // texts state, in both fire classes, becomes a dispatch.
     //
     // This list held six symbols and then five, and each one leaving it was a
@@ -1004,7 +1211,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // are the two paged decodes, which could not be planned at all until the
     // walk started stating the model's geometry.
     assert_eq!(
-        overridden, 1110,
+        overridden, 1788,
         "a different number of rectangles states its own extent"
     );
     // `head_param` and `heads_param` fired ZERO times for as long as the walk
@@ -1012,9 +1219,64 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // overrides were carried untested on a green suite. They fire now, and
     // the number is stated so that it going back to zero is visible rather
     // than comfortable.
+    //
+    // Counted separately, and that was not a tidying. One count of the UNION
+    // was 600 -- and `head_param` alone is 600 while `heads_param` is 200, so
+    // the rows stating a head count are a strict subset of those stating a
+    // head width. The union could not have witnessed `heads_param` at all:
+    // it going to zero would have left the number unchanged and the suite
+    // green. Two numbers, so each override answers for itself.
+    // Stated so that the seam going unexercised is visible. It was zero for
+    // as long as nothing asked, which is how it stayed broken-able.
+    //
+    // All 400 are `KvPageSize`, in the two paged decodes and the paged
+    // append. NOT ONE names a stride: these six texts are paged throughout,
+    // and the strides belong to the contiguous cache. That is why the loop
+    // above cannot be the whole check, and why the rows themselves are swept
+    // separately below.
+    // How many of those same launches `plan_one` REFUSED when handed a
+    // geometry of ZEROS -- 352 of 1788, the head-shaped ones. The rest plan
+    // fine because their dimensions come from the lowering rather than from
+    // the geometry, so the zeros never reach them, and they are right to.
+    //
+    // Every one of those refusals is `Ungeometric` -- 193 of them from the
+    // two paged decodes, whose module width cannot match a zero head, and the
+    // rest from rules that need a shape the zeros destroyed. NOT ONE is
+    // `Undispatchable::Empty`, which is the measurement this comment exists
+    // for: deleting `plan_one`'s `groups.contains(&0)` check still leaves this
+    // file green, because nothing reachable from a real plan and an arbitrary
+    // geometry produces an empty grid. That check is witnessed by
+    // `tests/device.rs` alone, where a zero grid is recorded and the card
+    // notices. Said here so the next reader does not mistake this number for
+    // a check of the refusal.
     assert_eq!(
-        heads_overridden, 600,
-        "a different number of rectangles states a head shape"
+        refused_hollow, 352,
+        "a different number of launches refused a geometry of zeros"
+    );
+    assert_eq!(
+        pool_numbers, 704,
+        "a different number of rectangles names one of the pool's numbers"
+    );
+    // ZERO, and asserted as zero because that is the fact `dims_of`'s
+    // `in_width` note rests on: no text here reaches `split_qkv`, so nothing
+    // consumes `in_width` and replacing it with a constant is invisible. A
+    // text that starts splitting its projections makes this number move,
+    // which is when the note stops being true.
+    assert_eq!(
+        split_rectangles, 0,
+        "a text now reaches `Rule::SplitPacked`, so `in_width` is no longer unwitnessed"
+    );
+    assert_eq!(
+        rotary_overridden, 704,
+        "a different number of rope rectangles states its rotary width"
+    );
+    assert_eq!(
+        head_overridden, 1056,
+        "a different number of rectangles states a head width"
+    );
+    assert_eq!(
+        heads_overridden, 352,
+        "a different number of rectangles states a head count"
     );
     // The total work these plans dispatch, as a single number.
     //
@@ -1024,7 +1286,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // `dims_of`'s statement override changes no other assertion in this file
     // and changes this one, which is the whole reason it is stated.
     assert_eq!(
-        workgroups, 23_025_115,
+        workgroups, 35_458_690,
         "the plans dispatch a different amount of work"
     );
     // The third dimension was 1 across every text until the paged decodes
@@ -1033,7 +1295,228 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // dimensions would have looked correct on every plan before this one.
     assert_eq!(
         widest_grid,
-        [2048, 25136, 64],
+        [3584, 25136, 64],
         "the widest grid in any dimension changed"
     );
+}
+
+/// Every row that names one of the pool's numbers is handed that number, and
+/// the three are not interchangeable.
+///
+/// The walk above can only ask this of rows its six texts reach, and they
+/// reach exactly one of the three numbers: all 400 are `KvPageSize`, because
+/// these texts are paged throughout and the two strides belong to the
+/// contiguous cache. So the strides went unwatched -- replacing either with a
+/// constant left the whole suite green, and a wrong stride is not an error but
+/// attention reading the wrong offsets and returning numbers.
+///
+/// `Pool`'s answers are checked in `resources.rs` and the shader's addressing
+/// in `tests/device.rs`, which hand-writes its push constants. Between those
+/// two the seam was open. This closes it from the table's side rather than a
+/// text's, so a row added tomorrow is covered whether or not a text reaches
+/// it.
+#[test]
+fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
+    use kernels::Source;
+
+    // Distinct and recognisable, so a swap fails as loudly as a drop. A
+    // resolver answering one number for all three would pass a check that
+    // only asked "is something there".
+    fn sentinel(src: Source) -> Option<u32> {
+        match src {
+            Source::KvPageSize => Some(0x0011_1111),
+            Source::KvHeadStride => Some(0x0022_2222),
+            Source::KvSeqStride => Some(0x0033_3333),
+            _ => None,
+        }
+    }
+    struct Sentinels(driver_vulkan::device::Buffer);
+    impl driver_vulkan::binding::Resolve for Sentinels {
+        fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
+            Some(&self.0)
+        }
+        fn named(
+            &self,
+            _: model_compiler::trace::ValueId,
+        ) -> Option<&driver_vulkan::device::Buffer> {
+            Some(&self.0)
+        }
+        fn number(&self, which: driver_vulkan::binding::FireNumber) -> Option<u32> {
+            Some(match which {
+                driver_vulkan::binding::FireNumber::KvPageSize => 0x0011_1111,
+                driver_vulkan::binding::FireNumber::KvHeadStride => 0x0022_2222,
+                driver_vulkan::binding::FireNumber::KvSeqStride => 0x0033_3333,
+            })
+        }
+    }
+
+    let store = Sentinels(driver_vulkan::device::Buffer::placeholder(1 << 30));
+    // A real lowering, borrowed for its shape and then emptied of scalars.
+    // Hand-building a `Lowered` would be a second definition of the type to
+    // keep in step for no gain -- nothing below reads any field but `params`.
+    let mut low = texts().swap_remove(0).1;
+    let mut rows = 0u32;
+    let mut named = std::collections::BTreeMap::<String, u32>::new();
+    for sig in kernels_vulkan::KERNELS {
+        let wanted: Vec<Source> = sig
+            .operands
+            .iter()
+            .map(|o| o.source)
+            .filter(|s| sentinel(*s).is_some())
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        rows += 1;
+
+        // A launch whose statement carries as many scalars as the row's
+        // `Param` slots index, and a module wide enough to hold the run --
+        // the question here is the RUN's contents, not its placement, which
+        // `binding`'s own tests already pin.
+        let params = sig
+            .operands
+            .iter()
+            .filter_map(|o| match o.source {
+                Source::Param(i) | Source::ParamF32(i) => Some(u32::from(i) + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        low.params = (0..params).map(|i| 1000 + i).collect();
+        let launch = model_compiler::lower::Launch {
+            kernel: 0,
+            rows: 0..1,
+            layers: 0..1,
+            op: 0,
+            args: 0..0,
+            params: 0..params,
+            peel: None,
+            cond: 0,
+        };
+        // A push block of EXACTLY the run's length, because `binding`
+        // refuses a run a block cannot hold rather than truncating it -- see
+        // `scalars_neither_shape_can_hold_are_refused_rather_than_truncated`.
+        // The length is the row's own: one word per operand that carries a
+        // scalar, plus the tail a `Buf` at a `Param` slot swallows.
+        let words = run_words(sig, params);
+        let declared = driver_vulkan::spirv::Declared {
+            local: [1, 1, 1],
+            bindings: 1,
+            used: vec![true],
+            reads_workgroup_count: false,
+            grid_axes: [true, false, false],
+            push_offsets: (0..words).map(|i| i * 4).collect(),
+            block_bytes: vec![None],
+        };
+        let got = driver_vulkan::binding::scalars(sig, &low, &launch, &declared, &store)
+            .unwrap_or_else(|e| panic!("`{}`: {e:?}", sig.symbol));
+        let bytes = match got {
+            driver_vulkan::binding::Params::Push(ref b) => b.clone(),
+            driver_vulkan::binding::Params::Block { ref bytes, .. } => bytes.clone(),
+            driver_vulkan::binding::Params::None => Vec::new(),
+        };
+        // The WHOLE run, not "is the number in there somewhere". Presence
+        // alone cannot see a swap: both strides are in the same run either
+        // way, and swapping them is the defect with the most plausible
+        // output -- attention striding by heads where it should stride by
+        // positions, reading real numbers from the wrong rows.
+        let want: Vec<u8> = expected_run(sig, &low, params)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert_eq!(
+            bytes, want,
+            "`{}` hands the shader a different run than its row spells",
+            sig.symbol
+        );
+        for src in wanted {
+            *named.entry(format!("{src:?}")).or_default() += 1;
+        }
+    }
+
+    // Every one of the three is witnessed by at least one row. Stated because
+    // the loop passes vacuously for a number no row names, which is precisely
+    // the state the strides were in.
+    assert_eq!(named.len(), 3, "only these are witnessed: {named:?}");
+    // Stated exactly. Six rows in the whole table name one of these, and a
+    // row losing its source is not an error anywhere -- the number simply
+    // stops being written and the shader reads whatever the statement left
+    // in that slot.
+    assert_eq!(rows, 6, "a different number of rows names a pool number");
+    assert_eq!(
+        named,
+        [
+            ("KvHeadStride".to_string(), 5u32),
+            ("KvPageSize".to_string(), 3),
+            ("KvSeqStride".to_string(), 5),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>(),
+        "a different set of rows names each number"
+    );
+}
+
+/// How many words the run for one row is, given a statement of `params`
+/// scalars.
+///
+/// Mirrors `binding::scalars`' walk rather than guessing, because the two
+/// disagreeing is the failure this file cannot see: a block sized from a guess
+/// would refuse rows that are fine and pass rows that are not.
+fn run_words(sig: &kernels::KernelSig, params: u32) -> u32 {
+    let mut n = 0u32;
+    for o in sig.operands {
+        match o.source {
+            _ if o.ty == kernels::Ty::InPacked => n += 1,
+            kernels::Source::KvPageSize
+            | kernels::Source::KvHeadStride
+            | kernels::Source::KvSeqStride => n += 1,
+            kernels::Source::Param(i) | kernels::Source::ParamF32(i) => {
+                if matches!(o.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
+                    n += params.saturating_sub(u32::from(i));
+                } else {
+                    n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
+/// The run one row spells, word for word, built from the row rather than from
+/// `binding`.
+///
+/// A second reading of the same table. That is the point: the check it feeds
+/// is that `binding::scalars` and the row agree, and a helper that asked
+/// `binding` would only be checking it against itself.
+fn expected_run(
+    sig: &kernels::KernelSig,
+    low: &model_compiler::lower::Lowered,
+    params: u32,
+) -> Vec<u32> {
+    let stated: Vec<u32> = (0..params).map(|i| 1000 + i).collect();
+    let mut run = Vec::new();
+    for o in sig.operands {
+        if o.ty == kernels::Ty::InPacked {
+            run.push(match o.source {
+                kernels::Source::RequestCount => low.n_requests,
+                _ => 0,
+            });
+            continue;
+        }
+        match o.source {
+            kernels::Source::KvPageSize => run.push(0x0011_1111),
+            kernels::Source::KvHeadStride => run.push(0x0022_2222),
+            kernels::Source::KvSeqStride => run.push(0x0033_3333),
+            kernels::Source::Param(i) | kernels::Source::ParamF32(i) => {
+                if matches!(o.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
+                    run.extend_from_slice(stated.get(usize::from(i)..).unwrap_or(&[]));
+                } else {
+                    run.push(stated.get(usize::from(i)).copied().unwrap_or(0));
+                }
+            }
+            _ => {}
+        }
+    }
+    run
 }

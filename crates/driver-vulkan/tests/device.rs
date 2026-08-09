@@ -153,6 +153,45 @@ fn a_device_opens_and_says_whether_a_layer_is_watching() {
     }
 }
 
+/// A buffer of no bytes is a buffer of four, and the card accepts it.
+///
+/// `Device::buffer` rounds a zero-length upload up to four bytes, because a
+/// zero-sized buffer is illegal Vulkan and an operand a variant never reads
+/// still needs a descriptor pointing somewhere. Deleting the round-up changed
+/// no test: every buffer in this suite has contents, so the one input the
+/// clamp exists for was never sent.
+///
+/// It is asked here rather than in a unit test because the claim is about
+/// what the DRIVER accepts, and the only thing that can answer that is a
+/// driver -- with a validation layer watching, which is where an illegal size
+/// would be reported.
+#[test]
+fn a_buffer_of_no_bytes_is_still_a_buffer_the_card_accepts() {
+    let (device, _) = gpu!();
+    let empty = device.buffer(&[]).expect("an empty upload allocates");
+    // Four and not zero, and read back through the same path everything else
+    // here uses, so the size is the driver's answer and not this crate's.
+    let back = device.read(&empty).expect("an empty buffer reads back");
+    assert_eq!(back.len(), 4, "an empty upload did not become four bytes");
+    // And it can be BOUND, which is the reason the round-up exists: a
+    // descriptor has to point at a range, and a range of nothing is refused
+    // one line further down.
+    assert!(
+        driver_vulkan::device::Bound::at(&device, &empty, 0, 4).is_ok(),
+        "a rounded-up buffer cannot be bound, so the round-up bought nothing"
+    );
+    // The control: the same buffer with a range of nothing is still refused,
+    // so the round-up did not turn an empty binding into a legal one.
+    assert!(
+        matches!(
+            driver_vulkan::device::Bound::at(&device, &empty, 0, 0),
+            Err(driver_vulkan::device::Failed::Overrun { len: 0, .. })
+        ),
+        "a zero-length range was accepted"
+    );
+    device.free(empty);
+}
+
 /// A row-wise norm, driven entirely through this crate's own API.
 ///
 /// The end-to-end case: the pipeline's layout comes from what the module
@@ -1588,25 +1627,6 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
         *hi = (*hi & 0x83) | 0x3c;
     }
     let arena_buffer = device.buffer(&fill).expect("the arena allocates");
-    let mut wfill: Vec<u8> = (0..1usize << 22).map(|i| (i * 17 % 241) as u8).collect();
-    for hi in wfill.iter_mut().skip(1).step_by(2) {
-        *hi = (*hi & 0x83) | 0x3c;
-    }
-    let weights = device.buffer(&wfill).expect("weights");
-
-    struct Store<'a>(&'a driver_vulkan::device::Buffer);
-    impl driver_vulkan::binding::Resolve for Store<'_> {
-        fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
-            Some(self.0)
-        }
-        fn named(
-            &self,
-            _: model_compiler::trace::ValueId,
-        ) -> Option<&driver_vulkan::device::Buffer> {
-            Some(self.0)
-        }
-    }
-    let store = Store(&weights);
 
     let arena = driver_vulkan::binding::Arena {
         buffer: &arena_buffer,
@@ -1617,6 +1637,36 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
         .iter()
         .find(|l| low.kernels[l.kernel as usize] == symbol)
         .expect("the text norms");
+
+    // One buffer PER NAME, not one for all of them. A store that answered
+    // every name with the same memory cannot tell a binder that resolved this
+    // launch's weight from one that resolved any of the other 703 the plan
+    // states, because both would read the same bytes and compute the same
+    // answer.
+    //
+    // Every name gets different contents, so binding the wrong one is a wrong
+    // number rather than a coincidence.
+    let mut weights = driver_vulkan::resources::Weights::new();
+    let mut wanted: Vec<String> = Vec::new();
+    for a in &low.args[launch.args.start as usize..launch.args.end as usize] {
+        if let model_compiler::lower::Arg::Weight(name) = a {
+            wanted.push(name.clone());
+        }
+    }
+    assert_eq!(wanted.len(), 1, "the norm states one weight");
+    // Two names, so the store holds a decoy as well: an assertion that the
+    // binder picked "a buffer in the store" passes on a store of one.
+    let decoy = "a.weight.this.launch.does.not.name";
+    for (i, name) in wanted.iter().map(String::as_str).chain([decoy]).enumerate() {
+        let mut fill: Vec<u8> = (0..1usize << 16)
+            .map(|b| ((b * 17 + i * 101) % 241) as u8)
+            .collect();
+        for hi in fill.iter_mut().skip(1).step_by(2) {
+            *hi = (*hi & 0x83) | 0x3c;
+        }
+        weights.hold(&device, name, &fill).expect("a weight");
+    }
+    weights.seam(&device, 1 << 16).expect("the seam");
 
     let code = std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module is built");
     let words = driver_vulkan::spirv::words(&code).expect("whole words");
@@ -1634,7 +1684,7 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
         },
         driver_vulkan::dispatch::Sources {
             arena,
-            resolver: &store,
+            resolver: &weights,
             min_offset: device.min_storage_offset(),
         },
         driver_vulkan::dispatch::Geometry::default(),
@@ -1660,9 +1710,22 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
         std::ptr::eq(x.buffer(), &arena_buffer) && std::ptr::eq(out.buffer(), &arena_buffer),
         "the norm's input and output are the plan's, so both are ranges of the arena"
     );
+    // By NAME. `std::ptr::eq(w.buffer(), <the one buffer>)` was the old form
+    // and it only said "the weight came from the store"; with one buffer in
+    // the store that is true of every name in the plan. This says the binder
+    // resolved the name the launch states, and the decoy beside it in the
+    // store means "some name in the store" is not enough to pass.
     assert!(
-        std::ptr::eq(w.buffer(), &weights),
-        "the norm's weight is the resolver's, not a range of the arena"
+        std::ptr::eq(
+            w.buffer(),
+            weights.at(&wanted[0]).expect("the launch's own weight")
+        ),
+        "the norm's weight is not the buffer held under {}",
+        wanted[0]
+    );
+    assert!(
+        !std::ptr::eq(w.buffer(), weights.at(decoy).expect("the decoy")),
+        "the norm resolved a name it does not state"
     );
     let widthed: Vec<&model_compiler::lower::Arg> = low.args
         [launch.args.start as usize..launch.args.end as usize]
@@ -1734,9 +1797,10 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     );
 
     cache.clear(&device);
-    for b in [arena_buffer, weights, params] {
+    for b in [arena_buffer, params] {
         device.free(b);
     }
+    weights.close(&device);
 }
 
 /// A chain of dispatches recorded once says what the same chain said one at a
@@ -1873,17 +1937,91 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
 /// the weights are a stand-in, so the arithmetic is meaningless and only the
 /// plumbing is under test. `a_norm_a_real_plan_states_computes_what_a_host_
 /// reference_computes` is the one that reads a result.
+///
+/// The weights are one buffer for all 704 names the plan states, so this
+/// cannot tell a binder that resolved `layer.3.q_proj` from one that resolved
+/// anything else. Sized rather than fixed only because `Arg::Weight` carries
+/// a name and no width, so a store here would be guessing. The norm test
+/// holds one buffer per name and checks that identity where a reference makes
+/// it mean something.
 #[test]
 fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+
+    let (device, dir) = gpu!();
+
+    // SIX texts and not one. This test was written against qwen3-0.6B because
+    // that was the text to hand, and every claim below -- that a whole plan
+    // records, that the batched run agrees with the one-at-a-time run, that a
+    // withheld weight is refused by NAME -- was being made about one model's
+    // shape. Six run here now: two dense qwen, olmo2 with its own norm
+    // placement, mistral, and the two mixtures of experts, whose router and
+    // gather rows nothing else on this card reaches.
+    //
+    // They are affordable: the largest arena among them is four mebibytes,
+    // measured, because a lowering sizes activations and not weights.
+    let mut fired = 0;
+    for (name, facts, metal) in [
+        (
+            "qwen3_0_6b",
+            LlamaLikeFacts::qwen3_0_6b(),
+            LlamaLikeMetalFacts::synthetic(),
+        ),
+        (
+            "qwen2_5_1_5b",
+            LlamaLikeFacts::qwen2_5_1_5b(),
+            LlamaLikeMetalFacts::synthetic(),
+        ),
+        (
+            "olmo2_1b",
+            LlamaLikeFacts::olmo2_1b(),
+            LlamaLikeMetalFacts::synthetic(),
+        ),
+        (
+            "mistral_7b_v03",
+            LlamaLikeFacts::mistral_7b_v03(),
+            LlamaLikeMetalFacts::synthetic(),
+        ),
+        (
+            "gpt_oss_20b",
+            LlamaLikeFacts::gpt_oss_20b(),
+            LlamaLikeMetalFacts::gpt_oss_20b(),
+        ),
+        (
+            "qwen3_30b_a3b",
+            LlamaLikeFacts::qwen3_30b_a3b(),
+            LlamaLikeMetalFacts::synthetic(),
+        ),
+    ] {
+        fired += whole_plan(&device, dir, name, &facts, &metal);
+    }
+    // Pinned, because a loop is not evidence that a loop ran: every text here
+    // could stop lowering and each `whole_plan` would still be a pass over
+    // whatever remained. This is the sum of the six decodes' launches, every
+    // one of them recorded and submitted on this card, and it moves when a
+    // text does.
+    assert_eq!(
+        fired, 3136,
+        "the six texts fired a different number of rectangles"
+    );
+}
+
+/// One text's whole decode, fired twice and compared against itself.
+///
+/// Answers how many rectangles it fired, so the caller can pin a total no
+/// individual text's pass would notice going missing.
+fn whole_plan(
+    device: &Device,
+    dir: &std::path::Path,
+    name: &str,
+    facts: &model::shared::llama_like::forward::facts::LlamaLikeFacts,
+    metal: &model::shared::llama_like::forward::facts::LlamaLikeMetalFacts,
+) -> usize {
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, Row, lower};
     use model_compiler::trace::FireClass;
 
-    let (device, dir) = gpu!();
-
-    let facts = LlamaLikeFacts::qwen3_0_6b();
-    let plan = llama_like_metal(&facts, &LlamaLikeMetalFacts::synthetic(), FireClass::Decode);
+    let plan = llama_like_metal(facts, metal, FireClass::Decode);
     let low = lower(
         &plan,
         &[Row {
@@ -1896,9 +2034,16 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
     )
     .expect("the text lowers");
 
-    let arena_buffer = device
-        .buffer(&vec![0u8; low.arena_bytes])
-        .expect("the arena allocates");
+    // Not zeros. Every dispatch in this plan reads the arena, and an arena of
+    // zeros makes a plan that ordered itself wrongly agree with one that did
+    // not: zero times anything is still zero, whichever order it happens in.
+    // Clamped exponents so nothing is an infinity or a NaN, because one NaN
+    // reaches every later rectangle and makes the whole comparison vacuous.
+    let mut fill: Vec<u8> = (0..low.arena_bytes).map(|i| (i * 31 % 251) as u8).collect();
+    for hi in fill.iter_mut().skip(1).step_by(2) {
+        *hi = (*hi & 0x83) | 0x3c;
+    }
+    let arena_buffer = device.buffer(&fill).expect("the arena allocates");
 
     // A real pool rather than one buffer standing in for everything. The
     // cache is per-layer, so a plan that asked layer 27 for layer 3's keys
@@ -1914,25 +2059,84 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
         pages: 4,
         bytes: 2,
     };
-    let mut store = driver_vulkan::resources::Pool::open(&device, shape).expect("the pool opens");
-    store.stand_in(&device, 1 << 22).expect("a stand-in");
-    for which in [
-        driver_vulkan::binding::FireTable::TokenIds,
-        driver_vulkan::binding::FireTable::Positions,
-        driver_vulkan::binding::FireTable::RequestOfToken,
-        driver_vulkan::binding::FireTable::KvPageIndices,
-        driver_vulkan::binding::FireTable::KvPageIndptr,
-        driver_vulkan::binding::FireTable::AttentionMask,
-        driver_vulkan::binding::FireTable::AttentionMaskEnabled,
-        driver_vulkan::binding::FireTable::KvWritePage,
-        driver_vulkan::binding::FireTable::KvWriteOffset,
-        driver_vulkan::binding::FireTable::RopeFrequencies,
-        driver_vulkan::binding::FireTable::SamplingIndices,
-    ] {
-        store
-            .state(&device, which, &vec![0u32; 4096])
-            .expect("a table");
+    let mut store = driver_vulkan::resources::Pool::open(device, shape).expect("the pool opens");
+    store.stand_in(device, 1 << 22).expect("a stand-in");
+    // One buffer per NAME, and the plan states 704 of them. Until `Model`
+    // existed no resolver in this crate could answer this fire at all: `Pool`
+    // answers the cache and the tables and hands every weight the same
+    // stand-in, and `Weights` answers names and knows nothing about a cache.
+    // This test fired against the stand-in and said so, which meant the whole
+    // plan proved its plumbing against a resolver deliberately wrong about
+    // half of what a plan states.
+    //
+    // The sizes are a GUESS, and that is the recorded blocker rather than an
+    // oversight: `Arg::Weight` carries a name and no width, so nothing in the
+    // plan says how big a tensor is. Four mebibytes covers every projection in
+    // this model; it does not cover the embedding table, which is 151936 rows
+    // of 1024 -- 311 MiB -- and the only reason that is safe here is that
+    // `TokenIds` is all zeros, so the gather reads row zero. This is why a
+    // whole plan exercises plumbing rather than computing anything, and it
+    // stays that way until a checkpoint loader supplies real sizes.
+    let mut weights = driver_vulkan::resources::Weights::new();
+    let names: std::collections::BTreeSet<&str> = low
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            model_compiler::lower::Arg::Weight(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    // 200 and not 500: the floor was set to one text's 704 and olmo2's
+    // decode states fewer, which is a difference in DEPTH and not a sign
+    // that a plan failed to lower. What the floor is for is a plan that
+    // collapsed to a handful of names.
+    assert!(
+        names.len() > 200,
+        "{name}: only {} weight names, so this is not a whole model",
+        names.len()
+    );
+    for n in &names {
+        weights
+            .hold(device, n, &vec![0u8; 1 << 22])
+            .expect("a weight");
     }
+    weights.seam(device, 1 << 22).expect("the seam");
+    // The fire's tables from `Frame::of` rather than four thousand zeros.
+    // The lengths are the fire's own and the page is 3, so the plan runs
+    // against a cache arranged the way a server would arrange one rather than
+    // against a table of zeros that makes every index correct.
+    //
+    // It is worth saying what this does NOT buy. A table one entry short was
+    // tried here and the validation layer said nothing, GPU-AV included: an
+    // overrun inside a bound storage buffer is not a thing Vulkan reports.
+    // That is the measured reason `Frame::of` refuses `PastItsPages` itself.
+    // There is no later stage that would have.
+    let frame = driver_vulkan::resources::Frame::of(
+        shape,
+        &[driver_vulkan::resources::Request {
+            positions: vec![5],
+            pages: vec![3, 1],
+            samples: Vec::new(),
+        }],
+    )
+    .expect("the fire stages");
+    store.stage(device, &frame).expect("the fire's tables");
+    // The one a `Frame` does not derive, because it is not a function of the
+    // paging: what the rows say. One entry, for the one row this decode has.
+    store
+        .state(device, driver_vulkan::binding::FireTable::TokenIds, &[0u32])
+        .expect("a table");
+    // A real ladder rather than the table of zeros this staged before. It
+    // changes nothing HERE and is not left in as a decoration: the only two
+    // rows in the table that read `RopeFrequencies` are `neox_freqs_mb` and
+    // `neox_freqs_decode`, and none of the three texts this crate walks
+    // launches either, because only a rescaling deployment needs them. Zeros
+    // were still wrong to stage -- an angle of zero is the identity, so a plan
+    // that started reading this table would keep passing -- and they were the
+    // wrong LENGTH as well, `head_dim` where a ladder is `head_dim / 2`.
+    store
+        .ladder(device, facts.head_dim, 1_000_000.0, None)
+        .expect("the ladder");
     let arena = driver_vulkan::binding::Arena {
         buffer: &arena_buffer,
         bytes: low.arena_bytes as u64,
@@ -1946,115 +2150,191 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
         experts_per_token: facts.experts_per_token,
     };
 
-    // Planned first, wholly, before anything is recorded. The parameter
-    // blocks have to outlive the recording and each one is a buffer, so the
-    // two passes are not a tidiness: a block freed while the command buffer
-    // still names it is a use-after-free the layer would catch and a caller
-    // would not.
-    let mut planned = Vec::new();
-    let mut blocks = Vec::new();
-    let mut modules: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
-    for launch in &low.launches {
-        let symbol = low.kernels[launch.kernel as usize].as_str();
-        let code = match modules.get(symbol) {
-            Some(c) => c.clone(),
-            None => {
-                let c = std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module built");
-                modules.insert(symbol.to_owned(), c.clone());
-                c
-            }
-        };
-        let words = driver_vulkan::spirv::words(&code).expect("whole words");
-        let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
-        let d = driver_vulkan::dispatch::plan_one(
-            &low,
-            launch,
-            kernels_vulkan::KERNELS,
-            driver_vulkan::dispatch::Built {
-                module: driver_vulkan::geometry::Module::named(
-                    symbol,
-                    [declared.local[0], declared.local[1], declared.local[2]],
-                ),
-                declared: &declared,
-            },
-            driver_vulkan::dispatch::Sources {
-                arena,
-                resolver: &store,
-                min_offset: device.min_storage_offset(),
-            },
-            geometry,
-        )
-        .unwrap_or_else(|e| panic!("{symbol}: {e}"));
-        if let driver_vulkan::binding::Params::Block { bytes, .. } = &d.params {
-            blocks.push(Some(device.buffer(bytes).expect("the block allocates")));
-        } else {
-            blocks.push(None);
-        }
-        planned.push((symbol.to_owned(), d));
-    }
-
-    let mut cache = Pipelines::new();
-    let mut buffers = Vec::with_capacity(planned.len());
-    for ((symbol, d), block) in planned.iter().zip(&blocks) {
-        let mut b = d.buffers.clone();
-        if let Some(buf) = block {
-            b.insert(d.block_at.expect("a block slot"), Bound::whole(buf));
-        }
-        cache
-            .get(
-                &device,
-                symbol,
-                &modules[symbol],
-                match &d.params {
-                    driver_vulkan::binding::Params::Push(p) => p.len() as u32,
-                    _ => 0,
-                },
-                b.len() as u32,
-                Capability::Baseline,
-            )
-            .expect("the pipeline builds");
-        buffers.push(b);
-    }
-    let run: Vec<driver_vulkan::device::Recorded<'_, '_>> = planned
+    // Through `serve::fire`, which is the call. This test used to assemble
+    // the three passes itself -- plan every rectangle, allocate every scalar
+    // block, build every pipeline, then record -- and that was the wrong place
+    // for it: a test that assembles a fire is testing its own assembly, and
+    // the ordering between those passes is not a matter of taste. A block
+    // freed while the command buffer still names it is a use-after-free; a
+    // pipeline reference taken before the next pipeline is built does not
+    // compile. `src/serve.rs` is that shape, with the reasons written down.
+    let modules: std::collections::BTreeMap<String, Vec<u8>> = low
+        .kernels
         .iter()
-        .zip(&buffers)
-        .map(|((symbol, d), b)| driver_vulkan::device::Recorded {
-            pipeline: cache
-                .peek(symbol, Capability::Baseline)
-                .expect("the pipeline was built above"),
-            buffers: b,
-            push: match &d.params {
-                driver_vulkan::binding::Params::Push(p) => p,
-                _ => &[],
-            },
-            groups: d.groups,
+        .map(|symbol| {
+            let code =
+                std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module is built");
+            (symbol.clone(), code)
         })
         .collect();
-
-    // Stated so that a plan that stopped lowering, or a loop that stopped
-    // pushing, cannot pass by recording nothing.
-    assert_eq!(
-        run.len(),
-        low.launches.len(),
-        "every launch the plan states is recorded"
-    );
+    // Stated so that a plan that stopped lowering cannot pass by firing
+    // nothing.
     assert!(
-        run.len() > 300,
-        "only {} launches, so this is not a plan",
-        run.len()
+        low.launches.len() > 250,
+        "{name}: only {} launches, so this is not a plan",
+        low.launches.len()
+    );
+    // Nine, measured, for this decode -- the three texts together reach
+    // nineteen. Five is the floor rather than nine because the point is that
+    // several DIFFERENT modules run, so the pipeline cache is exercised and a
+    // fire is not one kernel repeated; pinning the exact number would make
+    // this test fail when the model's shape changes, which is not what it is
+    // about.
+    assert!(
+        modules.len() >= 5,
+        "{name}: only {} distinct modules, so this is not a plan",
+        modules.len()
     );
 
-    match device.run_all(&run) {
-        Ok(()) => {}
-        Err((at, why)) => panic!("dispatch {at} ({}): {why}", planned[at].0),
-    }
+    let model = driver_vulkan::resources::Model {
+        weights: &weights,
+        pool: &store,
+    };
+    let mut cache = Pipelines::new();
+    let what = driver_vulkan::serve::Fire {
+        arena,
+        resolver: &model,
+        geometry,
+        tier: Capability::Baseline,
+        one_at_a_time: false,
+    };
+    let fired = driver_vulkan::serve::fire(device, &mut cache, &modules, &low, what)
+        .unwrap_or_else(|e| panic!("{e}"));
+    // Every launch the plan states, in one command buffer. Without this a
+    // `fire` that dropped the last rectangle passes, because the comparison
+    // below is against the same `fire` and both runs lose the same thing.
+    assert_eq!(
+        fired,
+        driver_vulkan::serve::Fired {
+            dispatches: low.launches.len(),
+            submissions: 1
+        }
+    );
+    let recorded = device.read(&arena_buffer).expect("the arena reads back");
 
-    cache.clear(&device);
-    for b in blocks.into_iter().flatten() {
-        device.free(b);
+    // And now the same plan the slow way. `Device::run` submits once per
+    // dispatch and waits on a fence, which is the strongest ordering Vulkan
+    // has, so this is what the plan MEANS. `run_all` puts them all in one
+    // command buffer with a memory barrier between each pair, which is what
+    // the plan COSTS.
+    //
+    // The eight-norm chain already showed that dropping those barriers gives
+    // wrong answers on this card while every call returns success and the
+    // layer stays silent. This says the same thing over a real plan: five
+    // hundred rectangles, twenty distinct kernels, an arena every one of them
+    // reads and writes, and a dependency graph nobody wrote down. Removing
+    // the barrier fails on every run, at a different byte each time.
+    //
+    // Worth recording what does NOT fail: setting both access masks to empty
+    // and keeping the barrier passed three runs. A `COMPUTE -> COMPUTE`
+    // pipeline barrier is an EXECUTION dependency whatever its masks say, and
+    // on this card that is the part that matters -- its L2 is coherent, so
+    // visibility follows ordering. The masks stay because the specification
+    // requires them and a card whose caches are not coherent would need them,
+    // but a control that only weakens them is not a control here.
+    device
+        .write(&arena_buffer, &fill)
+        .expect("the arena resets");
+    let slow = driver_vulkan::serve::fire(
+        device,
+        &mut cache,
+        &modules,
+        &low,
+        driver_vulkan::serve::Fire {
+            one_at_a_time: true,
+            ..what
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    // One submission per dispatch, which is what makes this the reference.
+    // Without it a `fire` that ignored the flag would record the same command
+    // buffer twice and the comparison below would be against itself.
+    assert_eq!(
+        slow,
+        driver_vulkan::serve::Fired {
+            dispatches: low.launches.len(),
+            submissions: low.launches.len()
+        }
+    );
+    let one_at_a_time = device.read(&arena_buffer).expect("the arena reads back");
+
+    assert_eq!(
+        recorded.len(),
+        one_at_a_time.len(),
+        "{name}: the same arena both times"
+    );
+    let differ = recorded
+        .iter()
+        .zip(&one_at_a_time)
+        .position(|(a, b)| a != b);
+    assert!(
+        differ.is_none(),
+        "{name}: the recorded plan and the submitted plan disagree at byte {:?} of the arena",
+        differ
+    );
+    // The plan moved the arena. Two runs that both did nothing agree, and a
+    // comparison that would accept that measures the read-back and not the
+    // plan.
+    let moved = recorded.iter().zip(&fill).filter(|(a, b)| a != b).count();
+    assert!(
+        moved > low.arena_bytes / 100,
+        "{name}: only {moved} of {} arena bytes changed, so the plan barely ran",
+        low.arena_bytes
+    );
+
+    // Every name is resolved by NAME, not by "some buffer in the store". Drop
+    // one of the 704 and the fire must refuse rather than bind a neighbour --
+    // and the name dropped is one this plan actually states, so a refusal is
+    // about resolution and not about a typo.
+    //
+    // This is also the control on `Model` itself, and it was measured rather
+    // than reasoned: fired against the `Pool` alone -- which is what this test
+    // did before -- a plan with `embed` withheld returns `Ok(Fired {
+    // dispatches: 452, submissions: 1 })`. All 452 rectangles run, because the
+    // pool answers every one of the 704 names with the same stand-in.
+    let missing = *names.iter().next().expect("the plan states weights");
+    let mut holed = driver_vulkan::resources::Weights::new();
+    for n in names.iter().filter(|n| **n != missing) {
+        holed
+            .hold(device, n, &vec![0u8; 1 << 22])
+            .expect("a weight");
     }
+    holed.seam(device, 1 << 22).expect("the seam");
+    let refused = driver_vulkan::serve::fire(
+        device,
+        &mut cache,
+        &modules,
+        &low,
+        driver_vulkan::serve::Fire {
+            resolver: &driver_vulkan::resources::Model {
+                weights: &holed,
+                pool: &store,
+            },
+            ..what
+        },
+    );
+    match refused {
+        // By the NAME in the message and not by the variant: every one of the
+        // 704 would produce an `Unplannable`, so matching the variant alone
+        // would pass on a fire that refused for a different name.
+        Err(driver_vulkan::serve::Unfired::Unplannable { why, .. }) => {
+            let said = why.to_string();
+            let want =
+                driver_vulkan::binding::Unbindable::UnknownWeight(missing.to_owned()).to_string();
+            assert!(
+                said.ends_with(&want),
+                "{name}: the fire refused with `{said}`, not for the withheld `{missing}`"
+            );
+        }
+        other => panic!("{name}: a plan missing `{missing}` fired anyway: {other:?}"),
+    }
+    holed.close(device);
+
+    cache.clear(device);
     device.free(arena_buffer);
-    store.close(&device);
+    weights.close(device);
+    store.close(device);
+    low.launches.len()
 }
 
 /// A real plan's KV append puts the row where the page table says.
@@ -2868,4 +3148,1795 @@ fn the_contiguous_decode_reads_the_pool_the_paged_append_wrote() {
     device.free(qb);
     device.free(ob);
     pool.close(&device);
+}
+
+/// Two requests in one fire do not read each other's history.
+///
+/// `Frame::of` refuses a row whose position reaches past its own request's
+/// pages, and the reason given is that the page lists sit end to end, so one
+/// entry over is another request's page: resident, aligned, and silently
+/// wrong. That is an argument. This is the measurement.
+///
+/// Two requests share a pool and a fire. Their pages interleave -- request 0
+/// owns 5 and 2, request 1 owns 6 and 1 -- so neither one's pages are
+/// contiguous and neither one's are ascending. Every table comes from
+/// `Frame::of`; nothing here fills one by hand, which is what every other GPU
+/// test in this file does and what this exists to stop.
+///
+/// Each request's rows are distinct from the other's, so an attention that
+/// walked the wrong span would answer with the other request's values. The
+/// reference is each request's own rows and nothing else.
+#[test]
+fn two_requests_in_one_fire_do_not_read_each_others_history() {
+    use driver_vulkan::binding::{FireTable, Resolve};
+    use driver_vulkan::resources::{Frame, Pool, Request, Shape};
+
+    let (device, dir) = gpu!();
+    let head_dim = 128usize;
+    let shape = Shape {
+        layers: 1,
+        kv_heads: 1,
+        head_dim: head_dim as u32,
+        page_size: 4,
+        pages: 8,
+        bytes: 2,
+    };
+    // Interleaved, descending within each request, and neither owns page 0.
+    let requests = [
+        Request {
+            positions: (0..6).collect(),
+            pages: vec![5, 2],
+            samples: Vec::new(),
+        },
+        Request {
+            positions: (0..3).collect(),
+            pages: vec![6, 1],
+            samples: Vec::new(),
+        },
+    ];
+    let frame = Frame::of(shape, &requests).expect("a stageable fire");
+    let rows = frame.rows();
+
+    // A row's contents depend on which request it belongs to, so reading the
+    // wrong span gives the wrong answer rather than a similar one.
+    let row = |r: usize, p: u32, salt: usize| -> Vec<f32> {
+        (0..head_dim)
+            .map(|d| (((r * 31 + p as usize * 7 + d * 13 + salt * 29) % 61) as f32 - 30.0) / 24.0)
+            .collect()
+    };
+    let ks: Vec<Vec<f32>> = (0..rows)
+        .map(|t| row(frame.request_of_token[t] as usize, frame.positions[t], 0))
+        .collect();
+    let vs: Vec<Vec<f32>> = (0..rows)
+        .map(|t| row(frame.request_of_token[t] as usize, frame.positions[t], 1))
+        .collect();
+    let queries: Vec<f32> = (0..requests.len() * head_dim)
+        .map(|i| ((i * 19 % 47) as f32 - 23.0) / 20.0)
+        .collect();
+
+    let mut pool = Pool::open(&device, shape).expect("the pool");
+    pool.stage(&device, &frame).expect("the fire's tables");
+    let mut cache = Pipelines::new();
+
+    // The append, one row at a time, each with the page and offset the frame
+    // worked out for it.
+    let scatter = module(dir, "kv_append_paged_bfloat16");
+    let mut ppush = Vec::new();
+    ppush.extend_from_slice(&(head_dim as i32).to_le_bytes());
+    ppush.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
+    ppush.extend_from_slice(&(shape.kv_heads as i32).to_le_bytes());
+    for t in 0..rows {
+        pool.state(&device, FireTable::KvWritePage, &[frame.kv_write_page[t]])
+            .expect("the write page");
+        pool.state(
+            &device,
+            FireTable::KvWriteOffset,
+            &[frame.kv_write_offset[t]],
+        )
+        .expect("the write offset");
+        let kn = device.buffer(&bf16_bytes(&ks[t])).expect("k_new");
+        let vn = device.buffer(&bf16_bytes(&vs[t])).expect("v_new");
+        let bound = [
+            Bound::whole(&kn),
+            Bound::whole(&vn),
+            Bound::whole(pool.kv(0, false).expect("keys")),
+            Bound::whole(pool.kv(0, true).expect("values")),
+            Bound::whole(pool.table(FireTable::KvWritePage).expect("page")),
+            Bound::whole(pool.table(FireTable::KvWriteOffset).expect("offset")),
+        ];
+        let pipeline = cache
+            .get(
+                &device,
+                "kv_append_paged_bfloat16",
+                &scatter,
+                ppush.len() as u32,
+                bound.len() as u32,
+                Capability::Baseline,
+            )
+            .expect("the append builds");
+        device
+            .run(pipeline, &bound, &ppush, [1, shape.kv_heads, 1])
+            .expect("the append dispatches");
+        device.free(kn);
+        device.free(vn);
+    }
+    // Put the fire's own write tables back, since the loop above replaced
+    // them with one row each.
+    pool.stage(&device, &frame)
+        .expect("the fire's tables again");
+
+    // One decode row per request, each asking for its own last position. The
+    // rows are the requests, so `RequestOfToken` is `[0, 1]` -- not the
+    // frame's, which describes the rows that were appended.
+    pool.state(
+        &device,
+        FireTable::Positions,
+        &requests
+            .iter()
+            .map(|r| r.positions.len() as u32 - 1)
+            .collect::<Vec<_>>(),
+    )
+    .expect("the query positions");
+    pool.state(&device, FireTable::RequestOfToken, &[0, 1])
+        .expect("one row per request");
+
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut spush = Vec::new();
+    spush.extend_from_slice(&1i32.to_le_bytes()); // gqa_factor
+    spush.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
+    spush.extend_from_slice(&(shape.kv_heads as i32).to_le_bytes());
+    spush.extend_from_slice(&scale.to_le_bytes());
+    spush.extend_from_slice(&0u32.to_le_bytes()); // mask stride
+    spush.extend_from_slice(&0i32.to_le_bytes()); // window
+
+    let qb = device.buffer(&bf16_bytes(&queries)).expect("queries");
+    let ob = device
+        .buffer(&vec![0u8; requests.len() * head_dim * 2])
+        .expect("out");
+    let symbol = "sdpa_paged_decode_bfloat16_d_128";
+    let code = module(dir, symbol);
+    {
+        let bound = [
+            Bound::whole(&qb),
+            Bound::whole(pool.kv(0, false).expect("keys")),
+            Bound::whole(pool.kv(0, true).expect("values")),
+            Bound::whole(&ob),
+            Bound::whole(pool.table(FireTable::Positions).expect("pos")),
+            Bound::whole(pool.table(FireTable::RequestOfToken).expect("req")),
+            Bound::whole(pool.table(FireTable::KvPageIndices).expect("ix")),
+            Bound::whole(pool.table(FireTable::KvPageIndptr).expect("ptr")),
+            Bound::whole(pool.table(FireTable::AttentionMask).expect("mask")),
+            Bound::whole(
+                pool.table(FireTable::AttentionMaskEnabled)
+                    .expect("enabled"),
+            ),
+        ];
+        let pipeline = cache
+            .get(
+                &device,
+                symbol,
+                &code,
+                spush.len() as u32,
+                bound.len() as u32,
+                Capability::Baseline,
+            )
+            .expect("the attention builds");
+        // One workgroup per query head, one row per request.
+        device
+            .run(pipeline, &bound, &spush, [1, requests.len() as u32, 1])
+            .expect("the attention dispatches");
+    }
+
+    let qq = bf16_read(&bf16_bytes(&queries));
+    let got = bf16_read(&device.read(&ob).expect("read back"));
+    let mut spread = 0.0f32;
+    for (r, request) in requests.iter().enumerate() {
+        // This request's rows, and only this request's.
+        let mine: Vec<usize> = (0..rows)
+            .filter(|&t| frame.request_of_token[t] as usize == r)
+            .collect();
+        assert_eq!(mine.len(), request.positions.len(), "the fire's rows");
+        let kq: Vec<Vec<f32>> = mine
+            .iter()
+            .map(|&t| bf16_read(&bf16_bytes(&ks[t])))
+            .collect();
+        let vq: Vec<Vec<f32>> = mine
+            .iter()
+            .map(|&t| bf16_read(&bf16_bytes(&vs[t])))
+            .collect();
+        let scores: Vec<f32> = kq
+            .iter()
+            .map(|k| {
+                (0..head_dim)
+                    .map(|d| scale * qq[r * head_dim + d] * k[d])
+                    .sum::<f32>()
+            })
+            .collect();
+        let top = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scores.iter().map(|s| (s - top).exp()).collect();
+        let total: f32 = exps.iter().sum();
+        spread = spread.max(exps.iter().copied().fold(0.0f32, f32::max) / total);
+        for d in 0..head_dim {
+            let want = (0..mine.len()).map(|i| exps[i] * vq[i][d]).sum::<f32>() / total;
+            let saw = got[r * head_dim + d];
+            assert!(
+                (saw - want).abs() <= 1e-2 * want.abs().max(1.0),
+                "request {r}, channel {d}: the attention says {saw}, its own {} rows say {want}",
+                mine.len()
+            );
+        }
+    }
+    assert!(
+        spread < 0.9,
+        "one position carries {spread} of some request's softmax, so the walk proves little"
+    );
+    // The two requests were asked different questions of different histories,
+    // so an attention that answered one of them twice is not a pass.
+    let first = &got[..head_dim];
+    let second = &got[head_dim..];
+    assert!(
+        first.iter().zip(second).any(|(a, b)| (a - b).abs() > 1e-3),
+        "both requests were answered identically"
+    );
+
+    cache.clear(&device);
+    device.free(qb);
+    device.free(ob);
+    pool.close(&device);
+}
+
+/// The ladder this driver builds is the one the shader raises.
+///
+/// `rope/neox.comp` compiles to two shaders from one file. `neox_mb` raises
+/// its own ladder -- `exp2(-(i / pair_half) * base)` -- and `neox_freqs_mb`
+/// reads one from a buffer. They exist as a pair because a deployment that
+/// rescales its ladder (llama-3, YaRN) has no base to state, and the second
+/// is the only form that can carry it.
+///
+/// So the second is handed `rope::frequencies` and both turn the same tensor.
+/// A real plan states `base = log2(rope_theta)` -- measured: `2^19.931568` is
+/// qwen3's 1_000_000 and `2^17.194603` is gpt-oss's 150_000 -- so the two are
+/// the same ladder said two ways, and nothing but this says so.
+///
+/// `neox_freqs_mb` had never reached a card. None of the three texts this
+/// crate walks launches it, because none of them rescales.
+///
+/// The position is 7 and not 0, because rope at position 0 is the identity
+/// and two identities agree whatever ladder either of them holds. That exact
+/// failure is recorded in `kernels-vulkan`'s own row comment for
+/// `neox_freqs_mb`, which was bare until a test at position zero stopped
+/// hiding it.
+#[test]
+fn the_ladder_this_driver_builds_is_the_one_the_shader_raises() {
+    use driver_vulkan::binding::FireTable;
+    use driver_vulkan::resources::{Pool, Shape};
+
+    let (device, dir) = gpu!();
+    let head_dim = 128usize;
+    let heads = 2usize;
+    let rows = 3usize;
+    let theta = 1_000_000.0f32;
+    let pair_half = head_dim / 2;
+
+    // Three rows at three different positions, so a shader that read position
+    // zero for every row -- the defect the `neox_freqs_mb` row records --
+    // disagrees on two of them.
+    let positions = [7u32, 1, 42];
+    let n = rows * heads * head_dim;
+    let x: Vec<f32> = (0..n)
+        .map(|i| (((i * 13 + 5) % 61) as f32 - 30.0) / 24.0)
+        .collect();
+
+    let mut pool = Pool::open(
+        &device,
+        Shape {
+            layers: 1,
+            kv_heads: 1,
+            head_dim: head_dim as u32,
+            page_size: 4,
+            pages: 2,
+            bytes: 2,
+        },
+    )
+    .expect("the pool");
+    pool.state(&device, FireTable::Positions, &positions)
+        .expect("the positions");
+    // Through `Pool::ladder`, which is the call a server makes, rather than
+    // through `state` with `rope::words` spelled out here. The two rope
+    // shaders are the only rows in the table that read this, so this test is
+    // the only place that seam can be checked at all -- and it was written the
+    // long way first, which left the call a server actually makes untested.
+    pool.ladder(&device, head_dim as u32, theta, None)
+        .expect("the ladder");
+
+    let mut cache = Pipelines::new();
+    let turn = |cache: &mut Pipelines, symbol: &str, push: &[u8], freqs: bool| -> Vec<f32> {
+        let code = module(dir, symbol);
+        let xb = device.buffer(&bf16_bytes(&x)).expect("the tensor");
+        {
+            use driver_vulkan::binding::Resolve;
+            let mut bound = vec![
+                Bound::whole(&xb),
+                Bound::whole(pool.table(FireTable::Positions).expect("pos")),
+            ];
+            if freqs {
+                bound.push(Bound::whole(
+                    pool.table(FireTable::RopeFrequencies).expect("freqs"),
+                ));
+            }
+            let pipeline = cache
+                .get(
+                    &device,
+                    symbol,
+                    &code,
+                    push.len() as u32,
+                    bound.len() as u32,
+                    Capability::Baseline,
+                )
+                .expect("the rotation builds");
+            // `Rule::Rope`: x is the pair index, y the head, z the row. The
+            // shader reads all three off the grid, so this IS the launch rule.
+            device
+                .run(
+                    pipeline,
+                    &bound,
+                    push,
+                    [pair_half as u32, heads as u32, rows as u32],
+                )
+                .expect("the rotation dispatches");
+        }
+        let out = bf16_read(&device.read(&xb).expect("read back"));
+        device.free(xb);
+        out
+    };
+
+    // `float scale; float base; int head_dim;`
+    let mut raised = Vec::new();
+    raised.extend_from_slice(&1.0f32.to_le_bytes());
+    raised.extend_from_slice(&theta.log2().to_le_bytes());
+    raised.extend_from_slice(&(head_dim as i32).to_le_bytes());
+    // `float scale; int head_dim; float mscale;` -- a different block, and
+    // `head_dim` is in the middle rather than at the end.
+    let mut read = Vec::new();
+    read.extend_from_slice(&1.0f32.to_le_bytes());
+    read.extend_from_slice(&(head_dim as i32).to_le_bytes());
+    read.extend_from_slice(&1.0f32.to_le_bytes());
+
+    let from_base = turn(&mut cache, "neox_mb_bfloat16", &raised, false);
+    let from_ladder = turn(&mut cache, "neox_freqs_mb_bfloat16", &read, true);
+
+    assert_eq!(from_base.len(), from_ladder.len(), "the same tensor");
+    for (i, (a, b)) in from_base.iter().zip(&from_ladder).enumerate() {
+        assert!(
+            (a - b).abs() <= 1e-2 * a.abs().max(1e-2),
+            "element {i}: the base raises {a} and the ladder reads {b}"
+        );
+    }
+    // Both turned it. Two shaders that each did nothing agree exactly, and
+    // rope IS the identity at position zero -- which is how a bare row hid
+    // once already.
+    let moved = from_base
+        .iter()
+        .zip(&x)
+        .filter(|(a, b)| (*a - bf16_read(&bf16_bytes(&[**b]))[0]).abs() > 1e-3)
+        .count();
+    assert!(
+        moved > n / 2,
+        "only {moved} of {n} elements moved, so neither shader rotated"
+    );
+    // And each row turned by ITS OWN position. `neox_freqs_mb` was once the
+    // decode symbol over a multi-row grid, which rotates row zero and leaves
+    // the rest; a shader that read `position[0]` for every row would turn all
+    // three by the same angle.
+    //
+    // Stated as an ORDERING rather than as a count. A ladder falls steeply --
+    // the last channel is under 1e-5 -- so most of a head barely moves at any
+    // position, and "this row moved a lot" is a claim about the ladder's shape
+    // and not about the row. How MANY channels move does track the position,
+    // monotonically, and three distinct positions give three distinct counts
+    // that a shader reading one position cannot produce.
+    let moved_in = |r: usize| -> usize {
+        let span = r * heads * head_dim..(r + 1) * heads * head_dim;
+        from_ladder[span.clone()]
+            .iter()
+            .zip(&x[span])
+            .filter(|(a, b)| (*a - bf16_read(&bf16_bytes(&[**b]))[0]).abs() > 1e-3)
+            .count()
+    };
+    let counts: Vec<usize> = (0..rows).map(moved_in).collect();
+    // `positions` is [7, 1, 42], so the order by angle is row 1, row 0, row 2
+    // -- deliberately not the row order, so a shader that turned each row by
+    // its own INDEX would not produce it either.
+    assert!(
+        counts[1] < counts[0] && counts[0] < counts[2],
+        "rows at positions {positions:?} moved {counts:?} channels, which does not \
+         track the position"
+    );
+
+    cache.clear(&device);
+    pool.close(&device);
+}
+
+/// The rows the frame says are read out are the rows the gather moves.
+///
+/// The readout seam, end to end and on a card. It is the last thing a fire
+/// does and the only part of a plan whose output leaves the arena, and until
+/// now nothing in this crate had dispatched it.
+///
+/// `row_gather` is also the ONLY row in the table with an `InPacked` operand,
+/// which is a value with no slot of its own: `RequestCount` is not a push word
+/// and not a buffer but the second FIELD of the struct `Param(0)` names.
+/// Metal's driver appends it to the scalar run, because there the packed slot
+/// IS the buffer; Vulkan sends scalars to a push block and binds the struct as
+/// a real std430 buffer, so `Binding::Packed` exists to keep the count out of a
+/// push word no shader reads. Nothing had ever run it, so "the count goes in
+/// the buffer" was a claim about a code path rather than about a result.
+///
+/// The fire is deliberately mixed -- two decodes and a prefill that reads three
+/// of its four rows -- so that the gather's output rows are neither the fire's
+/// first `n` nor one per request, and the sampled rows are not contiguous.
+#[test]
+fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
+    use driver_vulkan::resources::{Frame, Request, Shape};
+    use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+    use model::shared::llama_like::forward::llama_like_metal;
+    use model_compiler::lower::{Fire, lower};
+    use model_compiler::trace::FireClass;
+
+    let (device, dir) = gpu!();
+    let symbol = "row_gather_bfloat16";
+
+    let shape = Shape {
+        layers: 1,
+        kv_heads: 2,
+        head_dim: 8,
+        page_size: 8,
+        pages: 8,
+        bytes: 2,
+    };
+    // Six rows, four readouts, and the readouts are 0, 2, 4, 5 -- so a gather
+    // that copied the first four rows, or one row per request, or every row,
+    // gives a different answer from this one.
+    let requests = [
+        Request::of(vec![0], vec![0]),
+        Request {
+            positions: vec![0, 1, 2, 3],
+            pages: vec![1],
+            samples: vec![1, 3],
+        },
+        Request::of(vec![5], vec![2]),
+    ];
+    let frame = Frame::of(shape, &requests).expect("a fire");
+    assert_eq!(
+        frame.sampling_indices,
+        vec![0, 2, 4, 5],
+        "the fire this test means to run"
+    );
+
+    let plan = llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        FireClass::Prefill,
+    );
+    // `seriation` and not a hand-built row list: the flags the lowering reads
+    // and the table the driver stages come from the same frame, which is the
+    // agreement `resources`' own unit test makes and this one depends on.
+    let low = lower(
+        &plan,
+        &frame.seriation(),
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the text lowers");
+    assert_eq!(
+        low.n_requests as usize,
+        frame.readouts(),
+        "the gather's count is the table's length"
+    );
+
+    // Per-byte and not a ramp, with the exponent clamped so no row holds an
+    // infinity: the test compares gathered rows against source rows, and two
+    // NaNs are never equal, which would fail a correct gather.
+    let mut fill: Vec<u8> = (0..low.arena_bytes).map(|i| (i * 37 % 253) as u8).collect();
+    for hi in fill.iter_mut().skip(1).step_by(2) {
+        *hi = (*hi & 0x83) | 0x3c;
+    }
+    let arena_buffer = device.buffer(&fill).expect("the arena allocates");
+    let arena = driver_vulkan::binding::Arena {
+        buffer: &arena_buffer,
+        bytes: low.arena_bytes as u64,
+    };
+
+    let mut pool = driver_vulkan::resources::Pool::open(&device, shape).expect("a pool");
+    pool.stage(&device, &frame).expect("the tables stage");
+    pool.stand_in(&device, 1 << 16).expect("a stand-in");
+
+    let launch = low
+        .launches
+        .iter()
+        .find(|l| low.kernels[l.kernel as usize] == symbol)
+        .expect("the text gathers");
+
+    let code = module(dir, symbol);
+    let words = driver_vulkan::spirv::words(&code).expect("whole words");
+    let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
+    let d = driver_vulkan::dispatch::plan_one(
+        &low,
+        launch,
+        kernels_vulkan::KERNELS,
+        driver_vulkan::dispatch::Built {
+            module: driver_vulkan::geometry::Module::named(
+                symbol,
+                [declared.local[0], declared.local[1], declared.local[2]],
+            ),
+            declared: &declared,
+        },
+        driver_vulkan::dispatch::Sources {
+            arena,
+            resolver: &pool,
+            min_offset: device.min_storage_offset(),
+        },
+        driver_vulkan::dispatch::Geometry::default(),
+    )
+    .expect("the rectangle plans");
+
+    // The scalars, from the driver's own binding rather than from this test.
+    // Both of them: the width the plan states and the count the DRIVER
+    // supplies, in one buffer, which is the whole point of `Binding::Packed`.
+    let driver_vulkan::binding::Params::Block { bytes: block, .. } = &d.params else {
+        panic!("`row_gather` reads its scalars from a buffer, not from push");
+    };
+    assert_eq!(block.len(), 8, "`RowGatherParams` is two four-byte fields");
+    let width = u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(block[4..8].try_into().unwrap()) as usize;
+    // Which FIELD each landed in, not just that both are present. Swapping
+    // them gives a gather of `width` rows of `count` elements, which reads and
+    // writes real memory and returns success.
+    assert_eq!(
+        count,
+        frame.readouts(),
+        "the count is the second field, and it is the frame's readouts"
+    );
+    assert!(
+        width > count,
+        "the width is the first field, and a model's hidden size is not four"
+    );
+    // Nothing rode a push word. The module declares no push block at all, so a
+    // count that went there would be dropped in silence.
+    assert!(
+        declared.push_offsets.is_empty(),
+        "`row_gather` declares no push constants, so a scalar sent there is lost"
+    );
+
+    let params = device.buffer(block).expect("the block allocates");
+    let mut buffers = d.buffers.clone();
+    buffers.insert(d.block_at.expect("a block slot"), Bound::whole(&params));
+
+    // Which slot got the table, checked before the dispatch. The rows operand
+    // is the third, and it is the only one that is neither the arena nor the
+    // block -- so it comes from the resolver, and the resolver's answer for
+    // `SamplingIndices` is what `Pool::stage` wrote.
+    assert!(
+        std::ptr::eq(
+            d.buffers[2].buffer(),
+            driver_vulkan::binding::Resolve::table(
+                &pool,
+                driver_vulkan::binding::FireTable::SamplingIndices
+            )
+            .expect("the pool staged the readout table")
+        ),
+        "slot 2 is not the sampling table"
+    );
+
+    let mut cache = Pipelines::new();
+    let pipeline = cache
+        .get(
+            &device,
+            symbol,
+            &code,
+            0,
+            buffers.len() as u32,
+            Capability::Baseline,
+        )
+        .expect("the pipeline builds");
+    device
+        .run(pipeline, &buffers, &[], d.groups)
+        .expect("dispatch");
+
+    let bytes = |b: Bound<'_>| {
+        let whole = device.read(b.buffer()).expect("read back");
+        whole[b.offset() as usize..(b.offset() + b.len()) as usize].to_vec()
+    };
+    let src = bf16_read(&bytes(d.buffers[0]));
+    let got = bf16_read(&bytes(d.buffers[1]));
+
+    // Row for row against the SOURCE, not against a host reimplementation of a
+    // copy: the only thing a gather can get wrong is which row, so the
+    // reference has to be the rows themselves.
+    for (i, &at) in frame.sampling_indices.iter().enumerate() {
+        let want = &src[at as usize * width..(at as usize + 1) * width];
+        let have = &got[i * width..(i + 1) * width];
+        assert_eq!(
+            have, want,
+            "output row {i} is not the fire's row {at}, which the frame says it reads"
+        );
+    }
+    // And it did not write past the readouts. The output range is sized for
+    // `Dim::Requests`, so a gather that used the row count would run off it --
+    // and `count` is the only thing stopping it.
+    assert!(
+        got.len() >= count * width,
+        "the output range holds fewer than the {count} rows the gather writes"
+    );
+
+    // The comparison is not vacuous: the sampled rows differ from each other,
+    // so "output row i is source row at" is a claim that could fail. Zeros, or
+    // a buffer of one repeated row, would satisfy any permutation.
+    for i in 1..frame.readouts() {
+        assert_ne!(
+            &got[..width],
+            &got[i * width..(i + 1) * width],
+            "readout rows 0 and {i} are identical, so their order proves nothing"
+        );
+    }
+
+    cache.clear(&device);
+    for b in [arena_buffer, params] {
+        device.free(b);
+    }
+    pool.close(&device);
+}
+
+/// A fire that cannot run says which launch, and runs when it can.
+///
+/// The two ways a caller's module store can be wrong, over a real plan. Both
+/// are refused in pass one, before anything is recorded, and both have to name
+/// the LAUNCH and not only the symbol: a decode of qwen3-0.6B states 452
+/// rectangles over 9 distinct symbols, so "`rms_single_row_bfloat16` has no
+/// module" does not say which of the fifty-six, and the interesting question
+/// about a failure at rectangle 450 is almost always what came before it.
+///
+/// The symbol withheld is the LAST distinct one the plan reaches -- launch 450
+/// of 452 -- so the refusal happens after four hundred rectangles have been
+/// planned and their scalar blocks allocated. Withholding the first would
+/// refuse at launch 0, which is the only case that cannot have taken anything.
+///
+/// # What this does NOT check, and why
+///
+/// That the blocks are freed. `serve::fire` allocates one buffer per dispatch
+/// whose scalars live in a storage block and every early return frees them,
+/// which is the kind of claim a test should carry -- and it could not be made
+/// to fail. Replacing the free on this path with `std::mem::forget` and firing
+/// fifty refusals still left the device allocating a 64 MiB buffer afterwards;
+/// the blocks are tens of bytes each and this card has twenty-four gigabytes.
+/// Finding the ceiling directly was worse: allocating small buffers in a loop
+/// until one is refused did not finish in ten minutes, because each is its own
+/// device allocation.
+///
+/// So the free is stated in the code and its ordering is enforced by the borrow
+/// checker -- moving it one line earlier does not compile -- and no test here
+/// asserts it. A control that cannot be made to fire is not a control, and the
+/// alternative was an assertion that passes whatever the code does.
+#[test]
+fn a_fire_that_cannot_run_says_which_launch() {
+    use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+    use model::shared::llama_like::forward::llama_like_metal;
+    use model_compiler::lower::{Fire as LowerFire, Row, lower};
+    use model_compiler::trace::FireClass;
+
+    let (device, dir) = gpu!();
+
+    let plan = llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        FireClass::Decode,
+    );
+    let low = lower(
+        &plan,
+        &[Row {
+            samples: true,
+            ..Row::default()
+        }],
+        LowerFire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the text lowers");
+
+    let arena_buffer = device
+        .buffer(&vec![0u8; low.arena_bytes])
+        .expect("the arena allocates");
+    let mut store = driver_vulkan::resources::Pool::open(
+        &device,
+        driver_vulkan::resources::Shape {
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+            page_size: 8,
+            pages: 4,
+            bytes: 2,
+        },
+    )
+    .expect("the pool opens");
+    store.stand_in(&device, 1 << 22).expect("a stand-in");
+    let frame = driver_vulkan::resources::Frame::of(
+        store.shape(),
+        &[driver_vulkan::resources::Request::of(vec![5], vec![3, 1])],
+    )
+    .expect("the fire stages");
+    store.stage(&device, &frame).expect("the fire's tables");
+    store
+        .state(
+            &device,
+            driver_vulkan::binding::FireTable::TokenIds,
+            &[0u32],
+        )
+        .expect("the token ids");
+    store
+        .ladder(&device, 128, 1_000_000.0, None)
+        .expect("the ladder");
+
+    let whole: std::collections::BTreeMap<String, Vec<u8>> = low
+        .kernels
+        .iter()
+        .map(|symbol| {
+            let code =
+                std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module is built");
+            (symbol.clone(), code)
+        })
+        .collect();
+
+    let mut seen: Vec<&str> = Vec::new();
+    for launch in &low.launches {
+        let s = low.kernels[launch.kernel as usize].as_str();
+        if !seen.contains(&s) {
+            seen.push(s);
+        }
+    }
+    let late = *seen.last().expect("the plan names kernels");
+    let deep = low
+        .launches
+        .iter()
+        .position(|l| low.kernels[l.kernel as usize] == late)
+        .expect("the plan launches it");
+    assert!(
+        deep > 100,
+        "the withheld symbol first appears at launch {deep}, too early to say anything about \
+         what a refusal leaves behind"
+    );
+
+    let mut absent = whole.clone();
+    absent.remove(late);
+    let mut broken = whole.clone();
+    // Truncated to a length that is not a whole number of words, so
+    // `spirv::words` refuses. Cut on a word boundary it would still be a
+    // header, and would be refused later and for a different reason.
+    broken.insert(late.to_owned(), whole[late][..37].to_vec());
+
+    let what = driver_vulkan::serve::Fire {
+        arena: driver_vulkan::binding::Arena {
+            buffer: &arena_buffer,
+            bytes: low.arena_bytes as u64,
+        },
+        resolver: &store,
+        geometry: driver_vulkan::dispatch::Geometry {
+            q_heads: 16,
+            kv_heads: 8,
+            head_dim: 128,
+            rotary_dims: 128,
+            n_experts: 0,
+            experts_per_token: 0,
+        },
+        tier: Capability::Baseline,
+        one_at_a_time: false,
+    };
+
+    let mut cache = Pipelines::new();
+    match driver_vulkan::serve::fire(&device, &mut cache, &absent, &low, what) {
+        Err(driver_vulkan::serve::Unfired::NoModule { at, symbol }) => {
+            assert_eq!(symbol, late);
+            assert_eq!(at, deep, "the refusal names the wrong launch");
+        }
+        other => panic!("a plan with no module for `{late}` fired: {other:?}"),
+    }
+    match driver_vulkan::serve::fire(&device, &mut cache, &broken, &low, what) {
+        Err(driver_vulkan::serve::Unfired::Unreadable { at, symbol, .. }) => {
+            assert_eq!(symbol, late);
+            assert_eq!(at, deep, "the refusal names the wrong launch");
+        }
+        // `Unreadable` and not `NoModule`: a store that holds 37 bytes under a
+        // symbol is a different mistake from one that holds nothing, and a
+        // caller told the module is missing will go looking for a build step
+        // that ran.
+        other => panic!("a plan with a truncated `{late}` fired: {other:?}"),
+    }
+
+    // And the same plan with every module present runs, so both refusals are
+    // about the store and not about the plan.
+    let fired = driver_vulkan::serve::fire(&device, &mut cache, &whole, &low, what)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(fired.dispatches, low.launches.len());
+
+    cache.clear(&device);
+    device.free(arena_buffer);
+    store.close(&device);
+}
+
+/// The logits a fire leaves are as many rows as the frame asked for, and are
+/// not f32.
+///
+/// The last mile. `serve::fire` moves the arena and stops; the distribution a
+/// server samples from is a range of that arena, and until now nothing in this
+/// crate could name it.
+///
+/// Two claims, and the second is the one that carries a defect.
+///
+/// The row count is the frame's readouts, which is the third crate to compute
+/// the same number: the driver stages `sampling_indices`, `model-compiler`
+/// computes `n_requests`, and `Readout::rows` states it again. A fire of three
+/// requests is used so that "one row" cannot pass by coincidence.
+///
+/// The element width is bf16 and NOT f32, because `affine_qmv_fast` writes
+/// bf16 whatever the text's declared dtype says. `Readout::bytes`' own doc
+/// records what a reader that assumed f32 saw: a vocabulary exactly half
+/// zeros, which reads as a dead half of a tensor and is really two elements
+/// read as one. That is checked here as a claim about a real plan rather than
+/// as a comment -- and the arena is filled with a pattern first, so a range
+/// that was never written is not mistaken for a distribution.
+#[test]
+fn the_logits_a_fire_leaves_are_one_row_per_readout_and_are_not_f32() {
+    use driver_vulkan::resources::{Frame, Request, Shape};
+    use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+    use model::shared::llama_like::forward::llama_like_metal;
+    use model_compiler::lower::{Fire as LowerFire, lower};
+    use model_compiler::trace::FireClass;
+
+    let (device, dir) = gpu!();
+
+    let shape = Shape {
+        layers: 28,
+        kv_heads: 8,
+        head_dim: 128,
+        page_size: 8,
+        pages: 8,
+        bytes: 2,
+    };
+    // Three requests, three readouts. One would let a readout of one row pass
+    // whatever it counted.
+    let frame = Frame::of(
+        shape,
+        &[
+            Request::of(vec![0], vec![0]),
+            Request::of(vec![5], vec![1]),
+            Request::of(vec![9], vec![2, 3]),
+        ],
+    )
+    .expect("the fire stages");
+    assert_eq!(frame.readouts(), 3);
+
+    let plan = llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        FireClass::Decode,
+    );
+    let low = lower(
+        &plan,
+        &frame.seriation(),
+        LowerFire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the text lowers");
+
+    let exit = low.readout.expect("this text states an exit");
+    assert_eq!(
+        exit.rows as usize,
+        frame.readouts(),
+        "the exit states {} rows and the frame reads out {}",
+        exit.rows,
+        frame.readouts()
+    );
+    assert_eq!(
+        exit.bytes, 2,
+        "the exit is {} bytes an element, and this plan's lm head writes bf16",
+        exit.bytes
+    );
+
+    // A pattern and not zeros: the weights are zeros, so the logits are very
+    // likely zeros too, and a readout that pointed at a range nothing wrote
+    // would be indistinguishable from one that pointed at the answer. With a
+    // pattern underneath, "the exit range is no longer the pattern" is a claim
+    // that the fire wrote there.
+    let fill: Vec<u8> = (0..low.arena_bytes).map(|i| (i * 37 % 251) as u8).collect();
+    let arena_buffer = device.buffer(&fill).expect("the arena allocates");
+
+    let mut store = driver_vulkan::resources::Pool::open(&device, shape).expect("the pool opens");
+    store.stand_in(&device, 1 << 22).expect("a stand-in");
+    store.stage(&device, &frame).expect("the fire's tables");
+    store
+        .state(
+            &device,
+            driver_vulkan::binding::FireTable::TokenIds,
+            &vec![0u32; frame.rows()],
+        )
+        .expect("the token ids");
+    store
+        .ladder(&device, shape.head_dim, 1_000_000.0, None)
+        .expect("the ladder");
+
+    let modules: std::collections::BTreeMap<String, Vec<u8>> = low
+        .kernels
+        .iter()
+        .map(|symbol| {
+            let code =
+                std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module is built");
+            (symbol.clone(), code)
+        })
+        .collect();
+
+    let mut cache = Pipelines::new();
+    driver_vulkan::serve::fire(
+        &device,
+        &mut cache,
+        &modules,
+        &low,
+        driver_vulkan::serve::Fire {
+            arena: driver_vulkan::binding::Arena {
+                buffer: &arena_buffer,
+                bytes: low.arena_bytes as u64,
+            },
+            resolver: &store,
+            geometry: driver_vulkan::dispatch::Geometry {
+                q_heads: 16,
+                kv_heads: 8,
+                head_dim: 128,
+                rotary_dims: 128,
+                n_experts: 0,
+                experts_per_token: 0,
+            },
+            tier: Capability::Baseline,
+            one_at_a_time: false,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+
+    let got = driver_vulkan::serve::logits(&device, &arena_buffer, &low).expect("the logits read");
+    assert_eq!(got.rows, frame.readouts());
+    assert_eq!(got.vocab, exit.vocab as usize);
+    assert_eq!(got.values.len(), got.rows * got.vocab);
+    assert!(
+        got.row(got.rows - 1).is_some(),
+        "the last row is addressable"
+    );
+    assert!(got.row(got.rows).is_none(), "there is no row past the last");
+
+    // The fire wrote there. Compared against what the arena HELD, so a
+    // readout pointing at an untouched range fails.
+    let before: Vec<f32> = fill[exit.at..exit.at + got.values.len() * 2]
+        .chunks_exact(2)
+        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+        .collect();
+    let changed = before
+        .iter()
+        .zip(&got.values)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert!(
+        changed > got.values.len() / 2,
+        "only {changed} of {} logits differ from what the arena held, so the exit may not be \
+         where the fire wrote",
+        got.values.len()
+    );
+
+    // And the defect `Readout::bytes` records, as a measurement. Read the same
+    // range four bytes at a time and exactly half the elements are zero,
+    // because a bf16 is the TOP half of an f32 and its low half is the next
+    // element's -- which, in a vocabulary of mostly small values, is a run of
+    // zero mantissas.
+    let whole = device.read(&arena_buffer).expect("the arena reads back");
+    let as_f32: Vec<f32> = whole[exit.at..exit.at + got.values.len() * 2]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // Widened independently, from the same bytes. Without this the only claim
+    // about what `logits` RETURNS is that it differs from the pattern, and a
+    // control answering with a row of ones did not fire.
+    let expect: Vec<f32> = whole[exit.at..exit.at + got.values.len() * 2]
+        .chunks_exact(2)
+        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+        .collect();
+    assert!(
+        expect
+            .iter()
+            .zip(&got.values)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the logits are not the widening of the exit's own bytes"
+    );
+
+    let alive = as_f32.iter().filter(|v| **v != 0.0).count();
+    assert!(
+        alive * 4 < as_f32.len(),
+        "read as f32 the exit is {alive} of {} alive, so this plan's exit may really be f32 and \
+         the width check above is checking nothing",
+        as_f32.len()
+    );
+
+    // The three refusals `logits` makes before it reads anything. All three
+    // were unwitnessed -- deleting either check, or checking the range
+    // against an arena four kilobytes larger, left the whole suite green,
+    // because the only exit ever read here is the one the lowering states and
+    // that one is always in range and always two bytes wide. A readout is
+    // four numbers out of a compiler; the reader is what stands between a
+    // wrong one and a slice of somebody else's arena.
+    // Overrunning by EIGHT bytes and not by a page. A comfortable overrun is
+    // refused by a check with slack in it just as well as by a correct one,
+    // so the margin is the measurement: adding four kilobytes of slack to the
+    // comparison leaves a page-sized overrun still refused and this one
+    // accepted.
+    let extent = exit.rows as usize * exit.vocab as usize * exit.bytes as usize;
+    let mut past = low.clone();
+    past.readout = Some(model_compiler::lower::Readout {
+        at: low.arena_bytes - extent + 8,
+        ..exit
+    });
+    assert!(
+        matches!(
+            driver_vulkan::serve::logits(&device, &arena_buffer, &past),
+            Err(driver_vulkan::serve::Unread::PastArena { .. })
+        ),
+        "an exit running off the end of the arena was read anyway"
+    );
+    // Checked against the arena the LOWERING sized and not the buffer, which
+    // is a distinction with no symptom until a caller over-allocates. The
+    // plan here says its arena ends eight bytes before its own exit does,
+    // while the buffer really is big enough -- so a reader that measured
+    // against the buffer, or against the plan with any slack in it, reads
+    // eight bytes the plan never claimed. Eight and not a page, because the
+    // slice bound below is a second, buffer-shaped check that catches any
+    // overrun the buffer cannot hold and would otherwise stand in for this
+    // one.
+    let mut over = low.clone();
+    over.arena_bytes = exit.at + extent - 8;
+    assert!(
+        matches!(
+            driver_vulkan::serve::logits(&device, &arena_buffer, &over),
+            Err(driver_vulkan::serve::Unread::PastArena { .. })
+        ),
+        "an exit past the PLAN's arena was read out of a buffer that happened to be bigger"
+    );
+    // One byte and not three. Three is the width a reader would guess at,
+    // and it is caught by the RANGE check instead -- three bytes an element
+    // is half again as many bytes as the plan's arena holds -- so it never
+    // reaches the width check and witnesses the wrong refusal. One byte
+    // fits, which is exactly what makes it dangerous: the range is fine and
+    // the elements are read four at a time as f32 anyway.
+    let mut odd = low.clone();
+    odd.readout = Some(model_compiler::lower::Readout { bytes: 1, ..exit });
+    assert!(
+        matches!(
+            driver_vulkan::serve::logits(&device, &arena_buffer, &odd),
+            Err(driver_vulkan::serve::Unread::Width(1))
+        ),
+        "a one-byte element was read as an f32"
+    );
+    // The control: the same three clones with nothing changed still read, so
+    // the refusals above are about what was changed and not about cloning.
+    assert!(
+        driver_vulkan::serve::logits(&device, &arena_buffer, &low.clone()).is_ok(),
+        "the control read failed"
+    );
+
+    cache.clear(&device);
+    device.free(arena_buffer);
+    store.close(&device);
+}
+
+/// A conversation's history is still its own after another conversation has
+/// been seated between two of its fires.
+///
+/// [`Frame::of`] refuses two requests in ONE fire that name the same page, and
+/// every earlier test here handed out page numbers by hand. That is the
+/// smaller half of the problem: a request is a conversation, and the page it
+/// wrote into in one fire must still be its own in the next. Nothing in a
+/// plan, a lowering or a frame says so, so a hand-written caller that started
+/// at page 0 for every new conversation would pass every check in this crate
+/// and silently give two users each other's history.
+///
+/// Three fires, on purpose. A grows, then B is seated and grows into what a
+/// naive caller would hand it -- A's pages -- then A grows again and attends
+/// over its whole history. The reference is A's own six rows; if B's append
+/// landed anywhere A had written, the softmax weights move and the answer is
+/// not close.
+///
+/// The control that matters is to hand out pages by hand: both conversations
+/// starting at page 0 is the whole defect, and with `Book` it cannot happen.
+#[test]
+fn a_conversation_keeps_its_pages_while_another_is_seated_between_its_fires() {
+    use driver_vulkan::binding::{FireTable, Resolve};
+    use driver_vulkan::pages::Book;
+    use driver_vulkan::resources::{Frame, Pool, Request, Shape};
+
+    let (device, dir) = gpu!();
+    let head_dim = 128usize;
+    let shape = Shape {
+        layers: 1,
+        kv_heads: 1,
+        head_dim: head_dim as u32,
+        page_size: 4,
+        pages: 8,
+        bytes: 2,
+    };
+
+    let mut book = Book::over(shape);
+    // A fills exactly one page, B is seated, then A crosses into a second.
+    // The middle growth is the one a naive caller gets wrong.
+    let a_first = book.grow(1, 4).expect("room for A");
+    let b_first = book.grow(2, 4).expect("room for B");
+    let a_second = book.grow(1, 2).expect("room for A again");
+    assert_eq!(a_first.pages, vec![0]);
+    assert_eq!(b_first.pages, vec![1], "B is not given A's page");
+    assert_eq!(a_second.pages, vec![0, 2], "A keeps the page it filled");
+
+    // Contents depend on whose row it is, so a clobbered row is a wrong
+    // answer rather than a similar one.
+    let row = |who: u64, p: u32, salt: usize| -> Vec<f32> {
+        (0..head_dim)
+            .map(|d| {
+                (((who as usize * 41 + p as usize * 7 + d * 13 + salt * 29) % 61) as f32 - 30.0)
+                    / 24.0
+            })
+            .collect()
+    };
+
+    let mut pool = Pool::open(&device, shape).expect("the pool");
+    let mut cache = Pipelines::new();
+    let scatter = module(dir, "kv_append_paged_bfloat16");
+    let mut ppush = Vec::new();
+    ppush.extend_from_slice(&(head_dim as i32).to_le_bytes());
+    ppush.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
+    ppush.extend_from_slice(&(shape.kv_heads as i32).to_le_bytes());
+
+    // Every appended row, kept so the reference can be built from what was
+    // actually written rather than from what the loop meant to write.
+    let mut written: Vec<(u64, u32, Vec<f32>, Vec<f32>)> = Vec::new();
+    let mut append = |pool: &mut Pool, cache: &mut Pipelines, who: u64, request: &Request| {
+        let frame = Frame::of(shape, std::slice::from_ref(request)).expect("the fire stages");
+        for t in 0..frame.rows() {
+            let p = frame.positions[t];
+            let (k, v) = (row(who, p, 0), row(who, p, 1));
+            pool.state(&device, FireTable::KvWritePage, &[frame.kv_write_page[t]])
+                .expect("the write page");
+            pool.state(
+                &device,
+                FireTable::KvWriteOffset,
+                &[frame.kv_write_offset[t]],
+            )
+            .expect("the write offset");
+            let kn = device.buffer(&bf16_bytes(&k)).expect("k_new");
+            let vn = device.buffer(&bf16_bytes(&v)).expect("v_new");
+            let bound = [
+                Bound::whole(&kn),
+                Bound::whole(&vn),
+                Bound::whole(pool.kv(0, false).expect("keys")),
+                Bound::whole(pool.kv(0, true).expect("values")),
+                Bound::whole(pool.table(FireTable::KvWritePage).expect("page")),
+                Bound::whole(pool.table(FireTable::KvWriteOffset).expect("offset")),
+            ];
+            let pipeline = cache
+                .get(
+                    &device,
+                    "kv_append_paged_bfloat16",
+                    &scatter,
+                    ppush.len() as u32,
+                    bound.len() as u32,
+                    Capability::Baseline,
+                )
+                .expect("the append builds");
+            device
+                .run(pipeline, &bound, &ppush, [1, shape.kv_heads, 1])
+                .expect("the append dispatches");
+            device.free(kn);
+            device.free(vn);
+            written.push((who, p, k, v));
+        }
+    };
+
+    append(&mut pool, &mut cache, 1, &a_first);
+    append(&mut pool, &mut cache, 2, &b_first);
+    append(&mut pool, &mut cache, 1, &a_second);
+    assert_eq!(written.len(), 10);
+
+    // A attends over its whole history: one decode row, its own page table.
+    let a_now = Request {
+        positions: vec![book.tokens(1).expect("A is seated") as u32 - 1],
+        pages: book.pages(1).expect("A is seated").to_vec(),
+        samples: Vec::new(),
+    };
+    let a_frame = Frame::of(shape, std::slice::from_ref(&a_now)).expect("A's decode stages");
+    pool.stage(&device, &a_frame).expect("A's tables");
+
+    let queries: Vec<f32> = (0..head_dim)
+        .map(|i| ((i * 19 % 47) as f32 - 23.0) / 20.0)
+        .collect();
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut spush = Vec::new();
+    spush.extend_from_slice(&1i32.to_le_bytes());
+    spush.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
+    spush.extend_from_slice(&(shape.kv_heads as i32).to_le_bytes());
+    spush.extend_from_slice(&scale.to_le_bytes());
+    spush.extend_from_slice(&0u32.to_le_bytes());
+    spush.extend_from_slice(&0i32.to_le_bytes());
+
+    let qb = device.buffer(&bf16_bytes(&queries)).expect("queries");
+    let ob = device.buffer(&vec![0u8; head_dim * 2]).expect("out");
+    let symbol = "sdpa_paged_decode_bfloat16_d_128";
+    let code = module(dir, symbol);
+    {
+        let bound = [
+            Bound::whole(&qb),
+            Bound::whole(pool.kv(0, false).expect("keys")),
+            Bound::whole(pool.kv(0, true).expect("values")),
+            Bound::whole(&ob),
+            Bound::whole(pool.table(FireTable::Positions).expect("pos")),
+            Bound::whole(pool.table(FireTable::RequestOfToken).expect("req")),
+            Bound::whole(pool.table(FireTable::KvPageIndices).expect("ix")),
+            Bound::whole(pool.table(FireTable::KvPageIndptr).expect("ptr")),
+            Bound::whole(pool.table(FireTable::AttentionMask).expect("mask")),
+            Bound::whole(
+                pool.table(FireTable::AttentionMaskEnabled)
+                    .expect("enabled"),
+            ),
+        ];
+        let pipeline = cache
+            .get(
+                &device,
+                symbol,
+                &code,
+                spush.len() as u32,
+                bound.len() as u32,
+                Capability::Baseline,
+            )
+            .expect("the attention builds");
+        device
+            .run(pipeline, &bound, &spush, [1, 1, 1])
+            .expect("the attention dispatches");
+    }
+
+    // The reference: A's six rows and nothing B wrote.
+    let qq = bf16_read(&bf16_bytes(&queries));
+    let mine: Vec<&(u64, u32, Vec<f32>, Vec<f32>)> =
+        written.iter().filter(|(who, ..)| *who == 1).collect();
+    assert_eq!(mine.len(), 6, "A appended six rows over two fires");
+    let scores: Vec<f32> = mine
+        .iter()
+        .map(|(_, _, k, _)| {
+            let kq = bf16_read(&bf16_bytes(k));
+            qq.iter().zip(&kq).map(|(a, b)| a * b).sum::<f32>() * scale
+        })
+        .collect();
+    let top = scores.iter().copied().fold(f32::MIN, f32::max);
+    let ws: Vec<f32> = scores.iter().map(|s| (s - top).exp()).collect();
+    let total: f32 = ws.iter().sum();
+    let want: Vec<f32> = (0..head_dim)
+        .map(|d| {
+            mine.iter()
+                .zip(&ws)
+                .map(|((_, _, _, v), w)| bf16_read(&bf16_bytes(v))[d] * w)
+                .sum::<f32>()
+                / total
+        })
+        .collect();
+
+    let got = bf16_read(&device.read(&ob).expect("read back"));
+    let mut spread = 0.0f32;
+    for (d, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (g - w).abs() < 4e-2,
+            "channel {d}: attention gave {g} and A's own six rows give {w}"
+        );
+        spread = spread.max((w - want[0]).abs());
+    }
+    // A flat answer would pass the comparison whatever the history was.
+    assert!(
+        spread > 0.1,
+        "the reference answer is nearly constant ({spread}), so this comparison proves little"
+    );
+
+    device.free(qb);
+    device.free(ob);
+    cache.clear(&device);
+    pool.close(&device);
+}
+
+/// Three steps over one deployment: the positions continue, the pages stay
+/// put, and the second step builds no pipeline the first did not.
+///
+/// Everything before this test fired once. A server does not: it carries one
+/// pool, one checkpoint and one pipeline cache across thousands of fires while
+/// conversations arrive, grow and leave, and the things that can only be wrong
+/// ACROSS fires had no test at all.
+///
+/// The claims are about bookkeeping, not numerics -- the weights are a stand-in,
+/// so the distributions mean nothing and are not compared. What is compared:
+///
+/// - a conversation's positions continue rather than restarting, which is the
+///   difference between a decode and a prefill repeated;
+/// - its pages are still its own after a second conversation was seated
+///   between two of its steps;
+/// - the row count follows the turns, and a batch that grows, shrinks, and
+///   mixes a prefill with a decode is one code path;
+/// - the pipeline cache stops growing, which is the only reason a server can
+///   afford to lower every fire.
+///
+/// Then a prefill and a mixed batch -- one conversation decoding while another
+/// prefills -- which is the shape a server actually runs and which nothing in
+/// this crate could express before. The comment where they are fired records
+/// why they could not, since the reason is a real disagreement in the lowering
+/// rather than a missing feature.
+///
+/// It closes on a refusal: a step asking for more pages than the cache has
+/// left is refused with the gap rather than a bare no, and the book is
+/// unchanged afterwards.
+#[test]
+fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
+    use driver_vulkan::binding::Resolve;
+    use driver_vulkan::pages::Book;
+    use driver_vulkan::resources::{Pool, Shape, Weights};
+    use driver_vulkan::turns::{Held, Serving, Turn, Unstepped};
+    use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+    use model::shared::llama_like::forward::llama_like_metal;
+    use model_compiler::trace::FireClass;
+
+    let (device, dir) = gpu!();
+    let shape = Shape {
+        layers: 28,
+        kv_heads: 8,
+        head_dim: 128,
+        page_size: 8,
+        pages: 6,
+        bytes: 2,
+    };
+
+    let plan = llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        FireClass::Decode,
+    );
+    let serving = Serving {
+        plan: &plan,
+        geometry: driver_vulkan::dispatch::Geometry {
+            q_heads: 16,
+            kv_heads: 8,
+            head_dim: 128,
+            rotary_dims: 128,
+            n_experts: 0,
+            experts_per_token: 0,
+        },
+        tier: Capability::Baseline,
+    };
+
+    let mut book = Book::over(shape);
+    let mut pool = Pool::open(&device, shape).expect("the pool");
+    pool.stand_in(&device, 1 << 22).expect("a stand-in");
+    pool.ladder(&device, shape.head_dim, 1_000_000.0, None)
+        .expect("the ladder");
+    let mut weights = Weights::new();
+    weights
+        .seam(&device, 1 << 22)
+        .expect("a stand-in checkpoint");
+    // One buffer per NAME. `Model` is a pair and not a fallback chain, so an
+    // unheld weight is a refusal rather than a stand-in -- which is the point,
+    // and means the names must be collected before the first step. They come
+    // from a lowering of the same plan, which is the only place they exist:
+    // `Arg::Weight` carries a name and no width, so the SIZE below is a guess
+    // that works because `TokenIds` is all zeros and every gather reads row 0.
+    {
+        let probe = model_compiler::lower::lower(
+            &plan,
+            &[model_compiler::lower::Row::default()],
+            model_compiler::lower::Fire {
+                captures_across_splits: false,
+            },
+        )
+        .expect("the plan lowers");
+        let names: std::collections::BTreeSet<&str> = probe
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                model_compiler::lower::Arg::Weight(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.len() > 500,
+            "only {} weight names, so this is not a whole model",
+            names.len()
+        );
+        let block = vec![0u8; 1 << 22];
+        for name in names {
+            weights.hold(&device, name, &block).expect("a weight");
+        }
+    }
+    let mut cache = Pipelines::new();
+
+    // Loaded from the first step's kernels and never reloaded, which is also
+    // what a server does: the module set is the plan's, not the fire's.
+    let mut modules: std::collections::BTreeMap<String, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    let load = |modules: &mut std::collections::BTreeMap<String, Vec<u8>>| {
+        for name in std::fs::read_dir(dir).expect("the spirv dir").flatten() {
+            let path = name.path();
+            if path.extension().is_some_and(|e| e == "spv")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                modules.insert(stem.to_string(), std::fs::read(&path).expect("a module"));
+            }
+        }
+    };
+    load(&mut modules);
+
+    let mut held = Held {
+        book: &mut book,
+        pool: &mut pool,
+        weights: &weights,
+    };
+
+    // A prefill of four tokens for one conversation.
+    let first = serving
+        .step(
+            &device,
+            &mut cache,
+            &modules,
+            &mut held,
+            &[Turn {
+                who: 1,
+                tokens: vec![0],
+            }],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(first.rows, 1);
+    assert_eq!(first.logits.rows, 1, "one distribution per turn");
+    assert_eq!(held.book.tokens(1), Some(1));
+    let a_pages = held.book.pages(1).expect("A is seated").to_vec();
+    assert!(first.pipelines > 0);
+    assert_eq!(first.fired.submissions, 1);
+
+    // A second conversation, seated between A's two steps -- the case a
+    // hand-written caller gets wrong.
+    let second = serving
+        .step(
+            &device,
+            &mut cache,
+            &modules,
+            &mut held,
+            &[
+                Turn {
+                    who: 1,
+                    tokens: vec![0],
+                },
+                Turn {
+                    who: 2,
+                    tokens: vec![0],
+                },
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(second.rows, 2, "one row each");
+    // The tables the DEVICE holds are this step's, not the last one's. Read
+    // back rather than inferred: a step that staged once and never again
+    // passes every other claim here.
+    {
+        let held_positions = device
+            .read(
+                held.pool
+                    .table(driver_vulkan::binding::FireTable::Positions)
+                    .expect("the positions table"),
+            )
+            .expect("the table reads back");
+        let got: Vec<u32> = held_positions
+            .chunks_exact(4)
+            .take(second.rows)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, second.positions, "the pool holds another step's rows");
+    }
+    assert_eq!(second.logits.rows, 2, "one distribution per turn");
+    assert_eq!(
+        second.logits.vocab, first.logits.vocab,
+        "the vocabulary does not depend on the batch"
+    );
+    assert_eq!(held.book.tokens(1), Some(2), "A's positions continued");
+    assert_eq!(held.book.tokens(2), Some(1));
+    assert_eq!(
+        held.book.pages(1).expect("A"),
+        a_pages.as_slice(),
+        "A's pages survived B being seated"
+    );
+    assert!(
+        !held
+            .book
+            .pages(2)
+            .expect("B")
+            .iter()
+            .any(|p| a_pages.contains(p)),
+        "B was given a page A still holds"
+    );
+    assert_eq!(
+        second.pipelines,
+        first.pipelines,
+        "the second step built {} pipelines the first did not",
+        second.pipelines - first.pipelines
+    );
+
+    // A third, to show the batch can shrink again without rebuilding.
+    let third = serving
+        .step(
+            &device,
+            &mut cache,
+            &modules,
+            &mut held,
+            &[Turn {
+                who: 2,
+                tokens: vec![0],
+            }],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(third.rows, 1);
+    assert_eq!(third.logits.rows, 1);
+    assert_eq!(third.pipelines, first.pipelines);
+    assert_eq!(held.book.tokens(1), Some(2), "A did not move this step");
+
+    // A prefill: one turn of four tokens, and a mixed batch after it.
+    //
+    // This is the case that could not run at all until `Serving::step` forced
+    // every row to sample, and it is worth stating what was wrong rather than
+    // only that it works. qwen3's text spells its epilogue as three plain
+    // `OpKind::Launch` ops, not `OpKind::LmHead`, so `Lowerer::epilogue` --
+    // which would emit them over the SAMPLED rows -- never runs and the
+    // generic path emits them over the whole token window. With only the last
+    // row sampling, `n_requests` is 1 and the arena is sized for one row of
+    // logits while the head writes four; measured, that asks for 1215488
+    // bytes out of 303872 and `binding::extent` refuses the fire. Forcing
+    // every row to sample makes `n_requests` the row count, and the worst
+    // operand overrun over both shapes below is ZERO bytes.
+    //
+    // So the distributions are per ROW, and only the last row of a turn has
+    // seen the whole prompt. `readout_of` is what says which one that is, and
+    // a caller sampling `logits.row(i)` for turn `i` would read a model that
+    // had seen one token.
+    let prefill = serving
+        .step(
+            &device,
+            &mut cache,
+            &modules,
+            &mut held,
+            &[Turn {
+                who: 3,
+                tokens: vec![7, 8, 9, 10],
+            }],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(prefill.rows, 4);
+    assert_eq!(
+        prefill.logits.rows, 4,
+        "every row samples, so a prefill of four gives four distributions"
+    );
+    assert_eq!(
+        prefill.readout_of,
+        vec![3],
+        "the turn's answer is its last row"
+    );
+    assert!(
+        prefill.logits.row(prefill.readout_of[0]).is_some(),
+        "the turn's own distribution is addressable"
+    );
+    assert_eq!(held.book.tokens(3), Some(4));
+    // The pool's own `SamplingIndices` says what the lowering was told.
+    //
+    // The frame names one readout for this turn, so `Pool::stage` writes ONE
+    // entry -- while the lowering, told every row samples, has `row_gather`
+    // read four. That is a sixteen-byte read of a four-byte buffer, and
+    // nothing downstream can see it: `Arg::Named` has no extent to check, the
+    // descriptor is bound whole, and the validation layer does not report
+    // storage-buffer overruns. Checked here because it is checkable nowhere
+    // else.
+    {
+        let table = device
+            .read(
+                held.pool
+                    .table(driver_vulkan::binding::FireTable::SamplingIndices)
+                    .expect("the sampling table"),
+            )
+            .expect("the table reads back");
+        let got: Vec<u32> = table
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![0, 1, 2, 3],
+            "the gather would read {} entries out of {} the pool holds",
+            prefill.rows,
+            got.len()
+        );
+    }
+    assert_eq!(
+        prefill.pipelines, first.pipelines,
+        "a prefill built a pipeline no decode needed"
+    );
+
+    // And a mixed batch: one conversation decoding while another prefills,
+    // which is the shape a server actually runs and which no earlier test in
+    // this crate could express.
+    let mixed = serving
+        .step(
+            &device,
+            &mut cache,
+            &modules,
+            &mut held,
+            &[
+                Turn {
+                    who: 1,
+                    tokens: vec![5],
+                },
+                Turn {
+                    who: 4,
+                    tokens: vec![1, 2, 3],
+                },
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        mixed.rows, 4,
+        "one row for the decode and three for the prefill"
+    );
+    assert_eq!(mixed.logits.rows, 4);
+    assert_eq!(mixed.readout_of.len(), 2);
+    assert_ne!(
+        mixed.readout_of[0], mixed.readout_of[1],
+        "two turns cannot share one distribution"
+    );
+    // The decode's turn contributed exactly one row, so its readout row is
+    // the row whose position is the one the book had. Read from the frame the
+    // step reported rather than assumed.
+    assert_eq!(
+        mixed.positions[mixed.readout_of[0]], 2,
+        "the decode's answer is the row at its own position"
+    );
+    assert_eq!(
+        mixed.positions[mixed.readout_of[1]], 2,
+        "the prefill's answer is its LAST token, not its first"
+    );
+    assert_eq!(held.book.tokens(1), Some(3));
+    assert_eq!(held.book.tokens(4), Some(3));
+    held.book.release(3);
+    held.book.release(4);
+
+    // And the refusal. Six pages of eight is 48 tokens; A and B hold four
+    // between them, so this cannot fit.
+    let before = held.book.spare();
+    let refused = serving
+        .step(
+            &device,
+            &mut cache,
+            &modules,
+            &mut held,
+            &[Turn {
+                who: 9,
+                tokens: vec![0; 400],
+            }],
+        )
+        .expect_err("the cache is far too small for this");
+    match refused {
+        Unstepped::Unhoused(driver_vulkan::pages::Unhoused::NoPages { wanted, spare }) => {
+            assert!(
+                wanted > spare,
+                "{wanted} wanted and {spare} spare is not a refusal"
+            );
+            assert_eq!(spare, before);
+        }
+        other => panic!("the wrong refusal: {other}"),
+    }
+    assert_eq!(held.book.spare(), before, "a refused growth took a page");
+    assert!(
+        held.book.pages(9).is_none(),
+        "a refused conversation kept a seat"
+    );
+
+    cache.clear(&device);
+    pool.close(&device);
+    weights.close(&device);
+}
+
+/// The weight store answers by name, replaces without leaking, and never
+/// answers a name it was not given.
+///
+/// `Weights` has been the resolver under every whole-plan fire in this crate
+/// and has never been asked anything on its own. That is not a gap about
+/// coverage: the three claims below are each a way for a fire to bind the
+/// WRONG buffer and compute a plausible answer, and a whole-plan test cannot
+/// see any of them, because it holds one four-megabyte block under every name
+/// and so cannot tell the names apart.
+///
+/// Distinct contents per name, therefore, and the check is on the BYTES rather
+/// than on the handle -- a store that returned the right buffer object for the
+/// wrong name would pass a comparison of pointers.
+///
+/// The third claim is the one with teeth. `Model` is a pair, not a fallback
+/// chain, and `Weights::named` answers the seam for ANY value id. If `weight`
+/// fell back to the seam the same way, a plan naming a weight nobody loaded
+/// would bind a buffer of zeros and produce a fire that runs, computes
+/// nonsense and refuses nothing.
+#[test]
+fn a_weight_store_answers_by_name_and_refuses_a_name_it_was_never_given() {
+    use driver_vulkan::binding::Resolve;
+    use driver_vulkan::resources::Weights;
+
+    let (device, _) = gpu!();
+    let mut weights = Weights::new();
+    assert!(weights.is_empty());
+    assert_eq!(weights.len(), 0);
+
+    let block = |seed: u8| -> Vec<u8> { (0..256u32).map(|i| (i as u8) ^ seed).collect() };
+    for (name, seed) in [("layer.0.q", 1u8), ("layer.0.k", 2), ("embed", 3)] {
+        weights.hold(&device, name, &block(seed)).expect("a weight");
+    }
+    assert_eq!(weights.len(), 3);
+    assert!(!weights.is_empty());
+
+    // By NAME, and checked on the bytes. Three names that differ only in
+    // their last character, so a store keying on a prefix passes nothing.
+    for (name, seed) in [("layer.0.q", 1u8), ("layer.0.k", 2), ("embed", 3)] {
+        let got = device
+            .read(weights.at(name).expect("held under its name"))
+            .expect("it reads back");
+        assert_eq!(got, block(seed), "`{name}` answered with another's bytes");
+        let bound = Resolve::weight(&weights, name).expect("the resolver agrees");
+        assert_eq!(
+            device.read(bound).expect("it reads back"),
+            block(seed),
+            "`{name}` binds a different buffer than it holds"
+        );
+    }
+
+    // Replacing gives the new bytes, keeps the count, and -- the part a
+    // reader cannot check from outside -- frees the old buffer rather than
+    // stranding it. The count is checked; the free is not, and this says so
+    // rather than pretending: nothing in this crate can observe a Vulkan
+    // buffer that was allocated and never freed, for the reason
+    // `serve::fire`'s own doc records at length.
+    weights
+        .hold(&device, "embed", &block(9))
+        .expect("the replacement");
+    assert_eq!(weights.len(), 3, "replacing a name added one");
+    assert_eq!(
+        device
+            .read(weights.at("embed").expect("still held"))
+            .expect("read"),
+        block(9),
+        "the replacement did not take"
+    );
+
+    // A name nobody gave it is None, even though a seam exists. The seam
+    // answers `named` for any value id on purpose; a `weight` that shared
+    // that generosity would bind zeros for a weight a checkpoint forgot and
+    // the fire would run.
+    weights.seam(&device, 4096).expect("a seam");
+    assert!(Resolve::named(&weights, 0).is_some(), "the seam answers");
+    assert!(Resolve::named(&weights, 99_999).is_some(), "for any value");
+    assert!(
+        weights.at("layer.1.q").is_none(),
+        "a name never held was answered"
+    );
+    assert!(
+        Resolve::weight(&weights, "layer.1.q").is_none(),
+        "an unheld weight fell back to the seam"
+    );
+    assert!(
+        Resolve::weight(&weights, "").is_none(),
+        "the empty name was answered"
+    );
+
+    weights.close(&device);
 }

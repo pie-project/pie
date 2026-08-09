@@ -330,8 +330,8 @@ pub const HOST_SHARED: &[DeviceStruct] = &[LANE_TABLE_HEADER, LANE_RECORD, LANE_
 /// before anything runs.
 mod static_assertions {
     use super::*;
-    use core::mem::{offset_of, size_of};
     use crate::plan::{LaneChannelSlot, LaneRecord, LaneTableHeader};
+    use core::mem::{offset_of, size_of};
 
     /// Byte offset of field `index`, laid out the way both backends lay out
     /// a `#[repr(C)]` struct of 4- and 8-byte scalars.

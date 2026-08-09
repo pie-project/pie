@@ -61,7 +61,7 @@ fn foreign_completion_publish_records_epoch_before_wake() {
         let t2 = Arc::clone(&t);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            WaitFuture::new(&*t, id, move || match t2.published(id) {
+            WaitFuture::new(&t, id, move || match t2.published(id) {
                 Some(epoch) if epoch >= 7 => Readiness::Ready(epoch),
                 Some(epoch) => Readiness::Pending {
                     observed_epoch: epoch,
@@ -207,7 +207,7 @@ fn sweep_on_abort_resolves_blocked_take_to_err_b12() {
         let (t, poisoned, head) = (t.clone(), poisoned.clone(), head.clone());
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            WaitFuture::new(&*t, ch.reader, move || {
+            WaitFuture::new(&t, ch.reader, move || {
                 if poisoned.load(std::sync::atomic::Ordering::SeqCst) {
                     return Readiness::Ready(Err::<u64, &str>("poisoned"));
                 }

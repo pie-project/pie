@@ -18,9 +18,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind};
 use tensor_ir::op::tags;
 use tensor_ir::validate::BoundTrace;
-use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind};
 
 /// Kind discriminants. Re-exported from the driver ABI rather than restated:
 /// [`EmittedKernel::kind`] is handed straight to the driver, so a second
@@ -215,8 +215,8 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     // M2: one kernel per fused region, bound directly to channel cells. The
     // driver refuses this form above `kMetalM2MaxFusedChannels`, and so do we —
     // emitting it anyway would produce a kernel that cannot be bound.
-    let fused_supported =
-        stage.normalized.channel_bindings.len() <= crate::codegen::metal::METAL_M2_MAX_FUSED_CHANNELS;
+    let fused_supported = stage.normalized.channel_bindings.len()
+        <= crate::codegen::metal::METAL_M2_MAX_FUSED_CHANNELS;
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
         let entry = format!("ptir_m2_{signature}_r{region_index}");
         let emitted = if fused_supported {
@@ -256,7 +256,9 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             Some(LibraryOp::NucleusSample) => {
                 crate::codegen::metal::emit_grouped_nucleus(&entry, stage, region)
             }
-            Some(LibraryOp::TopK) => crate::codegen::metal::emit_grouped_topk(&entry, stage, region),
+            Some(LibraryOp::TopK) => {
+                crate::codegen::metal::emit_grouped_topk(&entry, stage, region)
+            }
             _ => crate::codegen::metal::emit_grouped_fused_region(&entry, stage, region),
         };
         out.push(EmittedKernel::new(

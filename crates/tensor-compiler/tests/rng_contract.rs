@@ -233,32 +233,23 @@ fn allowlists() -> Allowlists {
             STAGED_RNG_PREAMBLE,
         ],
         stride: &[
-            "crates/driver-cuda/csrc/src/batch/forward_graph.hpp",
-            "crates/driver-cuda/csrc/src/loader/weight_store_codec.hpp",
             "crates/gateway/src/route.rs",
             "crates/engine/src/inferlet/linker.rs",
             // splitmix64 id generation: the canonical splitmix increment
             // happens to be the same golden-ratio word; not a keyed-RNG
             // transcription.
             "crates/engine/src/pipeline/offload.rs",
-            // Same word, same reason: two splitmix mixers fingerprinting what a
-            // captured graph body bakes (the NS-3 spatial-split plan, and the
-            // staged lora table). Added by `f4a63579b` / `d7df4b575` without a
-            // row here, which is why this guard only started reporting them
-            // once the workspace test sweep could reach this suite again.
-            "crates/driver-cuda/csrc/src/model/llama_like/llama_like.cpp",
-            // The RUST port of the staged lora table's fingerprint,
-            // transcribed branch for branch with its splitmix finalizer.
-            // Same word, same reason, and it is here rather than
-            // deduplicated because a port that reached for a shared helper
-            // would no longer be a transcription of the function it has to
-            // agree with.
+            // The staged lora table's fingerprint, a splitmix mixer over what
+            // a captured lora body bakes. Same word, same reason, and it is
+            // here rather than deduplicated because it has to agree with the
+            // capture it fingerprints, branch for branch.
             //
-            // `model/llama_like.rs` used to sit beside it, carrying the
-            // NS-3 spatial-split layout key. That module is gone (2026-08-10,
-            // `cuda.md` §3.4.1): nothing in the driver called it, so the
-            // layout key it transcribed had no caller either.
-            "crates/driver-cuda/src/model/lora.rs",
+            // Two C++ siblings used to sit beside it — `llama_like.cpp`'s
+            // NS-3 spatial-split plan fingerprint and `dispatch.cu`'s
+            // stage-hook `hash_combine` — and a Rust `model/llama_like.rs`
+            // carrying the NS-3 layout key. All three went with the C++
+            // driver and the module that had no caller.
+            "crates/driver-cuda/src/fire/lora.rs",
             // boost-style `hash_combine` for the GEMM autotune cache key; the
             // golden-ratio word again, and nothing to do with the PTIR stream.
             // These have moved twice — `driver-cuda/ops/` to `kernels-cuda/ops/`
@@ -267,13 +258,8 @@ fn allowlists() -> Allowlists {
             // instead of letting the guard fail somewhere unrelated.
             "crates/kernels-cuda/csrc/src/gemm/gemm.cpp",
             "crates/kernels-cuda/csrc/src/tuning_cache.hpp",
-            // And again, for the stage-hook fingerprint's `hash_combine`.
-            "crates/driver-cuda/csrc/src/pipeline/dispatch.cu",
         ],
-        mask: &[
-            "crates/driver-cuda/csrc/tests/ptir_tier0_test.cu",
-            "crates/grammar/src/brle.rs",
-        ],
+        mask: &["crates/grammar/src/brle.rs"],
         // The float conversion's shift is the weakest needle here: any 64-bit
         // -> float reduction that wants 24 mantissa bits writes it. A murmur3
         // finalizer in a driver test is not a PTIR stream.
@@ -282,7 +268,13 @@ fn allowlists() -> Allowlists {
         // for the reason this guard exists: writing it out in a comment makes
         // THIS file a transcription, which is exactly what the first draft of
         // this comment did and what the guard then reported.)
-        shift: &["crates/driver-metal/csrc/tests/llama_numerics_test.cpp"],
+        //
+        // Empty, and left in place rather than deleted: the one entry was a
+        // Metal numerics test that went with the C++ driver, and nothing
+        // outside the contract writes this shift today. An empty list is the
+        // statement that the exemption is unused, which is worth more than
+        // the absence of a field.
+        shift: &[],
     }
 }
 
@@ -318,6 +310,82 @@ fn allowlisted_paths_still_exist() {
     }
 }
 
+/// The constants, spelled in fragments so that THIS file does not become the
+/// transcription the guard hunts. Three of them excuse a path in an allowlist,
+/// so they are named; the other three are the stream's own and may appear
+/// nowhere but an owner.
+struct Needles {
+    stride: String,
+    mask: String,
+    shift: String,
+    all: Vec<String>,
+}
+
+fn needles() -> Needles {
+    let stride = ["9e37", "79b9", "7f4a", "7c15"].concat();
+    let mask = ["a5a5", "a5a5"].concat();
+    let shift = [">>", "40"].concat();
+    let all = vec![
+        ["3c79", "ac49", "2ba7", "b653"].concat(),
+        ["1c69", "b3f7", "4ac4", "ae35"].concat(),
+        stride.clone(),
+        mask.clone(),
+        shift.clone(),
+        ["16777216", ".0"].concat(),
+    ];
+    Needles {
+        stride,
+        mask,
+        shift,
+        all,
+    }
+}
+
+fn normalize(text: &str) -> String {
+    text.chars()
+        .filter(|character| *character != '_' && !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The other way an allowlist rots, and the one
+/// [`allowlisted_paths_still_exist`] cannot see.
+///
+/// An entry says "the magic in this file is not a transcription". When the
+/// file stops carrying the magic — the fingerprint is deleted, the helper is
+/// shared, the hash changes — the entry survives, because the path is still
+/// there. What is left is a standing exemption for a file that no longer
+/// needs one, and the next transcription written into it passes.
+///
+/// That is not hypothetical either: this suite's stride list carried four
+/// entries whose files had been deleted with the C++ CUDA driver, and one
+/// that had merely MOVED. Only the move was reported, and only because the
+/// magic reappeared at a path the guard had never heard of. Had the file been
+/// deleted instead, nothing would have said so.
+#[test]
+fn allowlist_entries_still_carry_what_they_excuse() {
+    let root = repo_root();
+    let needles = needles();
+    let allow = allowlists();
+    for (name, list, needle) in [
+        ("unrelated_stride_users", allow.stride, &needles.stride),
+        ("unrelated_mask_users", allow.mask, &needles.mask),
+        ("unrelated_shift_users", allow.shift, &needles.shift),
+    ] {
+        for entry in list {
+            let contents =
+                fs::read_to_string(root.join(entry)).unwrap_or_else(|e| panic!("{entry}: {e}"));
+            assert!(
+                normalize(&contents).contains(needle),
+                "`{name}` excuses {entry}, which no longer contains the constant \
+                 it was excused for. The exemption outlived its reason: drop the \
+                 entry, or it will silently permit the next transcription written \
+                 into that file."
+            );
+        }
+    }
+}
+
 #[test]
 fn rng_magic_is_owned_by_the_contract() {
     if std::env::var("PTIR_REGEN").is_ok() {
@@ -329,45 +397,38 @@ fn rng_magic_is_owned_by_the_contract() {
 
     let allow = allowlists();
     let owner = |relative: &Path| path_in(allow.owners, relative);
+    let needles = needles();
 
-    let stride = ["9e37", "79b9", "7f4a", "7c15"].concat();
-    let ambient_mask = ["a5a5", "a5a5"].concat();
-    let float_shift = [">>", "40"].concat();
-    let magic = [
-        ["3c79", "ac49", "2ba7", "b653"].concat(),
-        ["1c69", "b3f7", "4ac4", "ae35"].concat(),
-        stride.clone(),
-        ambient_mask.clone(),
-        float_shift.clone(),
-        ["16777216", ".0"].concat(),
-    ];
-
+    // Collected rather than panicked on the first hit. A move that lands the
+    // magic in two files reports one, gets repointed, and reports the other
+    // on the next run — and the second report reads like a new regression
+    // rather than the rest of the same one.
+    let mut found = Vec::new();
     for relative in files {
         let contents = fs::read_to_string(root.join(&relative)).unwrap();
-        let normalized: String = contents
-            .chars()
-            .filter(|character| *character != '_' && !character.is_whitespace())
-            .flat_map(char::to_lowercase)
-            .collect();
-        for needle in &magic {
+        let normalized = normalize(&contents);
+        for needle in &needles.all {
             if !normalized.contains(needle) || owner(&relative) {
                 continue;
             }
-            if needle == &stride && path_in(allow.stride, &relative) {
+            if needle == &needles.stride && path_in(allow.stride, &relative) {
                 continue;
             }
-            if needle == &ambient_mask && path_in(allow.mask, &relative) {
+            if needle == &needles.mask && path_in(allow.mask, &relative) {
                 continue;
             }
-            if needle == &float_shift && path_in(allow.shift, &relative) {
+            if needle == &needles.shift && path_in(allow.shift, &relative) {
                 continue;
             }
-            panic!(
-                "PTIR RNG magic `{needle}` is independently transcribed in {}",
-                relative.display()
-            );
+            found.push(format!("`{needle}` in {}", relative.display()));
         }
     }
+    assert!(
+        found.is_empty(),
+        "PTIR RNG magic is independently transcribed in {} place(s):\n  {}",
+        found.len(),
+        found.join("\n  ")
+    );
 }
 
 /// The emitted CUDA source and the checked-in C++ header carry the same device
@@ -394,7 +455,10 @@ fn cuda_preamble_matches_the_header_literal() {
     );
     assert_eq!(
         embedded,
-        format!("\n{}", tensor_compiler::codegen::rng::cuda_device_functions()),
+        format!(
+            "\n{}",
+            tensor_compiler::codegen::rng::cuda_device_functions()
+        ),
         "the header literal and the emitter's preamble have drifted"
     );
 }

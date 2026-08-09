@@ -209,6 +209,12 @@ pub mod qwen_2;
 pub mod qwen_3;
 pub mod qwen_3_5;
 
+/// One row that describes no real checkpoint, so that a test can afford to
+/// write one. Absent unless asked for; see the module for why a closed set
+/// needs a door and why this is not one.
+#[cfg(feature = "test-rows")]
+pub mod test_rows;
+
 // ── Neither aspect ───────────────────────────────────────────────────
 //
 // What a served model's compiled metadata IS. Outside both aspects because the

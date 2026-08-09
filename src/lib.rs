@@ -3,7 +3,7 @@
 //! over these modules and `run_standalone` is the one public composition seam.
 //!
 //! This is the composition root, not a role crate — its `[lib]` exists purely to
-//! make the single compose seam testable (`bin/pie/tests/boot_smoke.rs` → green
+//! make the single compose seam testable (`tests/boot_smoke.rs` → green
 //! once golf's P5a `compose.rs` overlays), which is distinct from the worker's
 //! old lib+bin anti-pattern (a *role* crate flipping identity by feature).
 

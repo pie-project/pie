@@ -67,6 +67,10 @@ pub struct DummyDriverOptions {
     pub vocab_size: u32,
     pub max_model_len: u32,
     pub arch_name: String,
+    /// The catalog id the engine resolves to get layers, vocabulary and
+    /// the chat template. Unlike `arch_name` this is not decorative, which
+    /// is why it has no default worth writing down: see the `Default` impl.
+    pub model_id: String,
     pub activation_dtype: String,
     pub snapshot_dir: String,
     pub max_forward_tokens: u32,
@@ -104,6 +108,16 @@ impl Default for DummyDriverOptions {
             vocab_size: 32_000,
             max_model_len: 8192,
             arch_name: "dummy".to_string(),
+            // EMPTY, and deliberately not a real id.
+            //
+            // A default here would be a fixture claiming to be a model
+            // nobody asked for, and the engine would size a sampler and
+            // pick a chat template from it. Empty fails at
+            // `engine::model::register` with the nearest ids named, which
+            // is the failure a caller can act on. Callers that boot the
+            // engine set it; `worker::embedded_driver` identifies the
+            // checkpoint from its tensors to do so.
+            model_id: String::new(),
             activation_dtype: "f32".to_string(),
             snapshot_dir: String::new(),
             max_forward_tokens: 4096,
@@ -355,6 +369,7 @@ impl DummyDriver {
                 max_forward_requests: options.max_forward_requests,
                 max_page_refs: options.max_page_refs,
                 arch_name: options.arch_name,
+                model_id: options.model_id,
                 vocab_size: options.vocab_size,
                 max_model_len: options.max_model_len,
                 activation_dtype: options.activation_dtype,

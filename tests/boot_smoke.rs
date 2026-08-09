@@ -8,13 +8,13 @@
 //! inferlet, and a text completion through the dummy driver.
 //!
 //! **One boot per test process.** The runtime owns process-global singletons — `auth` panics
-//! "Service already spawned" on a 2nd boot (`runtime/src/auth.rs:31`) and the dummy driver grabs a
+//! "Service already spawned" on a 2nd boot (`crates/engine/src/service.rs:105`) and the dummy driver grabs a
 //! fixed POSIX shmem (`/pie_shmem_g0`) — so the gate is a *single* boot-once test that runs both
 //! the Tier-1 plane/addr checks and the ping-through-ingress check sequentially. (The same
 //! constraint applies to the `run` follow-on: one standalone per process.)
 //!
 //! Fixture: `tests/fixtures/smoke-model-ascii/tokenizer.json` — a real **256-token byte-level-BPE**
-//! tokenizer whose vocab is exactly `runtime/tokenizer/src/bpe.rs::build_byte_to_unicode`, id `n` =
+//! tokenizer whose vocab is exactly `crates/tokenizer/src/bpe.rs`'s `build_byte_to_unicode`, id `n` =
 //! byte `n` (`model.type=BPE`, empty `merges` → each byte = 1 token). **Boot-validated** (booted
 //! `bin/worker` → exit 0). The runtime parses the tokenizer at boot unconditionally
 //! (`model::register` → `Tokenizer::from_file`), so it must be valid — this is. The direct-channel
@@ -22,7 +22,7 @@
 //! dummy-driver PTIR path.
 //!
 //! Two loader requirements the fixture must satisfy, both checked at boot:
-//! `compile_profile` (`runtime/tokenizer/src/loader/huggingface.rs`) only accepts the *explicit*
+//! `compile_profile` (`crates/tokenizer/src/loader/huggingface.rs`) only accepts the *explicit*
 //! byte-level layout — a `Sequence` of `Split(Regex, Isolated)` + `ByteLevel{use_regex:false}` — not
 //! the classic GPT-2 bare `ByteLevel{use_regex:true}`; and `has_all_byte_atoms` requires all **256**
 //! byte atoms, not just ASCII. ``[driver] vocab_size`` must agree, or the
@@ -47,7 +47,11 @@ use client::client::Client;
 /// download — R3); auth off. The dummy driver's `[..options]` are explicit (`vocab_size = 128`
 /// constrains synthetic samples to valid single-byte UTF-8 IDs from the 128-token fixture;
 /// `arch_name` is kept explicit while the fixture `config.json` supplies the
-/// engine-owned model profile metadata).
+/// engine-owned model profile metadata; `model_id` names the catalog row the
+/// engine resolves for the layer count and the chat template, and it is stated
+/// rather than identified because the fixture checkpoint is four bytes -- see
+/// `worker::embedded_driver::identify_snapshot` for why a fabricating driver
+/// gets to say so).
 fn standalone_toml(snapshot: &str) -> String {
     format!(
         "         [server]\n\
@@ -61,8 +65,9 @@ fn standalone_toml(snapshot: &str) -> String {
          type = \"dummy\"\n\
          device = [\"cpu\"]\n\
          \n\
-         vocab_size = 256\n\
-         arch_name = \"qwen3\"\n"
+         vocab_size = 128\n\
+         arch_name = \"qwen3\"\n\
+         model_id = \"test-tiny-llama\"\n"
     )
 }
 

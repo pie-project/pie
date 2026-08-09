@@ -45,8 +45,8 @@ mod preflight;
 // pyo3 wheel code against the top-level paths and the reorg moves impls
 // underneath without reworking them.
 pub use config::Config;
-pub use engine::{WorkerHandle, run, run_with};
 pub use controller_api::Role;
+pub use engine::{WorkerHandle, run, run_with};
 // The control-plane seam `run_with` is generic over — re-exported so the
 // composition root (`bin/pie`) can impl it for its `EmbeddedControl` adapter.
 pub use link::control::ControlLink;

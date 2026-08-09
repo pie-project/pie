@@ -60,6 +60,23 @@ fn crates_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// The workspace root.
+///
+/// `crates/` is not all of the workspace: the `pie` binary's own `src/`
+/// and `tests/` sit beside it, and stopping at `crates/` left them
+/// unscanned by an argument that never applied to them. The slip is a
+/// property of editing long strings, and the root edits long strings.
+///
+/// It measured clean when this widened, so nothing was fixed to make it
+/// pass — which is the point of doing it while it is free rather than
+/// after the first offender lands.
+fn workspace_root() -> PathBuf {
+    crates_dir()
+        .parent()
+        .expect("crates/ has a parent")
+        .to_path_buf()
+}
+
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -138,6 +155,8 @@ fn collapsed_literals(src: &str) -> Vec<(usize, String)> {
 fn no_message_carries_a_swallowed_indent() {
     let mut sources = Vec::new();
     rust_sources(&crates_dir(), &mut sources);
+    rust_sources(&workspace_root().join("src"), &mut sources);
+    rust_sources(&workspace_root().join("tests"), &mut sources);
     assert!(
         sources.len() > 200,
         "the scan found only {} sources; it is not reaching the workspace",
@@ -150,7 +169,7 @@ fn no_message_carries_a_swallowed_indent() {
             continue;
         };
         for (line, text) in collapsed_literals(&src) {
-            let rel = path.strip_prefix(crates_dir()).unwrap_or(path);
+            let rel = path.strip_prefix(workspace_root()).unwrap_or(path);
             offenders.push(format!("  {}:{line}\n    {text}", rel.display()));
         }
     }

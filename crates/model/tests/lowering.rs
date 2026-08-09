@@ -361,9 +361,9 @@ fn the_moe_block_covers_itself_only_in_its_cuda_reading() {
 /// rectangle in the flat list — no residue, on every deployment the
 /// driver serves, in both classes, sampled and unsampled.
 ///
-/// This started as a ledger (88.7%-93.8%, residue `Swiglu` per layer
-/// + `LmHead` per fire) and is now the gate itself: `launches` is
-/// the WHOLE of what a fire runs, which is the property the driver
+/// This started as a ledger (88.7%-93.8%, residue `Swiglu` per
+/// layer + `LmHead` per fire) and is now the gate itself: `launches`
+/// is the WHOLE of what a fire runs, which is the property the driver
 /// needs before it can stop walking. A regression here is a
 /// statement that would silently not execute.
 #[test]

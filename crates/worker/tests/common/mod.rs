@@ -114,9 +114,7 @@ pub fn cuda_toml() -> String {
 pub async fn boot_cuda_model(snapshot_path: &str) -> WorkerHandle {
     let cfg =
         worker::Config::parse(&cuda_toml_for(snapshot_path)).expect("parse cuda worker config");
-    worker::run(cfg)
-        .await
-        .expect("boot embedded cuda engine")
+    worker::run(cfg).await.expect("boot embedded cuda engine")
 }
 
 /// Boot the embedded cuda engine with the default dense model (Qwen3-0.6B).

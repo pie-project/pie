@@ -7,10 +7,10 @@
 use crate::codegen::error::{EmitError, RegionForm, ValueLayoutSite};
 use crate::codegen::wellformed::{ops_valid, region_ranges_valid, value_types_valid};
 
+use crate::plan::{CompiledStage, Region, RegionKind, ScheduleTemplate, library_op_for_tag};
 use tensor_ir::op::Op;
 use tensor_ir::registry::Stage;
 use tensor_ir::types::DType;
-use crate::plan::{CompiledStage, Region, RegionKind, ScheduleTemplate, library_op_for_tag};
 
 /// `second_party_region_supported` — `envelope_dot` is the only second-party
 /// kernel this backend launches, so anything else fails at bind rather than
@@ -63,8 +63,7 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
             // 3 args = low-rank (A, B, SITES); 2 args = the SCALE form
             // (L, SITES) — IA3 (the adapter per-form rung).
             "lora" => {
-                (args.len() == 3 || args.len() == 2)
-                    && stage.normalized.stage == Stage::Prologue
+                (args.len() == 3 || args.len() == 2) && stage.normalized.stage == Stage::Prologue
             }
             _ => false,
         };
@@ -124,6 +123,7 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
 #[cfg(test)]
 mod tests {
     use super::second_party_region_supported;
+    use crate::plan::{LibraryOp, RegionKind, compile_bound};
     use alloc::string::ToString;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -132,7 +132,6 @@ mod tests {
     use tensor_ir::registry::{ModelProfile, Stage};
     use tensor_ir::types::{DType, Shape};
     use tensor_ir::validate::bind;
-    use crate::plan::{LibraryOp, RegionKind, compile_bound};
 
     /// A prologue `lora` container: three peeked channels feeding the sink,
     /// with an optional argument dropped to model a malformed call.

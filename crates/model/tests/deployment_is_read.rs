@@ -102,7 +102,10 @@ fn read_by_consumers() -> BTreeSet<String> {
         crates += 1;
         walk(&p.join("src"), &mut all);
     }
-    assert!(crates > 5, "found only {crates} sibling crates — the scan broke");
+    assert!(
+        crates > 5,
+        "found only {crates} sibling crates — the scan broke"
+    );
 
     let mut seen = BTreeSet::new();
     for (i, _) in all.match_indices('.') {
@@ -120,7 +123,11 @@ fn read_by_consumers() -> BTreeSet<String> {
 #[test]
 fn every_deployment_field_reaches_a_driver() {
     let names = declared();
-    assert!(names.len() > 15, "found only {} fields — the scan broke", names.len());
+    assert!(
+        names.len() > 15,
+        "found only {} fields — the scan broke",
+        names.len()
+    );
 
     let read = read_by_consumers();
     let excused: BTreeSet<&str> = UNREAD_BY_CONSUMERS.iter().map(|(n, _)| *n).collect();

@@ -934,8 +934,9 @@ mod tests {
     /// Flipping each byte in turn closes the decode half without needing a
     /// second value per field: an ignored byte is one whose mutation changes
     /// nothing. The encode half — a field never written at all — leaves no
-    /// byte to flip and is still held only by the byte goldens and the C++
-    /// mirror in `op_table_drift`.
+    /// byte to flip and is now held only by the byte goldens. It had a
+    /// second holder, the C++ mirror in `op_table_drift`, until that header
+    /// was deleted with the C++ Metal driver.
     #[test]
     fn no_byte_of_an_op_encoding_is_ignored_by_its_decoder() {
         let mut ignored: Vec<String> = Vec::new();

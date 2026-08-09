@@ -66,7 +66,7 @@ impl GptOssFacts {
     /// through `per_layer_window_left` — a scalar the text does not
     /// state, since the window is an argument and not a kernel.
     pub fn is_sliding(&self, l: u32) -> bool {
-        l % 2 == 0
+        l.is_multiple_of(2)
     }
 
     /// openai/gpt-oss-20b, read from the checkpoint's `config.json`

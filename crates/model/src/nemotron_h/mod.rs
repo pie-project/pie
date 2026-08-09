@@ -43,7 +43,12 @@ pub mod spec;
 /// What those numbers imply: a manifest, a deployment, a trace.
 pub mod project;
 
-use std::sync::{Arc, OnceLock};
+// `Arc` is the chat aspect's alone: it is the tokenizer a template
+// is handed and the `dyn Instruct` it is returned as. `OnceLock`
+// widens this generation's rows and every aspect reads that.
+#[cfg(feature = "chat")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::{Advertised, Deployment, Refusal};
@@ -245,9 +250,11 @@ impl Variant for NemotronH {
 mod tests {
     use super::spec::NemotronLayerKind;
     use super::{
-        ARCH, Deployed, HEAD_DIM_KERNEL, NORM_EPS, NemotronH, ROPE_THETA, VARIANTS, Variant,
-        project, rows,
+        ARCH, Deployed, HEAD_DIM_KERNEL, NORM_EPS, NemotronH, ROPE_THETA, VARIANTS, Variant, rows,
     };
+    // Only the refusal's test names the projection's constant.
+    #[cfg(feature = "forward")]
+    use super::project;
     use crate::manifest::{Observed, Presence};
 
     fn row(id: &str) -> &'static NemotronH {
@@ -496,7 +503,6 @@ mod tests {
     #[cfg(feature = "chat")]
     #[test]
     fn the_assistant_turn_opens_inside_a_think_block() {
-        use crate::instruct::Instruct;
         use std::sync::Arc;
         // `<think>\n` is ONE entry, because the suffix is encoded whole:
         // `Tokenizer::from_vocab` is a raw-char table and a fixture that

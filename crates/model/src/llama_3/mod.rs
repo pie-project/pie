@@ -36,7 +36,12 @@
 
 #[cfg(feature = "chat")]
 pub mod chat;
-use std::sync::{Arc, OnceLock};
+// `Arc` is the chat aspect's alone: it is the tokenizer a template
+// is handed and the `dyn Instruct` it is returned as. `OnceLock`
+// widens this generation's rows and every aspect reads that.
+#[cfg(feature = "chat")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -809,7 +814,6 @@ mod tests {
     #[cfg(feature = "chat")]
     #[test]
     fn the_template_is_the_header_protocol_and_not_the_chatml_fallback() {
-        use crate::instruct::Instruct;
         use tokenizer::Tokenizer;
 
         let vocab: Vec<String> = [
@@ -855,7 +859,6 @@ mod tests {
     #[cfg(feature = "chat")]
     #[test]
     fn every_row_answers_the_chat_question() {
-        use crate::instruct::Instruct;
         use tokenizer::Tokenizer;
 
         let vocab: Vec<String> = [

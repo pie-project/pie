@@ -48,7 +48,7 @@ pub const fn window_schedule<const N: usize>(
     let mut out = [sliding_window; N];
     let mut l = 0;
     while l < N {
-        if full_attn_interval > 0 && (l as u32 + 1) % full_attn_interval == 0 {
+        if full_attn_interval > 0 && (l as u32 + 1).is_multiple_of(full_attn_interval) {
             out[l] = -1;
         }
         l += 1;

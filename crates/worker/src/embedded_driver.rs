@@ -208,14 +208,9 @@ fn path_string(path: &Path) -> String {
 /// old name meant a `pie.model/1` document — ~40 resolved fields, a schema, a
 /// reader in each driver — and that document is deleted. What travels here is
 /// the checkpoint's own `config.json`, verbatim, read for exactly one field.
-fn write_config_beside(
-    out_path: &Path,
-    config: &[u8],
-    model: &mut toml::Table,
-) -> Result<()> {
+fn write_config_beside(out_path: &Path, config: &[u8], model: &mut toml::Table) -> Result<()> {
     let beside = out_path.with_file_name("model.config.json");
-    std::fs::write(&beside, config)
-        .with_context(|| format!("write model config {beside:?}"))?;
+    std::fs::write(&beside, config).with_context(|| format!("write model config {beside:?}"))?;
     insert_str(model, "config", path_string(&beside));
     Ok(())
 }
@@ -579,7 +574,10 @@ pub(crate) fn write_cuda_startup_toml(
     // The driver still speaks GiB floats; the unit lives in the config type,
     // not on the wire.
     if let Some(size) = opts.expert_cache {
-        model.insert("expert_cache_gb".into(), toml::Value::Float(size.as_gib_f64()));
+        model.insert(
+            "expert_cache_gb".into(),
+            toml::Value::Float(size.as_gib_f64()),
+        );
     }
     if let Some(size) = opts.expert_host_cache {
         model.insert(
@@ -669,6 +667,55 @@ fn local_driver_state_dir(group_id: usize, tp: Option<&TpLaunch>) -> Result<Path
     Ok(state_dir)
 }
 
+/// The catalog row the dummy driver reports having loaded.
+///
+/// `engine::model::register` resolves this id to a row and takes the layer
+/// count, the vocabulary and the chat template from it. So unlike
+/// `vocab_size` and `arch_name` it is not decorative: the engine acts on
+/// it, and an id that resolves to nothing stops the boot.
+///
+/// # Two answers, because the dummy is two things
+///
+/// **Stated** (`[model.driver.options] model_id`) it is taken at its word.
+/// That is the same leniency `vocab_size` already gets from this driver and
+/// for the same reason -- the dummy loads no weights, so there is nothing
+/// for a manifest to be checked against. `tests/boot_artifact.rs` converts
+/// a four-byte checkpoint precisely to prove the artifact plumbing works
+/// without any; asking it to match a real model's tensors would be asking
+/// it to stop being the test it is. The id still has to NAME a row, which
+/// is what keeps a typo from reaching the engine.
+///
+/// **Absent** it is identified from the checkpoint's tensors -- the same
+/// question `pie model build` asks, in the same words. A snapshot that
+/// really is a model gets the real answer without anyone writing it down.
+///
+/// The leniency is this function's, not the catalog's: nothing but the
+/// dummy driver calls it, and a real driver identifies or refuses.
+fn identify_snapshot(snapshot_dir: &Path, stated: Option<&str>) -> Result<String> {
+    if let Some(id) = stated {
+        let row = model::catalog::find(id).ok_or_else(|| {
+            anyhow!(
+                "`[model.driver.options] model_id` is {id:?}, which this build's \
+                 model catalog does not contain; nearest ids: {:?}",
+                model::catalog::nearest_ids(id, 3),
+            )
+        })?;
+        return Ok(row.id().to_owned());
+    }
+    let metadata = model_loader::checkpoint::read::parse_checkpoint_metadata(snapshot_dir)
+        .map_err(|e| anyhow!("read the checkpoint at {snapshot_dir:?} to identify it: {e}"))?;
+    let row = model::catalog::identify(&metadata, &model::catalog::Override::None).map_err(
+        |unmatched| {
+            anyhow!(
+                "the checkpoint at {snapshot_dir:?} does not identify: {unmatched}. \
+                 State `[model.driver.options] model_id` to say which row the dummy \
+                 driver should report."
+            )
+        },
+    )?;
+    Ok(row.id().to_owned())
+}
+
 fn dummy_native_options(
     opts: &DummyDriverOptions,
     snapshot_dir: &Path,
@@ -693,6 +740,36 @@ fn dummy_native_options(
         }
     };
 
+    let model_id = identify_snapshot(snapshot_dir, opts.model_id.as_deref())?;
+    // ONE VOCABULARY, NOT TWO.
+    //
+    // The engine sizes its logits from the ROW; this driver checks bound
+    // programs against its own advertised `vocab_size`. When the two
+    // disagree the boot succeeds and the first chat completion fails deep
+    // inside program binding -- "declared type violates the registry rule
+    // (profile: vocab=256)" -- naming neither the row nor the option that
+    // produced it.
+    //
+    // So they are held equal here, where both are in hand and both names
+    // are sayable. This is the same rule the catalog is for, applied to the
+    // one driver that can still hold two answers because it fabricates one
+    // of them.
+    let row_vocab = model::catalog::find(&model_id)
+        .expect("`identify_snapshot` returns an id it resolved")
+        .deployment(model::catalog::Deployed::single())
+        .map_err(|refusal| anyhow!("this build refuses {model_id:?}: {refusal}"))?
+        .shape
+        .vocab;
+    if vocab_size != row_vocab {
+        return Err(anyhow!(
+            "`[model.driver.options] vocab_size` is {vocab_size}, but the row \
+             {model_id:?} has a vocabulary of {row_vocab}. The engine sizes \
+             logits from the row and this driver checks programs against the \
+             option, so a bound program would be refused later with neither \
+             number named. Set one to match the other."
+        ));
+    }
+
     let max_forward_tokens = 4096u32;
     let max_forward_requests = 128u32;
     let total_pages = 256u32
@@ -714,6 +791,7 @@ fn dummy_native_options(
         max_forward_tokens,
         max_forward_requests,
         max_page_refs: total_pages,
+        model_id,
         has_mtp_logits: true,
         has_mtp_drafts: true,
         has_value_head: true,
@@ -787,14 +865,7 @@ pub(crate) fn create_driver_backend_group(
         }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
         let toml_path = state_dir.join("driver.toml");
-        write_cuda_startup_toml(
-            &toml_path,
-            opts,
-            snapshot_dir,
-            group_id,
-            Some(tp),
-            config,
-        )?;
+        write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp), config)?;
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 
@@ -940,7 +1011,7 @@ mod tests {
                 "model_type": "qwen3",
                 "architectures": ["Qwen3ForCausalLM"],
                 "num_hidden_layers": 1,
-                "vocab_size": 32,
+                "vocab_size": 128,
                 "max_position_embeddings": 128
             }"#,
         )
@@ -957,6 +1028,11 @@ mod tests {
                 opts: DummyDriverOptions {
                     vocab_size: None,
                     arch_name: None,
+                    // STATED, because this checkpoint is four bytes: what
+                    // is under test is the create/compile/load sequence,
+                    // and a fixture that had to match a real model's
+                    // tensors would be testing the manifest instead.
+                    model_id: Some(model::test_rows::TINY_LLAMA.to_string()),
                     ready_timeout: crate::config::Duration::from_secs(5),
                 },
                 random_seed: 7,
@@ -970,7 +1046,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(group.caps.arch_name, "qwen3");
-        assert_eq!(group.caps.vocab_size, 32);
+        assert_eq!(group.caps.vocab_size, 128);
+        assert_eq!(group.caps.model_id, model::test_rows::TINY_LLAMA);
         assert_eq!(group.caps.snapshot_dir, snapshot.display().to_string());
     }
 
@@ -1252,8 +1329,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("driver.toml");
         let snap = dir.path().join("snapshot");
-        write_cuda_startup_toml(&out, &CudaNativeDriverOptions::default(), &snap, 0, None, CONFIG)
-            .unwrap();
+        write_cuda_startup_toml(
+            &out,
+            &CudaNativeDriverOptions::default(),
+            &snap,
+            0,
+            None,
+            CONFIG,
+        )
+        .unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(val["cache"]["dir"].as_str().unwrap(), "/pie-home/cache");
     }
@@ -1280,7 +1364,10 @@ mod tests {
         sweep_stale_launch_state();
 
         assert!(!dead.exists(), "a dead pid's state must be reclaimed");
-        assert!(live.exists(), "the running process's own state must survive");
+        assert!(
+            live.exists(),
+            "the running process's own state must survive"
+        );
         assert!(
             foreign.exists(),
             "a directory that is not a pid is not ours to remove"

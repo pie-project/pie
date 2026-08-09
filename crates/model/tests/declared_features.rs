@@ -465,3 +465,86 @@ fn an_inner_module_is_keyed_under_its_door() {
         "the bare name would collide with a root module of the same name"
     );
 }
+
+/// Nothing but an explicit `--features test-rows` turns test rows on.
+///
+/// `catalog::a_shipped_catalog_has_no_test_rows` asserts the catalog is
+/// clean, but it cannot assert this: it is `#[cfg(not(feature =
+/// "test-rows"))]`, so a feature that switched test rows on would delete
+/// the guard rather than trip it. The claim "no other feature reaches this
+/// one" is a claim about the MANIFEST, and it has to be checked there.
+///
+/// Two ways it could be reached, and both are read off the source:
+///
+/// 1. `default`, or any other feature of `model`, listing `test-rows`.
+/// 2. A NON-DEV dependency on `model` enabling it. Dev-dependencies may —
+///    the root package's does, and that is the point: Cargo unifies
+///    dev-dependency features into builds that resolve dev targets, so
+///    `cargo test -p pie` gets the row and `cargo build -p pie` does not.
+///    That is this file's own trap, used deliberately, which is why the
+///    check has to distinguish the two sections rather than ban the string.
+#[test]
+fn only_an_explicit_feature_flag_puts_test_rows_in_a_build() {
+    let root = workspace_root();
+
+    let manifest = std::fs::read_to_string(root.join("crates/model/Cargo.toml"))
+        .expect("model/Cargo.toml is readable");
+    let mut section = String::new();
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            section = t.to_string();
+            continue;
+        }
+        if section != "[features]" || t.starts_with('#') {
+            continue;
+        }
+        let Some((name, rhs)) = t.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        assert!(
+            name == "test-rows" || !rhs.contains("test-rows"),
+            "feature `{name}` enables `test-rows`, which would delete \
+             `a_shipped_catalog_has_no_test_rows` instead of failing it",
+        );
+    }
+    assert!(
+        !default_features(&root).contains("test-rows"),
+        "`default` enables `test-rows`",
+    );
+
+    // Every workspace manifest, split at the dev boundary.
+    let mut manifests = vec![root.join("Cargo.toml")];
+    for entry in std::fs::read_dir(root.join("crates")).expect("crates/ is readable") {
+        let path = entry.expect("a readable entry").path().join("Cargo.toml");
+        if path.is_file() {
+            manifests.push(path);
+        }
+    }
+    for path in manifests {
+        let text = std::fs::read_to_string(&path).expect("a readable manifest");
+        let (mut deps, mut dev) = (false, false);
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with('[') && t.ends_with(']') {
+                // A DEPENDENCY table, by any of its spellings:
+                // `[dependencies]`, `[dependencies.model]`,
+                // `[target.'cfg(unix)'.dev-dependencies]`. Anything else --
+                // `[features]` above all, where `test-rows = []` is
+                // declared -- is not a place a dependency turns it on.
+                deps = t.contains("dependencies");
+                dev = t.contains("dev-dependencies");
+                continue;
+            }
+            if !deps || dev || t.starts_with('#') || !t.contains("test-rows") {
+                continue;
+            }
+            panic!(
+                "{}: a non-dev dependency enables `test-rows`:\n  {t}\n\
+                 A shipped build would carry a row no checkpoint matches.",
+                path.display(),
+            );
+        }
+    }
+}

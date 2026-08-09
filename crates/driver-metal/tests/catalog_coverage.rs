@@ -247,7 +247,7 @@ fn extraordinary(d: &Deployment) -> Option<String> {
     {
         return Some("a zero where a width belongs".into());
     }
-    if d.shape.q_heads % d.shape.kv_heads != 0 {
+    if !d.shape.q_heads.is_multiple_of(d.shape.kv_heads) {
         return Some("a head count GQA cannot group".into());
     }
     if d.attention.len() != d.layers as usize {

@@ -543,6 +543,15 @@ impl SgValuation {
     }
 }
 
+// THE EMITTER'S CONTEXT, THREADED.
+//
+// `b`, the facts, the CUDA facts and the fire's class are the same for
+// every statement in a trace, so they ride along rather than being
+// re-derived. A struct holding them would be built once per call and
+// read once per field, which buys a shorter signature and nothing else.
+// `emit_range_scoped` below has carried this allow since it was written;
+// its callers and callees differ from it only in arity.
+#[allow(clippy::too_many_arguments)]
 fn emit_range(
     b: &mut Body,
     plan: &ForwardPlan,
@@ -973,11 +982,13 @@ fn emit_row_norm(b: &mut Body, facts: &LlamaLikeFacts, weight: &str) {
         "k_norm" => ("ws.k.data()", "ws.k.data()", "Hk"),
         other => panic!("emitter: row-norm field {other} out of scope"),
     };
-    b.stmt(&format!("kernels::norm::rmsnorm_bf16("));
+    b.stmt("kernels::norm::rmsnorm_bf16(");
     b.stmt(&format!("    {input}, {},", require(layer, field, weight)));
     b.stmt(&format!("    {output}, N, {width}, eps, stream);"));
 }
 
+// The emitter's context, threaded -- see `emit_range` above.
+#[allow(clippy::too_many_arguments)]
 fn emit_op(
     b: &mut Body,
     op: &model_compiler::trace::Op,
@@ -1182,7 +1193,7 @@ fn emit_op(
             // Unpadded shape: no pad staging. The write mechanism is a
             // per-fire RUNTIME input (Guard's territory, see
             // declared_forward.hpp); both branches are the interpreter's.
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    if (has_write_desc) {");
             b.stmt("        kernels::attn::write_kv_explicit_bf16(");
@@ -1357,6 +1368,8 @@ fn emit_masked_pages_bracket(b: &mut Body, layer: u32, takes_paged_decode: bool)
     b.stmt("}");
 }
 
+// The emitter's context, threaded -- see `emit_range` above.
+#[allow(clippy::too_many_arguments)]
 fn emit_launch(
     b: &mut Body,
     kernel: &str,
@@ -1500,7 +1513,7 @@ fn emit_launch(
         "attn::write_kv_explicit_bf16" => {
             let layer = state.expect("kv write addresses kv state").layer;
             if matches!(win, Some(Win::DevTail)) {
-                b.stmt(&format!("{{"));
+                b.stmt("{");
                 b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
                 b.stmt("    kernels::attn::write_kv_explicit_bf16_devwin(");
                 b.stmt("        kv_view, ws.k.data(), ws.v.data(),");
@@ -1523,7 +1536,7 @@ fn emit_launch(
             } else {
                 ("ws.k.data()", "ws.v.data()")
             };
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::write_kv_explicit_bf16(");
             b.stmt("        kv_view,");
@@ -1544,7 +1557,7 @@ fn emit_launch(
                 "kv_view, ws.k.data(), ws.v.data(),"
             };
             if matches!(win, Some(Win::DevTail)) {
-                b.stmt(&format!("{{"));
+                b.stmt("{");
                 b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
                 b.stmt("    kernels::attn::write_kv_to_pages_bf16_devwin(");
                 b.stmt(&format!("        {kv_bufs}"));
@@ -1554,7 +1567,7 @@ fn emit_launch(
                 b.stmt("}");
                 return;
             }
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             let first = match win {
                 Some(Win::Host { start, .. }) => start,
@@ -1608,7 +1621,7 @@ fn emit_launch(
             );
             let layer = state.expect("attention addresses kv state").layer;
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/ false);
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::attention_xqa_decode_bf16_prepared(");
             b.stmt("        ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,");
@@ -1630,7 +1643,7 @@ fn emit_launch(
             } else {
                 "kv_page_indptr_h[R]"
             };
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::dequant_kv_cache_layer_to_bf16_active(");
             b.stmt(&format!(
@@ -1652,7 +1665,7 @@ fn emit_launch(
             // interpreter needs the fallback branch; the emitter does
             // not).
             if is_decode {
-                b.stmt(&format!("{{"));
+                b.stmt("{");
                 b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
                 b.stmt(&format!("    const int layer_window_left = {window};"));
                 // A mask peel's prefix region: the plan-free launcher
@@ -1684,7 +1697,7 @@ fn emit_launch(
             b.stmt("    throw std::runtime_error(");
             b.stmt("        \"generated forward: prepare built no prefill plan\");");
             b.stmt("}");
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::dispatch_attention_flashinfer_prefill_bf16(");
             b.stmt(&format!("        *{plan_cache},"));
@@ -1738,7 +1751,7 @@ fn emit_launch(
                 b.stmt("        \"spatial mask: split active but prepare built \"");
                 b.stmt("        \"no prefix decode plan\");");
                 b.stmt("}");
-                b.stmt(&format!("{{"));
+                b.stmt("{");
                 b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
                 b.stmt(&format!("    const int layer_window_left = {window};"));
                 b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode(");
@@ -1780,7 +1793,7 @@ fn emit_launch(
                 b.stmt("        \"generated forward: prepare built no decode plan\");");
                 b.stmt("}");
             }
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt(&format!("    const int layer_window_left = {window};"));
             if depth_active {
@@ -1827,7 +1840,7 @@ fn emit_launch(
             b.stmt("    throw std::runtime_error(");
             b.stmt("        \"generated forward: prepare built no custom-mask plan\");");
             b.stmt("}");
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             match win {
                 // The UnmaskedPrefix peel's TAIL region (NS-4 in the
@@ -1908,7 +1921,7 @@ fn emit_launch(
             b.stmt("        \"active score capture (guard/pred drift)\");");
             b.stmt("}");
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/ true);
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode_capture(");
             b.stmt("        *plan_state.decode_plan,");
@@ -1943,7 +1956,7 @@ fn emit_launch(
             b.stmt("        \"active score capture (guard/pred drift)\");");
             b.stmt("}");
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/ false);
-            b.stmt(&format!("{{"));
+            b.stmt("{");
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::dispatch_attention_flashinfer_prefill_capture_bf16(");
             b.stmt(&format!("        *{plan_cache},"));

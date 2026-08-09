@@ -980,7 +980,8 @@ impl Device {
     ///
     /// [`Self::run`] is one dispatch, one command buffer, one submit and one
     /// fence wait, which is right for a test and wrong for a fire: a real
-    /// plan states 3992 rectangles and 3992 round trips to the queue is most
+    /// plan states thousands of rectangles -- six texts here state 6272 --
+    /// and one round trip to the queue per rectangle is most
     /// of the time a small model spends.
     ///
     /// Between every pair a full compute-to-compute memory barrier. Vulkan
@@ -1389,6 +1390,14 @@ impl<'a> Bound<'a> {
         // driver, and dividing by a zero one would panic where refusing is the
         // whole job. Every offset is a multiple of 1, so a device that reports
         // nothing constrains nothing.
+        //
+        // UNWITNESSED, and unwitnessably so from here: deleting it changes no
+        // test because the alignment comes from the device's own limits and
+        // this card reports 16. Reaching it needs a driver that reports zero,
+        // which is the case it exists for and not one a test can produce. Kept
+        // rather than removed -- unlike the dead clamp in `geometry.rs`, this
+        // one guards a division and its absence is a panic, not a wrong
+        // answer.
         let alignment = alignment.max(1);
         if !offset.is_multiple_of(alignment) {
             return Err(Failed::Unaligned { offset, alignment });
@@ -1501,6 +1510,17 @@ impl Default for Pipelines {
 }
 
 impl Pipelines {
+    /// How many pipelines this cache holds.
+    ///
+    /// Not `len`, because a cache is not a collection the caller iterates and
+    /// `is_empty` would be the next thing a lint asked for. This exists so
+    /// that "the second fire built nothing new" is a number rather than a
+    /// claim about how long something took.
+    #[must_use]
+    pub fn built(&self) -> usize {
+        self.built.len()
+    }
+
     /// An empty cache.
     #[must_use]
     pub fn new() -> Self {

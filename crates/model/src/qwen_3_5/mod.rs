@@ -20,7 +20,12 @@
 //! Chat: the qwen3 lineage's ChatML, stated per row rather than reached
 //! through `instruct::create`'s `_ =>` arm.
 
-use std::sync::{Arc, OnceLock};
+// `Arc` is the chat aspect's alone: it is the tokenizer a template
+// is handed and the `dyn Instruct` it is returned as. `OnceLock`
+// widens this generation's rows and every aspect reads that.
+#[cfg(feature = "chat")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -499,6 +504,9 @@ mod tests {
             stem, ARCH,
             "the worker would refuse a real Qwen3.5 checkpoint"
         );
+        // The front-end table is the chat aspect's, so a build without
+        // it makes no claim about which decoder a label selects.
+        #[cfg(feature = "chat")]
         assert_eq!(
             crate::multimodal::VisionArch::from_arch_name(ARCH),
             Some(crate::multimodal::VisionArch::Qwen36),

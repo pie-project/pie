@@ -39,7 +39,10 @@ fn check_or_regenerate(path: &Path, expected: &str) {
 fn ptir_header_uptodate() {
     let root = repo_root();
     let expected = generate_c_header();
-    check_or_regenerate(&root.join("crates/tensor-compiler/include/ptir_abi.h"), &expected);
+    check_or_regenerate(
+        &root.join("crates/tensor-compiler/include/ptir_abi.h"),
+        &expected,
+    );
 }
 
 /// No C++ header may re-type a value the generated header already owns.

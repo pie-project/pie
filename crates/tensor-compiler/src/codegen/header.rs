@@ -8,12 +8,12 @@ use alloc::format;
 use alloc::string::String;
 
 use crate::codegen::layout;
+use crate::plan::{LibraryOp, ScheduleTemplate, SymbolicExtent};
 use tensor_ir::PTIR_VERSION;
 use tensor_ir::container::DT_ACT;
 use tensor_ir::op::{IntrinsicId, OP_TABLE, VARIADIC};
 use tensor_ir::registry::{KNOWN_SINKS, PHASE_DESCRIPTOR_TAG, Port, Stage};
 use tensor_ir::types::DType;
-use crate::plan::{LibraryOp, ScheduleTemplate, SymbolicExtent};
 
 /// Render `include/ptir_abi.h`. Pure function of the tables — byte-stable.
 pub fn generate_c_header() -> String {

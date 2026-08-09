@@ -166,13 +166,11 @@ impl PartnerLinkManager {
         let peer_conn = {
             #[cfg(feature = "nixl")]
             {
-                self.nixl
-                    .as_ref()
-                    .map(|nixl| driver_api::RemotePeerConn {
-                        kind: driver_api::RemoteTransferKind::Nixl,
-                        handle: Some(self.config.home_kv_handle.clone()),
-                        metadata: nixl.metadata.clone(),
-                    })
+                self.nixl.as_ref().map(|nixl| driver_api::RemotePeerConn {
+                    kind: driver_api::RemoteTransferKind::Nixl,
+                    handle: Some(self.config.home_kv_handle.clone()),
+                    metadata: nixl.metadata.clone(),
+                })
             }
             #[cfg(not(feature = "nixl"))]
             {

@@ -58,13 +58,22 @@ const MOVES: &[(&str, &str)] = &[
     ("server.worker_threads", "runtime.worker_threads"),
     ("server.max_upload", "runtime.max_upload"),
     // Admission is scheduling.
-    ("runtime.max_concurrent_processes", "server.max_concurrent_processes"),
+    (
+        "runtime.max_concurrent_processes",
+        "server.max_concurrent_processes",
+    ),
     // Distributed serving was three sections for one deployment shape.
     ("cluster.max_clients", "executor.max_clients"),
     ("cluster.offload", "offload.enabled"),
     ("cluster.transfer", "offload.transfer"),
-    ("cluster.prefill_min_suffix_tokens", "offload.prefill_min_suffix_tokens"),
-    ("cluster.max_outstanding_per_partner", "offload.max_outstanding_per_partner"),
+    (
+        "cluster.prefill_min_suffix_tokens",
+        "offload.prefill_min_suffix_tokens",
+    ),
+    (
+        "cluster.max_outstanding_per_partner",
+        "offload.max_outstanding_per_partner",
+    ),
 ];
 
 /// Keys `[driver]` carries that are common to every driver. Everything else in
@@ -132,18 +141,14 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
         }
     }
     if file.contains_key("worker") {
-        bail!(
-            "[worker] is no longer a section: its contents are the file."
-        );
+        bail!("[worker] is no longer a section: its contents are the file.");
     }
     if file
         .get("model")
         .and_then(|m| m.as_table())
         .is_some_and(|t| t.contains_key("driver") || t.contains_key("scheduler"))
     {
-        bail!(
-            "[model.driver] / [model.scheduler] are now [driver] and [runtime]."
-        );
+        bail!("[model.driver] / [model.scheduler] are now [driver] and [runtime].");
     }
 
     let mut leaves = Vec::new();
@@ -200,7 +205,6 @@ fn to_internal_path(file_path: &str) -> String {
     }
 }
 
-
 /// Insert `value` at a dotted path, merging tables rather than replacing them.
 fn insert_at(root: &mut toml::Table, path: &str, value: toml::Value) -> Result<()> {
     let mut parts: Vec<&str> = path.split('.').collect();
@@ -230,7 +234,6 @@ fn insert_at(root: &mut toml::Table, path: &str, value: toml::Value) -> Result<(
     Ok(())
 }
 
-
 /// Flatten a document to `(dotted path, scalar)` pairs.
 fn collect_leaves(value: &toml::Value, prefix: &str, out: &mut Vec<(String, toml::Value)>) {
     match value {
@@ -258,8 +261,14 @@ mod tests {
     #[test]
     fn a_key_reads_back_as_the_path_the_file_spells_it() {
         // What `pie config list` prints has to be what `pie config set` takes.
-        assert_eq!(to_file_path("model.scheduler.request_timeout"), "runtime.request_timeout");
-        assert_eq!(to_file_path("runtime.allow_network"), "sandbox.allow_network");
+        assert_eq!(
+            to_file_path("model.scheduler.request_timeout"),
+            "runtime.request_timeout"
+        );
+        assert_eq!(
+            to_file_path("runtime.allow_network"),
+            "sandbox.allow_network"
+        );
         assert_eq!(to_file_path("model.driver.type"), "driver.type");
         assert_eq!(
             to_file_path("model.driver.options.gpu_mem_utilization"),
@@ -278,7 +287,10 @@ mod tests {
         // `server.worker_threads` both match an internal path starting
         // `runtime`; the specific one has to win or the tuning knob would be
         // reported as a scheduler key.
-        assert_eq!(to_file_path("runtime.worker_threads"), "server.worker_threads");
+        assert_eq!(
+            to_file_path("runtime.worker_threads"),
+            "server.worker_threads"
+        );
         assert_eq!(to_file_path("runtime.max_upload"), "server.max_upload");
     }
 
@@ -290,8 +302,6 @@ mod tests {
         // Names what to do instead, not only what is wrong.
         assert!(err.contains("[cluster]"), "got: {err}");
     }
-
-
 
     #[test]
     fn driver_keys_split_into_common_and_specific() {

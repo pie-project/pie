@@ -1061,14 +1061,15 @@ impl Lowerer<'_> {
         // fire. This is the same rule `kernels::check_plan` enforces
         // statically against Peel regions; here it also catches the
         // dynamic case, where an arm happens to select a subset.
-        if let Some(sig) = kernels::sig_in(backend, kernel) {
-            if sig.whole && (window.start != 0 || window.end != self.rows.len() as u32) {
-                return Err(Uncovered::WholeKernelSplit {
-                    at_op: at,
-                    kernel: kernel.to_string(),
-                    rows: window.clone(),
-                });
-            }
+        if let Some(sig) = kernels::sig_in(backend, kernel)
+            && sig.whole
+            && (window.start != 0 || window.end != self.rows.len() as u32)
+        {
+            return Err(Uncovered::WholeKernelSplit {
+                at_op: at,
+                kernel: kernel.to_string(),
+                rows: window.clone(),
+            });
         }
         let id = match self.kernel_ids.get(kernel) {
             Some(&id) => id,
@@ -1783,11 +1784,11 @@ impl Buffers {
             }
             let Some(at) = stmt.op else { continue };
             for probe in [at as usize, at as usize + 1] {
-                if let Some(op) = plan.ops.get(probe) {
-                    if matches!(op.kind, OpKind::HookSite { .. } | OpKind::Launch { .. }) {
-                        pinned.extend(op.inputs.iter().copied());
-                        break;
-                    }
+                if let Some(op) = plan.ops.get(probe)
+                    && matches!(op.kind, OpKind::HookSite { .. } | OpKind::Launch { .. })
+                {
+                    pinned.extend(op.inputs.iter().copied());
+                    break;
                 }
             }
         }
@@ -1801,8 +1802,10 @@ impl Buffers {
             let owner = alias_owners(plan);
             let roots: std::collections::BTreeSet<ValueId> =
                 pinned.iter().map(|&v| owner[v as usize]).collect();
-            for v in 0..plan.values.len() {
-                if roots.contains(&owner[v]) {
+            // `alias_owners` returns one entry per value, so walking it
+            // walks every value.
+            for (v, root) in owner.iter().enumerate() {
+                if roots.contains(root) {
                     pinned.push(v as ValueId);
                 }
             }

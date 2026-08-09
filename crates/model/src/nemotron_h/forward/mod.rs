@@ -86,7 +86,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
     // attention op, which `dsl::cuda::attention_for` now holds.
     let family = format!("nemotron_h.cuda.{}", class.suffix());
     let mb = facts.mamba;
-    let _at = facts.attn.clone();
+    let _at = facts.attn;
     dsl::trace_named(&family, |t| {
         let mut y = dsl::embedded_prologue(t, facts.hidden);
 

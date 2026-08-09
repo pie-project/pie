@@ -280,10 +280,7 @@ pub fn disk_usage(path: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
-    entries
-        .flatten()
-        .map(|e| disk_usage(&e.path()))
-        .sum()
+    entries.flatten().map(|e| disk_usage(&e.path())).sum()
 }
 
 #[cfg(test)]

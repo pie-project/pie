@@ -182,33 +182,68 @@ fn there_is_no_symbol_this_backend_cannot_dispatch() {
 
 #[test]
 fn a_statement_that_states_scalars_carries_them_to_its_dispatch() {
-    // The QKV split is the case that forced the channel: three outputs, each
-    // a fraction of the work, and a kernel that cannot find the boundary
-    // between them from any operand shape. The widths are the TEXT's, and the
-    // driver forwards them without knowing what they mean.
+    // The QKV split used to be this test's example -- three outputs, each a
+    // fraction of the work, and a kernel that cannot find the boundary
+    // between them from any operand shape. It is not lowered here any more:
+    // `LlamaLikeMetalFacts::synthetic` states `qkv_fused: false`, because no
+    // Metal deployment publishes a fused bank, so the text projects three
+    // separate matvecs and there is nothing to split.
+    //
+    // Paged decode attention makes the point harder. Two of its six scalars
+    // could not come off a shape even in principle: `params[2]` is a f32
+    // BIT-CAST into a u32 slot, and `params[4]` is `u32::MAX` standing for
+    // "no sliding window" -- a sentinel, not a measurement. A driver that
+    // reconstructed scalars from operand extents would have to invent both.
     let low = lowered(FireClass::Decode, 1);
-    let split = planned(&low)
+    let facts = LlamaLikeFacts::qwen3_0_6b();
+    let sdpa = planned(&low)
         .0
         .into_iter()
-        .find(|d| d.symbol == "split_qkv_bf16")
-        .expect("the text states a QKV split");
-    assert_eq!(split.params.len(), 2, "q_width and kv_width");
-    let packed: u32 = split.params[0] + 2 * split.params[1];
+        .find(|d| d.symbol.starts_with("sdpa_paged_decode"))
+        .expect("the text states a paged decode attention");
+
+    assert_eq!(sdpa.params.len(), 6, "the statement's six scalars");
     assert_eq!(
-        split.grid[0], packed,
-        "the grid covers the packed input, not one of the three outputs"
+        sdpa.params[0],
+        facts.q_heads / facts.kv_heads,
+        "the GQA group, 16 query heads over 8 KV heads"
     );
-    // Five slots, not four: the row states its operands now, and one of them
-    // is the params buffer the shader takes at index 4. A row that places its
-    // own scalars is the difference between binding positionally and binding
-    // where the kernel reads.
-    assert_eq!(split.args.len(), 5, "packed in, q/k/v out, and the params");
-    assert_eq!(split.param_slots.len(), 1, "one packed struct");
+    assert_eq!(sdpa.params[1], facts.kv_heads, "the KV head count");
+
+    let scale = f32::from_bits(sdpa.params[2]);
+    let want = 1.0 / (facts.head_dim as f32).sqrt();
+    assert!(
+        (scale - want).abs() < 1e-9,
+        "the softmax scale rides through a u32 slot as bits: got {scale}, want {want}"
+    );
+
     assert_eq!(
-        split.param_slots[0].slot, 4,
-        "the row placed the scalars at buffer 4"
+        sdpa.params[4],
+        u32::MAX,
+        "no sliding window, said as a sentinel rather than as an absence"
     );
-    assert_eq!(split.param_slots[0].at, 0);
+    assert!(sdpa.grid[0] > 0, "the dispatch covers something");
+
+    // One placement per scalar, and the row states where each goes. That
+    // is the difference between binding positionally -- where a shader
+    // reordering its buffers is a silent miscompile -- and binding where
+    // the kernel reads.
+    assert_eq!(
+        sdpa.param_slots.len(),
+        sdpa.params.len(),
+        "every stated scalar is placed"
+    );
+    let slots: BTreeSet<u32> = sdpa.param_slots.iter().map(|p| p.slot as u32).collect();
+    assert_eq!(
+        slots.len(),
+        sdpa.param_slots.len(),
+        "two scalars placed in one slot would overwrite: {:?}",
+        sdpa.param_slots
+    );
+    assert!(
+        sdpa.param_slots.iter().any(|p| p.slot == 4 && p.at == 0),
+        "the first scalar sits at buffer 4, offset 0"
+    );
 
     // It used to be the ONLY statement carrying scalars, and this asserted
     // that — "the channel is not a general escape hatch that grew". It grew,

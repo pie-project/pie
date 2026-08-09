@@ -23,6 +23,23 @@
 //! its state handle, or its first input — rather than from a bracketing
 //! closure; the semantic goldens pin that this derivation reproduces the
 //! bracketed tagging byte for byte.
+//!
+//! # On arity
+//!
+//! Seven functions here take eight arguments, and the paragraph above is
+//! why: a declaration's parameters are the launcher's semantic operands,
+//! so the arity is the KERNEL's and not this file's to choose. `rope`
+//! takes a theta, a scale, a head dim, a rotary dim and a table flag
+//! because rope does. Bundling them behind a struct would put a layer
+//! between the surface and the symbol it is named for, which is the one
+//! thing this surface exists not to do.
+//!
+//! The allow is module-wide rather than seven copies because the reason
+//! is the module's, not any function's. A function here that is wide for
+//! some OTHER reason is a real finding, and this hides it — the guard
+//! against that is that a declaration which does not mirror a launcher
+//! does not belong in this file at all.
+#![allow(clippy::too_many_arguments)]
 
 use std::cell::RefCell;
 use std::rc::Rc;

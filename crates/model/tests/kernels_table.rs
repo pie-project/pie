@@ -523,7 +523,7 @@ fn a_weight_representation_states_its_kernel() {
         (WeightRepr::Mxfp4Marlin, "gemm::act_x_wt_mxfp4_marlin", 1),
     ];
     for (repr, symbol, extra) in cases {
-        let w = dense.clone().with_repr(repr.clone());
+        let w = dense.clone().with_repr(repr);
         assert_eq!(
             w.gemm_symbol(),
             Some(symbol),

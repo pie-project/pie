@@ -31,19 +31,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use ::engine::server::ClientId;
 use anyhow::{Context, Result, anyhow};
-use futures::StreamExt;
 use client_api::{ClientMessage, ServerMessage};
 use controller_api::GatewayEndpoint;
-use ::engine::server::ClientId;
+use futures::StreamExt;
 use ids::{ReqId, SessionId, WorkerId};
+use tarpc::serde_transport::{tcp, unix};
+use tarpc::server::{BaseChannel, Channel};
+use tokio::sync::{Mutex, Notify, mpsc};
 use worker_api::{
     Accepted, Control, GatewayInboundClient, Priority, Request, Tokens, WorkerControl,
     connect_gateway_link, dispatch_codec,
 };
-use tarpc::serde_transport::{tcp, unix};
-use tarpc::server::{BaseChannel, Channel};
-use tokio::sync::{Mutex, Notify, mpsc};
 
 /// Max frame on the gateway link's read side. A `dispatch` carries one
 /// `Request` whose `ClientMessage` can hold a large prompt / upload chunk, so we
@@ -481,7 +481,9 @@ impl TurnRoutes {
     /// is looked at — is enough for every later event to find its turn.
     fn target(&mut self, msg: &ServerMessage) -> Option<ReqId> {
         match msg {
-            ServerMessage::Response { corr_id, result, .. } => {
+            ServerMessage::Response {
+                corr_id, result, ..
+            } => {
                 let req_id = self.by_corr.get(corr_id).copied()?;
                 if self.awaiting_pid.remove(corr_id) {
                     self.by_pid.insert(result.clone(), req_id);
@@ -562,8 +564,10 @@ async fn session_driver(
         let registry = registry.clone();
         let link_gone_tx = link_gone_tx.clone();
         running.spawn(async move {
-            let outcome =
-                run_turn(client_id, &gateway, &cancel, req_id, fed, corr, binding, inbox).await;
+            let outcome = run_turn(
+                client_id, &gateway, &cancel, req_id, fed, corr, binding, inbox,
+            )
+            .await;
             routes.lock().await.close(req_id);
             cancels.lock().await.remove(&req_id);
             if let Some(reg) = registry.upgrade() {
@@ -644,7 +648,8 @@ enum Fed {
 }
 
 fn feed_turn(client_id: ClientId, req_id: ReqId, message: ClientMessage) -> Fed {
-    let non_final_chunk = matches!(upload_chunk_info(&message), Some((idx, total)) if idx + 1 < total);
+    let non_final_chunk =
+        matches!(upload_chunk_info(&message), Some((idx, total)) if idx + 1 < total);
     let expects_reply = corr_id_of(&message).is_some();
     if let Err(e) = ::engine::server::send_client_message(client_id, message) {
         tracing::warn!(%req_id, error = %e, "feeding turn into runtime failed");

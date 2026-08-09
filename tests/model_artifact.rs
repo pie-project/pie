@@ -124,6 +124,7 @@ fn build_materializes_the_serve_contract() {
         backend: "cuda".to_string(),
         out: Some(artifact.clone()),
         dry_run: false,
+        as_id: None,
     })
     .expect("build failed");
 
@@ -184,4 +185,60 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
     );
     let verified = verify_checkpoint(&artifact).expect("digests verify");
     assert_eq!(verified as usize, parsed.tensors.len());
+}
+
+/// A BUILT artifact is still the model it was built from.
+///
+/// The open question this settles. `build` rewrites a checkpoint into
+/// runtime layout — it emits fused banks no checkpoint ships — so the
+/// worry was that the rewrite destroys the thing identity is matched
+/// against, leaving an `-optimized.zt` that can never be identified and
+/// therefore never served without an operator naming it.
+///
+/// It does not, and the reason is structural rather than lucky. A
+/// manifest states the rows a MODEL has and `Manifest::check` walks
+/// only those, so a tensor the model does not mention cannot fault:
+/// the fused bank is invisible to the match. And the fusion is a
+/// VIEW — `q_proj.weight` still exists, at its checkpoint extents,
+/// aliasing into the bank — so every row the manifest does ask about is
+/// still there to answer.
+///
+/// Both halves are load-bearing. If a future backend fused DESTRUCTIVELY
+/// (dropping the views) this test is what fails, and the fix would be
+/// for `build` to write the id it identified into the artifact rather
+/// than for identification to learn about banks.
+#[test]
+fn a_built_artifact_still_identifies_as_the_row_it_was_built_from() {
+    let staging = tempfile::tempdir().expect("staging");
+    write_snapshot(staging.path(), "BF16");
+    let store = tempfile::tempdir().expect("store");
+    let artifact = store.path().join("optimized.zt");
+
+    pie::ops::model::build::run(pie::ops::model::build::BuildArgs {
+        source: staging.path().to_string_lossy().into_owned(),
+        quant: None,
+        fp8_native: false,
+        moe: None,
+        backend: "cuda".to_string(),
+        out: Some(artifact.clone()),
+        dry_run: false,
+        as_id: None,
+    })
+    .expect("build failed");
+
+    let meta = parse_checkpoint(&artifact).expect("parse artifact");
+    // Not vacuous: this is the REWRITTEN artifact, not a checkpoint that
+    // happened to be copied. The bank is the proof, as it is next door.
+    assert!(
+        meta.weights()
+            .any(|t| t.name == "model.layers.0.self_attn.qkv_proj.fused.weight"),
+        "no fusion happened, so this asserts nothing about the rewrite"
+    );
+    let row = model::catalog::identify(&meta, &model::catalog::Override::None)
+        .expect("a built artifact is still identifiable");
+    assert_eq!(
+        row.id(),
+        "test-tiny-llama",
+        "the rewrite changed which model the artifact is"
+    );
 }

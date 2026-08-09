@@ -10,9 +10,10 @@
 //!   * `weights::resolve` taking a `.zt` path and reporting an artifact;
 //!   * the compiled tokenizer read back out of `__meta__/tokenizer/*` and
 //!     rebuilt without `tokenizer.json` existing anywhere;
-//!   * `vocab_size` and `num_hidden_layers` read from the `pie.model/1`
-//!     descriptor rather than probed out of a `config.json`;
-//!   * the descriptor written beside the driver's bootstrap TOML.
+//!   * `vocab_size` and `num_hidden_layers` coming from the catalog row the
+//!     artifact's tensors match, rather than probed out of a `config.json`;
+//!   * the checkpoint's own config carried through beside the driver's
+//!     bootstrap TOML, which is where the declared quantization is read from.
 //!
 //! The proof that this is not just "it booted" is negative: the artifact is
 //! the *only* file in its directory. There is no `tokenizer.json` and no
@@ -47,8 +48,9 @@ fn standalone_toml(artifact: &str) -> String {
          [driver]\n\
          type = \"dummy\"\n\
          device = [\"cpu\"]\n\
-         vocab_size = 256\n\
-         arch_name = \"qwen3\"\n"
+         vocab_size = 128\n\
+         arch_name = \"qwen3\"\n\
+         model_id = \"test-tiny-llama\"\n"
     )
 }
 
@@ -124,7 +126,8 @@ async fn boot() -> Result<pie::StandaloneHandle> {
 /// runtime's request path (`boot_smoke` does that); it is checking that a model
 /// whose tokenizer and config exist *only* inside a `.zt` gets as far as
 /// serving requests at all — which means `register` built a tokenizer from the
-/// compiled objects and took its vocab and layer count from the descriptor.
+/// compiled objects and took its vocab and layer count from the row its
+/// tensors identify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_standalone_serves_a_model_that_exists_only_as_an_artifact() -> Result<()> {
     let pie = boot().await?;

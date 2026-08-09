@@ -296,3 +296,92 @@ fn closure<'a>(
     }
     seen
 }
+
+/// The half of this crate that builds without `native` contains no `unsafe`.
+///
+/// `lib.rs` says so in the comment explaining why the workspace lint table is
+/// restated by hand instead of taken whole: the table forbids `unsafe_code`,
+/// every `ash` entry point is unsafe, so the forbid is dropped and the
+/// portable half is said to keep the guarantee a different way. It pointed at
+/// a `tests/portable.rs` that has never existed. A claim with a citation to
+/// nothing is worse than an uncited one, because the citation is what stops
+/// the next reader checking.
+///
+/// So the claim is checked here, where the crate's other purity question
+/// already lives. Not by a lint -- `#![forbid(unsafe_code)]` is a crate-wide
+/// attribute and this is a per-module property -- but by reading the source,
+/// which is what a reader would do.
+///
+/// The gates are read out of `lib.rs` rather than listed here, so a new module
+/// is covered the day it is declared instead of the day someone remembers to
+/// add it.
+#[test]
+fn the_half_that_builds_without_a_driver_contains_no_unsafe() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs is readable");
+
+    // A module is portable unless the line before its declaration gates it.
+    // Only `native` exists today; any other gate is unknown and treated as
+    // portable so that a new one shows up as a failure rather than a silent
+    // exemption.
+    let mut portable = Vec::new();
+    let mut gated = 0usize;
+    let lines: Vec<&str> = lib.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(name) = line
+            .trim()
+            .strip_prefix("pub mod ")
+            .and_then(|r| r.strip_suffix(';'))
+        else {
+            continue;
+        };
+        let native = i > 0 && lines[i - 1].trim() == "#[cfg(feature = \"native\")]";
+        if native {
+            gated += 1;
+        } else {
+            portable.push(name.to_string());
+        }
+    }
+    assert!(
+        portable.len() >= 4 && gated >= 4,
+        "read {} portable and {gated} gated modules out of lib.rs, which is not what it looks \
+         like -- the parse is wrong and this test is measuring nothing",
+        portable.len()
+    );
+
+    // Counted rather than assumed. The guard above is about the PARSE; this is
+    // about the SCAN, and they are not the same claim -- a control that
+    // emptied the list between them passed, which is exactly the shape of a
+    // check that reports zero findings because it looked at zero files.
+    let mut scanned = 0usize;
+    let mut unsafes = Vec::new();
+    for name in &portable {
+        scanned += 1;
+        let path = src.join(format!("{name}.rs"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}.rs: {e}"));
+        // Word-bounded, so `unsafely` in prose is not a finding. Comments and
+        // strings are NOT excluded: this is a claim about what the file says,
+        // and a false positive costs a rename while a false negative costs the
+        // guarantee.
+        for (n, line) in text.lines().enumerate() {
+            if line
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|w| w == "unsafe")
+            {
+                unsafes.push(format!("{name}.rs:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert_eq!(
+        scanned,
+        portable.len(),
+        "read {} portable modules and scanned {scanned}",
+        portable.len()
+    );
+    assert!(
+        unsafes.is_empty(),
+        "the portable half names `unsafe` in {} place(s): {:#?}",
+        unsafes.len(),
+        unsafes
+    );
+}

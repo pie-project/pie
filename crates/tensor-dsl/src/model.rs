@@ -41,7 +41,10 @@ pub(crate) fn page_size() -> u32 {
 /// Standalone unit goldens may install a complete profile, but production
 /// author code has no model-configuration surface.
 #[cfg(test)]
-pub fn with_test_profile<R>(profile: &tensor_ir::registry::ModelProfile, f: impl FnOnce() -> R) -> R {
+pub fn with_test_profile<R>(
+    profile: &tensor_ir::registry::ModelProfile,
+    f: impl FnOnce() -> R,
+) -> R {
     with_constants(profile.vocab, profile.page_size, f)
 }
 

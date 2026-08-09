@@ -6,6 +6,8 @@
 //! ops in the wrong order, and checking only the result would pass for one
 //! that reaches the answer through a library op the backends do not have.
 
+use tensor_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
+use tensor_compiler::plan::{LibraryOp, NodeIndex, RegionKind, compile_stage, debug_stage_plan};
 use tensor_dsl::builder::Builder;
 use tensor_dsl::prelude::*;
 use tensor_dsl::ptir::op::Op;
@@ -13,8 +15,6 @@ use tensor_dsl::ptir::registry::ModelProfile;
 use tensor_dsl::ptir::types::{Literal, Predicate, RngKind};
 use tensor_dsl::ptir::validate::{BoundTrace, bind};
 use tensor_dsl::{Channel, Traced};
-use tensor_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
-use tensor_compiler::plan::{LibraryOp, NodeIndex, RegionKind, compile_stage, debug_stage_plan};
 
 #[test]
 fn row_membership_is_general_ssa_and_evaluates_per_row() {

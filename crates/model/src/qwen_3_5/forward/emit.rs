@@ -305,6 +305,9 @@ fn emit_class_fn(
     b.out
 }
 
+// The emitter's context, threaded -- see the note on `emit_range` in
+// `shared::llama_like::forward::emit`, which this file mirrors.
+#[allow(clippy::too_many_arguments)]
 fn emit_range(
     b: &mut Body,
     plan: &ForwardPlan,
@@ -657,6 +660,8 @@ fn emit_op(
     }
 }
 
+// The emitter's context, threaded -- see `emit_range` above.
+#[allow(clippy::too_many_arguments)]
 fn emit_launch(
     b: &mut Body,
     kernel: &str,

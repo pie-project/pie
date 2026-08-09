@@ -41,7 +41,12 @@ pub mod spec;
 /// What those numbers imply: a manifest, and two refusals.
 pub mod project;
 
-use std::sync::{Arc, OnceLock};
+// `Arc` is the chat aspect's alone: it is the tokenizer a template
+// is handed and the `dyn Instruct` it is returned as. `OnceLock`
+// widens this generation's rows and every aspect reads that.
+#[cfg(feature = "chat")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::{Deployment, Refusal};
@@ -368,7 +373,6 @@ mod tests {
     #[cfg(feature = "chat")]
     #[test]
     fn chat_is_answered_with_the_speaker_protocol_and_not_chatml() {
-        use crate::instruct::Instruct;
         use std::sync::Arc;
         let vocab: Vec<String> = [
             "<|begin_of_text|>",

@@ -58,6 +58,14 @@ ash = { version = "0.38", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+# `tests/checkpoint.rs` only: the tensor names and extents a real `.zt` states,
+# which is the one place a weight's SIZE exists -- `Arg::Weight` carries a name
+# and no width. A dev-dependency and not a real one on purpose: a driver that
+# depended on a checkpoint FORMAT would be a driver that could not be handed
+# bytes, and `tests/pure.rs` drops dev kinds so this does not widen the closure
+# it checks.
+model-loader = { path = "../model-loader" }
+
 # `tests/arena.rs` only: a real model to lower, so the offsets under test are
 # the ones a compiler actually assigns rather than ones a test invented.
 model = { path = "../model", default-features = false, features = ["forward"] }

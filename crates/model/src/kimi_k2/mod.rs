@@ -32,7 +32,12 @@ pub mod spec;
 /// its text.
 pub mod project;
 
-use std::sync::{Arc, OnceLock};
+// `Arc` is the chat aspect's alone: it is the tokenizer a template
+// is handed and the `dyn Instruct` it is returned as. `OnceLock`
+// widens this generation's rows and every aspect reads that.
+#[cfg(feature = "chat")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::Advertised;
@@ -449,7 +454,6 @@ mod tests {
     #[cfg(feature = "chat")]
     #[test]
     fn every_row_answers_the_chat_question() {
-        use crate::instruct::Instruct;
         use tokenizer::Tokenizer;
 
         let words: Vec<String> = ["<|im_user|>", "<|im_middle|>", "<|im_end|>", "user", "Hi"]

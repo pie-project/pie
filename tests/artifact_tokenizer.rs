@@ -127,59 +127,75 @@ fn an_incomplete_tokenizer_is_refused_by_name() {
     }
 }
 
-/// The `pie.model/1` descriptor survives the artifact, and says what the C++
-/// normalizer says.
+/// The checkpoint's own config survives the artifact, byte for byte.
 ///
-/// The differential in `model::config` proves the normalizer agrees with
-/// `config.cpp`; this proves the agreement survives being written into a `.zt`
-/// and read back out — and that `head_dim_kernel`, which is a property of a
-/// driver build rather than of a checkpoint, is *not* along for the ride.
+/// # What this used to check, and why the claim got simpler
 ///
-/// Point `PIE_TEST_ARTIFACT` at a converted artifact and `PIE_TEST_GOLDEN` at
-/// the matching `crates/driver-cuda/csrc/tests/hf_config_dump/golden/*.json`; a no-op
-/// otherwise.
+/// It compared a normalized `pie.model/1` descriptor — 136 fields — against
+/// `hf_config_dump/golden/*.json`, proving the Rust normalizer agreed with
+/// `config.cpp` after a round trip through a `.zt`. Both sides of that
+/// comparison are gone: the C++ normalizer was deleted, and the descriptor
+/// with it, because a normalized config was identity crossing as a document.
+/// Identity is now a manifest match against the tensors, which are already in
+/// the artifact and need no separate copy.
+///
+/// What a config is still needed for is the one thing tensors cannot say — the
+/// declared quantization, since a group size is not an extent of anything — so
+/// what the artifact carries is the checkpoint's own `config.json`, unread and
+/// unaltered. That makes the property checkable without a golden: the bytes
+/// are the same bytes.
+///
+/// Point `PIE_TEST_ARTIFACT` at a converted artifact, and optionally
+/// `PIE_TEST_CONFIG` at the `config.json` it was converted from; a no-op
+/// without the first.
 #[test]
-fn a_converted_artifact_carries_the_normalized_model_config() {
-    let (Ok(artifact), Ok(golden)) = (
-        std::env::var("PIE_TEST_ARTIFACT"),
-        std::env::var("PIE_TEST_GOLDEN"),
-    ) else {
+fn a_converted_artifact_carries_the_checkpoints_own_config() {
+    let Ok(artifact) = std::env::var("PIE_TEST_ARTIFACT") else {
         return;
     };
 
     let objects = parse_metadata(std::path::Path::new(&artifact)).unwrap();
     let raw = objects
-        .get("model/descriptor")
-        .expect("the artifact carries no model descriptor");
-    let actual: serde_json::Value = serde_json::from_slice(raw).unwrap();
-    let expected: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&golden).unwrap()).unwrap();
+        .get(model::encoding::CONFIG_OBJECT)
+        .unwrap_or_else(|| {
+            panic!(
+                "the artifact carries no {}; it was written before the config was \
+                 carried verbatim, or from a source that had none",
+                model::encoding::CONFIG_OBJECT
+            )
+        });
 
-    assert_eq!(actual["version"], "pie.model/1");
+    // Valid JSON, because an artifact must never carry an object no reader can
+    // open — `pie model import` checks this at write time and this is the
+    // other end of that check.
+    let parsed: serde_json::Value =
+        serde_json::from_slice(raw).expect("the carried config is not JSON");
     assert!(
-        actual.get("head_dim_kernel").is_none(),
-        "head_dim_kernel is a driver-build fact and must not be in the artifact"
+        parsed.is_object(),
+        "a config.json that is not an object cannot be a config"
     );
 
-    let expected = expected.as_object().unwrap();
-    let actual_map = actual.as_object().unwrap();
-    for (key, want) in expected {
-        if key == "head_dim_kernel" {
-            continue;
-        }
-        let got = actual_map
-            .get(key)
-            .unwrap_or_else(|| panic!("descriptor is missing {key}"));
-        // Numbers are f32 on both sides; compare at that width rather than as
-        // printed text.
-        match (got.as_f64(), want.as_f64()) {
-            (Some(a), Some(b)) => assert_eq!(a as f32, b as f32, "{key}"),
-            _ => assert_eq!(got, want, "{key}"),
-        }
+    // And it says something `Encoding` can read, which is the only reason it
+    // is carried at all.
+    let text = std::str::from_utf8(raw).expect("the carried config is not UTF-8");
+    let encoding =
+        model::encoding::Encoding::from_config_json(text).expect("Encoding cannot read it");
+
+    if let Ok(source) = std::env::var("PIE_TEST_CONFIG") {
+        let want = std::fs::read(&source).expect("cannot read PIE_TEST_CONFIG");
+        assert_eq!(
+            raw, &want,
+            "the artifact's config differs from {source}; verbatim means verbatim, \
+             and a config that was rewritten on the way in is one the driver reads \
+             differently from the checkpoint's author"
+        );
     }
+
     eprintln!(
-        "{artifact}: descriptor matches {golden} ({} fields)",
-        expected.len() - 1
+        "{artifact}: carries {} ({} bytes, quant method {:?})",
+        model::encoding::CONFIG_OBJECT,
+        raw.len(),
+        encoding.method
     );
 }
 

@@ -16,7 +16,11 @@ fn stage_key(bound: &BoundTrace, stage: Stage) -> Option<u64> {
         .stages
         .iter()
         .position(|program| program.stage == stage)?;
-    Some(tensor_compiler::plan::compile_stage_at(bound, index).signature.hash)
+    Some(
+        tensor_compiler::plan::compile_stage_at(bound, index)
+            .signature
+            .hash,
+    )
 }
 
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};

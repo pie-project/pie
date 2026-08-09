@@ -517,14 +517,12 @@ mod from_checkpoint {
     fn logical_element_count(spec: &model_loader::types::QuantSpec, span_bytes: u64) -> u64 {
         let spec = spec.clone().normalized();
         if let Some((elems, bytes)) = spec.block_layout() {
-            return if bytes == 0 {
-                0
-            } else {
-                span_bytes / bytes * elems
-            };
+            return span_bytes
+                .checked_div(bytes)
+                .map_or(0, |blocks| blocks * elems);
         }
         let bits = u64::from(spec.normalized_bits());
-        if bits == 0 { 0 } else { span_bytes * 8 / bits }
+        (span_bytes * 8).checked_div(bits).unwrap_or(0)
     }
 
     #[cfg(test)]

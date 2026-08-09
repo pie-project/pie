@@ -351,10 +351,10 @@ impl Geometry {
     /// [`Self::EMPTY`] must be askable.
     #[must_use]
     pub const fn gqa_group(&self) -> u32 {
-        if self.kv_heads == 0 {
-            0
-        } else {
-            self.q_heads / self.kv_heads
+        // `match` rather than `unwrap_or`, which is not const yet.
+        match self.q_heads.checked_div(self.kv_heads) {
+            Some(group) => group,
+            None => 0,
         }
     }
 

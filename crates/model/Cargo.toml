@@ -134,6 +134,18 @@ contract = ["dep:model-loader", "dep:serde_json", "dep:anyhow"]
 # default -- `pie model convert` reads a chat template and a load contract and
 # must not drag the tracer in behind them.
 forward = []
+# ONE ROW THAT IS NOT A MODEL, for tests that need real bytes on disk.
+#
+# The closed set's cost, paid where it lands hardest: identity is a manifest
+# match, so a test cannot make up a checkpoint, and the smallest real row is
+# half a gigabyte of embedding. A test that writes safetensors and runs them
+# through the executor is exactly the test worth having, so `test-rows` adds
+# a 64-wide llama nothing ever trained.
+#
+# Off by default and never enabled by another feature, which is the whole
+# guarantee. `catalog.rs` asserts a build without it carries no id with the
+# `test-` prefix, so this cannot become load-bearing by accident.
+test-rows = []
 
 [dependencies]
 # The facts a declaration traces against are serialized for the goldens, the

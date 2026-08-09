@@ -8,7 +8,7 @@
 //! masks cannot be one broadcast), per-row `argmax`, verify the `[k]` draft
 //! (`eq → cumprod` prefix-AND → sentinel `[k]`-Token). This is the FULL composed
 //! program (mask-`select` + spec-verify DAG) lowering through the real Sampling-IR
-//! CUDA backend on genuine model logits — what the mock (`north_star_e2e.rs`)
+//! CUDA backend on genuine model logits — what the mock (`crates/engine/tests/north_star_e2e.rs`)
 //! proved host-side, now certified on the device.
 //!
 //! Distinct from the two half-tests already on GPU:

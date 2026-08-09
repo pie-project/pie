@@ -412,6 +412,12 @@ const GENERATIONS: &[Rows] = &[
     crate::phi_3::rows,
     crate::mistral_3::rows,
     crate::csm::rows,
+    // Last, and only when asked for: a row that is not a model. See
+    // `test_rows` for why the closed set needs a door and why this is not
+    // one — and `a_shipped_catalog_has_no_test_rows` for the guarantee that
+    // it stays shut.
+    #[cfg(feature = "test-rows")]
+    crate::test_rows::rows,
 ];
 
 /// The variant with this id, or `None`.
@@ -830,6 +836,47 @@ mod tests {
                 "'{id}'"
             );
         }
+    }
+
+    /// A build that did not ask for test rows has none.
+    ///
+    /// The closed set's guarantee is that a checkpoint is a known model or
+    /// it is refused, and a row nobody trained is the one way to weaken it
+    /// by accident. `crate::test_rows` exists because a test that writes
+    /// real safetensors cannot afford a real row, and this is the fence
+    /// around it: the feature is off by default, no other feature turns it
+    /// on, and if either of those ever stopped being true this fails.
+    ///
+    /// It checks the PREFIX rather than the module, because the prefix is
+    /// what a shipped catalog can be inspected for -- `pie model ls` shows
+    /// it to an operator, and a `test-` id in that list is a bug report.
+    /// `test_rows::every_test_row_says_so_in_its_id` holds the other end.
+    #[test]
+    #[cfg(not(feature = "test-rows"))]
+    fn a_shipped_catalog_has_no_test_rows() {
+        let leaked: Vec<&str> = ids()
+            .into_iter()
+            .filter(|id| id.starts_with("test-"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{leaked:?} are in a catalog built without `test-rows`",
+        );
+    }
+
+    /// And a build that DID ask has exactly what it asked for.
+    ///
+    /// The other half of the same claim: without this, the check above
+    /// could pass because the feature does nothing.
+    #[test]
+    #[cfg(feature = "test-rows")]
+    fn asking_for_test_rows_is_what_puts_them_there() {
+        let present: Vec<&str> = ids()
+            .into_iter()
+            .filter(|id| id.starts_with("test-"))
+            .collect();
+        assert_eq!(present.len(), crate::test_rows::rows().len());
+        assert!(!present.is_empty(), "`test-rows` added nothing");
     }
 
     /// Every row's manifest matches the row's OWN implied tensors.

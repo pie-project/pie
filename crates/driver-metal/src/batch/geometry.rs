@@ -229,14 +229,6 @@ pub struct DecodeGeometry {
     /// flag because they agree today is how the fold got read off the
     /// sandwich.
     pub v_norm: bool,
-    /// Whether the MLP's gate is GELU rather than SiLU.
-    ///
-    /// Read from the config's stated activation, not from which publisher
-    /// shipped it. The two agree to about 2% at the origin and diverge from
-    /// there, so getting it wrong produces finite, plausible, wrong numbers
-    /// -- which is what happened for every gemma checkpoint until the
-    /// importer stopped normalizing `hidden_activation` away.
-    pub gelu_gate: bool,
     /// The rope RESCALING, when the config states one, or zero for a plain
     /// geometric ladder.
     ///
@@ -321,7 +313,6 @@ impl Default for DecodeGeometry {
             kv_shared_layers: 0,
             norm_unit_offset: true,
             v_norm: false,
-            gelu_gate: false,
             rope_freq_factor: 0.0,
             rope_low_freq_factor: 0.0,
             rope_high_freq_factor: 0.0,
@@ -1026,13 +1017,12 @@ pub fn geometry_from_deployment(
         global_head_dim,
         global_kv_heads,
         full_partial_rotary,
-        // The MLP gate, which a `Deployment` did not state and this file
-        // therefore left at its default — SiLU, for EVERY checkpoint that
-        // reached it. `serve::load` caught the gemma case by asking the
-        // tensors and refused; the rest were served a few percent wrong at
-        // the origin. `Deployment::mlp_gate` is the statement that refusal
-        // asked for.
-        gelu_gate: matches!(d.mlp_gate, model::deployment::MlpGate::GeluTanh),
+        // The MLP gate is deliberately NOT copied here. It reaches the
+        // text as the kernel the PLAN names — `g4_geglu` is a gemma-4 op,
+        // not a flag a shared emitter branches on — so a `gelu_gate: bool`
+        // beside it was a second copy of a live number with no reader.
+        // `geometry_is_stated` is what said so, the moment the load-path
+        // probe that had been its only consumer went to `crates/model`.
         ..DecodeGeometry::default()
     })
 }

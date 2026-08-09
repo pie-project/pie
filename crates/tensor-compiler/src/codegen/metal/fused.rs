@@ -254,7 +254,8 @@ pub fn emit_grouped_fused_region(
     // copy.
     let escapes = crate::codegen::alias::escaping_values(region);
     let value_types = &stage.normalized.value_types;
-    let covers = |source: u32, result: u32| crate::codegen::alias::covers(value_types, source, result);
+    let covers =
+        |source: u32, result: u32| crate::codegen::alias::covers(value_types, source, result);
 
     // Decided before anything is emitted, because the gather/argmax fusion below
     // has to see through these aliases to recognise its pattern.

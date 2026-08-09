@@ -1,6 +1,6 @@
 //! The citations resolve.
 //!
-//! This crate's comments carry an unusual amount of prose, and the prose earns
+//! The text this reads carries an unusual amount of prose, and the prose earns
 //! its place by being specific: it names the file that broke, the pass that
 //! rewrites the instruction, the test that would have caught it. A citation is
 //! the only part of a comment a reader can *act* on — the rest they must take
@@ -25,6 +25,8 @@
 //! backticks, as this comment just did four times. That is not a loophole —
 //! it is the distinction the check exists to protect. A reader who sees
 //! backticks should be able to open the file.
+//!
+//! [`TREES`] says where it reads and why that is more than one crate.
 //!
 //! Narrow on purpose in two other ways. `architecture.md` and `spec.md` live
 //! in a separate repository that is not checked out beside this one, so
@@ -73,9 +75,52 @@ fn workspace_files(root: &Path) -> BTreeSet<String> {
     out
 }
 
-/// This crate's text: every `.rs` file under `src/` and `tests/`, plus the
-/// files that describe the crate to the outside.
-fn crate_text() -> Vec<(String, String)> {
+/// The trees this check reads, and what a SLASHLESS citation in each means.
+///
+/// A citation with no `/` in it — `verify.rs`, `types.rs` — is read as
+/// naming a file in the tree it was WRITTEN in, because that is what it means
+/// when a comment there says it. Resolving such a name against the whole
+/// workspace would let main.rs and host.rs pass on the strength of some other
+/// crate's file, which is precisely the confusion the check is for.
+///
+/// `crates/model-loader`'s two trees share one home: a comment in its `src/`
+/// naming a test file is still talking about the same crate. The workspace
+/// root's do not, because `src/` and `tests/` there are the binary and the
+/// things that drive it — a slashless name in one is not a claim about the
+/// other.
+///
+/// # Why the root is here
+///
+/// The rot this was written against was not a `model-loader` habit, and the
+/// root had its own: nine dead citations, every one of them a path from a
+/// tree layout that has not existed for some time — bin/pie/tests/, and a
+/// runtime/ that held the auth service and the tokenizer. Each named a file
+/// that still exists under a different path, so a reader who searched found
+/// nothing and had no way to know the sentence was ever true.
+///
+/// Dropping the backticks around those four is the convention this check
+/// enforces, applied to itself. It caught this doc on the first run.
+///
+/// This list widens as areas are cleaned, the way CI's clippy `-p` list does
+/// and for the same reason: a check that fails on arrival is a check that
+/// gets disabled.
+const TREES: &[(&str, &str)] = &[
+    ("crates/model-loader/src", "crates/model-loader/"),
+    ("crates/model-loader/tests", "crates/model-loader/"),
+    ("src", "src/"),
+    ("tests", "tests/"),
+];
+
+/// The files that describe a package to the outside, with the tree they
+/// speak for. A manifest and a README name packages, which is the second
+/// rule's whole surface.
+const DESCRIPTIONS: &[(&str, &str)] = &[
+    ("crates/model-loader/README.md", "crates/model-loader/"),
+    ("crates/model-loader/Cargo.toml", "crates/model-loader/"),
+];
+
+/// Every covered file, as `(display name, slashless home, text)`.
+fn covered_text(root: &Path) -> Vec<(String, &'static str, String)> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -90,22 +135,27 @@ fn crate_text() -> Vec<(String, String)> {
             }
         }
     }
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut paths = Vec::new();
-    walk(&manifest.join("src"), &mut paths);
-    walk(&manifest.join("tests"), &mut paths);
-    paths.push(manifest.join("README.md"));
-    paths.push(manifest.join("Cargo.toml"));
-    paths
+    let mut found: Vec<(PathBuf, &'static str)> = Vec::new();
+    for (tree, home) in TREES {
+        let mut paths = Vec::new();
+        walk(&root.join(tree), &mut paths);
+        found.extend(paths.into_iter().map(|path| (path, *home)));
+    }
+    found.extend(
+        DESCRIPTIONS
+            .iter()
+            .map(|(path, home)| (root.join(path), *home)),
+    );
+    found
         .into_iter()
-        .filter_map(|path| {
+        .filter_map(|(path, home)| {
             let text = std::fs::read_to_string(&path).ok()?;
             let name = path
-                .strip_prefix(manifest)
+                .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            Some((name, text))
+            Some((name, home, text))
         })
         .collect()
 }
@@ -145,18 +195,14 @@ fn cited_path(span: &str) -> Option<&str> {
     (named && path.chars().all(printable)).then_some(path)
 }
 
-/// A citation with no `/` in it — `verify.rs`, `types.rs` — is read as naming
-/// a file in THIS crate, because that is what it means when a comment here
-/// says it. Resolving such a name against the whole workspace would let
-/// main.rs and host.rs pass on the strength of some other crate's file, which
-/// is precisely the confusion the check is for. A citation that carries a
-/// path is a deliberate reach outward and resolves workspace-wide.
-fn resolves(path: &str, files: &BTreeSet<String>) -> bool {
-    let within = if path.contains('/') {
-        ""
-    } else {
-        "crates/model-loader/"
-    };
+/// Does `path`, cited in a file whose slashless home is `home`, name a file
+/// that is there?
+///
+/// A citation that carries a path is a deliberate reach outward and resolves
+/// workspace-wide; a slashless one is held to its own tree. [`TREES`] says
+/// which tree that is and why.
+fn resolves(path: &str, home: &str, files: &BTreeSet<String>) -> bool {
+    let within = if path.contains('/') { "" } else { home };
     files.iter().any(|file| {
         file.starts_with(within) && (file == path || file.ends_with(&format!("/{path}")))
     })
@@ -167,12 +213,12 @@ fn every_cited_rust_file_exists() {
     let root = workspace_root();
     let files = workspace_files(&root);
     let mut offences = Vec::new();
-    for (source, text) in crate_text() {
+    for (source, home, text) in covered_text(&root) {
         for (line, span) in quoted(&text) {
             let Some(path) = cited_path(&span) else {
                 continue;
             };
-            if !resolves(path, &files) {
+            if !resolves(path, home, &files) {
                 offences.push(format!("{source}:{line} cites `{span}`"));
             }
         }
@@ -210,7 +256,7 @@ fn every_cited_workspace_crate_exists() {
         .collect();
 
     let mut offences = Vec::new();
-    for (source, text) in crate_text() {
+    for (source, _home, text) in covered_text(&root) {
         for (line, span) in quoted(&text) {
             let named = FAMILIES.iter().any(|family| span.starts_with(family))
                 && span

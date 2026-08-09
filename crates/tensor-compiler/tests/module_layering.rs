@@ -22,7 +22,9 @@
 use std::path::{Path, PathBuf};
 
 fn src(module: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(module)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join(module)
 }
 
 /// Every `.rs` under `dir`, with its repo-relative-ish label for diagnostics.
@@ -40,7 +42,10 @@ fn sources(dir: &Path) -> Vec<(String, String)> {
                     .unwrap_or(&path)
                     .display()
                     .to_string();
-                out.push((label, std::fs::read_to_string(&path).expect("readable source")));
+                out.push((
+                    label,
+                    std::fs::read_to_string(&path).expect("readable source"),
+                ));
             }
         }
     }

@@ -79,8 +79,8 @@ fn mm_cuda_toml(snapshot_path: &str) -> String {
 /// Boot the embedded cuda engine with the multimodal model under the tight
 /// [`mm_cuda_toml`] fit config.
 async fn boot_mm_cuda(snapshot_path: &str) -> worker::WorkerHandle {
-    let cfg = worker::Config::parse(&mm_cuda_toml(snapshot_path))
-        .expect("parse mm cuda worker config");
+    let cfg =
+        worker::Config::parse(&mm_cuda_toml(snapshot_path)).expect("parse mm cuda worker config");
     worker::run(cfg)
         .await
         .expect("boot embedded cuda engine (gemma-4-E4B)")

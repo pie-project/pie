@@ -30,7 +30,12 @@ pub mod spec;
 /// manifest, its `Deployment`, and its traced text.
 pub mod project;
 
-use std::sync::{Arc, OnceLock};
+// `Arc` is the chat aspect's alone: it is the tokenizer a template
+// is handed and the `dyn Instruct` it is returned as. `OnceLock`
+// widens this generation's rows and every aspect reads that.
+#[cfg(feature = "chat")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
@@ -491,13 +496,17 @@ mod tests {
     /// `131072` looks like a row someone forgot to update, and it is
     /// what all three published gemma-2 configs state. The `2048` in the
     /// synthetic corpus config is a parser fixture and is not it either.
+    ///
+    /// The comparison AGAINST gemma-3 is not here. It was, briefly, as
+    /// `assert!(MAX_MODEL_LEN < 32_768)` — a second spelling of the line
+    /// above it, true by constant folding and unable to fail. Reading
+    /// gemma-3's row instead made it a live assertion and a sibling
+    /// edge, which `tests/sibling_isolation.rs` refuses. It lives in
+    /// `tests/neighbouring_generations.rs` now, beside the OLMo pair
+    /// that made that file necessary for the same reason.
     #[test]
     fn the_generation_states_a_shorter_ceiling_than_its_successors_on_purpose() {
         assert_eq!(MAX_MODEL_LEN, 8_192);
-        assert!(
-            MAX_MODEL_LEN < 32_768,
-            "gemma-3's smallest row is four times this"
-        );
         assert_ne!(
             MAX_MODEL_LEN, 2_048,
             "the synthetic corpus config is not a checkpoint"

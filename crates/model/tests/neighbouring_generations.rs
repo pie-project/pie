@@ -29,6 +29,13 @@
 //! in `shared/` that knew about OLMo would be the same knowledge one
 //! directory further away. It is that a test comparing generations is
 //! written where generations are compared: outside all of them.
+//!
+//! The gemma-2/gemma-3 pair joined later, by the same route and for a
+//! reason worth naming: its assertion had been written against a
+//! hand-typed `32_768`, which made it a constant the compiler folded to
+//! `true`. A cross-generation claim that does not read the other
+//! generation is not checking anything, and the only place it CAN read
+//! it is here.
 #![cfg(feature = "forward")]
 
 use model::catalog::{Deployed, Variant};
@@ -110,4 +117,49 @@ fn both_generations_ship_rows() {
         !model::olmo_2::VARIANTS.is_empty() && !model::olmo_3::VARIANTS.is_empty(),
         "a generation with no rows would make every assertion above vacuous"
     );
+}
+
+/// Gemma 3 extended the context and gemma-2's rows must stay under it.
+///
+/// The same shape as the OLMo pair, and it arrived here the same way.
+/// `gemma_2/mod.rs` had asserted `MAX_MODEL_LEN < 32_768` against a
+/// number typed in by hand, which the compiler folded to `true` — it
+/// could not fail, and clippy said so. Reading gemma-3's row instead
+/// makes it live, and makes it a sibling edge, so it is here.
+///
+/// The comparison is against `gemma-3-1b`, the shortest gemma-3 row that
+/// generates text. `embeddinggemma-300m` states `2048` — a sixty-fourth
+/// of its siblings — because an embedding tower is trained on documents
+/// that fit, and it is not on this axis at all. A `min()` over the
+/// generation would find it and this test would read backwards.
+#[test]
+fn gemma_2_stays_under_the_ceiling_gemma_3_raised() {
+    let successor = model::gemma_3::VARIANTS
+        .iter()
+        .find(|v| v.id() == "gemma-3-1b")
+        .expect("gemma-3-1b is a row")
+        .deployment(Deployed::single())
+        .expect("servable")
+        .advertised
+        .max_model_len;
+
+    assert_eq!(
+        successor, 32_768,
+        "the 1B is the text-only release and states a quarter of its siblings"
+    );
+
+    let mut walked = 0usize;
+    for v in model::gemma_2::VARIANTS {
+        let a = v
+            .deployment(Deployed::single())
+            .expect("servable")
+            .advertised;
+        assert!(
+            a.max_model_len < successor,
+            "{}: gemma-2 is the shorter-context generation and the rows must say so",
+            v.id()
+        );
+        walked += 1;
+    }
+    assert!(walked > 0, "no gemma-2 row was walked");
 }

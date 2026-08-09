@@ -177,8 +177,13 @@ impl Port {
     pub fn consumes(self) -> bool {
         matches!(
             self,
-            Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff | Port::RsWSlot
-                | Port::RsWOff | Port::RsFoldLen
+            Port::EmbedTokens
+                | Port::Positions
+                | Port::WSlot
+                | Port::WOff
+                | Port::RsWSlot
+                | Port::RsWOff
+                | Port::RsFoldLen
         )
     }
 }

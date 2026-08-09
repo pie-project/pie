@@ -15,6 +15,8 @@
 //! hybrid are the same shape with a different block between the norms,
 //! and a projection that took the row would have to be written twice.
 
+// Only the texts name a backend, and only they are gated.
+#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,

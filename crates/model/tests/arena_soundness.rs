@@ -133,15 +133,19 @@ fn walk(plan: &ForwardPlan, rows: &[Row], buffers: &Buffers) -> Option<String> {
         for &v in &op.inputs {
             let Some((at, len)) = extent(v) else { continue };
             let want = alias.root(v);
-            for b in at..(at + len).min(owner.len()) {
-                if owner[b] != want {
+            // `take`/`skip` rather than `owner[at..hi]`: a value placed
+            // past the arena end is exactly the bug this hunts, and
+            // slicing it would panic instead of reporting it.
+            let hi = (at + len).min(owner.len());
+            for (b, &owns) in owner.iter().enumerate().take(hi).skip(at) {
+                if owns != want {
                     return Some(format!(
                         "op {i} ({:?}) reads value {v} at [{at}, {}), but byte \
                          {b} now belongs to value {} — the arena placed it \
                          over a buffer this op still reads",
                         op.kind,
                         at + len,
-                        owner[b]
+                        owns
                     ));
                 }
             }
@@ -654,7 +658,7 @@ fn what_is_live_where_the_arena_peaks() {
         // Who is holding it, longest-lived first: a value defined far
         // before the peak and read far after is the one the text could
         // stop carrying.
-        let mut holders: Vec<(usize, usize, usize)> = (0..plan.values.len())
+        let holders: Vec<(usize, usize, usize)> = (0..plan.values.len())
             .filter(|&v| placed(v) && def[v] <= peak_at && peak_at <= last[v])
             .map(|v| (bytes(v), last[v] - def[v], v))
             .collect();
@@ -675,8 +679,8 @@ fn what_is_live_where_the_arena_peaks() {
         let mut rows_out: Vec<_> = by_shape.into_iter().collect();
         rows_out.sort_by_key(|(_, (_, b, _))| std::cmp::Reverse(*b));
         println!(
-            "  {:>5}  {:>11}  {:>8}  {}",
-            "count", "bytes", "max span", "shape"
+            "  {:>5}  {:>11}  {:>8}  shape",
+            "count", "bytes", "max span"
         );
         for (shape, (count, b, span)) in rows_out.into_iter().take(8) {
             println!("  {count:>5}  {b:>11}  {span:>8}  {shape}");
@@ -750,8 +754,8 @@ fn what_a_widest_fire_actually_costs() {
                 }
                 ends[last[v].min(plan.ops.len())].push(v);
             }
-            for i in 0..plan.ops.len() {
-                for &v in &plan.ops[i].outputs {
+            for (i, op) in plan.ops.iter().enumerate() {
+                for &v in &op.outputs {
                     if (v as usize) < sizes.len() && def[v as usize] == i {
                         cur += sizes[v as usize];
                     }
@@ -825,7 +829,10 @@ fn which_values_are_read_wider_than_they_are_written() {
             }
         }
         let mut gaps = 0usize;
-        let mut worst: Option<(ValueId, (u32, u32), (u32, u32))> = None;
+        // Which value was read wider than written, the span the fire
+        // wrote, and the span it read.
+        type WidestRead = (ValueId, (u32, u32), (u32, u32));
+        let mut worst: Option<WidestRead> = None;
         for (&v, &(rlo, rhi)) in &read {
             let Some(&(wlo, whi)) = wrote.get(&v) else {
                 continue; // an input nothing in this fire produced
@@ -1055,8 +1062,7 @@ fn what_the_epilogue_hands_each_of_its_rectangles() {
             let last = out
                 .launches
                 .iter()
-                .filter(|p| p.op == l.op)
-                .next_back()
+                .rfind(|p| p.op == l.op)
                 .expect("the epilogue emits at least the gemm");
             assert!(
                 out.kernels[last.kernel as usize].contains("gemm"),

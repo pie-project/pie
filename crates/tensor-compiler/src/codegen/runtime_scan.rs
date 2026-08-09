@@ -118,7 +118,10 @@ pub fn names(tags: impl IntoIterator<Item = u8>) -> Vec<&'static str> {
 /// at build time.
 pub fn assert_execute_covers_the_table(source: &str, what: &str) {
     let handled = tags_compared_in(function_body(source, "void ptir_m1_execute"));
-    let declared: BTreeSet<u8> = tensor_ir::op::OP_TABLE.iter().map(|spec| spec.tag).collect();
+    let declared: BTreeSet<u8> = tensor_ir::op::OP_TABLE
+        .iter()
+        .map(|spec| spec.tag)
+        .collect();
     let missing = names(declared.difference(&handled).copied());
     let extra: Vec<u8> = handled.difference(&declared).copied().collect();
     assert!(

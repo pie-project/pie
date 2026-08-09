@@ -41,8 +41,8 @@ use crate::core::{
     Completion, Engine, EngineKind, PageSet, PeerConn, RegisteredHandle, TransferId, WorkerId,
 };
 use crate::error::{Result, TransportError};
-use ffi::*;
 use driver_api::{KvHandle, MemoryDomain};
+use ffi::*;
 
 const OK: nixl_capi_status_t = nixl_capi_status_t_NIXL_CAPI_SUCCESS;
 const INPROG: nixl_capi_status_t = nixl_capi_status_t_NIXL_CAPI_IN_PROG;

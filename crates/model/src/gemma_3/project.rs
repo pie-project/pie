@@ -23,6 +23,8 @@
 //! stated on the rows now, which is the difference the catalog makes:
 //! the numbers are not derived from a config, they ARE the model.
 
+// Only the texts name a backend, and only they are gated.
+#[cfg(feature = "forward")]
 use crate::catalog::{Backend, Deployed, MetalBinding};
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,

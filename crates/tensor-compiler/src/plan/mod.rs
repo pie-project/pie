@@ -42,8 +42,6 @@
 //! reason: `tensor-compiler` refuses plans it cannot emit (`EmitError`) because
 //! "this backend has no lowering for that" is a normal outcome, not a bug.
 
-
-
 mod compile;
 pub mod lane_table;
 

@@ -164,9 +164,9 @@ fn footprint(value_types: &[SymbolicType], value: u32) -> Option<(u8, u64, Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::SymbolicExtent;
     use alloc::vec;
     use tensor_ir::types::DType;
-    use crate::plan::SymbolicExtent;
 
     fn ty(dtype: DType, dims: &[Dimension]) -> SymbolicType {
         SymbolicType {

@@ -3,7 +3,7 @@
 //! exercised against real weights rather than the mock model in
 //! `crates/engine/tests/rs_frame.rs`.
 //!
-//! `rs_frame.rs` proves the HOST bookkeeping (slot accounting, CSR shapes,
+//! `crates/engine/tests/rs_frame.rs` proves the HOST bookkeeping (slot accounting, CSR shapes,
 //! refusals). It cannot prove the driver actually replays buffered
 //! activations, because its model computes nothing. Everything about the
 //! recurrent read path lives on the far side of that boundary, so it needs a

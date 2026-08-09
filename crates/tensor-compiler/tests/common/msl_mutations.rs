@@ -17,12 +17,12 @@
 //! `NodeIndex` newtype -- 245 lines describing a test that was not running.
 #![allow(dead_code)]
 
-use tensor_ir::op::Op;
-use tensor_ir::types::{DType, Predicate};
 use tensor_compiler::plan::{
     ChannelSink, ChannelSlot, CompiledStage, Dimension, LibraryOp, NodeIndex, PartitionKind,
     RegionKind, SymbolicType,
 };
+use tensor_ir::op::Op;
+use tensor_ir::types::{DType, Predicate};
 
 pub const MUTATIONS: &[&str] = &[
     "none",

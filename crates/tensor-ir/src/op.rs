@@ -1258,8 +1258,18 @@ mod tests {
             // compares a field with itself — it passed when a row's result
             // count was mutated, and only the C++ mirror noticed. Result count
             // has one declaration in this crate, which is the point; its
-            // witness is necessarily outside it, in
-            // `op_table_drift::driver_rows_agree_on_arity_and_result_count`.
+            // witness is necessarily outside it.
+            //
+            // That witness USED to be
+            // `op_table_drift::driver_rows_agree_on_arity_and_result_count`,
+            // which read the C++ driver's `op_info` rows. The header was
+            // deleted with the C++ Metal driver and the test went with it, so
+            // what remains is weaker: `eval::interp`'s
+            // `debug_assert!(vals.len() as u32 == next_id)`, which fires when
+            // an op's eval arm pushes a different number of values than its
+            // row claims. That is a real second source — the arms push by
+            // hand — but it covers only ops an evaluation actually reaches,
+            // and only in debug. Every row is no longer witnessed.
             //
             // Operand count below is different: `operands()` derives from the
             // enum's own fields, so this really is two sources meeting.

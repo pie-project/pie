@@ -128,7 +128,7 @@ pub fn rope_theta_at(list: &[f32], l: u32) -> f32 {
 /// layer, which `(l + 1) % 1 == 0` gives without a special case.
 #[must_use]
 pub fn full_attn_at(interval: u32, l: u32) -> bool {
-    interval > 0 && (l + 1) % interval == 0
+    interval > 0 && (l + 1).is_multiple_of(interval)
 }
 
 /// Whether layer `l` is past the DENSE PREFIX — the second schedule
@@ -324,10 +324,10 @@ impl GqaFacts {
     /// `refuse_unservable_gqa`.
     #[must_use]
     pub const fn group_size(&self) -> u32 {
-        if self.kv_heads == 0 {
-            0
-        } else {
-            self.heads / self.kv_heads
+        // `match` rather than `unwrap_or`, which is not const yet.
+        match self.heads.checked_div(self.kv_heads) {
+            Some(group) => group,
+            None => 0,
         }
     }
 }

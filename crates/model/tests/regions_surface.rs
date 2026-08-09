@@ -143,7 +143,7 @@ fn a_select_launches_nothing_and_windows_its_operand() {
 /// mode this whole architecture exists to make impossible.
 #[test]
 fn an_in_place_add_lands_in_the_window_it_reads() {
-    use model_compiler::lower::{Buffers, Fire, Row};
+    use model_compiler::lower::{Buffers, Row};
 
     let plan = trace_named("inplace.cuda.decode", |t| {
         let x = input(t, 8);

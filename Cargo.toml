@@ -299,6 +299,15 @@ tempfile = "3"
 # way a client does; that is the reason this package has a `[lib]` at all.
 client = { path = "crates/client" }
 
+# The same `model`, with the one row that is not a model. `model_artifact`
+# writes a checkpoint and runs it through `pie model build`, which identifies
+# it against the catalog -- so the test needs a row small enough to write.
+#
+# Cargo unifies this with the `[dependencies]` entry above, which is why the
+# guarantee cannot be "the binary does not enable it": it is
+# `a_shipped_catalog_has_no_test_rows`, in `model` itself.
+model = { path = "crates/model", features = ["contract", "test-rows"] }
+
 # SIGPIPE disposition — see `die_quietly_on_closed_pipe` in main.rs.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

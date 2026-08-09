@@ -1047,7 +1047,16 @@ mod tests {
             logit_softcap: 0.0,
             ..Gemma4Facts::gemma_4_e4b()
         };
-        let d = deployment(&f, RowScalars { mixture: None, sliding_window: 512, norm_eps: NORM_EPS, k_eq_v: false }, Deployed::single());
+        let d = deployment(
+            &f,
+            RowScalars {
+                mixture: None,
+                sliding_window: 512,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
+            Deployed::single(),
+        );
         assert!(!d.shares_kv());
         for l in 0..4u32 {
             assert_eq!(d.attention[l as usize].kv_source, l);
@@ -1157,7 +1166,16 @@ mod tests {
     #[test]
     fn the_second_geometry_schedules_its_last_layer_full() {
         let f = Gemma4Facts::gemma_4_e2b();
-        let d = deployment(&f, RowScalars { mixture: None, sliding_window: 512, norm_eps: NORM_EPS, k_eq_v: false }, Deployed::single());
+        let d = deployment(
+            &f,
+            RowScalars {
+                mixture: None,
+                sliding_window: 512,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
+            Deployed::single(),
+        );
         assert_eq!(d.attention.len(), 35);
         assert_eq!(d.attention[34].head_dim, 512, "layer 34 is a full layer");
         assert_eq!(d.attention[34].window, -1);

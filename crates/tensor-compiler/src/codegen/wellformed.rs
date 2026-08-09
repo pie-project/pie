@@ -19,9 +19,9 @@
 use crate::codegen::error::{EmitError, RegionForm, ValueLayoutSite};
 use crate::codegen::op_view::OpView;
 
+use crate::plan::{CompiledStage, Dimension, Region, SymbolicType};
 use tensor_ir::op::{OP_TABLE, VARIADIC, tags};
 use tensor_ir::types::MAX_RANK;
-use crate::plan::{CompiledStage, Dimension, Region, SymbolicType};
 
 /// Every value type in the stage is one the runtimes can describe.
 pub fn value_types_valid(stage: &CompiledStage) -> Result<(), EmitError> {

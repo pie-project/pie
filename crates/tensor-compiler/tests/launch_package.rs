@@ -18,19 +18,19 @@
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
-use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
 use driver_api::plan::LaunchStagePlan;
 use driver_api::{
     PIE_STAGE_GROUPED_VALID, PIE_STAGE_REQUIRES_ATTN_SCORE, PIE_STAGE_REQUIRES_KERNEL_CALL,
     PIE_STAGE_REQUIRES_LAYER, PIE_STAGE_REQUIRES_LORA, PIE_STAGE_REQUIRES_MTP_ROWS,
     PIE_STAGE_REQUIRES_PAGE_MASK, PIE_STAGE_REQUIRES_QUERY,
 };
+use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
+use tensor_compiler::plan::compile_bound;
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use tensor_ir::op::Op;
 use tensor_ir::registry::{ModelProfile, Stage};
 use tensor_ir::types::{DType, Shape};
 use tensor_ir::validate::bind;
-use tensor_compiler::plan::compile_bound;
 
 /// Every corpus trace's launch package, tagged with the trace it came from.
 fn packages() -> Vec<(String, Vec<LaunchStagePlan>)> {

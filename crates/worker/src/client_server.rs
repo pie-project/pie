@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use futures::{SinkExt, StreamExt};
 use client::message::ClientMessage;
+use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as TokioMutex, watch};
 use tokio_tungstenite::accept_async;

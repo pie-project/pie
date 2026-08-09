@@ -274,6 +274,12 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         // A well-formed instruction cannot claim more words than remain. This
         // is what keeps every `words[i + n]` below in bounds without a check of
         // its own.
+        //
+        // `checked_add` and not `+`: replacing it with a plain add changes no
+        // test, because `count` is sixteen bits and `i` is bounded by a slice
+        // length, so on any target this crate is built for the sum cannot
+        // wrap. Kept anyway -- the alternative to an unreachable branch here
+        // is a panic on input that arrives from a file.
         let end = i.checked_add(count).ok_or(Malformed::Truncated)?;
         if end > words.len() {
             return Err(Malformed::Truncated);
@@ -567,6 +573,52 @@ mod tests {
         w.extend([(4 << 16) | OP_DECORATE, 10, DECORATION_BINDING, 0]);
         w.extend([(4 << 16) | OP_DECORATE, 11, DECORATION_BINDING, 3]);
         w
+    }
+
+    /// A module claiming an instruction of no words is refused, not walked.
+    ///
+    /// The nastiest of the malformed cases and the one with no error to
+    /// report: the walk advances by the count it reads, so a count of zero
+    /// advances by nothing and the loop never ends. Deleting the refusal does
+    /// not fail this suite -- it HANGS it, which is how this was found, and
+    /// is exactly what would happen to a driver handed a corrupt module.
+    ///
+    /// Every module read here comes off disk, so "well formed" is an
+    /// assumption about a file and not about this crate's own output.
+    #[test]
+    fn an_instruction_claiming_no_words_is_refused_rather_than_walked_forever() {
+        let mut w = built();
+        w.push(0);
+        assert_eq!(declared(&w), Err(Malformed::ZeroLengthInstruction));
+        // The control: the same module with a well-formed instruction in that
+        // position reads, so the refusal is about the zero and not about the
+        // module having grown.
+        let mut ok = built();
+        ok.extend([(4 << 16) | OP_DECORATE, 12, DECORATION_BUILTIN, 26]);
+        assert!(declared(&ok).is_ok(), "the control module did not read");
+    }
+
+    /// An instruction claiming more words than remain is refused.
+    ///
+    /// The refusal every `words[i + n]` in the walk relies on: the walk
+    /// indexes up to five words past `i` with no bound of its own, and this is
+    /// the single check that makes those safe. A module can claim a length of
+    /// sixty-five thousand words in sixteen bits, so the claim and the file
+    /// are two different facts.
+    #[test]
+    fn an_instruction_claiming_more_words_than_remain_is_refused() {
+        let mut w = built();
+        w.push((9 << 16) | OP_DECORATE);
+        assert_eq!(declared(&w), Err(Malformed::Truncated));
+        // One word short of fitting, so the refusal is at the boundary and
+        // not merely somewhere past it.
+        let mut edge = built();
+        edge.extend([(3 << 16) | OP_DECORATE, 12]);
+        assert_eq!(declared(&edge), Err(Malformed::Truncated));
+        // And exactly fitting reads.
+        let mut fits = built();
+        fits.extend([(3 << 16) | OP_DECORATE, 12, 0]);
+        assert!(declared(&fits).is_ok(), "an exactly-fitting instruction");
     }
 
     #[test]

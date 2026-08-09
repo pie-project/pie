@@ -12,31 +12,34 @@ use engine::driver::{DriverBackend, SchedulerLimits};
 
 use super::mock_device::{Behavior, MockBackend, launch_observer};
 
+/// The catalog row the mock driver reports having loaded.
+///
+/// A test harness cannot use a real one: identity is a manifest match, and
+/// the smallest shipped row is half a gigabyte of embedding. `test-rows` is
+/// the documented door for exactly this, and its row is llama-shaped with
+/// two layers -- which is what this harness's fixtures already assumed.
+const MOCK_MODEL_ID: &str = model::test_rows::TINY_LLAMA;
+
 /// The mock model's logits/output vocab. MUST match what the engine model
 /// reports (`Model::vocab_size()`): a guest declares its `logits` intrinsic
 /// as `[rows, output-vocab-size]` and the dummy driver validates that decl
-/// against ITS capability vocab — a mismatch rejects every logits-using
+/// against ITS capability vocab -- a mismatch rejects every logits-using
 /// PTIR program at bind.
 ///
-/// Read from the fixture `config.json` here, and written into the fixture
-/// config below, so the two sides of that equality come from one number.
-/// The engine itself no longer reads a `config.json`: it takes `vocab_size`
-/// from the checkpoint config the worker hands it, which for a real
-/// boot is normalized from exactly this file.
+/// It comes from the CATALOG ROW now, which is the same place the engine
+/// gets it: `engine::model::register` resolves `ModelConfig::model_id` and
+/// takes `vocab` off the row's deployment. It used to be read from a
+/// fixture `config.json` and written back into the fixture metadata, so
+/// that the two sides of the equality came from one number -- true, but a
+/// number this harness owned. The row owns it now, and the harness that
+/// asserted the equality can simply ask.
 fn fixture_vocab_size() -> u32 {
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures");
-    let cfg =
-        std::fs::read_to_string(fixtures.join("config.json")).expect("read fixture config.json");
-    let cfg: serde_json::Value = serde_json::from_str(&cfg).expect("parse fixture config.json");
-    match cfg.get("vocab_size").and_then(|v| v.as_u64()) {
-        Some(v) => v as u32,
-        None => {
-            let tokenizer =
-                tokenizer::Tokenizer::from_file(&fixtures.join("test_tokenizer.json"))
-                    .expect("load fixture tokenizer");
-            tokenizer.vocab_size() as u32
-        }
-    }
+    model::catalog::find(MOCK_MODEL_ID)
+        .expect("the mock model's row")
+        .deployment(model::catalog::Deployed::single())
+        .expect("this build serves the mock model's row")
+        .shape
+        .vocab
 }
 
 fn dummy_driver_backend(
@@ -52,7 +55,7 @@ fn dummy_driver_backend(
         vocab_size: fixture_vocab_size(),
         max_model_len: 8192,
         arch_name: "test-dummy".into(),
-        model_id: String::new(),
+        model_id: MOCK_MODEL_ID.into(),
         activation_dtype: "f32".into(),
         snapshot_dir: String::new(),
         max_forward_tokens: 4096,
@@ -208,21 +211,20 @@ impl MockEnv {
             model: ModelConfig {
                 name: self.model_name.clone(),
                 arch_name: String::new(),
-                model_id: String::new(),
+                model_id: MOCK_MODEL_ID.into(),
                 kv_page_size: 16,
                 tokenizer_path,
-                // A fixture snapshot: the tokenizer is a file on disk, and the
-                // config is what the worker would have lifted from the
-                // fixture's `config.json`. Only the two fields `register`
-                // reads are stated -- the rest of the schema is the
-                // normalizer's business, and this harness never runs it.
+                // A fixture snapshot: the tokenizer is a file on disk, and
+                // the config is the checkpoint's own, as the worker lifts it.
+                //
+                // `register` reads NOTHING from it any more -- the layer
+                // count, the vocabulary and the chat template all come from
+                // `model_id`'s row. What a config still carries is the
+                // declared quantization, and this one declares none, which
+                // is the truth about a mock that stores nothing.
                 metadata: ::model::ModelMetadata {
                     tokenizer: None,
-                    config: format!(
-                        r#"{{"version":"pie.model/1","vocab_size":{},"num_hidden_layers":2}}"#,
-                        fixture_vocab_size(),
-                    )
-                    .into_bytes(),
+                    config: br#"{"model_type":"llama","num_hidden_layers":2}"#.to_vec(),
                 },
                 drivers,
                 scheduler: SchedulerConfig {

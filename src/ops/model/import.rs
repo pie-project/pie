@@ -25,9 +25,10 @@
 //! is ever resident, and only GGUF checkpoints decode today.
 //!
 //! The family-aware step landed as its own command: `pie model build`
-//! authors the serve contract through `model::contract` — no FFI, no
-//! driver — and materializes it offline. This command stays the
-//! family-blind half of the pair.
+//! identifies the checkpoint against the catalog, authors the serve contract
+//! through `model::contract` — no FFI, no driver — and materializes it
+//! offline. This command stays the family-blind half of the pair: it does not
+//! know or ask what model this is.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -46,12 +47,12 @@ use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use model_loader::types::{CheckpointFormat, TensorDecl, Visibility};
 
 // The artifact's on-disk names come from whoever owns them: the loader owns
-// the metadata namespace and the provenance attributes, `pie.model/1` owns the
-// object its descriptor lives in. A literal here would be a second definition
-// of something a reader elsewhere has to match exactly, and a mismatch does
-// not fail — the read just finds nothing.
+// the metadata namespace and the provenance attributes, `model::encoding` owns
+// the object the checkpoint's own config lands in. A literal here would be a
+// second definition of something a reader elsewhere has to match exactly, and
+// a mismatch does not fail — the read just finds nothing.
+use model::encoding::CONFIG_OBJECT;
 use model_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY, meta_name};
-use model::config::DESCRIPTOR_OBJECT;
 
 /// Parses a human-written byte size: `16GiB`, `5GB`, `512MiB`, `1000000`.
 ///
@@ -211,11 +212,11 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
              and serving it needs one from elsewhere"
         ),
     }
-    let descriptor = compile_descriptor(&source)?;
-    match &descriptor {
-        Some(_) => println!(
-            "convert: model config normalized to {}",
-            model::config::VERSION
+    let config = carry_config(&source)?;
+    match &config {
+        Some(bytes) => println!(
+            "convert: carrying the checkpoint's config.json ({} bytes) as {CONFIG_OBJECT}",
+            bytes.len()
         ),
         None => println!("convert: no config.json beside the weights"),
     }
@@ -264,8 +265,8 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
             meta.push((meta_name(path), bytes.to_vec()));
         }
     }
-    if let Some(descriptor) = &descriptor {
-        meta.push((meta_name(DESCRIPTOR_OBJECT), descriptor.clone()));
+    if let Some(config) = &config {
+        meta.push((meta_name(CONFIG_OBJECT), config.clone()));
     }
 
     let started = std::time::Instant::now();
@@ -659,7 +660,7 @@ pub(crate) fn artifact_path(out: &Path, name: &str) -> PathBuf {
 
 /// The tokenizer file beside the weights, if there is one.
 ///
-/// The convention the worker already uses (`translate.rs`): `tokenizer.json`,
+/// The convention the worker already uses (`crates/worker/src/translate.rs`): `tokenizer.json`,
 /// else `tiktoken.model`. A single checkpoint file has no snapshot to look in.
 fn tokenizer_path(source: &Source) -> Option<PathBuf> {
     if source.path.is_file() {
@@ -673,14 +674,31 @@ fn tokenizer_path(source: &Source) -> Option<PathBuf> {
     tiktoken.exists().then_some(tiktoken)
 }
 
-/// Compiles the source's `config.json` into the `pie.model/1` descriptor.
+/// Carries the source's `config.json` into the artifact, verbatim.
+///
+/// # Why this stopped normalizing
+///
+/// It used to compile the config into a `pie.model/1` descriptor: 136 fields
+/// of normalized geometry, which the driver then re-parsed to learn what
+/// model it had. That was the *identity* crossing as a document, and it is
+/// what the catalog refactor removed — identity is now a manifest match
+/// against the tensors, and the tensors are already in the artifact.
+///
+/// What is left for a config to say is the part the tensors cannot: the
+/// declared quantization, because a group size is not an extent of anything.
+/// [`model::encoding::Encoding`] reads exactly that, from the checkpoint's own
+/// words, so the honest thing to carry is the checkpoint's own words.
+///
+/// It is also why this can no longer fail on content. A config this command
+/// does not understand is not this command's problem — nothing here reads it,
+/// and `Encoding` refuses what it cannot parse at the point that needs it.
+/// Only unreadable bytes or invalid JSON are errors, and JSON is checked so
+/// that an artifact never carries an object no reader can open.
 ///
 /// `Ok(None)` when there is no `config.json` — a lone `.gguf` carries its
 /// metadata in its own header, and a directory without one is a weights-only
-/// checkpoint. An *unreadable or unrecognized* one is an error, for the same
-/// reason a broken tokenizer is: the artifact would not serve, and the failure
-/// belongs at import where it can be read once.
-pub(crate) fn compile_descriptor(source: &Source) -> Result<Option<Vec<u8>>> {
+/// checkpoint.
+pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
     if source.path.is_file() {
         return Ok(None);
     }
@@ -688,18 +706,16 @@ pub(crate) fn compile_descriptor(source: &Source) -> Result<Option<Vec<u8>>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
-    let root: serde_json::Value = serde_json::from_str(&raw)
+    let raw = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    serde_json::from_slice::<serde_json::Value>(&raw)
         .map_err(|err| anyhow!("cannot parse {}: {err}", path.display()))?;
-    let descriptor = model::config::descriptor(&root, &path.display().to_string())
-        .map_err(|err| anyhow!("cannot normalize {}: {err:#}", path.display()))?;
-    Ok(Some(serde_json::to_vec(&descriptor)?))
+    Ok(Some(raw))
 }
 
 /// Compiles the source's tokenizer into its canonical form, if it has one.
 ///
-/// Discovery follows the convention the worker already uses (`translate.rs`):
+/// Discovery follows the convention the worker already uses
+/// (`crates/worker/src/translate.rs`):
 /// `tokenizer.json`, else `tiktoken.model`, beside the weights. A source that
 /// is a single checkpoint file has no snapshot to look in and so has no
 /// tokenizer — that is `Ok(None)`, not an error, because converting a lone
@@ -762,124 +778,6 @@ fn staleness(artifact: &Path, version: &str, source: &str) -> Option<String> {
             Some(format!("the source changed: {recorded} → {source}"))
         }
         Some(_) => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use model_loader::checkpoint::write::{WriteTensor, write_zt};
-    use model_loader::types::{DType, Encoding, TensorId};
-
-    #[test]
-    fn a_repo_id_becomes_one_flat_store_name() {
-        assert_eq!(store_name("Qwen/Qwen3-0.6B"), "Qwen--Qwen3-0.6B");
-        // A name that already contains hyphens survives, which is why the
-        // separator is doubled: `--` cannot be confused for one of them.
-        assert_eq!(
-            store_name("meta-llama/Llama-3.1-8B"),
-            "meta-llama--Llama-3.1-8B"
-        );
-        // A bare name has no separator to translate.
-        assert_eq!(store_name("mymodel"), "mymodel");
-    }
-
-    #[test]
-    fn sizes_distinguish_the_two_conventions() {
-        // `GB` and `GiB` are different numbers, and a user who writes one and
-        // is given the other has been told the wrong thing about their files.
-        assert_eq!(parse_size("5GB").unwrap(), 5_000_000_000);
-        assert_eq!(parse_size("5GiB").unwrap(), 5 << 30);
-        assert_eq!(parse_size("16gib").unwrap(), 16 << 30);
-        assert_eq!(parse_size("512MiB").unwrap(), 512 << 20);
-        assert_eq!(parse_size("1_000_000").unwrap(), 1_000_000);
-        assert_eq!(parse_size("2048").unwrap(), 2048);
-        assert_eq!(parse_size(" 4 GiB ").unwrap(), 4 << 30);
-
-        assert!(parse_size("").is_err());
-        assert!(parse_size("GiB").is_err());
-        assert!(parse_size("5 furlongs").is_err());
-        // Zero would put every tensor in a file of its own.
-        assert!(parse_size("0").is_err());
-    }
-
-    #[test]
-    fn out_names_a_file_or_a_directory_to_put_one_in() {
-        assert_eq!(
-            artifact_path(Path::new("/data/custom.zt"), "qwen"),
-            PathBuf::from("/data/custom.zt")
-        );
-        assert_eq!(
-            artifact_path(Path::new("/data/models"), "qwen"),
-            PathBuf::from("/data/models/qwen.zt")
-        );
-        // The extension decides, not the case it is written in.
-        assert_eq!(
-            artifact_path(Path::new("/data/custom.ZT"), "qwen"),
-            PathBuf::from("/data/custom.ZT")
-        );
-    }
-
-    /// An artifact is a function of the pie that wrote it and of what it was
-    /// written from, so the up-to-date check compares exactly those. Provenance
-    /// it does not carry at all means it predates these keys, which is itself a
-    /// reason to rebuild.
-    #[test]
-    fn staleness_answers_for_the_pie_and_the_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let decl = TensorDecl {
-            id: TensorId(0),
-            name: "w".to_string(),
-            shape: vec![4],
-            encoding: Encoding::Raw(DType::U8),
-            alignment: 1,
-            visibility: Visibility::default(),
-        };
-        let write = |path: &Path, provenance: &BTreeMap<String, String>| {
-            write_zt(
-                path,
-                provenance,
-                &[WriteTensor {
-                    decl: &decl,
-                    bytes: &[1u8, 2, 3, 4],
-                }],
-            )
-            .unwrap();
-        };
-
-        let path = dir.path().join("model.zt");
-        let mut provenance = BTreeMap::new();
-        provenance.insert(VERSION_KEY.to_string(), "0.1.0".to_string());
-        provenance.insert(SOURCE_KEY.to_string(), "qwen/qwen3-0.6b".to_string());
-        write(&path, &provenance);
-
-        assert_eq!(staleness(&path, "0.1.0", "qwen/qwen3-0.6b"), None);
-        assert!(
-            staleness(&path, "0.2.0", "qwen/qwen3-0.6b")
-                .unwrap()
-                .contains("pie changed")
-        );
-        assert!(
-            staleness(&path, "0.1.0", "qwen/qwen3-4b")
-                .unwrap()
-                .contains("source changed")
-        );
-
-        // An artifact from before these keys existed records neither, and
-        // "no provenance" is a reason to rebuild rather than to trust it.
-        let bare = dir.path().join("bare.zt");
-        write(&bare, &BTreeMap::new());
-        assert!(
-            staleness(&bare, "0.1.0", "qwen/qwen3-0.6b")
-                .unwrap()
-                .contains("no pie version")
-        );
-
-        // A path that is not an artifact at all fails loudly rather than
-        // reporting "current".
-        let junk = dir.path().join("junk.zt");
-        std::fs::write(&junk, b"not a zt file").unwrap();
-        assert!(staleness(&junk, "0.1.0", "qwen/qwen3-0.6b").is_some());
     }
 }
 
@@ -1001,4 +899,122 @@ fn write_artifact(
     }
     progress.finish();
     Ok(written_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model_loader::checkpoint::write::{WriteTensor, write_zt};
+    use model_loader::types::{DType, Encoding, TensorId};
+
+    #[test]
+    fn a_repo_id_becomes_one_flat_store_name() {
+        assert_eq!(store_name("Qwen/Qwen3-0.6B"), "Qwen--Qwen3-0.6B");
+        // A name that already contains hyphens survives, which is why the
+        // separator is doubled: `--` cannot be confused for one of them.
+        assert_eq!(
+            store_name("meta-llama/Llama-3.1-8B"),
+            "meta-llama--Llama-3.1-8B"
+        );
+        // A bare name has no separator to translate.
+        assert_eq!(store_name("mymodel"), "mymodel");
+    }
+
+    #[test]
+    fn sizes_distinguish_the_two_conventions() {
+        // `GB` and `GiB` are different numbers, and a user who writes one and
+        // is given the other has been told the wrong thing about their files.
+        assert_eq!(parse_size("5GB").unwrap(), 5_000_000_000);
+        assert_eq!(parse_size("5GiB").unwrap(), 5 << 30);
+        assert_eq!(parse_size("16gib").unwrap(), 16 << 30);
+        assert_eq!(parse_size("512MiB").unwrap(), 512 << 20);
+        assert_eq!(parse_size("1_000_000").unwrap(), 1_000_000);
+        assert_eq!(parse_size("2048").unwrap(), 2048);
+        assert_eq!(parse_size(" 4 GiB ").unwrap(), 4 << 30);
+
+        assert!(parse_size("").is_err());
+        assert!(parse_size("GiB").is_err());
+        assert!(parse_size("5 furlongs").is_err());
+        // Zero would put every tensor in a file of its own.
+        assert!(parse_size("0").is_err());
+    }
+
+    #[test]
+    fn out_names_a_file_or_a_directory_to_put_one_in() {
+        assert_eq!(
+            artifact_path(Path::new("/data/custom.zt"), "qwen"),
+            PathBuf::from("/data/custom.zt")
+        );
+        assert_eq!(
+            artifact_path(Path::new("/data/models"), "qwen"),
+            PathBuf::from("/data/models/qwen.zt")
+        );
+        // The extension decides, not the case it is written in.
+        assert_eq!(
+            artifact_path(Path::new("/data/custom.ZT"), "qwen"),
+            PathBuf::from("/data/custom.ZT")
+        );
+    }
+
+    /// An artifact is a function of the pie that wrote it and of what it was
+    /// written from, so the up-to-date check compares exactly those. Provenance
+    /// it does not carry at all means it predates these keys, which is itself a
+    /// reason to rebuild.
+    #[test]
+    fn staleness_answers_for_the_pie_and_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let decl = TensorDecl {
+            id: TensorId(0),
+            name: "w".to_string(),
+            shape: vec![4],
+            encoding: Encoding::Raw(DType::U8),
+            alignment: 1,
+            visibility: Visibility::default(),
+        };
+        let write = |path: &Path, provenance: &BTreeMap<String, String>| {
+            write_zt(
+                path,
+                provenance,
+                &[WriteTensor {
+                    decl: &decl,
+                    bytes: &[1u8, 2, 3, 4],
+                }],
+            )
+            .unwrap();
+        };
+
+        let path = dir.path().join("model.zt");
+        let mut provenance = BTreeMap::new();
+        provenance.insert(VERSION_KEY.to_string(), "0.1.0".to_string());
+        provenance.insert(SOURCE_KEY.to_string(), "qwen/qwen3-0.6b".to_string());
+        write(&path, &provenance);
+
+        assert_eq!(staleness(&path, "0.1.0", "qwen/qwen3-0.6b"), None);
+        assert!(
+            staleness(&path, "0.2.0", "qwen/qwen3-0.6b")
+                .unwrap()
+                .contains("pie changed")
+        );
+        assert!(
+            staleness(&path, "0.1.0", "qwen/qwen3-4b")
+                .unwrap()
+                .contains("source changed")
+        );
+
+        // An artifact from before these keys existed records neither, and
+        // "no provenance" is a reason to rebuild rather than to trust it.
+        let bare = dir.path().join("bare.zt");
+        write(&bare, &BTreeMap::new());
+        assert!(
+            staleness(&bare, "0.1.0", "qwen/qwen3-0.6b")
+                .unwrap()
+                .contains("no pie version")
+        );
+
+        // A path that is not an artifact at all fails loudly rather than
+        // reporting "current".
+        let junk = dir.path().join("junk.zt");
+        std::fs::write(&junk, b"not a zt file").unwrap();
+        assert!(staleness(&junk, "0.1.0", "qwen/qwen3-0.6b").is_some());
+    }
 }

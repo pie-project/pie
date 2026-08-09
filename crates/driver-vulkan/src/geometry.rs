@@ -361,7 +361,12 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
             // otherwise get a grid that looks reasonable and an answer that is
             // not, so the two are required to agree.
             let built_for = module.local.at(0);
-            let head_dim = dims.head_dim.max(1);
+            // No `.max(1)` on the head width. It was here, and it was dead:
+            // `Local::at` already answers at least one, so a zero head width
+            // can never equal `built_for` and is refused by the line below
+            // under its real name. Deleting the clamp changed no test, which
+            // is how it was found.
+            let head_dim = dims.head_dim;
             if built_for != head_dim {
                 return Err(Ungeometric::HeadMismatch {
                     module: built_for,
@@ -526,6 +531,118 @@ mod tests {
         // A sweep that skipped everything would pass. Every rule but `Unstated`
         // answers for these dims, against six workgroup shapes.
         assert!(checked >= (kernels::LaunchRule::ALL.len() - 1) * locals.len());
+    }
+
+    /// Which rules answer a grid with a zero in it, stated exactly.
+    ///
+    /// A zero on any axis dispatches nothing and reports success -- the
+    /// failure with no symptom, and the one this crate refuses hardest.
+    /// `plan_one` is the layer that refuses it (`Undispatchable::Empty`, and
+    /// deleting that line fails the suite). This asks the question one layer
+    /// down, where several rules clamp a dimension to one for exactly this
+    /// reason and FIVE of those clamps could be deleted with everything
+    /// staying green -- the real plans never state a zero, so the clamps only
+    /// ever mattered for the input nothing was feeding them.
+    ///
+    /// Pinned as a SET rather than asserted empty, because it is a long way
+    /// from empty: FOURTEEN rule-and-field pairs answer a grid with a zero in
+    /// it. Almost every rule that multiplies a dimension does, and the ones
+    /// that clamp clamp only the dimension they happened to be bitten by.
+    ///
+    /// So `groups` does not guarantee a non-empty grid and was never the
+    /// layer that did. `plan_one` is, and singly: delete its check and the
+    /// suite fails. Stating the set is what turns that from an assumption
+    /// into a fact with a number, and makes the next change visible -- a
+    /// clamp deleted here moves this set, a new rule joins it, and a rule
+    /// that starts refusing leaves it.
+    ///
+    /// `Err` is not a failure here. A rule that refuses a degenerate
+    /// dimension has said so by name, which is the opposite of the defect.
+    #[test]
+    fn only_these_rules_answer_a_grid_with_a_zero_in_it() {
+        // The same six workgroup shapes the sibling sweep uses. One shape
+        // left most rules refusing on a mismatch that had nothing to do with
+        // the zero under test, which made the sweep look thorough and ask
+        // almost nothing -- seven answers out of a hundred and twelve.
+        let locals = [
+            [256, 1, 1],
+            [32, 2, 2],
+            [16, 16, 1],
+            [1024, 1, 1],
+            [64, 1, 1],
+            [32, 8, 1],
+        ];
+        // One field at a time, so a rule that clamps the field under test is
+        // not covered for it by another field still being sane.
+        type Zero = (&'static str, fn(&mut Dims));
+        let zeroed: [Zero; 8] = [
+            ("rows", |d| d.rows = 0),
+            ("width", |d| d.width = 0),
+            ("in_width", |d| d.in_width = 0),
+            ("q_heads", |d| d.q_heads = 0),
+            ("kv_heads", |d| d.kv_heads = 0),
+            ("head_dim", |d| d.head_dim = 0),
+            ("axis", |d| d.axis = 0),
+            ("experts_per_token", |d| d.experts_per_token = 0),
+        ];
+        let mut answered = 0;
+        let mut empty = Vec::new();
+        for &rule in kernels::LaunchRule::ALL {
+            for local in locals {
+                let m = Module {
+                    local: Local(local),
+                    tile: (rule == Rule::Qmm).then_some(Tile { rows: 32, cols: 64 }),
+                };
+                for (name, zero) in zeroed {
+                    // Decode attention is compiled per head width, so a
+                    // sweep over workgroup shapes has to move the head width
+                    // with it -- except when the head width IS the zero
+                    // under test.
+                    let mut d = if rule == Rule::SdpaVector {
+                        Dims {
+                            head_dim: local[0],
+                            ..dims()
+                        }
+                    } else {
+                        dims()
+                    };
+                    zero(&mut d);
+                    let Ok(g) = groups(rule, d, m) else {
+                        continue;
+                    };
+                    answered += 1;
+                    if g.contains(&0) {
+                        let case = format!("{rule:?}/{name}");
+                        if !empty.contains(&case) {
+                            empty.push(case);
+                        }
+                    }
+                }
+            }
+        }
+        empty.sort();
+        assert_eq!(
+            empty,
+            [
+                "Elementwise/width",
+                "ElementwiseRows/width",
+                "GatedRms/head_dim",
+                "GatedRms/kv_heads",
+                "PerHead/head_dim",
+                "PerHead/kv_heads",
+                "PerHeadElementwise/head_dim",
+                "PerHeadElementwise/q_heads",
+                "Qmm/width",
+                "Qmv/width",
+                "Rms/width",
+                "RouteRows/width",
+                "SdpaVector/q_heads",
+                "SplitPacked/in_width",
+            ],
+            "a different set of rules answers an empty grid"
+        );
+        // A sweep where every rule refused would pass while asking nothing.
+        assert!(answered > 200, "only {answered} rules answered at all");
     }
 
     /// And not WILDLY more, which is the other way a division can be wrong.

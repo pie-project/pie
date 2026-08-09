@@ -168,7 +168,11 @@ pub fn fields(driver: DriverKind) -> Vec<Field> {
         field.key = crate::config_layout::to_file_path(&field.key);
     }
     out.sort_by(|a, b| {
-        let section = |k: &str| k.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or_default();
+        let section = |k: &str| {
+            k.rsplit_once('.')
+                .map(|(s, _)| s.to_string())
+                .unwrap_or_default()
+        };
         section(&a.key).cmp(&section(&b.key))
     });
     out
@@ -322,7 +326,10 @@ mod tests {
             .map(|key| crate::config_layout::to_file_path(key))
             .filter(|key| !listed.contains(key))
             .collect();
-        assert!(missing.is_empty(), "keys serde accepts but the listing omits: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "keys serde accepts but the listing omits: {missing:?}"
+        );
     }
 
     #[test]

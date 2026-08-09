@@ -16,12 +16,12 @@
 //! a blanket re-bless turns this net into a transcript of whatever the
 //! emitters happen to do today.
 
+use tensor_compiler::plan::{CompiledStage, compile_bound, debug_stage_plan};
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use tensor_ir::op::{IntrinsicId, Op};
 use tensor_ir::registry::{KernelInfo, ModelProfile, SinkScope, Stage};
 use tensor_ir::types::{DType, RngKind, Shape};
 use tensor_ir::validate::bind;
-use tensor_compiler::plan::{CompiledStage, compile_bound, debug_stage_plan};
 
 /// Golden names in the order the corpus enumerates them.
 pub const GOLDEN_NAMES: &[&str] = &[

@@ -8,6 +8,7 @@
 //! Regenerate (bless) with:
 //! `PTIR_REGEN=1 cargo test -p pie-compiler-tests --test ptir_golden`
 
+use std::fmt::Write as _;
 use tensor_compiler::eval::interp::Value;
 use tensor_compiler::eval::interp::{Instance, NoKernels, PassInputs};
 use tensor_ir::container::{
@@ -19,7 +20,6 @@ use tensor_ir::registry::Port;
 use tensor_ir::registry::{ModelProfile, Stage};
 use tensor_ir::types::{DType, Literal, Shape};
 use tensor_ir::validate::{BoundTrace, bind};
-use std::fmt::Write as _;
 
 #[path = "common/traces.rs"]
 mod traces;
@@ -1908,8 +1908,11 @@ fn golden_extern_contrastive() {
     // constrains endpoints, not clocks).
     let ring = ExternChannel::for_decl(&am_trace.channels[0]);
     let mut am =
-        tensor_compiler::eval::interp::Instance::new_with_externs(&am_b, &[], &[(0, ring.clone())]).unwrap();
-    let mut ex = tensor_compiler::eval::interp::Instance::new_with_externs(&ex_b, &[], &[(0, ring)]).unwrap();
+        tensor_compiler::eval::interp::Instance::new_with_externs(&am_b, &[], &[(0, ring.clone())])
+            .unwrap();
+    let mut ex =
+        tensor_compiler::eval::interp::Instance::new_with_externs(&ex_b, &[], &[(0, ring)])
+            .unwrap();
 
     // Expert logits peak at 2 (9.0) and 5 (8.5), both in the α-window; the
     // AMATEUR (a genuinely different model) loves 2 -> contrastive demotes

@@ -14,6 +14,8 @@
 //! `HF_ROWS` column expressed — spelled as a call rather than as a table
 //! nothing held to the other two tables.
 
+// Only the texts name a backend, and only they are gated.
+#[cfg(feature = "forward")]
 use crate::catalog::{Backend, Deployed, MetalBinding};
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
@@ -465,7 +467,19 @@ pub fn metal_kernel_refusal(
 /// It is also why this struct was called `MetalRow`, which stopped
 /// being true the moment [`deployment`] read it — the deployment is
 /// what CUDA's launch reads its `moe_norm_topk` off.
-#[cfg(feature = "forward")]
+///
+/// # It carries no `forward` gate, for that same reason
+///
+/// It had one, left from when only the texts read it, and that gate
+/// outlived its truth by exactly the change the paragraph above
+/// describes: [`deployment`] is not gated, `Variant::deployment` is not
+/// gated, and every generation's `fn row` that feeds them is not gated
+/// either. So `--no-default-features --features contract` did not
+/// compile this crate at all — sixteen unresolved names, all this one.
+/// Nothing caught it because no consumer asks for `contract` without
+/// `forward`, and feature unification handed one to every build that
+/// did. The gate is gone rather than spread to the callers: a scalar a
+/// row STATES is not an aspect, and the twin in `gemma_4` never had one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowScalars {
     /// `rope_theta`, the rotary base every layer of this row rotates at.
@@ -1072,11 +1086,11 @@ mod tests {
         }
     }
 
-    /// qwen3-0.6b's row, as the generation states it — a full-attention
-    /// dense stack on one rope base.
-    #[cfg(feature = "forward")]
     /// A row for the deployment tests, so they state one the way a
     /// generation does rather than four loose scalars.
+    ///
+    /// Ungated, because [`deployment`] is: these tests are the ones
+    /// that hold a `contract`-only build honest.
     fn row(rope_theta: f32, window: i32) -> RowScalars {
         RowScalars {
             rope_theta,
@@ -1087,6 +1101,9 @@ mod tests {
         }
     }
 
+    /// qwen3-0.6b's row, as the generation states it — a full-attention
+    /// dense stack on one rope base.
+    #[cfg(feature = "forward")]
     fn qwen3_row() -> RowScalars {
         RowScalars {
             rope_theta: 1e6,
@@ -1111,7 +1128,6 @@ mod tests {
     #[cfg(feature = "forward")]
     #[test]
     fn the_metal_binding_is_the_loads_answer_and_the_rest_is_the_rows() {
-        let f = LlamaLikeFacts::qwen3_0_6b();
         let bind = binding(64, 4);
         let m = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
 
@@ -1156,7 +1172,6 @@ mod tests {
     #[cfg(feature = "forward")]
     #[test]
     fn a_second_publication_of_one_row_moves_only_the_binding() {
-        let f = LlamaLikeFacts::qwen3_0_6b();
         let four = binding(64, 4);
         let eight = binding(128, 8);
         let a = metal_facts(qwen3_row(), Deployed::metal(&four), &four);
@@ -1273,7 +1288,6 @@ mod tests {
     #[cfg(feature = "forward")]
     #[test]
     fn the_expert_bank_names_its_own_format_only_when_the_load_left_one() {
-        let f = LlamaLikeFacts::qwen3_30b_a3b();
         let plain = binding(64, 4);
         let mixed = MetalBinding {
             moe_mxfp4: true,
@@ -1304,7 +1318,6 @@ mod tests {
     #[cfg(feature = "forward")]
     #[test]
     fn a_rescaled_ladder_is_a_table_and_a_plain_one_is_a_base() {
-        let f = LlamaLikeFacts::qwen3_0_6b();
         let bind = binding(64, 4);
         let plain = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
         assert!(!plain.rope_freq_table);

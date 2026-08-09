@@ -10,6 +10,8 @@
 //! as two tables keyed on the string `"gemma2"` that nothing held to
 //! each other.
 
+// Only the texts name a backend, and only they are gated.
+#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
@@ -344,7 +346,7 @@ mod tests {
         assert_eq!(windows.len(), 42);
         assert_eq!(windows[0], 4096);
         assert_eq!(windows[1], -1);
-        assert!(windows.iter().any(|&w| w == -1) && windows.iter().any(|&w| w == 4096));
+        assert!(windows.contains(&-1) && windows.contains(&4096));
     }
 
     /// The final cap reaches the deployment, and a checkpoint that

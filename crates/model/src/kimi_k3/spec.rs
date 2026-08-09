@@ -92,7 +92,7 @@ impl KimiK3Facts {
     /// `l > 0` here and the same guard `forward::kimi_k3_cuda` states.
     #[must_use]
     pub const fn blends_attn_residual(&self, l: u32) -> bool {
-        self.attn_res_block > 0 && l > 0 && l % self.attn_res_block == 0
+        self.attn_res_block > 0 && l > 0 && l.is_multiple_of(self.attn_res_block)
     }
 
     pub fn kimi_k3_synthetic() -> Self {

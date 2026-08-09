@@ -59,11 +59,49 @@ jobs:
           cargo check -p tensor-ir --no-default-features
           cargo check -p tensor-compiler --no-default-features
 
+      # Same defect, one crate over. `model` declares ONE FEATURE PER ASPECT
+      # -- a driver links `contract` without a chat template, an authoring
+      # pass links it without the tracer -- and that is a claim about what
+      # links alone, so it is only true if something builds it that way.
+      #
+      # Nothing did, and it had not been true for the length of the catalog
+      # refactor: `RowScalars` kept a `forward` gate after `deployment`
+      # (ungated, and on the ungated part of `Variant`) started reading it,
+      # so `--features contract` did not compile AT ALL -- sixteen
+      # unresolved names. `cargo test -p model`, the plainest command in the
+      # crate, was among the things that did not run. It went unseen because
+      # every consumer pulls `forward` transitively and feature unification
+      # handed one to every build that asked.
+      #
+      # `--all-targets` because a test is where the gates come apart first:
+      # a `chat`-only vision table named from an ungated test is the same
+      # defect one layer down, and was also present.
+      - name: cargo check (model, one aspect at a time)
+        run: |
+          cargo check -p model --no-default-features --all-targets
+          cargo check -p model --no-default-features --all-targets --features chat
+          cargo check -p model --no-default-features --all-targets --features contract
+          cargo check -p model --no-default-features --all-targets --features forward
+          cargo check -p model --no-default-features --all-targets --features contract,forward
+
       # The compiler crates are at zero clippy warnings, so they are the only
       # part of the workspace that can be gated. The rest still carries ~240
       # warnings (167 in crates/engine alone); widen the `-p` list as crates
       # are cleaned rather than switching this to `--workspace` and reaching
       # for `-A` to hold it up.
+      #
+      # Four of these were already clean and gated by nothing, which is the
+      # worse half of a partial gate: `worker-api`, `ids`, `client-api` and
+      # `controller-api` cost nothing to add and had nothing holding them
+      # there. `model-compiler`, `waker` and `transport` were between one and
+      # twelve findings away.
+      #
+      # The list named `tensor-compiler` four times until now. Six crates were
+      # merged into three by a rename (`pie-ir`/`pie-plan`/`pie-eval`/
+      # `pie-codegen`/`pie-dsl`/`pie-compiler-tests`), and the rename rewrote
+      # each `-p` in place, so the repeats were the merge's shadow rather than
+      # anything cargo needed. Checked against the workspace members before
+      # deduplicating: no crate had fallen out of the gate by losing its name.
       #
       # `--no-deps` matters: cargo drives clippy through
       # RUSTC_WORKSPACE_WRAPPER, which lints every *path* dependency that gets
@@ -72,10 +110,19 @@ jobs:
       - name: cargo clippy (compiler crates, deny warnings)
         run: |
           cargo clippy --no-deps --all-targets \
-            -p tensor-ir -p tensor-compiler -p tensor-compiler \
-            -p tensor-compiler -p tensor-dsl -p tensor-compiler \
-            -p model-loader \
+            -p tensor-ir -p tensor-compiler -p tensor-dsl \
+            -p model-loader -p model-compiler \
+            -p worker-api -p client-api -p controller-api \
+            -p ids -p waker -p transport \
             -- -D warnings
+
+      # `model` runs as its own command because it needs `--all-features`.
+      # Its default feature set is `chat` alone, so gating it alongside the
+      # crates above would leave every `contract` and `forward` item — which
+      # is most of the crate — unlinted. The step above this one already
+      # compiles each aspect separately; this one lints all of them at once.
+      - name: cargo clippy (model, deny warnings)
+        run: cargo clippy --no-deps --all-targets -p model --all-features -- -D warnings
 
       # Same scope, same reason: these crates are rustfmt-clean, the rest of
       # the workspace is not.
@@ -85,12 +132,36 @@ jobs:
       # function's documentation sitting on another, a `///    ///` doubled
       # prefix, a body on its signature line — and each was one `cargo fmt`
       # away from visible for however long it stood.
+      #
+      # `model` joined for the same reason and proved it on the way in: three
+      # files had drifted — a call folded onto one over-long line, a struct
+      # literal written flat — and each had been committed by someone who
+      # believed the crate was clean. Checking a `mod.rs` recurses into its
+      # submodules, so a per-file check had reported a parent's name for a
+      # child's drift, and the drift read as noise.
+      #
+      # `driver-metal` is here and not on the macOS job on purpose. Its CLIPPY
+      # runs there, because a lint can depend on `cfg(target_os)` and only a
+      # Mac compiles both feature halves. rustfmt cannot: it parses and never
+      # type-checks, so it gives the same answer on either host. Leaving it on
+      # the Mac would have meant the only fmt check for the crate sat behind a
+      # runner this branch does not reach — which is how `weights/stage.rs`
+      # and `tests/geometry_is_stated.rs` came to carry a mis-sorted import
+      # and a body opened on its signature's line.
+      #
+      # `worker` is here for the plainer reason that it was never checked
+      # anywhere and had drifted in fifteen files. Its CLIPPY cannot join yet
+      # -- it carries 76 warnings, and a gate is worth nothing until the
+      # crate is at zero -- but fmt is at zero now, and the cheap half of a
+      # gate is still worth having when the alternative is neither half.
       - name: cargo fmt (compiler crates)
         run: |
           cargo fmt --check \
-            -p tensor-ir -p tensor-compiler -p tensor-compiler \
-            -p tensor-compiler -p tensor-dsl -p tensor-compiler \
-            -p model-loader
+            -p tensor-ir -p tensor-compiler -p tensor-dsl \
+            -p model-loader -p model -p model-compiler \
+            -p worker-api -p client-api -p controller-api \
+            -p ids -p waker -p transport \
+            -p driver-metal -p worker
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a

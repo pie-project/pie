@@ -20,6 +20,10 @@
 //! The op projection is [`crate::codegen::op_view::OpView`], the same one the emitters
 //! read, so the kernel and the description of the kernel cannot drift.
 
+use crate::plan::{
+    CompiledStage, Dimension, LibraryOp, NodeIndex, Region, RegionKind, RegionPartition,
+    SymbolicExtent, SymbolicType, stage_identity,
+};
 use driver_api::local::{
     PIE_CHANNEL_HOST_READER, PIE_CHANNEL_HOST_VISIBLE, PIE_CHANNEL_SEEDED, PIE_EXTENT_STATIC,
     PIE_NO_CHANNEL, PIE_READINESS_NEEDS_EMPTY, PIE_READINESS_NEEDS_FULL, PIE_READINESS_UNTOUCHED,
@@ -38,10 +42,6 @@ use tensor_ir::container::{ExternDir, HostRole, PortSource};
 use tensor_ir::op::{intrinsic_tags, tags};
 use tensor_ir::types::ValueType;
 use tensor_ir::validate::{BoundTrace, Direction};
-use crate::plan::{
-    CompiledStage, Dimension, LibraryOp, NodeIndex, Region, RegionKind, RegionPartition,
-    SymbolicExtent, SymbolicType, stage_identity,
-};
 
 use crate::codegen::op_view::OpView;
 
@@ -571,10 +571,12 @@ mod grouped_coverage {
     /// emitted program rather than a restatement of a constant.
     #[test]
     fn grouped_support_is_what_the_runtime_can_execute() {
-        let handled = crate::codegen::runtime_scan::tags_compared_in(crate::codegen::runtime_scan::function_body(
-            crate::codegen::metal::RUNTIME_TEMPLATE,
-            "void ptir_m1_execute",
-        ));
+        let handled = crate::codegen::runtime_scan::tags_compared_in(
+            crate::codegen::runtime_scan::function_body(
+                crate::codegen::metal::RUNTIME_TEMPLATE,
+                "void ptir_m1_execute",
+            ),
+        );
         assert!(
             handled.len() > 40,
             "only {} tag arms parsed out of ptir_m1_execute; the scan broke and \

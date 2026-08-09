@@ -13,12 +13,12 @@ use crate::codegen::wellformed::{op_valid, region_ranges_valid, value_types_vali
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use tensor_ir::op::{intrinsic_tags, tags};
-use tensor_ir::types::DType;
 use crate::plan::{
     CompiledStage, Dimension, LibraryOp, PartitionKind, Region, RegionKind, RegionPartition,
     ScheduleTemplate,
 };
+use tensor_ir::op::{intrinsic_tags, tags};
+use tensor_ir::types::DType;
 
 use super::M1OpMeta;
 use crate::codegen::op_view::OpView;

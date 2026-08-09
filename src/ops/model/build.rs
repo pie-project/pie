@@ -42,18 +42,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
 
+use model::catalog::{Override, Unmatched};
+use model::encoding::{CONFIG_OBJECT, Encoding};
+use model::shared::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
 use model_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY, meta_name};
 use model_loader::checkpoint::read::parse_checkpoint_metadata;
 use model_loader::checkpoint::write::CheckpointWriter;
 use model_loader::executor::Progress;
 use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use model_loader::types::Visibility;
-use model::facts::ModelFacts;
-use model::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
-use model::config::DESCRIPTOR_OBJECT;
 
 use super::import::{
-    ProgressLine, Spool, artifact_path, compile_descriptor, compile_tokenizer, pie_version,
+    ProgressLine, Spool, artifact_path, carry_config, compile_tokenizer, pie_version,
     resolve_source, store_path,
 };
 
@@ -99,42 +99,48 @@ pub struct BuildArgs {
     /// Report what would be done without doing it.
     #[arg(long)]
     pub dry_run: bool,
+    /// Author as this catalog row instead of the one the tensors match.
+    ///
+    /// The escape hatch for a closed set, and it is deliberately not a way
+    /// around the check: the named row's manifest is still held against the
+    /// checkpoint, so this can only ever RESOLVE an ambiguity, never
+    /// introduce one. Two release names for one geometry is the case it
+    /// exists for — nothing in the tensors distinguishes them, so nothing
+    /// but a person can.
+    #[arg(long = "as", value_name = "ID")]
+    pub as_id: Option<String>,
 }
 
 /// pie's own objects, lifted out of an artifact being re-optimized.
 ///
 /// An artifact is the one source that arrives with its metadata already
-/// compiled, and `compile_descriptor` / `compile_tokenizer` both answer `None`
-/// for it — correctly, since there is no `config.json` or `tokenizer.json` to
-/// compile. Writing the output without them would silently produce an artifact
-/// that cannot serve, so they are carried across verbatim instead.
+/// compiled, and `carry_config` / `compile_tokenizer` both answer `None` for
+/// it — correctly, since there is no `config.json` or `tokenizer.json` beside
+/// it. Writing the output without them would silently produce an artifact that
+/// cannot serve, so they are carried across verbatim instead.
 struct CarriedObjects {
-    descriptor: serde_json::Value,
-    descriptor_bytes: Vec<u8>,
+    config_bytes: Vec<u8>,
     tokenizer: Vec<(String, Vec<u8>)>,
 }
 
 fn read_carried_objects(path: &Path) -> Result<CarriedObjects> {
     let checkpoint = parse_checkpoint_metadata(path)
         .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
-    let descriptor_bytes =
-        model_loader::checkpoint::read::read_meta(&checkpoint, DESCRIPTOR_OBJECT)?.ok_or_else(
-            || {
-                anyhow!(
-                    "{} carries no {DESCRIPTOR_OBJECT}; it is a checkpoint file rather \
-                     than a pie artifact, and optimize needs the normalized config",
-                    path.display()
-                )
-            },
-        )?;
-    let descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes)
-        .map_err(|err| anyhow!("cannot parse {}'s model descriptor: {err}", path.display()))?;
+    let config_bytes = model_loader::checkpoint::read::read_meta(&checkpoint, CONFIG_OBJECT)?
+        .ok_or_else(|| {
+            anyhow!(
+                "{} carries no {CONFIG_OBJECT}; it is a checkpoint file rather than a \
+                 pie artifact, or an artifact from before the config was carried \
+                 verbatim — re-import it",
+                path.display()
+            )
+        })?;
     let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len());
     for name in tokenizer::canonical::OBJECTS {
         let bytes = model_loader::checkpoint::read::read_meta(&checkpoint, name)?.ok_or_else(
             || {
                 anyhow!(
-                    "{} carries a model descriptor but not {name}; an artifact with half \
+                    "{} carries a model config but not {name}; an artifact with half \
                      its metadata cannot serve, and this command does not compile the rest",
                     path.display()
                 )
@@ -143,36 +149,41 @@ fn read_carried_objects(path: &Path) -> Result<CarriedObjects> {
         tokenizer.push((name.to_string(), bytes));
     }
     Ok(CarriedObjects {
-        descriptor,
-        descriptor_bytes,
+        config_bytes,
         tokenizer,
     })
 }
 
 pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
     let source = resolve_source(&args.source)?;
-    // Two kinds of source, and the difference is only where the descriptor
-    // comes from: an artifact carries it compiled, and a snapshot is
-    // normalized into one here by the same `model-config` that wrote the
-    // artifact's. Both then reach the author through one projection.
-    //
-    // There were two readers here — one per source — and each defaulted and
-    // probed on its own. `ModelFacts::from_descriptor` is the single one now,
-    // and it lives beside the authors that read the facts rather than in this
-    // command.
+    // Two kinds of source, and the difference is only where the config comes
+    // from: an artifact carries the checkpoint's own, and a snapshot has it
+    // on disk. Both reach the author the same way from here.
     let carried = if source.path.is_file() {
         Some(read_carried_objects(&source.path)?)
     } else {
         None
     };
-    let descriptor = match &carried {
-        Some(objects) => objects.descriptor_bytes.clone(),
-        None => compile_descriptor(&source)?.ok_or_else(|| {
-            anyhow!("build needs a snapshot with a config.json to normalize")
+    let config_bytes = match &carried {
+        Some(objects) => objects.config_bytes.clone(),
+        None => carry_config(&source)?.ok_or_else(|| {
+            // Identity would survive this — the manifest is matched against
+            // the tensors, which are right there. The DECLARED QUANTIZATION
+            // would not: a group size is not an extent of anything, so an
+            // AWQ checkpoint with no config is indistinguishable from a bf16
+            // one here and would be authored as bf16. Refusing is the only
+            // answer that is not a guess.
+            anyhow!(
+                "build needs a snapshot with a config.json: the tensors say what \
+                 model this is, but only the config states how its numbers are \
+                 quantized"
+            )
         })?,
     };
-    let facts = ModelFacts::from_descriptor(&descriptor)
-        .map_err(|err| anyhow!("cannot read the compiled model descriptor: {err}"))?;
+    let config = String::from_utf8(config_bytes.clone())
+        .map_err(|err| anyhow!("the model config is not UTF-8: {err}"))?;
+    let encoding = Encoding::from_config_json(&config)
+        .map_err(|err| anyhow!("cannot read the model config's quantization: {err}"))?;
 
     let runtime_quant = RuntimeQuant::resolve(args.quant.as_deref().unwrap_or(""), args.fp8_native)
         .map_err(|err| anyhow!("--quant: {err}"))?;
@@ -235,14 +246,36 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
 
     let metadata = parse_checkpoint_metadata(&source.path)
         .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;
-    let contract = model::contract::author(&facts, &metadata, &target, &policy)
-        .map_err(|err| anyhow!("cannot author '{}': {err}", facts.model_type))?
-        .ok_or_else(|| anyhow!("no contract author for model_type '{}'", facts.model_type))?;
+
+    // WHAT MODEL THIS IS, ASKED OF THE TENSORS.
+    //
+    // It used to be asked of the config: `model_type` picked an author out of
+    // a table, and a config that misdescribed its own geometry was believed
+    // until an assertion several frames later contradicted it, if one did.
+    // The row is now matched against the tensor names and extents that are
+    // about to be read, so identification and validation are one operation
+    // and a checkpoint is a known model or it is not.
+    let chosen = args
+        .as_id
+        .as_ref()
+        .map_or(Override::None, |id| Override::Id(id.clone()));
+    let row = model::catalog::identify(&metadata, &chosen).map_err(|why| {
+        let hint = match &why {
+            Unmatched::Ambiguous { .. } => {
+                "\n  two rows are one geometry under two names; say which with --as <id>"
+            }
+            _ => "",
+        };
+        anyhow!("cannot identify {}: {why}{hint}", source.path.display())
+    })?;
+
+    let contract = model::contract::author(row, &encoding, &metadata, &target, &policy)
+        .map_err(|err| anyhow!("cannot author '{}': {err}", row.id()))?;
     if !contract.groups.is_empty() {
         bail!(
             "the '{}' contract declares streamed expert groups, which are a paging \
              decision; materializing them eagerly would build the residency they avoid",
-            facts.model_type
+            row.id()
         );
     }
     let public = contract
@@ -252,7 +285,7 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
         .count();
     println!(
         "optimize: {} declares {} tensors ({} bound) for {}, quant={:?}, moe={:?}",
-        facts.model_type,
+        row.id(),
         contract.tensors.len(),
         public,
         args.backend,
@@ -282,9 +315,8 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
         .map_err(|err| anyhow!("cannot compile: {err}"))?;
 
     // Metadata first, weights streamed after — the same shape convert has.
-    // The descriptor was compiled above, because the facts were read from it;
-    // the artifact carries that same document rather than a second
-    // normalization of the same file.
+    // The config was read above for its quantization; the artifact carries
+    // those same bytes rather than a second reading of the same file.
     let tokenizer = compile_tokenizer(&source)?;
 
     let mut bar = ProgressLine::new();
@@ -328,10 +360,7 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
             for (path, bytes) in &objects.tokenizer {
                 meta.push((meta_name(path), bytes.clone()));
             }
-            meta.push((
-                meta_name(DESCRIPTOR_OBJECT),
-                objects.descriptor_bytes.clone(),
-            ));
+            meta.push((meta_name(CONFIG_OBJECT), objects.config_bytes.clone()));
         }
         None => {
             if let Some(canonical) = &tokenizer {
@@ -341,7 +370,7 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
             }
             // Not conditional: the run could not have authored anything
             // without this document, so by here it exists.
-            meta.push((meta_name(DESCRIPTOR_OBJECT), descriptor.clone()));
+            meta.push((meta_name(CONFIG_OBJECT), config_bytes.clone()));
         }
     }
     let mut entries: Vec<(&str, Entry<'_>)> = meta

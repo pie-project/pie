@@ -198,6 +198,14 @@ const NOT_SHARED: &[(&str, &str)] = &[
         "shared/kimi.rs",
         "kimi's shared pieces, bound by kimi-k2 and kimi-k3",
     ),
+    (
+        "test_rows.rs",
+        "ONE ROW THAT IS NOT A MODEL, behind a feature no shipped build \
+         enables. It names llama-3 because it IS a `Llama3` — deliberately, \
+         so that a test exercises the same type, table and authoring pass \
+         production does rather than a second implementation of them. Sharing \
+         is not the question for a file the perimeter never links",
+    ),
 ];
 
 /// `instruct.rs` is half vocabulary and half registry, in that order, split by

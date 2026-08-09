@@ -66,7 +66,8 @@ const FILLED_ELSEWHERE: &[(&str, &str)] = &[
     ),
 ];
 
-fn source() -> String {    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/batch/geometry.rs");
+fn source() -> String {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/batch/geometry.rs");
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 
@@ -100,7 +101,10 @@ fn declared(s: &str) -> BTreeSet<String> {
 }
 
 fn stated(s: &str, names: &BTreeSet<String>) -> BTreeSet<String> {
-    let b = block(s, s.find("fn geometry_from_deployment").expect("the builder"));
+    let b = block(
+        s,
+        s.find("fn geometry_from_deployment").expect("the builder"),
+    );
     names
         .iter()
         .filter(|n| {
@@ -119,7 +123,11 @@ fn stated(s: &str, names: &BTreeSet<String>) -> BTreeSet<String> {
 fn every_geometry_field_is_stated_or_accounted_for() {
     let s = source();
     let names = declared(&s);
-    assert!(names.len() > 35, "found only {} fields — the scan broke", names.len());
+    assert!(
+        names.len() > 35,
+        "found only {} fields — the scan broke",
+        names.len()
+    );
 
     let stated = stated(&s, &names);
     let accounted: BTreeSet<&str> = FILLED_ELSEWHERE.iter().map(|(n, _)| *n).collect();
@@ -182,7 +190,10 @@ fn read_names() -> BTreeSet<String> {
         }
     }
     let mut all = String::new();
-    walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut all);
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut all,
+    );
     let mut seen = BTreeSet::new();
     for (i, _) in all.match_indices('.') {
         let r = &all[i + 1..];

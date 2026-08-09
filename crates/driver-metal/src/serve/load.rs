@@ -224,41 +224,21 @@ impl Shell {
         let geometry = crate::batch::geometry_from_deployment(&deployment, row.load_shape(), quant)
             .map_err(Error::from)?;
 
-        // TWO STATEMENTS FROM ONE CHECKPOINT THAT CANNOT BOTH BE TRUE — and
-        // the reason there is no refusal here any more.
+        // The sandwich-norm/GELU pair used to be checked here, by asking
+        // the staged tensors whether `pre_feedforward_layernorm` had
+        // arrived and comparing that to the row's gate. It is now
+        // `model/tests/sandwich_norm_implies_gelu.rs`, where both halves
+        // are already stated and no checkpoint is needed: the manifest
+        // declares the norm, the deployment states the gate, and every
+        // row is checked when it is written rather than the ones a Metal
+        // load happens to reach.
         //
-        // A stack that norms both ways round each sub-layer — a sandwich norm
-        // — states its MLP gate as a GELU. This used to be unconditional for
-        // gemma, because a `Deployment` STATED NO ACTIVATION AT ALL and this
-        // driver could only project a SiLU; the refusal named what would lift
-        // it, and `Deployment::mlp_gate` is that. So the guard now compares
-        // two independent answers instead of one answer and a default: what
-        // the ROW says its gate is, against what the TENSORS imply.
-        //
-        // Kept, and not deleted with the hole it described. Serving a gemma
-        // on a SiLU is a 2%-at-the-origin error that diverges from there,
-        // produces finite plausible tokens and never faults — measured on
-        // gemma-4-31b, whose three mid-rank probes read 0.95, 0.93 and 0.93
-        // of MLX's logits and whose argmax and top five were RIGHT
-        // throughout. A defect that survives every cheap check is one worth
-        // keeping a second reader for, and a row added later with its gate
-        // left at the default is exactly how it would come back.
-        if loaded
-            .tensors
-            .contains_key("layers.0.pre_feedforward_layernorm.weight")
-            && !geometry.gelu_gate
-        {
-            return Err(Error::Unserved {
-                what: "load_model",
-                message: format!(
-                    "`{}` ships a sandwich norm, whose MLP gate is a GELU, and its \
-                     catalog row states a SiLU. `Deployment::mlp_gate` is what this \
-                     driver projects from, so the row is where to fix it: a gemma \
-                     served on a SiLU answers plausibly and wrongly",
-                    row.id()
-                ),
-            });
-        }
+        // The measurement that motivated it is recorded there. What does
+        // not survive the move is the idea that this driver should hold a
+        // second answer -- `no_probe_decides_a_fact` forbids exactly the
+        // tensor question that guard asked, and it is right to: the norm
+        // variant came to read `(1 + w)` for gemma-4 because a probe of
+        // this shape asked whether it shipped the norm.
 
         // THE ROW, and what this load OBSERVED that the row cannot state.
         //

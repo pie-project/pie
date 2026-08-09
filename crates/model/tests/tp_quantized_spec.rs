@@ -68,7 +68,7 @@ fn spec(f: &Facts) -> model_compiler::trace::ForwardPlan {
         // A projection handle carries BOTH facts: the width is this
         // rank's, the repr is the checkpoint's.
         let proj = |name: &str, width: u32| {
-            MatW::dense(format!("layer.{l}.{name}"), width, Some(l)).with_repr(f.proj_repr.clone())
+            MatW::dense(format!("layer.{l}.{name}"), width, Some(l)).with_repr(f.proj_repr)
         };
 
         let y = dsl::embed_with(t, "embed", f.hidden);

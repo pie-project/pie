@@ -128,6 +128,14 @@ client = { path = "../client" }
 [dev-dependencies]
 tempfile = "3"
 tensor-ir = { path = "../tensor-ir" }
+# The same `model`, with the one row that is not a model.
+#
+# `dummy_boot_uses_create_compile_load_sequence` writes a four-byte
+# checkpoint because what it checks is the create/compile/load SEQUENCE, not
+# a model. Identity is a manifest match now, so the dummy driver has to name
+# a row it can be held to, and the smallest real one is half a gigabyte of
+# embedding. See `model::test_rows`.
+model = { path = "../model", features = ["forward", "contract", "test-rows"] }
 
 [build-dependencies]
 # `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a
