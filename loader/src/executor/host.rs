@@ -918,8 +918,7 @@ impl HostExecutor<'_, '_> {
         if from == to {
             return Ok(bytes.to_vec());
         }
-        let values = decode_values(bytes, from)?;
-        encode_values(&values, to)
+        cast_raw(bytes, from, to)
     }
 
     /// Decode a self-contained blocked payload to its logical dtype: the
@@ -949,49 +948,7 @@ impl HostExecutor<'_, '_> {
                 "GGUF Q4_0 decodes to its logical BF16, not {dtype:?}"
             )));
         }
-        if !bytes.len().is_multiple_of(18) {
-            return Err(invalid(format!(
-                "host Decode read {} bytes, not whole 18-byte Q4_0 blocks",
-                bytes.len()
-            )));
-        }
-        let blocks = bytes.len() / 18;
-        let mut out = vec![0u8; blocks * 64];
-        // Blocks are self-contained, so they decode in parallel the same way
-        // encode rows do: disjoint output slices, any worker count, the same
-        // bytes.
-        let workers = if blocks < (1 << 15) {
-            1
-        } else {
-            std::thread::available_parallelism()
-                .map_or(1, std::num::NonZero::get)
-                .min(blocks)
-        };
-        let per_worker = blocks.div_ceil(workers);
-        std::thread::scope(|scope| {
-            let mut out_rest = &mut out[..];
-            let mut start = 0usize;
-            while start < blocks {
-                let count = per_worker.min(blocks - start);
-                let (chunk, rest) = std::mem::take(&mut out_rest).split_at_mut(count * 64);
-                out_rest = rest;
-                let source = &bytes[start * 18..(start + count) * 18];
-                scope.spawn(move || {
-                    let mut values = [0.0f32; 32];
-                    for (block, out) in source.chunks_exact(18).zip(chunk.chunks_exact_mut(64)) {
-                        decode_gguf_q4_0_block_into(
-                            block.try_into().expect("chunks are 18 bytes"),
-                            &mut values,
-                        );
-                        for (value, le) in values.iter().zip(out.chunks_exact_mut(2)) {
-                            le.copy_from_slice(&bf16::from_f32(*value).to_bits().to_le_bytes());
-                        }
-                    }
-                });
-                start += count;
-            }
-        });
-        Ok(out)
+        decode_gguf_q4_0(bytes)
     }
 
     /// Quantize on the host: the ports of the CUDA encode kernels, arithmetic
@@ -2059,6 +2016,82 @@ fn exp2_e8m0(sb: u8) -> f32 {
     } else {
         f32::from_bits(u32::from(sb) << 23)
     }
+}
+
+/// Apply the import-time conversion for one complete tensor payload.
+///
+/// The plan executor and metadata-first importer meet here so conversion has
+/// one implementation regardless of whether bytes came from a local file or
+/// a remote range. Materialization admits exactly these two conversion forms.
+pub fn convert_tensor_bytes(
+    bytes: &[u8],
+    from: &Encoding,
+    to: &Encoding,
+) -> Result<Vec<u8>, Error> {
+    match (from, to) {
+        (Encoding::Raw(from), Encoding::Raw(to)) => cast_raw(bytes, *from, *to),
+        (Encoding::Quant(spec), Encoding::Raw(DType::BF16))
+            if spec.scheme == QuantScheme::GgufQ4_0 =>
+        {
+            decode_gguf_q4_0(bytes)
+        }
+        _ => Err(invalid(format!(
+            "host import conversion does not implement {from:?} to {to:?}"
+        ))),
+    }
+}
+
+fn cast_raw(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Error> {
+    if from == to {
+        return Ok(bytes.to_vec());
+    }
+    let values = decode_values(bytes, from)?;
+    encode_values(&values, to)
+}
+
+fn decode_gguf_q4_0(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    if !bytes.len().is_multiple_of(18) {
+        return Err(invalid(format!(
+            "host Decode read {} bytes, not whole 18-byte Q4_0 blocks",
+            bytes.len()
+        )));
+    }
+    let blocks = bytes.len() / 18;
+    let mut out = vec![0u8; blocks * 64];
+    // Blocks are self-contained, so they decode in parallel the same way
+    // encode rows do: disjoint output slices, any worker count, the same bytes.
+    let workers = if blocks < (1 << 15) {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(blocks)
+    };
+    let per_worker = blocks.div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut out_rest = &mut out[..];
+        let mut start = 0usize;
+        while start < blocks {
+            let count = per_worker.min(blocks - start);
+            let (chunk, rest) = std::mem::take(&mut out_rest).split_at_mut(count * 64);
+            out_rest = rest;
+            let source = &bytes[start * 18..(start + count) * 18];
+            scope.spawn(move || {
+                let mut values = [0.0f32; 32];
+                for (block, out) in source.chunks_exact(18).zip(chunk.chunks_exact_mut(64)) {
+                    decode_gguf_q4_0_block_into(
+                        block.try_into().expect("chunks are 18 bytes"),
+                        &mut values,
+                    );
+                    for (value, le) in values.iter().zip(out.chunks_exact_mut(2)) {
+                        le.copy_from_slice(&bf16::from_f32(*value).to_bits().to_le_bytes());
+                    }
+                }
+            });
+            start += count;
+        }
+    });
+    Ok(out)
 }
 
 fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {

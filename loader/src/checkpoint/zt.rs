@@ -126,6 +126,28 @@ pub fn artifact_identity(path: &Path) -> Result<Option<Vec<u8>>, Error> {
     Ok(Some(identity))
 }
 
+/// Per-object payload digests from a `.zt` manifest, without reading payloads.
+///
+/// Canonical checkpoints have one `data` part per object. Returning the
+/// manifest value lets a producer reconcile digests it computed while writing
+/// without paying a second artifact read.
+pub fn artifact_digests(path: &Path) -> Result<std::collections::BTreeMap<String, String>, Error> {
+    let manifest = ztensor::read::manifest_of(path)
+        .map_err(Error::from)?
+        .ok_or_else(|| Error::Checkpoint(format!("{} has no zTensor manifest", path.display())))?;
+    let mut digests = std::collections::BTreeMap::new();
+    for (name, object) in manifest.objects {
+        let part = object.parts.get("data").ok_or_else(|| {
+            Error::Checkpoint(format!("object {name:?} has no canonical data part"))
+        })?;
+        let digest = part.digest.clone().ok_or_else(|| {
+            Error::Checkpoint(format!("object {name:?} carries no payload digest"))
+        })?;
+        digests.insert(name, digest);
+    }
+    Ok(digests)
+}
+
 /// Reads a checkpoint's file-level attributes as a flat text map.
 ///
 /// The read side of what [`CheckpointWriter`](super::write::CheckpointWriter)

@@ -3,9 +3,9 @@
 //! `build` authors the serve contract, materializes it through the
 //! streaming executor and the disk spool, and writes the *runtime* tensors —
 //! the fused QKV banks are the proof, because no checkpoint ships one.
-//! `import` on an F32 snapshot exercises the same spool from the other
-//! side: the decoded set is the whole model, which is exactly the case the
-//! spool exists for, and the artifact must hold the BF16 the engine reads.
+//! `import` on an F32 snapshot exercises the metadata-first bounded source
+//! window: the decoded set is the whole model and the artifact must hold the
+//! BF16 the engine reads without a decoded disk spool.
 //!
 //! Both run against a synthetic llama snapshot written from scratch — real
 //! safetensors bytes on disk, no fixtures — so the tests cover the
@@ -148,11 +148,11 @@ fn build_materializes_the_serve_contract() {
     assert_eq!(verified as usize, parsed.tensors.len());
 }
 
-/// import on an F32 snapshot decodes *everything* — the whole-model case
-/// the streaming executor and the disk spool exist for — and the artifact
-/// holds BF16 under the original names.
+/// import on an F32 snapshot decodes *everything* through the same bounded
+/// source seam remote imports use, and the artifact holds BF16 under the
+/// original names.
 #[test]
-fn import_streams_a_fully_decoded_model_through_the_spool() {
+fn import_streams_a_fully_decoded_model_without_a_spool() {
     let staging = tempfile::tempdir().expect("staging");
     write_snapshot(staging.path(), "F32");
     let store = tempfile::tempdir().expect("store");
@@ -164,6 +164,8 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
         dry_run: false,
         force: false,
         max_shard_size: None,
+        reorder_buffer: 3 << 30,
+        integrity_report: Some(store.path().join("converted.integrity.json")),
         delete_source: false,
     })
     .expect("import failed");
@@ -181,6 +183,10 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
     assert!(
         !store.path().join("converted.spool.tmp").exists(),
         "the spool was not cleaned up"
+    );
+    assert!(
+        store.path().join("converted.integrity.json").exists(),
+        "the in-pass integrity census was not emitted"
     );
     let verified = verify_checkpoint(&artifact).expect("digests verify");
     assert_eq!(verified as usize, parsed.tensors.len());

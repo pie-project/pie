@@ -17,9 +17,230 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::checkpoint::CheckpointMetadata;
 use crate::checkpoint::zt;
+use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use crate::error::Error;
+use crate::types::{CheckpointFormat, DType, Encoding, FileId, TensorId};
+
+/// A safetensors shard whose leading header bytes have already been read.
+///
+/// `header` includes the eight-byte little-endian JSON length and the padded
+/// JSON body, exactly as stored at offset zero. Keeping I/O outside this type
+/// lets local files and remote ranges share the loader's format authority.
+pub struct SafetensorsShardHeader {
+    pub path: String,
+    pub size_bytes: u64,
+    pub header: Vec<u8>,
+}
+
+#[derive(serde::Deserialize)]
+struct SafetensorsTensorHeader {
+    dtype: String,
+    shape: Vec<u64>,
+    data_offsets: [u64; 2],
+}
+
+/// Project already-fetched safetensors headers into loader metadata.
+///
+/// This is the metadata-first counterpart of [`parse_checkpoint_metadata`].
+/// Fetching the bytes is a provisioning concern; validating the tensor names,
+/// encodings, shapes, and addresses remains a checkpoint concern.
+pub fn parse_safetensors_headers(
+    shards: &[SafetensorsShardHeader],
+) -> Result<CheckpointMetadata, Error> {
+    let mut files = Vec::with_capacity(shards.len());
+    let mut tensors = Vec::new();
+    let mut names = BTreeSet::new();
+
+    for (file_index, shard) in shards.iter().enumerate() {
+        let file_id = FileId(u32::try_from(file_index).map_err(|_| {
+            Error::Checkpoint("checkpoint has more files than a file id holds".into())
+        })?);
+        if shard.header.len() < 8 {
+            return Err(Error::Checkpoint(format!(
+                "{}: safetensors header is shorter than its 8-byte length",
+                shard.path
+            )));
+        }
+        let json_len = u64::from_le_bytes(shard.header[..8].try_into().unwrap());
+        if json_len > 100 << 20 {
+            return Err(Error::Checkpoint(format!(
+                "{}: safetensors header is {json_len} bytes; refusing more than 100 MiB",
+                shard.path
+            )));
+        }
+        let data_start = 8u64.checked_add(json_len).ok_or_else(|| {
+            Error::Checkpoint(format!(
+                "{}: safetensors header length overflows",
+                shard.path
+            ))
+        })?;
+        if data_start != shard.header.len() as u64 {
+            return Err(Error::Checkpoint(format!(
+                "{}: declared safetensors header is {json_len} bytes but {} bytes were supplied",
+                shard.path,
+                shard.header.len().saturating_sub(8)
+            )));
+        }
+        if data_start > shard.size_bytes {
+            return Err(Error::Checkpoint(format!(
+                "{}: safetensors header ends at {data_start}, past the {}-byte file",
+                shard.path, shard.size_bytes
+            )));
+        }
+
+        let root: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&shard.header[8..]).map_err(|err| {
+                Error::Checkpoint(format!("{}: invalid safetensors header: {err}", shard.path))
+            })?;
+        let mut occupied = Vec::new();
+        let mut shard_tensors = Vec::new();
+        for (name, value) in root {
+            if name == "__metadata__" {
+                continue;
+            }
+            if !names.insert(name.clone()) {
+                return Err(Error::Checkpoint(format!(
+                    "tensor {name:?} appears in more than one safetensors shard"
+                )));
+            }
+            let entry: SafetensorsTensorHeader = serde_json::from_value(value).map_err(|err| {
+                Error::Checkpoint(format!("{} tensor {name:?}: {err}", shard.path))
+            })?;
+            let [start, end] = entry.data_offsets;
+            if start > end {
+                return Err(Error::Checkpoint(format!(
+                    "{} tensor {name:?}: data offsets go backwards ({start}..{end})",
+                    shard.path
+                )));
+            }
+            let span_bytes = end - start;
+            let dtype = safetensors_dtype(&entry.dtype).ok_or_else(|| {
+                Error::Checkpoint(format!(
+                    "{} tensor {name:?}: unsupported safetensors dtype {:?}",
+                    shard.path, entry.dtype
+                ))
+            })?;
+            let shape: Vec<i64> = entry
+                .shape
+                .iter()
+                .map(|&dimension| {
+                    i64::try_from(dimension).map_err(|_| {
+                        Error::Checkpoint(format!(
+                            "{} tensor {name:?}: dimension {dimension} does not fit i64",
+                            shard.path
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let expected = crate::types::tensor_nbytes(&shape, dtype.bytes()).ok_or_else(|| {
+                Error::Checkpoint(format!(
+                    "{} tensor {name:?}: shape byte count overflows",
+                    shard.path
+                ))
+            })?;
+            if expected != span_bytes {
+                return Err(Error::Checkpoint(format!(
+                    "{} tensor {name:?}: shape and dtype require {expected} bytes, header declares {span_bytes}",
+                    shard.path
+                )));
+            }
+            let file_offset = data_start.checked_add(start).ok_or_else(|| {
+                Error::Checkpoint(format!(
+                    "{} tensor {name:?}: file offset overflows",
+                    shard.path
+                ))
+            })?;
+            let file_end = data_start.checked_add(end).ok_or_else(|| {
+                Error::Checkpoint(format!(
+                    "{} tensor {name:?}: file end overflows",
+                    shard.path
+                ))
+            })?;
+            if file_end > shard.size_bytes {
+                return Err(Error::Checkpoint(format!(
+                    "{} tensor {name:?}: range ends at {file_end}, past the {}-byte file",
+                    shard.path, shard.size_bytes
+                )));
+            }
+            occupied.push((start, end, name.clone()));
+            shard_tensors.push((name, file_offset, span_bytes, shape, Encoding::Raw(dtype)));
+        }
+
+        occupied.sort_unstable_by_key(|(start, _, _)| *start);
+        let mut next = 0u64;
+        for (start, end, name) in &occupied {
+            if *start != next {
+                return Err(Error::Checkpoint(format!(
+                    "{}: tensor {name:?} starts at {start}, leaving a gap after {next}",
+                    shard.path
+                )));
+            }
+            next = *end;
+        }
+        for pair in occupied.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(Error::Checkpoint(format!(
+                    "{}: tensor ranges {:?} and {:?} overlap",
+                    shard.path, pair[0].2, pair[1].2
+                )));
+            }
+        }
+        let data_bytes = shard.size_bytes - data_start;
+        if next != data_bytes {
+            return Err(Error::Checkpoint(format!(
+                "{}: tensors cover {next} data bytes but the file carries {data_bytes}",
+                shard.path
+            )));
+        }
+        shard_tensors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (name, file_offset, span_bytes, shape, encoding) in shard_tensors {
+            let id = TensorId(u32::try_from(tensors.len()).map_err(|_| {
+                Error::Checkpoint("checkpoint has more tensors than a tensor id holds".into())
+            })?);
+            tensors.push(RawTensor {
+                id,
+                name,
+                file_id,
+                file_offset,
+                span_bytes,
+                shape,
+                encoding,
+            });
+        }
+        files.push(CheckpointFile {
+            id: file_id,
+            path: shard.path.clone(),
+            size_bytes: shard.size_bytes,
+            format: CheckpointFormat::Safetensors,
+        });
+    }
+    tensors.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    for (index, tensor) in tensors.iter_mut().enumerate() {
+        tensor.id = TensorId(index as u32);
+    }
+    Ok(CheckpointMetadata { files, tensors })
+}
+
+fn safetensors_dtype(dtype: &str) -> Option<DType> {
+    Some(match dtype {
+        "F32" => DType::F32,
+        "F16" => DType::F16,
+        "BF16" => DType::BF16,
+        "F8_E4M3" | "F8_E4M3FN" => DType::F8E4M3,
+        "F8_E5M2" => DType::F8E5M2,
+        "I64" => DType::I64,
+        "I32" => DType::I32,
+        "I16" => DType::I16,
+        "I8" => DType::I8,
+        "U64" => DType::U64,
+        "U32" => DType::U32,
+        "U16" => DType::U16,
+        "U8" => DType::U8,
+        "BOOL" => DType::Bool,
+        _ => return None,
+    })
+}
 
 /// Discover the safetensors shard files for a snapshot directory, matching the
 /// C++ `discover_safetensors_manifest` with a `SingleFile` layout preference.
@@ -239,5 +460,43 @@ mod tests {
         std::fs::write(&path, b"GGUF").unwrap();
         assert_eq!(discover_gguf_file(&path), Some(path.clone()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn metadata_first_headers_match_the_filesystem_reader() {
+        let dir = tmpdir("header_parity");
+        let path = dir.join("model.safetensors");
+        let json = r#"{"z":{"dtype":"BF16","shape":[2],"data_offsets":[4,8]},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut file = Vec::new();
+        file.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        file.extend_from_slice(json.as_bytes());
+        file.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, &file).unwrap();
+
+        let filesystem = parse_checkpoint_metadata(&dir).unwrap();
+        let projected = parse_safetensors_headers(&[SafetensorsShardHeader {
+            path: path.display().to_string(),
+            size_bytes: file.len() as u64,
+            header: file[..8 + json.len()].to_vec(),
+        }])
+        .unwrap();
+        assert_eq!(projected, filesystem);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn metadata_first_headers_reject_unclaimed_payload_bytes() {
+        let json = r#"{"a":{"dtype":"U8","shape":[1],"data_offsets":[1,2]}}"#;
+        let mut header = Vec::new();
+        header.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        header.extend_from_slice(json.as_bytes());
+        let error = parse_safetensors_headers(&[SafetensorsShardHeader {
+            path: "model.safetensors".into(),
+            size_bytes: header.len() as u64 + 2,
+            header,
+        }])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("leaving a gap"), "got: {error}");
     }
 }

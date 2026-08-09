@@ -21,6 +21,8 @@ use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
 
 pub mod build;
 pub mod import;
+#[cfg(feature = "remote-import")]
+pub(crate) mod remote;
 
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {

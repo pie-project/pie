@@ -115,6 +115,13 @@ pub struct ImportArgs {
     /// recommendation — see the note on `--help`.
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub max_shard_size: Option<u64>,
+    /// Maximum fetched tensor bytes waiting for their name-ordered write.
+    /// A single tensor larger than this fails rather than growing memory.
+    #[arg(long, value_name = "SIZE", default_value = "3GiB", value_parser = parse_size)]
+    pub reorder_buffer: u64,
+    /// Write the in-pass source/output digest census as JSON here.
+    #[arg(long, value_name = "PATH")]
+    pub integrity_report: Option<PathBuf>,
     /// After the artifact is written and every tensor digest verifies, delete
     /// the source weight files it was computed from. Config and tokenizer
     /// files stay.
@@ -128,13 +135,15 @@ pub struct ImportArgs {
 }
 
 pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
-    let source = resolve_source(&args.source)?;
-    let metadata = parse_checkpoint_metadata(&source.path)
-        .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;
+    let source = ImportSource::resolve(&args.source)?;
+    if args.delete_source && !source.is_local() {
+        bail!("--delete-source applies only to a source already on disk");
+    }
+    let metadata = source.metadata()?;
 
     let out_file = match &args.out {
-        Some(out) => artifact_path(out, &source.name),
-        None => store_path(&source.name),
+        Some(out) => artifact_path(out, source.name()),
+        None => store_path(source.name()),
     };
 
     // A checkpoint that is already an artifact is the one thing left alone —
@@ -150,16 +159,16 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         }
         return Ok(crate::ui::Answer::noop(format!(
             "{} is already pie's own format; nothing to convert",
-            source.name
+            source.name()
         )));
     }
 
     // Up to date means: written by this pie, from this source.
     if out_file.exists() && !args.force {
-        if let Some(reason) = staleness(&out_file, pie_version(), &source.origin) {
+        if let Some(reason) = staleness(&out_file, pie_version(), source.origin()) {
             println!(
                 "{}: rebuilding {} ({reason})",
-                source.name,
+                source.name(),
                 out_file.display()
             );
         } else {
@@ -170,7 +179,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
             // silence at exactly the moment source files are being deleted.
             let up_to_date = format!(
                 "{} is up to date at {}",
-                source.name,
+                source.name(),
                 crate::ui::short_path(&out_file)
             );
             // An artifact already standing in for the source is exactly the
@@ -181,7 +190,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
                     report_would_delete(&metadata);
                     return Ok(crate::ui::Answer::noop("dry run: nothing was deleted"));
                 }
-                delete_source(&source.name, &metadata, &out_file)?;
+                delete_source(source.name(), &metadata, &out_file)?;
                 return Ok(crate::ui::Answer::did("deleted the source files"));
             }
             return Ok(crate::ui::Answer::noop(up_to_date));
@@ -199,7 +208,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     // Metadata compiles here, before any bytes are written: an artifact whose
     // weights are perfect but whose tokenizer would not compile cannot serve,
     // and finding that out after copying 800 GB helps nobody.
-    let tokenizer = compile_tokenizer(&source)?;
+    let tokenizer = source.compile_tokenizer()?;
     match &tokenizer {
         Some(canonical) => println!(
             "convert: tokenizer compiled to {} ({} KiB)",
@@ -211,7 +220,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
              and serving it needs one from elsewhere"
         ),
     }
-    let descriptor = compile_descriptor(&source)?;
+    let descriptor = source.compile_descriptor()?;
     match &descriptor {
         Some(_) => println!(
             "convert: model config normalized to {}",
@@ -241,20 +250,19 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     // The passthrough set, resolved to source addresses up front — the copy
     // total is part of the progress denominator from the first frame, and
     // resolving the file here leaves the copy loop nothing to look up.
-    let mut passthrough: Vec<(&RawTensor, &str)> =
-        Vec::with_capacity(materialization.passthrough.len());
+    let mut passthrough: Vec<&RawTensor> = Vec::with_capacity(materialization.passthrough.len());
     for name in &materialization.passthrough {
         let raw = metadata
             .tensor_by_name(name)
             .ok_or_else(|| anyhow!("'{name}' is in the materialization but not the checkpoint"))?;
-        let file = metadata
+        metadata
             .files
             .iter()
             .find(|file| file.id == raw.file_id)
             .ok_or_else(|| anyhow!("'{name}' points at a file the checkpoint lacks"))?;
-        passthrough.push((raw, file.path.as_str()));
+        passthrough.push(raw);
     }
-    let copy_bytes: u64 = passthrough.iter().map(|(raw, _)| raw.span_bytes).sum();
+    let source_bytes: u64 = metadata.tensors.iter().map(|raw| raw.span_bytes).sum();
 
     // pie's own objects, named into the reserved namespace so the write can
     // merge them with the weights in one ascending pass.
@@ -271,13 +279,10 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     let started = std::time::Instant::now();
     let mut bar = ProgressLine::new();
 
-    // Decode phase: the blocked tensors stream through the plan executor
-    // into a disk spool, one at a time. Peak memory is one tensor's working
-    // set, not the decoded set — which for an F16 checkpoint is the whole
-    // model, the case that made the old collect-everything executor a
-    // 2x-model-size boot. The spool holds the decoded bytes so the ascending
-    // merge below can still interleave them with the passthrough copies.
-    let mut decode_read_bytes = 0u64;
+    // Compile the decoded declarations, but execute each direct materialization
+    // from the bounded source window below. That removes the decoded disk spool
+    // while preserving the plan compiler as the authority for output shape and
+    // encoding.
     let decoded = if materialization.contract.tensors.is_empty() {
         None
     } else {
@@ -288,63 +293,58 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         };
         let plan = pie_loader::plan::compile(&metadata, &materialization.contract, target)
             .map_err(|err| anyhow!("cannot compile the decode: {err}"))?;
-        let mut spool = Spool::create(&out_file)?;
-        pie_loader::executor::host::execute_plan_into(
-            &plan,
-            &source.base(),
-            &mut spool,
-            &mut |progress| {
-                decode_read_bytes = progress.total_read_bytes;
-                bar.render(&Progress {
-                    read_bytes: progress.read_bytes,
-                    total_read_bytes: progress.total_read_bytes + copy_bytes,
-                    finalized: progress.finalized,
-                });
-            },
-        )
-        .map_err(|err| anyhow!("decoding failed: {err}"))?;
-        Some((plan, spool))
+        Some(plan)
     };
 
     let provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
-        (SOURCE_KEY.to_string(), source.origin.clone()),
+        (SOURCE_KEY.to_string(), source.origin().to_string()),
     ]);
     let mut writer = match args.max_shard_size {
         Some(max) => CheckpointWriter::create_sharded(&out_file, &provenance, max),
         None => CheckpointWriter::create(&out_file, &provenance),
     }
     .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
-    let mut decoded = decoded;
-    let written_bytes = write_artifact(
+    let report = write_artifact(
         &mut writer,
-        decoded.as_mut(),
+        &source,
+        &metadata,
+        decoded.as_ref(),
         &passthrough,
         &meta,
         &mut bar,
-        decode_read_bytes,
-        copy_bytes,
+        source_bytes,
+        args.reorder_buffer,
     )?;
     // Closing belongs to whoever opened it: `finish` consumes the writer.
     writer
         .finish()
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
-    if let Some((_, spool)) = decoded {
-        spool.remove();
+    reconcile_digests(
+        &out_file,
+        &report.digests,
+        args.integrity_report.as_deref(),
+    )?;
+    if let Some(summary) = source.telemetry() {
+        println!("{summary}");
     }
+    println!(
+        "integrity: {} tensors hashed during transport/write; conversion correctness: S1 byte-identity only",
+        report.digests.len()
+    );
 
     // `ui::bytes` and `ui::duration`, not `/ (1 << 20)` and `{:.1?}`: this line
     // reported megabytes while every other line pie prints reports GiB, and a
     // Debug-formatted Duration ("94.31234s") is not a rendering anyone chose.
     let did = format!(
         "imported {} — {} in {} → {}",
-        source.name,
-        crate::ui::bytes(written_bytes),
+        source.name(),
+        crate::ui::bytes(report.written_bytes),
         crate::ui::duration(started.elapsed()),
         crate::ui::short_path(&out_file)
     );
     if args.delete_source {
-        delete_source(&source.name, &metadata, &out_file)?;
+        delete_source(source.name(), &metadata, &out_file)?;
     }
     Ok(crate::ui::Answer::did(did))
 }
@@ -415,13 +415,9 @@ fn remove_cache_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The decoded tensors, spooled to disk beside the artifact.
-///
-/// The executor streams tensors out in schedule order; the artifact writer
-/// needs them back in ascending-name order, interleaved with the passthrough
-/// copies. The spool is the buffer between the two orders, and it is a file
-/// rather than a map so the buffer costs disk instead of memory — the
-/// decoded set is the whole model for an F16 checkpoint.
+/// Disk spool used by `pie model build`, whose general transform schedule is
+/// not name ordered. Import no longer uses it: direct materialization now
+/// drains the bounded source window into the artifact in name order.
 pub(crate) struct Spool {
     path: PathBuf,
     file: std::fs::File,
@@ -431,8 +427,6 @@ pub(crate) struct Spool {
 
 impl Spool {
     pub(crate) fn create(out_file: &Path) -> Result<Self> {
-        // Beside the artifact, so it lands on the same filesystem the bytes
-        // are headed for anyway.
         let path = out_file.with_extension("spool.tmp");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -459,7 +453,6 @@ impl Spool {
             .get(name)
             .ok_or_else(|| anyhow!("the plan declared '{name}' but produced nothing"))?;
         let mut bytes = vec![0u8; len as usize];
-        use std::io::{Read, Seek, SeekFrom};
         self.file
             .seek(SeekFrom::Start(offset))
             .and_then(|_| self.file.read_exact(&mut bytes))
@@ -521,8 +514,11 @@ impl ProgressLine {
         if let Some(name) = progress.finalized {
             self.current = name.to_string();
         }
-        self.bar
-            .draw(progress.read_bytes, progress.total_read_bytes, &self.current);
+        self.bar.draw(
+            progress.read_bytes,
+            progress.total_read_bytes,
+            &self.current,
+        );
     }
 
     pub(crate) fn finish(&mut self) {
@@ -554,6 +550,266 @@ impl Source {
                 .unwrap_or_else(|| PathBuf::from("."))
         } else {
             self.path.clone()
+        }
+    }
+}
+
+struct SourceRange {
+    ordinal: usize,
+    file_id: u32,
+    start: u64,
+    end: u64,
+}
+
+struct FetchedRange {
+    ordinal: usize,
+    bytes: Vec<u8>,
+}
+
+/// The importer-facing source seam. Local paths and remote ranges expose the
+/// same metadata, auxiliary objects, and bounded range-window operation; HTTP
+/// policy remains entirely inside the feature-gated remote module.
+enum ImportSource {
+    Local(Source),
+    #[cfg(feature = "remote-import")]
+    Remote {
+        source: crate::ops::model::remote::RemoteSnapshot,
+        name: String,
+        origin: String,
+    },
+}
+
+impl ImportSource {
+    fn resolve(spec: &str) -> Result<Self> {
+        if Path::new(spec).exists() {
+            return resolve_source(spec).map(Self::Local);
+        }
+        #[cfg(feature = "remote-import")]
+        {
+            let source = crate::ops::model::remote::RemoteSnapshot::open(spec)?;
+            let repo = spec.rsplit_once('@').map_or(spec, |(repo, _)| repo);
+            return Ok(Self::Remote {
+                source,
+                name: store_name(repo),
+                origin: spec.to_string(),
+            });
+        }
+        #[cfg(not(feature = "remote-import"))]
+        {
+            resolve_source(spec).map(Self::Local)
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Local(source) => &source.name,
+            #[cfg(feature = "remote-import")]
+            Self::Remote { name, .. } => name,
+        }
+    }
+
+    fn origin(&self) -> &str {
+        match self {
+            Self::Local(source) => &source.origin,
+            #[cfg(feature = "remote-import")]
+            Self::Remote { origin, .. } => origin,
+        }
+    }
+
+    fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+
+    fn metadata(&self) -> Result<CheckpointMetadata> {
+        match self {
+            Self::Local(source) => parse_checkpoint_metadata(&source.path)
+                .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display())),
+            #[cfg(feature = "remote-import")]
+            Self::Remote { source, .. } => {
+                let mut headers = Vec::new();
+                for (file_id, file) in source.files().iter().enumerate() {
+                    let prefix = source.read_exact(file_id as u32, 0..8)?;
+                    let json_len = u64::from_le_bytes(
+                        prefix
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow!("{}: short safetensors prefix", file.path))?,
+                    );
+                    if json_len > 100 << 20 {
+                        bail!(
+                            "{}: safetensors header is {json_len} bytes; refusing more than 100 MiB",
+                            file.path
+                        );
+                    }
+                    let end = 8u64
+                        .checked_add(json_len)
+                        .ok_or_else(|| anyhow!("{}: header length overflows", file.path))?;
+                    let mut header = prefix;
+                    header.extend_from_slice(&source.read_exact(file_id as u32, 8..end)?);
+                    headers.push(pie_loader::checkpoint::read::SafetensorsShardHeader {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        header,
+                    });
+                }
+                pie_loader::checkpoint::read::parse_safetensors_headers(&headers)
+                    .map_err(|err| anyhow!("cannot read {}: {err}", source.repo()))
+            }
+        }
+    }
+
+    fn compile_descriptor(&self) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Local(source) => compile_descriptor(source),
+            #[cfg(feature = "remote-import")]
+            Self::Remote { source, .. } => {
+                let Some(raw) = source.aux("config.json") else {
+                    return Ok(None);
+                };
+                let label = format!("{}@{}/config.json", source.repo(), source.revision());
+                let root: serde_json::Value = serde_json::from_slice(raw)
+                    .map_err(|err| anyhow!("cannot parse {label}: {err}"))?;
+                let descriptor = pie_model_config::descriptor(&root, &label)
+                    .map_err(|err| anyhow!("cannot normalize {label}: {err:#}"))?;
+                Ok(Some(serde_json::to_vec(&descriptor)?))
+            }
+        }
+    }
+
+    fn compile_tokenizer(&self) -> Result<Option<pie_tokenizer::canonical::CanonicalTokenizer>> {
+        match self {
+            Self::Local(source) => compile_tokenizer(source),
+            #[cfg(feature = "remote-import")]
+            Self::Remote { source, .. } => {
+                let Some(raw) = source.aux("tokenizer.json") else {
+                    if source.aux("tiktoken.model").is_some() {
+                        bail!(
+                            "{}@{} uses tiktoken.model; metadata-first tiktoken compilation is not implemented yet",
+                            source.repo(),
+                            source.revision()
+                        );
+                    }
+                    return Ok(None);
+                };
+                let label = format!("{}@{}/tokenizer.json", source.repo(), source.revision());
+                let tokenizer =
+                    pie_tokenizer::loader::huggingface::from_slice(raw).map_err(|err| {
+                        anyhow!(
+                            "cannot compile {label}: {err:#}\n\
+                             pie compiles every tokenizer into one of a small number of modern \
+                             pipelines, and this one is outside that set. The artifact is not \
+                             written, because one without a working tokenizer cannot serve."
+                        )
+                    })?;
+                tokenizer
+                    .to_canonical()
+                    .map(Some)
+                    .map_err(|err| anyhow!("cannot serialize {label}: {err:#}"))
+            }
+        }
+    }
+
+    fn read_window(&self, ranges: &[SourceRange], byte_ceiling: u64) -> Result<Vec<FetchedRange>> {
+        match self {
+            Self::Local(source) => {
+                let requested: u64 = ranges.iter().try_fold(0u64, |total, range| {
+                    let len = range
+                        .end
+                        .checked_sub(range.start)
+                        .ok_or_else(|| anyhow!("range goes backwards"))?;
+                    if len > byte_ceiling {
+                        bail!(
+                            "tensor range is {len} bytes, above the {byte_ceiling}-byte reorder ceiling"
+                        );
+                    }
+                    total
+                        .checked_add(len)
+                        .ok_or_else(|| anyhow!("reorder byte count overflows"))
+                })?;
+                if requested > byte_ceiling {
+                    bail!(
+                        "reorder window requires {requested} bytes, above its {byte_ceiling}-byte ceiling"
+                    );
+                }
+                let metadata = parse_checkpoint_metadata(&source.path)
+                    .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;
+                let mut handles = std::collections::HashMap::new();
+                let mut ordered: Vec<&SourceRange> = ranges.iter().collect();
+                ordered.sort_unstable_by_key(|range| (range.file_id, range.start));
+                let mut fetched = Vec::with_capacity(ranges.len());
+                for range in ordered {
+                    let file = metadata
+                        .files
+                        .get(range.file_id as usize)
+                        .ok_or_else(|| anyhow!("checkpoint has no file id {}", range.file_id))?;
+                    let handle = match handles.entry(range.file_id) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let path = Path::new(&file.path);
+                            let path = if path.is_absolute() || path.exists() {
+                                path.to_path_buf()
+                            } else {
+                                source.base().join(path)
+                            };
+                            entry.insert(
+                                std::fs::File::open(&path)
+                                    .with_context(|| format!("cannot open {}", path.display()))?,
+                            )
+                        }
+                    };
+                    let len = range.end - range.start;
+                    let mut bytes = vec![
+                        0u8;
+                        usize::try_from(len).map_err(|_| {
+                            anyhow!("range length {len} does not fit this machine")
+                        })?
+                    ];
+                    handle
+                        .seek(SeekFrom::Start(range.start))
+                        .and_then(|_| handle.read_exact(&mut bytes))
+                        .with_context(|| format!("cannot read range from {}", file.path))?;
+                    fetched.push(FetchedRange {
+                        ordinal: range.ordinal,
+                        bytes,
+                    });
+                }
+                fetched.sort_unstable_by_key(|range| range.ordinal);
+                Ok(fetched)
+            }
+            #[cfg(feature = "remote-import")]
+            Self::Remote { source, .. } => source
+                .read_window(
+                    &ranges
+                        .iter()
+                        .map(|range| crate::ops::model::remote::RangeRequest {
+                            ordinal: range.ordinal,
+                            file_id: range.file_id,
+                            range: range.start..range.end,
+                        })
+                        .collect::<Vec<_>>(),
+                    byte_ceiling,
+                )
+                .map(|ranges| {
+                    ranges
+                        .into_iter()
+                        .map(|range| FetchedRange {
+                            ordinal: range.ordinal,
+                            bytes: range.bytes,
+                        })
+                        .collect()
+                }),
+        }
+    }
+
+    fn telemetry(&self) -> Option<String> {
+        match self {
+            Self::Local(_) => None,
+            #[cfg(feature = "remote-import")]
+            Self::Remote { source, .. } => Some(source.telemetry().render(
+                source.repo(),
+                source.revision(),
+                source.files().len(),
+            )),
         }
     }
 }
@@ -616,9 +872,8 @@ fn resolve_snapshot(repo_id: &str) -> Result<PathBuf> {
         // and convert is one command with an argument.
         crate::ops::model::fetch_snapshot(repo_id)?;
     }
-    let entries = std::fs::read_dir(&snapshots).map_err(|_| {
-        anyhow!("{repo_id} is neither a path nor a model any registry has")
-    })?;
+    let entries = std::fs::read_dir(&snapshots)
+        .map_err(|_| anyhow!("{repo_id} is neither a path nor a model any registry has"))?;
     let snapshot = entries
         .filter_map(|entry| entry.ok())
         .find(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
@@ -884,8 +1139,22 @@ mod tests {
     }
 }
 
-/// One pass over decoded tensors, passthrough tensors and metadata, in
-/// ascending name order. Returns the bytes written.
+#[derive(serde::Serialize)]
+struct IntegrityDigest {
+    name: String,
+    source_xxh3: String,
+    output_xxh3: String,
+    source_bytes: u64,
+    output_bytes: u64,
+}
+
+struct WriteReport {
+    written_bytes: u64,
+    digests: Vec<IntegrityDigest>,
+}
+
+/// One bounded pass over decoded tensors, passthrough tensors and metadata, in
+/// ascending name order.
 ///
 /// Ascending order across the *union* is what canonical `.zt` form asks for,
 /// and the writer trusts its caller for it. Metadata is interleaved rather
@@ -893,113 +1162,206 @@ mod tests {
 /// after digits and capitals but before lowercase, so it lands in the middle
 /// of a typical weight namespace.
 ///
-/// Decoded tensors come from executor storage, passthrough is streamed from
-/// its source file through one bounded buffer, metadata comes from memory.
-/// The two byte counts are the progress denominator: what the decode already
-/// read, and what this pass is about to copy.
+/// Tensor ranges are fetched by source address inside a byte-bounded window,
+/// then drained by name ordinal. The configured ceiling is a hard bound: even
+/// one tensor larger than it fails before allocation rather than growing the
+/// reorder buffer silently.
 fn write_artifact(
     writer: &mut CheckpointWriter,
-    decoded: Option<&mut (pie_loader::plan::LoadPlan, Spool)>,
-    passthrough: &[(&RawTensor, &str)],
+    source: &ImportSource,
+    metadata: &CheckpointMetadata,
+    decoded: Option<&pie_loader::plan::LoadPlan>,
+    passthrough: &[&RawTensor],
     meta: &[(String, Vec<u8>)],
     progress: &mut ProgressLine,
-    decode_read_bytes: u64,
-    copy_bytes: u64,
-) -> Result<u64> {
+    source_bytes: u64,
+    reorder_ceiling: u64,
+) -> Result<WriteReport> {
     enum From<'a> {
-        Decoded(&'a TensorDecl),
-        /// The tensor and the file its bytes are in.
-        Copy(&'a RawTensor, &'a str),
+        Decoded(&'a TensorDecl, &'a RawTensor),
+        Copy(&'a RawTensor),
         Meta(&'a [u8]),
     }
     let mut entries: Vec<(&str, From<'_>)> = Vec::new();
-    let (decoded_plan, spool) = match decoded {
-        Some((plan, spool)) => (Some(&*plan), Some(spool)),
-        None => (None, None),
-    };
-    let mut spool = spool;
-    if let Some(plan) = decoded_plan {
+    // Decoded source declarations are not in `passthrough`; recover them from
+    // the plan's source ids through the metadata held by the source seam.
+    if let Some(plan) = decoded {
         for decl in &plan.tensors {
-            entries.push((&decl.name, From::Decoded(decl)));
+            let raw = metadata.tensor_by_name(&decl.name).ok_or_else(|| {
+                anyhow!(
+                    "decoded tensor '{}' is absent from source metadata",
+                    decl.name
+                )
+            })?;
+            entries.push((&decl.name, From::Decoded(decl, raw)));
         }
     }
-    for (raw, path) in passthrough {
-        entries.push((&raw.name, From::Copy(raw, path)));
+    for raw in passthrough {
+        entries.push((&raw.name, From::Copy(raw)));
     }
     for (name, bytes) in meta {
         entries.push((name.as_str(), From::Meta(bytes)));
     }
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
-    let mut sources: std::collections::HashMap<u32, std::fs::File> =
-        std::collections::HashMap::new();
-    let mut buffer = vec![0u8; 16 << 20];
-    let mut copied = 0u64;
+    let total_read_bytes = source_bytes
+        .saturating_add(meta.iter().map(|(_, bytes)| bytes.len() as u64).sum::<u64>());
+    let mut read_bytes = 0u64;
     let mut written_bytes = 0u64;
-    for (name, entry) in &entries {
-        match entry {
-            From::Decoded(decl) => {
-                let spool = spool.as_mut().expect("decoded entries imply a spool");
-                let bytes = spool.read(name)?;
-                writer
-                    .add_tensor(decl, &bytes)
-                    .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
-                written_bytes += bytes.len() as u64;
+    let mut digests = Vec::with_capacity(entries.len());
+    let mut cursor = 0usize;
+    while cursor < entries.len() {
+        let mut end = cursor;
+        let mut window_bytes = 0u64;
+        while end < entries.len() {
+            let bytes = match &entries[end].1 {
+                From::Decoded(_, raw) | From::Copy(raw) => raw.span_bytes,
+                From::Meta(_) => 0,
+            };
+            if bytes > reorder_ceiling {
+                bail!(
+                    "tensor '{}' is {} bytes, above the {}-byte reorder ceiling",
+                    entries[end].0,
+                    bytes,
+                    reorder_ceiling
+                );
             }
-            From::Meta(bytes) => {
-                let path = name
-                    .strip_prefix(pie_loader::checkpoint::meta::META_PREFIX)
-                    .expect("metadata entries carry the namespace prefix");
-                writer
-                    .add_meta(path, bytes)
-                    .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
-                written_bytes += bytes.len() as u64;
+            if window_bytes > 0 && window_bytes.saturating_add(bytes) > reorder_ceiling {
+                break;
             }
-            From::Copy(raw, path) => {
-                let handle = match sources.entry(raw.file_id.0) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                        std::fs::File::open(path).with_context(|| format!("cannot open {path}"))?,
-                    ),
-                };
-                let decl = TensorDecl {
-                    id: raw.id,
-                    name: raw.name.clone(),
-                    shape: raw.shape.clone(),
-                    encoding: raw.encoding.clone(),
-                    alignment: 1,
-                    visibility: Visibility::default(),
-                };
-                writer
-                    .begin_tensor(&decl, raw.span_bytes)
-                    .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
-                handle
-                    .seek(SeekFrom::Start(raw.file_offset))
-                    .with_context(|| format!("cannot seek in {path}"))?;
-                let mut remaining = raw.span_bytes;
-                while remaining > 0 {
-                    let take = remaining.min(buffer.len() as u64) as usize;
-                    handle
-                        .read_exact(&mut buffer[..take])
-                        .with_context(|| format!("cannot read '{name}' from {path}"))?;
-                    writer
-                        .write(&buffer[..take])
-                        .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
-                    remaining -= take as u64;
-                    copied += take as u64;
-                    progress.render(&Progress {
-                        read_bytes: decode_read_bytes + copied,
-                        total_read_bytes: decode_read_bytes + copy_bytes,
-                        finalized: Some(name),
-                    });
-                }
-                writer
-                    .end_tensor()
-                    .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
-                written_bytes += raw.span_bytes;
-            }
+            window_bytes += bytes;
+            end += 1;
         }
+        let ranges: Vec<SourceRange> = entries[cursor..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(within, (_, entry))| match entry {
+                From::Decoded(_, raw) | From::Copy(raw) => Some(SourceRange {
+                    ordinal: cursor + within,
+                    file_id: raw.file_id.0,
+                    start: raw.file_offset,
+                    end: raw.file_offset + raw.span_bytes,
+                }),
+                From::Meta(_) => None,
+            })
+            .collect();
+        let fetched = source.read_window(&ranges, reorder_ceiling)?;
+        let mut fetched: std::collections::HashMap<usize, Vec<u8>> = fetched
+            .into_iter()
+            .map(|range| (range.ordinal, range.bytes))
+            .collect();
+
+        for at in cursor..end {
+            let (name, entry) = &entries[at];
+            let (source_payload, output_payload) = match entry {
+                From::Decoded(decl, raw) => {
+                    let source_payload = fetched
+                        .remove(&at)
+                        .ok_or_else(|| anyhow!("source returned no bytes for '{name}'"))?;
+                    let output_payload = pie_loader::executor::host::convert_tensor_bytes(
+                        &source_payload,
+                        &raw.encoding,
+                        &decl.encoding,
+                    )
+                    .map_err(|err| anyhow!("cannot convert '{name}': {err}"))?;
+                    writer
+                        .add_tensor(decl, &output_payload)
+                        .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
+                    (source_payload, output_payload)
+                }
+                From::Meta(bytes) => {
+                    let path = name
+                        .strip_prefix(pie_loader::checkpoint::meta::META_PREFIX)
+                        .expect("metadata entries carry the namespace prefix");
+                    writer
+                        .add_meta(path, bytes)
+                        .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
+                    (bytes.to_vec(), bytes.to_vec())
+                }
+                From::Copy(raw) => {
+                    let bytes = fetched
+                        .remove(&at)
+                        .ok_or_else(|| anyhow!("source returned no bytes for '{name}'"))?;
+                    let decl = TensorDecl {
+                        id: raw.id,
+                        name: raw.name.clone(),
+                        shape: raw.shape.clone(),
+                        encoding: raw.encoding.clone(),
+                        alignment: 1,
+                        visibility: Visibility::default(),
+                    };
+                    writer
+                        .begin_tensor(&decl, raw.span_bytes)
+                        .and_then(|_| writer.write(&bytes))
+                        .and_then(|_| writer.end_tensor())
+                        .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
+                    (bytes.clone(), bytes)
+                }
+            };
+            read_bytes += source_payload.len() as u64;
+            written_bytes += output_payload.len() as u64;
+            let digest = |bytes: &[u8]| format!("xxh3:{:016x}", xxhash_rust::xxh3::xxh3_64(bytes));
+            digests.push(IntegrityDigest {
+                name: (*name).to_string(),
+                source_xxh3: digest(&source_payload),
+                output_xxh3: digest(&output_payload),
+                source_bytes: source_payload.len() as u64,
+                output_bytes: output_payload.len() as u64,
+            });
+            progress.render(&Progress {
+                read_bytes,
+                total_read_bytes,
+                finalized: Some(name),
+            });
+        }
+        if !fetched.is_empty() {
+            bail!("source returned ranges outside the requested reorder window");
+        }
+        cursor = end;
     }
     progress.finish();
-    Ok(written_bytes)
+    Ok(WriteReport {
+        written_bytes,
+        digests,
+    })
+}
+
+fn reconcile_digests(
+    path: &Path,
+    digests: &[IntegrityDigest],
+    report_path: Option<&Path>,
+) -> Result<()> {
+    let manifest = pie_loader::checkpoint::zt::artifact_digests(path)
+        .map_err(|err| anyhow!("cannot read written digests: {err}"))?;
+    if manifest.len() != digests.len() {
+        bail!(
+            "written manifest has {} digests, conversion recorded {}",
+            manifest.len(),
+            digests.len()
+        );
+    }
+    for digest in digests {
+        match manifest.get(&digest.name) {
+            Some(written) if written == &digest.output_xxh3 => {}
+            Some(written) => bail!(
+                "{}: in-pass output digest {} differs from manifest {written}",
+                digest.name,
+                digest.output_xxh3
+            ),
+            None => bail!(
+                "{}: in-pass digest is absent from the manifest",
+                digest.name
+            ),
+        }
+    }
+    if let Some(report_path) = report_path {
+        let staging = report_path.with_extension("integrity.json.tmp");
+        let bytes = serde_json::to_vec_pretty(digests)?;
+        std::fs::write(&staging, bytes)
+            .with_context(|| format!("cannot write {}", staging.display()))?;
+        std::fs::rename(&staging, report_path)
+            .with_context(|| format!("cannot publish {}", report_path.display()))?;
+        println!("integrity census: {}", crate::ui::short_path(report_path));
+    }
+    Ok(())
 }
