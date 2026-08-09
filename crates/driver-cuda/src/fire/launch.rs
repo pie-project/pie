@@ -132,7 +132,9 @@ pub(crate) fn sg_trace(what: impl FnOnce() -> String) {
 ///   serves;
 /// - one exec runs two structurally distinct KV-write programs and
 ///   returns byte-identical logits, selected by a byte of device memory
-///   (`bridge_smoke::the_union_captures_and_replays_the_same_decode`);
+///   (`bridge_smoke::the_union_captures_and_replays_the_same_decode`, in
+///   the 5,097-line target deleted with `bind::abi::ffi` — the property is
+///   recorded here because nothing else states it);
 /// - and one exec serves a SECOND fire's tokens
 ///   (`a_cached_exec_serves_the_next_fire`), which is the property that
 ///   makes a cached exec worth caching and the only one that can tell a
@@ -2583,7 +2585,8 @@ fn lora_phase(
 /// sentence. A peel's tail serves rows `[split, N)` — a different
 /// request count, so FlashInfer's planner produces a different schedule,
 /// and handing it the fire's is handing it a plan that does not describe
-/// the launch. `bridge_smoke`'s hooked leg built this by hand to prove
+/// the launch. `bridge_smoke`'s hooked leg (deleted with the archive's
+/// door) built this by hand to prove
 /// the HANDING-OVER worked; the driver never built one, so the peel
 /// worked in a test harness and nowhere else.
 ///

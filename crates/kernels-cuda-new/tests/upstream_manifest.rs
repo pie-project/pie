@@ -2,7 +2,7 @@
 //!
 //! # The claim, and why prose was not enough
 //!
-//! `csrc/vendor/MODIFICATIONS` opens by asserting a property rather than
+//! `csrc/src/attn/flashinfer/MODIFICATIONS` opens by asserting a property rather than
 //! describing one:
 //!
 //! > *"Generated from the tree, and kept honest by the property it asserts:
@@ -132,8 +132,8 @@ fn measure(text: &str) -> Row {
 /// the parse is deliberately strict: a row this cannot read is a row the test
 /// would otherwise skip silently, which is how a manifest check goes vacuous.
 fn manifest() -> BTreeMap<String, Row> {
-    let text = std::fs::read_to_string(csrc().join("vendor/MODIFICATIONS"))
-        .expect("csrc/vendor/MODIFICATIONS");
+    let text = std::fs::read_to_string(csrc().join("src/attn/flashinfer/MODIFICATIONS"))
+        .expect("csrc/src/attn/flashinfer/MODIFICATIONS");
     let mut out = BTreeMap::new();
     let mut in_table = false;
     for line in text.lines() {
@@ -188,11 +188,27 @@ fn is_rtc_guard(line: &str) -> bool {
 
 /// The strip `MODIFICATIONS` describes: drop a `// PIE:` marker with its
 /// continuation comments, and if a `#ifndef __CUDACC_RTC__` follows, drop that
-/// directive and its matching `#endif` while KEEPING the body.
+/// directive and its matching `#endif` while KEEPING the body and DISCARDING
+/// the `#else` branch.
 ///
 /// Keeping the body is the point. The guards exist to hide host-only code
 /// from NVRTC, so the body is upstream's and must survive the strip; only the
-/// three lines this tree added come out.
+/// lines this tree added come out.
+///
+/// The `#else` clause is the newer half and it was missing here for longer
+/// than it should have been. `f622dcf8d` introduced the shape it exists for
+/// — `mla.cuh`'s two stray `.template` keywords, upstream's spelling under
+/// the guard and ours in an `#else` — and amended step 1 of `MODIFICATIONS`
+/// to say the branch is discarded, but this function was not amended with it.
+/// The consequence was quiet and exactly the kind this file exists to stop:
+/// `added` came out 4 short, so the manifest's own definition of the column
+/// and the code computing it disagreed while both looked authoritative. An
+/// `#else` under a `// PIE:` guard is by construction ours, never upstream's,
+/// because upstream has no reason to write one there.
+///
+/// Only a *top-level* `#else` counts — one at `depth == 1`. An `#else`
+/// belonging to a nested `#if` inside the body is upstream's and is kept,
+/// which is the same reason the depth counter exists at all.
 fn strip(text: &str) -> (String, usize) {
     let src: Vec<&str> = text.lines().collect();
     let mut out: Vec<&str> = Vec::new();
@@ -222,10 +238,16 @@ fn strip(text: &str) -> (String, usize) {
             i += 1;
             removed += 1;
             let mut depth = 1usize;
+            let mut in_else = false;
             while i < src.len() && depth > 0 {
                 let d = src[i].trim_start();
                 if d.starts_with("#if") {
                     depth += 1;
+                } else if d.starts_with("#else") && depth == 1 {
+                    in_else = true;
+                    i += 1;
+                    removed += 1;
+                    continue;
                 } else if d.starts_with("#endif") {
                     depth -= 1;
                     if depth == 0 {
@@ -234,7 +256,11 @@ fn strip(text: &str) -> (String, usize) {
                         break;
                     }
                 }
-                out.push(src[i]);
+                if in_else {
+                    removed += 1;
+                } else {
+                    out.push(src[i]);
+                }
                 i += 1;
             }
         }
@@ -255,19 +281,30 @@ fn strip(text: &str) -> (String, usize) {
 /// up, so the reverse of a canonical `<pie/device/vec.cuh>` is not a function
 /// of the target alone.
 ///
-/// # Empty, on purpose, and early on purpose
+/// # Still empty after the move, and that is the finding
 ///
-/// Nothing has moved yet. Every vendored file still sits under
-/// `csrc/vendor/flashinfer/` reaching its siblings the way upstream wrote,
-/// so there is no `<pie/…>` anywhere and this map has nothing to say.
+/// This block used to read *"Nothing has moved yet"*. The tree HAS moved:
+/// `csrc/vendor/flashinfer/` is now `csrc/src/attn/flashinfer/`, because
+/// `csrc/` was narrowed to device text and a vendor directory is a statement
+/// about provenance rather than about role. The map is still empty, and the
+/// reason is the whole design of that move.
 ///
-/// It is here anyway because of the order the work has to happen in. The
-/// first file to move out of this directory changes upstream's bytes — there
-/// is no way to move it without changing an `#include` — and at that instant
-/// the manifest's claim is either backed by a written-down transform or it is
-/// a sentence someone remembers being true. A map built after the move is
-/// derived from the move and agrees with it by construction, which is the
-/// shape of every check this session has had to throw away.
+/// The prediction above was that *"the first file to move out of this
+/// directory changes upstream's bytes — there is no way to move it without
+/// changing an `#include`"*. That is true of a file. It is FALSE of a
+/// subtree moved intact: a relative directive like `"../cp_async.cuh"` names
+/// a path relative to the includer, so it keeps resolving as long as the
+/// includer and the target move together. **Measured: 58 relative directives
+/// across the closure, and zero of them needed rewriting.** The four
+/// `#include`s that DID change are ours — `attn/fa2.cuh` and its three
+/// siblings, which reached in from outside and had to learn the new prefix.
+///
+/// So the transform in this file is still the identity, all 28 files are
+/// still byte-for-byte upstream plus their guards, and all four numeric
+/// columns of the manifest are unchanged. The map stays because the
+/// prediction it was built for is deferred, not refuted: separating the
+/// device stdlib from the attention algorithms still rewrites upstream's
+/// lines, and that is still not something to derive after the fact.
 ///
 /// A row is added by the same commit that moves the file. A row whose file no
 /// longer holds that directive is a dead row and
@@ -342,20 +379,31 @@ fn normalise(name: &str, text: &str) -> Result<(String, usize), String> {
     Ok((denormalise_includes(name, &stripped)?, removed))
 }
 
-/// Every vendored FlashInfer file, as `MODIFICATIONS` names it.
+/// Every internalised FlashInfer file, as `MODIFICATIONS` names it.
+///
+/// `LICENSE` and `MODIFICATIONS` are excluded because they are not upstream
+/// SOURCE and have no manifest row. `LICENSE` always was; `MODIFICATIONS`
+/// became a sibling of the files it describes when the tree was internalised
+/// — it used to sit one level up, at `csrc/vendor/MODIFICATIONS`, where this
+/// walk could not see it. **Without the second name this function would
+/// return a file the manifest cannot describe and the round-trip below would
+/// fail on the manifest itself.** The two names are exactly
+/// `carried::NOT_SOURCE`'s first and third entries, for the same reason.
 fn vendored() -> Vec<(String, PathBuf)> {
+    const NOT_SOURCE: &[&str] = &["LICENSE", "MODIFICATIONS"];
     fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) {
-        for e in std::fs::read_dir(dir).expect("read vendor dir").flatten() {
+        for e in std::fs::read_dir(dir).expect("read the internalised dir").flatten() {
             let p = e.path();
             if p.is_dir() {
                 walk(&p, root, out);
-            } else if p.file_name().is_some_and(|n| n != "LICENSE") {
+            } else if p.file_name().is_some_and(|n| !NOT_SOURCE.contains(&&*n.to_string_lossy()))
+            {
                 let rel = p.strip_prefix(root).expect("under root");
                 out.push((rel.to_string_lossy().replace('\\', "/"), p.clone()));
             }
         }
     }
-    let root = csrc().join("vendor/flashinfer");
+    let root = csrc().join("src/attn/flashinfer");
     let mut v = Vec::new();
     walk(&root, &root, &mut v);
     v.sort();
@@ -408,19 +456,22 @@ fn modifications_describes_the_vendored_tree() {
 
     assert!(
         wrong.is_empty(),
-        "MODIFICATIONS no longer describes csrc/vendor/flashinfer:\n  {}",
+        "MODIFICATIONS no longer describes csrc/src/attn/flashinfer:\n  {}",
         wrong.join("\n  ")
     );
 }
 
 /// The table's own totals row agrees with the rows above it.
 ///
-/// `28 files   33   206   18187   798875` is a summary, and a summary is the
+/// `28 files   35   226   18207   799944` is a summary, and a summary is the
 /// line a reader takes on trust. It is also the line that survives a per-file
-/// edit unchanged, so it is the one most likely to go stale.
+/// edit unchanged, so it is the one most likely to go stale — and it did:
+/// `f622dcf8d` grew `mla.cuh` by 20 lines and 1,069 bytes without touching
+/// either its row or this line, which is the drift this test was written for
+/// and which nothing had yet run it to catch.
 #[test]
 fn the_totals_row_sums_the_table() {
-    let text = std::fs::read_to_string(csrc().join("vendor/MODIFICATIONS")).expect("manifest");
+    let text = std::fs::read_to_string(csrc().join("src/attn/flashinfer/MODIFICATIONS")).expect("manifest");
     let totals = text
         .lines()
         .find(|l| l.split_whitespace().next().is_some_and(|w| w.parse::<usize>().is_ok()))
@@ -450,7 +501,7 @@ fn the_totals_row_sums_the_table() {
 /// wrong in a document whose entire purpose is being right about this tree.
 #[test]
 fn the_untouched_count_in_the_prose_is_the_table_s() {
-    let text = std::fs::read_to_string(csrc().join("vendor/MODIFICATIONS")).expect("manifest");
+    let text = std::fs::read_to_string(csrc().join("src/attn/flashinfer/MODIFICATIONS")).expect("manifest");
     let words: Vec<&str> = text.split_whitespace().collect();
     // `N files are untouched`, and not the totals row's `28 files`, which
     // appears first and would answer with the wrong number.
@@ -470,11 +521,11 @@ fn the_untouched_count_in_the_prose_is_the_table_s() {
 /// The marker total the manifest's own prose quotes.
 ///
 /// Separate from the per-row check because it is the number a reader greps
-/// for — `grep -rn "// PIE:" csrc/vendor/flashinfer/` — and a prose number
+/// for — `grep -rn "// PIE:" csrc/src/attn/flashinfer/` — and a prose number
 /// nothing checks is the thing this file exists about.
 #[test]
 fn the_quoted_marker_total_is_the_real_one() {
-    let text = std::fs::read_to_string(csrc().join("vendor/MODIFICATIONS")).expect("manifest");
+    let text = std::fs::read_to_string(csrc().join("src/attn/flashinfer/MODIFICATIONS")).expect("manifest");
     let quoted: usize = text
         .split_whitespace()
         .zip(text.split_whitespace().skip(1))
@@ -534,6 +585,37 @@ tail";
     let (out, removed) = strip(nested);
     assert_eq!(out, "#if FOO\nint x;\n#endif\ntail");
     assert_eq!(removed, 3);
+
+    // `mla.cuh`'s shape: upstream's spelling under the guard, ours in the
+    // `#else`. Both the branch and its directive are ours, so both come out,
+    // and what survives is upstream's line alone.
+    let with_else = "\
+// PIE: the stray `template` keyword
+#ifndef __CUDACC_RTC__
+  o_smem.template store_128b(a, b);
+#else
+  o_smem.store_128b(a, b);
+#endif
+tail";
+    let (out, removed) = strip(with_else);
+    assert_eq!(out, "  o_smem.template store_128b(a, b);\ntail", "upstream's line survives alone");
+    assert_eq!(removed, 5, "marker + ifndef + else + our line + endif");
+
+    // an `#else` belonging to a NESTED `#if` is upstream's and is kept, which
+    // is what distinguishes this clause from "drop everything after #else".
+    let nested_else = "\
+// PIE: guarded
+#ifndef __CUDACC_RTC__
+#if FOO
+int x;
+#else
+int y;
+#endif
+#endif
+tail";
+    let (out, removed) = strip(nested_else);
+    assert_eq!(out, "#if FOO\nint x;\n#else\nint y;\n#endif\ntail");
+    assert_eq!(removed, 3, "only the marker and the two outer directives");
 }
 
 /// The second step refuses what it cannot recover, and only what it cannot.
@@ -781,7 +863,7 @@ fn the_manifest_check_can_fail_on_every_drift_it_claims_to_catch() {
 /// numbers is what keeps that distinction from being re-derived.
 #[test]
 fn the_cooperative_groups_census_still_holds() {
-    let dir = csrc().join("vendor/flashinfer");
+    let dir = csrc().join("src/attn/flashinfer");
     let read = |rel: &str| std::fs::read_to_string(dir.join(rel)).expect(rel);
     let count = |hay: &str, needle: &str| hay.matches(needle).count();
 

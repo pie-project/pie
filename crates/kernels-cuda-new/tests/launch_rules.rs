@@ -1316,14 +1316,39 @@ mod transcribed {
     // half: THE LINE IS NO LONGER CHECKED, so an edit that leaves a launch
     // alone and moves it now passes here while every `at :NNN` in
     // `families::attn` and `runtime::launch` goes stale unnoticed.
-    const MLA: &str = include_str!("../../driver-cuda/src/fire/mla_paged.rs");
-    // `attn/qkv_fused.cu` IS DELETED (`44ffd6466`) and `QKV` names
+    //
+    // IT HAS MOVED AGAIN, for `ROPE`'s reason one paragraph down:
+    // `fire/mla_paged.rs` IS DELETED and both host programs are
+    // `kernels-cuda-new/src/x/attn.rs`'s, carrying all six quotes below
+    // verbatim. Same `quoted()`, same cost, plus `ROPE`'s extra one -- the
+    // source is INSIDE THIS CRATE now, so it is a weaker independence than a
+    // `driver-cuda` file, and it is still the launcher rather than the
+    // assertion read twice.
+    const MLA: &str = ATTN_X;
+    // `attn/qkv_fused.cu` IS DELETED (`44ffd6466`) and `QKV` named
     // `driver-cuda/src/fire/qkv_fused.rs` — *"Four `<<<>>>` -> the eight
     // instantiations of `driver-cuda/src/fire/qkv_fused.rs`"*, per
-    // `kernels-cuda/csrc/CMakeLists.txt`. `quoted()` for the same reason and
-    // at the same cost as `MLA`: the line halves of thirteen citations stop
-    // being checked here.
-    const QKV: &str = include_str!("../../driver-cuda/src/fire/qkv_fused.rs");
+    // `kernels-cuda/csrc/CMakeLists.txt`.
+    //
+    // IT HAS MOVED AGAIN, for `MLA`'s reason exactly: the decode dispatch is
+    // `kernels_cuda_new::x::attn::qkv_fused`'s host program now, and all
+    // seven quotes below went with it verbatim. `fire/qkv_fused.rs` survived
+    // one commit as the cast-and-forward resolution `bind::service` called,
+    // and is DELETED: the row crossed as `x::attn`'s `QKV_DECODE_FUSED`, the
+    // bind resolves the operands from `Cx` directly, and a cast with no
+    // caller is not a seam.
+    //
+    // TWO OF THE SEVEN HAD BEEN FAILING AND THE PIN'S TEXT WAS NEVER WRONG.
+    // `constexpr int BLOCK = 256;` and `dim3 grid(num_rows, num_q_heads +
+    // num_kv_heads);` are the PREFILL launcher's; `fire/qkv_fused.rs` was
+    // only ever the DECODE dispatch and never held them. The Rust they were
+    // written from is `x::attn::qkv_fused`'s
+    // `qkv_packed_qk_norm_rope_vnorm_write_kv_bf16`, which has carried that
+    // launcher since it crossed, and both quotes are on `PACKED_BLOCK`'s doc
+    // there. The note that used to stand here said *"the right response is to
+    // find the launcher it was written from, not to stop asking"* — this is
+    // that, and the pin was right to keep failing until someone did it.
+    const QKV: &str = ATTN_X;
     const ALTUP_CUH: &str = include_str!("../csrc/src/norm/altup.cuh");
     // `rope/rope.cu` IS DELETED (`58b31cf1b`) and `ROPE` names the Rust that
     // replaced it. IT HAS MOVED TWICE. `kernels-cuda/csrc/CMakeLists.txt`
@@ -1344,7 +1369,10 @@ mod transcribed {
     // and `DSV4` names `driver-cuda/src/fire/dsv4_compress.rs` — *"Four
     // `<<<>>>` left in it ... now `driver-cuda/src/fire/dsv4_compress.rs`"*.
     // `quoted()` at `MLA`'s cost.
-    const DSV4: &str = include_str!("../../driver-cuda/src/fire/dsv4_compress.rs");
+    // THAT FILE IS DELETED TOO, and all three of its surviving host programs
+    // are `x::attn`'s, with the four quotes below verbatim. Follows `RMSNORM`
+    // exactly.
+    const DSV4: &str = ATTN_X;
     // `driver-cuda/csrc/attn/attention_flashinfer.cu` IS DELETED — agent
     // `fa2-nvrtc` finished the retirement this comment was waiting on — and
     // `FLASHINFER` IS DELETED AS A CONSTANT because its successor was
@@ -1459,13 +1487,21 @@ mod transcribed {
     // here and downgrade the two `runtime::launch::single`/`single_warp` pins
     // to `quoted()`"*; that is what happened.
     const KV_PAGED: &str = include_str!("../../driver-cuda/src/fire/kv_paged.rs");
+    // `x/attn.rs` — the fn-world half of `attn`, and the successor of FOUR
+    // deleted `fire/` modules: `mla_paged.rs`, `dsv4_compress.rs`,
+    // `attention_naive.rs` and `page_compact.rs`. ONE `include_str!` for all
+    // four, for the reason `FLASHINFER` was dropped in favour of `SCORE_RS`:
+    // a second would be the same file read twice under two names.
+    const ATTN_X: &str = include_str!("../src/x/attn.rs");
     // `attn/attention_naive.cu` IS DELETED (`244df6054`) and `NAIVE_UNPAGED`
     // names `driver-cuda/src/fire/attention_naive.rs` — *"Two `<<<>>>` left
     // in it -- the MTP state pair ... now
     // `driver-cuda/src/fire/attention_naive.rs`"*, per
     // `kernels-cuda/csrc/CMakeLists.txt`. `quoted()` at `MLA`'s cost.
-    const NAIVE_UNPAGED: &str =
-        include_str!("../../driver-cuda/src/fire/attention_naive.rs");
+    // THAT FILE IS DELETED TOO -- the MTP pair crossed into fn-world -- and
+    // both quotes are `x::attn`'s verbatim, the launch on one line as the C++
+    // had it.
+    const NAIVE_UNPAGED: &str = ATTN_X;
     // `attn/page_compact.cu` IS DELETED (`244df6054`) and `PAGE_COMPACT`
     // names `driver-cuda/src/fire/page_compact.rs` — *"Two `<<<num_requests,
     // kBlock>>>` on one stream ... now `driver-cuda/src/fire/page_compact.rs`"*.
@@ -1475,7 +1511,11 @@ mod transcribed {
     // launches and not one read twice. `quoted` cannot tell them apart, so
     // that claim is no longer checked by this file at all — `fire::page_compact`
     // quotes both at `:46` and `:49` and is where a reader must now look.
-    const PAGE_COMPACT: &str = include_str!("../../driver-cuda/src/fire/page_compact.rs");
+    // THAT FILE IS DELETED TOO. `x::attn::compact_page_csr` quotes both
+    // `<<<>>>` at `:45`/`:46` and `:48`/`:49` and fires both in order, so the
+    // pair is still visible as a pair in exactly one place -- which is what
+    // the paragraph above says is the whole content of the refusal-to-move.
+    const PAGE_COMPACT: &str = ATTN_X;
     // `norm/rmsnorm.cu` IS DELETED (`58b31cf1b`) and `RMSNORM` named
     // `driver-cuda/src/fire/rmsnorm.rs` — *"Three of its five launchers are
     // `device::JIT_DISPATCHED` ... and two are `execution::RUST_SERVED` ...
@@ -2127,90 +2167,94 @@ mod transcribed {
         // which is a finding about `fire/mla_paged.rs` and not about this
         // file. The fix is to restore the three quotes there — NOT to weaken
         // the three assertions here.
-        quoted(MLA, "driver-cuda src/fire/mla_paged.rs", "constexpr int BS = 256;", "`mla_prepare`");
-        quoted(MLA, "driver-cuda src/fire/mla_paged.rs", "const int half = rope / 2;", "`mla_prepare`");
+        quoted(MLA, "kernels-cuda-new src/x/attn.rs (was fire/mla_paged.rs)", "constexpr int BS = 256;", "`mla_prepare`");
+        quoted(MLA, "kernels-cuda-new src/x/attn.rs (was fire/mla_paged.rs)", "const int half = rope / 2;", "`mla_prepare`");
         quoted(
             MLA,
-            "driver-cuda src/fire/mla_paged.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/mla_paged.rs)",
             "const int heads_per_block = half >= BS ? 1 : (BS / half);",
             "`mla_prepare`",
         );
         quoted(
             MLA,
-            "driver-cuda src/fire/mla_paged.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/mla_paged.rs)",
             "const int q_blocks = (heads + heads_per_block - 1) / heads_per_block;",
             "`mla_prepare`",
         );
         quoted(
             MLA,
-            "driver-cuda src/fire/mla_paged.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/mla_paged.rs)",
             "dim3 grid(total_tokens, 1 + q_blocks);",
             "`mla_prepare`",
         );
         quoted(
             MLA,
-            "driver-cuda src/fire/mla_paged.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/mla_paged.rs)",
             "device::mla_prepare<BS><<<grid, BS, 0, stream>>>(",
             "`mla_prepare`",
         );
 
         // ── the three `qkv_fused` grids ──
         //
-        // ALL SEVEN ARE NOW `quoted()` AGAINST `fire/qkv_fused.rs`, the Rust
-        // that replaced the deleted `.cu`. The LINE stops being checked, at
+        // ALL SEVEN ARE NOW `quoted()` AGAINST `x/attn.rs`, the Rust that
+        // replaced the deleted `.cu` — first in `driver-cuda`, and now in
+        // `kernels_cuda_new::x::attn::qkv_fused` beside the `unit!` whose
+        // eleven rows it fires. The LINE stops being checked, at
         // `MLA`'s cost, and here the loss has a second edge: the Rust cites
         // `:105`/`:106` where this file's citations say `:98`/`:99`, because
         // the `.cu` moved under both of them before it died. Nothing can tell
         // which numbering `families::attn` and `runtime::launch` are written
         // against any more, and no assertion in this tree can settle it.
         //
-        // AND TWO OF THE SEVEN ARE NOT REPRODUCED. `fire/qkv_fused.rs` is the
-        // DECODE dispatch only; `rows_packed_heads`' prefill launcher
-        // (`constexpr int BLOCK = 256;` at `:221` and `dim3 grid(num_rows,
-        // num_q_heads + num_kv_heads);` at `:222`) was already gone when the
-        // file was deleted and no Rust reproduces it. Those two assertions
-        // fail, and are left failing: the rule `rows_packed_heads` is still
-        // stated and still transcribed below, so the right response is to
-        // find the launcher it was written from, not to stop asking.
+        // ALL SEVEN ARE REPRODUCED NOW, and two of them only just.
+        // `fire/qkv_fused.rs` was the DECODE dispatch and never held
+        // `rows_packed_heads`' prefill launcher (`constexpr int BLOCK = 256;`
+        // at `:221` and `dim3 grid(num_rows, num_q_heads + num_kv_heads);` at
+        // `:222`), so those two assertions failed for as long as `QKV` named
+        // that file. The launcher they were written from is
+        // `x::attn::qkv_fused::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16`,
+        // whose `PACKED_BLOCK` carries both lines verbatim, and `QKV` names
+        // `x/attn.rs` now. The rule `rows_packed_heads` is still stated,
+        // still transcribed below, and now checked against its own source.
         quoted(
             QKV,
-            "driver-cuda src/fire/qkv_fused.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/qkv_fused.rs)",
             "constexpr int BLOCK = 256;",
             "`rows_packed_heads`",
         );
         quoted(
             QKV,
-            "driver-cuda src/fire/qkv_fused.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/qkv_fused.rs)",
             "dim3 grid(num_rows, num_q_heads + num_kv_heads);",
             "`rows_packed_heads`",
         );
         quoted(
             QKV,
-            "driver-cuda src/fire/qkv_fused.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/qkv_fused.rs)",
             "constexpr int BLOCK = 128;",
             "`rows_packed_heads_narrow`",
         );
         quoted(
             QKV,
-            "driver-cuda src/fire/qkv_fused.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/qkv_fused.rs)",
             "dim3 grid(num_requests, num_q_heads + num_kv_heads);",
             "`rows_packed_heads_narrow`",
         );
         quoted(
             QKV,
-            "driver-cuda src/fire/qkv_fused.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/qkv_fused.rs)",
             "constexpr int WARP_BLOCK = 256;",
             "`warp_packed_heads`",
         );
         quoted(
             QKV,
-            "driver-cuda src/fire/qkv_fused.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/qkv_fused.rs)",
             "const int total_units = num_requests * (num_q_heads + num_kv_heads);",
             "`warp_packed_heads`",
         );
         quoted(
             QKV,
-            "driver-cuda src/fire/qkv_fused.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/qkv_fused.rs)",
             "dim3 warp_grid((total_units + (WARP_BLOCK / 32) - 1) / (WARP_BLOCK / 32));",
             "`warp_packed_heads`",
         );
@@ -2230,11 +2274,12 @@ mod transcribed {
         // the six have nothing left to protect. They are deleted rather than
         // fixed, because there is no C++ to re-pin them to: the predicate
         // they were written from is `block_symbol(rope_table)` in
-        // `driver-cuda/src/fire/qkv_fused.rs:136`, a Rust `if` over a
-        // pointer, and a compiler checks that.
+        // `kernels-cuda-new/src/x/attn.rs`, a Rust `if` over a pointer, and a
+        // compiler checks that.
         //
         // The three `warp_packed_heads` geometry pins above STAY. They quote
-        // `fire/qkv_fused.rs`'s own Rust and that file did not move.
+        // that same host program's own Rust, which moved file without
+        // changing a character of the arithmetic they check.
 
         // ── `altup_streams`, re-pinned to the kernel it launches ──
         //
@@ -2369,25 +2414,25 @@ mod transcribed {
         // constant is `:70` and the launch `:317-321`.
         quoted(
             DSV4,
-            "driver-cuda src/fire/dsv4_compress.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/dsv4_compress.rs)",
             "constexpr int ATTN_BLOCK = 128;",
             "`paged_scores_decode`",
         );
         quoted(
             DSV4,
-            "driver-cuda src/fire/dsv4_compress.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/dsv4_compress.rs)",
             "dim3 grid(static_cast<unsigned>(total_tokens),",
             "`paged_scores_decode`",
         );
         quoted(
             DSV4,
-            "driver-cuda src/fire/dsv4_compress.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/dsv4_compress.rs)",
             "(static_cast<std::size_t>(head_dim) + ATTN_BLOCK) * sizeof(float);",
             "`paged_scores_decode`",
         );
         quoted(
             DSV4,
-            "driver-cuda src/fire/dsv4_compress.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/dsv4_compress.rs)",
             "device::compressed_attn_paged<<<grid, ATTN_BLOCK, smem, stream>>>(",
             "`paged_scores_decode`",
         );
@@ -2549,25 +2594,25 @@ mod transcribed {
         // is now the only place the pair is visible as a pair.
         quoted(
             NAIVE_UNPAGED,
-            "driver-cuda src/fire/attention_naive.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/attention_naive.rs)",
             "device::mtp_update_pending_hidden<bf16><<<num_requests, BLOCK, 0, stream>>>(",
             "`runtime::launch::per_request`",
         );
         quoted(
             NAIVE_UNPAGED,
-            "driver-cuda src/fire/attention_naive.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/attention_naive.rs)",
             "constexpr int BLOCK = device::BLOCK;",
             "`runtime::launch::per_request`",
         );
         quoted(
             PAGE_COMPACT,
-            "driver-cuda src/fire/page_compact.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/page_compact.rs)",
             "<<<num_requests, device::kBlock, 0, stream>>>(",
             "`runtime::launch::per_request`'s argument for NOT moving these two",
         );
         quoted(
             PAGE_COMPACT,
-            "driver-cuda src/fire/page_compact.rs",
+            "kernels-cuda-new src/x/attn.rs (was fire/page_compact.rs)",
             "<<<num_requests, device::kBlock, 0, stream>>>(",
             "`runtime::launch::per_request`'s argument for NOT moving these two",
         );
@@ -3475,7 +3520,11 @@ mod transcribed {
     /// own maintenance.
     #[test]
     fn the_fa2_specification_has_not_shifted_under_its_citations() {
-        const SPEC: &str = include_str!("../csrc/src/attn/attention_flashinfer_common.cuh");
+        // `spec/` and no longer `csrc/src/attn/`: the file is host C++ that
+        // no compiler reads, and `csrc/` holds device text only. `git mv`
+        // moved the path and not one byte above the EOF note, so every pin
+        // below still names the line it named. See `spec/README.md`.
+        const SPEC: &str = include_str!("../spec/attention_flashinfer_common.cuh");
         let cites = "`attention_flashinfer_common.cuh`'s twenty-four line citations";
 
         // The last of the six host includes, and the anchor CMakeLists:553
@@ -3523,14 +3572,14 @@ mod transcribed {
             (WNA16_CUH, "dequant_wna16.cuh"),
             (FP4_CUH, "dequant_fp4.cuh"),
             (NAIVE, "attention_naive_paged.cuh"),
-            (MLA, "driver-cuda src/fire/mla_paged.rs"),
-            (QKV, "driver-cuda src/fire/qkv_fused.rs"),
+            (MLA, "kernels-cuda-new src/x/attn.rs (was fire/mla_paged.rs)"),
+            (QKV, "kernels-cuda-new src/x/attn.rs (was fire/qkv_fused.rs)"),
             (ALTUP_CUH, "norm/altup.cuh"),
             (ROPE, "kernels-cuda-new src/x/rope.rs"),
-            (DSV4, "driver-cuda src/fire/dsv4_compress.rs"),
+            (DSV4, "kernels-cuda-new src/x/attn.rs (was fire/dsv4_compress.rs)"),
             (KV_PAGED, "driver-cuda src/fire/kv_paged.rs"),
-            (NAIVE_UNPAGED, "driver-cuda src/fire/attention_naive.rs"),
-            (PAGE_COMPACT, "driver-cuda src/fire/page_compact.rs"),
+            (NAIVE_UNPAGED, "kernels-cuda-new src/x/attn.rs (was fire/attention_naive.rs)"),
+            (PAGE_COMPACT, "kernels-cuda-new src/x/attn.rs (was fire/page_compact.rs)"),
             (RMSNORM, "kernels-cuda-new src/x/norm.rs"),
             (NEMOTRON, "ssm/nemotron_h.cuh"),
             (NEMOTRON_RS, "kernels-cuda-new src/x/ssm.rs (nemotron_h)"),
@@ -3595,9 +3644,16 @@ mod transcribed {
 //
 // # What is NOT fired here, and why
 //
-// `Rule::PagedScores` and `Rule::PagedScoresDecode` land no rows: their
-// kernels take `device::KvScheme` and `device::KvDType` by value and
-// `kernels::Ty` has no variant for an enum class. There is nothing to fire.
+// `Rule::PagedScores` and `Rule::PagedScoresDecode` land no rows -- and the
+// reason CHANGED TWICE. It was *"their kernels take `device::KvScheme` and
+// `device::KvDType` by value and `kernels::Ty` has no variant for an enum
+// class"*; `Ty` gained both variants and the rows were written; and now the
+// root has crossed to `x::attn::attention_naive_paged`, where a `unit!` row
+// carries `LaunchRule::Unstated` by construction. So there are no rows for
+// these rules again, for the opposite reason: not that a rule's operands
+// could not be spelled, but that a `fn` writes its own `Launch` and has no
+// use for a rule. The two fires below survive the change -- they resolve the
+// `_dev` row and build the launch by hand, which is what they always did.
 //
 // `Rule::MlaPrepare`'s row does not claim the ahead-of-time symbol, because
 // `attn::mla_prepare_bf16` takes `MlaCacheLayerView` by value — the same
@@ -4772,7 +4828,8 @@ mod fires {
     // `Rule::PagedScores` and `Rule::PagedScoresDecode`
     //
     // The two rows that could not exist until `kernels::Ty` had a variant for
-    // an `enum class ... : u8`. Both kernels take `device::KvScheme` and
+    // an `enum class ... : u8`, and which are `x::attn`'s `unit!` rows now.
+    // Both kernels take `device::KvScheme` and
     // `device::KvDType` BY VALUE and adjacently, so this pair of fires is
     // also the measurement that `Ty::KvScheme`/`Ty::KvDType` marshal — a
     // kind that renders in the emitters and not in `ArgValue::cell` binds a
@@ -5008,16 +5065,26 @@ mod fires {
         }
     }
 
-    /// Both paged rows are stated, hosted, and claim their rules.
+    /// Both paged rows are stated and hosted.
+    ///
+    /// **THE RULE ASSERTION IS GONE, AND ITS SUBJECT IS GONE WITH IT.** This
+    /// read `assert_eq!(row.sig.launch, rule)` against `Rule::PagedScores`
+    /// and `Rule::PagedScoresDecode`. The root crossed into fn-world as
+    /// `x::attn::attention_naive_paged`, and a `unit!` row carries
+    /// `LaunchRule::Unstated` by construction -- a `fn` writes its own
+    /// `Launch`, so there is no rule for a row to claim and nothing for this
+    /// to compare. The geometry is still checked, harder than a rule ever
+    /// checked it, by `the_paged_row_reproduces_the_launcher` below: it fires
+    /// the shipped path against a hand-built launch at four shapes and
+    /// compares every byte of both outputs.
+    ///
+    /// The prefill symbol is `_dev`: §60.6 splits a device row's name from
+    /// the trace's, and `attn::attention_naive_paged` is the CONTRACT's now.
     #[test]
     fn the_paged_rows_are_stated_and_hosted() {
-        for (symbol, rule) in [
-            ("attn::attention_naive_paged", Rule::PagedScores),
-            ("attn::naive_paged_decode", Rule::PagedScoresDecode),
-        ] {
+        for symbol in ["attn::attention_naive_paged_dev", "attn::naive_paged_decode"] {
             assert!(runtime::hosts(symbol), "{symbol} is hosted by no unit");
             let row = runtime::row(symbol).expect("hosted");
-            assert_eq!(row.sig.launch, rule, "{symbol}");
             assert_eq!(row.sig.file, Some("attn/attention_naive_paged.cuh"), "{symbol}");
         }
     }
@@ -5040,7 +5107,10 @@ mod fires {
     #[test]
     fn the_paged_row_reproduces_the_launcher() {
         let Some(_) = arch_or_skip("the_paged_row_reproduces_the_launcher") else { return };
-        let symbol = "attn::attention_naive_paged";
+        // `_dev`: the DEVICE row. `attn::attention_naive_paged` is
+        // `x::attn::ATTENTION_NAIVE_PAGED`, a contract, and a contract symbol
+        // is never a unit row's symbol.
+        let symbol = "attn::attention_naive_paged_dev";
         let module = module_of(symbol, "attn/attention_naive_paged");
         let entry = module.entry(symbol).expect("the row resolved");
 
@@ -5272,7 +5342,7 @@ mod fires {
     #[test]
     fn the_kv_enums_cross_as_one_byte_each() {
         let Some(_) = arch_or_skip("the_kv_enums_cross_as_one_byte_each") else { return };
-        let symbol = "attn::attention_naive_paged";
+        let symbol = "attn::attention_naive_paged_dev";
         let module = module_of(symbol, "attn/attention_naive_paged");
         let entry = module.entry(symbol).expect("the row resolved");
 

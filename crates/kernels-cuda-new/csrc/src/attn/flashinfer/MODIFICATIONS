@@ -1,5 +1,5 @@
-MODIFICATIONS -- every vendored file, and how many guards it carries
-===================================================================
+MODIFICATIONS -- every internalised file, and how many guards it carries
+========================================================================
 
 Generated from the tree, and kept honest by the property it asserts.  Apply
 this transform to any file below and you get FlashInfer v0.6.15, byte for
@@ -10,23 +10,61 @@ byte:
        `#endif` -- keeping the guarded BODY, which is upstream's, and
        DISCARDING the `#else` branch, if any, which is ours;
     2. rewrite every `#include <pie/...>` back to the spelling upstream
-       wrote, using the map in `tests/vendor_manifest.rs`.
+       wrote, using the map in `tests/upstream_manifest.rs`.
 
-Step 2 is new and is currently the identity: no vendored file has moved out
-of `csrc/vendor/flashinfer/` yet, so no vendored file spells `<pie/...>` and
-the map is empty.  It exists BEFORE the move rather than after it, because
-the thing it protects is the thing a move destroys.  `csrc/` is being cut by
-ROLE rather than by provenance -- a device-stdlib header belongs beside the
-other device-stdlib headers whoever wrote it -- and the whole risk of that cut
-is that vendoring quietly becomes a fork.  A file that moves must change its
-`#include` lines, because upstream reaches its siblings by RELATIVE path
-(`"../cp_async.cuh"`, `"../utils.cuh"`: 58 such directives, and not one
-`<flashinfer/...>` among them).  So the move edits upstream's bytes, and the
-only thing standing between "vendoring plus a mechanical transform" and "a
-fork" is a transform that is written down and checked.  A version bump stays
-re-fetch plus re-apply.
+THE TREE HAS MOVED AND STEP 2 IS STILL THE IDENTITY.  This paragraph used to
+read "no vendored file has moved out of `csrc/vendor/flashinfer/` yet".  That
+directory no longer exists: `csrc/` was narrowed to device text only, which
+left a provenance-named directory nowhere to be, and these 28 files are now
+at `csrc/src/attn/flashinfer/`.  Vendoring became INTERNALISING.  Not one
+byte below changed in that move.
 
-`grep -rn "// PIE:" csrc/vendor/flashinfer/` finds all 33 markers.
+ONE ROW WAS ALREADY WRONG WHEN THE MOVE FOUND IT, and the correction is
+below rather than hidden in it.  This paragraph first claimed "all four
+numeric columns are the numbers they were" -- true of the move, and not a
+statement about whether they were RIGHT.  Re-measuring all 28 files against
+the table turned up exactly one row that disagreed with its file:
+
+    attention/mla.cuh    was   1     7    1143     54176
+                         is    3    27    1163     55245
+
+`f622dcf8d` put three `#ifndef __CUDACC_RTC__` blocks in that file where
+there had been one -- the two stray `.template` keywords at `:806` and `:847`
+that NVRTC rejects, each keeping upstream's spelling in the guard and ours in
+an `#else` -- and it amended step 1 above to discard the `#else`, which was
+the right call, but it did not re-run the columns.  So the row read 1 guard
+where the file has 3 and 1143 lines where the file has 1163, and the totals
+under it were short by the same 20 lines and 1,069 bytes.  The drift is +4
+`added` lines wider than a naive count suggests, because the two `#else`
+branches are ours and step 1 discards them, so they are added lines too.
+`tests/upstream_manifest.rs` would have caught this the moment it ran; it is
+recorded here because the fix and the reason belong in the same place.
+
+The reason the transform survived is worth writing down, because the version
+of this note that predicted otherwise was WRONG.  It said: "a file that moves
+must change its `#include` lines, because upstream reaches its siblings by
+RELATIVE path (`"../cp_async.cuh"`, `"../utils.cuh"`: 58 such directives, and
+not one `<flashinfer/...>` among them).  So the move edits upstream's bytes."
+That is true of a FILE and false of a SUBTREE.  A relative directive names a
+path relative to the includer, so it keeps resolving as long as the includer
+and its target move together -- and this tree moved intact, one `git mv` of
+the whole directory.  58 relative directives, zero rewritten.  The ten
+`#include` lines that did change are ours, in four of our files:
+`csrc/src/attn/{fa2,attention_mla_fa2,attention_score_capture}.cuh` and
+`csrc/src/cascade/merge_states.cuh`, which reach IN from outside and had to
+learn the new prefix.  They also changed bracket style, `<flashinfer/...>` to
+`"attn/flashinfer/..."`, which is not cosmetic: `source.rs`'s reachability
+walk follows quoted spellings and skips angled ones, so quoting these ten put
+the internalised closure inside the graph the tests check.
+
+So step 2 is still the identity, no file below spells `<pie/...>`, and the
+map in `tests/upstream_manifest.rs` is still empty.  It stays because the
+prediction it was built for is DEFERRED, not refuted: separating the device
+stdlib from the attention algorithms still rewrites upstream's lines, and the
+whole risk of that cut is still that internalising quietly becomes a fork.  A
+version bump stays re-fetch plus re-apply.
+
+`grep -rn "// PIE:" csrc/src/attn/flashinfer/` finds all 35 markers.
 
 Columns: guards, added lines, file lines, file bytes.
 
@@ -49,7 +87,7 @@ attention/default_decode_params.cuh              0       0      279       8705
 attention/default_prefill_params.cuh             4      26      474      15831
 attention/heap.h                                 1       6       72       2108
 attention/mask.cuh                               0       0       30        922
-attention/mla.cuh                                1       7     1143      54176
+attention/mla.cuh                                3      27     1163      55245
 attention/mla_params.cuh                         0       0       84       2251
 attention/prefill.cuh                            0       0     4367     223123
 attention/scheduler.cuh                          1      13     1840      87507
@@ -71,7 +109,7 @@ profiler.cuh                                     0       0      149       6708
 utils.cuh                                        5      31      581      28134
 vec_dtypes.cuh                                   0       0     2194      74561
 -----------------------------------------------------------------------------
-28 files                                        33     206    18187     798875
+28 files                                        35     226    18207     799944
 
 14 files are untouched. `LICENSE` is upstream's, copied and not counted.
 
@@ -99,8 +137,12 @@ file called `cuda_fp16.h` is answering for NVIDIA's `cuda_fp16.h` and cannot
 be renamed without ceasing to do its job.  nvcc needed one line: a second
 `-iquote` at each of the four sites that pass the first.
 
-Nothing in this table moved, and nothing in it changed.  The transform above
-still recovers upstream v0.6.15 byte for byte from every file listed, which is
-the point of doing the shim group first -- it is the one role whose files are
-neither vendored nor included by relative path from a vendored file, so it
-moves without editing a single upstream byte.
+One row in this table changed, and not because of the move: see the
+correction near the top.  Every file in it moved, together, from
+`csrc/vendor/flashinfer/` to `csrc/src/attn/flashinfer/`, byte for byte, and
+the transform above still recovers upstream v0.6.15 from every file listed.
+The shim group was done first for a reason that turned out to generalise: it
+was the one role whose files are neither upstream's nor included by relative
+path from an upstream file, so it moved without editing a single upstream
+byte.  Moving the closure as one subtree bought the same property for a
+harder case, and the 58 relative directives are why.

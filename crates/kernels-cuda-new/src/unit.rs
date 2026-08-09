@@ -40,8 +40,8 @@
 //!   finished, measured and exact, and needs NVRTC 13.3 for `cuda::tiles`;
 //!   this box loads 13.0. Nothing on `Unit` could say so, so the file is
 //!   carried as text and declared as no unit at all.
-//! * **which header set it resolves against.** A unit compiling vendored
-//!   FlashInfer needs [`crate::source::VENDOR`], which [`DEVICE_HEADERS`]
+//! * **which header set it resolves against.** A unit compiling upstream
+//!   FlashInfer needs [`crate::source::UPSTREAM`], which [`DEVICE_HEADERS`]
 //!   deliberately excludes because NVRTC copies every byte of every header it
 //!   is handed and a `norm` kernel has no business paying for an attention
 //!   library.
@@ -100,8 +100,9 @@ pub struct Unit {
     /// and a flag that only one unit needs must not silently become everyone's.
     ///
     /// The case that made this a field rather than a constant is
-    /// `--device-as-default-execution-space`. Vendored upstream source needs
-    /// it: FlashInfer's headers are full of functions with no `__device__`
+    /// `--device-as-default-execution-space`. Internalised upstream source
+    /// needs it: FlashInfer's headers are full of functions with no
+    /// `__device__`
     /// annotation, which nvcc forgives inside a `.cu` and NVRTC does not, and
     /// without the flag `decode.cuh` is rejected at the first one. Turning it
     /// on globally would be the wrong fix twice over — it would silently
@@ -206,7 +207,7 @@ impl fmt::Display for Toolchain {
 ///   which the key already does for the CONTENT — and the content is not the
 ///   same claim as the choice. See [`Unit::cache_key_under`].
 /// * the sets are the crate's, not a unit's. `source`'s whole argument is that
-///   there is one carried library and one vendored closure; a unit that could
+///   there is one carried library and one upstream closure; a unit that could
 ///   name an arbitrary set could name a private header, which is the state
 ///   that module exists to prevent.
 ///
@@ -226,7 +227,7 @@ impl fmt::Display for Toolchain {
 ///
 /// # Where this is going, and what it is not yet
 ///
-/// Two arms is a DICHOTOMY, and it exists for exactly one reason: FlashInfer
+/// Two arms is a DICHOTOMY, and it existed for exactly one reason: FlashInfer
 /// arrived wholesale as somebody else's tree, so the only question a unit was
 /// ever asked was *do you want the vendored library or not*. That is a
 /// question about provenance.
@@ -237,26 +238,47 @@ impl fmt::Display for Toolchain {
 /// question becomes *which roles does this unit need*: an `attn` unit takes
 /// `device` + `attn`, a `norm` unit takes `device` + `norm`, and neither
 /// carries the other's bytes. Two arms becomes a per-unit SUBSET, and the
-/// 1.7 MB that a `norm` kernel pays for today because it is in one bag
+/// 1.2 MB that a `norm` kernel pays for today because it is in one bag
 /// stops being one bag.
 ///
 /// It is not that yet, and this comment is not pretending otherwise. Both
 /// arms below gained [`crate::source::SHIM`] and neither lost anything: the
-/// sets are the same files with the same names, regrouped. A subset needs the
-/// device stdlib separated from the attention algorithms inside
-/// `csrc/vendor/flashinfer/`, and separating them rewrites upstream's
-/// `#include` lines, which is why `tests/vendor_manifest.rs` grew a
-/// transform and a counted negative control before anything moved.
+/// sets are the same files with the same names, regrouped.
+///
+/// # The provenance question outlived the provenance directory
+///
+/// The paragraph above used to end *"a subset needs the device stdlib
+/// separated from the attention algorithms inside `csrc/vendor/flashinfer/`,
+/// and separating them rewrites upstream's `#include` lines"*. Internalising
+/// moved that tree to `csrc/src/attn/flashinfer/` and `csrc/src/attn/xqa/`
+/// **without rewriting one upstream byte** — the subtree kept its shape, so
+/// its fifty-eight relative directives kept resolving. `csrc/vendor` is gone
+/// and the transform in `tests/upstream_manifest.rs` is still the identity.
+///
+/// So the split is now a PREFIX and not a directory: [`crate::source::LIBRARY`]
+/// is `csrc/src` minus `attn/flashinfer/` and `attn/xqa/`, and
+/// [`crate::source::UPSTREAM`] is exactly those two. That is a weaker thing
+/// than a directory — a rule stated in `carried.rs` rather than a fact a
+/// walker can see — and it buys the property that made it worth it: the
+/// closure can be re-patched from upstream by replacing a subtree.
+///
+/// The dichotomy survives because the REASON survives. It is still 1.2 MB, a
+/// `norm` kernel still has no business copying it through
+/// `nvrtcCreateProgram`, and the arm still names who wrote the text. The
+/// subset this comment wants is still not built; what changed is that the
+/// separation it asks for is now a change to one `const` in `carried.rs`
+/// rather than a change to somebody else's `#include` lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Headers {
-    /// [`DEVICE_HEADERS`]: `csrc/shim` and `csrc/src` — the impersonating
-    /// headers, the prelude, and every kernel header authored here. What
-    /// every unit authored here compiles against.
+    /// [`DEVICE_HEADERS`]: `csrc/shim` and `csrc/src` minus the internalised
+    /// subtrees — the impersonating headers, the prelude, and every kernel
+    /// header authored here. What every unit authored here compiles against.
     Library,
-    /// [`ALL_HEADERS`]: the above plus `csrc/vendor`, the patched FlashInfer
-    /// closure — 1.7 MB, and NVRTC copies every byte of it, which is why it
-    /// goes only to the units that ask.
-    LibraryAndVendor,
+    /// [`ALL_HEADERS`]: the above plus `csrc/src/attn/flashinfer` and
+    /// `csrc/src/attn/xqa`, the patched FlashInfer and XQA closure — 1.2 MB,
+    /// and NVRTC copies every byte of it, which is why it goes only to the
+    /// units that ask.
+    LibraryAndUpstream,
 }
 
 impl Headers {
@@ -265,7 +287,7 @@ impl Headers {
     pub const fn set(self) -> &'static [Header] {
         match self {
             Headers::Library => DEVICE_HEADERS,
-            Headers::LibraryAndVendor => ALL_HEADERS,
+            Headers::LibraryAndUpstream => ALL_HEADERS,
         }
     }
 
@@ -273,11 +295,18 @@ impl Headers {
     ///
     /// Short and stable: it is written into every key, and a key is compared
     /// as bytes.
+    ///
+    /// `"lib+vendor"` until the closure was internalised. Renaming it
+    /// INVALIDATES the cached cubins of the four units that carry it, which
+    /// is a cold recompile and not a correctness problem — and it is the
+    /// honest outcome, because those four units' text moved. A tag that had
+    /// stayed `"lib+vendor"` would have kept the old cubins addressable under
+    /// a name for a directory that no longer exists.
     #[must_use]
     pub const fn tag(self) -> &'static str {
         match self {
             Headers::Library => "lib",
-            Headers::LibraryAndVendor => "lib+vendor",
+            Headers::LibraryAndUpstream => "lib+upstream",
         }
     }
 }
@@ -315,18 +344,26 @@ impl Demands {
 /// measurement rather than a placeholder: every unit declared before it
 /// compiles under the NVRTC this crate loads and resolves against the library
 /// set. `crate::families::fa2` is the first that does not. Its 56 units
-/// `#include <flashinfer/attention/decode.cuh>` and
-/// `<flashinfer/attention/prefill.cuh>`, which reach the whole 1.7 MB patched
-/// vendor closure, so they demand [`Headers::LibraryAndVendor`].
+/// `#include "attn/flashinfer/attention/decode.cuh"` and
+/// `"attn/flashinfer/attention/prefill.cuh"`, which reach the whole 1.2 MB
+/// patched upstream closure, so they demand [`Headers::LibraryAndUpstream`].
 ///
 /// `crate::families::cascade` is the second. Its one
-/// unit `#include`s `<flashinfer/attention/cascade.cuh>` — the OTHER half of
-/// FA2's split path, the fold that turns `tmp_v`/`tmp_s` into `o` — which
-/// reaches `cp_async.cuh`, `math.cuh`, `utils.cuh` and `state.cuh`, all
-/// vendored. `crate::x::xqa` is the third and is the entry the XQA lattice's
-/// own doc predicted: five units on one root that reaches
-/// `csrc/vendor/xqa/`'s fifteen-file closure. Every other unit still demands
-/// nothing.
+/// unit `#include`s `"attn/flashinfer/attention/cascade.cuh"` — the OTHER
+/// half of FA2's split path, the fold that turns `tmp_v`/`tmp_s` into `o` —
+/// which reaches `cp_async.cuh`, `math.cuh`, `utils.cuh` and `state.cuh`, all
+/// upstream's. `crate::x::xqa` is the third and is the entry the XQA
+/// lattice's own doc predicted: five units on one root that reaches
+/// `csrc/src/attn/xqa/`'s fifteen-file closure. Every other unit still
+/// demands nothing.
+///
+/// The spellings above were `<flashinfer/…>` and `<xqa/…>` until
+/// internalisation, and they are quoted now for a reason worth stating here
+/// because this is the doc a reader checks them against:
+/// [`crate::source::quoted_includes`] parses only `"…"`, so an angled
+/// spelling is invisible to [`crate::source::reachable`] and to
+/// `every_device_include_resolves`. Quoting these four roots is what puts
+/// them under the gate that proves the closure still resolves.
 ///
 /// The one file that would ALSO be here — `moe/moe_grouped_gemm_tile` — is
 /// deliberately not a unit yet, and adding it here without adding the unit
@@ -422,14 +459,14 @@ impl Demands {
 const DEMANDS: &[(&str, Demands)] = &[
     (
         "attn/fa2_*",
-        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndUpstream },
     ),
     // The second entry, and the first that is not a family prefix.
     //
     // `crate::families::cascade`'s one unit `#include`s
-    // `<flashinfer/attention/cascade.cuh>`, which reaches `cp_async.cuh`,
-    // `math.cuh`, `utils.cuh` and `state.cuh` — vendored, every one of them,
-    // and unreachable from `Headers::Library`. It is the same demand
+    // `"attn/flashinfer/attention/cascade.cuh"`, which reaches `cp_async.cuh`,
+    // `math.cuh`, `utils.cuh` and `state.cuh` — upstream's, every one of
+    // them, and unreachable from `Headers::Library`. It is the same demand
     // `attn/fa2_*` makes and it is stated separately rather than widened into
     // a `*` that would cover both, because the two are different families and
     // a shared wildcard would be a key that stops naming what it covers.
@@ -439,21 +476,27 @@ const DEMANDS: &[(&str, Demands)] = &[
     // than a prefix that silently matches nothing else.
     (
         "cascade/merge_states",
-        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndUpstream },
     ),
     // The third, and the second family prefix.
     //
     // `crate::x::xqa`'s five enrolled units all compile ONE root,
     // `csrc/src/attn/attention_xqa_mha.cuh`, whose two includes are
-    // `<cuda_bf16.h>` and `<xqa/mha.cuh>` — and the second reaches the
-    // fifteen-file, 272 KB closure at `csrc/vendor/xqa/`. Every byte of it
-    // is vendor, none of it is reachable from `Headers::Library`, and
+    // `<cuda_bf16.h>` and `"attn/xqa/mha.cuh"` — and the second reaches the
+    // fifteen-file, 275 KB closure at `csrc/src/attn/xqa/`. Every byte of it
+    // is upstream's, none of it is reachable from `Headers::Library`, and
     // `families::attn::XQA_LATTICE`'s own doc names this entry as the one
     // the table would gain: *"Every member needs
     // `crate::unit::Headers::LibraryAndVendor`, and that is the one entry
     // the currently-empty `DEMANDS` table would gain."* The table was not
     // empty by the time it was written, which changes the sentence and not
-    // the demand.
+    // the demand — and the variant it names is `LibraryAndUpstream` now,
+    // which is a stale quotation in a file this task does not own and is
+    // reported rather than edited.
+    //
+    // That root's THIRD include is `<attn/xqa/mha_sm90.cuh>`, angled, inside
+    // `#if USE_SM90_MHA`. It is the one carried file that names a `csrc/`
+    // path and is not in any set, and the bracket is how it says so.
     //
     // A PREFIX and not five exact keys, for `attn/fa2_*`'s reason with one
     // addition: the sixth member of the lattice is deliberately NOT enrolled
@@ -463,13 +506,14 @@ const DEMANDS: &[(&str, Demands)] = &[
     // see a key that was never added.
     (
         "attn/attention_xqa_mha_*",
-        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndUpstream },
     ),
     // The fourth, and the second exact key.
     //
     // `crate::x::attn::mla_fa2`'s one unit compiles
-    // `csrc/src/attn/attention_mla_fa2.cuh`, whose two vendored includes are
-    // `<flashinfer/attention/mla.cuh>` and `<flashinfer/attention/mla_params.cuh>`,
+    // `csrc/src/attn/attention_mla_fa2.cuh`, whose two upstream includes are
+    // `"attn/flashinfer/attention/mla.cuh"` and
+    // `"attn/flashinfer/attention/mla_params.cuh"`,
     // and the first of those includes `prefill.cuh` at its line 33 — so the
     // closure is `attn/fa2_*`'s, reaching `cascade.cuh`, `scheduler.cuh`,
     // `permuted_smem.cuh`, `fastdiv.cuh` and the rest. None of it is
@@ -483,7 +527,7 @@ const DEMANDS: &[(&str, Demands)] = &[
     // key would stop naming what it covers.
     (
         "attn/attention_mla_fa2",
-        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndVendor },
+        Demands { floor: Toolchain::ANY, headers: Headers::LibraryAndUpstream },
     ),
 ];
 
@@ -668,7 +712,7 @@ impl Unit {
     ///   the unit ASKED for, which is what `nvrtc::compile` reads to decide
     ///   what to hand it. Two units whose sets happen to agree byte for byte
     ///   today would key the same on the digest alone, and stop agreeing the
-    ///   moment a vendored header lands — after the cubin was written.
+    ///   moment an upstream header lands — after the cubin was written.
     /// * The floor is not in the text at all. It decides whether this machine
     ///   may produce the cubin, and a unit whose floor moved from `any` to
     ///   13.3 is a unit whose old entry was produced by a compiler it now
@@ -948,10 +992,10 @@ mod tests {
         // The SAME text handed in, and only the choice different: this is the
         // term the header digest cannot express, because the digest is the
         // bytes and the choice is what the compile will go and fetch.
-        let vendored = Demands { headers: Headers::LibraryAndVendor, ..Demands::DEFAULT };
+        let upstream = Demands { headers: Headers::LibraryAndUpstream, ..Demands::DEFAULT };
         assert_ne!(
             base,
-            unit.cache_key_under("sm_90", DEVICE_HEADERS, vendored),
+            unit.cache_key_under("sm_90", DEVICE_HEADERS, upstream),
             "the header-set CHOICE is spanned, not merely the bytes it resolved to"
         );
 
@@ -1026,22 +1070,45 @@ mod tests {
         }
     }
 
-    /// The two families that reach the vendored closure, and only those two.
+    /// The four demands that reach the upstream closure, and only those.
     ///
     /// Named rather than counted. A count is a number to bump; a name is a
-    /// claim that fails when a third family starts `#include`ing
-    /// `<flashinfer/...>` without saying so — which is the failure
+    /// claim that fails when a fifth root starts `#include`ing
+    /// `"attn/flashinfer/…"` without saying so — which is the failure
     /// [`DEMANDS`]' own doc calls the one direction no mechanism can check,
-    /// caught here for the two cases where it is checkable because the
-    /// answer is written down.
+    /// caught here for the cases where it is checkable because the answer is
+    /// written down.
+    ///
+    /// # This was two names against a four-row table, and it was wrong
+    ///
+    /// It read `the_vendored_closure_is_demanded_by_the_two_families_that_
+    /// reach_it` and its predicate was `attn/fa2_*` OR `cascade/merge_states`
+    /// — the table's first two rows, written when they were the only two.
+    /// [`DEMANDS`] has had four rows since `crate::x::xqa`'s five units and
+    /// `attn/attention_mla_fa2` enrolled, and `families::ALL` carries both,
+    /// so six units answered `LibraryAndUpstream` to a predicate that said
+    /// `false`. A test named after its own denominator goes stale the moment
+    /// the denominator moves, and this one advertised the staleness in its
+    /// name for the whole time it was failing.
+    ///
+    /// Found while renaming the variant, which is the only reason this
+    /// assertion was read at all. It is not caused by internalisation and it
+    /// is fixed here because the rename could not be applied without deciding
+    /// what the line should say.
+    ///
+    /// The predicate now mirrors [`DEMANDS`] row for row, in its order, with
+    /// `*` spelled as `starts_with` and an exact key as `==` — so a fifth row
+    /// is a fifth clause and a reader can diff the two lists by eye.
     #[test]
-    fn the_vendored_closure_is_demanded_by_the_two_families_that_reach_it() {
+    fn the_upstream_closure_is_demanded_by_exactly_the_roots_that_reach_it() {
         for unit in UNITS {
-            let wants_vendor = unit.name.starts_with("attn/fa2_")
-                || unit.name == crate::families::cascade::MERGE_STATES.name;
+            let wants_upstream = unit.name.starts_with("attn/fa2_")
+                || unit.name == crate::families::cascade::MERGE_STATES.name
+                || unit.name.starts_with("attn/attention_xqa_mha_")
+                || unit.name == "attn/attention_mla_fa2";
             assert_eq!(
-                unit.headers() == Headers::LibraryAndVendor,
-                wants_vendor,
+                unit.headers() == Headers::LibraryAndUpstream,
+                wants_upstream,
                 "`{}`",
                 unit.name
             );
@@ -1059,12 +1126,12 @@ mod tests {
 
         // The two sets are two sets, and the choice reaches them.
         assert_eq!(Headers::Library.set(), DEVICE_HEADERS);
-        assert_eq!(Headers::LibraryAndVendor.set(), ALL_HEADERS);
+        assert_eq!(Headers::LibraryAndUpstream.set(), ALL_HEADERS);
         assert!(
-            Headers::LibraryAndVendor.set().len() > Headers::Library.set().len(),
-            "the vendored closure is carried on top of the library, not instead of it"
+            Headers::LibraryAndUpstream.set().len() > Headers::Library.set().len(),
+            "the upstream closure is carried on top of the library, not instead of it"
         );
-        assert_ne!(Headers::Library.tag(), Headers::LibraryAndVendor.tag());
+        assert_ne!(Headers::Library.tag(), Headers::LibraryAndUpstream.tag());
     }
 
     /// [`rows`] is the concatenation and nothing else — no unit skipped, no

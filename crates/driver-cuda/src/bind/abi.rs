@@ -305,50 +305,37 @@ pub enum Mxfp4RowSelect {
     Odd = 2,
 }
 
-/// The generated `extern "C"` half of the launch ABI — the bridge's door.
+/// THE ARCHIVE'S DOOR STOOD HERE — `pub mod ffi`, and it is DELETED.
 ///
-/// `build.rs` writes this file to `OUT_DIR` from the same kernel tables the
-/// launch_abi tests prove, beside the C shim it compiles and links. One
-/// declaration per stated row, `pie_k_<symbol>` — see `kernels_cuda_new::abi`.
+/// Its whole body was one line:
 ///
-/// Everything here is `unsafe` in the plainest sense: the bindings state
-/// types, and the TRUTH of each pointer (liveness, extent, stream ordering)
-/// is the caller's. The executor (retirement plan phase C) is the intended
-/// caller; tests smoke one entry to prove the plumbing.
-#[cfg(feature = "bridge")]
-pub mod ffi {
-    #[allow(unused_imports)]
-    use super::{
-        AttentionWorkspaceView, HopperPrefillPlan, KvCacheLayerView, MlaCacheLayerView,
-        MoeActivation, Mxfp4RowSelect, StructuredMaskParams, YarnOriginalParams,
-    };
-    #[allow(unused_imports)]
-    use crate::dtype::DType;
-    #[allow(unused_imports)]
-    use crate::weights::weight_view::WeightView;
-    include!(concat!(env!("OUT_DIR"), "/launch_bindings.rs"));
+/// ```ignore
+/// include!(concat!(env!("OUT_DIR"), "/launch_bindings.rs"));
+/// ```
+///
+/// `build.rs` wrote that file from every family table, one
+/// `extern "C" pie_k_<symbol>` per STATED row, and the generated dispatch
+/// called them. **It was the only item in `driver-cuda/src` that reached the
+/// C++ archive** — north star §6's census found 76 `bridge` gate attributes
+/// and exactly one whose body needed a symbol `launch_bindings.rs` declares.
+/// The other 75 were fossil or row-world (BRIDGE_RETIREMENT.md §2.2, and
+/// `e88f1ffff` for the 68 retractions).
+///
+/// It goes now because it has nothing to declare. `emit_rust_bindings` emits
+/// a declaration per row `abi::stated()` keeps, `stated()` drops a row with
+/// no operands, `table::ROW_TABLES` is `&[]`, and every row `table::KERNELS`
+/// still holds is a `Contract::sig` — which states none. The generated file
+/// is empty, so this module declared nothing and its only caller, the
+/// generated `match` in `dispatch_generated`, is deleted in the same index.
+///
+/// The seven hand-written `pie_x_*` extras that also stood here went earlier
+/// and for a different reason, recorded because the two are easy to
+/// conflate: the decode/prefill plan-cache factories, their deleters,
+/// `set_decode_plan_int_base` and the two planners were C++ lifetimes a C ABI
+/// could not express, and they are `fire::flashinfer_fa2::{DecodePlanCache,
+/// PrefillPlanCache}` now — plain Rust whose deleter is `Drop`.
 
-    // THE HAND-WRITTEN EXTRAS ARE GONE. Seven `pie_x_*` declarations stood
-    // here -- the decode and prefill plan-cache factories, their two
-    // deleters, `set_decode_plan_int_base`, and the two planners -- against
-    // `driver-cuda/csrc/attn/plan_lifecycle.cpp` and
-    // `csrc/attn/attention_flashinfer.cu`, both DELETED by north star §5
-    // step 7.
-    //
-    // Their own header said why they existed: *"a `unique_ptr` with a custom
-    // deleter"*, which a C ABI cannot express. The replacement caches are
-    // `fire::flashinfer_fa2::{DecodePlanCache, PrefillPlanCache}` -- plain
-    // Rust structs whose deleter is `Drop` -- so the reason is not merely
-    // ported, it is retired. `bind::DecodePlan` and `bind::PrefillPlan` keep
-    // the same handle API over a `Box::into_raw` pointer.
-    //
-    // Nothing else was ever declared here: the generated `pie_k_*` bindings
-    // above are `kernels_cuda_new::abi`'s alone, and the six FlashInfer FA2
-    // rows are on `execution::RUST_SERVED`, so `emit_c_shim` no longer emits
-    // forwarders for them either.
-}
-
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 /// Seed a KV cache's envelope tiers as EMPTY, safely.
 ///
 /// The `unsafe` for this launch used to sit in `pools/kv_cache_live.rs`,

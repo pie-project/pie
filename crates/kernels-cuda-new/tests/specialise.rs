@@ -577,9 +577,16 @@ fn agrees_refuses_every_way_of_getting_an_arm_wrong() {
 /// would need it to.**
 ///
 /// The case above proves the check with a DOCTORED row. This one proves it
-/// with the two real ones, because the invariant is what refuses
-/// `attn::qkv_decode_qk_norm_rope_write_kv_bf16` and a refusal resting on a
-/// synthetic fixture is a refusal resting on a fixture.
+/// with the two real ones, because a refusal resting on a synthetic fixture
+/// is a refusal resting on a fixture.
+///
+/// **The invariant no longer refuses anything.** It was what refused
+/// `attn::qkv_decode_qk_norm_rope_write_kv_bf16` a table row, and that symbol
+/// crossed into fn-world as `x::attn::QKV_DECODE_FUSED` — where the choice
+/// between the two geometries is two `if`s in a host `fn` and no
+/// `Specialisation` is involved. The invariant still holds of the two REAL
+/// unit rows this test reads, which is why the test is unchanged: it measures
+/// `Specialisation::agrees` over `unit::unit_of`, not over the table.
 ///
 /// `attn/qkv_fused.cu`'s decode launcher is four kernels behind one symbol at
 /// TWO geometries:

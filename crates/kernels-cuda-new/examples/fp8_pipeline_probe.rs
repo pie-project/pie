@@ -679,18 +679,19 @@ mod probe {
 
     /// The closure, end to end -- reported, deliberately not gated.
     ///
-    /// The table above holds four headers to bit-parity against the vendor.
+    /// The table above holds four headers to bit-parity against NVIDIA's.
     /// This asks the other question: does the tree that includes them
-    /// actually compile? It walks `csrc/shim`, `csrc/src` and `csrc/vendor`
-    /// off disk,
+    /// actually compile? It walks `csrc/shim` and `csrc/src` off disk
+    /// — the latter now including the internalised `attn/flashinfer/` and
+    /// `attn/xqa/` closures —
     /// hands NVRTC every file under both its path-relative and its bare name,
     /// and includes the fifteen closure roots.
     ///
-    /// Off disk, not `include_str!`, for a reason: the vendored tree is six
+    /// Off disk, not `include_str!`, for a reason: the upstream tree is six
     /// hundred files and moves under other hands. And the result is PRINTED,
     /// never counted as a FAIL, for the same reason -- it depends on
     /// `cuda_fp16.h`, `cuda_bf16.h`, `cooperative_groups.h`, `cuda/std/limits`
-    /// and every vendored `.cuh`, none of which this file owns. A red row here
+    /// and every upstream `.cuh`, none of which this file owns. A red row here
     /// would say "someone else's header moved", which is not what a parity
     /// probe is for. When it was last measured it compiled, with the two
     /// typedefs named below supplied by this function rather than by the
@@ -728,10 +729,15 @@ mod probe {
         // `cuda_fp16.h` at all and every closure root that reaches for one
         // would fail to resolve, which is a red row this function is
         // explicitly not supposed to produce.
+        // `csrc/vendor` was a fifth root and is gone: the FlashInfer and XQA
+        // closures are internalised under `csrc/src/attn/`, so the second
+        // root already walks them. Leaving the entry in would have taken the
+        // `!root.is_dir()` branch below and returned EARLY, printing "is not
+        // there" and compiling nothing -- a probe that reports success by
+        // reporting nothing at all.
         let roots = [
             crate_dir.join("csrc/shim"),
             crate_dir.join("csrc/src"),
-            crate_dir.join("csrc/vendor"),
             crate_dir.join("../kernels-cuda/csrc/src"),
         ];
         let mut owned: Vec<(String, String)> = Vec::new();

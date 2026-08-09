@@ -7,10 +7,10 @@
 //! *a header not in the set does not exist as far as a compile is concerned*.
 //! Three is a list. The set now holds every kernel header this crate
 //! compiles, the shims that replace NVIDIA's device headers, the two that
-//! close the CCCL door, and a vendored FlashInfer closure of twenty-eight
-//! files — and the moment a list of sixty entries has to be edited by hand to
-//! add a file, the rule stops being enforced by the build and starts being
-//! enforced by whoever remembers it.
+//! close the CCCL door, and an internalised FlashInfer and XQA closure of
+//! forty-four files — and the moment a list of sixty entries has to be edited
+//! by hand to add a file, the rule stops being enforced by the build and
+//! starts being enforced by whoever remembers it.
 //!
 //! The failure mode is specific and unpleasant: a `.cuh` added to `csrc/` and
 //! not added to the array is not a compile error anywhere. It is an NVRTC
@@ -29,28 +29,55 @@
 //!
 //! * `csrc/shim/cuda/std/limits` is carried as `cuda/std/limits`, which is what
 //!   FlashInfer's `#include <cuda/std/limits>` says.
-//! * `csrc/vendor/flashinfer/attention/decode.cuh` is carried as
-//!   `flashinfer/attention/decode.cuh`, which is what our own `.cu` files say.
+//! * `csrc/src/attn/flashinfer/attention/decode.cuh` is carried as
+//!   `attn/flashinfer/attention/decode.cuh`, which is what `attn/fa2.cuh`
+//!   says.
 //!
-//! Impersonating a vendor header's spelling is deliberate where the includer
+//! Impersonating another project's spelling is deliberate where the includer
 //! is source we do not own — `new-horizon.md` §13.4 is the rule — and the
 //! directory layout is how that decision is expressed rather than configured.
+//! It is why the internalised trees moved INTACT: upstream reaches its
+//! siblings by relative path (`"../cp_async.cuh"`, `"mask.cuh"`) and a
+//! subtree that keeps its shape keeps every one of those spellings resolving
+//! through the alias pass below, so not one upstream byte had to change.
 //!
 //! # Three groups, because a compile should not carry what it cannot need
 //!
-//! `SHIM` and `LIBRARY` go to every unit. `VENDOR` is 1.7 MB of somebody
+//! `SHIM` and `LIBRARY` go to every unit. `UPSTREAM` is 1.2 MB of somebody
 //! else's attention library, and `nvrtcCreateProgram` copies every byte it is
-//! handed, so a `norm` kernel does not get it. The split is by directory
-//! because that is a fact a walk can see; which units want `VENDOR` is stated
-//! by the units.
+//! handed, so a `norm` kernel does not get it. Which units want `UPSTREAM` is
+//! stated by the units.
 //!
-//! `SHIM` is the newest of the three and is a cut by ROLE rather than by
-//! provenance. The impersonating headers used to be split between the other
-//! two trees by who wrote them — `cuda_fp16.h` and `cooperative_groups.h`
-//! under `csrc/src`, `cstdint` and `cuda_runtime.h` under `csrc/vendor` —
-//! which recorded a fact about history and none about what a compile needs.
-//! They do the same job, so they sit together. Nothing about the SET changed:
-//! same files, same names, same bytes, one more walk.
+//! `SHIM` is a cut by ROLE rather than by provenance. The impersonating
+//! headers used to be split between the other two trees by who wrote them —
+//! `cuda_fp16.h` and `cooperative_groups.h` under `csrc/src`, `cstdint` and
+//! `cuda_runtime.h` under the vendored tree — which recorded a fact about
+//! history and none about what a compile needs. They do the same job, so
+//! they sit together.
+//!
+//! # The third group stopped being a third DIRECTORY
+//!
+//! It was `collect("csrc/vendor")` while there was a `csrc/vendor`. There is
+//! not: FlashInfer and XQA are internalised at `csrc/src/attn/flashinfer/`
+//! and `csrc/src/attn/xqa/`, so all three groups now walk one of two trees
+//! and the third is a FILTER over `csrc/src` rather than a directory of its
+//! own. [`UPSTREAM_TREES`] is the filter and it is two string prefixes.
+//!
+//! A directory was the better discriminator and it stopped being available,
+//! so it is worth saying what that costs. **The group is now a rule in this
+//! file instead of a fact about the filesystem**, and an upstream tree added
+//! under `csrc/src/attn/` without a prefix here lands in `LIBRARY` and is
+//! handed to every `norm` compile — which is loud in a profile and silent
+//! everywhere else. The `assert!` below covers the mirror-image mistake (a
+//! prefix that names nothing) and cannot cover this one.
+//!
+//! Both walks root at `csrc/src`, which is what makes the split safe: a
+//! carried name is relative to its TREE, so filtering one walk into two
+//! groups leaves every name exactly what it would have been.
+//! `attn/fa2.cuh` is `attn/fa2.cuh` in `LIBRARY` and
+//! `attn/flashinfer/attention/decode.cuh` is that in `UPSTREAM`, and a unit
+//! handed both arrays sees one flat namespace with no overlap. Measured after
+//! the move: zero spellings name two different files across the three groups.
 //!
 //! It also closes a door that was propped open. `csrc/src` holds device text
 //! an offline compile reaches with `-iquote`, and while eight headers wearing
@@ -108,11 +135,31 @@ use std::path::{Path, PathBuf};
 
 /// Files under `csrc/` that are documentation rather than source.
 ///
-/// A licence is carried in the tree because vendoring requires it, and it must
-/// not be carried in the BINARY as something an `#include` could resolve
-/// against — a header set whose entries include a licence is a set whose rule
-/// no longer means anything.
+/// A licence is carried in the tree because redistribution requires it — and
+/// after internalisation there are two, `attn/flashinfer/LICENSE` and
+/// `attn/xqa/LICENSE`, plus `attn/flashinfer/MODIFICATIONS`. It must not be
+/// carried in the BINARY as something an `#include` could resolve against: a
+/// header set whose entries include a licence is a set whose rule no longer
+/// means anything.
+///
+/// Matched by BASENAME, which is why the attribution files kept theirs
+/// through the move. `FLASHINFER-LICENSE` would have made the provenance
+/// louder in a directory listing and put 11 KB of Apache-2.0 into
+/// `includeNames[]`.
 const NOT_SOURCE: &[&str] = &["LICENSE", "NOTICE", "MODIFICATIONS", "README", "README.md"];
+
+/// The subtrees of `csrc/src` that are somebody else's, named by prefix.
+///
+/// This is the whole of the `LIBRARY`/`UPSTREAM` cut. It used to be
+/// `csrc/vendor` — a directory, which a walk could see — and internalising
+/// FlashInfer and XQA moved them under `csrc/src/attn/` where the walk cannot
+/// tell them from our own text. So the fact is stated here.
+///
+/// Prefixes and not directory names, and with the trailing slash spelled:
+/// `starts_with("attn/xqa")` would also claim a file called
+/// `attn/xqa_helpers.cuh`, which is the kind of near-miss that puts 1.2 MB
+/// into the wrong group without changing a count anyone reads.
+const UPSTREAM_TREES: &[&str] = &["attn/flashinfer/", "attn/xqa/"];
 
 /// Write `$OUT_DIR/carried.rs`.
 pub fn generate(out: &Path) {
@@ -125,13 +172,13 @@ pub fn generate(out: &Path) {
     // `csrc/shim` is the impersonation layer: headers wearing NVIDIA's and
     // the standard library's filenames, because the source that reaches for
     // them is source we do not own and `new-horizon.md` §13.4 says the
-    // spelling is the contract. They are a third walk rather than part of
+    // spelling is the contract. They are their own walk rather than part of
     // either of the others because that is what they ARE -- neither our
     // device text nor upstream's, but the answer to a name.
     //
     // They used to be split across the other two trees by where they came
     // from: `cuda_fp16.h` and `cooperative_groups.h` under `csrc/src` because
-    // PIE wrote them, `cstdint` and `cuda_runtime.h` under `csrc/vendor`
+    // PIE wrote them, `cstdint` and `cuda_runtime.h` under the vendored tree
     // because they arrived with the vendoring. Same job, two directories,
     // and the only thing the split recorded was provenance -- which is a fact
     // about history and not about what a compile needs.
@@ -139,13 +186,14 @@ pub fn generate(out: &Path) {
     // Their NAMES do not change, which is why this was the first move: a
     // header set is matched by literal include string, so a shim that moved
     // and kept its name is a shim NVRTC cannot tell moved at all.
-    let shim = collect(&root.join("csrc/shim"));
+    let shim = collect(&root.join("csrc/shim"), &|_| true);
     // `csrc/src` is the device text: every `__global__` template a unit
-    // compiles and the prelude they are written over. One tree, one walk --
-    // it was two until the kernels moved here from `../kernels-cuda/csrc/src`,
-    // and the second walk went with the reach.
-    let library = collect(&root.join("csrc/src"));
-    let vendor = collect(&root.join("csrc/vendor"));
+    // compiles and the prelude they are written over. ONE TREE, TWO WALKS,
+    // and the second is the whole of what used to be `csrc/vendor` -- see
+    // `UPSTREAM_TREES`. Both are rooted here, so a name is what it would have
+    // been either way.
+    let library = collect(&root.join("csrc/src"), &|name| !is_upstream(name));
+    let upstream = collect(&root.join("csrc/src"), &is_upstream);
 
     // An empty group is not a smaller set, it is a crate that carries no
     // device text at all — and it compiles. The failure surfaces as NVRTC
@@ -153,23 +201,27 @@ pub fn generate(out: &Path) {
     // GPU, which is the diagnostic this whole module exists to prevent, now
     // reading as if a header were missing rather than as if a directory were.
     //
-    // The walk produces one for exactly one reason: it was pointed at a tree
-    // that is not there. That was theoretical while the paths had been right
-    // for years; it stopped being theoretical when the `.cuh` files moved
-    // into `csrc/src` and one of the two walks changed what it names, and it
-    // is live again now that a third walk names a tree three days old.
+    // Two ways to produce one, and the second is new. A walk pointed at a
+    // tree that is not there returns no files rather than an error — that was
+    // theoretical while the paths had been right for years, and stopped being
+    // theoretical when the `.cuh` files moved into `csrc/src`. And now a
+    // FILTER that matches nothing does the same thing without any directory
+    // being wrong: rename `csrc/src/attn/xqa/` and `UPSTREAM` silently
+    // becomes the FlashInfer half, with the XQA half quietly reassigned to
+    // every `norm` compile. Hence the third row, and hence its message names
+    // the filter rather than a path.
     for (group, tree, files) in [
         ("SHIM", "csrc/shim", &shim),
-        ("LIBRARY", "csrc/src", &library),
-        ("VENDOR", "csrc/vendor", &vendor),
+        ("LIBRARY", "csrc/src, minus the upstream subtrees", &library),
+        ("UPSTREAM", "csrc/src, restricted to UPSTREAM_TREES", &upstream),
     ] {
         assert!(
             !files.is_empty(),
-            "{group} is empty: nothing was found under {}. A walk of a \
+            "{group} is empty: nothing was found under {} ({tree}). A walk of a \
              directory that does not exist returns no files rather than an \
-             error, so this is what that looks like — check whether `{tree}` \
-             still names the tree that holds the text.",
-            root.join(tree).display()
+             error, and so does a prefix in `UPSTREAM_TREES` that names no \
+             directory — so this is what either of those looks like.",
+            root.display()
         );
     }
 
@@ -184,22 +236,43 @@ pub fn generate(out: &Path) {
              // what NVRTC matches `includeNames[]` against. Editing this is\n\
              // pointless: add or remove a FILE and the next build follows.\n\
              //\n\
-             // {} shims, {} device headers and {} vendored, {} bytes of text,\n\
+             // {} shims, {} device headers and {} internalised, {} bytes of text,\n\
              // carried into the binary by the `include_str!`s below.\n\n",
             shim.len(),
             library.len(),
-            vendor.len(),
-            shim.iter().chain(&library).chain(&vendor).map(|(_, p)| file_len(p)).sum::<u64>()
+            upstream.len(),
+            shim.iter().chain(&library).chain(&upstream).map(|(_, p)| file_len(p)).sum::<u64>()
         ),
     );
     emit(&mut text, "SHIM", &shim, "csrc/shim");
-    emit(&mut text, "LIBRARY", &library, "csrc/src");
-    emit(&mut text, "VENDOR", &vendor, "csrc/vendor");
+    emit(&mut text, "LIBRARY", &library, "csrc/src, minus `UPSTREAM_TREES`");
+    emit(&mut text, "UPSTREAM", &upstream, "csrc/src's `UPSTREAM_TREES`");
 
     std::fs::write(out.join("carried.rs"), text).expect("write carried.rs");
 }
 
-/// Every source file under `tree`, as `(include name, absolute path)`, sorted.
+/// Whether a `csrc/src`-relative name is in one of [`UPSTREAM_TREES`].
+fn is_upstream(name: &str) -> bool {
+    UPSTREAM_TREES.iter().any(|tree| name.starts_with(tree))
+}
+
+/// Every source file under `tree` that `keep` accepts, as `(include name,
+/// absolute path)`, sorted.
+///
+/// # Why there is a filter
+///
+/// Two of the three groups walk `csrc/src` and differ only in which subtrees
+/// they take — see [`UPSTREAM_TREES`]. `keep` receives the TREE-RELATIVE
+/// name, which is the same string the entry will be carried under, so the two
+/// walks partition one directory into two groups without either group's names
+/// depending on which walk produced it.
+///
+/// The filter runs BEFORE the alias pass below, and that ordering is the
+/// whole reason this is one function with a predicate rather than one walk
+/// and a `partition`. Upstream's relative spellings (`"../cp_async.cuh"`)
+/// must resolve against upstream's own files and our `"attn/…"` spellings
+/// against ours; resolving each group inside itself is what keeps a stray
+/// near-miss from silently reaching across the seam.
 ///
 /// # Why a file appears more than once
 ///
@@ -212,9 +285,11 @@ pub fn generate(out: &Path) {
 /// That is not hypothetical and it is not rare. FlashInfer's
 /// `attention/decode.cuh` says `#include "../cp_async.cuh"`, and its
 /// `attention/prefill.cuh` says `#include "mask.cuh"`; carried under their
-/// paths alone, `flashinfer/cp_async.cuh` and `flashinfer/attention/mask.cuh`
-/// are present and unreachable, and the compile stops at decode's first
-/// relative directive. Thirty-two such spellings exist in the vendored tree.
+/// paths alone, `attn/flashinfer/cp_async.cuh` and
+/// `attn/flashinfer/attention/mask.cuh` are present and unreachable, and the
+/// compile stops at decode's first relative directive. Fifty-eight such
+/// spellings exist in the internalised tree, and they are also the reason it
+/// moved intact: a subtree that keeps its shape needs none of them rewritten.
 ///
 /// So the walk collects the paths and then reads the carried text to find
 /// **every spelling any directive uses**, resolving each against the
@@ -239,9 +314,10 @@ pub fn generate(out: &Path) {
 /// the filter has nothing left to exclude — and a filter that excludes
 /// nothing is a rule a reader has to check rather than one the directory
 /// states.
-fn collect(tree: &Path) -> Vec<(String, PathBuf)> {
+fn collect(tree: &Path, keep: &dyn Fn(&str) -> bool) -> Vec<(String, PathBuf)> {
     let mut found = Vec::new();
     walk(tree, tree, &mut found);
+    found.retain(|(name, _)| keep(name));
     found.sort();
 
     // The canonical name of each file, so a spelling can be resolved to one.

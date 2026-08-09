@@ -963,3 +963,41 @@ cudaError_t AttnHd<HEAD_DIM>::prefill_custom(
 //    :926 and :1143. The rule out of it: an `#include` from a translation
 //    unit that cannot be compiled is not a consumer. Line 75 is left as
 //    written -- it was true when taken, and moving it would trip item 1.
+//
+// 3. THIS FILE HAS LEFT `csrc/`. It is now `kernels-cuda-new/spec/`, and the
+//    move is a rule being applied rather than a tidy-up: `csrc/` may hold
+//    device text and nothing else, and this file's own measurement is
+//    `__global__` = 0, `__device__` = 0, twenty-one non-comment host-C++
+//    lines -- `<vector>`, `<string>`, `<algorithm>`, `<stdexcept>`,
+//    `std::vector` in `AttnHd`'s seven staging members, `cudaGetDevice`,
+//    `cudaGetDeviceProperties`, and the four `cudaMemcpy(..., DeviceToHost)`
+//    at :686-689 inside an `if constexpr (false)` debug block.
+//
+//    Appended at EOF, below 878, for item 1's reason. Nothing above moved:
+//    `git mv` changed the path and not one byte of the text, so all
+//    twenty-four line citations still land where they landed.
+//
+//    Two things were checked before the move and both contradict the brief
+//    that ordered it:
+//
+//    * **It has no `#include` consumers.** The claim that `fa2.cuh`,
+//      `attention_flashinfer.cuh` and `attention_score_post.cuh` include it
+//      is false -- all three name it only in prose. `grep -rnE
+//      '^[[:space:]]*#[[:space:]]*include.*attention_flashinfer_common'`
+//      over `crates/` returns nothing, which is what item 2 above and
+//      `source.rs`'s exemption already recorded. NVRTC was never handed this
+//      text.
+//    * **Its host logic is already Rust, twice over.** `AttnHd`'s plan
+//      caches are `driver-cuda/src/fire/flashinfer_fa2.rs`'s
+//      `DecodePlanCache` (:324) and `PrefillPlanCache` (:454); the
+//      `DecodePlan`/`PrefillPlan` calls under them are
+//      `kernels-cuda-new/src/plan/{decode,prefill}.rs`. The `cudaMemcpy`
+//      trio the brief wanted moved into `driver-cuda` is four calls, not
+//      three, and is dead debug scaffolding behind `if constexpr (false)` --
+//      there is nothing there to port.
+//
+//    So it is retired as a HEADER and kept as a SPECIFICATION, which is what
+//    it has been since the last `attention_flashinfer_hd<N>.cu` was deleted.
+//    Deleting it would have invalidated twenty-four live citations and the
+//    seven pins in `tests/launch_rules.rs` that guard them, to remove a file
+//    no compiler reads. `spec/README.md` states the contract.

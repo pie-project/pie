@@ -110,8 +110,35 @@ mod native {
     /// invariant they answered to and not whether they needed an entry
     /// point. **They no longer need one.** §5 step 5 made them `fn`s in
     /// `x::driver_internal` with no `contract!`, so nothing generates a
-    /// `pie_k_*` for them and nothing calls one — the six callers are direct
-    /// Rust calls. There is no second table left to append.
+    /// `pie_k_*` for them and nothing calls one. There is no second table
+    /// left to append.
+    ///
+    /// # This paragraph used to end *"— the six callers are direct Rust
+    /// calls"*, and there are none
+    ///
+    /// Measured over every `.rs` under `crates/` — `src/`, `tests/`,
+    /// `examples/`, `benches/` and `build.rs` — with comments stripped and
+    /// string literals preserved, the token `driver_internal` occurs three
+    /// times: `x/mod.rs`'s `pub mod driver_internal;`, and one mention each
+    /// in `driver-cuda/tests/launch_abi.rs` (`bridge_smoke.rs` was the
+    /// second and is deleted with `bind::abi::ffi`). **Not one
+    /// `src/` outside the declaration.** The six `pub unsafe fn`s have no
+    /// caller of any kind, direct or generated.
+    ///
+    /// `x/driver_internal.rs`'s own header states the same absent set from
+    /// the other end — *"Launchers the DRIVER reaches for directly"* — and
+    /// `driver-cuda` reaches none of them; where it wants that shape it has
+    /// written its own, e.g. `fire/split_packed.rs::split_qkv_bf16_devwin`
+    /// beside `x::driver_internal::split_qkv_bf16`. Two files one crate
+    /// apart agreeing about a caller set that is empty is why the sentence
+    /// survived: each read as corroboration of the other.
+    ///
+    /// **Nothing is deleted on this measurement.** It is stated here and
+    /// not acted on because the module is `x/**` and not this crate's, and
+    /// because "no caller today" is the premise of a decision, not the
+    /// decision — the same restraint `x/attn.rs` applies to
+    /// `write_kv_at_positions`, carried with no caller precisely so that a
+    /// transcription does not silently drop a kernel.
     fn tables() -> Vec<&'static [kernels::KernelSig]> {
         kernels_cuda_new::table::TABLES.to_vec()
     }
@@ -163,8 +190,23 @@ mod native {
         // `execution::RUST_SERVED` so the shim asks for nothing. The name
         // stays in this list for the reason the doc above gives: the
         // `read_dir` below already returns nothing for a missing directory,
-        // and an explicit list says what it LOOKED at. Six of the twelve are
-        // in that state now.
+        // and an explicit list says what it LOOKED at.
+        //
+        // HOW MANY ARE IN THAT STATE — measured, because the sentence here
+        // used to say "Six of the twelve" and that number was written once
+        // and never re-run:
+        //
+        //   present, contributing .hpp   attn (5), rope (1), vision (5)
+        //   present, contributing none   layout (0 headers, empty dir)
+        //   MISSING                      norm, mlp, gemm, moe, ssm, quant,
+        //                                sample, comm
+        //
+        // **Eight of the twelve are gone and nine contribute nothing**, so
+        // this list looks at twelve names to find eleven headers under
+        // three of them. The count is stated as a derivation rather than a
+        // number so that the next reader can re-run it: it is `ls
+        // csrc/src/<name>/*.hpp` for each name in the array below, and
+        // nothing else.
         for dir in [
             "attn", "rope", "norm", "mlp", "gemm", "moe", "ssm", "quant", "layout", "sample",
             "vision", "comm",

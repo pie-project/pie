@@ -53,9 +53,12 @@ pub trait KvCacheDeviceOps {
     fn stream_synchronize(&mut self);
 }
 
-/// The live [`KvCacheDeviceOps`] (retirement plan phase B), behind `bridge`
-/// because [`Self::envelope_seed`] is a LAUNCH — the first driver-internal
-/// row the second table exists for.
+/// The live [`KvCacheDeviceOps`] (retirement plan phase B), behind `_cuda`
+/// because [`Self::envelope_seed`] is a LAUNCH. It was `bridge` when that
+/// launch was a generated shim entry off the second table's first
+/// driver-internal row; the row is gone, the `.cu` is gone, and the launch
+/// is `kernels_cuda_new::x::layout::envelope_seed_empty`. The gate outlived
+/// its reason by exactly that much (BRIDGE_RETIREMENT.md §2.2's specimen).
 ///
 /// `escape_arena`/`restore_arena` are no-ops here, and that is a statement
 /// about THIS impl rather than a shortcut: the C++ escapes because a global
@@ -79,7 +82,7 @@ pub trait KvCacheDeviceOps {
 /// Which is why this is no longer `Copy`: a copy would have been a second
 /// owner of the same tiers, and dropping either would have freed them
 /// under the other.
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 #[derive(Debug)]
 pub struct LiveKvCacheOps<'a> {
     stream: crate::device::StreamRef<'a>,
@@ -87,7 +90,7 @@ pub struct LiveKvCacheOps<'a> {
     held: Vec<crate::device::DeviceBuffer>,
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl<'a> LiveKvCacheOps<'a> {
     /// Ops ordered on `stream`, allocating from `alloc`.
     ///
@@ -134,7 +137,7 @@ impl<'a> LiveKvCacheOps<'a> {
     }
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl KvCacheDeviceOps for LiveKvCacheOps<'_> {
     fn alloc_tensor(&mut self, dtype: DType, shape: &[i64]) -> *mut c_void {
         let elems: i64 = shape.iter().product();

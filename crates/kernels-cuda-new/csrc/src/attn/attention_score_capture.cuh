@@ -26,7 +26,7 @@
 #include <cstdint>
 #include <cstddef>
 
-#include <flashinfer/attention/variants.cuh>
+#include "attn/flashinfer/attention/variants.cuh"
 
 namespace pie_cuda_driver::kernels::attn::fa2 {
 

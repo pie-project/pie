@@ -169,18 +169,18 @@ pub trait LoraOps {
     fn upload_slab(&mut self, dst: *mut c_void, slots: &[*const c_void]);
 }
 
-/// The live [`LoraOps`] (retirement plan phase B), behind `bridge` for the
+/// The live [`LoraOps`] (retirement plan phase B), behind `_cuda` for the
 /// cast launch. The slab upload is `cudaMemcpyAsync` of the host pointer
 /// array — device-resident because `cublasGemmGroupedBatchedEx` does not
 /// consume its pointer arrays synchronously, which is the trait doc's own
 /// sentence and the reason this is an upload rather than an argument.
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 #[derive(Debug, Clone, Copy)]
 pub struct LiveLoraOps {
     stream: *mut c_void,
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl LiveLoraOps {
     /// Ops ordered on the fire's stream.
     #[must_use]
@@ -195,7 +195,7 @@ impl LiveLoraOps {
 /// `LiveLoraOps` implements BOTH traits because the staging needs both
 /// — memory to lay the slab in and kernels to cast with — and splitting
 /// them would mean two handles onto one stream.
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl crate::fire::sideband_arena::DeviceMemory for LiveLoraOps {
     fn alloc(&mut self, bytes: usize) -> Option<*mut c_void> {
         use cudarc::runtime::sys::{cudaError, cudaMalloc};
@@ -214,7 +214,7 @@ impl crate::fire::sideband_arena::DeviceMemory for LiveLoraOps {
     }
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl LoraOps for LiveLoraOps {
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn cast_fp32_to_bf16(&mut self, src: *const c_void, dst: *mut c_void, elems: usize) {
@@ -727,7 +727,7 @@ impl LoraFireState {
     /// composes as s ⊙ (y + B(Ax)), DoRA's order; a lone scale lane is
     /// IA3 unchanged. The LAYER is the op tag's (never `param1` — the
     /// bug the C++'s first live A/B caught).
-    #[cfg(feature = "bridge")]
+    #[cfg(feature = "_cuda")]
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn apply(
         &self,

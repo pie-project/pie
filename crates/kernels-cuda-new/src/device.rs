@@ -1088,7 +1088,22 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // The other 30 are proven by the build, which is what the four compulsory
     // compiles check: `routed_rows_have_an_arm` for the arm, the `bridge`
     // link for the shim edge, and `cargo check` toolkit-free.
-    "attn::attention_naive_paged",
+    // `attn::attention_naive_paged` STOOD HERE, the last line of BATCH 7 and
+    // the last `attn` row on this list. It is
+    // `x::attn::ATTENTION_NAIVE_PAGED` now -- unit, host `fn`, contract and
+    // bind -- and the line goes for BATCH 5's reason: a contract states no
+    // `operands`, so `emit_c_shim` emits no entry and there is nothing for a
+    // routing list to keep it out of.
+    //
+    // It is worth one more sentence than the others, because this entry was
+    // the row's last live consumer. `table::attn`'s row was FULLY SOURCED, so
+    // `emit_rust_dispatch` would have emitted a shim call; being named here
+    // is what made it a JIT arm instead, resolving `families::attn`'s device
+    // sig rather than the table row's operand list. The two lists disagreed
+    // about the argument count -- twenty-three against fourteen -- and the
+    // disagreement was legitimate, because a device row states the
+    // `__global__`'s parameters and a table row states the trace's. In
+    // fn-world there is one list.
     // `attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16` stood here, the
     // first line of the block above. It is `x::attn::QKV_PACKED_POST` now —
     // contract, bind and a host `fn` — and its line goes for BATCH 5's
@@ -1096,9 +1111,10 @@ pub static JIT_DISPATCHED: &[&str] = &[
     // entry and there is nothing for a routing list to keep it out of.
     //
     // Its DECODE sibling was never on this list and still is not:
-    // `attn::qkv_decode_qk_norm_rope_write_kv_bf16` is served by
-    // `bind::service` out of `driver-cuda/src/fire/qkv_fused.rs`, so the row
-    // stays in `table::attn` and the shim never had an entry to drop.
+    // `attn::qkv_decode_qk_norm_rope_write_kv_bf16` was served by
+    // `bind::service` over `x::attn::qkv_fused`'s host program, so the shim
+    // never had an entry to drop. It is `x::attn::QKV_DECODE_FUSED` now —
+    // contract, bind, and the last row `table::attn` held.
     // `mlp::chunked_swiglu_bf16` stood here — the one row of `mlp`'s twelve
     // that was NOT in BATCH 2, because `mlp/swiglu.cu` still called it. It
     // went into fn-world with the other eleven and is

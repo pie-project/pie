@@ -26,10 +26,13 @@
 //!
 //! Three things, and the report names each so a refusal can be attributed:
 //!
-//! * **The vendored closure** — `csrc/vendor/flashinfer/`, 28 files copied
-//!   byte-for-byte from FlashInfer v0.6.15 and modified only by `#ifndef
-//!   __CUDACC_RTC__` guards, each marked `// PIE:` (see `NOTICE` and
-//!   `csrc/vendor/MODIFICATIONS`).
+//! * **The internalised closure** — `csrc/src/attn/flashinfer/`, 28 files
+//!   copied byte-for-byte from FlashInfer v0.6.15 and modified only by
+//!   `#ifndef __CUDACC_RTC__` guards, each marked `// PIE:` (see `NOTICE` and
+//!   `csrc/src/attn/flashinfer/MODIFICATIONS`). It lived at `csrc/vendor/`
+//!   until `csrc/` was narrowed to device text only; the subtree moved
+//!   intact, so not one upstream byte changed and the manifest's four numeric
+//!   columns are the same numbers they were.
 //! * **Six carried headers of our own** — `cstdint`, `type_traits`, `cuda.h`,
 //!   `cuda_runtime.h`, `bit`, `boost/math/ccmath/fabs.hpp`. Each exists because
 //!   guarding its include was measured and REFUSED: the names in it reach
@@ -41,7 +44,7 @@
 //!
 //! The first two used to be a sixty-entry `include_str!` array in this file,
 //! and its own comment called that a debt. `build.rs` now walks `csrc/` and
-//! generates the set, so the probe reads [`source::VENDOR`],
+//! generates the set, so the probe reads [`source::UPSTREAM`],
 //! [`source::DEVICE_HEADERS`] and [`source::ALL_HEADERS`] — **the same objects the
 //! library hands NVRTC.** That is not tidiness: a probe whose header set is
 //! narrower than the library's measures a configuration nothing runs, which is
@@ -51,15 +54,15 @@
 //! The set carries every SPELLING, not every file, and that distinction was a
 //! finding of the run before this one. NVRTC matches an `#include` literally —
 //! FlashInfer reaches its own files as `../cp_async.cuh` and `mask.cuh` while
-//! our sources reach them as `flashinfer/cp_async.cuh` — so a set that named
-//! each file once carried `flashinfer/cp_async.cuh` present and unreachable,
-//! and stopped at decode's first relative directive. This example derived the
+//! our sources reach them as `attn/flashinfer/cp_async.cuh` — so a set that
+//! named each file once carried `attn/flashinfer/cp_async.cuh` present and
+//! unreachable, and stopped at decode's first relative directive. This example derived the
 //! missing spellings itself for one run; `build.rs` now reads each carried file
 //! and registers it under every spelling that resolves to it, and refuses to
-//! build when one spelling would reach two files. 34 vendored files, 66
+//! build when one spelling would reach two files. 34 upstream files, 66
 //! entries. The probe takes the set as given, which is the point of a probe.
 //!
-//! [`source::VENDOR`]: kernels_cuda_new::source::VENDOR
+//! [`source::UPSTREAM`]: kernels_cuda_new::source::UPSTREAM
 //! [`source::DEVICE_HEADERS`]: kernels_cuda_new::source::DEVICE_HEADERS
 //! [`source::ALL_HEADERS`]: kernels_cuda_new::source::ALL_HEADERS
 //!
@@ -68,7 +71,7 @@
 //! **The crutch** runs first, and it is the one that answers §13.6: NVIDIA's
 //! real `cuda_fp16.h`/`cuda_bf16.h`/`cuda_fp8.h`/`cuda_fp4.h` out of
 //! `$CUDA_HOME`, and real CCCL for `cuda/*`. If FlashInfer refuses to compile
-//! against the vendor's own headers, the source is the problem; if it compiles,
+//! against NVIDIA's own headers, the source is the problem; if it compiles,
 //! the source is acceptable and everything after is about the shims. Mixing the
 //! two questions would produce one result that answers neither.
 //!
@@ -130,13 +133,13 @@ mod probe {
     use cudarc::nvrtc::sys as nv;
     use kernels_cuda_new::source::{self, Header};
 
-    /// The vendored closure, and PIE's headers beside it, as the LIBRARY carries
-    /// them.
+    /// The internalised closure, and PIE's headers beside it, as the LIBRARY
+    /// carries them.
     ///
     /// This was sixty `include_str!` entries written out by hand, and its own
     /// comment called that a debt. `build.rs` now walks `csrc/` and emits
-    /// [`source::VENDOR`] — one entry per file under `csrc/vendor`, named by the
-    /// path an `#include` would spell — so the twenty-eight FlashInfer files and
+    /// [`source::UPSTREAM`] — one entry per file under `csrc/src/attn/flashinfer`
+    /// and `csrc/src/attn/xqa`, named by the path an `#include` would spell — so the twenty-eight FlashInfer files and
     /// the six headers PIE carries beside them are in this binary because they
     /// are on disk, not because a list in an example remembered them.
     ///
@@ -146,13 +149,37 @@ mod probe {
     /// precisely that when a sibling header became a forwarder and a hand-written
     /// list went on carrying the file it used to be.
     ///
-    /// The split here is by prefix because the directory is: `flashinfer/…` is
-    /// somebody else's tree — the closure this probe reports on. Since the
-    /// role cut there is nothing else under `csrc/vendor`, so this is now the
-    /// whole of it plus the second spellings its own relative directives
-    /// register.
+    /// The split here is by prefix because the NAME is: `attn/flashinfer/…` is
+    /// somebody else's tree — the closure this probe reports on — and
+    /// `attn/xqa/…` is somebody else's OTHER tree, which this probe does not
+    /// report on and which the filter therefore excludes.
+    ///
+    /// The prefix was already written and already correct, so this is a note
+    /// and not a bug — but the note is worth having, because the numbers say
+    /// something about the alias pass that is easy to get wrong.
+    /// **Measured: `source::UPSTREAM` is 87 entries; 28 begin
+    /// `attn/flashinfer/`, 15 begin `attn/xqa/`, and the other 44 begin with
+    /// NEITHER.** Those 44 are the second spellings — `mask.cuh`,
+    /// `../cp_async.cuh`, `defines.h` — and an alias is registered under the
+    /// literal directive text, which has no tree prefix in it. So `closure()`
+    /// yields the 28 FILES and none of their aliases, which is what its
+    /// callers want (`audit` checks files against the manifest, and
+    /// `compile_closure` compiles each file once) and is exactly what it
+    /// yielded before the move, when the same filter said `flashinfer/`.
+    ///
+    /// # The name collision the alias pass could have had, and did not
+    ///
+    /// Both trees carry a `utils.cuh` and an `mma.cuh`. A bare `"utils.cuh"`
+    /// from either tree's root would resolve `beside` the includer and
+    /// register one spelling against two different files, which `collect`
+    /// asserts against — the build would stop. It does not, because XQA
+    /// already spells those five directives `"attn/xqa/utils.cuh"` and
+    /// `"attn/xqa/mma.cuh"`, the five `// PIE:` markers the manifest records
+    /// for exactly this reason. **Checked across every quoted include under
+    /// `attn/xqa/`: fourteen distinct spellings, five prefixed, and not one
+    /// of the other nine names a file FlashInfer also has.**
     fn closure() -> impl Iterator<Item = &'static Header> {
-        source::VENDOR.iter().filter(|h| h.name.starts_with("flashinfer/"))
+        source::UPSTREAM.iter().filter(|h| h.name.starts_with("attn/flashinfer/"))
     }
 
     /// The impersonating headers the closure resolves its non-FlashInfer
@@ -170,9 +197,9 @@ mod probe {
     /// unsets `CUDA_VERSION` and the fp4 vector types disappear with no
     /// diagnostic at all. A host header whose names reach device code is
     /// CARRIED, under the exact spelling the directive uses. That rule is the
-    /// difference between 33 guards and roughly seventy.
+    /// difference between 35 guards and roughly seventy.
     ///
-    /// They used to sit at the root of `csrc/vendor`, and this function used
+    /// They used to sit at the root of the vendor tree, and this function used
     /// to find them by *not* being FlashInfer's — a definition by exclusion,
     /// which is what a provenance-shaped tree forces. Since `csrc/` was cut by
     /// ROLE they are in `csrc/shim/` beside the eight PIE wrote for its own
@@ -180,17 +207,18 @@ mod probe {
     /// impersonation layer, so this is a filter for the ones this closure
     /// actually reaches rather than a subtraction.
     ///
-    /// `csrc/vendor` therefore now partitions cleanly into the closure and its
-    /// second spellings, with nothing of ours left in it.
+    /// [`source::UPSTREAM`] therefore holds nothing of ours: two upstream
+    /// closures and the second spellings their own relative directives
+    /// register, and no third thing.
     fn carried() -> impl Iterator<Item = &'static Header> {
         // The six that arrived because FlashInfer asked, as opposed to the
         // eight in `SHIMMABLE` that PIE's own text asks for. Both sets are in
         // `csrc/shim/` now; the split here is about who needs them, which is
         // what this probe reports on.
-        const VENDOR_SHIMS: &[&str] =
+        const UPSTREAM_SHIMS: &[&str] =
             &["bit", "boost/math/ccmath/fabs.hpp", "cstdint", "cuda.h", "cuda_runtime.h",
               "type_traits"];
-        source::SHIM.iter().filter(|h| VENDOR_SHIMS.contains(&h.name))
+        source::SHIM.iter().filter(|h| UPSTREAM_SHIMS.contains(&h.name))
     }
 
     /// One of `csrc/shim`'s headers, by the name an `#include` spells.
@@ -288,9 +316,9 @@ mod probe {
         library: Vec<String>,
     }
 
-    /// `csrc/vendor/MODIFICATIONS`, carried so that it can be checked against the
+    /// `csrc/src/attn/flashinfer/MODIFICATIONS`, carried so it can be checked against the
     /// text it describes rather than believed.
-    const MODIFICATIONS: &str = include_str!("../csrc/vendor/MODIFICATIONS");
+    const MODIFICATIONS: &str = include_str!("../csrc/src/attn/flashinfer/MODIFICATIONS");
 
     /// Everything above, in the order the report prints it.
     pub fn run() {
@@ -301,23 +329,25 @@ mod probe {
         println!("NVRTC version:  {}", version());
         println!("architecture:   {arch}");
         println!(
-            "vendored:       {} closure files, {} lines, {} bytes",
+            "internalised:   {} closure files, {} lines, {} bytes",
             closure().count(),
             lines(),
             bytes()
         );
         // Entries against FILES, because they stopped being the same number when
-        // the generator learned that NVRTC matches an include literally: 34 files
-        // under 66 names, the extra 32 being the relative spellings FlashInfer
-        // reaches its own tree by. A probe that printed only one of these two
-        // numbers would be hiding the mechanism that makes the tree compile.
-        let files: HashSet<&str> = source::VENDOR.iter().map(|h| h.text).collect();
+        // the generator learned that NVRTC matches an include literally. The
+        // group now spans both internalised trees: 43 files (28 FlashInfer, 15
+        // XQA) under 87 names, the extra 44 being the relative spellings each
+        // tree reaches its own siblings by. A probe that printed only one of
+        // these two numbers would be hiding the mechanism that makes the tree
+        // compile.
+        let files: HashSet<&str> = source::UPSTREAM.iter().map(|h| h.text).collect();
         println!(
-            "VENDOR:         {} entries, {} files -- {} closure, {} second spellings",
-            source::VENDOR.len(),
+            "UPSTREAM:       {} entries, {} files -- {} closure, {} second spellings",
+            source::UPSTREAM.len(),
             files.len(),
             closure().count(),
-            source::VENDOR.len() - files.len()
+            source::UPSTREAM.len() - files.len()
         );
         println!(
             "SHIM:           {} headers, {} of them here because FlashInfer asks",
@@ -445,7 +475,7 @@ mod probe {
         }
     }
 
-    /// Check `csrc/vendor/MODIFICATIONS` against the text this binary carries.
+    /// Check `csrc/src/attn/flashinfer/MODIFICATIONS` against the text this binary carries.
     ///
     /// A hand-written inventory of somebody else's tree is a lie waiting for the
     /// next guard to be added, so it is not trusted here: the file is carried
@@ -464,7 +494,7 @@ mod probe {
         let mut wrong = Vec::new();
 
         for file in closure() {
-            let name = file.name.trim_start_matches("flashinfer/");
+            let name = file.name.trim_start_matches("attn/flashinfer/");
             let counted = file.text.matches("\n#ifndef __CUDACC_RTC__").count();
             let lines = file.text.lines().count();
             guards += counted;
@@ -492,7 +522,7 @@ mod probe {
         // generator refuses to emit one spelling for two files, which covers a
         // collision WITHIN a tree; this is the other half -- three trees walked
         // separately and joined by a const fn, where nothing upstream can see
-        // that `csrc/shim/cuda_fp16.h` and a `csrc/vendor/cuda_fp16.h` would be
+        // that `csrc/shim/cuda_fp16.h` and a second `cuda_fp16.h` would be
         // two entries with one name.
         let mut names = HashSet::new();
         let doubled: Vec<&str> =
@@ -536,17 +566,17 @@ mod probe {
         // reached. Reading top to bottom, the first REFUSED is the one that
         // matters; the rest are usually the same refusal seen through an include.
         const ORDER: &[&str] = &[
-            "flashinfer/page.cuh",
-            "flashinfer/pos_enc.cuh",
-            "flashinfer/layout.cuh",
-            "flashinfer/utils.cuh",
-            "flashinfer/attention/state.cuh",
-            "flashinfer/attention/variants.cuh",
-            "flashinfer/attention/mask.cuh",
-            "flashinfer/fastdiv.cuh",
-            "flashinfer/attention/decode.cuh",
-            "flashinfer/attention/prefill.cuh",
-            "flashinfer/attention/mla.cuh",
+            "attn/flashinfer/page.cuh",
+            "attn/flashinfer/pos_enc.cuh",
+            "attn/flashinfer/layout.cuh",
+            "attn/flashinfer/utils.cuh",
+            "attn/flashinfer/attention/state.cuh",
+            "attn/flashinfer/attention/variants.cuh",
+            "attn/flashinfer/attention/mask.cuh",
+            "attn/flashinfer/fastdiv.cuh",
+            "attn/flashinfer/attention/decode.cuh",
+            "attn/flashinfer/attention/prefill.cuh",
+            "attn/flashinfer/attention/mla.cuh",
         ];
 
         let mut names: Vec<&str> = ORDER.to_vec();
@@ -554,8 +584,8 @@ mod probe {
 
         let mut ok = 0;
         for name in &names {
-            let source = format!("#include <{name}>\n__global__ void probe() {{}}\n");
-            let marker = if *name == "flashinfer/attention/decode.cuh" { " <-- the target" } else { "" };
+            let source = format!("#include \"{name}\"\n__global__ void probe() {{}}\n");
+            let marker = if *name == "attn/flashinfer/attention/decode.cuh" { " <-- the target" } else { "" };
             match compile(&source, config, arch, None) {
                 Ok(built) => {
                     ok += 1;
@@ -597,9 +627,9 @@ mod probe {
             "flashinfer::BatchDecodeParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int32_t>>"
         );
         const SOURCE: &str = concat!(
-            "#include <flashinfer/attention/decode.cuh>\n",
-            "#include <flashinfer/attention/default_decode_params.cuh>\n",
-            "#include <flashinfer/attention/variants.cuh>\n"
+            "#include \"attn/flashinfer/attention/decode.cuh\"\n",
+            "#include \"attn/flashinfer/attention/default_decode_params.cuh\"\n",
+            "#include \"attn/flashinfer/attention/variants.cuh\"\n"
         );
 
         println!("\n  BatchDecodeWithPagedKVCacheKernel<kNone, 2, 1, 8, 16, 4, 2,");
@@ -637,7 +667,7 @@ mod probe {
     /// configuration exists — nothing about it is shippable, since it reads a
     /// toolkit off the build machine at run time.
     ///
-    /// [`source::VENDOR`] and not [`source::ALL_HEADERS`], deliberately: the
+    /// [`source::UPSTREAM`] and not [`source::ALL_HEADERS`], deliberately: the
     /// crutch must not see `csrc/shim`, or it would be measuring the shims it
     /// exists to be independent of. The single exception is
     /// `cooperative_groups.h`, which is the shim in BOTH columns — NVIDIA's is a
@@ -648,7 +678,7 @@ mod probe {
     /// [`source::ALL_HEADERS`]: kernels_cuda_new::source::ALL_HEADERS
     fn crutch_config(cuda: &Path) -> Config {
         let mut entries: Vec<Entry> =
-            source::VENDOR.iter().map(|h| entry(h.name, Cow::Borrowed(h.text))).collect();
+            source::UPSTREAM.iter().map(|h| entry(h.name, Cow::Borrowed(h.text))).collect();
         let cg = shim(COOPERATIVE_GROUPS).expect("`csrc/shim` carries the CG shim");
         entries.push(entry(cg.name, Cow::Borrowed(cg.text)));
 
@@ -688,7 +718,7 @@ mod probe {
     /// The configuration that will ship: the crate's own header set, exactly as
     /// the library assembles it.
     ///
-    /// [`source::ALL_HEADERS`] verbatim — prelude, shims, vendor — because that is
+    /// [`source::ALL_HEADERS`] verbatim — prelude, shims, upstream — because that is
     /// what a FlashInfer [`Unit`] would resolve its includes against, and a probe
     /// that assembled its own approximation of it would answer a question about
     /// the approximation. This example carried a hand-written sixty-entry list

@@ -1,5 +1,10 @@
-//! Would three FlashInfer kernels vendor into `csrc/vendor/flashinfer/`, and
+//! Would three FlashInfer kernels land in `csrc/src/attn/flashinfer/`, and
 //! does NVRTC 13.0 compile them for `sm_89`?
+//!
+//! The directory in that sentence was `csrc/vendor/flashinfer/` when this
+//! probe was written. `csrc/` was narrowed to device text afterwards and the
+//! closure was internalised; the subtree moved intact, so every measurement
+//! below is unaffected and only the path changed.
 //!
 //! # The question
 //!
@@ -14,8 +19,9 @@
 //!
 //! That classification bundles two different claims — *"the kernel is a
 //! library's"* and *"the text is not here"* — and for the first row the second
-//! half is **false on its face**: `csrc/vendor/flashinfer/attention/cascade.cuh`
-//! is already in this crate's own vendored tree, 791 lines, seven
+//! half is **false on its face**:
+//! `csrc/src/attn/flashinfer/attention/cascade.cuh`
+//! is already in this crate's own tree, 791 lines, seven
 //! `__global__`s, and `MODIFICATIONS` records it as one of the fourteen files
 //! carried with **zero** guards. So this probe does not read; it compiles.
 //!
@@ -24,7 +30,7 @@
 //! `new-horizon.md` §14 sets the bar a vendoring has to meet, and it is not
 //! *"it compiles"*:
 //!
-//! * **strippable back to upstream byte for byte** — 33 guards over 206 added
+//! * **strippable back to upstream byte for byte** — 35 guards over 226 added
 //!   lines across 28 files today, every one marked `// PIE:`;
 //! * every `#include` answered by the carried header set or by a shim, **never
 //!   by the toolkit**;
@@ -94,7 +100,45 @@ mod imp {
 
     use cudarc::driver::sys as dr;
     use cudarc::nvrtc::sys as nv;
-    use kernels_cuda_new::source::{self, ALL_HEADERS, LIBRARY, SHIM, VENDOR};
+    use kernels_cuda_new::source::{self, ALL_HEADERS, LIBRARY, SHIM, UPSTREAM};
+
+    /// The one already-internalised candidate, under the name the carried set
+    /// gives it.
+    ///
+    /// A `const` because the string appeared four times and internalisation
+    /// changed it — it was `flashinfer/attention/cascade.cuh` while the walk
+    /// rooted at `csrc/vendor`, and is `attn/flashinfer/attention/cascade.cuh`
+    /// now that it roots at `csrc/src`. Four literals is four chances to
+    /// update three of them, and a `find` that misses answers `0 lines, 0
+    /// bytes` rather than failing.
+    const CASCADE: &str = "attn/flashinfer/attention/cascade.cuh";
+
+    /// An upstream-relative FlashInfer path, under the name the carried set
+    /// gives it.
+    ///
+    /// [`closure`] returns UPSTREAM-relative paths (`flashinfer/utils.cuh`),
+    /// because it walks a CPM checkout of FlashInfer v0.6.15 and that is what
+    /// the directives inside it spell. The carried set names the same file
+    /// `attn/flashinfer/utils.cuh`, because internalisation put the closure
+    /// under `csrc/src/attn/` and `carried.rs` names an entry by its path
+    /// relative to `csrc/src`.
+    ///
+    /// The two spellings were IDENTICAL until that move, so three comparisons
+    /// in this file were written as `h.name == f` and were right. They are
+    /// silently wrong without this: `staged.retain` would stop recognising
+    /// already-carried files and hand NVRTC a pristine upstream copy beside
+    /// the patched one, which is the duplicate-name abort its own comment
+    /// records hitting on the first run — and the "already vendored / would
+    /// MOVE" split would report every file as new.
+    ///
+    /// Non-FlashInfer names pass through, so this is safe on a system header.
+    fn carried_name(upstream_rel: &str) -> String {
+        if upstream_rel.starts_with("flashinfer/") {
+            format!("attn/{upstream_rel}")
+        } else {
+            upstream_rel.to_string()
+        }
+    }
 
     // -----------------------------------------------------------------------
     // the candidates
@@ -157,7 +201,7 @@ mod imp {
         /// separately from `guards` — see [`ShimPatch`].
         patches: &'static [ShimPatch],
         /// Headers PIE does not have and would have to WRITE, each one a new
-        /// entry in `DEVICE_HEADERS` and a new file in `csrc/vendor/`.
+        /// entry in `DEVICE_HEADERS` and a new file in `csrc/src/attn/`.
         ///
         /// This is the field that turns "vendors with N shims" from an
         /// estimate into a count: N is `shims.len()`, and the lines are the
@@ -200,7 +244,7 @@ mod imp {
         launcher: "kernels-cuda/csrc/src/attn/attention_merge_states.cu:37",
         roots: &[],
         source: r#"
-#include <flashinfer/attention/cascade.cuh>
+#include "attn/flashinfer/attention/cascade.cuh"
 namespace fi = ::flashinfer;
 "#,
         wanted: || {
@@ -236,7 +280,7 @@ namespace fi = ::flashinfer;
     const MAMBA: Candidate = Candidate {
         row: "ssm::flashinfer_mamba_ssu_bf16",
         launcher: "deleted by new-horizon.md §43 -- nothing reached it; \
-                   this probe and csrc/vendor are what make it cheap to re-add",
+                   this probe and the internalised closure are what make it cheap to re-add",
         roots: &["flashinfer/mamba/selective_state_update.cuh"],
         source: r#"
 #include <cstdint>
@@ -278,10 +322,10 @@ namespace fm = ::flashinfer::mamba;
     /// now, where the same four values are
     /// `fire::all_reduce::REACHED` and the cross product is
     /// `UPSTREAM_POINTS` / `AOT_POINTS_AFTER_PRUNING`. **This probe is
-    /// unaffected**: what it asks is whether the vendored tree can compile
+    /// unaffected**: what it asks is whether the internalised tree can compile
     /// upstream's kernels, and that question is about
-    /// `flashinfer/comm/trtllm_allreduce_fusion.cuh`, which `csrc/vendor/`
-    /// still does not carry.
+    /// `flashinfer/comm/trtllm_allreduce_fusion.cuh`, which
+    /// `csrc/src/attn/flashinfer/` still does not carry.
     const TRTLLM: Candidate = Candidate {
         row: "comm::all_reduce_residual_rmsnorm_bf16",
         launcher: "driver-cuda/src/fire/all_reduce.rs::CustomAllReduce::all_reduce_residual_rmsnorm_bf16",
@@ -884,7 +928,10 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
         // compiles: those three are already vendored WITH THEIR GUARDS, and a
         // pristine upstream copy shadowing the patched one would measure a
         // vendoring nobody would ship.
-        staged.retain(|s| !ALL_HEADERS.iter().any(|h| h.name == s.name));
+        staged.retain(|s| {
+            let carried = carried_name(&s.name);
+            !ALL_HEADERS.iter().any(|h| h.name == carried)
+        });
         Ok(staged)
     }
 
@@ -1149,8 +1196,14 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
         Unanswered,
     }
 
+    /// Whether the carried set answers this name, under either spelling.
+    fn is_carried(name: &str) -> bool {
+        let carried = carried_name(name);
+        ALL_HEADERS.iter().any(|h| h.name == name || h.name == carried)
+    }
+
     fn answer(name: &str) -> Answer {
-        if ALL_HEADERS.iter().any(|h| h.name == name) {
+        if is_carried(name) {
             Answer::Carried
         } else if BASELINE_EXTERNALS.contains(&name) {
             Answer::GuardedInBaseline
@@ -1280,11 +1333,11 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
         println!("NVRTC version:  {}", version());
         println!("architecture:   {arch}");
         println!(
-            "carried set:    {} headers ({} shim + {} library + {} vendored), {} bytes",
+            "carried set:    {} headers ({} shim + {} library + {} upstream), {} bytes",
             ALL_HEADERS.len(),
             SHIM.len(),
             LIBRARY.len(),
-            VENDOR.len(),
+            UPSTREAM.len(),
             ALL_HEADERS.iter().map(|h| h.text.len()).sum::<usize>()
         );
 
@@ -1334,21 +1387,21 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
         let mut guard_lines = 0usize;
         if candidate.roots.is_empty() {
             println!("  closure:  0 new files -- the text is ALREADY VENDORED.");
-            let carried: Vec<&str> = VENDOR
+            let carried: Vec<&str> = UPSTREAM
                 .iter()
                 .filter(|h| h.name.contains("cascade"))
                 .map(|h| h.name)
                 .collect();
             println!(
-                "            {} in csrc/vendor, {} lines, {} bytes",
+                "            {} in csrc/src/attn, {} lines, {} bytes",
                 carried.first().copied().unwrap_or("?"),
-                VENDOR
+                UPSTREAM
                     .iter()
-                    .find(|h| h.name == "flashinfer/attention/cascade.cuh")
+                    .find(|h| h.name == CASCADE)
                     .map_or(0, |h| h.text.lines().count()),
-                VENDOR
+                UPSTREAM
                     .iter()
-                    .find(|h| h.name == "flashinfer/attention/cascade.cuh")
+                    .find(|h| h.name == CASCADE)
                     .map_or(0, |h| h.text.len())
             );
         } else {
@@ -1358,7 +1411,7 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
             };
             let files = closure(tree, candidate.roots, candidate.guards);
             let already: Vec<&String> =
-                files.iter().filter(|f| ALL_HEADERS.iter().any(|h| h.name == **f)).collect();
+                files.iter().filter(|f| is_carried(f)).collect();
             let fresh: Vec<&String> = files.iter().filter(|f| !already.contains(f)).collect();
             println!(
                 "  closure:  {} files -- {} already vendored, {} would MOVE",
@@ -1402,16 +1455,19 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
 
         // ---- 2. the externals ----------------------------------------------
         let mut externals: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        // Both spellings of every carried name, for `carried_name`'s reason:
+        // a staged file is named the way UPSTREAM spells it and a carried one
+        // the way `csrc/src` does, and a name that is inside under one
+        // spelling and outside under the other would be counted as an
+        // external this vendoring has to answer for.
         let inside: BTreeSet<&str> = staged
             .iter()
             .map(|s| s.name.as_str())
             .chain(ALL_HEADERS.iter().map(|h| h.name))
+            .chain(ALL_HEADERS.iter().filter_map(|h| h.name.strip_prefix("attn/")))
             .collect();
         let sources: Vec<(&str, &str)> = if staged.is_empty() {
-            vec![("flashinfer/attention/cascade.cuh", VENDOR
-                .iter()
-                .find(|h| h.name == "flashinfer/attention/cascade.cuh")
-                .map_or("", |h| h.text))]
+            vec![(CASCADE, UPSTREAM.iter().find(|h| h.name == CASCADE).map_or("", |h| h.text))]
         } else {
             staged.iter().map(|s| (s.name.as_str(), s.text.as_str())).collect()
         };
@@ -1497,7 +1553,7 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
             // The crutch is built first because it also has to REPLACE this
             // crate's own shims. §14.5's separation only works if the two runs
             // differ in one thing: whose header answered. Leaving
-            // `csrc/vendor/cuda_bf16.h` in place under the crutch would mix
+            // this crate's own `cuda_bf16.h` in place under the crutch would mix
             // NVIDIA's real `cooperative_groups/memcpy_async.h` against PIE's
             // 40-line `cooperative_groups.h`, and a failure there would name
             // neither the source nor the substitute.

@@ -5,6 +5,13 @@ This crate redistributes third-party source. What follows names it, states its
 licence, and says exactly what was changed -- in that order, because the third
 part is the one a rebase needs.
 
+The text used to sit under `csrc/vendor/`. It does not any more: there is no
+vendor directory in this crate and no build step looks for one. The files were
+`git mv`'d, subtree shape intact, into `csrc/src/attn/flashinfer/` and
+`csrc/src/attn/xqa/` -- see "Where it lives, and why it moved" below. Nothing
+about the licences, the copyrights or the obligations changes with the path;
+only the paths in this document do.
+
 
 FlashInfer
 ----------
@@ -14,8 +21,8 @@ FlashInfer
     Version:    v0.6.15
     Licence:    Apache License 2.0
     Copyright:  Copyright (c) 2023-2025 by FlashInfer team
-    Located at: csrc/vendor/flashinfer/
-    Licence at: csrc/vendor/flashinfer/LICENSE (upstream's file, unmodified)
+    Located at: csrc/src/attn/flashinfer/
+    Licence at: csrc/src/attn/flashinfer/LICENSE (upstream's file, unmodified)
 
 The pin is not ours to choose. `crates/kernels-cuda/csrc/CMakeLists.txt`
 fetches the same tree for the ahead-of-time build:
@@ -27,30 +34,30 @@ fetches the same tree for the ahead-of-time build:
       GIT_SHALLOW TRUE
       DOWNLOAD_ONLY YES)
 
-and the vendored files were copied from the tree that command produced --
+and the carried files were copied from the tree that command produced --
 `.../build/_deps/flashinfer-src/include/flashinfer/` -- rather than from a
 fresh clone, so that the text carried here is byte-for-byte the text the AOT
 build compiles. Seventeen copies of that tree exist under `target/`, one per
 build hash; all seventeen were compared and are identical.
 
-### What is vendored
+### What is carried
 
 Twenty-eight files: the transitive `#include` closure, inside the FlashInfer
 tree, of the fifteen headers `crates/kernels-cuda/csrc/src` names --
 `attention/{cascade,decode,mask,mla,prefill,scheduler,state,variants,
 default_decode_params,default_prefill_params}.cuh` and
-`{fastdiv,layout,page,pos_enc,utils}.cuh`. 18,187 lines.
+`{fastdiv,layout,page,pos_enc,utils}.cuh`. 18,207 lines.
 
-Not vendored, and deliberately: `attention/hopper/*`, `comm/*`,
+Not carried, and deliberately: `attention/hopper/*`, `comm/*`,
 `gemm/bmm_fp8.cuh`, `cutlass_utils.cuh` and `mamba/selective_state_update.cuh`.
 They are outside the closure of those fifteen seeds, they are a different
-architecture's problem (sm_90 TMA, NVSHMEM, CUTLASS), and vendoring text
+architecture's problem (sm_90 TMA, NVSHMEM, CUTLASS), and carrying text
 nobody compiles would be weight in every binary.
 
 ### What was changed
 
-Nothing but guards. **33 `#ifndef __CUDACC_RTC__` guards across 14 of the 28
-files, 206 added lines**; the other 14 files are byte-identical to upstream.
+Nothing but guards. **35 `#ifndef __CUDACC_RTC__` guards across 14 of the 28
+files, 226 added lines**; the other 14 files are byte-identical to upstream.
 Every copyright header is intact and untouched. Nothing was reformatted,
 renamed, reordered or "improved" -- include order in particular is upstream's,
 which is why several files carry four small guards where one large one would
@@ -69,12 +76,17 @@ Each guard is preceded by a marker of a fixed form:
     // PIE: guarded for NVRTC -- <what and why>. Upstream is unmodified apart
     // from markers of this form; see NOTICE. Removing them restores the file.
 
-One `grep -rn "// PIE:" csrc/vendor/flashinfer/` finds all 33. The boilerplate
-sentence appears once per file, on its first marker. `csrc/vendor/MODIFICATIONS`
-lists the count per file, and the property that list asserts -- *strip the
-markers, the `#ifndef` under each and its matching `#endif`, and every file is
-byte-for-byte upstream* -- was checked mechanically, per file, before this
-NOTICE was written.
+One `grep -rn "// PIE:" csrc/src/attn/flashinfer/` finds all 35. The
+boilerplate sentence appears once per file, on its first marker.
+`csrc/src/attn/flashinfer/MODIFICATIONS` lists the count per file, and the
+property that list asserts -- *strip the markers, the `#ifndef` under each and
+its matching `#endif`, and every file is byte-for-byte upstream* -- was checked
+mechanically, per file, against the CPM tree before this NOTICE was written.
+`tests/upstream_manifest.rs` re-checks the half of that claim which needs no
+network: every file's guard count, added-line count, line count and byte count
+still match the table, and the strip is still well defined for every file. The
+other half -- that the stripped text equals upstream's -- needs the CPM
+checkout and is a manual step on rebase.
 
 Two consequences are worth recording because they are not visible in a diff:
 
@@ -91,13 +103,19 @@ Two consequences are worth recording because they are not visible in a diff:
     of `__grid_constant__` -- are untouched, and the fields are filled from
     Rust.
 
-### What is NOT FlashInfer's, in the same directory
+### What is NOT FlashInfer's, and no longer sits next to it
 
-`csrc/vendor/` also holds six small headers written by PIE, carrying no
-third-party text:
+The six small headers PIE wrote to stand in for names NVRTC does not ship --
 
     cstdint, type_traits, cuda.h, cuda_runtime.h, bit,
     boost/math/ccmath/fabs.hpp
+
+-- used to share a directory with the FlashInfer text, which made this a
+paragraph about disambiguation. They are now in `csrc/shim/`, a directory that
+holds nothing else and whose README states the rule, so the disambiguation is
+structural and this paragraph is only history. There are twenty-one of them
+today; `csrc/shim/README.md` is the register, and it records each addition and
+retirement rather than restating a total.
 
 They are named after the headers they stand in for because an `#include`
 resolves against a header set by exact spelling -- this crate has no include
@@ -108,18 +126,121 @@ break device code, and each says so in its own banner. In particular
 Boost: it is a one-line constexpr absolute value under a name FlashInfer asks
 for.
 
+### Where it lives, and why it moved
+
+`csrc/src/attn/flashinfer/`, subtree shape exactly as upstream ships it, plus
+`LICENSE` and `MODIFICATIONS` at its root. It was `csrc/vendor/flashinfer/`.
+
+The move is the point, not a side effect: this crate compiles every kernel
+through NVRTC, so `csrc/` is device text and nothing else, and a directory
+called `vendor` said the opposite -- that the text was a guest with its own
+rules. It is not a guest. It is compiled by the same JIT, guarded by the same
+markers, and tested by the same tests as everything beside it.
+
+**Not one byte of the twenty-nine changed in the move** -- all 28 source files
+and `LICENSE`, zero changed lines each; only `MODIFICATIONS`, which is PIE's
+own file, was edited, to record the new path. The subtree shape is what makes
+that true: upstream's files include each other relatively (`"../cp_async.cuh"`,
+`"mask.cuh"`) and a relative spelling survives a move that carries the whole
+tree.
+
+Seventeen `#include` directives changed across the whole internalisation, and
+the split is worth stating because only one half of it touches upstream text:
+**twelve in PIE's own files** -- ten `<flashinfer/attention/…>` and two
+`<xqa/…>`, which is where an angled, tree-rooted spelling lived -- and **five
+inside the XQA files themselves**, which had already been made tree-relative
+for an unrelated reason (see the XQA section below) and simply gained the new
+prefix. No FlashInfer file contains a changed directive.
+
+
+XQA (NVIDIA), via FlashInfer
+----------------------------
+
+    Project:    XQA -- cross/multi-query attention decode kernels
+    Upstream:   https://github.com/flashinfer-ai/flashinfer, csrc/xqa/
+                (NVIDIA-authored; the files themselves speak of matching the
+                TRT-LLM API, and FlashInfer redistributes them under its own
+                Apache-2.0 tree)
+    Version:    v0.6.15 -- the same CPM checkout as above
+    Licence:    Apache License 2.0
+    Copyright:  SPDX-FileCopyrightText: Copyright (c) 2023-2025 and
+                2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    Located at: csrc/src/attn/xqa/
+    Licence at: csrc/src/attn/xqa/LICENSE
+
+This section is new. The XQA text has been in the tree since the XQA lattice
+landed and its `LICENSE` came with it, but no NOTICE entry named it -- the
+document described FlashInfer's `include/flashinfer/` closure and stopped
+there, and `csrc/xqa/` is a different directory of the same checkout that
+arrived by a different route. Redistributing Apache-2.0 source obliges us to
+carry the licence and say what we changed; the licence was carried, the saying
+was missing. It is below.
+
+### What is carried
+
+Fifteen files, 7,249 lines, 274,966 bytes:
+
+    barriers.cuh   defines.h     mha.cuh      mha_components.cuh   mma.cuh
+    cuda_hint.cuh  hostUtils.h   mha.h        mha_stdheaders.cuh   platform.h
+    ldgsts.cuh     specDec.h     mhaUtils.cuh utils.cuh            utils.h
+
+Not carried, and deliberately: `gmma.cuh`, `gmma_impl.cuh`, `mha_sm90.cu`,
+`mla_sm120.cu`, `mla_sm120.cuh`, `tensorMap.cpp`, `tensorMap.h`, `tma.h`,
+`xqa_wrapper.cu`. The first five are sm_90/sm_120 TMA and GMMA paths this
+crate does not build; the rest are host code -- a `.cpp` and a `.cu` wrapper
+whose job (tensor-map construction, kernel launch) is Rust's here, in
+`driver-cuda/src/fire/xqa.rs`.
+
+### What was changed
+
+**Three of the fifteen files differ from upstream at all; the other twelve are
+byte-identical.** Across those three: 56 lines added, 5 replaced, net +51.
+
+  * `mha.cu` is carried as **`mha.cuh`**. It is a rename and nothing else.
+    This crate holds no translation units -- a `.cu` is an ahead-of-time TU
+    for nvcc and there is no nvcc here -- and the rename is free because
+    nothing includes it by its upstream name. Every `mha.cu:N` citation in
+    this repo is against upstream; `mha.cuh:N` means our copy. The file's own
+    header note gives the offset both ways and it is arithmetic, not memory:
+    3,093 - 3,051 = 42.
+  * One `#ifndef GENERATE_CUBIN` guard, around the host tail of `mha.cuh`
+    (`configureKernel`, `launchMHAFlashInfer` -- `cudaMemcpyFromSymbol`,
+    `cudaFuncSetAttribute`, `cudaLaunchKernelEx`). Upstream guards its *own*
+    host launcher `launchMHA` exactly this way at `mha.cu:2820`; this tail is
+    FlashInfer's downstream addition and they never guarded it. The guarded
+    body's replacement is `driver-cuda/src/fire/xqa.rs`.
+  * Five `#include` spellings made tree-relative -- `"mma.cuh"` and
+    `"utils.cuh"` become `"attn/xqa/mma.cuh"` and `"attn/xqa/utils.cuh"` in
+    `mha.cuh`, `mhaUtils.cuh` and `mha_components.cuh`. This is the one change
+    forced by carrying two upstream trees at once: FlashInfer *also* has an
+    `mma.cuh` and a `utils.cuh`, NVRTC has a single flat include namespace
+    keyed on the literal directive string, and a bare `"utils.cuh"` from XQA
+    would otherwise resolve to FlashInfer's. Those five are the only bare
+    spellings either tree shares; the other nine XQA directives name files
+    FlashInfer does not have and were left alone.
+  * 48 `// PIE:` marker lines across the same three files, in the same fixed
+    form used on the FlashInfer side. `grep -rn "// PIE:" csrc/src/attn/xqa/`
+    finds all 48.
+
+Note the shape of the difference from the FlashInfer side of this document:
+there, the changes are 35 `#ifndef __CUDACC_RTC__` guards; here there are
+**none**. XQA was written to be compiled as a cubin -- it carries upstream's
+own `GENERATE_CUBIN` switch for exactly that -- so the JIT needed one guard
+where FlashInfer's host-facing headers needed thirty-three. Diffing XQA
+against a fresh checkout is correspondingly cheap.
+
 
 FP16 (Marat Dukhan / AMD), via FlashInfer
 -----------------------------------------
 
-    File:       csrc/vendor/flashinfer/fp16.h
+    File:       csrc/src/attn/flashinfer/fp16.h
     Licence:    MIT
     Copyright:  SPDX-FileCopyrightText: 2017-2024 Marat Dukhan
                 SPDX-FileCopyrightText: 2025 Advanced Micro Devices, Inc.
 
 FlashInfer redistributes this file under MIT inside its Apache-2.0 tree and
 its SPDX headers are preserved byte for byte, so this notice only restates
-what the file already says. It is vendored because the closure walk reaches
+what the file already says. It is carried because the closure walk reaches
 it: `attention/prefill.cuh` includes it under `FP16_QK_REDUCTION_SUPPORTED`.
 One guard, on an unused `<limits>`.
 
@@ -127,8 +248,21 @@ One guard, on an unused `<limits>`.
 CCCL, NVIDIA CUDA headers
 -------------------------
 
-Neither is vendored, and that is the point of `csrc/src`'s shims. Where
+Neither is carried, and that is the point of `csrc/shim`. Where
 `examples/flashinfer_probe.rs` reads NVIDIA's `cuda_fp16.h` or FlashInfer's
-vendored CCCL from disk, it does so at RUN time, in a probe, to separate "is
-this source acceptable to NVRTC" from "is our shim correct". No toolkit text
-is carried in this crate's binary and none is redistributed.
+own CCCL checkout from disk, it does so at RUN time, in a probe, to separate
+"is this source acceptable to NVRTC" from "is our shim correct". No toolkit
+text is carried in this crate's binary and none is redistributed.
+
+
+The two LICENSE files
+---------------------
+
+`csrc/src/attn/flashinfer/LICENSE` and `csrc/src/attn/xqa/LICENSE` are
+byte-identical to each other: both are the stock Apache License 2.0 text, 230
+lines, as each upstream ships it. They are kept as two files rather than one
+shared copy because each is the licence *of its own directory* and a rebase
+replaces a directory, not a crate. Neither may be renamed: `carried.rs`
+excludes a file from the NVRTC header set by basename -- `LICENSE`, `NOTICE`,
+`MODIFICATIONS`, `README`, `README.md` -- so a name like `FLASHINFER-LICENSE`
+would quietly put 12 KB of licence text into `includeNames[]`.

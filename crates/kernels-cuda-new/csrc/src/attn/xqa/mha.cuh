@@ -19,24 +19,24 @@
 // PIE: because `kernels-cuda-new` holds no translation units: a `.cu` is an
 // PIE: ahead-of-time TU for nvcc, a `.cuh` is device text carried into
 // PIE: NVRTC, and this crate is 120 of the second and none of the first.
-// PIE: The bytes are upstream's; only the name and the one guard below
-// PIE: differ. When diffing against FlashInfer, diff this against
-// PIE: `csrc/xqa/mha.cu` and expect the two to agree.
+// PIE: The bytes are upstream's; only the name, one guard and two include
+// PIE: spellings differ. When diffing against FlashInfer, diff this
+// PIE: against `csrc/xqa/mha.cu` and expect the rest to agree.
 // PIE:
 // PIE: The rename is free because nothing has to be impersonated. NVRTC
 // PIE: resolves an include by matching the literal directive string against
-// PIE: `includeNames[]`, and `carried.rs` names this entry `xqa/mha.cuh`
+// PIE: `includeNames[]`; `carried.rs` names this `attn/xqa/mha.cuh`
 // PIE: from its path -- so the only thing that had to change with it is the
 // PIE: one includer, `csrc/src/attn/attention_xqa_mha.cuh`, which is ours.
-// PIE: Nothing inside `csrc/vendor/xqa/` includes a `.cu` by name (checked
+// PIE: Nothing inside `csrc/src/attn/xqa/` includes a `.cu` by name (checked
 // PIE: across all fifteen files), so no upstream byte spells the old name.
 // PIE:
-// PIE: LINE NUMBERS: every `xqa/mha.cu:N` citation in this repo is against
-// PIE: UPSTREAM, which is the stable anchor. In THIS file two insertions
-// PIE: shift it: this note is 21 lines at 18, and the `GENERATE_CUBIN` guard
-// PIE: is 15 lines at upstream 2955 plus its `#endif` at the tail. So
-// PIE: upstream `:409` is `:430` here, upstream `:2757` is `:2778`, and
-// PIE: upstream `:2955` (`configureKernel`) is `:2991`.
+// PIE: LINE NUMBERS: a `mha.cu:N` citation is UPSTREAM's, a `mha.cuh:N` one
+// PIE: is this file's. THREE insertions separate them: this note, 23 lines
+// PIE: at 18; the include marker below, 3 lines at upstream 28; and the
+// PIE: `GENERATE_CUBIN` guard, 15 lines at upstream 2955, plus its `#endif`
+// PIE: at the tail -- 3093 - 3051 = 42. So upstream `:409` is `:435` here,
+// PIE: `:2757` is `:2783`, and `:2955` (`configureKernel`) is `:2996`.
 
 #include "cuda_hint.cuh"
 #include "defines.h"
@@ -51,8 +51,8 @@
 // PIE: upstream spells these two bare; FlashInfer's `mma.cuh` and
 // PIE: `utils.cuh` answer to the same literal spellings in NVRTC's flat
 // PIE: include namespace. See `mha_components.cuh` for the whole note.
-#include "xqa/mma.cuh"
-#include "xqa/utils.cuh"
+#include "attn/xqa/mma.cuh"
+#include "attn/xqa/utils.cuh"
 #ifndef GENERATE_CUBIN
 #include <cuda_runtime.h>
 

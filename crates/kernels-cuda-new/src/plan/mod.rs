@@ -28,8 +28,10 @@
 //! * **The FA2 `__global__` templates go through NVRTC now.** §13.6 priced
 //!   that as *"a FlashInfer patch set plus ~39 bit-exact device intrinsics"*
 //!   and **the price is obsolete** — it was quoted before anyone re-measured,
-//!   and both halves of it had already been paid: `csrc/vendor/flashinfer/`
-//!   IS the patch set (24 `.cuh`, marked, upstream otherwise unmodified) and
+//!   and both halves of it had already been paid:
+//!   `csrc/src/attn/flashinfer/` IS the patch set (24 `.cuh`, marked, upstream
+//!   otherwise unmodified — it was `csrc/vendor/flashinfer/` until the tree
+//!   was internalised, and the files did not change) and
 //!   `csrc/shim/` supplies the impersonating headers the intrinsics wanted.
 //!   Measured against `libnvrtc.so.13` on an L40S at `compute_89`:
 //!   `math.cuh`, `vec_dtypes.cuh`, `page.cuh` and `attention/decode.cuh` all

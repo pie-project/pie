@@ -74,7 +74,14 @@
 //! it is counted: [`kind_of_wall`] maps each [`Wall`] onto a [`Kind`], the
 //! three kinds partition all 198 stated symbols, and [`assert_total`] derives
 //! the service set twice — once from the walls here, once from
-//! `execution::SERVED` — and asserts the two agree as SETS.
+//! `execution::SERVED`.
+//!
+//! **It holds a SUBSET, not an equality**, and the difference is the whole
+//! content of check 6c: `Wall::Library ⟹ SERVED` is argued; the converse is
+//! false, because `SERVED` says who executes a symbol and a wall says why no
+//! kernel of ours can be extracted from it. Nine classified driver ops span
+//! four walls. The equality this line used to claim fires on two of them,
+//! both correctly classified.
 //!
 //! The classification is only as good as the row-by-row evidence, and the bar
 //! is deliberately high: **no `__global__` in the symbol's closure, or a
@@ -313,7 +320,9 @@ fn report_partition(refused: &BTreeSet<&str>, rows: usize, migrated: usize, libr
         "Every stated symbol is a KERNEL ({kernels}), an OP ({ops}) or a SERVICE ({services}).\n\
          `Execution` in `src/execution.rs` is that distinction as data; `kind_of_wall`\n\
          is the mapping, and `assert_total` derives the service set twice -- from the\n\
-         walls here and from `execution::SERVED` -- and asserts the two agree.\n\
+         walls here and from `execution::SERVED` -- and holds that the walls' set is a\n\
+         SUBSET of the crate's. The two are not equal and never were: a driver op can\n\
+         be truthfully walled `HostChoice` or `TwoLaunches`.\n\
          \n  \
          A SERVICE is never work: cuBLAS, CUTLASS, NCCL, the P2P all-reduce plane, or\n  \
          the driver itself. It cannot migrate because it was never a kernel of ours.\n  \
@@ -454,8 +463,14 @@ pub enum Wall {
     ///
     /// **This is the wall that means [`Kind::Service`]**, so an entry here is
     /// also an entry in [`kernels_cuda_new::execution::SERVED`], with the
-    /// service that runs it — and [`assert_total`] derives the two sets by
-    /// different routes and asserts they are equal.
+    /// service that runs it — and [`assert_total`] holds that **one
+    /// direction**: `Library ⟹ SERVED`, as a subset.
+    ///
+    /// It used to say *"asserts they are equal"*, and the sentence above is
+    /// the only one that was ever argued. `SERVED` says who executes a
+    /// symbol; a wall says why no kernel of ours can be extracted from it.
+    /// A driver op can be truthfully walled `HostChoice` or `TwoLaunches`,
+    /// and an equality fires on it. See [`Wall::NotAKernel`] and check 6c.
     ///
     /// # This wall has now been over-claimed TEN times, and the corrections
     /// are the whole reason the classification exists
@@ -465,7 +480,7 @@ pub enum Wall {
     /// `csrc/third_party/marlin` holds 2,082 lines of device text that NVRTC
     /// 13.0 compiles to a **55,024-byte sm_89 cubin**, reaching seven external
     /// includes of which **zero** are unanswered — three by the shims, four by
-    /// `csrc/vendor` — and needing exactly two intrinsics (`__hadd2`,
+    /// `csrc/src/attn/` — and needing exactly two intrinsics (`__hadd2`,
     /// `atomicAdd(__nv_bfloat162*)`) and two namespace aliases.
     /// `examples/marlin_probe.rs` was the instrument; both it and the vendored
     /// tree it measured were deleted in §47, once the OTHER question -- not
@@ -494,7 +509,7 @@ pub enum Wall {
     /// call site is a guess.** `flashinfer::*` in a `.cu` says which library
     /// is called; it does not say whether that library's source is in this
     /// tree — and for FlashInfer's cascade merge it demonstrably is
-    /// (`csrc/vendor/flashinfer/attention/cascade.cuh` holds seven
+    /// (`csrc/src/attn/flashinfer/attention/cascade.cuh` holds seven
     /// `__global__`s including `MergeStatesKernel`).
     Library,
     /// **The launcher returns `bool` and declines.** `K % 8 != 0`, or a
@@ -518,8 +533,22 @@ pub enum Wall {
     /// `the_unstated_rows_are_exactly_the_ones_with_a_written_reason` calls
     /// this `Unstated::NotACppFunction` and says of it: *"never closes"*.
     ///
-    /// The second wall that means [`Kind::Service`] — [`Service::DriverOp`],
-    /// where the library is the driver.
+    /// The second wall that means [`Kind::Service`] — and it is a
+    /// one-way statement, which this line used to blur.
+    ///
+    /// It reads *"[`Service::DriverOp`], where the library is the driver"*,
+    /// and a reader took that as a biconditional. **It is not.** Every
+    /// `NotAKernel` row is a `DriverOp`; the converse is false, because
+    /// `SERVED` answers *who executes this* and a wall answers *why there is
+    /// no kernel here to extract*, and those are different questions. The
+    /// nine classified driver ops span **four** walls — `NotAKernel` ×3,
+    /// `Library` ×4, `HostChoice` ×1 (`gemm::act_x_wt_bf16`, whose two arms
+    /// are ours and cuBLASLt's on a tuner) and `TwoLaunches` ×1
+    /// (`gemm::act_x_wt_bias_bf16`, a GEMM and a bias-add this crate hosts).
+    ///
+    /// `assert_total`'s check 6 asserted the biconditional and would fire on
+    /// those last two — truthfully classified rows, failing an assertion
+    /// about the classification. It is a subset check now; see 6c.
     NotAKernel,
     /// **A `switch` over a scheme, whose cases reach different kernels.**
     /// `write_kv_to_pages` reads `layer.scheme` and lands in one of four
@@ -555,6 +584,48 @@ pub enum Wall {
     /// this crate hosts and fires TODAY. It is blocked on a vocabulary for
     /// SEQUENCE, which is step two.
     TwoLaunches,
+    /// **The kernel exists, is extracted, and is registered under a SIBLING
+    /// name.** The `_dev` split (§60.6): `unit!` declares the device symbol
+    /// with a `_dev` infix — `moe::build_moe_ptrs_aligned_dev_bf16` — while
+    /// the stated row keeps the plain name, `moe::build_moe_ptrs_aligned_bf16`.
+    /// So `unit::unit_of` answers `None` for the row forever, and the report
+    /// reads *"nothing hosts it"* about a kernel that is hosted.
+    ///
+    /// **This is not a wall.** Every other variant here answers *why no
+    /// kernel of ours can be extracted from this symbol*; this one answers
+    /// *the kernel was extracted and the row names its host program*. It is
+    /// the third wall that means [`Kind::Op`], and it means it exactly:
+    /// this report's own printed sentence says an OP is *"a host program over
+    /// kernels of ours, most of which migrate already"*, and here the kernel
+    /// under it has already migrated.
+    ///
+    /// # Seven rows are classified here, and the variant predates all of them
+    ///
+    /// Twenty `_dev` symbols exist across `x/*.rs`, so the shape is a class
+    /// and not an accident. The variant was added ahead of its members
+    /// because the alternative was reached first and was wrong: asked to
+    /// classify `moe::build_moe_ptrs_aligned_bf16`, the available walls all
+    /// say *"there is no kernel"* and its `.cuh` text is in
+    /// `csrc/src/moe/moe_dispatch.cuh`. **A taxonomy with no true answer
+    /// invites a false one**, which is how `Wall::Library` was over-claimed
+    /// ten times.
+    ///
+    /// Its members are that symbol and the six FlashInfer FA2 dispatches,
+    /// whose device text is the `families/fa2.rs` lattice — `attn::fa2::\
+    /// decode_hd{HD}_g{G}` and the prefill equivalents, in units named for
+    /// the geometry. **The sibling need not be one kernel**: a lattice is a
+    /// whole product of them, and the row names none.
+    ///
+    /// # Not to be confused with [`Wall::HostChoice`], which looks identical
+    ///
+    /// `DeviceIsSibling`: there is exactly one implementation and it wears
+    /// another name. `HostChoice`: the host picks between TWO, so no single
+    /// instantiation is the row's. `moe::moe_grouped_gemm_bf16` satisfies
+    /// BOTH descriptions — its WMMA leg is ours under
+    /// `moe::device::moe_grouped_gemm` — and is classified `HostChoice`,
+    /// because that is the stronger statement and the one that says why no
+    /// instantiation is the row's.
+    DeviceIsSibling,
 }
 
 /// What a symbol IS, per its wall — a kernel, an op, or a service.
@@ -586,7 +657,7 @@ pub enum Wall {
 const fn kind_of_wall(wall: Wall) -> Kind {
     match wall {
         Wall::Library | Wall::NotAKernel => Kind::Service,
-        Wall::SchemeSwitch | Wall::TwoLaunches => Kind::Op,
+        Wall::SchemeSwitch | Wall::TwoLaunches | Wall::DeviceIsSibling => Kind::Op,
         Wall::HostChoice | Wall::Declines => Kind::Kernel,
     }
 }
@@ -925,7 +996,7 @@ pub static CLASSIFIED: &[Refusal] = &[
         why: "CUTLASS grouped-GEMM MoE pipeline, returns `bool`. THE ONE THAT SURVIVES: `csrc/third_party/flashinfer_moe/*.cu` holds 0 `__global__`, `src/moe/flashinfer_moe.cu` holds 0 and calls no kernel of ours, and `cutlass/` is in no SOURCE directory of this repo -- CPM fetches it into `target/**/_deps/flashinfer-src/3rdparty/cutlass` at configure time. The kernels are templates in headers we do not have" },
     Refusal { symbol: "attn::merge_attention_states_bf16", class: Class::Structural(Wall::HostChoice),
         consumer: Consumer::Nothing { wrapper: "merge_attention_states", swept: "0 callers of the wrapper in any tracked file, 0 goldens, 0 `pie_k_*`, 0 `lower.rs`, no peel stem, no fact gate; `launch_rules.rs` STATES its two arms and fires neither, `vendor_probe.rs` compiles its text, and `attention_flashinfer_hopper_stub.cpp:53` names it in a COMMENT. §28.9" },
-        why: "MEASURED: ZERO files to move -- `csrc/vendor/flashinfer/attention/cascade.cuh` is already here, byte-for-byte upstream, and NVRTC compiles it to 96,176 B with 8 of 8 symbols resolving. The wall is `cascade.cuh:644-664`, a host `if` over TWO kernels with two geometries: `MergeStatesLargeNumIndexSetsKernel` is grid `(seq_len, num_heads)` with dynamic smem, `MergeStatesKernel` is grid `(seq_len)` with none. TWO WALLS, and the predicate is only the first: `:644` is `num_index_sets >= seq_len`, a comparison of TWO OPERANDS, and every `Term` is unary (`Aligned`, `Multiple` and `Is` test against a literal; `Present` tests for null) while `Source`'s combinators stop at `Ne`, which is equality. The second is that BOTH arms launch a 2-D thread block `(bdx, bdy)` with `bdx = HEAD_DIM / vec_size`, and `Tile16`'s constant (16, 16) is the vocabulary's only 2-D block. Measured smem 8,704 B at head_dim 64/128/256 and 16,896 B at 512, all under 48 KB, so the `cudaFuncSetAttribute` at `:656` is a no-op" },
+        why: "MEASURED: ZERO files to move -- `csrc/src/attn/flashinfer/attention/cascade.cuh` is already here, byte-for-byte upstream, and NVRTC compiles it to 96,176 B with 8 of 8 symbols resolving. The wall is `cascade.cuh:644-664`, a host `if` over TWO kernels with two geometries: `MergeStatesLargeNumIndexSetsKernel` is grid `(seq_len, num_heads)` with dynamic smem, `MergeStatesKernel` is grid `(seq_len)` with none. TWO WALLS, and the predicate is only the first: `:644` is `num_index_sets >= seq_len`, a comparison of TWO OPERANDS, and every `Term` is unary (`Aligned`, `Multiple` and `Is` test against a literal; `Present` tests for null) while `Source`'s combinators stop at `Ne`, which is equality. The second is that BOTH arms launch a 2-D thread block `(bdx, bdy)` with `bdx = HEAD_DIM / vec_size`, and `Tile16`'s constant (16, 16) is the vocabulary's only 2-D block. Measured smem 8,704 B at head_dim 64/128/256 and 16,896 B at 512, all under 48 KB, so the `cudaFuncSetAttribute` at `:656` is a no-op" },
     // NCCL, and not even in this crate: `csrc/src/dist/` does not exist.
     // These are methods on the DRIVER's `NcclComm`, which is what
     // `launch_abi::the_unstated_rows...` calls `SecondNamespaceRoot`.
@@ -945,7 +1016,7 @@ pub static CLASSIFIED: &[Refusal] = &[
     // `driver-cuda/src/fire/all_reduce.rs`. Both rowed entry points still
     // take a `CustomAllReduce*` the driver owns (a Rust struct behind an
     // opaque handle now) and still forward into headers this repo does not
-    // carry: `csrc/vendor/flashinfer` holds `attention/` only, and there is
+    // carry: `csrc/src/attn/flashinfer` holds `attention/` only, and there is
     // no in-repo copy of `flashinfer/comm/vllm_custom_all_reduce.cuh` or
     // `flashinfer/comm/trtllm_allreduce_fusion.cuh`.
     //
@@ -976,6 +1047,28 @@ pub static CLASSIFIED: &[Refusal] = &[
         why: "the driver's own arm: `bind/mod.rs:1895` calls `(*state).apply(ctx.cublas, ...)`, built out of grouped GEMM calls it already had" },
 
     // ── A: a switch over the cache scheme ────────────────────────────────
+    //
+    // BOTH OF THESE HAVE CROSSED INTO FN-WORLD and both are still counted
+    // here, which is a property of the DENOMINATOR and not a stale entry.
+    // `refused_set()` is `candidates()` filtered by `unit_of(s).is_none()`,
+    // and `unit_of` looks a symbol up among the UNIT rows — which for this
+    // family are `attn::write_kv_bf16_dev#hnd` and its nineteen siblings,
+    // named under §60.6's `_dev` split so that `a_walk_is_only_a_walk` could
+    // hold. A contract symbol is never a unit row's symbol, so **every
+    // fn-world symbol in the workspace reads as refused here**: `ssm`'s four
+    // below are the same shape, and so are `mlp`, `quant`, `layout`, `rope`
+    // and `moe`'s.
+    //
+    // The report is not wrong about what it measures — *"a candidate with no
+    // JIT twin under its own name"* — it is measuring something that stopped
+    // being the question when the second world arrived. Left standing rather
+    // than repointed, because `assert_total`'s partition is derived twice and
+    // made to agree, and removing a `CLASSIFIED` row moves it into class B by
+    // arithmetic; the fix is a denominator that asks `x::ENTRIES` as well,
+    // and that is one edit to a file that is not this one.
+    //
+    // What each `why` says about the LAUNCHER is still true; what the class
+    // implies about the migration is not.
     Refusal { symbol: "attn::write_kv_to_pages", class: Class::Structural(Wall::SchemeSwitch),
         consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/shared/llama_like/forward/mod.rs:1198", names: "write_kv_to_pages" }, goldens: 27 },
         why: "`switch (layer.scheme)` over four page formats, and throws on `first_token != 0` off native bf16; `attn/kv_paged.cu:107-160`" },
@@ -1069,12 +1162,72 @@ pub static CLASSIFIED: &[Refusal] = &[
     Refusal { symbol: "rope::qk_rmsnorm_rope_bf16_rounded", class: Class::Stale,
         consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/gemma_4/forward/mod.rs:217", names: "qk_rmsnorm_rope_rounded_q_only" }, goldens: 4 },
         why: "NOT `rope/rope.cu:214-215`, which is `dim3(num_tokens, num_q_heads)` — Q ONLY. The real call site (`model/src/gemma_4/forward/mod.rs:217`) reaches it with `k = nullptr` and `num_kv_heads = 0`, while `Dims::kv_heads` is the FIRE's head count (`bind/mod.rs:1379`) and is non-zero there. `RowsPackedHeadsNarrow` would open `q + kv` blocks and the excess would rotate a null `k`; `packed_heads`' zero-refusal cannot fire, because the zero is in the OPERAND and not in the `Dims`. NEEDS a separate symbol for the q-only form (as `_devwin` has) or a rule whose head axis reads the operand — reproducing `rope/rope.cu:214`" },
-    Refusal { symbol: "attn::qkv_decode_qk_norm_rope_write_kv_bf16", class: Class::Stale,
-        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/shared/llama_like/forward/mod.rs:1514", names: "qkv_decode_qk_norm_rope_write_kv_region" }, goldens: 1 },
-        why: "the reason on record was the vocabulary and the vocabulary caught up: `WarpPackedHeads` and `RowsPackedHeadsNarrow` were BOTH ported from this launcher (`attn/qkv_fused.cu:51-53`, `:98-102`) and `Term::Present` reads `rope_table != nullptr`. What refuses it NOW is that a `Specialisation` may not change a `LaunchRule` — the launcher picks between those two GEOMETRIES on `head_dim` — and this audit KEPT that invariant: `fire.rs:176-186` evaluates the grid from the base row before consulting the specialisation, four readers take `KernelSig::launch` as a contract, and lifting it would not land the row anyway because `head_dim == 64 | 128 | 256` is still unspellable (`Term::Multiple { of: 64 }` holds of 192). `tests/specialise.rs::agrees_refuses_an_arm_that_changes_the_launch_rule`" },
+    // `attn::qkv_decode_qk_norm_rope_write_kv_bf16` STOOD HERE, class D, and
+    // the refusal is RESOLVED rather than re-stated. The reason on record was
+    // that *a `Specialisation` may not change a `LaunchRule`* — the launcher
+    // picks between `WarpPackedHeads` and `RowsPackedHeadsNarrow` on
+    // `head_dim` — with the leg that lifting the invariant would not land the
+    // row anyway, because `head_dim == 64 | 128 | 256` is unspellable
+    // (`Term::Multiple { of: 64 }` holds of 192).
+    //
+    // BOTH LEGS WERE TRUE AND THE CONCLUSION WAS A ROW-WORLD CONCLUSION. A
+    // `LaunchRule` is how a ROW states a grid; a host `fn` states it with two
+    // `if`s and an arithmetic expression, and needs no rule, no
+    // specialisation and nothing spellable in `Term`. The symbol is
+    // `x::attn::QKV_DECODE_FUSED` now — a contract, a real bind, and
+    // `x::attn::qkv_fused::qkv_decode_fused_dispatch` choosing the warp form
+    // at 64/128/256 and falling through to the block form otherwise.
+    //
+    // It was the last row in `ROW_TABLES`. `tests/specialise.rs::agrees_\
+    // refuses_an_arm_that_changes_the_launch_rule` still passes and still
+    // measures the invariant, over the two UNIT rows rather than two table
+    // rows.
     Refusal { symbol: "ssm::build_nemotron_moe_ptrs_decode_batched_bf16", class: Class::Stale,
         consumer: Consumer::Nothing { wrapper: "build_nemotron_moe_ptrs_decode", swept: "0 callers of the wrapper, 0 goldens, 0 `pie_k_*`, 0 `lower.rs`, no C++ CALL; its whole occurrence set is the table row, the wrapper and this report. §28.9" },
         why: "refused as an extent no shape produces; `ElementwiseIn` is `rows * in_width`, which is `rows * top_k` to the digit, and `Ty::BufArray*` now names its `void**` operands. NOT RE-DERIVED: `families/ssm.rs` is outside this session's grant" },
+
+    // ── The eight `Service::DriverOp` crossings that check 6b named ───────
+    //
+    // Every one of these gained an `execution::SERVED` entry when it crossed
+    // and never gained a classification, because nothing required one until
+    // 6b did. Seven are `Wall::DeviceIsSibling`: the kernel EXISTS, is
+    // extracted, and is registered under a name that is not the row's — so
+    // `unit::unit_of` answers `None` forever about a kernel that is hosted.
+    //
+    // **The eighth is not, and the difference is the discriminator between
+    // the two walls that look alike here.** `DeviceIsSibling` means there is
+    // exactly ONE kernel and it wears another name. `HostChoice` means the
+    // host picks between TWO implementations, so no single instantiation is
+    // the row's. `moe::moe_grouped_gemm_bf16` is ours-or-cuBLAS on a host
+    // decision, which is `gemm::act_x_wt_bf16`'s shape exactly.
+    //
+    // Golden counts below were derived by `goldens_naming`'s own method —
+    // `text.contains("\"{symbol}\"")` over `crates/model/tests/golden/*.json`,
+    // 73 traces — and not estimated.
+    Refusal { symbol: "attn::dispatch_attention_flashinfer_decode", class: Class::Structural(Wall::DeviceIsSibling),
+        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/gemma_4/forward/mod.rs:265", names: "attention_flashinfer_decode" }, goldens: 15 },
+        why: "the decode lattice hosts it under FOUR sibling names per geometry -- `families/fa2.rs` declares `attn::fa2::decode_hd{HD}_g{G}` plus `_window`, `_capture_full`, `_capture_window`, in units named `attn/fa2_decode_hd{HD}_g{G}`. The row's own name appears in no unit, so `unit_of` is `None` about text that is extracted and JIT-compiled. The host half is `fire::flashinfer_fa2_dispatch::decode` over a `DecodePlanCache`, which is why `SERVED` calls it `DriverOp`" },
+    Refusal { symbol: "attn::dispatch_attention_flashinfer_decode_capture", class: Class::Structural(Wall::DeviceIsSibling),
+        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/shared/llama_like/forward/mod.rs:1486", names: "attention_flashinfer_decode_capture" }, goldens: 7 },
+        why: "the capture pair of the decode lattice -- `attn::fa2::decode_hd{HD}_g{G}_capture_full` and `_capture_window`, `families/fa2.rs`'s `SIGS[3]` and `SIGS[4]`. Same sibling registration as the plain decode; the extra two operands are the score buffers, which the row sources `AttnNonZero` and the arm refuses when the fire published none" },
+    Refusal { symbol: "attn::dispatch_attention_flashinfer_prefill_bf16", class: Class::Structural(Wall::DeviceIsSibling),
+        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/qwen_3_5/forward/mod.rs:1003", names: "attention_flashinfer_prefill" }, goldens: 11 },
+        why: "the prefill lattice, ten sigs per unit, units named `attn/fa2_prefill_hd{HD}_q{Q}_kv{KV}`. NOTE THE NAME TRAP: the dsl method `attention_flashinfer_prefill` maps to THIS symbol (`dsl.rs:7080`), while the symbol `attn::attention_flashinfer_prefill` is the PLANLESS one (`dsl.rs:7101`) -- a method and a symbol that share a spelling and mean different rows" },
+    Refusal { symbol: "attn::dispatch_attention_flashinfer_prefill_capture_bf16", class: Class::Structural(Wall::DeviceIsSibling),
+        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/shared/llama_like/forward/mod.rs:1585", names: "attention_flashinfer_prefill_capture" }, goldens: 7 },
+        why: "the prefill lattice's capture variants, same units. Its arm is the one that returns `Option<PrefillArm>` (`fire/flashinfer_fa2_dispatch.rs:571`), because a capture prefill can decline on a geometry the plain one accepts" },
+    Refusal { symbol: "attn::dispatch_attention_flashinfer_prefill_custom", class: Class::Structural(Wall::DeviceIsSibling),
+        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/shared/llama_like/forward/mod.rs:1511", names: "attention_flashinfer_prefill_custom" }, goldens: 9 },
+        why: "the prefill lattice's `VariantCustom` instantiation. `needs = Prepare::CustomPlan` and NOT `PrefillPlan` -- a transcription this session caught while crossing it, and a wrong `needs` is a `Decline::Unplanned` at RUN time rather than a compile error" },
+    Refusal { symbol: "attn::attention_flashinfer_prefill", class: Class::Structural(Wall::DeviceIsSibling),
+        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/gemma_4/forward/mod.rs:271", names: "attention_flashinfer_prefill_planless" }, goldens: 8 },
+        why: "the PLANLESS prefill -- same lattice siblings, no plan cache. It is the one of the FlashInfer six that names no driver RESOURCE: its cache is stack-local and `plan_device()` is a capability query, not a pool. It is a driver op by the second condition alone -- it walks `qo_indptr_h`/`kv_page_indptr_h`, HOST CSR mirrors, and no `Cx` answers a host pointer. `split_qkv_bf16_devwin`'s shape" },
+    Refusal { symbol: "moe::build_moe_ptrs_aligned_bf16", class: Class::Structural(Wall::DeviceIsSibling),
+        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/qwen_3_5/forward/mod.rs:183", names: "build_moe_ptrs_aligned" }, goldens: 1 },
+        why: "the `_dev` split, and the specimen this wall was written for. `x/moe.rs:1053` declares `fn build_moe_ptrs_aligned = \"moe::device::build_moe_ptrs_aligned\"` with the instantiation `\"moe::build_moe_ptrs_aligned_dev_bf16\"`; the stated row keeps the plain `_bf16`. Device text is `csrc/src/moe/moe_dispatch.cuh`. The host half is `fire::moe_ptrs.rs`, whose per-fire bump arena carves the six pointer arrays -- a driver RESOURCE, hence `DriverOp`" },
+    Refusal { symbol: "moe::moe_grouped_gemm_bf16", class: Class::Structural(Wall::HostChoice),
+        consumer: Consumer::ModelText { cite: Cite { at: "crates/model/src/qwen_3_5/forward/mod.rs:199", names: "moe_grouped_gemm" }, goldens: 1 },
+        why: "TWO arms on a host decision, which is `gemm::act_x_wt_bf16`'s wall and not `DeviceIsSibling`'s. Ours is the WMMA leg -- `x/moe.rs:1127` units `moe/moe_grouped_gemm` over `csrc/src/moe/moe_grouped_gemm.cuh`, entered as `moe::device::moe_grouped_gemm` -- and the fallback is `x::gemm::dense::batched_act_x_wt_bf16`, `cublasGemmGroupedBatchedEx` falling back to `cublasGemmBatchedEx`, `gemm.cpp:1145-1241` verbatim. `fire/moe_grouped.rs:77` is *\"pick the implementation, then launch it\"*. Both halves ARE registered under sibling names, so `DeviceIsSibling` is TRUE of it too -- `HostChoice` is the stronger statement and the one that says why no single instantiation is this row's" },
 ];
 
 /// Every claim this report makes about its own arithmetic, checked.
@@ -1217,19 +1370,102 @@ fn assert_total(refused: &BTreeSet<&str>, rows: usize, migrated: usize, library:
         "kernel + op + service must be every stated symbol — a row is in no kind or in two"
     );
 
-    // 6. The SERVICE set, derived twice by independent routes and compared as
-    //    a SET. Route one is this file's walls; route two is the crate's
-    //    `execution::SERVED`, which is where the driver reads it. Counts
-    //    would agree by accident; sets name the row that disagrees.
+    // 6. The SERVICE set, derived twice by independent routes. Route one is
+    //    this file's walls; route two is the crate's `execution::SERVED`,
+    //    which is where the driver reads it. Counts would agree by accident;
+    //    sets name the row that disagrees.
+    //
+    //    **What the two routes are allowed to conclude is stated below the
+    //    derivations, not here** — this comment used to end "and compared as
+    //    a SET", and the comparison it described was an equality that the
+    //    data denies. See 6c.
     let by_wall: BTreeSet<&str> = candidates().filter(|s| kind_of(s) == Kind::Service).collect();
     let by_table: BTreeSet<&str> =
         execution::SERVED.iter().map(|(symbol, _, _)| *symbol).filter(|s| stated.contains(s)).collect();
-    assert_eq!(
-        by_wall, by_table,
-        "the service set disagrees between the walls here and `execution::SERVED` — \
-         a `Wall::Library`/`Wall::NotAKernel` row that no service runs, or a served \
-         row this file still calls work"
+    // 6b. EVERY DRIVER OP IS CLASSIFIED. The gate that closes a drift this
+    //     file has taken eight times without noticing.
+    //
+    //     A symbol crossing into fn-world as a `contract!` with no `Entry`
+    //     gains an `execution::SERVED` entry — that is what makes
+    //     `x::route` answer `Route::Driver`. It does NOT gain a `CLASSIFIED`
+    //     entry, because nothing requires one. So `by_table` grows and
+    //     `by_wall` does not, and assertion 6 goes red one commit later with
+    //     a message about *"a served row this file still calls work"* —
+    //     which names the symptom and not the missing line.
+    //
+    //     Eight symbols reached that state before this assertion existed:
+    //     the six FlashInfer FA2 dispatches, `moe::build_moe_ptrs_aligned_bf16`
+    //     and `moe::moe_grouped_gemm_bf16`. Every one of them arrived the same
+    //     way — a crossing commit that maintained one side of a two-sided
+    //     registration. **Nine other driver ops ARE classified**, which is
+    //     why the design was never wrong, only unmaintained, and why the fix
+    //     is a gate here rather than a change to the denominator. (I wrote
+    //     that denominator change first. The nine are what refuted it.)
+    //
+    //     Stated before assertion 6 so the reader meets the cause and not the
+    //     consequence.
+    for (symbol, service, _) in execution::SERVED {
+        if *service != execution::Service::DriverOp || !stated.contains(symbol) {
+            continue;
+        }
+        assert!(
+            CLASSIFIED.iter().any(|r| r.symbol == *symbol),
+            "`{symbol}` is a `Service::DriverOp` candidate with no `CLASSIFIED` entry. \
+             A driver op has no device text, so `unit_of` refuses it forever and it sits \
+             in the refused set as class B — the residue — rather than as the crossing it \
+             is. Classify it with the wall that says WHY there is no device text; do not \
+             widen the denominator to hide it."
+        );
+    }
+
+    // 6c. The SERVICE set — and the DIRECTION of the claim, which this
+    //    assertion had backwards.
+    //
+    //    `Wall::Library`'s doc argues one implication and states it plainly:
+    //    *"This is the wall that means `Kind::Service`, so an entry here is
+    //    also an entry in `execution::SERVED`."* **Library ⟹ SERVED.**
+    //
+    //    `assert_eq!` asserts the converse too, and the converse is false.
+    //    `execution::SERVED` answers *who executes this*, and since
+    //    `Service::DriverOp` entered that enum the answer can be "the driver"
+    //    for a symbol whose WALL is about something else entirely:
+    //
+    //      gemm::act_x_wt_bf16        Wall::HostChoice   -> Kind::Kernel
+    //      gemm::act_x_wt_bias_bf16   Wall::TwoLaunches  -> Kind::Op
+    //
+    //    Both are `Service::DriverOp`, both are correctly walled, and neither
+    //    is in `by_wall`. Nine driver ops are classified and they span FOUR
+    //    walls — so `SERVED` and `Kind::Service` were never the same set, and
+    //    an equality between them fails on truthfully classified rows.
+    //
+    //    This is the row grammar's distinction one level up: a claim that
+    //    ASSERTS and a claim that TESTS are different claims, and `assert_eq!`
+    //    spelled the stronger one because it was the shorter one to write.
+    //
+    //    So: the argued direction, as a subset.
+    assert!(
+        by_wall.is_subset(&by_table),
+        "a `Wall::Library`/`Wall::NotAKernel` candidate is not in `execution::SERVED` — \
+         the wall says a library runs it and the crate names no service: {:?}",
+        by_wall.difference(&by_table).collect::<Vec<_>>()
     );
+
+    //    And the direction that IS true in the other sense, which is weaker
+    //    than the old equality and is not vacuous: a symbol something else
+    //    executes is never plain work. Every served candidate is refused
+    //    STRUCTURALLY — some wall, any wall — and never sits in the residue.
+    for symbol in &by_table {
+        assert!(
+            matches!(
+                CLASSIFIED.iter().find(|r| r.symbol == *symbol),
+                Some(Refusal { class: Class::Structural(_), .. })
+            ),
+            "`{symbol}` is in `execution::SERVED` and is not classified \
+             `Class::Structural` — something other than a JIT kernel of ours executes it, \
+             so it is not work waiting on text or on vocabulary, and it must name the wall \
+             that says why there is no kernel here to migrate"
+        );
+    }
     assert_eq!(
         by_table.len(),
         execution::SERVED.len(),

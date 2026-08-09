@@ -35,7 +35,7 @@
 //! # By-value aggregates, and why [`Abi::arg`] takes `&self`
 //!
 //! A `__global__` that takes a struct **by value** — XQA's
-//! `KVCacheList<true>` at `xqa/mha.cuh:2801`, FA2's `__grid_constant__`
+//! `KVCacheList<true>` at `xqa/mha.cuh:2804`, FA2's `__grid_constant__`
 //! params — crosses as [`ArgValue::Bytes`](crate::runtime::ArgValue::Bytes),
 //! which is a borrowed `(ptr, len)`. That is the reason this trait's one
 //! method takes `&self` rather than `self`:

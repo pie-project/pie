@@ -217,27 +217,34 @@ pub struct Header {
 /// not open source file"* on a machine with a GPU, at the first fire of
 /// whatever unit needed it.
 ///
-/// [`LIBRARY`] is `csrc/src`: every kernel header this crate compiles and the
-/// prelude they are written over. [`SHIM`] is `csrc/shim`: the headers that
-/// wear NVIDIA's and the standard library's filenames, because the source
-/// that reaches for those names is source we do not own. [`VENDOR`] is
-/// `csrc/vendor`: the patched FlashInfer closure, which is 1.7 MB and goes
-/// only to the units that ask for it.
+/// [`LIBRARY`] is `csrc/src` minus the internalised subtrees: every kernel
+/// header this crate authored and the prelude they are written over. [`SHIM`]
+/// is `csrc/shim`: the headers that wear NVIDIA's and the standard library's
+/// filenames, because the source that reaches for those names is source we do
+/// not own. [`UPSTREAM`] is `csrc/src/attn/flashinfer` and
+/// `csrc/src/attn/xqa`: the patched FlashInfer and XQA closure, which is
+/// 1.2 MB and goes only to the units that ask for it.
+///
+/// The third group used to be a third DIRECTORY, `csrc/vendor`. It is a
+/// prefix now, because the rule that `csrc/` holds only device text left
+/// those files nowhere else to be — internalised, not vendored. What did not
+/// change is that they are still upstream's, still 1.2 MB, and still not
+/// something a `norm` compile should carry.
 mod carried {
     include!(concat!(env!("OUT_DIR"), "/carried.rs"));
 }
 
-pub use carried::{LIBRARY, SHIM, VENDOR};
+pub use carried::{LIBRARY, SHIM, UPSTREAM};
 
 /// What every compile in this crate resolves an `#include` against, unless the
 /// unit says otherwise.
 ///
-/// [`SHIM`] and [`LIBRARY`], and nothing else. Not [`VENDOR`]: NVRTC copies
+/// [`SHIM`] and [`LIBRARY`], and nothing else. Not [`UPSTREAM`]: NVRTC copies
 /// every byte of every header it is handed, and a `norm` kernel has no
 /// business paying for an attention library. A unit that needs it says so —
-/// with [`crate::unit::Headers::LibraryAndVendor`], which is the field that
+/// with [`crate::unit::Headers::LibraryAndUpstream`], which is the field that
 /// used to be missing and the reason `tests/flashinfer_decode.rs` had to
-/// reach past `nvrtc::compile` to compile a vendored unit at all.
+/// reach past `nvrtc::compile` to compile such a unit at all.
 ///
 /// This was a concatenation of two walks — `SHIMS` for `csrc/src` and
 /// `LIBRARY` for the sibling tree's `*.cuh` — until the `.cuh` files moved
@@ -251,20 +258,24 @@ pub use carried::{LIBRARY, SHIM, VENDOR};
 ///
 /// It is two walks again, and the second is `SHIM` — but the seam is now
 /// where the ROLE changes rather than where the authorship does. Eight
-/// impersonating headers used to sit under `csrc/src` and six more under
-/// `csrc/vendor`, doing one job from two directories, and the only thing the
+/// impersonating headers used to sit under `csrc/src` and six more under the
+/// vendor tree, doing one job from two directories, and the only thing the
 /// split recorded was which of the two reasons a name had to be answered:
 /// ours asked for it, or upstream's did. The SET is unchanged, file for file
 /// and byte for byte; what changed is that a directory now answers *what is
 /// this text for* instead of *who wrote it*.
+///
+/// It is three walks in the generator now and still two groups here, because
+/// internalising the attention closure took its directory away without taking
+/// away the reason it was separate. See [`ALL_HEADERS`].
 const SHIMMED: [Header; SHIM.len() + LIBRARY.len()] =
     join::<{ SHIM.len() + LIBRARY.len() }>(SHIM, LIBRARY);
 
 /// See [`SHIMMED`].
 pub const DEVICE_HEADERS: &[Header] = &SHIMMED;
 
-/// [`DEVICE_HEADERS`] plus [`VENDOR`] — what a unit compiling vendored source
-/// resolves against.
+/// [`DEVICE_HEADERS`] plus [`UPSTREAM`] — what a unit compiling upstream
+/// source resolves against.
 ///
 /// A const-fn concatenation rather than a `Vec` behind a `OnceLock`, because
 /// this must stay a `&'static [Header]` for every reader that already takes
@@ -272,7 +283,7 @@ pub const DEVICE_HEADERS: &[Header] = &SHIMMED;
 /// `concat` nor iterator chaining is const. [`crate::table`] builds `KERNELS`
 /// the same way for the same reason.
 pub const ALL_HEADERS: &[Header] =
-    &join::<{ SHIM.len() + LIBRARY.len() + VENDOR.len() }>(&SHIMMED, VENDOR);
+    &join::<{ SHIM.len() + LIBRARY.len() + UPSTREAM.len() }>(&SHIMMED, UPSTREAM);
 
 /// `[T] ++ [U] -> [T; N]` at compile time.
 ///
@@ -352,10 +363,10 @@ pub fn as_nvrtc_arrays(headers: &[Header]) -> Result<(Vec<CString>, Vec<CString>
 /// the set the crate ships?* The question that decides whether a fire works is
 /// narrower — *does this resolve against the set THAT UNIT COMPILES WITH* —
 /// and the two differ for the first unit that asks for
-/// [`crate::unit::Headers::LibraryAndVendor`]. A check against a set the
+/// [`crate::unit::Headers::LibraryAndUpstream`]. A check against a set the
 /// compile will not be handed is a check of the wrong thing, and it fails in
-/// both directions: a vendored unit looks broken, and a library unit that
-/// reaches a vendored header looks fine.
+/// both directions: an upstream unit looks broken, and a library unit that
+/// reaches an upstream header looks fine.
 ///
 /// # Errors
 ///
@@ -472,12 +483,15 @@ mod tests {
     /// An earlier version asserted over the whole set, which was right while
     /// the set was three headers written out by hand. It stopped being right
     /// when the generator began walking `kernels-cuda/csrc/src`: that tree
-    /// holds `.cuh` files belonging to the ahead-of-time build, and some of
-    /// them include a host `.hpp` the JIT deliberately does not carry —
-    /// `attn/attention_flashinfer_common.cuh` is one. Those are carried
-    /// because walking a directory is how the set stopped being a hand-list,
-    /// and they are harmless: NVRTC reads only what is included, so a carried
-    /// header nothing reaches is dead weight rather than a defect.
+    /// held `.cuh` files belonging to the ahead-of-time build, and some of
+    /// them included a host `.hpp` the JIT deliberately does not carry —
+    /// `attn/attention_flashinfer_common.cuh` was the example, and it has
+    /// since left `csrc/` for `kernels-cuda-new/spec/` because a file with no
+    /// device text in it is not device text. The reason the check is scoped
+    /// this way is unchanged even though its example is gone: the internalised
+    /// FlashInfer and XQA closure under `csrc/src/attn/{flashinfer,xqa}` is
+    /// carried for the units that ask, and a header no unit reaches is dead
+    /// weight rather than a defect — NVRTC reads only what is included.
     ///
     /// What must hold is narrower and is the thing that actually breaks a
     /// fire: **from a unit's root, every include resolves, transitively.** A
@@ -489,7 +503,7 @@ mod tests {
     /// same set for every unit declared today and they are not the same
     /// question: `nvrtc::compile` hands NVRTC the unit's own set, so a check
     /// against a different one proves nothing about the compile that will
-    /// happen. The first unit to ask for the vendored closure is the first one
+    /// happen. The first unit to ask for the upstream closure is the first one
     /// this distinction saves, and it is the reason the check moved into
     /// [`reachable`] where the set is an argument.
     /// # It asserts its own denominator
@@ -524,33 +538,40 @@ mod tests {
     }
 
     /// The set a unit chooses decides what resolves — checked with a header
-    /// only the vendored closure carries.
+    /// only the internalised closure carries.
     ///
     /// The proof that the parameter is load-bearing rather than decorative:
     /// the same root resolves against one choice and not the other. Both
     /// halves matter. That `Library` REFUSES it is what keeps a `norm` unit
-    /// from silently reaching into 1.7 MB of FlashInfer; that
-    /// `LibraryAndVendor` ACCEPTS it is the thing a vendored unit needs and
+    /// from silently reaching into 1.2 MB of FlashInfer; that
+    /// `LibraryAndUpstream` ACCEPTS it is the thing such a unit needs and
     /// could not previously state.
     ///
-    /// The vendored header is found rather than named, so this test does not
+    /// Note what this still proves after internalisation: the two sets are
+    /// now two halves of ONE directory, `csrc/src`, split by a prefix rather
+    /// than by a walk root. If that split ever silently stopped happening,
+    /// every name would be in both sets, the `find` below would return `None`
+    /// and this test would fail on its own `expect` rather than passing
+    /// vacuously.
+    ///
+    /// The upstream header is found rather than named, so this test does not
     /// have to be edited when the closure is repatched — the failure mode
     /// `rows_is_every_units_rows_in_order`'s comment describes.
     #[test]
     fn a_units_header_choice_decides_what_resolves() {
-        let vendored = VENDOR
+        let upstream = UPSTREAM
             .iter()
             .find(|v| !Headers::Library.set().iter().any(|l| l.name == v.name))
-            .expect("the vendored closure carries a header the library does not");
-        let root = format!("#include \"{}\"\n", vendored.name);
+            .expect("the upstream closure carries a header the library does not");
+        let root = format!("#include \"{}\"\n", upstream.name);
 
         let refused = reachable("a/unit", &root, Headers::Library.set())
-            .expect_err("the library set does not carry a vendored header");
-        assert!(refused.contains(vendored.name), "a refusal names the include: {refused}");
+            .expect_err("the library set does not carry an upstream header");
+        assert!(refused.contains(upstream.name), "a refusal names the include: {refused}");
 
-        let resolved = reachable("a/unit", &root, Headers::LibraryAndVendor.set())
-            .expect("the vendored set carries it");
-        assert!(resolved.contains(&vendored.name), "and reports what it reached: {resolved:?}");
+        let resolved = reachable("a/unit", &root, Headers::LibraryAndUpstream.set())
+            .expect("the upstream set carries it");
+        assert!(resolved.contains(&upstream.name), "and reports what it reached: {resolved:?}");
     }
 
     /// Reachability is transitive and reports the header it came THROUGH,
@@ -579,7 +600,7 @@ mod tests {
         );
     }
 
-    /// This crate's OWN headers are self-consistent.
+    /// Every header `csrc/` carries is self-consistent.
     ///
     /// Narrower than the reachability check above and true of a bigger set
     /// than it used to be: `csrc/src` is authored here, so every include in
@@ -589,62 +610,33 @@ mod tests {
     /// also the ahead-of-time build's and may say what nvcc can resolve. The
     /// files moved; the promise now covers all of them.
     ///
-    /// # The one exemption, and why it is not a hole
+    /// # THE ONE EXEMPTION IS GONE, BECAUSE ITS SUBJECT LEFT `csrc/`
     ///
-    /// A `.hpp` and the `kernels.def` manifest are HOST text, compiled by
-    /// g++ and nvcc's host pass, and this set carries no host text at all.
-    /// `attn/attention_flashinfer_common.cuh` includes six of them — the
-    /// launcher declarations and the manifest FlashInfer's dispatch is
-    /// generated against — and it is a device header only by extension.
+    /// This block used to open *"a `.hpp` and the `kernels.def` manifest are
+    /// HOST text … `attn/attention_flashinfer_common.cuh` includes six of
+    /// them … and it is a device header only by extension"*, and the test
+    /// below skipped any quoted include ending in `.hpp` or `.def` to let
+    /// that one file through. There was exactly one file in the exemption and
+    /// it is no longer in this tree: it is host C++ with `__global__` = 0 and
+    /// `__device__` = 0, it has **zero `#include` consumers anywhere in the
+    /// workspace**, and `csrc/` holds device text only — so it moved to
+    /// `kernels-cuda-new/spec/`, where `spec/README.md` states what it is and
+    /// `tests/launch_rules.rs` goes on pinning the lines its twenty-four
+    /// citations name.
     ///
-    /// ## THE REASON THIS WAS WRITTEN WITH HAS EXPIRED. THE EXEMPTION HAS NOT
+    /// The skip went with it. **Measured before removing it: zero quoted
+    /// `#include`s ending in `.hpp` or `.def` remain anywhere under `csrc/`.**
+    /// (The one surviving `.hpp` spelling in the tree is
+    /// `<boost/math/ccmath/fabs.hpp>` in the internalised `fp16.h`, which is
+    /// angled — [`quoted_includes`] never saw it — and answered by a shim.)
+    /// A rule with no exceptions is a rule; a rule with an exception whose
+    /// subject has been deleted is a hole waiting for the next host header.
     ///
-    /// The sentence here used to read *"no unit reaches it, THE ARCHIVE IS
-    /// WHAT COMPILES IT, and it finds them under
-    /// `-I …/kernels-cuda/csrc/src`, which the archive's CMake still passes
-    /// and NVRTC has no equivalent of."* Half of that is still true and half
-    /// of it is a claim with a deletion date, which is the worse half to
-    /// leave standing: it justifies the exemption out of a fact that step 6
-    /// removes, so the exemption would have gone red for a reason that has
-    /// nothing to do with whether it is correct.
+    /// So the rule checked is every include of DEVICE text, with nothing
+    /// waived. A missing `.cuh` is a failure here, which is the case that
+    /// costs a compile on a machine with a GPU.
     ///
-    /// **Measured: `attention_flashinfer_common.cuh` has ZERO `#include`
-    /// consumers anywhere in the workspace.** Not a `.cu`, not a `.cuh`, not
-    /// a `.cpp`, in either crate. Every archive translation unit that used to
-    /// include it was an `attn/attention_flashinfer_hd<N>.cu` and all of them
-    /// are deleted; `attn/attention_flashinfer_hopper.hpp:80` reached the
-    /// same finding independently and states it as *"it has no compiler
-    /// now"*. So the archive is not what compiles it — **nothing** is, and
-    /// nothing has been for some time.
-    ///
-    /// That is a strictly stronger ground for the same exemption and it is
-    /// the one that survives step 6. A file no compiler reads may include
-    /// whatever it likes; the six host includes are not resolved somewhere
-    /// this check cannot see, they are never resolved by anyone. Deleting
-    /// `crates/kernels-cuda` changes nothing about this header, which lives
-    /// in THIS crate and goes on living here.
-    ///
-    /// ## What it is instead, and the one constraint that comes with it
-    ///
-    /// It is the FA2 archive's **specification**, and roughly thirty live
-    /// sites cite it BY LINE NUMBER — `fire/flashinfer_fa2.rs`,
-    /// `fire/flashinfer_fa2_dispatch.rs`, `families/fa2.rs`, `plan/*.rs`,
-    /// `csrc/src/attn/fa2.cuh`, two tests. Every one of those citations is
-    /// into a file in the surviving crate, so they survive with it.
-    ///
-    /// **The constraint nobody had written down: an edit that INSERTS OR
-    /// REMOVES LINES in this file silently invalidates all of them.** There
-    /// is no compiler to catch it, because there is no compiler; there is no
-    /// pinned assertion over it either. A line-shifting edit here is the
-    /// cheapest way in this tree to turn thirty accurate citations into
-    /// thirty confident wrong ones. If it must be annotated, annotate at the
-    /// END of the file, past the last cited line.
-    ///
-    /// So the rule checked is every include of DEVICE text. A missing `.cuh`
-    /// is still a failure here, which is the case that costs a compile on a
-    /// machine with a GPU.
-    ///
-    /// # Why [`DEVICE_HEADERS`] and not [`LIBRARY`]
+    /// # Why [`ALL_HEADERS`] and not [`DEVICE_HEADERS`] or [`LIBRARY`]
     ///
     /// The role cut split one tree into two, and the includes cross the seam
     /// in both directions: `csrc/src/pie_fp8.cuh` reaches
@@ -652,16 +644,44 @@ mod tests {
     /// `csrc/src/pie_device.cuh`. Walking [`LIBRARY`] alone would check the
     /// first direction and stop checking the second on the day the second
     /// became possible — a test that got quieter because the tree got more
-    /// structure. Both groups are authored here, so both are held to it.
+    /// structure.
+    ///
+    /// [`DEVICE_HEADERS`] was the right denominator while the third group was
+    /// `csrc/vendor` and this test's subject was *what this crate authored*.
+    /// Internalising ended that distinction at the filesystem: there is no
+    /// vendor directory, every carried file is under `csrc/`, and the fifty-
+    /// eight relative directives the closure resolves among itself are now
+    /// this crate's problem to keep resolving. So the denominator is the
+    /// whole carried set.
+    ///
+    /// **Measured before widening: [`DEVICE_HEADERS`] leaves eleven quoted
+    /// spellings unchecked, and [`ALL_HEADERS`] resolves all of them.** The
+    /// eleven are the internalised closure's own cross-references — our
+    /// `attn/*.cuh` reaching `attn/flashinfer/attention/*.cuh` and
+    /// `attn/xqa/*.cuh`. Under the narrow set those eleven are not failures,
+    /// they are simply not looked at, which is the shape of green-while-blind
+    /// this file has already been found in five times.
+    ///
+    /// # The one thing this cannot check, and why it is angled
+    ///
+    /// `attn/attention_xqa_mha.cuh` includes `<attn/xqa/mha_sm90.cuh>` in
+    /// angle brackets, on purpose: that file is deliberately not carried, and
+    /// [`quoted_includes`] reads only `"…"`. The bracket style is how a
+    /// directive says *do not hold me to this*.
+    ///
+    /// **Measured across every angled include under `csrc/`** — forty-two
+    /// distinct spellings — **exactly two name something this set does not
+    /// carry**, and neither is an accident: that one, and
+    /// `<rng_contract.generated.h>` in `ptir/tier0.cuh`, which the build
+    /// generates. Every other angled spelling is a system or NVIDIA name that
+    /// [`SHIM`] answers. So the angle bracket is not a hole in this test; it
+    /// is a two-entry list, and both entries are written down here.
     #[test]
     fn every_device_include_resolves() {
-        for header in DEVICE_HEADERS {
+        for header in ALL_HEADERS {
             for included in quoted_includes(header.text) {
-                if included.ends_with(".hpp") || included.ends_with(".def") {
-                    continue;
-                }
                 assert!(
-                    DEVICE_HEADERS.iter().any(|h| h.name == included),
+                    ALL_HEADERS.iter().any(|h| h.name == included),
                     "`{}` includes `{included}`, which the set does not carry",
                     header.name
                 );

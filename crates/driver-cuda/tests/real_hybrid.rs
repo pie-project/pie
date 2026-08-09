@@ -40,7 +40,7 @@
 //! 0.6. A structural bug (a swapped binding, a wrong state slab) blows
 //! all four; bf16 accumulation passes them.
 
-#![cfg(all(feature = "_cuda", feature = "bridge"))]
+#![cfg(feature = "_cuda")]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

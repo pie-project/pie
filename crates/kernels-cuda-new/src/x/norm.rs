@@ -47,7 +47,7 @@
 //! **The other two are not units and never were.** `rmsnorm_tile.cuh` and
 //! `rmsnorm_rasr_tile.cuh` are `#include`d only by
 //! `csrc/src/tile_alternatives.cuh:366,368`, which is reached only from
-//! `tests/vendor_manifest.rs`. No row names a symbol in either, no
+//! `tests/upstream_manifest.rs`. No row names a symbol in either, no
 //! `include_str!` reads them, and nothing in `families/norm.rs` did. A root
 //! is a unit when something launches out of it; these are a comparison the
 //! vendor manifest compiles.

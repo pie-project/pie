@@ -169,11 +169,16 @@ pub enum Execution {
 ///
 /// # A step names a SYMBOL, never an execution
 ///
-/// [`Step::Fire`]`{ symbol: "attn::compact_page_csr", .. }` names a ROW. That row
-/// resolves its own [`Execution`], which may be [`Execution::Jit`],
-/// [`Execution::Service`], another [`Execution::Composed`], or -- today, for
-/// two of the four step symbols below -- nothing at all, because the symbol is
-/// a kernel nobody has migrated. Three consequences, and they are the design:
+/// [`Step::Fire`]`{ symbol: "attn::compact_page_csr", .. }` names a SYMBOL.
+/// That symbol resolves its own [`Execution`], which may be
+/// [`Execution::Jit`], [`Execution::Service`], another
+/// [`Execution::Composed`], or nothing at all.
+///
+/// **`compact_page_csr` NO LONGER HAS A ROW and this paragraph still holds**,
+/// which is the point of the heading: a step names a symbol, and what serves
+/// that symbol was never the step's business. [`crate::x::route`] answers it
+/// now, and answers `Entry` for this one. Three consequences, and they are
+/// the design:
 ///
 /// 1. **A step never mentions cuBLAS**, because it never mentions an
 ///    execution. Step one's rule -- *a row states which service serves it, and
@@ -362,6 +367,14 @@ pub struct Composition {
 /// | `norm::rmsnorm_bf16_with_fp16` | three arms on `y_fp16 == nullptr` and `rmsnorm_vec8_ok` | no -- one arm has no row |
 /// | `attn::write_kv_to_pages` | a throw, then a 5-way `switch (layer.scheme)`, one arm of which is itself two launches | no |
 /// | `attn::dequant_kv_cache_layer_to_bf16_active` | a 5-way `switch (layer.scheme)`, one launch each | no |
+///
+/// The table is the MEASUREMENT and not an index: every row still describes
+/// the launcher it was read off. FIVE of the ten have since crossed into
+/// fn-world, `attn::compact_page_csr` included -- its two launches are two
+/// statements in `x::attn::compact_page_csr`, with both refusals hoisted
+/// ahead of the first -- and the `switch` a "no" refused to state is an `if`
+/// in a `fn` now. That is the answer the column was asking for, arrived at by removing
+/// the question rather than by widening `Term`.
 ///
 /// # The open question step one left, answered by measurement rather than by
 /// the decision
@@ -736,7 +749,8 @@ pub static WALKED: &[Walk] = &[
     // Its entry said what its own retirement required: transcribe 772 lines
     // across three files that cannot be split, delete the
     // `table::driver_internal` row in the same commit, and rewrite
-    // `driver-cuda/tests/bridge_smoke.rs`'s hand-written
+    // `driver-cuda/tests/bridge_smoke.rs`'s hand-written (that file is
+    // deleted now, with `bind::abi::ffi`; this records what it did)
     // `ffi::pie_k_vision_qwen3vl_scatter` call — *"because that row's
     // launcher is `qwen3_vl_tower_c.cpp` and a shim entry forwarding to a
     // deleted launcher does not compile"*. All three happened together, and
@@ -806,181 +820,48 @@ pub static WALKED: &[Walk] = &[
     // field: these walks become Rust, so the citation moves from
     // `attention_flashinfer.cu` to `driver-cuda/src/fire/flashinfer_fa2.rs`.
     // That is an edit to two strings, not a reclassification. **IT HAS NOW
-    // HAPPENED.** All six FA2 launcher rows are on [`RUST_SERVED`],
-    // `attention_flashinfer.cu` and `plan_lifecycle.cpp` are deleted, and the
-    // `because` strings below cite the Rust. The C++ line numbers are kept
-    // INSIDE them, because a citation to a deleted file is still the only
-    // record of where a transcription came from.
-    Walk {
-        symbol: "attn::dispatch_attention_flashinfer_decode_capture",
-        control: Control::Switch { on: "cache.head_dim" },
-        refuses: &[
-            "`cache is empty; call plan_attention_flashinfer_decode_bf16 first` -- a dispatch \
-             against an unplanned cache reads a descriptor nobody wrote",
-            "`score sink is null` -- the capture's whole output. A dispatch that ran anyway \
-             would be the non-capturing kernel wearing this symbol's name",
-            "`attention score capture does not support logits_soft_cap` -- the hook would \
-             record `cap*tanh(s/cap)`, which is not the pre-softmax score H2O/TOVA define \
-             their eviction policy over",
-            "`attention score capture does not support sliding-window attention` -- \
-             `LogitsMask` runs after `LogitsTransform`, so the captured row would include \
-             positions the softmax discards",
-            "`flashinfer decode capture dispatch: unsupported head_dim` -- \
-             `throw_unsupported_head_dim` is the `switch`'s `default`, and it is the reason \
-             this is a walk: the arms come from `src/kernels.def` and the discriminant \
-             arrives at run time",
-        ],
-        because: "`driver-cuda/src/bind/service.rs::attn_dispatch_attention_flashinfer_\
-                  decode_capture`, over `fire::flashinfer_fa2_dispatch::decode_capture` and \
-                  `fire::flashinfer_fa2::fire_decode` -- a KV dequant of the active pages \
-                  (`fire::kv_paged`), the capture arm cascade, one `fire_raw` of a \
-                  `families::fa2` symbol with a `DecodeScoreParams` by value, then one \
-                  post-kernel of ours. THE POST-KERNEL IS A ROW: \
-                  `attn::attn_score_normalize`, in `families::attn`'s `ATTN_SCORE_POST` \
-                  unit, `LaunchRule::Unstated` with `dim3(num_requests, num_q_heads) x 256` \
-                  quoted on it, fired by `driver-cuda/src/fire/attn_score.rs`. The half that \
-                  `new-horizon.md` §53.6 specified as missing -- the FA2 instantiation with \
-                  the capture sink as a TEMPLATE ARGUMENT -- is `families::fa2`'s \
-                  `DecodeArm::{CaptureFull, CaptureWindow}` and the params mirror is \
-                  `fa2::params::DecodeScoreParams`. Transcribed from \
-                  `driver-cuda/csrc/attn/attention_flashinfer.cu:532-594` (deleted), which \
-                  was moved verbatim from \
-                  `kernels-cuda/csrc/src/attn/attention_flashinfer.cu:696-816`",
-    },
-    Walk {
-        symbol: "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-        control: Control::Switch { on: "cache.head_dim" },
-        refuses: &[
-            "`cache is empty; call plan_attention_flashinfer_prefill_bf16 first`",
-            "`score sink is null` -- three buffers, and the fold's output is one of them",
-            "`prefill score capture needs a positive observation window` -- SnapKV's window is \
-             the row count, and zero rows is not an empty answer",
-            "`prefill score capture is not implemented for the SM90 kernel; plan without it \
-             (the planner honours wants_prefill_score)` -- THE EXPLICIT SM90 REFUSAL. The \
-             Hopper kernel takes a different variant API, so a silent fallthrough would run \
-             attention with no capture and hand the policy an all-zero row, which reads as \
-             \"nothing was attended to\" and evicts the whole prefix",
-            "`prefill score capture does not support logits_soft_cap` -- the decode refusal, \
-             for SnapKV rather than H2O",
-            "`prefill score capture does not support sliding-window attention` -- same \
-             `LogitsMask`-after-`LogitsTransform` ordering",
-            "`prefill score capture requires the full-attention variant`",
-            "`flashinfer prefill capture dispatch: unsupported head_dim` -- the `switch`'s \
-             `default`, again from `src/kernels.def`",
-        ],
-        because: "`driver-cuda/src/bind/service.rs::attn_dispatch_attention_flashinfer_\
-                  prefill_capture_bf16`, over `fire::flashinfer_fa2_dispatch::\
-                  prefill_capture` and `fire::flashinfer_fa2::fire_prefill` -- the guards \
-                  above, `make_prefill_params` (now one Rust function all four prefill \
-                  dispatches share), one `fire_raw` of a `families::fa2` symbol with a \
-                  `PrefillScoreParams` by value, then TWO post-kernels of ours. BOTH ARE \
-                  ROWS: `attn::attn_prefill_score_normalize` on `dim3(nr, nh, window) x 256` \
-                  and `attn::attn_prefill_score_fold` on `dim3(nr, 32u) x 256`, in \
-                  `families::attn`'s `ATTN_SCORE_POST`, fired by \
-                  `driver-cuda/src/fire/attn_score.rs`. The `32u` is the second literal grid \
-                  axis in the tree and the first is `attn_score_fold_heads`' `64u` -- \
-                  DIFFERENT literals in one file, which is why neither is a `LaunchRule` and \
-                  both are carried as named constants in the caller. THE SM90 REFUSAL ABOVE \
-                  IS NOW STRUCTURAL: `Decline::Sm90Unported` refuses ANY prefill against an \
-                  SM90 plan, capture or not, because the SM90 launcher is not in this \
-                  lattice. Transcribed from \
-                  `driver-cuda/csrc/attn/attention_flashinfer.cu:831-933` (deleted), which \
-                  was moved verbatim from \
-                  `kernels-cuda/csrc/src/attn/attention_flashinfer.cu:995-1097`",
-    },
-    // ── the four FA2 launcher rows that were never `Walk` and had to be ───
+    // HAPPENED, TWICE.** First the six went to [`RUST_SERVED`] and the
+    // `because` strings were repointed at the Rust; then the rows went too
+    // and the entries left this list entirely. The C++ line numbers are kept
+    // inside the [`SERVED`] sentences that replaced them, because a citation
+    // to a deleted file is still the only record of where a transcription
+    // came from -- and note which half survived the second move: the line
+    // numbers, which are about the KERNEL, and not the module paths, which
+    // are about the tree.
+    // ── AND ALL SIX ARE GONE, BECAUSE THEY ARE DRIVER OPS ───────────────
     //
-    // `RUST_SERVED`'s invariant is that a taken-over row was classified
-    // first, and these four were not classified at all: the two capture rows
-    // above were, because they were the two that made `Execution` grow its
-    // fourth arm, and the four plain ones were left because nothing had yet
-    // taken them over. Taking them over is what requires the classification,
-    // and the classification is the same one for the same reason -- host
-    // control flow the DRIVER owns, over kernels that are not ours.
+    // Six `Walk`s stood here -- the two capture dispatches this arm was
+    // added for, and the four plain launchers added beside them. They are
+    // now [`SERVED`] entries with `Service::DriverOp`, and the reason is not
+    // that the classification above was wrong. Every sentence of it still
+    // holds: the geometry comes from a plan built at run time, the symbol
+    // names a host program over several kernels, and none of that is `Jit`,
+    // `Composed` or `Service` in the linked-library sense.
     //
-    // Their `refuses` lists are shorter than the capture pair's and that is a
-    // fact about the C++, not an omission: a non-capturing dispatch has no
-    // sink to be null and no variant it cannot compose with.
-    Walk {
-        symbol: "attn::dispatch_attention_flashinfer_decode",
-        control: Control::Switch { on: "cache.head_dim" },
-        refuses: &[
-            "`cache is empty; call plan_attention_flashinfer_decode_bf16 first` -- a \
-             dispatch against an unplanned cache reads a descriptor nobody wrote",
-            "`flashinfer decode dispatch: unsupported head_dim` -- the `switch`'s \
-             `default`, from `src/kernels.def`. In Rust it is \
-             `Decline::DecodeLatticePoint`, which names the GQA group too, because the \
-             lattice is indexed by both",
-        ],
-        because: "`driver-cuda/src/bind/service.rs::attn_dispatch_attention_flashinfer_\
-                  decode`, over `fire::flashinfer_fa2_dispatch::decode` and \
-                  `fire::flashinfer_fa2::fire_decode` -- a KV dequant of the active pages, \
-                  the three-arm variant cascade (`decode_arm`, whose ORDER is load-bearing: \
-                  a windowed layer with a soft cap takes the soft-cap arm), then one \
-                  `fire_raw` with a `DecodeParams` by value. Transcribed from \
-                  `driver-cuda/csrc/attn/attention_flashinfer.cu:490-522, 660-692` (deleted)",
-    },
-    Walk {
-        symbol: "attn::dispatch_attention_flashinfer_prefill_bf16",
-        control: Control::Switch { on: "cache.head_dim" },
-        refuses: &[
-            "`prefill dispatch requires a prepared plan`",
-            "`this plan is an SM90 plan and the SM90 launcher is not part of this lattice` \
-             -- the C++ FORWARDED here, to `dispatch_attention_flashinfer_prefill_sm90_bf16` \
-             in `kernels-cuda`'s hopper unit. That launcher was never in the deleted file, \
-             so this is a routing gap and not a numerics one, and §44.7 -- every sm_90 claim \
-             in this migration is argued from the call graph and none from a run -- is why \
-             it refuses rather than guessing",
-            "`flashinfer prefill dispatch: unsupported head_dim` -- in Rust \
-             `Decline::PrefillLatticePoint`, which names `CTA_TILE_Q` and `NUM_MMA_KV` too, \
-             because the prefill lattice is indexed by all three",
-        ],
-        because: "`driver-cuda/src/bind/service.rs::attn_dispatch_attention_flashinfer_\
-                  prefill_bf16`, over `fire::flashinfer_fa2_dispatch::prefill` and \
-                  `fire::flashinfer_fa2::fire_prefill`. The `DISPATCH_NUM_MMA_KV` switch \
-                  (`utils.cuh:116-133`) does NOT survive as a switch: the archive \
-                  instantiated all four points because the choice came from a device query, \
-                  and `fa2::PrefillGeometry::derive` makes the query once on the host so the \
-                  fire names ONE unit. That is the largest single saving of this migration \
-                  and it is invisible in the row count. Transcribed from \
-                  `driver-cuda/csrc/attn/attention_flashinfer.cu:776-836` (deleted)",
-    },
-    Walk {
-        symbol: "attn::attention_flashinfer_prefill",
-        control: Control::Switch { on: "cache.head_dim" },
-        refuses: &[
-            "`flashinfer prefill: unsupported head_dim` -- `attn_head_dim_instantiated`, \
-             checked before the plan rather than in the dispatch",
-            "the planner's own refusals, which this row meets and the plan-taking rows do \
-             not: it PLANS AND FIRES in one call, so a workspace too small for the \
-             descriptor is its refusal too",
-        ],
-        because: "`driver-cuda/src/bind/service.rs::attn_attention_flashinfer_prefill` -- \
-                  the PLANLESS prefill, which builds a `PrefillPlanCache` on the spot, fires \
-                  from it and drops it. `attention_flashinfer.cu:935-1075` (deleted) did \
-                  exactly this with a function-local `PrefillPlanCache`; the Rust holds one \
-                  in a `Mutex` beside the row so the descriptor buffers are not \
-                  reallocated per call, which is the same trade `indptr_h_buf` records one \
-                  layer down. It is `causal = true` and `full_attention_variant = false`, \
-                  from the C++'s own call",
-    },
-    Walk {
-        symbol: "attn::dispatch_attention_flashinfer_prefill_custom",
-        control: Control::Switch { on: "cache.head_dim" },
-        refuses: &[
-            "`custom prefill dispatch requires a prepared non-SM90 plan` -- ONE `if` over \
-             both conditions in the C++, two `Decline`s in Rust",
-            "`flashinfer prefill custom dispatch: unsupported head_dim`",
-        ],
-        because: "`driver-cuda/src/bind/service.rs::attn_dispatch_attention_flashinfer_\
-                  prefill_custom`, over `fire::flashinfer_fa2_dispatch::prefill_custom`. \
-                  Two arms, `PrefillArm::{Custom, CustomSoftcap}`, and NO causal axis -- the \
-                  mask IS the causality, so a custom dispatch that also set `CAUSAL` would \
-                  mask twice. `window_left` is written `-1` for the same reason and NOT \
-                  taken from the cache, which is the one place the params filler's \
-                  cache-sourced window is overwritten. Transcribed from \
-                  `driver-cuda/csrc/attn/attention_flashinfer.cu:1115-1224` (deleted)",
-    },
+    // What changed is the QUESTION this file is asked. `x::route` reads
+    // [`SERVED`] as the driver-op oracle -- `Service::DriverOp` says *"the
+    // driver already fires this"* -- and there is no route a `Walk` produces.
+    // The six rows left `table::attn` in the same commit, so the alternative
+    // was `Route::Rows` against a row that no longer exists. `x::gemm`'s
+    // twelve made this move first and `moe::build_moe_ptrs_aligned_bf16`
+    // made it from a `Walk` exactly as these do, under the test that refuses
+    // both at once: **a walk and a service are two answers to one question.**
+    //
+    // The RESOURCE each names is `DecodePlanCache` / `PrefillPlanCache`,
+    // boxed and mutable and living across fires -- §3.3's forbidden surface,
+    // which is the driver-op test answered in one line. Five of the six
+    // answer it that way. `attn::attention_flashinfer_prefill` does NOT, and
+    // its entry below says so rather than borrowing its siblings' reason.
+    //
+    // AND THE `refuses` LISTS ARE NOT LOST PROSE. Each was a transcription
+    // of a C++ `throw` string, and every one of them is now a variant of
+    // `driver-cuda/src/fire/flashinfer_fa2_dispatch::Decline` --
+    // `Unplanned`, `Sm90Unported`, `DecodeLatticePoint`,
+    // `PrefillLatticePoint`, `CaptureSinkMissing`,
+    // `CaptureVariantUnsupported`, `Geometry`. A list of strings beside the
+    // code goes stale in silence; an enum the code returns cannot. That is
+    // the whole argument for letting the entries go instead of repointing
+    // them, and it is the one `moe`'s nine were repointed against.
     // ── the dense bf16 GEMM and its autotuner ─────────────────────────────
     //
     // THE HOTTEST ROW IN THE TREE, and the last thing `gemm.cpp` was holding.
@@ -1175,18 +1056,30 @@ pub static WALKED: &[Walk] = &[
     // fallback a walk could only DESCRIBE was one an implementation could
     // silently take.
     //
-    // ITS OTHER ARM IS WHY `moe::build_moe_ptrs_aligned_bf16` IS A DRIVER
-    // OP, and the cross-link is worth a sentence because the two entries sat
-    // 200 lines apart and neither of them said it. The arm this symbol takes
-    // when `supported()` refuses is BATCHED cuBLAS, and batched cuBLAS is
-    // the only reader of the six device pointer arrays that build produces.
-    // That reader is a LOWERING of this symbol and not a statement of it:
-    // the grouped GEMM's operand list is `(a, weight_base, c, expert_ids)`
-    // and names no pointer array anywhere. Six results with no stated
-    // consumer are six values `lower.rs:1911`'s liveness frees at the first
-    // op past the build, so declaring them would hand the fallback bytes the
-    // next allocation owns — a wrong answer, not a refusal. The arrays are
-    // the driver's arena instead, and [`SERVED`] carries the symbol.
+    // AND THE SWITCH IS BACK, one level down, WHICH IS WHERE A WALK ALWAYS
+    // SAID IT WAS. This symbol is a driver op now — see [`SERVED`] — and its
+    // body, `driver-cuda/src/fire/moe_grouped.rs`, is the two-armed choice
+    // this walk described: `supported()` yes fires the WMMA kernel, no calls
+    // `x::gemm::dense::batched_act_x_wt_bf16` over the pointer arrays. What
+    // changed between the walk and the body is the only thing that ever
+    // mattered: the walk was a DESCRIPTION nothing checked, and the body is
+    // the code, so the arm that used to be prose is now a `match` the
+    // compiler reads. The bind that stood between the two served exactly one
+    // side of the predicate.
+    //
+    // ITS OTHER ARM IS ALSO WHY `moe::build_moe_ptrs_aligned_bf16` IS A
+    // DRIVER OP, and the cross-link is worth a sentence because the two
+    // entries sat 200 lines apart and neither of them said it. The arm this
+    // symbol takes when `supported()` refuses is BATCHED cuBLAS, and batched
+    // cuBLAS is the only reader of the six device pointer arrays that build
+    // produces. That reader is a LOWERING of this symbol and not a statement
+    // of it: the grouped GEMM's operand list is `(a, weight_base, c,
+    // expert_ids)` and names no pointer array anywhere. Six results with no
+    // stated consumer are six values `lower.rs:1911`'s liveness frees at the
+    // first op past the build, so declaring them would hand the fallback
+    // bytes the next allocation owns — a wrong answer, not a refusal. The
+    // arrays are the driver's arena instead, and [`SERVED`] carries both
+    // symbols: the one that fills them, and this one, which reads them.
 
     // ── sample: an occupancy query, a growing scratch, and two kernels ────
     //
@@ -1481,18 +1374,54 @@ pub static WALKED: &[Walk] = &[
     //   got STRONGER: a walk's refusal list is prose a reader checks, and a
     //   `#[must_use] Fired::Declined` is a value the caller cannot drop.
     //
-    // WHAT THIS LEAVES FOR THE LAST CROSSING. [`WALKED`] is 24 entries and
-    // all 24 are `attn::`. When `attn` crosses, this list is EMPTY and
-    // `Walk::agrees` is never called on anything — a check of the empty set,
-    // exactly as `the_driver_internal_rows_are_not_statable` was before
-    // `table/mod.rs` retired it — while `no_control_shape_is_unevidenced`
-    // goes RED in that same edit, because every member of every shape will
-    // be gone. That is correct behaviour and not a chore: a shape enum whose
-    // variants have no evidence is vocabulary admitted on nobody's word, and
-    // that test exists to say so out loud rather than to pass vacuously. The
-    // edit that empties this list should delete `Control`, `Walk` and
-    // `Execution::Walk` with it, on the same argument this block makes for
-    // nine entries.
+    // WHAT THIS LEFT FOR THE LAST CROSSING, AND WHAT THE LAST CROSSING DID.
+    // [`WALKED`] was ONE entry — `attn::qkv_decode_qk_norm_rope_write_kv_\
+    // bf16` — and it is EMPTY now. `Walk::agrees` is never called on
+    // anything, exactly as `the_driver_internal_rows_are_not_statable` was
+    // before `table/mod.rs` retired it, and `no_control_shape_is_unevidenced`
+    // would have gone RED in the same edit, because every member of every
+    // shape is gone. That is correct behaviour and not a chore: a shape enum
+    // whose variants have no evidence is vocabulary admitted on nobody's
+    // word, and that test exists to say so out loud rather than to pass
+    // vacuously.
+    //
+    // **"24 entries and all 24 are `attn::`" WAS NEVER TRUE OF THIS LIST.**
+    // Re-derived two ways at `2dc9957b7` — a regex over `symbol:` inside the
+    // bracket-matched static, and an `awk` counting `^    Walk {` between
+    // `^pub static WALKED` and `^];` — and both answer ONE. §75, in the
+    // sentence that was measuring the thing it stood next to.
+    //
+    // THE INSTRUCTION THIS BLOCK GAVE — *"the edit that empties this list
+    // should delete `Control`, `Walk` and `Execution::Walk` with it"* — WAS
+    // MEASURED AND DEFERRED, and the measurement is the useful half:
+    //
+    //   LIVE CODE           `tests/layers.rs` :326 (a match arm) and :365.
+    //                       `:655`'s `matches!(first, Execution::Walk(_))`
+    //                       WAS the third and is REPAIRED — see the note
+    //                       there. It was red for several arcs and nothing
+    //                       said so, which is the property that makes this
+    //                       deletion worth doing rather than deferring
+    //                       again: a walk is the one executor that can be
+    //                       retracted without any list going empty, because
+    //                       `WALKED` losing its last member is not a
+    //                       compile error.
+    //   INTRA-DOC LINKS     `x/gemm.rs` :293, :298, :306 link
+    //                       [`crate::execution::Walk`], `Walk::refuses` and
+    //                       [`crate::execution::Control`] BY PATH, so
+    //                       deleting the types breaks four rustdoc links in
+    //                       a file this pass does not own
+    //   PROSE               ~30 further citations across
+    //                       `x/{gemm,moe,ssm,driver_internal,attn}.rs`,
+    //                       `device.rs`, `families/{attn,graph}.rs`,
+    //                       `bind/service.rs`, `fire/mod.rs` and
+    //                       `kernels-cuda/tests/sources.rs`
+    //
+    // So the deletion is a six-file edit across three ownership grants, and
+    // `Walk`/`Control` are the ROW WORLD's vocabulary — a walk classifies a
+    // row the row world still interprets — so they retire with the row
+    // interpreters in step 6, as one deletion rather than three.
+    // `no_control_shape_is_unevidenced` carries the tripwire meanwhile: it
+    // returns early on an empty list and says why there.
 
 
     // ── ssm/nemotron_h.cu's last two — GONE, and not to a walk ──────────
@@ -1523,167 +1452,67 @@ pub static WALKED: &[Walk] = &[
     // `nemotron_h.cuh` names the `_dev_` form and the model text names the
     // other, and a rename would break one of the two.
 
-    // ── the two native KV appenders, and the dequantiser below them ──────
+    // ── THE THREE `attn/kv_paged.cu` WALKS ARE RETRACTED ─────────────────
     //
-    // `attn/kv_paged.cu` IS DELETED, and the entry three below is the one
-    // that deleted it. All three moved LANGUAGE, not archive:
-    // `driver-cuda/src/fire/kv_paged.rs` is the program now. Read the C++ at
-    // any commit before this one — `write_kv_to_pages` at `:109`,
-    // `write_kv_explicit_bf16` at `:304`,
-    // `dequant_kv_cache_layer_to_bf16_active` at `:191`.
+    // `attn::write_kv_to_pages`, `attn::write_kv_explicit_bf16` and
+    // `attn::dequant_kv_cache_layer_to_bf16_active` have CROSSED INTO
+    // FN-WORLD — `x::attn`'s `WRITE_KV_TO_PAGES`, `WRITE_KV_EXPLICIT` and
+    // `DEQUANT_KV_ACTIVE`, over the `attn/kv_paged` unit, with their host
+    // programs in `x::attn::kv_paged`. Their `table/attn.rs` rows are gone
+    // and §52.11 requires the retraction: a walked symbol must satisfy
+    // `unit_of(sym).is_none()`, and all three now host device text.
     //
-    // WHY EITHER APPENDER IS A WALK AND NOT A COMPOSITION.
-    // `Composition::agrees` requires a fixed SEQUENCE: two or more steps,
-    // every step one launch, every operand of every step filled from the
-    // composed row by index. Neither of these is that. `write_kv_to_pages`
-    // chooses among five cache schemes and one of the five arms is itself
-    // two launches; `write_kv_explicit_bf16` fires a SECOND launch only when
-    // the layer carries envelopes, which is a run-time property of the cache
-    // and not a step in a sequence. A composition that spelled either would
-    // be a sequence that is not always run, which is the one thing a
-    // sequence may not be.
-    Walk {
-        symbol: "attn::write_kv_to_pages",
-        control: Control::Switch { on: "layer.scheme" },
-        refuses: &[
-            "`write_kv_to_pages: partial (first_token) writes require the native bf16 \
-             cache` -- `kv_paged.cu:130-134`, a `throw`, so a PANIC naming the symbol and \
-             not a decline: a non-zero `first_token` means the leading rows were written \
-             by a fused kernel that exists only for the native cache, and a partial write \
-             on any other scheme leaves the prefix holding garbage from `k_curr` rows \
-             nobody filled",
-            "`total_tokens <= 0` -- an empty fire, declined rather than launched as a \
-             `<<<0, 256>>>` no-op, because the quantised arms multiply that extent into \
-             two- and three-axis grids and a zero grid stated three ways is three chances \
-             to state it wrong",
-            "`KvCacheScheme::Native` reached at the switch -- `kv_paged.cu:212-213`, \
-             `case KvCacheScheme::Native: break;`, which the C++ could reach only for a \
-             cache declaring native storage in a dtype that is not bf16. Nothing is \
-             launched in either language",
-        ],
-        because: "`x::attn::kv_paged::write_kv_to_pages` (MOVED out of \
-                   `driver-cuda/src/fire/kv_paged.rs`), ported from \
-                  `kernels-cuda/csrc/src/attn/kv_paged.cu:109-153` (now deleted). One \
-                  `if (layer.is_native_bf16())` over two programs: the native arm fires \
-                  `attn::write_kv_bf16#hnd` or `#nhd` on a grid of \
-                  `total_tokens - first_token` and then, when `has_envelopes() && \
-                  !hnd_layout && total_tokens > 0`, `layout::envelope_update_appended_bf16` \
-                  over a host-computed `max_touched`; the other arm is the five-way \
-                  `switch (layer.scheme)` at `:155-215`, whose Int8/Fp8 per-token-head \
-                  arms carry a dynamic shared allocation of `2 * (BLOCK / 32) * \
-                  sizeof(float)` and whose Fp4 arm computes a third grid axis from \
-                  `block_size`. `examples/migration_status.rs` recorded this row's wall as \
-                  `Wall::SchemeSwitch` and that reading was right about the finding: no \
-                  row can state it. A walk can.",
-    },
-    Walk {
-        symbol: "attn::write_kv_explicit_bf16",
-        control: Control::Switch { on: "layer.has_envelopes() && !layer.hnd_layout" },
-        refuses: &[
-            "`write_kv_explicit_bf16 requires native bf16 KV cache` -- \
-             `kv_paged.cu:314-317`, a `throw`, so a PANIC naming the symbol. It is a \
-             condition on the CALLER and not on the launch: the explicit descriptor names \
-             a page and an offset in elements, and there is no quantised addressing for it \
-             to mean anything under",
-            "`B <= 0` -- `kv_paged.cu:320`, an empty descriptor, declined silently in the \
-             C++ and declined by value here",
-        ],
-        because: "`x::attn::kv_paged::write_kv_explicit_bf16` (MOVED out of \
-                   `driver-cuda/src/fire/kv_paged.rs`), ported from \
-                  `kernels-cuda/csrc/src/attn/kv_paged.cu:304-352` (now deleted). A throw, \
-                  an empty-extent decline, an instantiation choice on `layer.hnd_layout` \
-                  over `attn::write_kv_explicit_bf16_dev#hnd`/`#nhd` at `<<<B, 256>>>`, \
-                  and then a CONDITIONAL second launch: `if (layer.has_envelopes() && \
-                  !layer.hnd_layout)` fires `layout::envelope_merge_written_bf16`, which \
-                  is itself one launch or two on `num_tokens <= 128`. The CSR-derived \
-                  refresh `write_kv_to_pages` uses cannot be reused -- there is no page \
-                  list here, only the per-token descriptor the program wrote -- which is \
-                  why the envelope tier has two merge points. The device rows carry the \
-                  `_dev` suffix so this symbol satisfies §52.11 (`unit_of` is \
-                  `None` for a walked symbol); see `families/attn.rs` for that split.",
-    },
-    // ── the dequantiser, and with it `attn/kv_paged.cu` ITSELF ───────────
+    // Same shape as `layout::embed`'s retraction below: the classification
+    // stopped existing rather than becoming false. A `Walk` says *this
+    // symbol's host program is a branch no row can state*; a `fn` IS that
+    // branch, written in the language the branch was always in, so there is
+    // nothing left to classify.
     //
-    // THE LAST FOUR `<<<>>>` IN ANY `.cu` OF THE ARCHIVE. When the two
-    // appenders above left, this file kept 284 lines holding exactly one
-    // function, and its four launches were the whole of what
-    // `kernels-cuda/tests/sources.rs` counts — 401 at the start of this
-    // migration, four here, and zero when this entry landed.
+    // WHAT THE THREE ENTRIES ARGUED, kept because each is still true of the
+    // program and would otherwise have to be rediscovered:
     //
-    // ZERO OVER `.cu`, AND THAT IS THE CLAIM. It is not yet zero over what
-    // nvcc compiles: `attn/attention_mla.cu:17` includes
-    // `kernels-cuda-new/csrc/src/attn/attention_mla_naive.cuh`, which holds
-    // two host launchers at `:266` and `:725` that the `.cu`-only scan never
-    // opens. They are the XQA/MLA pass's and are named here so this entry
-    // cannot be read as claiming more than it measured; `sources.rs` states
-    // the same two at `EXPECTED`.
+    //   * WHY A WALK AND NEVER A COMPOSITION, argued three times here.
+    //     `Composition::agrees` requires a fixed SEQUENCE — two or more
+    //     steps, every step one launch, every operand filled from the
+    //     composed row by index. `write_kv_to_pages` chooses among five
+    //     cache schemes and one of the five arms is itself two launches;
+    //     `write_kv_explicit_bf16` fires a second launch only when the layer
+    //     carries envelopes, which is a run-time property of the cache and
+    //     not a step; the dequant is five arms of which exactly one runs.
+    //     **A composition that spelled any of them would be a sequence that
+    //     is not always run, which is the one thing a sequence may not be.**
     //
-    // WHY IT COULD NOT LEAVE WITH ITS SIBLINGS, which is the whole reason
-    // this entry is separate. `fire/kv_paged.rs`' own header states the rule:
-    // *do not transcribe a live switch into a second language until the first
-    // copy is dead or dies in the same change* — *"the copy that is NOT
-    // called is the one that drifts."* This switch had four live C++ callers
-    // in `driver-cuda/csrc/attn/attention_flashinfer.cu` (`:648`, `:675`,
-    // `:1098`, `:1244`), C++ calling C++ by symbol with no shim between and
-    // therefore nothing a Rust dispatch could intercept. Only the FA2 host
-    // program moving to Rust emptied that set, and it did: the four call
-    // sites are `bind::service`'s four FA2 entry points calling
-    // `fire::kv_paged::dequant_kv_cache_layer_to_bf16_active` directly, and
-    // the file that held them is deleted. The prohibition was discharged by
-    // the thing it was waiting for rather than overridden.
+    //   * WHY NOT A `Specialisation`: the discriminant is a FIELD of
+    //     `Ty::KvCacheLayerView`, which is `device::Fact::Opaque`, and no
+    //     `Term` reads a struct field. §26.9 names these symbols for exactly
+    //     that. The five `Specialisation`s this family DID carry were over
+    //     `hnd_layout` and turned out to be a second copy of a decision the
+    //     driver had always made in Rust; `device::SPECIALISED` is empty.
     //
-    // WHY A WALK AND NOT A COMPOSITION, for the third time and the same
-    // reason: `Composition::agrees` wants a fixed SEQUENCE, and this is five
-    // arms of which exactly one runs. WHY NOT A `Specialisation`: the
-    // discriminant is a FIELD of `Ty::KvCacheLayerView`, which is
-    // `device::Fact::Opaque`, and no `Term` reads a struct field. This
-    // module's own §26.9 paragraph names this symbol and
-    // `attn::write_kv_to_pages` together for exactly that.
-    Walk {
-        symbol: "attn::dequant_kv_cache_layer_to_bf16_active",
-        control: Control::Switch { on: "layer.scheme" },
-        refuses: &[
-            "`layer.is_native_bf16()` -- `kv_paged.cu:197`, a `return` and not a throw: a \
-             cache that already stores bf16 has nothing to widen, and the bf16 planes the \
-             attention kernels read are the storage planes. Declined by value here",
-            "`num_pages_in_batch <= 0` -- the other half of `:197`. An empty batch is \
-             nothing to dequantise FROM, and the alternative is a `<<<0, 256>>>` whose \
-             extent was computed by multiplying that zero through a page geometry: a zero \
-             grid stated the long way is a chance to state it wrong",
-            "`KvCacheScheme::Native` reached at the switch -- `kv_paged.cu:257-258`, \
-             `case KvCacheScheme::Native: break;`. UNREACHABLE in the C++, because `:197` \
-             returned on `is_native_bf16()` before the switch ran, and reachable here only \
-             for a cache declaring `Native` storage in a dtype that is not bf16. Nothing is \
-             launched in either language, and it is a distinct `QuantisedDecline` from the \
-             two above so the impossible case cannot be read as the empty one",
-        ],
-        because: "`x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active` (MOVED out \
-                   of `driver-cuda/src/fire/kv_paged.rs`), \
-                  ported from `kernels-cuda/csrc/src/attn/kv_paged.cu:191-261`, which is \
-                  DELETED WITH THIS ENTRY -- the file held nothing else. One guard at \
-                  `:197`, then ONE grid for all four arms: `page_elems = page_size * \
-                  num_kv_heads * head_dim`, `logical_n = (long long)num_pages_in_batch * \
-                  page_elems` -- the widen at `:201` is load-bearing and travels with the \
-                  port, because a page count times a page's elements overflows 32 bits at \
-                  production page counts -- and `blocks = ceil(logical_n / 256)`. All four \
-                  launches are `<<<blocks, 256, 0, stream>>>` at `:209`, `:219`, `:231` and \
-                  `:246`, so the geometry is computed once and no arm restates it. The \
-                  arms: `Fp8PerTensor` delegates to the already-ported \
-                  `dequant_fp8_per_tensor_pages_active`, whose `storage_dtype == FP8_E5M2 ? \
-                  __NV_E5M2 : __NV_E4M3` ternary is the argument `kernels::Ty::Fp8Kind` \
-                  exists to carry; `Fp8PerTokenHead` and `Int8PerTokenHead` are the same \
-                  eleven operands over `attn::dequant_{fp8,int8}_per_token_head_pages_\
-                  active_bf16`, two symbols and not one template because the page planes \
-                  are `U8s` and `I8s` and one row could not say which \
-                  (`families/attn.rs:3705-3706`); `Fp4Block` is the only arm with a twelfth \
-                  operand, `block_size > 0 ? block_size : 16`, which is NVFP4's own block \
-                  and the kernel's default rather than a policy. What did NOT come across \
-                  is `:260`'s `CUDA_CHECK(cudaGetLastError())`: `hand::fire` reports a \
-                  launch failure against the symbol it fired, which is strictly more than \
-                  a sticky error attributing the fault to whichever of four kernels ran \
-                  last, and a synchronous check would serialise a path that runs once per \
-                  layer per step.",
-    },
+    //   * WHY THE DEQUANT COULD NOT LEAVE WITH ITS SIBLINGS, and the rule it
+    //     was obeying: *do not transcribe a live switch into a second
+    //     language until the first copy is dead or dies in the same change*
+    //     — *"the copy that is NOT called is the one that drifts."* This
+    //     switch had four live C++ callers in
+    //     `driver-cuda/csrc/attn/attention_flashinfer.cu`, C++ calling C++
+    //     by symbol with no shim between and therefore nothing a Rust
+    //     dispatch could intercept. The FA2 host program moving to Rust
+    //     emptied that set; the prohibition was discharged by the thing it
+    //     was waiting for rather than overridden. Those four call sites are
+    //     `bind::service`'s four FA2 entry points, and they now call
+    //     `x::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active` — which
+    //     is why that body is a `pub fn` and not an arm's private one.
+    //
+    //   * WHAT DID NOT COME ACROSS, and deliberately: `:260`'s
+    //     `CUDA_CHECK(cudaGetLastError())`. `hand::fire` reports a launch
+    //     failure against the symbol it fired, which is strictly more than a
+    //     sticky error attributing the fault to whichever of four kernels
+    //     ran last, and a synchronous check would serialise a path that runs
+    //     once per layer per step.
+    //
+    // The throws are still throws and the declines are still declines; the
+    // declines gained information, because `Refusal` can carry two reasons
+    // where `kv_paged.cu:197`'s `if (a || b) return;` could carry none.
     // ═══ `attn/mla_paged.cu` — BOTH LAUNCHERS, IN ONE CHANGE ═════════════
     //
     // Both are `Supplies`, and both supply values that come out of a
@@ -1717,137 +1546,120 @@ pub static WALKED: &[Walk] = &[
     // the host program, and the `table::attn` row and the `RUST_SERVED`
     // entry went in the same change. `driver-cuda/src/fire/dsv4_compress.rs`
     // keeps the other three.
-    Walk {
-        symbol: "attn::dsv4_boundary_meta_decode",
-        control: Control::Supplies { what: "the grid, ceil(n / 128), from an element count the kernel also reads as a bound" },
-        refuses: &[
-            "`n <= 0` -- an empty batch",
-            "`ratio <= 0` -- the compression ratio divides a position, and a non-positive one is a division this launcher will not reach",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/dsv4_compress.cu:121-150` -- one launch of \
-                  `dsv4_boundary_meta_decode` at `:141` over `<<<ceil(n/128), 128>>>`, \
-                  computing each decode row's compressed-block boundary metadata. \
-                  `LaunchRule::Elementwise` states the rectangle and the device row \
-                  already carried it; what blocked the takeover was the SYMBOL, which unit \
-                  and table both spelled `attn::dsv4_boundary_meta_decode`. Device row \
-                  renamed `_dev` (§60.6). Row unsourced -- `record_many` passes an empty \
-                  parameter list, so `ratio` has no `Source::Param` to name -- which makes \
-                  this §60.7's case. Now `driver-cuda/src/fire/dsv4_compress.rs`",
-    },
-    Walk {
-        symbol: "attn::dsv4_boundary_meta_paged",
-        control: Control::Supplies { what: "the grid, ceil(n / 128), as its decode twin" },
-        refuses: &[
-            "`n <= 0` -- an empty batch",
-            "`ratio <= 0` -- a non-positive compression ratio",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/dsv4_compress.cu:138-171` -- one launch of \
-                  `dsv4_boundary_meta_paged` at `:163`. The prefill form of the decode \
-                  twin: same geometry, same guard, and it differs only in resolving the \
-                  request index by a binary search over `qo_indptr` instead of \
-                  shortcutting it to the token index. Device row renamed `_dev` (§60.6); \
-                  row unsourced. Now `driver-cuda/src/fire/dsv4_compress.rs`",
-    },
-    Walk {
-        symbol: "attn::attention_compressed_paged_bf16",
-        control: Control::Supplies { what: "the DYNAMIC SHARED allocation, (head_dim + 128) * sizeof(float) -- the scores tile plus the accumulator row" },
-        refuses: &[
-            "`total_tokens <= 0` -- an empty batch, and grid.x",
-            "`num_q_heads <= 0` -- grid.y",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/dsv4_compress.cu:186-233` -- one launch of \
-                  `compressed_attn_paged` at `:322` over `<<<dim3(total_tokens, \
-                  num_q_heads), 128, (head_dim + 128) * sizeof(float)>>>`. \
-                  `LaunchRule::PagedScoresDecode` states every field of that including the \
-                  shared allocation, which makes the `.cuh`'s *no ported rule computes a \
-                  shared-memory size from an operand width* stale, and the same file's \
-                  *`compressed_attn` and `compressed_attn_paged` are blocked by their HOST \
-                  half* stale for the second of the pair: this one's host half is a null \
-                  guard, a grid, a smem and one `<<<>>>`. `qo_indptr` is in the launcher's \
-                  parameter list COMMENTED OUT at `:307` and never forwarded, so the \
-                  ahead-of-time row carries a cell the kernel has no parameter for; the \
-                  Rust keeps the parameter and drops the argument, exactly as the C++ did. \
-                  Device row renamed `attn::compressed_attn_paged_dev` (§60.6). Now \
-                  `driver-cuda/src/fire/dsv4_compress.rs`",
-    },
-    // ═══ `attn/kv_paged.cu` — THE WINDOWED EXPLICIT APPEND ══════════════
-    Walk {
-        symbol: "attn::write_kv_explicit_bf16_devwin",
-        control: Control::Switch { on: "layer.hnd_layout -- the KV page layout, which picks the instantiation and nothing else" },
-        refuses: &[
-            "`n_max <= 0` -- no lanes, and this launcher's whole grid",
-            "a cache that is not native bf16 -- PANICS, because the C++ threw; a refusal is never a fallback",
-            "a cache carrying envelopes -- PANICS, same reason: envelope maintenance is not windowed on this variant and the host-window form is the caller's answer",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/kv_paged.cu:132-175` -- two `<<<n_max, 256, 0,                   stream>>>` over `write_kv_explicit_devwin<true|false>` at `:158` and                   `:166`, behind two `throw`s and an empty-extent guard. **This is §58's                   case, and §58's answer was incomplete.** §58 read                   `execution::tests::a_walk_is_only_a_walk` against                   `Specialisation::agrees` -- the first wants `unit_of(symbol).is_none()`,                   the second wants `unit_of(self.base)` to RESOLVE -- and concluded a                   `Specialisation` IS the walk, so this symbol needed a caller and not a                   classification. The caller never came, because the only thing that could                   call the Rust is a dispatch arm and only `JIT_DISPATCHED` or `RUST_SERVED`                   makes the emitter write one. §60.6 dissolves the contradiction instead of                   choosing a side: the DEVICE rows are now                   `attn::write_kv_explicit_bf16_devwin_dev` and `WRITE_KV_EXPLICIT_DEVWIN`'s                   `base` moved with them, so the ahead-of-time symbol is unit-free and                   walkable while the `Specialisation` still resolves. The sibling                   `attn::write_kv_explicit_bf16` was already in exactly this arrangement,                   which is the evidence that it is an arrangement and not a hack. The Rust                   was written a pass ago and fires `_dev#hnd`/`_dev#nhd` directly. **THE                   NEXT CLAUSE WAS WRONG AND IS CORRECTED IN PLACE:** it said the row is fully                   sourced and that this moves a LIVE dispatch off the shim. `table/attn.rs:292`                   states `Source::Unbound` on ALL NINE operands, and `abi.rs:810` skips a row                   with any `Unbound` operand WHOLE -- so `emit_rust_dispatch` has never written a                   dispatch arm for this symbol, this `RUST_SERVED` entry has never been reached,                   and the `bind::service` shim has never had a caller. The claim is true of the                   SIBLING `attn::write_kv_explicit_bf16` row, which is fully sourced, and was                   written for this one. Corrected rather than deleted because the rest of the                   entry is right and because the sibling still needs it said. The host                   program has MOVED: `kernels-cuda-new/src/x/attn.rs`'s `x::attn::kv_paged`",
-    },
-    // ═══ `attn/qkv_fused.cu` — THE LAST `attn` DISPATCH ═════════════════
-    Walk {
-        symbol: "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
-        control: Control::Switch { on: "head_dim -- 64, 128 and 256 take the WARP form and every other width falls through to the BLOCK form, and the two forms have different LaunchRules" },
-        refuses: &[
-            "`num_requests <= 0` -- an empty batch, and both grids' first axis",
-            "a head width whose warp instantiation is missing -- panics with the symbol named rather than falling through, because the block form there is correct and several times slower",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/qkv_fused.cu:31-159` -- ONE launcher over FOUR                   kernels and EIGHT instantiations, and the last `attn` file to fall                   because it is the one whose dispatch a `Specialisation` cannot state.                   `families::attn` wrote the refusal itself: *this row states                   `RowsPackedHeadsNarrow` and the warp triple below states                   `WarpPackedHeads`, which is the whole refusal in two lines*, plus the                   leg that settles it -- *lifting it would not land the row, because                   `head_dim == 64 | 128 | 256` is still unspellable*. A host program                   spells it. Two choices compose: `head_dim` picks the form                   (`:92`, `:96`, `:100`, fallthrough at `:105`) and `rope_table !=                   nullptr` picks the `USE_ROPE_TABLE` arm (`:56`, `:107`). The warp grid                   is `ceil(num_requests * (q + kv) / 8)` at block 256 -- warpS per block,                   not threads, and the factor 32 does not fault if wrong because the                   kernel bounds itself on `total_units`. FOUR device rows were WRITTEN in                   this change for the `d64` and `d256` expansions the unit never had;                   `qkv_fused.cu`'s own header named their absence as what blocked the                   port. `win` is `nullptr` on every path here, the `_devwin` twin that                   passed a real one having been deleted earlier, but the parameter is                   kept on the Rust dispatch because the kernels read it per row. Now                   `driver-cuda/src/fire/qkv_fused.rs`",
-    },
-    // ═══ `attn/dsa_indexer.cu` — ALL THREE, IN ONE CHANGE ═══════════════
-    Walk {
-        symbol: "attn::dsa_index_knorm_rope_bf16",
-        control: Control::Supplies { what: "the grid, <<<tokens, 256>>>, from an operand the kernel never sees" },
-        refuses: &[
-            "`tokens <= 0` -- an empty batch, and this launcher's whole grid",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/dsa_indexer.cu:14-26` -- one launch of \
-                  `index_knorm_rope<bf16>` at `:20` over `<<<tokens, kBlock>>>`. The device \
-                  row already stated `LaunchRule::PerRow` and stated why it is not `Rms` \
-                  (thirty-two bytes of dynamic shared memory no launcher passes and no \
-                  kernel reads); what blocked the takeover was the SYMBOL, which the unit \
-                  and the table both spelled `attn::dsa_index_knorm_rope_bf16`, so \
-                  `unit_of` was `Some` and §52.11 refused the walk. Device row renamed \
-                  `_dev` in the same change. Row unsourced, so `RUST_SERVED` is §60.7's \
-                  case. Now `driver-cuda/src/fire/dsa_indexer.rs`",
-    },
-    Walk {
-        symbol: "attn::dsa_index_q_rope_bf16",
-        control: Control::Supplies { what: "the BLOCK width -- ((n_heads + 31) / 32) * 32 with a one-warp floor -- which is a statement parameter and not a rectangle" },
-        refuses: &[
-            "`tokens <= 0` -- an empty batch, and this launcher's whole grid",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/dsa_indexer.cu:28-39` -- one launch of \
-                  `index_q_rope<bf16>` at `:36`, and the block above it at `:34-35`: \
-                  `int block = ((n_heads + 31) / 32) * 32; if (block < 32) block = 32;`. \
-                  ONE THREAD PER HEAD rounded up to a warp, which no `LaunchRule` states \
-                  because no `Dims` carries a head count -- `PerRow` would fix 256 and \
-                  launch eight times the threads a 24-head indexer bounds itself against. \
-                  This kernel had NO device row at all before this change; \
-                  `dsa_indexer.cu`'s header called it *waiting on a launch rule*, and the \
-                  answer is that it wanted a host. Now `driver-cuda/src/fire/dsa_indexer.rs`",
-    },
-    Walk {
-        symbol: "attn::dsa_index_topk_mask",
-        control: Control::Supplies { what: "the DYNAMIC SHARED allocation, tokens * sizeof(float) -- one float per key, and under-sizing it does not fault, it reads another block's floats" },
-        refuses: &[
-            "`tokens <= 0` -- an empty batch, and this launcher's whole grid",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/dsa_indexer.cu:41-55` -- one launch of \
-                  `index_topk_mask<bf16>` at `:49` over `<<<tokens, kBlock, smem>>>` with \
-                  `smem = tokens * sizeof(float)` at `:48`. `LaunchRule::RowScores` was \
-                  ported FROM this launcher and states grid, block AND the shared \
-                  allocation exactly, so the geometry was never the obstacle; the SYMBOL \
-                  was, the unit and the table having spelled it the same. Unlike its two \
-                  siblings this row is FULLY SOURCED, so it was a live shim entry reaching \
-                  a live launcher and the split plus `RUST_SERVED` is what redirects it to \
-                  `bind::service` instead of to C++. Now `driver-cuda/src/fire/dsa_indexer.rs`",
-    },
+    // ═══ `attn::dsv4_boundary_meta_decode`, `attn::dsv4_boundary_meta_paged`
+    // AND `attn::attention_compressed_paged_bf16` — RETRACTED. ═══
+    //
+    // Three `Walk`s stood here, and the sentence four lines up already said
+    // what happened to them: *"`driver-cuda/src/fire/dsv4_compress.rs` keeps
+    // the other three."* It does not; the file is DELETED. All three crossed
+    // into fn-world as `x::attn`'s `DSV4_BOUNDARY_META_DECODE`,
+    // `DSV4_BOUNDARY_META_PAGED` and `DSV4_ATTENTION_COMPRESSED_PAGED`, with
+    // their host programs, and `a_walk_is_only_a_walk` would have caught the
+    // three that remained.
+    //
+    // Each `Control::Supplies` was TRUE and none of it is lost: the decode
+    // pair's grid is `Launch::flat(n, 128)`, spelled by the floor rather than
+    // by a driver, and the compressed row's `(head_dim + 128) * sizeof(float)`
+    // is four lines of `x::attn::attention_compressed_paged_bf16` beside the
+    // launch it sizes. That is the `Walk` DISSOLVING rather than being
+    // satisfied -- `combine_attn_outputs_bf16`'s shape, and `layout::embed`'s
+    // before it -- because a `fn` supplies its own geometry and there is no
+    // longer a classification to make.
+    //
+    // The refusals gained rather than lost. `Dsv4Decline`'s five variants
+    // are `Refusal::Empty { what }` and `Refusal::Narrow { what, at }`, which
+    // name the extent and carry the offending value; the enum's variant names
+    // had to be read against the C++ to know which `<=` they came from.
+    // ═══ `attn::write_kv_explicit_bf16_devwin` — RETRACTED, AND ITS `Walk`
+    //     CARRIED THE CLEAREST FALSE FACT IN THIS FILE ══════════════════════
+    //
+    // CROSSED INTO FN-WORLD as `x::attn`'s `WRITE_KV_EXPLICIT_DEVWIN`, a
+    // `contract!` with a `none:` arm: the host program
+    // (`x::attn::kv_paged::write_kv_explicit_bf16_devwin`) is complete and
+    // `win_d` has no producer in `AttnCtx` to bind it from.
+    //
+    // THE FALSE FACT, kept because §75 collects this class. This entry's
+    // `because` used to end *"the row is fully sourced, so this moves a LIVE
+    // dispatch off the shim."* `table/attn.rs`'s row stated `Source::Unbound`
+    // on ALL NINE operands, and `abi.rs:810` skips a row with any `Unbound`
+    // operand WHOLE — so `emit_rust_dispatch` never wrote a dispatch arm,
+    // this `RUST_SERVED` entry was never reached, and the `bind::service`
+    // shim never had a caller. **The claim was true of the SIBLING
+    // `attn::write_kv_explicit_bf16` row, which was fully sourced, and was
+    // written for this one.** Not stale — never true here. A fact derived
+    // from one member of a set and stored next to a different member.
+    //
+    // §58 AND §60.6 WERE BOTH REASONING ABOUT A MECHANISM NOBODY CONSULTED.
+    // §58 asked whether a specialised symbol may also be walked; §60.6
+    // dissolved it by moving the device rows to `_dev` names. Both were
+    // arguments about `device::SPECIALISED`, and `driver-cuda` had been
+    // choosing `#hnd`/`#nhd` in Rust and firing by name the whole time.
+    //
+    // What the entry recorded and is still true of the program: two
+    // `<<<n_max, 256, 0, stream>>>` on `layer.hnd_layout`; `n_max <= 0`
+    // declines; a cache that is not native bf16 PANICS, and one carrying
+    // envelopes PANICS, because envelope maintenance was never windowed and
+    // merging a window's rows against a full-row envelope would widen it
+    // with rows the window excluded.
+    // ═══ `attn/qkv_fused.cu`'S WALK IS RETRACTED — AND IT WAS THE LAST ═══
+    //
+    // `attn::qkv_decode_qk_norm_rope_write_kv_bf16` crossed into fn-world as
+    // `x::attn`'s `QKV_DECODE_FUSED`, a `contract!` and a real `bind!` over
+    // the `attn/qkv_fused` unit. Its row was FULLY SOURCED and on
+    // `RUST_SERVED`, so this crossing really did move a live generated
+    // dispatch — unlike the unsourced retractions below it, which dropped
+    // nothing. A walk classifies a row the row world still interprets, and
+    // `ROW_TABLES` is now `&[]`, so there is nothing left to interpret and
+    // `WALKED` is EMPTY.
+    //
+    // What the walk said, kept because it is still true of the kernels.
+    // `qkv_fused.cu:31-159` was ONE launcher over FOUR kernels and EIGHT
+    // instantiations, and the last `attn` file to fall *because it is the one
+    // whose dispatch a `Specialisation` cannot state*. `families::attn` had
+    // written its own refusal: the row states `RowsPackedHeadsNarrow` and the
+    // warp triple states `WarpPackedHeads`, which is the whole refusal in two
+    // lines — plus the leg that settles it, that lifting the
+    // one-rule-per-row invariant would not land the row anyway, because
+    // `head_dim == 64 | 128 | 256` is unspellable (`Term::Multiple { of: 64 }`
+    // holds of 192). **A host program spells it, and that is the answer the
+    // whole of §5 step 5 is.** Two choices compose: `head_dim` picks the form
+    // (`:92`, `:96`, `:100`, fallthrough at `:105`) and `rope_table !=
+    // nullptr` picks the `USE_ROPE_TABLE` arm (`:56`, `:107`). The warp grid
+    // is `ceil(num_requests * (q + kv) / 8)` at block 256 — warpS per block,
+    // not threads. `win` is `nullptr` on every path, the `_devwin` twin that
+    // passed a real one having been deleted earlier, but the parameter stays
+    // on `qkv_decode_fused_dispatch` because the kernels read it per row.
+    //
+    // The refusals it listed are all hoisted before the single launch in
+    // `x::attn::qkv_fused::qkv_decode_fused_dispatch`, and it gained one the
+    // walk could not have: a null `q_out` is `Refusal::Absent` rather than a
+    // store through null, because the producer can write one and the device
+    // text does not test it.
+    //
+    // ═══ `attn/dsa_indexer.cu`'s THREE WALKS ARE RETRACTED ══════════════
+    //
+    // All three crossed into fn-world together: `x::attn`'s
+    // `DSA_INDEX_{KNORM_ROPE,Q_ROPE,TOPK_MASK}`, three contracts, one bind
+    // and two `none:` arms. A walk classifies a row the row world still
+    // interprets, and there is no row left to interpret -- so the entries go
+    // rather than being restated, exactly as `attn::combine_attn_outputs_\
+    // bf16`'s and `attn::write_kv_explicit_bf16_devwin`'s did.
+    //
+    // What the three walks said, kept because it is still true of the
+    // kernels: one launch each, no host arithmetic beyond a grid and a block,
+    // and `index_q_rope`'s block width -- `((n_heads + 31) / 32) * 32` with a
+    // one-warp floor -- was the reason `dsa_indexer.cu`'s header called
+    // itself *waiting on a launch rule*. The answer was that it wanted a
+    // HOST, and it has one: `x::attn::dsa_index_q_rope_bf16`, with the
+    // rounding in `dsa_indexer::q_rope_block`.
+    //
+    // `dsa_index_topk_mask`'s row WAS fully sourced, so its crossing
+    // replaced a live generated arm with a bind rather than dropping an
+    // entry nothing reached. The other two were unsourced and their `none:`
+    // arms shadow nothing -- and what blocks them is a STATEMENT, not a
+    // query: `rope_dim` is in no shape, no param and no context, and
+    // `knorm_rope`'s statement names no weight bank for a kernel that reads
+    // a LayerNorm weight and a bias.
     // ═══ `attn/attention_naive.cu` — THE MTP STATE PAIR ═════════════════
     //
     // Both are `Supplies`, and what they supply is the same thing twice: the
@@ -1855,68 +1667,67 @@ pub static WALKED: &[Walk] = &[
     // kernel's argument list as the extent it is -- `total_tokens` never
     // reaches the kernel at all -- so the rectangle is a host quantity even
     // though a rule states the same one.
-    Walk {
-        symbol: "attn::mtp_shift_hidden_bf16",
-        control: Control::Supplies { what: "the grid, <<<total_tokens, 256>>>, from an operand the kernel never sees; and the null test on pending_hidden, which is MTP state and not a shape" },
-        refuses: &[
-            "`total_tokens <= 0` -- an empty batch, and this launcher's whole grid",
-            "`num_requests <= 0` -- no requests to find tokens in",
-            "`hidden_size <= 0` -- a zero-width model",
-            "`pending_hidden == nullptr` -- MTP is not armed for this fire, which is not a geometry and no rule can answer",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/attention_naive.cu:54-75` -- one launch of \
-                  `mtp_shift_hidden<bf16>` at `:64` over `<<<total_tokens, BLOCK>>>`. The \
-                  four-clause guard at `:60-63` is the reason this is not merely a rule's \
-                  `Ungeometric::Empty`: `pending_hidden == nullptr` asks whether MTP is \
-                  armed, which is a question about STATE and not about a rectangle. The \
-                  device row was renamed `attn::mtp_shift_hidden_dev` in the same change \
-                  (§60.6) so `unit_of` on this symbol is `None` and §52.11 holds. The \
-                  `table::attn` row is unsourced on every operand and so never generated a \
-                  dispatch arm; `RUST_SERVED` takes the shim entry and nothing else, which \
-                  is §60.7. Now `driver-cuda/src/fire/attention_naive.rs`",
-    },
-    Walk {
-        symbol: "attn::mtp_update_pending_hidden_bf16",
-        control: Control::Supplies { what: "the grid, <<<num_requests, 256>>>, where the statement records a StateRef and names no rectangle of its own" },
-        refuses: &[
-            "`num_requests <= 0` -- no requests, and this launcher's whole grid",
-            "`hidden_size <= 0` -- a zero-width model",
-            "`pending_hidden == nullptr` -- there is no MTP state to stash into",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/attention_naive.cu:77-93` -- one launch of \
-                  `mtp_update_pending_hidden<bf16>` at `:85` over `<<<num_requests, \
-                  BLOCK>>>`, stashing each request's LAST hidden state so the next step's \
-                  shift has something to shift in. `families/attn.rs` records why this is \
-                  `PerRequest` where its twin is `PerRow`: the statement records a \
-                  `StateRef` and NO result, so it names no rectangle. Device row renamed \
-                  `_dev` per §60.6; row unsourced, so `RUST_SERVED` is §60.7's case. Now \
-                  `driver-cuda/src/fire/attention_naive.rs`",
-    },
-    // ═══ `attn/split_packed.cu` — THE LAST LAUNCHER IN THAT FILE ════════
-    Walk {
-        symbol: "attn::split_qkv_bf16_devwin",
-        control: Control::Supplies { what: "xblocks = ceil(max(q_dim, kv_dim) / 256) and grid.y = n_max, the FIRE's lane count and not the statement's rectangle" },
-        refuses: &[
-            "`n_max <= 0` -- `n_max` IS `grid.y`, so an empty lane count is an empty grid",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/split_packed.cu:35-52` -- one launch of \
-                  `split_qkv_devwin<bf16>` at `:46` over `dim3 grid(xblocks, n_max)` at \
-                  `:45`. `families/attn.rs`' `SPLIT_PACKED_SIGS` spent a page on why no \
-                  `LaunchRule` may state this and both halves are answered by a host \
-                  rather than by a rule: `grid.y` is the FIRE's `rows_total` and not \
-                  `Dims::rows`, which differ exactly under a peel and a peel's tail is the \
-                  only place this symbol is stated; and the four buffers are BASE pointers \
-                  by contract, because the window lives in device memory so a captured \
-                  graph can replay across row splits, while the JIT binder would resolve \
-                  `In`/`Out` through the statement's window and double-window them. A \
-                  driver-owned `Launch` states the first and `fire::hand::fire` binds \
-                  without re-windowing, which is the second. `grid.x` covers the WIDER of \
-                  the two outputs and not the packed width, which `split_packed.cuh` \
-                  licenses in one direction only. Now `driver-cuda/src/fire/split_packed.rs`",
-    },
+    // ═══ `attn::mtp_shift_hidden_bf16` AND
+    // `attn::mtp_update_pending_hidden_bf16` — RETRACTED. ═══
+    //
+    // Both crossed into fn-world as `x::attn`'s `MTP_SHIFT_HIDDEN` and
+    // `MTP_UPDATE_PENDING_HIDDEN`, with their host programs, and
+    // `driver-cuda/src/fire/attention_naive.rs` is deleted. Their device
+    // halves are `x::attn::attention_naive`'s unit, written for this
+    // crossing: `attn/attention_naive.cuh` had none.
+    //
+    // Both `Control::Supplies` entries named a GRID the kernel does not read
+    // — `total_tokens` for the shift, `num_requests` for the refresh — and
+    // both are `Launch::per_row` now, three lines above the launch. The
+    // refresh's is the interesting one and its measurement is preserved in
+    // the unit: opening the grid over ROWS rather than requests would have a
+    // fire of eight requests and ninety-three tokens write eighty-five slots
+    // that are not its own.
+    //
+    // NEITHER BINDS, and the blocker is `slot_ids` for both. The only query
+    // that reaches a request→slot map is `Cx::gdn`, whose `slot_ids_d` is
+    // exactly this pointer and which answers `None` unless the fire has a
+    // recurrent shape — and an MTP head on a dense transformer has none.
+    // The refresh has a second, of a different kind: its `StateRef` names
+    // `RecurrentState` for a buffer that is `RecurrentStateCache`'s THIRD
+    // half, addressed by slot rather than by layer, and `Slab` has no
+    // variant for it.
+    // ═══ `attn::split_qkv_bf16_devwin` — RETRACTED. ═════════════════════
+    //
+    // It crossed into fn-world as `x::attn`'s `SPLIT_QKV_DEVWIN`, with a
+    // REAL bind, and `driver-cuda/src/fire/split_packed.rs` is deleted.
+    //
+    // Its `Control::Supplies` was *"xblocks = ceil(max(q_dim, kv_dim) / 256)
+    // and grid.y = n_max, the FIRE's lane count and not the statement's
+    // rectangle"*, and both halves are supplied by `x::attn::split_qkv_bf16_
+    // devwin`, four lines above the launch. Its two `refuses` are a
+    // `Refusal::Empty` and the named panic, unchanged.
+    //
+    // **THE INTERESTING PART IS THE HALF THAT WAS FALSE.** The `because`
+    // gave two reasons no rule and no bind could state this, and the second
+    // read: *"the JIT binder would resolve `In`/`Out` through the
+    // statement's window and double-window them"*. `bind/mod.rs:3973`:
+    //
+    // > `let row = if kernel.ends_with("_devwin") { 0 } else {
+    // > launch.rows.start };` -- *"The `_devwin` forms are the stated
+    // > exception. Their contract is BASE pointers."*
+    //
+    // The binder exempts this kernel BY NAME, three hundred lines before a
+    // `Cx` exists, and `Fire::arg_in` returns `bound.args[i].ptr` unchanged.
+    // The general fact was true of every other symbol and was stored beside
+    // the one the exception is for.
+    //
+    // The first reason was true and is now answered rather than retracted:
+    // `Cx::rows().total` is `DispatchCtx::rows_total`, and `bind/facts.rs:319`
+    // names a `_devwin` launch in the field's own doc. So the whole of the
+    // `because` survives as measurement; what went is the conclusion.
+    //
+    // The rest of it, because none of it is retracted: *"`kernels-cuda/csrc/
+    // src/attn/split_packed.cu:35-52` -- one launch of `split_qkv_devwin
+    // <bf16>` at `:46` over `dim3 grid(xblocks, n_max)` at `:45`. ...
+    // `grid.x` covers the WIDER of the two outputs and not the packed width,
+    // which `split_packed.cuh` licenses in one direction only."* All three
+    // are in the `fn`, quoted rather than paraphrased.
     // ═══ `layout/embed.cu` — THE LAST LAUNCHER IN `csrc/src/layout/` ═════
     //
     // GONE, and not to a walk. `layout` crossed into fn-world (§5 step 5),
@@ -1960,43 +1771,33 @@ pub static WALKED: &[Walk] = &[
     // `table::layout` "to make this line legal" — is now history rather than
     // mechanism: `RUST_SERVED` is not what drops the shim entry any more.
     // An empty operand list is, and it is not gated on a table at all.
-    Walk {
-        symbol: "attn::mla_prepare_bf16",
-        control: Control::Supplies { what: "heads_per_block and q_blocks -- an operand AND the grid's second axis -- plus low_dim/high_dim from yarn_original_ramp_bounds and the packed kv_a_row_stride default" },
-        refuses: &[
-            "`total_tokens <= 0` -- an empty batch is an empty grid, `mla_paged.cu:47`",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/mla_paged.cu:23-84` -- one launch of \
-                  `mla_prepare<256>` at `:68` over `dim3 grid(total_tokens, 1 + q_blocks)` \
-                  at `:67`, and FOUR host quantities before it: `heads_per_block` at `:64` \
-                  (`half >= BS ? 1 : BS / half`, passed to the kernel AND dividing the head \
-                  axis of the grid, which is the exact case `Control::Supplies` was written \
-                  for), `q_blocks` at `:65`, the packed-row default `kv_lora + rope` at \
-                  `:55` when `kv_a_row_stride <= 0`, and the YaRN ramp bounds at `:61`. \
-                  The `1 +` on the grid's second axis is a LANE, not slack: \
-                  `mla_paged.cuh:236` reads `blockIdx.y - 1` and takes the KV path when it \
-                  is negative. The `table::attn` row is unsourced on every operand, so it \
-                  never generated a dispatch arm and `RUST_SERVED` here takes only the shim \
-                  entry -- §60.7's case exactly. Now `driver-cuda/src/fire/mla_paged.rs`",
-    },
-    Walk {
-        symbol: "attn::write_mla_to_pages",
-        control: Control::Supplies { what: "page_size, kv_lora_rank and qk_rope_head_dim -- unpacked out of the MlaCacheLayerView the dispatch passes whole" },
-        refuses: &[
-            "`total_tokens <= 0` -- an empty batch, `mla_paged.cu:104`",
-            "a `unit`/`row` disagreement or an NVRTC compile failure -- panics, named",
-        ],
-        because: "`kernels-cuda/csrc/src/attn/mla_paged.cu:116-135` -- a forwarder into \
-                  `write_mla_to_pages_bf16` at `:85`, which holds the one launch of \
-                  `write_mla` at `:105`. The forwarder existed to unpack the layer view, \
-                  and unpacking it is the whole of what the host does: `layer.ckv_pages`, \
-                  `layer.kpe_pages`, `layer.page_size`, `layer.kv_lora_rank` and \
-                  `layer.qk_rope_head_dim` become five kernel arguments the dispatch passes \
-                  as one. `write_mla_to_pages_bf16` is DELETED rather than ported -- its \
-                  consumer set was empty on all five channels and this forwarder was its \
-                  only caller. Now `driver-cuda/src/fire/mla_paged.rs`",
-    },
+    // ═══ `attn::mla_prepare_bf16` AND `attn::write_mla_to_pages` —
+    // RETRACTED. ═══
+    //
+    // Both crossed into fn-world as `x::attn`'s `MLA_PREPARE` and
+    // `WRITE_MLA_TO_PAGES`, with their host programs, and
+    // `driver-cuda/src/fire/mla_paged.rs` is deleted.
+    //
+    // `mla_prepare_bf16`'s `Control::Supplies` was this enum's own worked
+    // example — `heads_per_block`, *"passed to the kernel AND divides the
+    // head axis of the grid"* — and it is now `x::attn::mla_heads_per_block`,
+    // four lines above the launch it divides, with the C++'s measurement
+    // comment intact. `q_blocks`, the `kv_a_row_stride` default and the
+    // YaRN ramp bounds travelled the same way; `ramp_bounds` is now one
+    // crate away from its `.cuh` rather than two.
+    //
+    // `write_mla_to_pages` supplied `page_size`, `kv_lora_rank` and
+    // `qk_rope_head_dim`, described here as *"three operands the kernel
+    // declares and no `Source` can reach, because the view is one dispatch
+    // argument and its fields are five."* THAT SENTENCE IS THE ARGUMENT FOR
+    // `Cx`: `Cx::mla_layer` returns all five as `x::MlaLayer`, so the
+    // unpacking is the host program's own first lines and there is no
+    // classification left to make. The `Walk` dissolved.
+    //
+    // Neither BINDS. `Cx::mla_layer` refuses because `AttnCtx` carries no
+    // MLA layer list, which is a producer no fire reaches rather than a
+    // value that does not exist — see the `dsv4` retraction above for the
+    // other kind.
 ];
 
 
@@ -2185,10 +1986,11 @@ pub static SERVED: &[(&str, Service, &str)] = &[
     // `cublasGemmBatchedEx`, both arms the library's -- and the row is gone
     // anyway (`new-horizon.md` §38), because nothing asked for it. A true
     // statement about a launcher is not a statement that anything calls it.
-    ("gemm::mla_absorb_q_to_latent_bf16",  Service::Cublas,
-     "one `cublasGemmStridedBatchedEx` over the head axis; `gemm.cpp:2419-2442`. Its own comment names the per-head scalar kernels it REPLACED"),
-    ("gemm::mla_absorb_latent_to_v_bf16",  Service::Cublas,
-     "the second absorb, same single strided-batched call; `gemm.cpp:2444-2468`"),
+    // MLA'S ABSORB PAIR MOVED TO `Service::DriverOp`, one block down, when
+    // `attn` crossed them. The `Service::Cublas` FINDING was true and is kept
+    // verbatim in the sentences there -- one `cublasGemmStridedBatchedEx`
+    // each, nothing else in the body, so extracting a kernel extracts
+    // nothing. What changed is only the question `x::route` asks this list.
 
     // ── CUTLASS ───────────────────────────────────────────────────────────
     ("moe::flashinfer_cutlass_moe_bf16",   Service::Cutlass,
@@ -2264,6 +2066,35 @@ pub static SERVED: &[(&str, Service, &str)] = &[
     ("moe::build_moe_ptrs_aligned_bf16", Service::DriverOp,
      "the aligned MoE leg's step 3 of 8: one launch of `build_moe_ptrs_aligned<bf16>` that bakes three staging bases into six device pointer arrays. It DECLARES `gu_stage`/`act_stage`/`out_stage`, the destinations every op below it writes into, so the aligned leg cannot start without it -- which makes this symbol the gate on retiring `moe::flashinfer_cutlass_moe_bf16`, the only leg qwen3.5 decode takes and the one every aligned-leg condition already falls back FROM. Body: `driver-cuda/src/fire/moe_ptrs.rs`, whose per-fire bump arena carves the six, called from `bind/mod.rs`'s driver-op table beside `pie_lora_qkv_correction`. It had a `Walk` until this entry existed and `a_walk_is_only_a_walk` is right to refuse both -- see the note where that walk stood for where its `Control::Supplies` went"),
 
+    // ── and the ONE symbol that reads those six arrays ────────────────────
+    //
+    // Steps 4 and 5, the entry above's only consumer, and the only symbol in
+    // the tree that came to this shape FROM A WORKING BIND. `x::moe` bound it
+    // and fired the WMMA kernel for every shape `supported` accepts; what a
+    // bind cannot do is the other side of that predicate, and qwen3.5 decode
+    // fires one statement on each side:
+    //
+    //   gate_up  M=16 N=2*I=1024 K=H=2048  K > SHORT_K -> batched cuBLAS
+    //   down     M=16 N=H=2048   K=I=512   supported   -> WMMA
+    //
+    // `supported`'s `K > 512` arm names its own replacement -- "above which
+    // cuBLAS wins" -- and the replacement needs the cuBLAS handle (which §3.3
+    // forbids `Cx` to hand over) and the six arrays (which are nobody's
+    // operand). Nor could the caller finish the choice: `bind/mod.rs` states
+    // *"a refusal is not a fallthrough"*, so a `Refusal::Wide` returned from a
+    // bind is the answer the driver reports and not the first half of a
+    // decision. One symbol, two implementations, one host program that picks.
+    //
+    // WHAT THIS ENTRY ACTUALLY CLOSED is a gap that had been open since the
+    // aligned leg was written: `DispatchRefusal::ShapeDeclined` said "the C++
+    // driver reads the same predicate and takes a batched-cuBLAS fallback;
+    // until that fallback exists here, saying so is the only honest answer",
+    // and the fallback DID exist -- `x::gemm::dense::batched_act_x_wt_bf16`,
+    // ported under §45.2 with its row struck and no caller. The missing thing
+    // was never the arithmetic; it was that nothing named the function.
+    ("moe::moe_grouped_gemm_bf16", Service::DriverOp,
+     "the aligned leg's steps 4 and 5, and the only consumer the pointer build's six arrays have. Two implementations behind one symbol, chosen by `x::moe::supported`: the WMMA kernel inside its rectangle (3.0x the library at both of qwen3.5's shapes, `x/moe.rs`'s decode census) and `x::gemm::dense::batched_act_x_wt_bf16` outside it, which is `gemm.cpp:1145-1241` -- grouped-batched falling back to plain batched, with the stream-capture latch. qwen3.5 needs both: gate_up is `K=2048` against a `SHORT_K` of 512 and down is `K=512`. Body: `driver-cuda/src/fire/moe_grouped.rs`, which reads `ctx.moe_ptrs` and picks its triple by the bank pointer the statement names. A `contract!` with NO `Entry` in `x::moe`, third registration shape -- the bind that stood there served half the symbol and its `Refusal::Wide` was final by `bind/mod.rs`'s \"a refusal is not a fallthrough\""),
+
     // ── the dense GEMMs, reclassified by the step-5 `gemm` port ───────────
     //
     // These four WERE `Service::Cublas` and `Service::Cutlass` — findings
@@ -2291,6 +2122,56 @@ pub static SERVED: &[(&str, Service, &str)] = &[
      "a `gemm::act_x_wt_bf16` and then a `norm::add_bias_bf16` over the result (`gemm.cpp:2395-2398`), which `COMPOSED` stated as two ops and fn-world spells as a two-call body: `x::gemm::act_x_wt_bias_bf16`. Its `beta` is a literal 0.0, so the one fact the dense sibling needs, this one never asks"),
     ("gemm::grouped_act_x_wt_bf16",     Service::DriverOp,
      "one `cublasGemmGroupedBatchedEx`; `gemm.cpp:1242-1294`. Measured, not read: it is CLASSIC cuBLAS, not the cuBLASLt the previous entry claimed. The group boundaries are fire-global and no `Source` names one, so its consumer is and always was `fire::lora`'s hand-written staged apply, calling `x::gemm::grouped_act_x_wt_bf16` directly"),
+
+    // ── FLASHINFER'S SIX, RECLASSIFIED OUT OF [`WALKED`] ──────────────────
+    //
+    // See the tombstone in [`WALKED`] for why they moved and why their
+    // `refuses` lists did not come with them. Here is the part that belongs
+    // on this list: **what resource the driver owns that a `Cx` cannot
+    // reach.**
+    //
+    // For five of the six, name it and stop: a `DecodePlanCache` or a
+    // `PrefillPlanCache`, `Box`ed inside [`crate::prepare::Prepare`]'s
+    // `DecodePlan` / `PrefillPlan`, mutated by the planner, read by every
+    // dispatch of the fire and outliving all of them. That is §3.3's
+    // forbidden surface named exactly, and it is the whole test.
+    //
+    // THE SIXTH IS THE FINDING AND IT IS RECORDED HERE RATHER THAN SMOOTHED
+    // OVER. `attn::attention_flashinfer_prefill` names NO resource: it
+    // builds a plan cache on its own stack, allocates nothing that survives
+    // the call and asks one read-only capability query. It is a driver op by
+    // the SECOND condition -- *can a `Cx` state what the body reads?* -- and
+    // it cannot, because the body walks `qo_indptr_h` and `kv_page_indptr_h`
+    // on the CPU. Those are HOST mirrors of a device CSR, no `Cx` query
+    // answers a host pointer, and reading the device copy host-side is a
+    // synchronise, which §0 forbids inside a fire. `split_qkv_bf16_devwin`
+    // is the same shape and the pair is now the evidence that *name the
+    // resource* is necessary and NOT sufficient.
+    ("attn::dispatch_attention_flashinfer_decode", Service::DriverOp,
+     "the plain paged decode. RESOURCE: `DecodePlanCache` (and `decode_plan_full`, the gemma-4 second kind -- `bind::attn_plan` picks between them by the layer's window, which is a DECISION and the reason it is module-level in `bind/mod.rs` rather than nested in the generated dispatcher that used to be its only caller). Arm: `bind::fa2_decode`, over `fire::flashinfer_fa2_dispatch::attn_dispatch_attention_flashinfer_decode` -> `::decode` -> `fire::flashinfer_fa2::fire_decode` -- a KV dequant of the active pages, the three-arm variant cascade (`decode_arm`, whose ORDER is load-bearing: a windowed layer with a soft cap takes the soft-cap arm), then one `fire_raw` with a `DecodeParams` by value. Transcribed from `driver-cuda/csrc/attn/attention_flashinfer.cu:490-522, 660-692` (deleted)"),
+    ("attn::dispatch_attention_flashinfer_decode_capture", Service::DriverOp,
+     "the same decode with the attention scores captured. RESOURCE: the same `DecodePlanCache`, plus the score sink itself -- `AttnCtx::score_out` is arena-STABLE across a fire because the capture predicate is FOLDED, so one exec serves a fire that wants scores and one that does not, and an address recorded at bind time has to still be right when the predicate goes true. A trace value could not promise that. Arm: `bind::fa2_decode_capture`, over `fire::flashinfer_fa2_dispatch::decode_capture`; the capture arm cascade is `families::fa2`'s `DecodeArm::{CaptureFull, CaptureWindow}` and the params mirror is `fa2::params::DecodeScoreParams`. THE POST-KERNEL IS STILL A ROW: `attn::attn_score_normalize` in `families::attn`'s `ATTN_SCORE_POST`, fired by `driver-cuda/src/fire/attn_score.rs`. Transcribed from `attention_flashinfer.cu:532-594` (deleted)"),
+    ("attn::dispatch_attention_flashinfer_prefill_bf16", Service::DriverOp,
+     "the plain paged prefill. RESOURCE: `PrefillPlanCache`. Arm: `bind::fa2_prefill`, over `fire::flashinfer_fa2_dispatch::prefill` -> `fire::flashinfer_fa2::fire_prefill`. The `DISPATCH_NUM_MMA_KV` switch (`utils.cuh:116-133`) does NOT survive as a switch: the archive instantiated all four points because the choice came from a device query, and `fa2::PrefillGeometry::derive` makes the query once on the host so the fire names ONE unit -- the largest single saving of this migration and invisible in the row count. An SM90 plan is `Decline::Sm90Unported` and NOT a forward to `kernels-cuda`'s hopper unit, per §44.7. Transcribed from `attention_flashinfer.cu:776-836` (deleted)"),
+    ("attn::dispatch_attention_flashinfer_prefill_capture_bf16", Service::DriverOp,
+     "the prefill sibling of the capturing decode. RESOURCE: `PrefillPlanCache` plus the arena-stable sinks, and it takes one MORE than the decode form -- `folded_out` beside `score_out`, since a prefill's raw scores and their per-request fold are different extents. Arm: `bind::fa2_prefill_capture`, over `fire::flashinfer_fa2_dispatch::prefill_capture`; `make_prefill_params` is the one Rust function all four prefill dispatches share. TWO post-kernels, both rows: `attn::attn_prefill_score_normalize` on `dim3(nr, nh, window) x 256` and `attn::attn_prefill_score_fold` on `dim3(nr, 32u) x 256`. The `32u` and `attn_score_fold_heads`' `64u` are DIFFERENT literal grid axes in one file, which is why neither is a `LaunchRule`. Transcribed from `attention_flashinfer.cu:831-933` (deleted)"),
+    ("attn::dispatch_attention_flashinfer_prefill_custom", Service::DriverOp,
+     "the custom-mask prefill. RESOURCE: `PrefillPlanCache` -- raised by `Prepare::CustomPlan` and not `PrefillPlan`, because the prepare that stages the mask and its CSR is a different one, plus `AttnCtx::mask_d` / `mask_indptr_d`, which ride the ctx for the score sink's reason -- the predicate is folded. Arm: `bind::fa2_prefill_custom`. Two arms, `PrefillArm::{Custom, CustomSoftcap}`, and NO causal axis: the mask IS the causality, so a custom dispatch that also set `CAUSAL` would mask twice. `window_left` is written `-1` for the same reason and NOT taken from the cache -- the one place the params filler's cache-sourced window is overwritten. Transcribed from `attention_flashinfer.cu:1115-1224` (deleted)"),
+    ("attn::attention_flashinfer_prefill", Service::DriverOp,
+     "the PLANLESS prefill: it plans and fires in one call, so the planner's own refusals are its refusals too. RESOURCE: **NONE, and that is the point** -- `fire::flashinfer_fa2_dispatch::attn_attention_flashinfer_prefill` builds a `PrefillPlanCache` on its own stack, drops it, and asks `plan_device()`, a read-only capability query and not a pool. It is a driver op by the second condition alone: it walks `AttnCtx::qo_indptr_h` and `kv_page_indptr_h`, the HOST mirrors of the CSR, to learn `num_pages_in_batch` -- and no `Cx` query answers a host pointer. Arm: `bind::fa2_prefill_planless`, which is the one of the six that also needs `rows`. `causal = true`, `full_attention_variant = false`, from the C++'s own call at `attention_flashinfer.cu:935-1075` (deleted)"),
+
+    // ── MLA's absorb pair, reclassified by `attn`'s crossing ──────────────
+    //
+    // Both were `Service::Cublas`, both still ARE one `cublasGemmStrided\
+    // BatchedEx` and nothing else. The reclassification is `x::gemm`'s: a
+    // finding about the body, re-read as an answer to *"does something the
+    // driver owns already fire this?"* -- and the resource is the same
+    // `ctx.cublas` those twelve name, so the same third registration shape
+    // follows. `x::attn` declares two contracts and NO `Entry`.
+    ("gemm::mla_absorb_q_to_latent_bf16", Service::DriverOp,
+     "one `cublasGemmStridedBatchedEx` over the head axis, `batchCount = heads`; `gemm.cpp:2419-2442`, whose own comment names the per-head scalar kernels it REPLACED. Body: `x::attn::mla_absorb_q_to_latent_bf16`, taking `handle: *mut c_void` as fn-world spells a resource it cannot own. Arm: `bind::mla_absorb_q`, reading the four widths off `LaunchSpec::params` because both absorbs take the WHOLE `kv_b_proj` bank and slice it themselves. The archive's `tokens <= 0 || heads <= 0` early return is a `Refusal::Empty` now: under `void` a caller could not tell it from a launch"),
+    ("gemm::mla_absorb_latent_to_v_bf16", Service::DriverOp,
+     "the second absorb, same single strided-batched call; `gemm.cpp:2444-2468`. It reads the SECOND half of each head's bank -- `kv_b_proj + qk_nope_dim * kv_lora_rank` bf16 elements -- which is the one pointer arithmetic step the port had to carry, and `OP_T` on the weight where the first absorb takes `OP_N`. Body: `x::attn::mla_absorb_latent_to_v_bf16`; arm: `bind::mla_absorb_v`"),
 ];
 
 /// **The rows the DRIVER executes, in Rust — the consumer side of the
@@ -2399,8 +2280,10 @@ pub static RUST_SERVED: &[&str] = &[
     // C++ for ~120 of Rust and no third place for the transposes to live.
     // `gemm::act_x_wt_bf16_out_fp32` and `gemm::grouped_act_x_wt_bf16` WERE
     // HERE and are `x::gemm`'s two real `bind!` arms now.
-    "gemm::mla_absorb_q_to_latent_bf16",
-    "gemm::mla_absorb_latent_to_v_bf16",
+    // MLA's absorb pair stood here. Both crossed: `x::attn`'s
+    // `MLA_ABSORB_{Q_TO_LATENT,LATENT_TO_V}` contracts, bodies in
+    // `x::attn::mla_absorb_*`, arms in `driver-cuda/src/bind`. A driver op
+    // has no shim entry for this list to drop.
     // The composition [`COMPOSED`] already stated, executed. This one is
     // here for a reason the other four are not: `gemm.cpp:2393` called
     // `norm::add_bias_bf16`, a row of OURS that is already migrated, and
@@ -2707,28 +2590,44 @@ pub static RUST_SERVED: &[&str] = &[
     // contract states no operands — so `emit_c_shim` emits nothing for them
     // with or without this list, and `every_taken_over_row_is_stated` would
     // be right to refuse them. Their host programs are `x::moe`'s twenty
-    // `fn`s. Two of the nine bind (`moe_gate_up_decode_gemv_bf16`,
-    // `moe_down_decode_gemv_bf16`); the other seven are `none:` arms, which
-    // is what they already were in effect — every one of their rows was
-    // unsourced and got no arm. `fire/moe_dispatch.rs`,
-    // `fire/dsv4_routing.rs` and the six `bind::service::moe_*` wrappers are
-    // deleted with them.
-    // The two native KV appenders, whose `Walk`s are above and whose Rust is
-    // `driver-cuda/src/fire/kv_paged.rs`. Naming them here is what drops the
-    // two `pie_k_attn_write_kv_*` shim entries, and dropping those is what
-    // let `attn/kv_paged.cu` lose its two envelope call sites -- which is in
-    // turn what let `layout/envelope.cu` be deleted whole. The chain runs the
-    // other way from how it reads: the envelope port is the thing these two
-    // were blocking on, and closing them is what unblocked it.
-    "attn::write_kv_to_pages",
-    "attn::write_kv_explicit_bf16",
+    // `fn`s. FOUR of the nine bind (`moe_gate_up_decode_gemv_bf16`,
+    // `moe_down_decode_gemv_bf16`, `reorder_moe_aligned_output_bf16`,
+    // `hash_route_lookup`), FOUR are `none:` arms — which is what they
+    // already were in effect, every one of their rows unsourced and getting
+    // no arm — and the ninth, `build_moe_ptrs_aligned_bf16`, is a DRIVER OP
+    // with no `Entry` at all. That last one is the correction worth keeping:
+    // this paragraph read "two bind, the other seven are `none:` arms" for
+    // two edits after both halves of it stopped being true, and neither half
+    // was checkable from here. `x::moe`'s `bind!` block is the only place the
+    // split is countable, and it is 13 binds and 4 refusals over 20
+    // contracts with 3 driver ops taking no arm.
+    // `fire/moe_dispatch.rs`, `fire/dsv4_routing.rs` and the six
+    // `bind::service::moe_*` wrappers are deleted with them.
+    // The two native KV appenders STOOD HERE. Naming them was what dropped
+    // the two `pie_k_attn_write_kv_*` shim entries, and dropping those is
+    // what let `attn/kv_paged.cu` lose its two envelope call sites -- which
+    // is in turn what let `layout/envelope.cu` be deleted whole. The chain
+    // ran the other way from how it read: the envelope port was the thing
+    // these two were blocking on, and closing them is what unblocked it.
+    //
+    // **THEY LEFT THIS LIST WITH THE CROSSING.** `x::attn`'s
+    // `WRITE_KV_TO_PAGES` and `WRITE_KV_EXPLICIT` are contracts, they state
+    // no `operands`, and `emit_c_shim` emits nothing for a symbol that
+    // resolves through a `Contract::sig` -- the THIRD shim-dropping
+    // mechanism, and the one that is not gated on `table::sig` resolving.
+    // Their host programs are `x::attn::kv_paged`'s. `layout::embed`'s
+    // retraction below is the precedent for the sentence and for keeping it.
     // `attn/mla_paged.cu`, both launchers. Both rows are UNSOURCED, so neither
     // ever produced a dispatch arm; `RUST_SERVED` here takes the shim entry
     // and with it the last two `<<<>>>` in the file, which is then deleted.
     // §60.7 is the precedent (`ssm::build_nemotron_moe_ptrs_*` are the live
     // instances of it).
-    "attn::mla_prepare_bf16",
-    "attn::write_mla_to_pages",
+    // `attn::mla_prepare_bf16` and `attn::write_mla_to_pages` STOOD HERE and
+    // left with the crossing -- two `x::attn` contracts with `none:` arms on
+    // `Cx::mla_layer`. Neither dropped anything: both rows were unsourced on
+    // every operand, `abi.rs:810` skipped each whole, and what the entries
+    // bought was the shim entry and with it the `.cu`. The `.cuh` is
+    // `x::attn::mla_paged`'s unit now, so the shim entry buys nothing.
     // `layout/embed.cu`, the last launcher under `csrc/src/layout/`, STOOD
     // HERE. It is gone with the family: `layout` crossed into fn-world and
     // its seven contracts state no `operands`, which is the THIRD of the
@@ -2737,22 +2636,23 @@ pub static RUST_SERVED: &[&str] = &[
     // *"The row moved out of `table::driver_internal` to make this line
     // legal"* — a move this list no longer needs, because the mechanism
     // that drops the entry is not gated on `table::sig` resolving.
-    // `attn/split_packed.cu`'s last launcher. Its row moved out of
-    // `table::driver_internal` to make this line legal, for `embed`'s reason.
-    "attn::split_qkv_bf16_devwin",
+    // `attn::split_qkv_bf16_devwin` STOOD HERE and left with the crossing --
+    // `x::attn`'s `SPLIT_QKV_DEVWIN`, a contract with a real bind. Its `Walk`
+    // went too, and see the retraction there for why: one of the two reasons
+    // it could not bind was false, and `bind/mod.rs:3973` is where.
     // `attn/page_compact.cu`. Classified `Execution::Composed` since the
     // split -- the composition's "one that fires end to end" -- and the
     // classification was never the thing that was missing. `RUST_SERVED` is
     // what drops the shim entry, and `driver-cuda/src/fire/page_compact.rs`
     // is the host that fires the two steps in order.
-    "attn::compact_page_csr",
+    // `attn::compact_page_csr` STOOD HERE and left with the crossing --
+    // `x::attn`'s `COMPACT_PAGE_CSR`, a contract with a `none:` arm. ITS
+    // `COMPOSED` ENTRY STAYS: that entry is a finding about the BODY, and
+    // the body is still two launches on one stream with the second reading
+    // the first's buffer. What went is the row and this line.
     // `attn/attention_naive.cu`'s MTP state pair, both unsourced. The device
     // rows were renamed `_dev` in the same change so `unit_of` is `None` and
     // the `Walk` classification is legal.
-    // `attn/dsa_indexer.cu`, all three. `dsa_index_topk_mask`'s row is FULLY
-    // SOURCED -- unlike almost every other line in this block, this one moves
-    // a live dispatch from the C shim to `bind::service` rather than merely
-    // dropping an entry nothing reached.
     // `attn/dsv4_compress.cu`'s four survivors.
     //
     // **This comment said "All four rows unsourced" and one of them was
@@ -2768,16 +2668,41 @@ pub static RUST_SERVED: &[&str] = &[
     // `attn::combine_attn_outputs_bf16` LEFT THIS LIST when it crossed into
     // fn-world -- `x::attn`'s `COMBINE_ATTN_OUTPUTS`, a contract with a bind
     // -- and its `Walk` was retracted in the same change. Three remain.
-    "attn::dsv4_boundary_meta_decode",
-    "attn::dsv4_boundary_meta_paged",
-    "attn::attention_compressed_paged_bf16",
-    "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
-    "attn::write_kv_explicit_bf16_devwin",
-    "attn::dsa_index_knorm_rope_bf16",
-    "attn::dsa_index_q_rope_bf16",
-    "attn::dsa_index_topk_mask",
-    "attn::mtp_shift_hidden_bf16",
-    "attn::mtp_update_pending_hidden_bf16",
+    // `attn::dsv4_boundary_meta_decode`, `attn::dsv4_boundary_meta_paged` and
+    // `attn::attention_compressed_paged_bf16` STOOD HERE and left with the
+    // crossing -- three `x::attn` contracts with `none:` arms. NONE of the
+    // three ever dropped anything: all three rows had `Source::Unbound` on
+    // every operand, so `abi.rs:810` skipped each one whole, no arm was
+    // generated, and the shim entries these named were never reached.
+    //
+    // "Three remain" above is now ZERO of the four, and the sentence it
+    // corrects has finished being true of anything. `attn::dsv4_compress`'s
+    // whole `.cu` is fn-world.
+    // `attn::qkv_decode_qk_norm_rope_write_kv_bf16` STOOD HERE and left with
+    // the crossing -- `x::attn`'s `QKV_DECODE_FUSED`, a contract and a real
+    // bind. **This line DID drop something**: the row was fully sourced, so
+    // `abi.rs:810` kept it, `emit_rust_dispatch` wrote an arm, and
+    // `bind::service::attn_qkv_decode_qk_norm_rope_write_kv_bf16` had a live
+    // caller until this commit. It is the last `attn` entry on this list and
+    // the last row in `ROW_TABLES`; what remains here is `comm`'s two.
+    // `attn::write_kv_explicit_bf16_devwin` STOOD HERE and left with the
+    // crossing -- `x::attn`'s `WRITE_KV_EXPLICIT_DEVWIN`, a contract with a
+    // `none:` arm. This line never dropped anything: the row stated
+    // `Source::Unbound` on all nine operands, `abi.rs:810` skipped it whole,
+    // no dispatch arm was ever generated and the shim entry it was meant to
+    // take never had a caller. Its `Walk`'s "the row is fully sourced"
+    // claim, corrected above, is why anyone looked.
+    // `attn/dsa_indexer.cu`'s three STOOD HERE and left with the crossing.
+    // `dsa_index_topk_mask`'s row was fully sourced, so this line really did
+    // move a live dispatch; the other two were unsourced, so `abi.rs:810`
+    // skipped them whole and neither line ever dropped anything. All three
+    // are `x::attn` contracts now, and `driver-cuda/src/fire/dsa_indexer.rs`
+    // went with them -- `bind::service`'s three entry points were that
+    // module's only consumer.
+    // `attn::mtp_shift_hidden_bf16` and `attn::mtp_update_pending_hidden_bf16`
+    // STOOD HERE and left with the crossing -- two `x::attn` contracts with
+    // `none:` arms on `slot_ids`. Both rows were unsourced on every operand,
+    // so `abi.rs:810` skipped each whole and no arm was ever generated.
     // `moe/flashinfer_moe.cu`, the file's single dispatch — and the reversal
     // of the sentence this list's own header used to carry about it.
     //
@@ -2872,6 +2797,38 @@ pub static RUST_SERVED: &[&str] = &[
     "comm::all_reduce_bf16",
     "comm::all_reduce_residual_rmsnorm_bf16",
 
+    // ── AND THE FA2 SIX ARE RETRACTED, HAVING SERVED THEIR ONE PURPOSE ───
+    //
+    // The six entries stood here and the block above them is kept below,
+    // because what it recorded is still true and is the reason this list
+    // existed at all: `driver-cuda/csrc/attn/attention_flashinfer.cu` (1,258
+    // lines) and `attn/plan_lifecycle.cpp` (105) are deleted, and
+    // `driver-cuda/build.rs`'s last `.cuda(true)` with them. **nvcc is no
+    // longer invoked anywhere in this tree.** The params-layout hazard that
+    // block names -- a `paged_kv_t` filled against the shim's
+    // `__fast_div_modulo` and read against CCCL's, `num_heads` at +24 versus
+    // +20 with `sizeof` reconverging at 96, a silent wrong answer and not a
+    // crash -- is closed by there being one filler and one reader.
+    //
+    // WHAT RETRACTS THEM IS THE NEXT STEP OF THE SAME MOVE. This list takes
+    // *the shim entry and nothing else*, so a symbol on it still had a ROW,
+    // still routed `Route::Rows`, and still reached Rust through a generated
+    // dispatch arm resolving 13-19 operands from `table::attn`. Those arms
+    // are hand-written now, the six rows are deleted, and the symbols are
+    // `Service::DriverOp` in [`SERVED`]. There is no shim entry left to take
+    // over.
+    //
+    // AND THE TEST IS WHY THIS HAD TO BE ONE INDEX WITH THE MOVE.
+    // `every_rust_served_symbol_is_spelled_here` reads
+    // `include_str!("service.rs")` and asks that every symbol on this list
+    // appear in that file. `bind::service` became `#[cfg(feature =
+    // "bridge")]` at `f38d199c2` and these six must OUTLIVE `bridge`, so
+    // their entry points moved to `fire::flashinfer_fa2_dispatch` -- the
+    // same shape `dequant_kv_cache_layer_to_bf16_active` took. The instant
+    // the first one left `service.rs` the test would have gone red with the
+    // names still listed here. Removing them is not bookkeeping after the
+    // fact; it is the other half of the move.
+
     // ── the FA2 host program, and with it the LAST TWO C++ FILES in
     //    `driver-cuda/csrc` ─────────────────────────────────────────────────
     //
@@ -2927,58 +2884,51 @@ pub static RUST_SERVED: &[&str] = &[
     // `PrefillPlanCache::sm90_plan` is still planned and the dispatch refuses
     // with `Decline::Sm90Unported`, under §44.7's rule that every sm_90 claim
     // in this migration is argued from the call graph and none from a run.
-    "attn::dispatch_attention_flashinfer_decode",
-    "attn::dispatch_attention_flashinfer_decode_capture",
-    "attn::dispatch_attention_flashinfer_prefill_bf16",
-    "attn::attention_flashinfer_prefill",
-    "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-    "attn::dispatch_attention_flashinfer_prefill_custom",
 
-    // ── THE LAST ONE. `attn/kv_paged.cu` and the census ──────────────────
+    // ── `attn/kv_paged.cu` AND THE CENSUS — THE LAST ENTRY THIS LIST EVER
+    //    NEEDED, AND IT IS RETRACTED ────────────────────────────────────────
+    //
+    // `attn::dequant_kv_cache_layer_to_bf16_active` STOOD HERE, and the
+    // history is worth keeping because the ORDERING was the finding:
     //
     // 284 lines holding ONE function and FOUR `<<<>>>`, and those four were
     // the entire remaining census in the whole tree. `attn/kv_paged.cu`,
-    // `attn/kv_paged.hpp` and their `CMakeLists.txt` entry are deleted with
-    // this line, and **the `<<<>>>` census is ZERO, from 401.**
+    // `attn/kv_paged.hpp` and their `CMakeLists.txt` entry went with that
+    // line, and **the `<<<>>>` census is ZERO, from 401.**
     //
     // IT COULD NOT GO ONE ENTRY EARLIER. Its consumer set was four C++ call
     // sites inside the file the block above deleted —
     // `attention_flashinfer.cu:648`, `:675`, `:1098`, `:1244` — so the two
     // deletions had to be ordered and could not be split across passes: the
     // FA2 host program had to be Rust before this switch had an empty C++
-    // consumer set, and `fire/kv_paged.rs`' rule (*do not transcribe a live
-    // switch into a second language*) is why the Rust arms were written in
-    // the same change that emptied it rather than earlier.
+    // consumer set, and *do not transcribe a live switch into a second
+    // language* is why the Rust arms were written in the same change that
+    // emptied it rather than earlier.
     //
-    // IT COULD NOT JUST BE DELETED EITHER, which is why this line exists at
-    // all. The symbol is in NEITHER `device::JIT_DISPATCHED` nor this list,
-    // and its `table::attn` row states four fully-sourced operands — so all
+    // IT COULD NOT JUST BE DELETED EITHER, which is why the line existed at
+    // all. The symbol was in NEITHER `device::JIT_DISPATCHED` nor this list,
+    // and its `table::attn` row stated four fully-sourced operands — so all
     // three shim-dropping mechanisms were open, `abi::emit_c_shim` still
     // wrote `pie_k_attn_dequant_kv_cache_layer_to_bf16_active`, and deleting
     // the `.cu` would have left that entry with a declaration, a forwarder
-    // and no definition. A link error, not a clean removal. Naming it here
-    // is what closes the third mechanism.
+    // and no definition. A link error, not a clean removal.
     //
-    // THE ROW IS LIVE. `model-compiler/src/dsl.rs:7750` states
-    // `"attn::dequant_kv_cache_layer_to_bf16_active"` and `lower.rs:1100`
-    // names it, so `emit_rust_dispatch` keeps writing an arm and a model
-    // trace still reaches it — through `bind::service::
-    // attn_dequant_kv_cache_layer_to_bf16_active` instead of through the
-    // shim. `crates/model/src` names neither the symbol nor a wrapper, which
-    // is why the DSL is the only channel to check and why it was checked.
-    //
-    // Classified `Execution::Walk` first — `Control::Switch { on:
-    // "layer.scheme" }` — as `every_taken_over_row_was_classified_first`
-    // requires, and `unit_of` is `None` for it (the four kernels are rowed
-    // under their own names in `families::attn`), so `a_walk_is_only_a_walk`
-    // holds without a `_dev` split.
-    "attn::dequant_kv_cache_layer_to_bf16_active",
+    // **AND NOW THE ROW IS GONE**, which closes that mechanism the other
+    // way: `x::attn`'s `DEQUANT_KV_ACTIVE` is a contract, it states no
+    // operands, `table::sig` no longer resolves the symbol, and there is
+    // nothing for `emit_c_shim` to write. `model-compiler/src/dsl.rs:7750`
+    // still states the symbol and `lower.rs:1100` still names it — that
+    // channel is what the `bind!` arm serves now, so the trace that reached
+    // the shim reaches a `fn`.
 ];
 
 /// The service that executes a symbol, if a service does.
 ///
-/// A linear scan over fourteen entries, on a path nothing hot takes -- the
-/// same trade [`crate::device::specialisation`] documents.
+/// A linear scan on a path nothing hot takes -- the same trade
+/// [`crate::device::specialisation`] documents. The length is deliberately
+/// not quoted, for [`walk`]'s reason: this doc said *"fourteen entries"* for
+/// as long as it took the list to reach twenty, and `SERVED.len()` cannot go
+/// stale the way a word can.
 #[must_use]
 pub fn service(symbol: &str) -> Option<Service> {
     SERVED.iter().find(|(s, _, _)| *s == symbol).map(|(_, service, _)| *service)
@@ -3250,9 +3200,11 @@ impl Walk {
         // a test that a symbol is absent from every list, when the symbol is
         // no longer data in any list, is a test of the empty set.
         //
-        // And [`WALKED`] grew from five to 45, and is 24 now — every one of
-        // them `attn::`, because §5 has been emptying it a family at a time.
-        // The sentence that stood here said *"every one of the 45 resolves
+        // And [`WALKED`] grew from five to 45, and is ZERO now — §5 emptied
+        // it a family at a time and `attn`'s last row took the last entry.
+        // ("24 now" stood here and was wrong when it was written: the list
+        // held ONE. Re-derived two ways.) The sentence that stood here said
+        // *"every one of the 45 resolves
         // through [`table::sig`] today"*, and it is STILL TRUE, which is the
         // interesting part. `moe`'s nine outlived `table/moe.rs` by two
         // edits and went on resolving, because `table::sig` reads `KERNELS`
@@ -3427,8 +3379,8 @@ pub fn execution(symbol: &str) -> Option<Execution> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPOSED, Control, Execution, Kind, SERVED, Service, Step, WALKED, execution, service,
-        walk,
+        COMPOSED, Control, Execution, Kind, SERVED, Service, Step, WALKED, Walk, execution,
+        service, walk,
     };
 
     /// Every variant of [`Service`] has at least one member.
@@ -3484,9 +3436,22 @@ mod tests {
     #[test]
     fn the_four_arms_are_the_three_kinds() {
         const STEPS: &[Step] = &[Step::Fire { symbol: "norm::residual_add_bf16", take: &[] }];
+        // `WALKED` IS EMPTY, so the walk is built here rather than indexed.
+        // `WALKED[0]` stood here until `attn::qkv_decode_qk_norm_rope_write_\
+        // kv_bf16` — the last row in `ROW_TABLES` — crossed, and an index
+        // into an empty list panics. The assertion is about
+        // `Execution::Walk`'s `kind()` and never about which walk it is
+        // handed, which is the same reason `STEPS` above is a literal: a
+        // test of a variant should not depend on the variant having members.
+        const WALK: Walk = Walk {
+            symbol: "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
+            control: Control::Switch { on: "head_dim -- the last walk there was" },
+            refuses: &[],
+            because: "the shape of a walk, kept after the last one was retracted",
+        };
         assert_eq!(Execution::Composed(STEPS).kind(), Kind::Op);
         assert_eq!(Execution::Service(Service::Cublas).kind(), Kind::Service);
-        assert_eq!(Execution::Walk(&WALKED[0]).kind(), Kind::Op);
+        assert_eq!(Execution::Walk(&WALK).kind(), Kind::Op);
 
         let jit = crate::unit::rows().next().expect("some unit hosts a row");
         assert_eq!(Execution::Jit(jit).kind(), Kind::Kernel);
@@ -3515,6 +3480,25 @@ mod tests {
     /// [`no_service_name_is_unevidenced`]: tests::no_service_name_is_unevidenced
     #[test]
     fn no_control_shape_is_unevidenced() {
+        // AND NOW THE LIST IS EMPTY, WHICH IS NOT THE SAME AS A VIOLATION.
+        //
+        // `attn::qkv_decode_qk_norm_rope_write_kv_bf16` was the last walk and
+        // the last row in `ROW_TABLES`. This rule says *a shape named on
+        // nobody's evidence should not be in the enum*; with no walks at all,
+        // its SUBJECT is gone rather than its invariant broken, and both
+        // `Switch` and `Supplies` are now in the same position `Predicate`
+        // and `Loop` were when they were deleted.
+        //
+        // The difference is that `Walk`, `Control` and [`WALKED`] are the ROW
+        // WORLD's vocabulary — a walk classifies a row the row world still
+        // interprets — so they retire with the row interpreters in north star
+        // step 6, as one deletion, and not here as three. This branch is the
+        // tripwire that keeps that decision visible: if a walk is ever
+        // re-landed, the loop below applies again unchanged, and if step 6
+        // lands first, this test goes with the enum.
+        if WALKED.is_empty() {
+            return;
+        }
         for shape in Control::ALL {
             assert!(
                 WALKED.iter().any(|w| w.control.label() == *shape),

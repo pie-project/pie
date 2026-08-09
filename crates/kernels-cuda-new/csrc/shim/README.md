@@ -34,6 +34,13 @@ Same job, two directories, and the only thing the split recorded was a fact
 about history. A compile does not care who wrote a shim; it cares that the
 name resolves. Filed by **role**, all fourteen are one thing.
 
+Both directories in that table are historical now, not only the first. There
+is no `csrc/vendor` any more: the FlashInfer and XQA text was internalised
+into `csrc/src/attn/{flashinfer,xqa}/` and `csrc/` is `shim` and `src`. Every
+`csrc/vendor` below — the `-I` recipe in the CUTLASS section, the
+`cutlass_extensions` note at the end — is quoting a tree that existed when
+the measurement was taken, and is left in the words it was measured in.
+
 The six on the second row have a second story worth keeping: every one of them
 was a `#ifndef __CUDACC_RTC__` guard first, and every one of those guards was
 measured and refused. Guarding `#include <cstdint>` compiles and then deletes

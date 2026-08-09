@@ -621,9 +621,9 @@ mod tests {
 // Guard nesting maps to a stack of body captures over the depth-indexed
 // stream pool. Nothing here knows about models.
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 use super::stream::OwnedStream;
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 use cudarc::runtime::sys::{
     cudaStream_t, cudaStreamCaptureMode, cudaStreamCaptureStatus,
     cudaStreamUpdateCaptureDependenciesFlags,
@@ -810,7 +810,7 @@ impl PeelWindowWord {
 }
 
 /// What CUDA's capture state says about a stream, at one instant.
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 struct CaptureInfo {
     status: cudaStreamCaptureStatus,
     graph: cudaGraph_t,
@@ -825,7 +825,7 @@ struct CaptureInfo {
 /// documents: CUDA 13 renamed the 7-argument form back onto the base symbol,
 /// while CUDA 12 keeps it as `_v3`. Calling the wrong one is a segfault far
 /// from the cause rather than an error code.
-#[cfg(all(feature = "bridge", feature = "cuda-12"))]
+#[cfg(all(feature = "_cuda", feature = "cuda-12"))]
 unsafe fn capture_info(stream: cudaStream_t) -> Result<CaptureInfo> {
     let mut status = cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
     let mut graph: cudaGraph_t = std::ptr::null_mut();
@@ -854,7 +854,7 @@ unsafe fn capture_info(stream: cudaStream_t) -> Result<CaptureInfo> {
     })
 }
 
-#[cfg(all(feature = "bridge", feature = "cuda-13"))]
+#[cfg(all(feature = "_cuda", feature = "cuda-13"))]
 unsafe fn capture_info(stream: cudaStream_t) -> Result<CaptureInfo> {
     let mut status = cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
     let mut graph: cudaGraph_t = std::ptr::null_mut();
@@ -885,7 +885,7 @@ unsafe fn capture_info(stream: cudaStream_t) -> Result<CaptureInfo> {
 
 /// `cudaStreamUpdateCaptureDependencies`, version-routed for the same reason
 /// [`capture_info`] is.
-#[cfg(all(feature = "bridge", feature = "cuda-12"))]
+#[cfg(all(feature = "_cuda", feature = "cuda-12"))]
 unsafe fn update_capture_deps(stream: cudaStream_t, node: *mut cudaGraphNode_t) -> Result<()> {
     check_rt(
         unsafe {
@@ -901,7 +901,7 @@ unsafe fn update_capture_deps(stream: cudaStream_t, node: *mut cudaGraphNode_t) 
     )
 }
 
-#[cfg(all(feature = "bridge", feature = "cuda-13"))]
+#[cfg(all(feature = "_cuda", feature = "cuda-13"))]
 unsafe fn update_capture_deps(stream: cudaStream_t, node: *mut cudaGraphNode_t) -> Result<()> {
     check_rt(
         unsafe {
@@ -923,7 +923,7 @@ unsafe fn update_capture_deps(stream: cudaStream_t, node: *mut cudaGraphNode_t) 
 /// capturing when the node was added, which is not a value the builder owns.
 /// Destroying one separately is the mistake, and the builder never hands out
 /// anything that could.
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 #[derive(Debug, Clone, Copy)]
 pub struct Cond {
     node: cudaGraphNode_t,
@@ -931,7 +931,7 @@ pub struct Cond {
     else_body: Option<cudaGraph_t>,
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl Cond {
     /// The node, to name as a dependency.
     pub const fn node(&self) -> cudaGraphNode_t {
@@ -951,14 +951,14 @@ impl Cond {
 
 /// A SWITCH node opened during capture and the bodies it selects among.
 /// See [`SupergraphBuilder::open_switch`].
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 #[derive(Debug, Clone)]
 pub struct Switch {
     node: cudaGraphNode_t,
     bodies: Vec<cudaGraph_t>,
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl Switch {
     /// The node, to name as a dependency.
     pub const fn node(&self) -> cudaGraphNode_t {
@@ -991,7 +991,7 @@ impl Switch {
 /// The root stream must already be inside a capture — [`crate::device::CaptureScope`]
 /// is what opens one, and holding that scope is what keeps the allocator shut
 /// for the capture's lifetime.
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 #[derive(Debug)]
 pub struct SupergraphBuilder<'a> {
     root: StreamRef<'a>,
@@ -1011,7 +1011,7 @@ pub struct SupergraphBuilder<'a> {
     nodes: Vec<Option<cudaGraphNode_t>>,
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl<'a> SupergraphBuilder<'a> {
     /// Start building on an already-capturing stream, reading predicates from
     /// `preds`.

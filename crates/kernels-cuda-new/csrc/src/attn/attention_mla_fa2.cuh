@@ -110,10 +110,12 @@
 // # Every name below arrives from `carried.rs`, not from a search path
 //
 // This crate's NVRTC passes NO `-I`. `fa2.cuh`'s header is the full account;
-// the consequence here is that `<flashinfer/attention/mla.cuh>` resolves
-// because `csrc/vendor/flashinfer/attention/mla.cuh` is carried under exactly
-// that name, and that `tests/layers.rs::every_include_reachable_from_a_unit_resolves`
-// walks QUOTED includes only, so nothing below is behind that gate.
+// the consequence here is that `"attn/flashinfer/attention/mla.cuh"` resolves
+// because `csrc/src/attn/flashinfer/attention/mla.cuh` is carried under
+// exactly that name, and that it is QUOTED, so
+// `tests/layers.rs::every_include_reachable_from_a_unit_resolves` — which
+// walks quoted includes only — now covers it. It did not while the spelling
+// was `<flashinfer/attention/mla.cuh>`.
 //
 //===----------------------------------------------------------------------===//
 #pragma once
@@ -121,8 +123,8 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-#include <flashinfer/attention/mla.cuh>
-#include <flashinfer/attention/mla_params.cuh>
+#include "attn/flashinfer/attention/mla.cuh"
+#include "attn/flashinfer/attention/mla_params.cuh"
 
 namespace pie_cuda_driver::kernels::attn::mla_fa2 {
 

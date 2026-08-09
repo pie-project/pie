@@ -1,31 +1,41 @@
-//! `attn`'s JIT units — the small half of the family.
+//! `attn`'s two remaining JIT units, and the record of the seventeen that left.
 //!
-//! # What this module holds
+//! # What this module holds, MEASURED rather than described
 //!
-//! One [`Unit`] per migrated `.cuh`, the [`DeviceKernel`] rows those units
-//! instantiate, and the [`KernelSig`]s behind them. Each sig is its
-//! ahead-of-time twin minus the stream — a stream is `cuLaunchKernel`'s sixth
-//! PARAMETER, outside the `void**`, so it was never an operand — and minus
-//! whatever extent the launch rule recovers.
+//! Two [`Unit`]s and four [`DeviceKernel`] rows:
 //!
-//! # Twenty-one kernels, thirteen rows, and why the gap is the point
+//! ```text
+//! ATTN_SCORE_POST   3 rows   attn/attention_score_post.cuh
+//! ATTN_XQA          1 row    attn/attention_xqa_mha.cuh
+//! ```
 //!
-//! Nine `.cu` files in the small half held twenty-one `__global__`s. All nine
-//! are split now into a `.cuh` of templates plus a `.cu` of launchers, so the
-//! tree has exactly ONE definition of each — the property that matters most,
-//! because two copies that agree today drift tomorrow and each stays right for
-//! whichever half its tests exercise.
+//! [`UNITS_SMALL`] IS EMPTY and [`UNITS_HEAVY`] holds those two, so
+//! [`UNITS`] — the concatenation — is the same two. Every other `attn` root
+//! is [`crate::x::attn`]'s: eighteen units there, declared beside their host
+//! programs, against two here.
 //!
-//! Six rows came out of that over five units, and five more landed the day
-//! [`crate::runtime::launch`] grew a head axis and a KV-sized shared
-//! allocation: `attn_sink_rescale` states `PerHeadElementwise`, `pad_head_dim`
-//! and `strip_head_dim` state `PerHead`, `split_qkv` states `SplitPacked`, and
-//! `attn_naive` states `SdpaVector`. Two of those units — `head_dim_pad`
-//! and `split_packed` — did not exist before, because a unit with no rows is
-//! refused rather than compiled: a cubin nothing can fire is cached under an
-//! architecture and satisfies nobody. [`PAGE_COMPACT`] is the third, and its
-//! two rows are the newest: see that unit's doc for the statement that
-//! distinguishes its `<<<num_requests, 256>>>` from the one `per_row` refuses.
+//! Each sig is still its ahead-of-time twin minus the stream — a stream is
+//! `cuLaunchKernel`'s sixth PARAMETER, outside the `void**`, so it was never
+//! an operand — and minus whatever extent the launch rule recovers.
+//!
+//! # THE COUNTS IN EVERY SECTION BELOW ARE HISTORY, and are kept deliberately
+//!
+//! This header said *"Twenty-one kernels, thirteen rows"* and *"the heavy
+//! half has nine"* through six passes that deleted roots out from under it,
+//! and both had been false for some time when they were re-derived against
+//! the file rather than read. The sections below are the RECORD of how this
+//! module emptied — every one of them names the `crate::x::attn` unit its
+//! subject became — and their findings are still true of the kernels they
+//! are about. Their arithmetic is not true of this file. Read a number below
+//! as a fact about the pass that wrote it, and read the block above as the
+//! fact about now.
+//!
+//! One derived consequence, because it decides how the two longest sections
+//! are read: **all four surviving rows are [`DeviceKernel::PLAIN`]**. There
+//! is no template argument left anywhere in this module, so the
+//! multi-argument ceiling below and the [`crate::device::Specialisation`]
+//! argument after it are both about kernels that are elsewhere now. Neither
+//! reaches anything this file still declares.
 //!
 //! The kernels still without rows are migrated as TEXT and unmigrated as
 //! ROWS, and the reason is no longer uniform. [`crate::runtime::launch::eval`]
@@ -55,15 +65,22 @@
 //!   REQUEST, and every rule opened its grid over rows. **Retired.**
 //!   [`LaunchRule::PerRequest`] opens its grid over [`Dims::requests`], which
 //!   `jit_dims` fills from the attention context rather than from `rows`, and
-//!   `ATTENTION_NAIVE_SIGS[2]` is the row.
-//! * **`attn/attention_flashinfer`'s `attn_score_fold_heads` is the newest
-//!   member, and the last kernel in the tree whose blocker was that its text
-//!   had not moved.** The text has moved — `attn/attention_flashinfer.cuh`,
-//!   a PARTIAL split of a file that keeps its FlashInfer dispatch; its three
-//!   private score-normalisation kernels went too, to
+//!   `crate::x::attn::attention_naive`'s `mtp_update_pending_hidden` is the
+//!   row.
+//! * **`attn/attention_flashinfer`'s `attn_score_fold_heads` LEFT this list
+//!   by dissolving it, which is the outcome `combine_attn_outputs` had and
+//!   the one this whole section argues for.** The root is
+//!   [`crate::x::attn::attention_flashinfer`] now and the refusal below is
+//!   retained as the ARGUMENT, not as a live verdict: in fn-world a `Launch`
+//!   is written by whoever fires it, so a geometry no `LaunchRule` can state
+//!   stops being a reason to refuse and starts being three lines of Rust.
+//!   Nothing was satisfied; the question stopped existing.
+//!
+//!   The text had moved first — `attn/attention_flashinfer.cuh`, a PARTIAL
+//!   split of a file that keeps its FlashInfer dispatch; its three private
+//!   score-normalisation kernels went too, to
 //!   `attn/attention_score_post.cuh`, and are [`ATTN_SCORE_POST`]'s rows as
-//!   of §53.8 — so the row is now refused
-//!   for GEOMETRY like the rest of this list. The launcher is
+//!   of §53.8. The launcher was
 //!   `driver-cuda/csrc/attn/attention_flashinfer.cu:618-619`,
 //!   `dim3(requests, 64)` at 256 threads
 //!   with nothing shared, and the `64` is a LITERAL: a grid-stride fanout,
@@ -82,7 +99,10 @@
 //!   `tests/units.rs::verdict` hard-fails a unit with no rows and a cubin
 //!   nothing can fire satisfies nobody.
 //!   `tests/launch_rules.rs::mod transcribed::pins` pins both launcher lines
-//!   so the refusal's citation cannot rot.
+//!   so the refusal's citation cannot rot — and the pin now reads
+//!   `crate::x::attn`, because the host program is `fire/attn_score.rs`'s
+//!   hand-built `Launch` and always was. That is the other half of why this
+//!   entry dissolved: the row never had a host program to lose.
 //! * `attn/split_packed`'s `split_qkv_devwin` shares its sibling's grid
 //!   arithmetic and not its INPUTS — see
 //!   [`crate::x::attn::split_packed`], which is the
@@ -124,7 +144,8 @@
 //!   `__shfl_down_sync` / `__shfl_up_sync` instead. Both fold `u32` under `+`,
 //!   which is exact and associative modulo 2^32, so any correct fold order
 //!   produces the same bits — not "close to CUB", the same integer. The file
-//!   is [`PAGE_COMPACT`] now, with a row for each of its two kernels.
+//!   is `crate::x::attn::page_compact` now, with a row for each of its two
+//!   kernels.
 //! * `attn/pack_dense_mask.cu` took a `StructuredMaskParams` defined in its
 //!   host `.hpp`, which NVRTC cannot include. The header carries a device
 //!   MIRROR of that struct, and the duplication WAS checked rather than
@@ -461,14 +482,43 @@ use crate::unit::Unit;
 // See the deleted `DSA_INDEXER_ROWS`' crossing note below for the whole of
 // what travelled.
 
-/// The reference attention kernels and MTP's hidden-state plumbing. Two rows
-/// of five; the `.cuh` names the obstacle for each of the other three.
-pub const ATTENTION_NAIVE: Unit = Unit {
-    name: "attn/attention_naive",
-    root: include_str!("../../csrc/src/attn/attention_naive.cuh"),
-    rows: ATTENTION_NAIVE_ROWS,
-    options: &[],
-};
+// `ATTENTION_NAIVE` AND `PAGE_COMPACT` CROSSED INTO FN-WORLD as
+// [`crate::x::attn::attention_naive::ATTENTION_NAIVE`] and
+// [`crate::x::attn::page_compact::PAGE_COMPACT`], units and rows together.
+// Both roots left this list because a root is in exactly one of the two:
+// a second `unit!` over the same text compiles it twice and `unit_of` would
+// answer with whichever won.
+//
+// All five device rows travelled -- `mtp_shift_hidden`, `attn_naive`,
+// `mtp_update_pending_hidden`, `count_kept`, `scan_and_scatter` -- and so
+// did every measurement that stood beside them:
+//
+// * `attn_naive`'s SdpaVector reading, `dim3 grid(num_q_heads, num_tokens)`
+//   at 256 with `sizeof(float) * (num_tokens + BLOCK)`, and WHY no other
+//   rule could stand in: the kernel lays `scores[num_tokens]` and
+//   `reduce_buf[BLOCK]` in one `extern __shared__` block, so launched with
+//   less the reduction scratch overlaps the scores it is reducing and THE
+//   ANSWER IS FINITE. It has no host program and no statement lowers to it;
+//   it is declared because it is a row, not because anything fires it.
+// * `mtp_update_pending_hidden` was the row that MADE `LaunchRule::PerRequest`
+//   and the only row on it. Its `fn` opens `Launch::per_row(num_requests, 256)`
+//   directly, so the rule has no members left in this family.
+// * `PAGE_COMPACT_SIGS`' two kept `LaunchRule::PerRow` against the same
+//   `<<<num_requests, kBlock>>>`, which was this file's sharpest
+//   demonstration that a launcher's SHAPE and a fire's rectangle are two
+//   different questions -- `dsl::cuda::compact_page_csr` records
+//   `Shape(vec![Dim::Requests])` and `mtp_update_pending_hidden` records no
+//   result at all. Both `fn`s now state their own grid, so the
+//   demonstration is a paragraph rather than a disagreement between rules.
+// * `elem: "attn::device::kBlock"` was chosen over `device::i32(256)` so the
+//   row could not drift from the launcher. The `fn` reads
+//   `x::attn::page_compact::K_BLOCK`, one constant for both `<<<>>>`, which
+//   is the same argument one crate over.
+//
+// `attn::compact_page_csr` was never claimed by either row here -- one
+// launcher over two kernels -- and it is a `contract!` in `x::attn` now,
+// which is the name those two rows would have been claiming half of.
+
 
 /// flashinfer's supported head widths CROSSED INTO FN-WORLD, and closed a
 /// measured defect on the way.
@@ -491,109 +541,8 @@ pub const ATTENTION_NAIVE: Unit = Unit {
 // `split_qkv_bf16_devwin` keeps its table row and
 // `driver-cuda/src/fire/split_packed.rs`.
 
-/// The paged-KV CSR compactor: quest's page-eviction gather.
-///
-/// Two rows over the header's two `__global__`s, and the unit exists because
-/// both of the things that kept it out are gone. `<cub/cub.cuh>` was the first
-/// — CCCL is 13.7 MB in 1,691 files and NVRTC answers no external include, so
-/// the two collectives this file used are written out against `__shfl_down_sync`
-/// / `__shfl_up_sync`, exactly, in `u32` under `+`, which is associative modulo
-/// 2^32 and therefore the same integer rather than a close one.
-///
-/// The second was the grid, and the header still records the refusal:
-/// *"one block per REQUEST, not per row of anything ... No ported rule opens a
-/// grid over requests"*. That reading was one statement short.
-/// [`LaunchRule::PerRow`]'s grid is `Dims::rows`, which `driver-cuda`'s
-/// `jit_dims` fills from `BoundLaunch::rows` — documented at
-/// `driver-cuda/src/bind/mod.rs:93` as *"the rectangle, in the op's own row
-/// space"* — and `model-compiler`'s `dsl::cuda::compact_page_csr` records this
-/// op's result as `Shape(vec![Dim::Requests])`: rank one, `Dim::Requests`,
-/// which `lower.rs:716` resolves to `n_requests`. The statement is `whole`, so
-/// the rectangle is all of it. For this op and no other reading, `Dims::rows`
-/// IS the request count.
-///
-/// That is the whole of the distinction from the launcher `per_row`'s own doc
-/// refuses by name. `attn/attention_naive`'s `mtp_update_pending_hidden` also
-/// opens `<<<num_requests, 256>>>`, and `dsl::cuda::mtp_update_pending_hidden`
-/// records NO result at all — its rectangle is its input's, `[Tokens, hidden]`
-/// — so its fire's `rows` is the token count and `PerRow` would run one block
-/// per token against a buffer with one slot per request. Same launcher shape,
-/// opposite verdict, and the statement is what tells them apart.
-pub const PAGE_COMPACT: Unit = Unit {
-    name: "attn/page_compact",
-    root: include_str!("../../csrc/src/attn/page_compact.cuh"),
-    rows: PAGE_COMPACT_ROWS,
-    options: &[],
-};
 
-/// `attn/page_compact.cuh`'s two instantiations.
-///
-/// `elem` is `attn::device::kBlock` and not `256`: `instantiation()` prefixes
-/// slot 1 with `::pie_cuda_driver::kernels::`, so a bare literal comes back
-/// `expected an identifier` — and the constant it names is the SAME one
-/// `page_compact.cu:45` and `:48` spell in both `<<<>>>`, so the row cannot
-/// drift from the launcher by construction. `device::i32(256)` would also
-/// resolve (`quant`, `layout` and `rope` all record the measurement) and would
-/// be a second copy of a number this header already owns.
-///
-/// `BLOCK` is not a decoration. It sizes `__shared__ u32 tmp[BLOCK / 32]` and
-/// fixes how many warp partials the two collectives fold, so a row that named
-/// 128 would fold four partials that were never written — a plausible page
-/// list, not a fault.
-static PAGE_COMPACT_ROWS: &[DeviceKernel] = &[
-    DeviceKernel {
-        sig: &PAGE_COMPACT_SIGS[0],
-        template_path: "attn::device::count_kept",
-        elem: "attn::device::kBlock",
-    },
-    DeviceKernel {
-        sig: &PAGE_COMPACT_SIGS[1],
-        template_path: "attn::device::scan_and_scatter",
-        elem: "attn::device::kBlock",
-    },
-];
 
-/// Two kernels, two rows, and the ORDER between them that no row states.
-///
-/// `scan_and_scatter` reads the `counts` buffer `count_kept` fills, on the same
-/// stream. Two rows state two geometries and no dependency, so a caller firing
-/// these must fire them in this order on one stream — which is what
-/// `page_compact.cu:45`/`:48` do and what the ahead-of-time entry point
-/// `attn::compact_page_csr` wraps.
-///
-/// **Neither row claims `attn::compact_page_csr`.** That symbol is ONE launcher
-/// over TWO kernels, and a row that took its name would be claiming half a
-/// launcher — the same honesty `kv_paged`'s rows keep for
-/// `attn::dequant_kv_cache_layer_to_bf16_active`. The consequence is visible
-/// and intended: these two do not move `examples/migration_status`, they appear
-/// in its "hosted but not stated" list.
-///
-/// Every operand is the launcher's, unsourced for the same reason
-/// `kv_paged`'s were: `scratch_counts` is a driver-owned scratch buffer
-/// and `keep_stride` comes off a host CSR, and no `Source` spells either.
-#[rustfmt::skip]
-static PAGE_COMPACT_SIGS: [KernelSig; 2] = [
-    // `page_compact.cu:45` -- `device::count_kept<device::kBlock>
-    // <<<num_requests, device::kBlock, 0, stream>>>`.
-    kernel!(count_kept "attn::count_kept",
-        file = Some("attn/page_compact.cuh"),
-        launch = LaunchRule::PerRow,
-        operands = operands![
-            page_indptr_in: U32s, keep: U8s, keep_stride: U32,
-            num_requests: I32, counts: U32sMut,
-        ]),
-    // `page_compact.cu:48` -- `device::scan_and_scatter<device::kBlock>
-    // <<<num_requests, device::kBlock, 0, stream>>>`.
-    kernel!(scan_and_scatter "attn::scan_and_scatter",
-        file = Some("attn/page_compact.cuh"),
-        launch = LaunchRule::PerRow,
-        operands = operands![
-            page_indices_in: U32s, page_indptr_in: U32s, last_page_lens_in: U32s,
-            keep: U8s, counts: U32s, keep_stride: U32, num_requests: I32,
-            page_indptr_out: U32sMut, last_page_lens_out: U32sMut,
-            page_indices_out: U32sMut,
-        ]),
-];
 
 // `SOFTCAP_ROWS`/`SOFTCAP_SIGS` CROSSED INTO FN-WORLD, both rows, with
 // every measurement they carried:
@@ -649,17 +598,26 @@ static PAGE_COMPACT_SIGS: [KernelSig; 2] = [
 // them and in the doc comments of those `fn`s.
 
 // `DSA_INDEXER_ROWS` and `DSA_INDEXER_SIGS` DELETED, unit-only crossing —
-// the device text is `crate::x::attn::dsa_indexer`'s and the three host
-// programs never left `driver-cuda/src/fire/dsa_indexer.rs`.
+// the device text is `crate::x::attn::dsa_indexer`'s.
 //
-// **No row crossed and none could.** A `table::` row is a claim about what a
-// TRACE may say; these three kernels are fired by Rust that already exists
-// and is already correct. Two of the three rows were unsourced — `n_heads`,
-// `head_dim`, `rope_dim` and `topk` arrive on `Source::Param`, which is the
-// statement's parameter channel, and *"a JIT row that guessed which statement
-// parameter carried which would bind three integers in an order nothing
-// reports"*. The third, `dsa_index_topk_mask`, IS fully sourced in
-// `table::attn` and its row stays there; only the device text moved.
+// **AND ALL THREE TABLE ROWS HAVE NOW CROSSED TOO**, so the two sentences
+// this comment used to end on are both retracted. It said the host programs
+// *"never left `driver-cuda/src/fire/dsa_indexer.rs`"* and that
+// `dsa_index_topk_mask`'s *"row stays there"*. Neither is true: the three
+// host programs are `x::attn::dsa_index_{knorm_rope,q_rope,topk_mask}_bf16`,
+// `fire/dsa_indexer.rs` is deleted, and `table/attn.rs` carries none of the
+// three. They are three `contract!`s, one bind and two `none:` arms.
+//
+// **What was right is WHY the two are still refused**, and this comment had
+// it first. It said two of the three rows were unsourced because `n_heads`,
+// `head_dim`, `rope_dim` and `topk` arrive on the statement's parameter
+// channel, and *"a JIT row that guessed which statement parameter carried
+// which would bind three integers in an order nothing reports"*. The
+// crossing measured the statements and found the sharper version: for
+// `q_rope` and `knorm_rope` the parameters are not merely unlabelled, they
+// are ABSENT -- `dsl::cuda::dsa_index_q_rope` records no params at all and
+// `rope_dim` is in no shape, no param and no context anywhere. `topk_mask`
+// records three, which is exactly why it is the one that binds.
 //
 // Everything these rows argued travelled to the new home, in the module doc
 // and in the three `fn` docs beside the declarations:
@@ -698,12 +656,15 @@ static PAGE_COMPACT_SIGS: [KernelSig; 2] = [
 //   is absent from `knorm_rope`, because one block per row IS `tokens` and
 //   the kernel never addresses with it.
 // * §60.6's SYMBOL SPLIT on all three. The device symbols are
-//   `attn::dsa_index_{knorm_rope,q_rope,topk_mask}_dev`; `table::attn` still
-//   carries `attn::dsa_index_knorm_rope_bf16`, `attn::dsa_index_q_rope_bf16`
-//   and `attn::dsa_index_topk_mask`. `_bf16` is DROPPED as well as `_dev`
-//   added, because these are `template <class T>` and the ROW picks `T`.
-//   `fire/dsa_indexer.rs:45-61` holds both halves of each pair as constants
-//   side by side and is the only thing that bridges them.
+//   `attn::dsa_index_{knorm_rope,q_rope,topk_mask}_dev` and the trace
+//   symbols are `attn::dsa_index_knorm_rope_bf16`,
+//   `attn::dsa_index_q_rope_bf16` and `attn::dsa_index_topk_mask`. `_bf16`
+//   is DROPPED as well as `_dev` added, because these are
+//   `template <class T>` and the ROW picks `T`. The two halves used to sit
+//   side by side as constants in `fire/dsa_indexer.rs:45-61`; the crossing
+//   put them one line apart instead -- each `contract!` names the trace
+//   symbol and each host `fn` passes the `_dev` symbol to `raw::`, which is
+//   the same bridge with the string in the call that uses it.
 // * `template <class T>` and nothing else on `topk_mask` — `kBlock` is a
 //   file-scope `constexpr int` the kernel strides by, not a template
 //   argument, so there is no non-type argument to cite and the 256 a launcher
@@ -716,146 +677,7 @@ static PAGE_COMPACT_SIGS: [KernelSig; 2] = [
 // reader was `DSA_INDEXER` itself, and the only `include_str!` is now
 // `x::attn::dsa_indexer`'s.
 
-/// MTP's input shift, the reference attention, and MTP's pending-state stash.
-pub static ATTENTION_NAIVE_ROWS: &[DeviceKernel] = &[
-    DeviceKernel {
-        sig: &ATTENTION_NAIVE_SIGS[0],
-        template_path: "attn::device::mtp_shift_hidden",
-        elem: "device::bf16",
-    },
-    DeviceKernel {
-        sig: &ATTENTION_NAIVE_SIGS[1],
-        template_path: "attn::device::attn_naive",
-        elem: "device::bf16",
-    },
-    DeviceKernel {
-        sig: &ATTENTION_NAIVE_SIGS[2],
-        template_path: "attn::device::mtp_update_pending_hidden",
-        elem: "device::bf16",
-    },
-];
 
-#[rustfmt::skip]
-static ATTENTION_NAIVE_SIGS: [KernelSig; 3] = [
-    // `whole`, as the twin is: the kernel reads `qo_indptr` to find which
-    // request a token belongs to, and a row window starting anywhere but zero
-    // would index that table with the wrong token number.
-    //
-    // `total_tokens` is gone — `Rms` opens one block per row. `num_requests`
-    // is NOT: it bounds `find_request_u32`'s scan, and a request count is not
-    // a row count.
-    // §60.6's SYMBOL SPLIT. This row was `attn::mtp_shift_hidden_bf16`, the
-    // same string the `table::attn` row carries, and that made the table
-    // symbol unit-hosted -- which §52.11 forbids for a `Walk` (*a walk may
-    // drive a JIT'd kernel; it may not be one*), enforced by
-    // `execution::tests::a_walk_is_only_a_walk` through `unit_of`. The
-    // launcher in `attention_naive.cu` could not be taken over while the two
-    // names were one. The TABLE symbol does not move: it is what a trace
-    // records. The `_bf16` suffix is dropped here as well as `_dev` added,
-    // for `crate::x::attn::mla_paged`'s reason about `attn::write_mla` -- this is
-    // `template <typename T>` and the ROW picks `T`, so a format suffix on
-    // the row's own name advertises a choice at a level that does not make
-    // it. The launcher is `driver-cuda/src/fire/attention_naive.rs`.
-    kernel!(mtp_shift_hidden "attn::mtp_shift_hidden_dev",
-        file = Some("attn/attention_naive.cuh"),
-        launch = LaunchRule::PerRow,
-        // `PerRow`, not `Rms`. The launcher is `<<<total_tokens, BLOCK=256, 0>>>` in
-        // `attn/attention_naive.cu:154`, and `Rms` requests thirty-two bytes of dynamic
-        // shared memory that no launcher here passes and no kernel here
-        // reads -- `block_sum`'s warp buffer, which this shape has no
-        // reduction to need. Harmless in effect and wrong as a contract:
-        // a rule is meant to REPRODUCE its launcher, and one that asks
-        // for memory the launcher did not is a rule nobody can check
-        // against the `<<<>>>` it came from.
-        whole = true,
-        operands = operands![
-            target_hidden: Buf, pending_hidden: Buf, qo_indptr: U32s,
-            slot_ids: I32s, out: BufMut, num_requests: I32, hidden_size: I32,
-        ]),
-    // The reference attention, and the row the `.cuh` said would arrive as a
-    // diff of one line when a rule did. Its two obstacles were the same
-    // rule's: a head count on `grid.x`, and a dynamic shared allocation sized
-    // on a KV extent. `SdpaVector` is BOTH, and it is this launcher's
-    // arithmetic rather than a shape that resembles it --
-    // `dim3 grid(num_q_heads, num_tokens)`, `dim3 block(256)`,
-    // `sizeof(float) * (num_tokens + BLOCK)` -- which `eval` returns as
-    // `[q_heads, rows, 1]`, `[256, 1, 1]` and `(rows + 256) * 4`.
-    //
-    // The smem is the whole reason no other rule could stand in. `attn_naive`
-    // lays `scores[num_tokens]` and `reduce_buf[BLOCK]` in one
-    // `extern __shared__` block and takes the second as `smem + num_tokens`;
-    // launched with less, the reduction scratch overlaps the scores it is
-    // reducing, the softmax denominator is computed from bytes the same
-    // kernel is overwriting, and the answer is finite. A rule that defaulted
-    // `smem` to zero would do that on every fire.
-    //
-    // UNSOURCED, as its paged twin's ahead-of-time row is: this kernel exists
-    // so a parity test has something to compare flashinfer against on a shape
-    // flashinfer does not cover, and no statement lowers to it. `scale` is
-    // the launcher's `1 / sqrtf(head_dim)`, which is a host computation and
-    // not a `Source` -- inventing one so the row LOOKED bindable would put a
-    // guess where an absence belongs.
-    //
-    // `num_tokens` stays an operand. The rule recovers the row count for the
-    // GRID; the kernel reads it as its KV extent and as the bound on the
-    // score loop, and those are the same number only because this is the
-    // unpaged form.
-    kernel!(attention_naive "attn::attention_naive_bf16",
-        file = Some("attn/attention_naive.cuh"),
-        launch = LaunchRule::SdpaVector,
-        whole = true,
-        operands = operands![
-            q: Buf, k: Buf, v: Buf, o: BufMut,
-            num_tokens: I32, num_q_heads: I32, num_kv_heads: I32,
-            head_dim: I32, scale: F32,
-        ]),
-    // The kernel whose `.cuh` doc says *"NO ROW STATES THIS KERNEL: one block
-    // per REQUEST"* and spells out what a row over rows would cost: *"a fire
-    // of eight requests and ninety-three tokens would open ninety-three
-    // blocks — eighty-five of them writing a slot that is not theirs."*
-    // That doc is now half true and is corrected in place.
-    //
-    // `attn/attention_naive.cu:174`, and `BLOCK` is `device::BLOCK = 256` at
-    // `attention_naive.cuh:91`:
-    //
-    // ```text
-    // :174   device::mtp_update_pending_hidden<bf16><<<num_requests, BLOCK, 0, stream>>>(
-    // :175       static_cast<const bf16*>(target_hidden),
-    // :176       static_cast<bf16*>(pending_hidden),
-    // :177       qo_indptr, slot_ids, num_requests, hidden_size);
-    // ```
-    //
-    // `LaunchRule::PerRequest` is that grid: `[Dims::requests, 1, 1]` at 256,
-    // no shared memory. **This is the row that made the rule**, and it is the
-    // only row on it today (§10.5, stated rather than inferred).
-    // `attn/page_compact.cu:45` and `:48` open the same
-    // `<<<num_requests, kBlock>>>` and KEEP [`LaunchRule::PerRow`] — see
-    // [`PAGE_COMPACT`] — which is the sharpest demonstration in this file
-    // that a launcher's SHAPE and a fire's rectangle are two different
-    // questions, and the reason this variant is an axis rather than a
-    // one-kernel convenience.
-    //
-    // `num_requests` stays an operand where `mtp_shift_hidden`'s
-    // `total_tokens` went: the rule recovers the request count for the GRID,
-    // and the kernel reads the operand as the bound on `r >= num_requests`.
-    // Dropping it would leave the guard reading a register nothing set.
-    //
-    // UNSOURCED, and `table/attn.rs:745` is too: `pending_hidden` is a
-    // recurrent-state store the driver owns, `slot_ids` is the batch's slot
-    // map, and `qo_indptr` is the fire's CSR. `dsl::cuda::mtp_update_pending_hidden`
-    // records a `StateRef` and NO result, so the statement names no rectangle
-    // of its own — which is the second half of why `PerRow` is wrong here and
-    // right for `compact_page_csr`, whose result IS `Shape(vec![Dim::Requests])`.
-    // §60.6's symbol split, for the twin's reason above.
-    kernel!(mtp_update_pending_hidden "attn::mtp_update_pending_hidden_dev",
-        file = Some("attn/attention_naive.cuh"),
-        launch = LaunchRule::PerRequest,
-        whole = true,
-        operands = operands![
-            target_hidden: Buf, pending_hidden: BufMut, qo_indptr: U32s,
-            slot_ids: I32s, num_requests: I32, hidden_size: I32,
-        ]),
-];
 
 // `HEAD_DIM_PAD_ROWS`/`HEAD_DIM_PAD_SIGS` CROSSED INTO FN-WORLD with their
 // two constants, and the readings they carried are restated where the `fn`s
@@ -899,10 +721,23 @@ static ATTENTION_NAIVE_SIGS: [KernelSig; 3] = [
 //   to a DEVICE row, which is why both rows crossed and neither became a
 //   bind.
 //
+// BOTH OF THOSE WERE OVERTAKEN and `attn::split_qkv_bf16_devwin` IS a bind
+// now -- `x::attn`'s `SPLIT_QKV_DEVWIN`, over `x::attn::split_qkv_bf16_
+// devwin`. The first was answered by `Cx::rows().total`, which is
+// `DispatchCtx::rows_total` and whose own doc at `bind/facts.rs:319` names a
+// `_devwin` launch. The second was never true of this symbol:
+// `bind/mod.rs:3973` resolves every arg of a kernel whose name ends
+// `_devwin` at row 0, BY SUFFIX, because *"their contract is BASE
+// pointers"*. The double-window the `.cuh` refuses is refused in the binder,
+// three hundred lines before a `Cx` exists.
+//
 // The two-symbol arrangement crossed with them: the device row is
-// `attn::split_qkv_devwin` and the table row is
-// `attn::split_qkv_bf16_devwin`, bridged by `SPLIT_DEVWIN_SYMBOL` and
-// `SPLIT_DEVWIN_DEVICE` in `driver-cuda/src/fire/split_packed.rs`.
+// `attn::split_qkv_devwin` and the trace symbol is
+// `attn::split_qkv_bf16_devwin`. `SPLIT_DEVWIN_SYMBOL` and
+// `SPLIT_DEVWIN_DEVICE` bridged them in
+// `driver-cuda/src/fire/split_packed.rs`, which is DELETED; the bridge is
+// now the contract's `symbol` beside the unit row's string, which is the
+// ordinary fn-world arrangement and needs no constants.
 
 // `PACK_DENSE_MASK` CROSSED INTO FN-WORLD -- `crate::x::attn::pack_dense_mask`,
 // as a UNIT AND NOTHING ELSE. Its two `DeviceKernel::PLAIN` rows went with it;
@@ -940,10 +775,11 @@ static ATTENTION_NAIVE_SIGS: [KernelSig; 3] = [
 //   it -- `if (b >= B) return;` and `if (request >= B) return;` are the first
 //   lines of each -- so a declaration that dropped it on the grounds that the
 //   rule recovers it would hand the kernel whatever the previous launch left
-//   in that slot. `PAGE_COMPACT_SIGS` keeps `num_requests` for the same
-//   reason, and that sentence is why this one is repeated there.
+//   in that slot. `page_compact`'s two rows kept `num_requests` for the same
+//   reason, and that sentence is why this one is repeated there --
+//   `crate::x::attn::page_compact` carries it now.
 //
-// * EVERY OPERAND UNSOURCED, for the reason `PAGE_COMPACT_SIGS`' are:
+// * EVERY OPERAND UNSOURCED, for the reason `page_compact`'s were:
 //   `mask_indptr` is a host-built prefix sum the driver owns, `packed` is a
 //   pre-zeroed driver allocation, and `p_page` is the dense mask's row stride.
 //   No `Source` spells any of the three. That is why the two rows were
@@ -977,8 +813,9 @@ pub const UNITS_SMALL: &[Unit] = &[
     // rows and their host programs are all there; nothing here may name the
     // same roots, because a second `unit!` over the same text compiles it
     // twice and `unit_of` would answer with whichever won.
-    ATTENTION_NAIVE,
-    PAGE_COMPACT,
+    // `ATTENTION_NAIVE` and `PAGE_COMPACT` left this list with their
+    // crossing. IT IS NOW EMPTY, and that is the small half of `attn`
+    // finished: every root it held is `crate::x::attn`'s.
 ];
 
 /// The units `attn` compiles: the small half's, then the heavy half's.
@@ -1216,24 +1053,33 @@ const EMPTY: Unit = Unit { name: "", root: "", rows: &[], options: &[] };
 
 // `KV_PAGED` STOOD HERE — `attn/kv_paged.cuh`, the paged KV cache's
 // appenders, quantised writers and dequantisers, and the largest root left
-// in this family. **CROSSED INTO FN-WORLD** — `crate::x::attn::kv_paged`,
-// UNIT-ONLY, and `table::attn`'s four rows over this root STAY.
+// in this family. **CROSSED INTO FN-WORLD, BOTH HALVES** —
+// `crate::x::attn::kv_paged`, and `table::attn`'s four rows over this root
+// are GONE with it.
 //
 // A row's survival is decided by whether a `contract!` names its symbol, and
-// none of the four is named: `attn::write_kv_to_pages`,
+// all four are named now: `attn::write_kv_to_pages`,
 // `attn::write_kv_explicit_bf16`, `attn::write_kv_explicit_bf16_devwin` and
-// `attn::dequant_kv_cache_layer_to_bf16_active` are WALKS whose host
-// programs live in `driver-cuda/src/fire/kv_paged.rs`, and
-// `kernels-cuda-new` cannot call `driver-cuda`. A `contract!` here would
-// retire the shim entry and route the trace to a `bind!` with no body to
-// run. They are the second named half of `kv_paged` and they move when
-// their host programs do.
+// `attn::dequant_kv_cache_layer_to_bf16_active`. Half A left them standing
+// because their host programs were in `driver-cuda/src/fire/kv_paged.rs`;
+// Half B moved the seven programs here, and four `Cx` queries
+// (`first_token`, `num_pages_in_batch`, `w_page_d`, `w_off_d`) closed the
+// last gap. Three bind; devwin is a `none:` arm because `win_d` has no
+// producer in `AttnCtx` at all.
 //
-// §52.11 is the other half of that sentence and it points the same way:
+// Half A also said the block was that `kernels-cuda-new` cannot call
+// `driver-cuda`. **True, and not the reason** — the dependency runs the
+// other way. The reason was a driver RESOURCE, and there was none: the test
+// is answerable in one line, name the resource, and if you cannot it is a
+// move.
+//
+// §52.11 pointed the same way and is now discharged:
 // `execution::tests::a_walk_is_only_a_walk` requires `unit_of(sym)` to be
 // `None` for every walked symbol, and **no symbol in the new unit is any of
 // those four**. §60.6's `_dev` suffix bought exactly that, which is why the
-// unit can exist at all while the walks stand.
+// unit could exist while the walks stood; the four `Walk`s are retracted in
+// the same change as the contracts, and the suffix stays because the device
+// rows still need names their host programs do not collide with.
 
 // `MLA_PAGED` STOOD HERE — the MLA cache's append and its preparation pass,
 // both header kernels, as two rows. **CROSSED INTO FN-WORLD** —
@@ -1260,89 +1106,42 @@ const EMPTY: Unit = Unit { name: "", root: "", rows: &[], options: &[] };
 // reading `head_dim` computes `heads_per_block = 1` where the launcher
 // computes 8, and opens 129 lanes where the launcher opens 17.
 
-/// The one `__global__` `attn/attention_flashinfer.cuh` holds.
-///
-/// The other three `__global__`s of `attention_flashinfer.cu` stay in the
-/// `.cu`, and the header says why in one line: *"They move when something
-/// asks for them."*
-pub static ATTN_SCORE_FOLD_ROWS: &[DeviceKernel] = &[DeviceKernel {
-    sig: &ATTN_SCORE_FOLD_SIGS[0],
-    template_path: "attn::device::attn_score_fold_heads",
-    // Not a template, and the header argues at length that it must not
-    // become one: every buffer is `float` or page-table metadata, the block
-    // width arrives as `blockDim.x` and the fanout as `gridDim.y`, so a
-    // `template <int BLOCK>` would be a parameter the body never mentions
-    // and an arm that cannot differ from its sibling.
-    elem: DeviceKernel::PLAIN,
-}];
-
-#[rustfmt::skip]
-static ATTN_SCORE_FOLD_SIGS: [KernelSig; 1] = [
-    // `LaunchRule::Unstated`, and this is a refusal that was argued rather
-    // than a gap nobody filled.
-    //
-    // The launcher is `attention_flashinfer.cu`:
-    //
-    //     const dim3 grid(static_cast<unsigned>(num_requests), 64u);
-    //     device::attn_score_fold_heads<<<grid, 256, 0, stream>>>(
-    //
-    // `dim3(requests, 64)` at 256 threads, no shared memory. `64` is not in
-    // `Dims`: not heads, not requests, not pages, not a head dimension. It
-    // is an occupancy constant — a guess about one GPU, made once.
-    //
-    // The rule CANNOT be chosen by measuring bytes. The body strides
-    // `i += blockDim.x * gridDim.y`, so every value of `gridDim.y` produces
-    // the same floats; `LaunchRule::PerRequest` would pass any parity test
-    // ever written for this kernel and be wrong by 64x in blocks alone.
-    //
-    // The tempting repair is a parameterised `PerRequestFanout(64)`, and the
-    // measurement that kills it: there are exactly TWO literal grid axes in
-    // all of `csrc/src`, both in this one file — `(num_requests, 64u)` and
-    // `(cache.num_requests, 32u)`. DIFFERENT literals. There is no shared
-    // rule waiting to be extracted, only two constants that share a file, and
-    // a rule covering both would be vocabulary growth for a single literal —
-    // which is what §10.5 exists to forbid.
-    //
-    // So the vocabulary declines to lie and the driver builds the `Launch` by
-    // hand. `KernelModule::fire`'s own doc anticipates it — *"reaching here
-    // with one means a caller built a `Launch` by hand"* — and
-    // `runtime::fire::fire` still refuses `Unstated` through `launch::eval`,
-    // so the hand-built path is the ONLY path and it is visible at the one
-    // site that takes it. `driver-cuda`'s `fire/attn_score.rs` carries the 64
-    // and the 256 as named constants with the `.cu` line cited beside them:
-    // the number is a citation, not a derivation.
-    kernel!(attn_score_fold_heads "attn::attn_score_fold_heads",
-        file = Some("attn/attention_flashinfer.cuh"),
-        launch = LaunchRule::Unstated,
-        whole = true,
-        operands = operands![
-            scores: Buf,
-            score_indptr: I32s,
-            kv_page_indptr: U32s,
-            kv_last_page_lens: U32s,
-            page_size: I32,
-            num_q_heads: I32,
-            folded: BufMut,
-        ]),
-];
-
-/// The per-head → per-request score fold, as a JIT unit.
-///
-/// This is the migration in one launcher: the `__global__` is ours, the
-/// geometry is a literal, and nothing about either needs the archive. The
-/// device text is `attention_flashinfer.cuh`; the launch is
-/// `driver-cuda`'s `fire/attn_score.rs`. `model-compiler` cannot tell.
-pub const ATTN_SCORE_FOLD: Unit = Unit {
-    name: "attn/attention_flashinfer",
-    root: include_str!("../../csrc/src/attn/attention_flashinfer.cuh"),
-    rows: ATTN_SCORE_FOLD_ROWS,
-    options: &[],
-};
+// `ATTN_SCORE_FOLD`, `ATTN_SCORE_FOLD_ROWS` and `ATTN_SCORE_FOLD_SIGS` STOOD
+// HERE, and the root CROSSED INTO FN-WORLD as
+// `crate::x::attn::attention_flashinfer` -- one unit, one row, one symbol.
+//
+// `attn::attn_score_fold_heads` is `crate::x::attn::ATTN_SCORE_FOLD_HEADS`,
+// a contract with a `none:` arm, and `table::attn`'s row is GONE. The host
+// program does NOT move: `driver-cuda/src/fire/attn_score.rs` is 1,548 lines
+// whose live consumers -- `fire/scratch.rs`, `fire/stage_hooks.rs`,
+// `fire/launch.rs`, `bind/mod.rs` -- are about score STAGING and not about
+// this launch. Moving the fold would move a `Launch` and leave its staging
+// behind.
+//
+// §60.6's `_dev` SPLIT WAS NEVER APPLIED HERE and the crossing had to do it
+// first. The device row's symbol was `attn::attn_score_fold_heads`, the same
+// string as the table row and the same string `dsl::cuda` states, so a
+// `contract!` on it would have made a contract symbol a unit row's symbol --
+// which `execution::a_walk_is_only_a_walk` and `migration_status`'
+// `refused_set()` both read. The device row is
+// `attn::attn_score_fold_heads_dev` now and `fire/attn_score.rs`'s
+// `FOLD_SYMBOL` is the ONE firer, resolving through `unit::unit_of` rather
+// than a table, which is what made the rename one line.
+//
+// The `LaunchRule::Unstated` argument crossed verbatim into the unit doc,
+// because none of it is retracted: `dim3(num_requests, 64u)` at 256 threads,
+// `64` in no `Dims`, the body striding `i += blockDim.x * gridDim.y` so every
+// fanout produces the same floats and any parity test would pass a rule wrong
+// by 64x in blocks; and the two literal grid axes in all of `csrc/src` being
+// DIFFERENT literals in one file, so there is no rule to extract. In fn-world
+// the conclusion needs no rule to decline -- a `Launch` is written by whoever
+// fires it.
 
 /// The one `__global__` `attn/attention_xqa.cuh` holds — and the LAST one the
 /// `kernels-cuda` archive held.
 ///
-/// Not a template, for the same reason [`ATTN_SCORE_FOLD_ROWS`] is not: every
+/// Not a template, for the same reason `attn/attention_flashinfer.cuh`'s one
+/// row is not (it is `crate::x::attn::attention_flashinfer`'s now): every
 /// buffer is a page-table integer width fixed by the KV cache's own layout,
 /// there is no element type to vary, and a `template <int BLOCK>` would name a
 /// parameter the body never mentions.
@@ -1633,229 +1432,56 @@ pub const ATTN_SCORE_POST: Unit = Unit {
 
 /// The units the heavy half of `attn` compiles.
 pub const UNITS_HEAVY: &[Unit] = &[
-    ATTENTION_NAIVE_PAGED,
-    ATTN_SCORE_FOLD,
     ATTN_SCORE_POST,
     ATTN_XQA,
 ];
 
-/// The reference paged attention — `attention_naive_paged.cuh`'s two rows.
-///
-/// # What was blocking them, and what closed it
-///
-/// The SHAPE was stated a round ago: [`LaunchRule::PagedScores`] computes
-/// `dim3(num_requests, total_tokens, num_q_heads)` with the dynamic
-/// `(head_dim + 128) * sizeof(float)`, and [`LaunchRule::PagedScoresDecode`]
-/// its decode twin. What blocked the ROWS was the OPERANDS: both kernels take
-/// `device::KvScheme scheme` and `device::KvDType storage_dtype` **by value**,
-/// adjacently, and `kernels::Ty` had no variant for an `enum class`.
-///
-/// [`kernels::Ty::KvScheme`] and [`kernels::Ty::KvDType`] are that variant —
-/// two of them, not one. The refusal that mattered is
-/// [`kernels::Ty::KvScheme`]'s own: the two operands are ADJACENT in both
-/// parameter lists and the same width, so one shared kind would make the swap
-/// type-check on every side this crate can check. Two kinds put the check
-/// where the C++ can make it, in `abi::emit_device_typecheck`'s
-/// function-pointer initialisation, which admits no conversions and which an
-/// `enum class` admits none to begin with.
-///
-/// # §21.14's test, applied
-///
-/// *Does the new spelling make a wrong predicate well-formed?* The value
-/// arrives as [`crate::runtime::ArgValue::U8`] and becomes
-/// [`crate::device::Fact::Opaque`] — deliberately not a
-/// [`Fact::Int`](crate::device::Fact::Int). An enumerator read as an integer
-/// would make `Term::Multiple { operand: scheme, of: 2 }` a well-formed
-/// clause meaning *"the bank is `Native` or `Int8PerTokenHead`"*, which is a
-/// sentence nobody means and which selects an arm on the parity of a name.
-/// With `Opaque` it is a [`Fact::Kind`](crate::device::Fault::Kind) fault,
-/// and `Specialisation::agrees` refuses the clause before a fire, because
-/// `Term::Multiple` requires `Ty::I32`. A NAME is not a NUMBER; the
-/// vocabulary now says so.
-///
-/// # Why one row is sourced and one is not
-///
-/// `attn::attention_naive_paged` is DISPATCHED — `model::gemma_4`'s forward
-/// reaches it through `dsl::cuda::attention_naive_paged` when a head width
-/// FlashInfer's prefill template refuses (gemma-4's 512) needs a fallback —
-/// so its row states where every argument comes from, and the operands are
-/// `table::attn`'s own row expanded: that row hands the launcher a whole
-/// `KvCacheLayerView` and the launcher takes it apart, so the fields it takes
-/// apart INTO are what this row names.
-///
-/// `naive_paged_decode` has no dispatched launcher.
-/// `driver-cuda/tests/launch_abi.rs:491` records
-/// `attention_naive_paged_decode` as `NoRow::KernelsInternal` — it is called
-/// by kernels code and by no statement — so a row claiming a symbol would be
-/// claiming one nothing routes. It states its contract and its geometry and
-/// carries no `Source`, exactly as `QKV_FUSED_ROWS`' decode triple did and
-/// for the same reason. That triple is now three rows of
-/// `crate::x::attn::qkv_fused`'s `unit!` and carries no `Source` there
-/// either — a `unit!` row has nowhere to put one, which is the same fact
-/// stated by a shape rather than by an omission.
-pub const ATTENTION_NAIVE_PAGED: Unit = Unit {
-    name: "attn/attention_naive_paged",
-    root: include_str!("../../csrc/src/attn/attention_naive_paged.cuh"),
-    rows: ATTENTION_NAIVE_PAGED_ROWS,
-    options: &[],
-};
-
-/// `attn/attention_naive_paged.cuh`'s two rows.
-///
-/// `128` is `attention_naive_paged.cu:35`'s `constexpr int BLOCK = 128` and
-/// is a SHARED-MEMORY contract, not a tuning constant: the launcher asks for
-/// `(head_dim + BLOCK) * sizeof(float)` and the kernel cuts the tail of that
-/// allocation into exactly `BLOCK` reduction slots
-/// (`attention_naive_paged.cuh:402-404`). A row at another width would read
-/// slots nothing wrote. [`crate::runtime::launch`]'s `PAGED_BLOCK` states the
-/// same number on the geometry side and says so at greater length — including
-/// that the `.cu` named above is DELETED, that the 128 was read off it while
-/// it existed, and that the surviving oracle is the `.cuh`'s `template <int
-/// BLOCK>` plus the instantiation string NVRTC checks.
-#[rustfmt::skip]
-static ATTENTION_NAIVE_PAGED_ROWS: &[DeviceKernel] = &[
-    DeviceKernel {
-        sig: &ATTENTION_NAIVE_PAGED_SIGS[0],
-        template_path: "attn::device::naive_paged_attn",
-        elem: "device::i32(128)",
-    },
-    DeviceKernel {
-        sig: &ATTENTION_NAIVE_PAGED_SIGS[1],
-        template_path: "attn::device::naive_paged_decode",
-        elem: "device::i32(128)",
-    },
-];
-
-/// The two contracts, in [`ATTENTION_NAIVE_PAGED_ROWS`]' order.
-///
-/// # `k_scales` and `v_scales` are nullable and `custom_mask` is nullable and
-/// they are not the same kind of absent
-///
-/// The scale planes are null under `KvCacheScheme::Native`
-/// (`bind::abi::KvCacheLayerView::k_scales`, *"null under
-/// `KvCacheScheme::Native`"*) — absence means *"this bank is not quantised"*,
-/// which is a fact the `scheme` operand states in the same breath. The mask
-/// pair is null because THIS LAUNCHER passes it null:
-/// `attention_naive_paged.cu:208-209` hands `nullptr` twice where
-/// `attention_naive_paged_custom` at `:255-256` hands a real mask. Absence
-/// there means *"causal, not custom"*, and the kernel's own
-/// `use_custom_mask = custom_mask != nullptr` at `attention_naive_paged.cuh:393`
-/// is what reads it.
-///
-/// Both are `| null` and both are real; naming the difference here is the
-/// only place it is written down.
-///
-/// # The prefill row does NOT claim the ahead-of-time symbol's argument list
-///
-/// It claims the SYMBOL — `attn::attention_naive_paged` is what a statement
-/// dispatches — and the operands are the `__global__`'s, which is the whole
-/// point of a device row: the launcher's `KvCacheLayerView` and its
-/// `num_pages_in_batch` (which the launcher casts to `void` at `:193`) do not
-/// cross a `cuLaunchKernel`, and its `stream` is that call's sixth parameter
-/// rather than an argument. [`crate::x::attn::mla_paged`] argues the same
-/// split.
-#[rustfmt::skip]
-static ATTENTION_NAIVE_PAGED_SIGS: [KernelSig; 2] = [
-    // `attention_naive_paged.cu:195-221` --
-    //
-    //     dim3 grid(num_requests, total_tokens, num_q_heads);
-    //     dim3 block(BLOCK);
-    //     const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);
-    //     device::naive_paged_attn<BLOCK><<<grid, block, smem, stream>>>(
-    //         static_cast<const device::bf16*>(q),
-    //         kv_layer.k_pages, kv_layer.v_pages,
-    //         static_cast<const float*>(kv_layer.k_scales),
-    //         static_cast<const float*>(kv_layer.v_scales),
-    //         static_cast<device::bf16*>(o),
-    //         qo_indptr_d, kv_page_indices_d, kv_page_indptr_d,
-    //         kv_last_page_lens_d,
-    //         nullptr, nullptr,
-    //         num_q_heads, kv_layer.num_kv_heads, kv_layer.head_dim,
-    //         kv_layer.page_size,
-    //         static_cast<device::KvScheme>(kv_layer.scheme),
-    //         static_cast<device::KvDType>(kv_layer.storage_dtype),
-    //         kv_layer.block_size,
-    //         window_left, sm_scale, logits_soft_cap, lse_out);
-    //
-    // The two `static_cast`s are the mirror correspondence this row's two new
-    // `Ty`s reproduce: the host enum cannot cross NVRTC (its header pulls
-    // `<cstdint>`), so `attention_naive_paged.cuh:187` and `:198` declare
-    // device mirrors and `driver-cuda/tests/enum_mirrors.rs` asserts every
-    // enumerator of both. A row naming the mirror is naming a checked type.
-    //
-    // THAT CHECK USED TO BE `attention_naive_paged.cu`'s `static_assert`s and
-    // the file is deleted; the conclusion above is unchanged and the pair
-    // being checked is now the LIVE one. Those asserts compared host C++
-    // against the device mirror, and under NVRTC no host enum reaches a launch
-    // -- the operand this row builds is Rust's `KvCacheScheme`/`DType`. The
-    // replacement compares Rust against the `.cuh` directly and found the
-    // drift the old pair could not see: two `DType` enumerators, `MXFP4_PACKED`
-    // and `E8M0`, were never mirrored at all.
-    kernel!(attention_naive_paged "attn::attention_naive_paged",
-        file = Some("attn/attention_naive_paged.cuh"),
-        launch = LaunchRule::PagedScores,
-        operands = operands![
-            q: Bf16s <- Source::In(0),
-            k_pages: Buf <- Source::KvLayerField("k_pages"),
-            v_pages: Buf <- Source::KvLayerField("v_pages"),
-            k_scales: F32s | null <- Source::KvLayerField("k_scales"),
-            v_scales: F32s | null <- Source::KvLayerField("v_scales"),
-            o: BufMut <- Source::Out(0),
-            qo_indptr: U32s <- Source::Attn("qo_indptr_d"),
-            kv_page_indices: U32s <- Source::Attn("kv_page_indices_d"),
-            kv_page_indptr: U32s <- Source::Attn("kv_page_indptr_d"),
-            kv_last_page_lens: U32s <- Source::Attn("kv_last_page_lens_d"),
-            custom_mask: U8s | null <- Source::Lit(Lit::Null),
-            custom_mask_indptr: I32s | null <- Source::Lit(Lit::Null),
-            // The head COUNT, which nobody carries: the query's width over
-            // the cache's head dim. `table::attn`'s own row spells it the
-            // same way and for the same reason.
-            num_q_heads: I32 <- Source::Div(
-                &Source::Width(&Source::In(0)),
-                &Source::KvLayerField("head_dim"),
-            ),
-            num_kv_heads: I32 <- Source::KvLayerField("num_kv_heads"),
-            head_dim: I32 <- Source::KvLayerField("head_dim"),
-            page_size: I32 <- Source::KvLayerField("page_size"),
-            scheme: KvScheme <- Source::KvLayerField("scheme"),
-            storage_dtype: KvDType <- Source::KvLayerField("storage_dtype"),
-            block_size: I32 <- Source::KvLayerField("block_size"),
-            window_left: I32 <- Source::AttnWindow,
-            sm_scale: F32 <- Source::Attn("sm_scale"),
-            logits_soft_cap: F32 <- Source::Attn("logits_soft_cap"),
-            lse_out: F32sMut <- Source::Attn("lse_out_d"),
-        ]),
-    // `attention_naive_paged.cu:147-171` --
-    //
-    //     dim3 grid(num_requests, num_q_heads);
-    //     dim3 block(BLOCK);
-    //     const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);
-    //     device::naive_paged_decode<BLOCK><<<grid, block, smem, stream>>>(
-    //
-    // **No `Source`s**, and `ATTENTION_NAIVE_PAGED`'s doc gives the reason:
-    // `attention_naive_paged_decode` is `NoRow::KernelsInternal`, so there is
-    // no statement whose operands this row could be sourced from.
-    //
-    // `grid.x` is `num_requests` and [`LaunchRule::PagedScoresDecode`] reads
-    // `Dims::rows`, which is the identification a decode's contract licenses
-    // and a prefill's does not: one token per request makes `total_tokens ==
-    // num_requests`. The rule's own doc argues it against `PagedScores`,
-    // which cannot make it because a prefill spells both numbers in one
-    // `dim3`.
-    kernel!(naive_paged_decode "attn::naive_paged_decode",
-        file = Some("attn/attention_naive_paged.cuh"),
-        launch = LaunchRule::PagedScoresDecode,
-        operands = operands![
-            q: Bf16s, k_pages: Buf, v_pages: Buf,
-            k_scales: F32s | null, v_scales: F32s | null,
-            o: BufMut,
-            kv_page_indices: U32s, kv_page_indptr: U32s, kv_last_page_lens: U32s,
-            num_q_heads: I32, num_kv_heads: I32, head_dim: I32, page_size: I32,
-            scheme: KvScheme, storage_dtype: KvDType, block_size: I32,
-            window_left: I32, sm_scale: F32, logits_soft_cap: F32,
-            lse_out: F32sMut,
-        ]),
-];
+// `ATTENTION_NAIVE_PAGED`, `ATTENTION_NAIVE_PAGED_ROWS` and
+// `ATTENTION_NAIVE_PAGED_SIGS` STOOD HERE, and the root CROSSED INTO
+// FN-WORLD as `crate::x::attn::attention_naive_paged` -- one unit, two rows,
+// a host `fn`, a `contract!` and a `bind!`. `table::attn`'s row is GONE and
+// so is its `device::JIT_DISPATCHED` line.
+//
+// WHAT THIS BLOCK SAID WAS BLOCKING IT WAS TRUE AND IS CLOSED. Both kernels
+// take `device::KvScheme` and `device::KvDType` BY VALUE, adjacently, each an
+// `enum class ... : ::std::uint8_t`, and this file's own doc recorded that
+// `kernels::Ty` had no variant for one. It gained two -- not one, because the
+// operands are adjacent and the same width, so a shared kind would make the
+// SWAP type-check on every side this crate can check. `x::Abi` then had the
+// same gap one level down, and `x/abi.rs:226` had already predicted its own
+// first caller: *"an open set adds the impl with its first kernel."*
+// `x::attn::kv_scheme` and `x::attn::kv_dtype` are that impl, beside the one
+// kernel that needs them.
+//
+// THE NARROWING IS THE PART WORTH KEEPING. `x::cx`'s mirrors are
+// `#[repr(i32)]` and the device's are one byte, so the crossing is `as u8` --
+// four bytes on one side and one on the other, which is §3.2's hazard turned
+// ninety degrees. It is written once, in the `Abi` impl, so no host program
+// can spell it a second way.
+//
+// AND THE CROSSING RESTORED A PREDICATE THE ROW WORLD LOST.
+// `attention_naive_paged.cuh:220` records that the deleted `.cu` read
+// `kMaxHeadDim` in `check_head_dim_supported` -- *"the array and the
+// predicate that keeps launches inside it are ONE constant, not two."* The
+// `.cu` went; the predicate went with it; the generated JIT arm that replaced
+// it opens a grid through a `LaunchRule` and A `LaunchRule` CANNOT REFUSE.
+// So a head dim above 1024 has been reaching a kernel that indexes `acc[8]`
+// past its end -- a wrong answer, not a crash. `x::attn`'s `fn` refuses it as
+// `Refusal::Wide { what: "head_dim", at, max: 1024 }`.
+//
+// Both arguments this block made about the SIGS survive where the rows are:
+// the two kinds of nullability (`k_scales`/`v_scales` null under
+// `KvScheme::Native` means "not quantised"; `custom_mask` null means "causal,
+// not custom") are in the prefill row's doc, and §21.14's test -- *does the
+// new spelling make a wrong predicate well-formed?* -- is answered by
+// `ArgValue::U8` becoming `Fact::Opaque` rather than `Fact::Int`, so
+// `Term::Multiple { operand: scheme, of: 2 }` is a `Fact::Kind` fault rather
+// than a sentence about the parity of a name.
+//
+// The decode row kept its shape and gained nothing: `naive_paged_decode` is
+// `NoRow::KernelsInternal`, so it is a `unit!` row with no host program, and
+// a `unit!` row has nowhere to put a `Source` -- the absence is the shape
+// rather than a decision a later editor can quietly reverse.
 
 // `QKV_FUSED`, `QKV_FUSED_ROWS` and `QKV_FUSED_SIGS` STOOD HERE, and the
 // root CROSSED INTO FN-WORLD as `crate::x::attn::qkv_fused` — three `fn`s,
@@ -1865,10 +1491,12 @@ static ATTENTION_NAIVE_PAGED_SIGS: [KernelSig; 2] = [
 // They were a `Specialisation` spelling here: a base row plus arms, with
 // `flags_are_covered` proving the base unreachable. fn-world has no
 // `Specialisation`, so the obvious crossing renames them — and that would be
-// a `NoLoweredName` at the first decode fire, because
-// `driver-cuda/src/fire/qkv_fused.rs` fires by NAME:
-// `warp_symbol(head_dim, rope_table)` and `block_symbol(rope_table)` return
-// exactly these strings. The suffix is legal there for a checkable reason —
+// a `NoLoweredName` at the first decode fire, because the host program fires
+// by NAME: `warp_symbol(head_dim, rope_table)` and `block_symbol(rope_table)`
+// return exactly these strings. Those two are
+// `crate::x::attn::qkv_fused`'s now, moved out of
+// `driver-cuda/src/fire/qkv_fused.rs` with the dispatch they serve.
+// The suffix is legal there for a checkable reason —
 // `x/abi.rs:824`'s `mangle` already lists `'#'` among the characters it
 // replaces when it writes the typecheck TU. **The row world's arm spelling
 // survives as a plain symbol**, which is the cheapest crossing a
@@ -1881,13 +1509,20 @@ static ATTENTION_NAIVE_PAGED_SIGS: [KernelSig; 2] = [
 // base row states one `launch` — is retired by the crossing rather than
 // answered: in fn-world a `Launch` is written by whoever fires it, so two
 // geometries are two `Launch` literals in one host `fn` and nothing has to
-// agree with anything. `qkv_decode_fused_dispatch` already writes both.
+// agree with anything. `x::attn::qkv_fused::qkv_decode_fused_dispatch`
+// already writes both — and it is `x::attn`'s now rather than
+// `driver-cuda`'s, so the two `Launch` literals sit beside the `unit!` that
+// declares the eleven rows they fire.
 //
-// One of the two table rows went with it. `attn::qkv_packed_qk_norm_rope_
-// vnorm_write_kv_bf16` is `crate::x::attn::QKV_PACKED_POST`, contract and
-// bind; `attn::qkv_decode_qk_norm_rope_write_kv_bf16` STAYS in `table::attn`,
-// because its host program is `bind::service`-served out of `driver-cuda` —
-// the `attn::split_qkv_bf16_devwin` arrangement, unchanged.
+// BOTH table rows went with it, one commit apart.
+// `attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16` is
+// `crate::x::attn::QKV_PACKED_POST` and
+// `attn::qkv_decode_qk_norm_rope_write_kv_bf16` is
+// `crate::x::attn::QKV_DECODE_FUSED`, each a contract and a real bind. The
+// decode form waited on `Cx::q_out` and nothing else; the sentence that stood
+// here said it *"STAYS in `table::attn`, because its host program is
+// `bind::service`-served"*, which was true for as long as the query did not
+// exist. It was the LAST ROW IN `ROW_TABLES`.
 
 // `MLA_PAGED_ROWS`, `MLA_PAGED_SIGS`, `KIMI_MLA_ROWS` and `KIMI_MLA_SIGS`
 // STOOD HERE, 224 lines of them. Both roots crossed into fn-world —
@@ -2006,8 +1641,8 @@ static ATTENTION_NAIVE_PAGED_SIGS: [KernelSig; 2] = [
 //
 // With `prefix()`, `TAKE_15`/`13`/`12`/`11`/`10`, `SPECIALISATIONS` and the
 // `each_arm_names_the_instantiation_its_name_claims` test. **CROSSED INTO
-// FN-WORLD** — `crate::x::attn::kv_paged`, UNIT-ONLY, and `table::attn`'s
-// four rows over this root STAY.
+// FN-WORLD** — `crate::x::attn::kv_paged`, and `table::attn`'s four rows
+// over this root have since gone with Half B.
 //
 // **The five `Specialisation`s did not become `if`s here; they had already
 // become `if`s and nothing had noticed.** `driver-cuda/src/fire/kv_paged.rs`

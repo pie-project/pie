@@ -132,9 +132,9 @@
 // **`fastdiv.cuh:29` -- `__host__ uint_fastdiv(uint32_t d)` -- trips the same
 // error**, and the failure reads as if `<cuda/cmath>` were at fault when the
 // wall is in FlashInfer's execution-space annotations. It is now guarded in
-// `csrc/vendor/flashinfer/fastdiv.cuh` with `#ifndef __CUDACC_RTC__` -- a JIT
-// caller computes the divisor host-side and passes it in a params struct, so
-// device code never constructs one. Recorded here anyway, because the next
+// `csrc/src/attn/flashinfer/fastdiv.cuh` with `#ifndef __CUDACC_RTC__` -- a
+// JIT caller computes the divisor host-side and passes it in a params struct,
+// so device code never constructs one. Recorded here anyway, because the next
 // person to meet it will open this file first.
 //
 // # Includes nothing

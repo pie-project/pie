@@ -137,7 +137,11 @@ const POSTS: &[Post] = &[
     // because a check that covers three of four launches invites the reader
     // to wonder about the fourth.
     Post {
-        symbol: "attn::attn_score_fold_heads",
+        // `_dev`: §60.6's split, applied to this root when it crossed. The
+        // trace symbol `attn::attn_score_fold_heads` is
+        // `x::attn::ATTN_SCORE_FOLD_HEADS`'s now, and a contract symbol is
+        // never a unit row's symbol. The DEVICE row is what this file checks.
+        symbol: "attn::attn_score_fold_heads_dev",
         operands: &[
             ("scores", Ty::Buf),
             ("score_indptr", Ty::I32s),
@@ -238,7 +242,7 @@ fn the_three_post_kernels_share_one_unit() {
         );
     }
     assert_ne!(
-        unit_of("attn::attn_score_fold_heads"),
+        unit_of("attn::attn_score_fold_heads_dev"),
         normalize,
         "the decode fold has joined the post unit — if that was deliberate, this \
          assertion is the place to say so, because it changes what a first fire costs"

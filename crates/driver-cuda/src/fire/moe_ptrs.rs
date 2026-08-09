@@ -97,6 +97,73 @@ pub struct Arrays {
     pub b_dn: *mut *const c_void,
     /// down output — into the `out` staging.
     pub c_dn: *mut *mut c_void,
+    /// The `[E, 2·I, H]` bank whose expert slices `b_gu`'s entries address,
+    /// and [`Self::bank_dn`] the `[E, H, I]` one behind `b_dn`.
+    ///
+    /// Carried so a later arm can say WHICH projection it is holding. The two
+    /// grouped GEMMs are the same symbol with the same parameter list —
+    /// `dsl::cuda::moe_grouped_gemm(act, expert_ids, stage, .., bank, ..)`
+    /// twice, at `model/src/qwen_3_5/forward/mod.rs:198` and `:210` — and
+    /// nothing else in the statement tells them apart. `N` would, on a model
+    /// where `2·I != H`, which is a property of qwen3.5 and not of the shape.
+    /// The BANK is exact: the build and both GEMMs are handed the same two
+    /// weight NAMES (`w.expert_gate_up.name`, `w.expert_down.name`), so one
+    /// `Resolver::weight` answer per name is one address, and the arm
+    /// compares the address it was given against the two carved from.
+    pub bank_gu: *const c_void,
+    /// See [`Self::bank_gu`].
+    pub bank_dn: *const c_void,
+}
+
+/// Which projection a grouped GEMM is, once [`Arrays::select`] has named it.
+///
+/// Two variants and no `Unknown`: a bank that is neither is a refusal at the
+/// call site, not a third state carried around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Half {
+    /// `[aligned, H] @ [E, 2·I, H]^T -> [aligned, 2·I]`, the gate/up pair.
+    GateUp,
+    /// `[aligned, I] @ [E, H, I]^T -> [aligned, H]`, the down projection.
+    Down,
+}
+
+impl Arrays {
+    /// Which of the two triples serves a GEMM that names `bank`.
+    ///
+    /// `None` for a bank neither half was built for — a third projection, or
+    /// a build whose banks are another layer's. That is a refusal and not a
+    /// default: picking a triple by "it must be the other one" launches a
+    /// GEMM over pointer arrays addressed to a tensor the statement does not
+    /// name, which is the wrong-answer direction rather than the refusing
+    /// one.
+    #[must_use]
+    pub fn select(&self, bank: *const c_void) -> Option<Half> {
+        if bank.is_null() {
+            return None;
+        }
+        if std::ptr::eq(bank, self.bank_gu) {
+            Some(Half::GateUp)
+        } else if std::ptr::eq(bank, self.bank_dn) {
+            Some(Half::Down)
+        } else {
+            None
+        }
+    }
+
+    /// The `(activations, weights, output)` triple for a half, in the order
+    /// [`kernels_cuda_new::x::gemm::dense::batched_act_x_wt_bf16`] takes them.
+    #[must_use]
+    pub fn triple(
+        &self,
+        half: Half,
+    ) -> (*const *const c_void, *const *const c_void, *const *mut c_void) {
+        match half {
+            Half::GateUp => {
+                (self.a_gu.cast_const(), self.b_gu.cast_const(), self.c_gu.cast_const())
+            }
+            Half::Down => (self.a_dn.cast_const(), self.b_dn.cast_const(), self.c_dn.cast_const()),
+        }
+    }
 }
 
 /// The four weight bases, with the shared-expert pair kept nullable.
@@ -281,7 +348,12 @@ impl MoePtrArena {
     /// One `alloc` and six offsets rather than six `alloc`s, so the six
     /// cannot be split across a growth: a partial carve would leave three
     /// arrays in a retired block the next fire's reset hands back.
-    fn carve<M: DeviceMemory>(&mut self, mem: &mut M, max_blocks: i32) -> Option<Arrays> {
+    fn carve<M: DeviceMemory>(
+        &mut self,
+        mem: &mut M,
+        max_blocks: i32,
+        banks: Banks,
+    ) -> Option<Arrays> {
         let slots = usize::try_from(max_blocks).ok()?;
         let one = slots.checked_mul(size_of::<*const c_void>())?;
         let stride = one.div_ceil(Self::ALIGN) * Self::ALIGN;
@@ -299,6 +371,13 @@ impl MoePtrArena {
             a_dn: at(3).cast(),
             b_dn: at(4).cast(),
             c_dn: at(5).cast(),
+            // The two bases are carried rather than re-derived because the
+            // arrays outlive this call and the banks do not travel with the
+            // GEMM that reads them. Taking them here rather than in `build`
+            // is so that an `Arrays` is never half-filled: every field is
+            // set by the one expression that mints the value.
+            bank_gu: banks.gate_up,
+            bank_dn: banks.down,
         })
     }
 
@@ -317,8 +396,9 @@ impl MoePtrArena {
 ///
 /// The arrays are the return value because they are the driver's and nothing
 /// else can hold them: the two grouped GEMMs that read them are the same
-/// dispatch's later statements, so the caller keeps this `Arrays` beside the
-/// fire and hands it to the batched fallback when
+/// dispatch's later statements, so `DispatchCtx::moe_ptrs` holds this
+/// `Arrays` for the fire and [`crate::fire::moe_grouped`] hands it to the
+/// batched fallback when
 /// [`x::moe::supported`](kernels_cuda_new::x::moe::supported) refuses the
 /// WMMA form. On qwen3.5 that is not hypothetical: gate/up has `K = 2048`
 /// against a `SHORT_K` of 512, so the fallback is the only GEMM on that half.
@@ -348,7 +428,7 @@ pub unsafe fn build<M: DeviceMemory>(
     // is made here is the one refusal the host program cannot see, because
     // the arena is the caller's: a device that would not grow it. Carving
     // first also means a declined build has allocated nothing.
-    let Some(arrays) = arena.carve(mem, bounds.max_blocks) else {
+    let Some(arrays) = arena.carve(mem, bounds.max_blocks, banks) else {
         return Built::Declined(Decline::NoArena {
             bytes: MoePtrArena::carve_bytes(bounds.max_blocks),
         });
@@ -443,37 +523,34 @@ thread_local! {
     /// it, and a fire is a thread.
     static ARENA: std::cell::RefCell<MoePtrArena> =
         std::cell::RefCell::new(MoePtrArena::default());
-
-    /// The last carve, and this cell is a SEAM rather than a design.
-    ///
-    /// The six arrays are produced by one dispatch arm and read by another —
-    /// `moe::moe_grouped_gemm_bf16`'s batched-cuBLAS fallback, which
-    /// `bind::DispatchRefusal::ShapeDeclined` says in as many words does not
-    /// exist yet ("until that fallback exists here, saying so is the only
-    /// honest answer"). Between two arms of one `match` in one fire there is
-    /// no value to pass, so the carve is stashed where the second can find
-    /// it.
-    ///
-    /// **The better home is a field on `DispatchCtx`**, beside `ctx.lora`,
-    /// which is that struct's precedent for exactly this: state one arm
-    /// builds and another consumes. That is a floor change and the floor is
-    /// not this file's, so the stash is written so it can move in one edit —
-    /// [`build_for_fire`] stores, [`last_arrays`] reads, and nothing else
-    /// touches the cell.
-    ///
-    /// WHAT MAKES IT CORRECT MEANWHILE IS THE PLAN AND NOT LUCK: the build
-    /// is step 3 of 8, both grouped GEMMs are below it in the same lowering,
-    /// on the same thread, in issue order. WHAT MAKES IT A SEAM is that
-    /// nothing states that — the next layer's build overwrites the cell, and
-    /// it is only correct because this layer's GEMMs sit between the two.
-    static LAST: std::cell::Cell<Option<Arrays>> = const { std::cell::Cell::new(None) };
 }
 
-/// [`build`] against the per-thread arena, stashing the carve for the GEMM
-/// arms below it.
+// A SECOND `thread_local!` STOOD HERE — `LAST`, the carve stashed for the
+// GEMM arm that reads it — and it is GONE, in the one edit its own doc said
+// it was written for.
+//
+// It called itself a SEAM and named the better home: *"a field on
+// `DispatchCtx`, beside `ctx.lora`, which is that struct's precedent for
+// exactly this: state one arm builds and another consumes"*. That field
+// landed as `DispatchCtx::moe_ptrs`, and as a `Cell<Option<Arrays>>` rather
+// than the plain `Option` the ask asked for — `ctx.lora`'s precedent does
+// not transfer, because `lora` is filled at CONSTRUCTION and this cannot be
+// (the build is step 3 of 8) while every dispatch arm holds `&DispatchCtx`.
+// A plain `Option` would have been `None` for the life of the fire.
+//
+// What the stash could never state is the part worth keeping: it was correct
+// only because the build and both GEMMs are the same fire on the same thread
+// in issue order, and NOTHING SAID SO — the next layer's build overwrote the
+// cell and only the plan's shape kept that from being read. The `ctx` field
+// says it: the arrays belong to the dispatch that built them, and a second
+// dispatch has a second ctx.
+
+/// [`build`] against the per-thread arena.
 ///
 /// The entry point a dispatch arm calls: it holds a raw stream and no arena,
-/// which is the whole difference from [`build`].
+/// which is the whole difference from [`build`]. The `Ready` arrays are the
+/// CALLER'S to keep — `DispatchCtx::moe_ptrs` is where they go, and the two
+/// grouped GEMMs below this statement read them from there.
 ///
 /// # Safety
 ///
@@ -489,27 +566,11 @@ pub unsafe fn build_for_fire(
     stream: *mut c_void,
 ) -> Built {
     let mut mem = LiveMoePtrMemory::new(stream);
-    let built = ARENA.with(|arena| {
+    ARENA.with(|arena| {
         let mut arena = arena.borrow_mut();
         // SAFETY: the caller's obligation, forwarded unchanged.
         unsafe {
             build(&mut arena, &mut mem, expert_ids, aligned_in, banks, stage, bounds, stream)
         }
-    });
-    if let Built::Ready(arrays) = &built {
-        LAST.with(|cell| cell.set(Some(*arrays)));
-    }
-    built
-}
-
-/// The last successful carve on this thread, for the grouped GEMM arms.
-///
-/// `None` before the first build of the process, and after a build that
-/// declined — a declined build stores nothing, so a caller that reads a
-/// stale carve reads one whose staging bases are still the ones its own
-/// statement named.
-#[cfg(feature = "_cuda")]
-#[must_use]
-pub fn last_arrays() -> Option<Arrays> {
-    LAST.with(std::cell::Cell::get)
+    })
 }

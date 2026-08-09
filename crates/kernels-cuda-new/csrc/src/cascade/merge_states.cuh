@@ -32,13 +32,13 @@
 // `tests/layers.rs`' `a_row_lives_in_the_unit_that_compiles_it`, so the
 // rename cannot be done half way.
 //
-// # The vendored copy, which is the whole point
+// # The internalised copy, which is the whole point
 //
 // The include below resolves against the CARRIED set --
-// `csrc/vendor/flashinfer/attention/cascade.cuh`, walked into `carried.rs`
+// `csrc/src/attn/flashinfer/attention/cascade.cuh`, walked into `carried.rs`
 // and handed to NVRTC as `includeNames[]`. It is not the CPM checkout: no
-// `-I` anywhere in this repository ever put `csrc/vendor` in front of a C++
-// compiler, and the launcher that used to read this text read
+// `-I` anywhere in this repository ever put this crate's `csrc` in front of a
+// C++ compiler, and the launcher that used to read this text read
 // `${flashinfer_SOURCE_DIR}` instead. The two copies are the same upstream
 // bytes, which is what kept the distinction invisible while both existed.
 // Only one of them exists now, and it is this one.
@@ -49,7 +49,7 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
-#include <flashinfer/attention/cascade.cuh>
+#include "attn/flashinfer/attention/cascade.cuh"
 
 namespace pie_cuda_driver::kernels::cascade {
 

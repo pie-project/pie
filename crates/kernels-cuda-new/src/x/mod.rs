@@ -281,9 +281,27 @@ pub fn entry(symbol: &str) -> Option<&'static Entry> {
 /// seam no [`Cx`] can cross. `moe::flashinfer_cutlass_moe_bf16` was one
 /// because it needed a workspace query, an allocation and an arch probe.
 /// `moe::build_moe_ptrs_aligned_bf16` is one because the six pointer arrays
-/// it carves live in the driver's arena. **In each case the test is the same
-/// and it is answerable in one line: name the resource.** If you cannot,
-/// it is a move.
+/// it carves live in the driver's arena. And `moe::moe_grouped_gemm_bf16` is
+/// the third, needing **both** — the cuBLAS handle and those same arrays.
+/// **In each case the test is the same and it is answerable in one line: name
+/// the resource.** If you cannot, it is a move.
+///
+/// # The test is NECESSARY AND NOT SUFFICIENT
+///
+/// `attn::split_qkv_bf16_devwin` needs no driver resource — so by the test
+/// above it is a move — and still could not bind, because [`Cx::arg_in`] and
+/// [`Cx::arg_out`] are pre-windowed by `resolve_arg_windowed` and that kernel
+/// windows *again* from device memory. The second condition is whether `Cx`
+/// can **state** what the body reads, and there it could not until
+/// [`Cx::window_left`].
+///
+/// And `moe::moe_grouped_gemm_bf16` is the only symbol in the tree that
+/// reached this shape **from a working bind**. The bind served one half
+/// (`K = 512`) and refused the other (`K = 2048`) with `Refusal::Wide`, and
+/// `bind`'s own *"a refusal is not a fallthrough"* makes that the FINAL
+/// answer rather than the first half of a choice — so both implementations
+/// had to move behind one host program. **A working half plus a permanent
+/// refusal is not a partial success; it is a symbol that cannot be served.**
 ///
 /// This is the only case where a `none:` arm is wrong. Everywhere else a
 /// `none:` is exactly right and is the whole point of [`Route::Unbound`]:

@@ -681,7 +681,7 @@ mod tests {
 /// makes that a deliberate line rather than an omission.
 ///
 /// Cheap: ~70 multiplies once per fire, against a graph launch.
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 #[must_use]
 pub fn capture_digest(
     ctx: &crate::bind::DispatchCtx,

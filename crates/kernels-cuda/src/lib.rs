@@ -127,6 +127,14 @@
 // a door nobody opens, spelled as a `pub use`.
 //
 // So the crate is now what its header already claimed it was: `csrc/` and
-// `build.rs`. Its Rust is a lib target Cargo requires and a `links` key that
-// carries `DEP_PIE_KERNELS_CUDA_LAUNCH_SHIM` to `driver-cuda`, which is the
-// only handoff with a reader.
+// `build.rs`. Its Rust is a lib target Cargo requires and a `links` key.
+//
+// **THAT KEY NOW HAS NO READER.** `DEP_PIE_KERNELS_CUDA_LAUNCH_SHIM` was
+// read by `driver-cuda/build.rs`, which located `libpie_launch_shim.a`
+// through it and emitted the `-l`. North star §6 cut that line: the shim has
+// zero members once no row is stated, so there is nothing to link. The key
+// is still PUBLISHED — this crate's `shim()` still prints it under `native`
+// — and `del-archive` is where the question of whether `native` itself
+// survives belongs. What is settled is that the last thread from
+// `driver-cuda` to here is cut; nothing in that crate names `kernels_cuda::`
+// and nothing in it asks for `native`.

@@ -5,8 +5,8 @@
 // PIE: spellings — so the bare form would reach whichever tree NVRTC
 // PIE: scanned first. Spelled tree-relative here; the bytes included are
 // PIE: upstream's own files, unchanged.
-#include "xqa/mma.cuh"
-#include "xqa/utils.cuh"
+#include "attn/xqa/mma.cuh"
+#include "attn/xqa/utils.cuh"
 
 using InstAcc = Array2D<float, 2, 2>;
 

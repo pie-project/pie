@@ -1,5 +1,27 @@
 //! Layer 1: the rows, and nothing that needs a GPU to read one.
 //!
+//! **THERE ARE NO ROWS LEFT.** [`ROW_TABLES`] is `&[]` as of the `attn`
+//! crossing, so [`KERNELS`] is the flattening of [`crate::x::SIGS`] and
+//! nothing else, and this module is no longer a table. What it still is, and
+//! why it survives its own contents:
+//!
+//! * **the flattener.** `x::SIGS` is `&[&[KernelSig]]` — a list per family,
+//!   each derived by `Contract::sig`. Every consumer needs a flat
+//!   `&[KernelSig]`: `model-compiler`'s `check_plan`, `kernels-cuda`'s
+//!   `build.rs`, and six test files. [`concat_tables`] is the only const
+//!   `[&[T]] -> [T]` in the tree.
+//! * **the lookup.** [`sig`] is what answers *"does anything declare this
+//!   symbol"*, which is the question a model load asks per statement.
+//!
+//! So `table/` does NOT die with the rows, and the claim [`ROW_TABLES`]
+//! carried for six ports — *"when it is, `KERNELS` is `x::SIGS` and this file
+//! is deletable"* — was one step too strong. Deleting this file means moving
+//! `KERNELS`, `TABLES`, `sig` and `total` into `x/` and editing every consumer
+//! that spells `table::`. That is a rename of live API with no behaviour
+//! change: step 6's cost, paid for a name. The honest end state is that this
+//! module is renamed, not removed — and until it is, the one thing worth
+//! keeping straight is that **`table::` now means `x::SIGS`, flattened.**
+//!
 //! One row per launcher symbol the ahead-of-time archive defines, written in
 //! `kernels`' vocabulary — [`KernelSig`], `whole`, `needs`, `lacks`, `sink` —
 //! which is also where the reasons for each of those words are.
@@ -77,6 +99,15 @@ use kernels::{KernelSig, Prepare};
 // symbol from a JIT'd one, so the contract must reach it, and nothing else
 // about the symbol may.
 pub mod attn;
+// `attn::KERNELS` IS EMPTY AND IS IN NO LIST — §5 step 5 finished here.
+//
+// The module is declared and read by path from
+// `driver-cuda/tests/launch_abi.rs` (`:540`, `:809`), and it holds the
+// derivations of all forty-one crossings. It is NOT in [`ROW_TABLES`], which
+// is `&[]`, so it contributes nothing to [`KERNELS`] and nothing to
+// [`TABLES`]. That is deliberate and not an oversight: an empty list in no
+// list is inert, while an empty list still IN `ROW_TABLES` would leave the
+// list non-empty and the north star's step-5 gate unmet on a technicality.
 // `driver_internal` and `gemm` ARE GONE — §5 step 5 took both into fn-world.
 //
 // `gemm` is `x::gemm`: twelve contracts, two binds, ten `none:` arms and a
@@ -155,16 +186,16 @@ pub static KERNELS: &[KernelSig] = &concat_tables();
 /// keeps them.
 pub static TABLES: &[&[KernelSig]] = &concat_lists();
 
-/// The families still written as rows.
+/// The families still written as rows. **EMPTY.**
 ///
-/// Shrinks by one module per §5 step-5 port and is empty when the sweep is
-/// done. When it is, [`KERNELS`] is `x::SIGS` and this file is deletable —
-/// which is the clearest available statement of what step 5 finishing means.
+/// Shrank by one module per §5 step-5 port and is empty now the sweep is
+/// done. [`KERNELS`] is [`crate::x::SIGS`] — which is the clearest available
+/// statement of what step 5 finishing means.
 ///
-/// `static` rather than `const`, and deliberately: the members are `static`s,
-/// and [`TABLES`] has read `static`s from a `const` context here since
-/// [`total`] was written. Matching that shape exactly means this line adds no
-/// construct the tree has not already compiled.
+/// `static` rather than `const`, and deliberately: the members were
+/// `static`s, and [`TABLES`] has read `static`s from a `const` context here
+/// since [`total`] was written. Matching that shape exactly meant this line
+/// added no construct the tree had not already compiled.
 ///
 /// **`moe::KERNELS` left on the commit that crossed `quant`'s four routed
 /// decode GEMVs**, and the shape of that crossing is worth keeping: those
@@ -175,12 +206,15 @@ pub static TABLES: &[&[KernelSig]] = &concat_lists();
 /// family's name for as long as both entries were there. Nothing was wrong
 /// until one had to go.
 ///
-/// **`attn` is the last, and its 32 rows are the whole remaining structural
-/// distance in the CUDA lane** — when they go, this list is empty, [`KERNELS`]
-/// is `x::SIGS`, `driver-cuda`'s `bridge` feature is deletable, and with it
-/// `kernels-cuda/native`, which is the only switch over every nvcc and `.cpp`
-/// compile in the workspace.
-static ROW_TABLES: &[&[KernelSig]] = &[attn::KERNELS];
+/// **`attn::KERNELS` was the last**, and its forty-one rows were the whole
+/// remaining structural distance in the CUDA lane. They are gone, so
+/// [`KERNELS`] is `x::SIGS`, `driver-cuda`'s `bridge` feature is deletable,
+/// and with it `kernels-cuda/native`, which is the only switch over every
+/// nvcc and `.cpp` compile in the workspace. **`table::attn` itself is still
+/// declared** — an empty list and eight hundred lines of tombstones, read by
+/// path from `driver-cuda/tests/launch_abi.rs`; its module doc says why, and
+/// removing it is one line here plus one `git rm`.
+static ROW_TABLES: &[&[KernelSig]] = &[];
 
 const N_LISTS: usize = ROW_TABLES.len() + crate::x::SIGS.len();
 

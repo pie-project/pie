@@ -364,13 +364,21 @@ fn the_lookup_agrees_with_the_tables_it_reads() {
     let statable_walks =
         execution::WALKED.iter().filter(|w| table::sig(w.symbol).is_some()).count();
     assert_eq!(walked, statable_walks, "a walked row is not a table row");
+    // `walked > 0` LEFT THIS CONJUNCTION AND `walked` IS STILL PRINTED.
+    //
+    // `execution::WALKED` is empty: `attn::qkv_decode_qk_norm_rope_write_kv_\
+    // bf16` was its last entry and the last row in `table::ROW_TABLES`, and
+    // both went in the same index. The other three floors stay because their
+    // arms still have members; this one would assert that a list the
+    // migration exists to empty is not empty. It stays in the message so a
+    // future non-zero is visible rather than silent.
     assert_eq!(
         jit + served + composed + walked + pending,
         table::KERNELS.len(),
         "the lookup is not total"
     );
     assert!(
-        jit > 100 && composed > 0 && walked > 0 && pending > 0,
+        jit > 100 && composed > 0 && pending > 0,
         "the arms are not all exercised: {jit} jit, {composed} composed, {walked} walked, \
          {pending} pending"
     );
@@ -643,7 +651,8 @@ fn the_three_kinds_are_all_reachable() {
     // and called the first step *"an UNMIGRATED kernel — neither `Jit` nor
     // `Service`"*. It was true for four arcs and it is the thing that
     // changed: `gemm.cpp`'s dense autotuner is `driver-cuda/src/fire/gemm.rs`
-    // now, the row is `Execution::Walk`, and `COMPOSED`'s entry for
+    // now, the row was `Execution::Walk` and is `Service::DriverOp` today,
+    // and `COMPOSED`'s entry for
     // `gemm::act_x_wt_bias_bf16` is byte-for-byte what it was. **That is the
     // information hiding working**, and it is a stronger demonstration than
     // the absence was: the step did not have to know, and it did not.
@@ -651,10 +660,42 @@ fn the_three_kinds_are_all_reachable() {
     assert_eq!(bias.kind(), Kind::Op);
     let first = execution::execution("gemm::act_x_wt_bf16")
         .expect("the demonstration case's first step is executed now");
+    // THE §75 ARTEFACT THIS ASSERTION CARRIED, kept because it is the
+    // clearest specimen in the file: the paragraph above once read *"the row
+    // is `Execution::Walk`"*, a fact derived when `gemm.cpp`'s autotuner was
+    // a driver-owned walk and left next to the demonstration after the walk
+    // went. `gemm::act_x_wt_bf16` has not been in `WALKED` since `gemm`'s own
+    // §5 step-5 crossing retracted its walks, so the assertion below was red
+    // for several arcs and nothing said so — a walk is the one executor that
+    // can be retracted without any list going empty, because `WALKED` losing
+    // its last member is not a compile error.
+    // WAS RED AT HEAD, AND NOT MADE RED BY THE `attn` CROSSING. Repaired
+    // here because north star §6 owns it: the walk world and the row world
+    // retire together, and `WALKED` is empty.
+    //
+    // Derived, not assumed, from `execution.rs`'s own lists rather than from
+    // the paragraph above: `gemm::act_x_wt_bf16` is absent from `WALKED`
+    // (which holds nothing at all), absent from `COMPOSED` and `RUST_SERVED`,
+    // and present in `SERVED` as `Service::DriverOp` — with a `because` that
+    // names the body: *"its bf16 arm is a direct Rust call to
+    // `x::gemm::dense::act_x_wt_bf16` — the autotuner, the cuBLASLt plan
+    // cache and the on-disk tactic cache."*
+    //
+    // So the answer changed from `Walk` to `Service(DriverOp)` and the
+    // DEMONSTRATION IS UNHARMED — it is strictly better. The paragraph above
+    // promises that a step "names a SYMBOL and knows nothing about what
+    // executes it", and this symbol has now changed executor TWICE
+    // (unmigrated -> walk -> driver op) while `COMPOSED`'s entry for
+    // `gemm::act_x_wt_bias_bf16` stayed byte-for-byte identical. Asserting
+    // the CURRENT executor by name would re-mint the coupling the assertion
+    // exists to disprove, so what is asserted is that it HAS one and that
+    // the composition did not have to know which.
     assert!(
-        matches!(first, Execution::Walk(_)),
-        "`gemm::act_x_wt_bf16` is a driver-owned host walk — a runtime autotuner over three \
-         kernel families — and neither `Jit` nor `Service` can say that"
+        !matches!(first, Execution::Composed(_)),
+        "`gemm::act_x_wt_bf16` is executed by something that is not itself a \
+         composition -- it is `Service::DriverOp` today and was a driver-owned \
+         host walk before that, and the point of this test is that \
+         `COMPOSED`'s entry did not change when it moved"
     );
     assert_eq!(first.kind(), Kind::Op);
 }

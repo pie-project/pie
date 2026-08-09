@@ -1261,8 +1261,9 @@ fn single_warp() -> Launch {
 /// whose rectangle IS the request count. `dsl::cuda::compact_page_csr`
 /// records its result as `Shape(vec![Dim::Requests])`, `lower.rs:716`
 /// resolves that to `n_requests`, the statement is `whole`, and
-/// `families::attn`'s [`PAGE_COMPACT`](crate::families::attn::PAGE_COMPACT)
-/// sets the chain out in full. Moving those two here would make them read
+/// [`crate::x::attn::page_compact`] sets the chain out in full -- it was
+/// `families::attn`'s `PAGE_COMPACT` when this was written, and the unit
+/// crossed into fn-world with both rows. Moving those two here would make them read
 /// [`Dims::requests`], which `jit_dims` fills from the ATTENTION context and
 /// leaves zero without one — turning two rules that agree into one that
 /// answers [`Ungeometric::Empty`]. `mtp_update_pending_hidden` goes the other

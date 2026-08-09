@@ -21,7 +21,7 @@
 // PIE: upstream spells this bare; FlashInfer's `utils.cuh` answers to the
 // PIE: same literal spelling in NVRTC's flat include namespace. See
 // PIE: `mha_components.cuh` for the whole note.
-#include "xqa/utils.cuh"
+#include "attn/xqa/utils.cuh"
 
 // for beam search
 template <typename Head, uint32_t tokensPerPage, uint32_t nbPages>

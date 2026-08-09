@@ -610,7 +610,14 @@ jobs:
       # for `metal-4` being a feature rather than a `target_vendor`.
       - name: cargo build (every feature spelling)
         run: |
-          cargo build -p driver-cuda --features cuda-13,bridge
+          # `cuda-13,bridge` STOOD HERE. `bridge` is retired (north star §6)
+          # and naming a feature that does not exist is a hard cargo error,
+          # so this line had to go in the same commit as the manifest.
+          #
+          # `abi` is what covers it: `abi = ["bridge", …]` until this commit
+          # and `["_cuda", …]` after, so the configuration this step actually
+          # built under both spellings is the one below. The spelling that
+          # went was a strict subset, not a distinct configuration.
           cargo build -p driver-cuda --features cuda-13,abi
 
       - name: cargo build (driver-cuda)

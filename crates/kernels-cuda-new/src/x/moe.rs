@@ -46,7 +46,7 @@
 //! ```
 //!
 //! The last three are `cuda::tiles` kernels. They are carried on disk, they
-//! are measured, they are gated by `tests/vendor_manifest.rs`, and they are
+//! are measured, they are gated by `tests/upstream_manifest.rs`, and they are
 //! not units because **a unit is a claim that this crate's compiler can
 //! compile it** and that claim is false at the system `libnvrtc`. Their
 //! measurements are below, in full, because a port that consumes a
@@ -86,7 +86,13 @@
 //! being true. **A name chosen to keep two things legal beside each other
 //! keeps them legal after one of them stops being true.**
 //!
-//! # TWO driver ops, and the second one arrived by re-reading a refusal
+//! # THREE driver ops, and each one arrived by a different road
+//!
+//! The first was always one, the second arrived by re-reading a refusal, and
+//! the third was a working bind that gave the shape up because half of its
+//! shapes have no kernel. Three roads to one registration shape, and the
+//! third is the only one in the tree that ran BACKWARDS — see
+//! `MOE_GROUPED_GEMM`'s contract.
 //!
 //! ## `moe::flashinfer_cutlass_moe_bf16`
 //!
@@ -139,6 +145,41 @@
 //! the aligned leg cannot start without this call. The pointer build DECLARES
 //! `gu_stage`/`act_stage`/`out_stage`, the three destinations every op below
 //! it writes into. It is not an optimisation, it is step 3 of 8.
+//!
+//! ## `moe::moe_grouped_gemm_bf16`
+//!
+//! Steps 4 and 5, and the only consumer the six arrays have. It became a
+//! driver op **from a working bind**, which no other symbol in the tree has
+//! done, and the reason is that the bind was only ever half the symbol:
+//!
+//! ```text
+//!   gate_up   M=16  N=2*I=1024  K=H=2048   K > SHORT_K  ->  batched cuBLAS
+//!   down      M=16  N=H=2048    K=I=512    supported    ->  WMMA
+//! ```
+//!
+//! `supported`'s `K > 512` refusal names its own replacement — *"above which
+//! cuBLAS wins"* — and qwen3.5 decode fires one statement on each side of it.
+//! The bind served `down` and refused `gate_up` with `Refusal::Wide`, which
+//! `bind::DispatchRefusal::ShapeDeclined` recorded in as many words: *"the C++
+//! driver reads the same predicate and takes a batched-cuBLAS fallback; until
+//! that fallback exists here, saying so is the only honest answer."* So step 3
+//! built six arrays whose only reader was unwritten, and the leg stopped at 4.
+//!
+//! It could not be finished in the bind, because the batched form needs the
+//! cuBLAS handle and the arrays; and it could not be finished by the caller,
+//! because *"a refusal is not a fallthrough"* makes the bind's `Wide` the
+//! final answer rather than the first half of a choice. Both implementations
+//! therefore live behind one host program in
+//! `driver-cuda/src/fire/moe_grouped.rs`, which asks `supported` and picks.
+//!
+//! **The fallback was already in the tree.**
+//! `x::gemm::dense::batched_act_x_wt_bf16` is `gemm.cpp:1145-1241` verbatim,
+//! grouped-batched falling back to plain batched, with the stream-capture
+//! latch that makes the first form safe — ported under §45.2 with its row
+//! struck and its doc saying *"its whole consumer set was one unreachable
+//! inline"*. What was missing was never the arithmetic. **A body with no
+//! caller and a caller with no body sat in two crates for the whole of it**,
+//! and the thing that connected them was reading one refusal's own sentence.
 //!
 //! # What this port needed from the floor, asked for, and got
 //!
@@ -334,7 +375,7 @@
 //! control, so there is no third version to reach for. The file is carried,
 //! with a banner that says all of this, because it looks exactly like a
 //! kernel someone should finish and it is not.
-//! `tests/vendor_manifest.rs` gates the banner.
+//! `tests/upstream_manifest.rs` gates the banner.
 //!
 //! # `moe/topk_softmax_tile.cuh` — text, and it beats the warp ladder
 //!
@@ -387,7 +428,7 @@
 //! A `none:` says the symbol is declared, callable as a `fn`, and unsourceable
 //! from a statement — it surfaces as `Route::Unbound` at model load with the
 //! sentence written beside it. Four of this family's twenty contracts have
-//! one, fourteen bind, and the other TWO are driver ops. **This is the
+//! one, thirteen bind, and the other THREE are driver ops. **This is the
 //! number to read the port by**, and it was ELEVEN for one round:
 //!
 //! ```text
@@ -1981,10 +2022,21 @@ pub const fn supported(m: i32, n: i32, k: i32) -> Result<(), Refusal> {
 /// `bind::service::moe_moe_grouped_gemm_bf16` spelled the call `let _ =
 /// unsafe { ... }` and said why: the generated arm returns `bool`, its `true`
 /// means *"a branch ran"* rather than *"the kernel launched"*, so a refusal
-/// had nowhere to go. In fn-world the bind body returns the refusal and the
-/// fire reports it with this symbol named. Nothing about the launch changed;
-/// what changed is that the decline is no longer discarded one frame above
-/// the only code that could act on it.
+/// had nowhere to go. In fn-world the refusal is returned and the fire
+/// reports it with this symbol named. Nothing about the launch changed; what
+/// changed is that the decline is no longer discarded one frame above the
+/// only code that could act on it.
+///
+/// **And one frame above is now where the decline is ACTED ON.** This `fn`
+/// is called by `fire::moe_grouped`, not by a `bind!` body: the symbol is a
+/// driver op, because [`supported`] refuses half of qwen3.5's shapes and the
+/// implementation that serves them is a batched cuBLAS call over the pointer
+/// arrays `build_moe_ptrs_aligned_bf16` fills. That caller asks [`supported`]
+/// first and comes here only when the answer is yes, so the predicate below
+/// is now checked twice on the WMMA path and once on the other. Keeping it
+/// here anyway is deliberate: it is this host program's own precondition, and
+/// a `fn` that is correct only when its caller has already checked something
+/// is a `fn` with an unstated argument.
 ///
 /// # Safety
 ///
@@ -3234,6 +3286,35 @@ contract! {
     /// carry only their PRODUCT — the aligned rectangle's leading extent.
     /// `n` and `k` need no help: they are the result's and the operand's own
     /// row widths.
+    ///
+    /// # The THIRD contract here with no [`Entry`](crate::x::Entry)
+    ///
+    /// A driver op, and the only one of the three that reached the shape from
+    /// a WORKING bind rather than from a gap. The predicate is
+    /// [`supported`](super::supported): inside it the WMMA kernel is 3.0x the
+    /// library at both of this model's shapes, outside it there is no kernel
+    /// at all, and qwen3.5 decode fires one statement on each side —
+    /// `gate_up` at `K = 2048` against a `SHORT_K` of 512, `down` at
+    /// `K = 512`. One symbol, two implementations, and the choice cannot be
+    /// made in a `bind!` body: the outside-the-predicate one is a batched
+    /// cuBLAS call over the six pointer arrays `BUILD_MOE_PTRS_ALIGNED` fills,
+    /// which needs the driver's cuBLAS handle (§3.3 forbids `Cx` to hand one
+    /// over) and arrays that are nobody's operand.
+    ///
+    /// Nor can the choice be left to the caller. `bind/mod.rs` states *"a
+    /// refusal is not a fallthrough"*: a `Refusal::Wide` for `K = 2048`
+    /// returned from a bind is the answer the driver reports, not the first
+    /// half of a decision it finishes. So the whole choice moves to the one
+    /// place that holds both implementations' inputs —
+    /// `driver-cuda/src/fire/moe_grouped.rs`, called from `bind/mod.rs`'s
+    /// driver-op table.
+    ///
+    /// `in_place` is what makes the batched leg's destination this
+    /// statement's: the arrays were baked with the staging's base addresses
+    /// and the library writes there, so a planner that handed result 0 a
+    /// fresh buffer would leave the WMMA leg right and this one writing bytes
+    /// the swiglu never reads. The claim below is the load-bearing one on
+    /// this leg, not a hint.
     MOE_GROUPED_GEMM = "moe::moe_grouped_gemm_bf16" as moe_grouped_gemm {
         in_place: &[(0, 2)],
     }
@@ -3444,13 +3525,13 @@ contract! {
 // What happens when a trace says it
 // ---------------------------------------------------------------------------
 
-// EIGHTEEN arms for twenty contracts. `MOE_FUSED_CUTLASS` and
-// `BUILD_MOE_PTRS_ALIGNED` have none, on purpose and by the third
-// registration shape: an `Entry` here — a bind OR a `none:` — would shadow
-// the driver op that fires the symbol, and `Route::Unbound` refuses a live
-// model at load.
+// SEVENTEEN arms for twenty contracts. `MOE_FUSED_CUTLASS`,
+// `BUILD_MOE_PTRS_ALIGNED` and `MOE_GROUPED_GEMM` have none, on purpose and
+// by the third registration shape: an `Entry` here — a bind OR a `none:` —
+// would shadow the driver op that fires the symbol, and `Route::Unbound`
+// refuses a live model at load.
 //
-// FOURTEEN bind, FOUR refuse, and the four are one group rather than three:
+// THIRTEEN bind, FOUR refuse, and the four are one group rather than three:
 // their rows stated no `Source` on at least one operand, so there was
 // nothing to derive a binding from, no arm was ever generated, and nothing
 // fires them today either. A `none:` here is what they already did, said out
@@ -3464,27 +3545,52 @@ contract! {
 // constant. `a41a1df0a` landed the three queries and the three `Facts`
 // methods under them; these six arms are the other half of that change, and
 // the header's floor block is kept as the record of the ask.
+//
+// It was FOURTEEN binds until the aligned leg was finished. `MOE_GROUPED_GEMM`
+// left DOWNWARD — the only symbol in this family that was bound, worked, and
+// became a driver op anyway — because half of its shapes have no kernel and
+// the implementation that serves them needs the driver's cuBLAS handle. See
+// the tombstone where its arm stood.
 #[cfg(feature = "_cuda")]
 bind! {
-    MOE_GROUPED_GEMM => { cx, stream => {
-        // `max_blocks` is param 1 and `m` param 0 — the two block numbers
-        // the operands carry only the product of.
-        let param = |i: usize| cx.param(i).map(|v| i32::try_from(v).unwrap_or(0));
-        unsafe {
-            moe_grouped_gemm_bf16(
-                cx.arg_in(0)?.cast_const().cast::<bf16>(),
-                cx.weight(0)?.cast_const().cast::<bf16>(),
-                cx.arg_out(0)?.cast::<bf16>(),
-                cx.arg_in(1)?.cast_const().cast::<i32>(),
-                param(1)?,
-                param(0)?,
-                cx.out_width(0)?,
-                cx.in_width(0)?,
-                stream,
-            )
-        }
-        .ok()
-    }},
+    // `MOE_GROUPED_GEMM` STOOD HERE and is GONE. It did not become a
+    // refusal: it became `x::moe`'s THIRD DRIVER OP, so it must have no
+    // `Entry` at all — a bind OR a `none:` shadows `route()`'s `DriverOp`
+    // arm, and the shadowed answer would refuse at load a symbol the
+    // driver-op table fires.
+    //
+    // IT IS THE ONLY ONE OF THE THREE THAT WAS BOUND AND WORKING. The other
+    // two never had an arm in either world. This one fired the WMMA kernel
+    // for every shape `supported` accepts, and still does — through
+    // `fire::moe_grouped`, which asks the same predicate and then chooses.
+    // What the bind could not do is the OTHER side of the predicate:
+    //
+    //   gate_up   M=16  N=1024  K=2048   K > SHORT_K  ->  batched cuBLAS
+    //   down      M=16  N=2048  K=512    supported    ->  WMMA, as before
+    //
+    // and qwen3.5 decode takes both. A `bind!` body cannot make that call:
+    // the batched form needs the cuBLAS handle, which §3.3 forbids `Cx` to
+    // hand over, and the six device pointer arrays, which are not operands
+    // of anything. And it cannot be left to the caller either, because
+    // `bind/mod.rs` states *"a refusal is not a fallthrough"* — a `Wide` for
+    // `K = 2048` returned from here is the final answer, not the first half
+    // of a choice. So the choice moves to where both resources are.
+    //
+    // The mapping this arm made, kept because the driver-op arm re-derives
+    // every one of these from `bound`/`spec` and nothing connects the two:
+    //
+    //   a           `cx.arg_in(0)`     the aligned rectangle
+    //   weight_base `cx.weight(0)`     the `[E, N, K]` bank, `spec.weight`
+    //   c           `cx.arg_out(0)`    the staging, in place over `arg_in(2)`
+    //   expert_ids  `cx.arg_in(1)`     what the kernel indexes the bank by
+    //   max_blocks  `cx.param(1)`      the two block numbers the operands
+    //   m           `cx.param(0)`        carry only the PRODUCT of
+    //   n           `cx.out_width(0)`  the result's row width
+    //   k           `cx.in_width(0)`   the operand's
+    //
+    // Body: `driver-cuda/src/fire/moe_grouped.rs`. The batched leg it
+    // reaches, `x::gemm::dense::batched_act_x_wt_bf16`, was already in the
+    // tree with no caller — §38 struck its row and §45.2 ported it anyway.
 
     APPLY_PER_EXPERT_SCALE => { cx, stream => {
         // `n` and `k` were two operands of the ahead-of-time twin and are
@@ -3711,7 +3817,7 @@ bind! {
     //
     // The five arms this file shipped with are four: `add_moe_route_bias`,
     // `transpose_expert_scales`, `moe_bucket_exact` and
-    // `scatter_add_weighted`. Twenty symbols, fourteen binds, two driver
+    // `scatter_add_weighted`. Twenty symbols, thirteen binds, three driver
     // ops, four refusals.
     //
     // The dtype the old sentence asked for was the wrong ask, and finding

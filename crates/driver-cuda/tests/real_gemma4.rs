@@ -45,7 +45,7 @@
 //! demolishes them; every one of the four defects this A/B caught
 //! saturated the softcap.
 
-#![cfg(all(feature = "_cuda", feature = "bridge"))]
+#![cfg(feature = "_cuda")]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

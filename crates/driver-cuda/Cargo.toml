@@ -64,43 +64,51 @@ _cuda = ["dep:cudarc"]
 # target that runs. See `src/lib.rs` for why that is safer than refusing
 # to build, and `src/gpu/mod.rs` for where the line runs.
 
-# The launch bridge (retirement plan phase A): build.rs generates the
-# `extern "C"` shim and the Rust bindings from the kernel table, compiles the
-# shim against the real headers, and links the kernels archive so
-# `launch::ffi` can actually be called. Off by default, deliberately: the
-# bridge needs the CUDA toolkit at BUILD time (real `cuda_runtime.h`, nvcc
-# for the archive), and this crate's toolkit-free build — cudarc resolves
-# symbols by `dlopen`, nothing links — is load-bearing for CI.
+# `bridge` STOOD HERE — `["_cuda", "kernels-cuda/native"]` — and north star
+# §6 has retired it. Its whole payload was the ARCHIVE: `build.rs` generated
+# the `extern "C"` shim and the Rust bindings from the kernel table, compiled
+# the shim against the real headers, and linked `libpie_launch_shim.a` so
+# `bind::abi::ffi` could be called.
 #
-# `kernels-cuda/native` rather than `dep:kernels-cuda`: the table itself is
-# now a plain dependency (see `[dependencies]`), because `bind::launch` reads
-# a row's launch rule with no shim in the build. What `bridge` adds is the
-# ARCHIVE, which is that crate's `native` feature and nothing else.
-bridge = ["kernels-cuda/native"]
+# It is gone because it gated nothing that exists. The census: 76 `#[cfg]`
+# attributes across 13 files carried it and exactly ONE — `bind::abi::ffi`,
+# whose body was `include!(launch_bindings.rs)` — had a body needing a symbol
+# the archive defines. 68 were fossils re-gated `_cuda` at `e88f1ffff`; three
+# were the row world's interpreters, deleted with the door at `c9ab3a936`;
+# the four `[[test]]` gates below are retired in this commit.
+#
+# > A `bridge` gate marks where the archive WAS, not where it IS.
+#
+# The archive is not "ported". `libpie_launch_shim.a` had ZERO members at the
+# cut: `emit_c_shim` emits one `pie_k_*` forwarder per STATED row, and no row
+# states operands since `table::ROW_TABLES` emptied. `kernels-cuda` still
+# builds it under its own `native` feature; nothing in this crate asks.
 
 # Phase D's door: the thirteen `pie_cuda_*` exports the engine binds
 # (retirement plan — "the cutover boundary, measured"). Implies `bridge`
 # (the shell runs the executor). MUTUALLY EXCLUSIVE with linking the C++
 # shell into the same binary: same symbols, one provider.
-abi = ["bridge", "dep:driver-api", "dep:model-loader", "model/contract"]
+# `_cuda` was inherited through `bridge` and is stated directly now; the
+# feature set an `abi` build resolves to is unchanged.
+abi = ["_cuda", "dep:driver-api", "dep:model-loader", "model/contract"]
 
-# The AOT-vs-JIT parity harness's half of the seam: `bind::dispatch_jit_probe`
-# and the second generated `match` it includes, in which every row a
-# `kernels-cuda-new` unit hosts takes its JIT arm whether or not it is routed.
+# `jit-parity` STOOD HERE and is deleted with `bind::dispatch_jit_probe`.
 #
-# OFF EVERYWHERE BUT THE HARNESS, and the reason is timing rather than size.
-# Routing a row deletes its shim entry, so the only window in which its two
-# implementations can be compared is BEFORE the flip -- and a dispatcher
-# cannot hold both arms for one symbol. Two dispatchers can, which is what
-# this feature compiled: `tests/jit_parity.rs` fired one statement through
-# `dispatch` (the AOT arm, because the row is not routed yet) and through
-# `dispatch_jit_probe` (the arm routing will emit), and compares bytes.
+# It was the AOT-vs-JIT parity harness's half of the seam: a SECOND generated
+# `match` in which every row a `kernels-cuda-new` unit hosts took its JIT arm
+# whether or not it was routed, so one `BoundLaunch` could be fired both ways
+# and compared. Two dispatchers, because one cannot hold two arms for a
+# symbol.
 #
-# It is not a fallback and cannot become one: the probe's `match` contains no
-# `pie_k_*` call at all, so a row it declines has no JIT arm rather than a
-# second chance, and nothing inside the driver calls it. Needs `bridge`, which
-# is where the generated files come from.
-jit-parity = []
+# The window it existed for was explicitly narrow — *"routing a row deletes
+# its shim entry, so the only window in which its two implementations can be
+# compared is BEFORE the flip"* — and it is closed. Every row is routed;
+# `table::ROW_TABLES` is `&[]`. There is no unrouted row left to be the AOT
+# side of a comparison, so the probe compares a thing to itself.
+#
+# `tests/jit_parity.rs` is a two-line PLACEHOLDER-REFACTOR-SCAFFOLD with no
+# `[[test]]` stanza and was never the real target; it is left where it is,
+# because it is not this feature's and deleting it is a different question.
 
 [dependencies]
 # The CUDA version is pinned EXPLICITLY rather than through
@@ -354,16 +362,18 @@ driver-api = { path = "../driver-api" }
 # `kernels-cuda/native` through the regular dependency above, and the
 # dev-dependency compiles the same archive under test.
 [build-dependencies]
-# The TABLE, the DEVICE ROWS and the EMITTERS. Layer 1 supplies the eleven
-# family tables the bindings and the dispatch are generated from; layer 2
-# supplies `device::jit_dispatched` and, for the gate below, `unit::unit_of` —
-# every symbol the dispatcher routes to `bind::jit::fire` must be a symbol
-# some unit in this crate will compile. All of it answers with no feature, no
-# cudarc and no device, which is what lets the check run in a build script at
-# all, and why it is a build error rather than an `Error::Unknown` on the
-# first fire of a model text.
-kernels-cuda-new = { path = "../kernels-cuda-new", default-features = false }
-cc = "1"
+# EMPTY, and it was `kernels-cuda-new` + `cc`.
+#
+# `kernels-cuda-new` supplied the family tables, `device::jit_dispatched` and
+# `unit::unit_of` so the generator could emit from the rows and refuse a
+# routed symbol no unit hosts — all of which answered with no feature, no
+# cudarc and no device, which is what let the check be a BUILD error instead
+# of an `Error::Unknown` on the first fire of a model text. There is nothing
+# left to generate, and `unit::unit_of` still answers that question in
+# `kernels-cuda-new`'s own tests. `cc` compiled nothing here; it was the
+# shim's, one crate over.
+#
+# `build.rs` is 136 lines and prints link directives.
 
 # `required-features` keeps `cargo test` with no CUDA feature reporting the
 # same one error the library does, instead of additionally failing to compile
@@ -407,11 +417,15 @@ required-features = ["_cuda"]
 name = "cublas_handle_parity"
 required-features = ["_cuda"]
 
-# §45's parity gate. `bridge` and not `_cuda`, because it constructs a
-# `DispatchCtx` to hand the ports, and that type is the bridge's.
+# §45's parity gate. `_cuda`, because it constructs a `DispatchCtx` to hand
+# the ports — and that type is NOT the bridge's. Thirty-five fields: two
+# stream/handle pointers, scalars, three `Vec`s, a `BTreeMap`, and device
+# pointers. Not one comes from the C++ archive (BRIDGE_RETIREMENT.md §2.2),
+# and this comment asserting otherwise is how the gate spread: the type was
+# read through the attribute it carried instead of through its fields.
 [[test]]
 name = "gemm_service_parity"
-required-features = ["bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "entry_validation"
@@ -514,9 +528,18 @@ required-features = ["_cuda"]
 name = "launch_abi"
 required-features = ["_cuda"]
 
-[[test]]
-name = "bridge_smoke"
-required-features = ["_cuda", "bridge"]
+# `[[test]] bridge_smoke` STOOD HERE and is deleted with its subject.
+#
+# 5,097 lines that fired ONE generated binding end to end —
+# `quant::cast_fp32_to_bf16`, chosen because bf16 is the top half of the fp32
+# so the answer is bit-checkable on the host. Its first line was
+# `use driver_cuda::bind::abi::ffi;`, and `bind::abi::ffi` is deleted in this
+# commit: the module was `include!(launch_bindings.rs)` and that file is
+# generated per STATED row, of which there are none.
+#
+# It proved the plumbing, and the plumbing is what north star §5 replaced. A
+# row's launch is a `unit!` plus a `fn` now, and what smokes one is the
+# family's own tests in `kernels-cuda-new`.
 
 
 [[test]]
@@ -525,15 +548,15 @@ required-features = ["_cuda"]
 
 [[test]]
 name = "real_prefill"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "real_hybrid"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "real_gemma4"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "serve"
@@ -545,7 +568,7 @@ required-features = ["_cuda"]
 
 [[test]]
 name = "gpu_supergraph"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "catalog_coverage"
@@ -568,5 +591,5 @@ required-features = ["_cuda"]
 # dispatcher routes or not.
 [[test]]
 name = "jit_dispatch"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 

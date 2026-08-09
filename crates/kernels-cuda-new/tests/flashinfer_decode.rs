@@ -5,7 +5,7 @@
 //! # What was missing, and what this closes
 //!
 //! Two halves were already measured and neither touched the other.
-//! `examples/flashinfer_probe.rs` proved that the 28-file vendored closure
+//! `examples/flashinfer_probe.rs` proved that the 28-file internalised closure
 //! compiles under NVRTC against this crate's shims — with no include path on
 //! disk — and that `BatchDecodeWithPagedKVCacheKernel<...>` instantiates to a
 //! cubin. `tests/plan.rs` proved that `src/plan` reproduces `scheduler.cuh`
@@ -64,7 +64,7 @@
 //!
 //! # Skipping
 //!
-//! No GPU, no NVRTC, no `nvcc`, or no vendored FlashInfer tree — the test
+//! No GPU, no NVRTC, no `nvcc`, or no upstream FlashInfer checkout — the test
 //! prints why and passes. That is the same contract `tests/plan.rs` and
 //! `tests/fire.rs` keep: a machine that cannot run the measurement must not
 //! report a failure that means "this box has no card".
@@ -154,7 +154,7 @@ const MERGE_SMEM: u32 = 4 * MERGE_BDY * HEAD_DIM * 2 + MERGE_THREADS * 4;
 /// # Why a mirror and not a constructor
 ///
 /// `paged_kv_t`'s two `__host__` constructors are behind `#ifndef
-/// __CUDACC_RTC__` in the vendored copy, and they have to be: NVRTC rejects a
+/// __CUDACC_RTC__` in this crate's copy, and they have to be: NVRTC rejects a
 /// function marked `__host__` outright — *"a function explicitly marked as a
 /// `__host__` function is not allowed in JIT mode"* — whether or not anything
 /// calls it. `uint_fastdiv(uint32_t)` is guarded for the same reason. So under
@@ -351,10 +351,10 @@ const fn fast_div_magic(d: u32) -> u64 {
 /// offsets the same compiler, with the same header set and the same options,
 /// chose for the struct the decode kernel is about to read.
 const ROOT: &str = r#"
-#include <flashinfer/attention/decode.cuh>
-#include <flashinfer/attention/default_decode_params.cuh>
-#include <flashinfer/attention/variants.cuh>
-#include <flashinfer/attention/cascade.cuh>
+#include "attn/flashinfer/attention/decode.cuh"
+#include "attn/flashinfer/attention/default_decode_params.cuh"
+#include "attn/flashinfer/attention/variants.cuh"
+#include "attn/flashinfer/attention/cascade.cuh"
 
 namespace pie_cuda_driver {
 namespace kernels {
@@ -973,7 +973,7 @@ int main(int argc, char** argv) {
 /// that path changes with the build, so this globs rather than hard-codes.
 /// `PIE_FLASHINFER_INCLUDE` overrides it. Lifted from `tests/plan.rs`, which
 /// needs the same tree for the same reason — and deliberately NOT the crate's
-/// own `csrc/vendor`, because the reference must be the UNMODIFIED upstream
+/// own `csrc/src/attn/flashinfer`, because the reference must be the UNMODIFIED upstream
 /// headers that ship today, not this crate's guarded copy of them.
 fn flashinfer_src() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("PIE_FLASHINFER_INCLUDE") {
@@ -1720,7 +1720,7 @@ fn occupancy(function: dr::CUfunction, threads: u32, smem: u32) -> (u32, u32) {
 /// `tests/units.rs` does this for every declared unit and cannot do it for this
 /// one — it is not in `unit::UNITS`, because a vendored unit is not compilable
 /// through `nvrtc::compile`: that path resolves includes against
-/// [`source::DEVICE_HEADERS`], which deliberately excludes [`source::VENDOR`].
+/// [`source::DEVICE_HEADERS`], which deliberately excludes [`source::UPSTREAM`].
 /// The check that survives is the cheap one: three rows, three signatures, and
 /// an instantiation string that names the right templates.
 #[test]
@@ -1782,8 +1782,8 @@ fn the_fastdiv_magic_is_the_shims() {
 ///
 /// `nvrtc::compile` — and therefore `cache::module` and `runtime::fire` — passes
 /// [`source::DEVICE_HEADERS`], which is prelude plus shims and deliberately
-/// excludes [`source::VENDOR`]. A unit whose root says
-/// `#include <flashinfer/attention/decode.cuh>` cannot be compiled through the
+/// excludes [`source::UPSTREAM`]. A unit whose root says
+/// `#include "attn/flashinfer/attention/decode.cuh"` cannot be compiled through the
 /// normal path at all; this test reaches for `nvrtc::compile_with(..,
 /// source::ALL_HEADERS)` instead, which no launch path calls. A `headers` field
 /// on `Unit` would fix it, and [`Unit::cache_key`] must span it — the key
@@ -1883,6 +1883,6 @@ fn the_fastdiv_magic_is_the_shims() {
 /// Decode needed none of the three, which is why decode is what fires here.
 ///
 /// [`source::DEVICE_HEADERS`]: kernels_cuda_new::source::DEVICE_HEADERS
-/// [`source::VENDOR`]: kernels_cuda_new::source::VENDOR
+/// [`source::UPSTREAM`]: kernels_cuda_new::source::UPSTREAM
 #[allow(dead_code)]
 mod what_a_vendored_unit_needs {}

@@ -269,14 +269,22 @@ impl LiveScoreOps {
     }
 }
 
-/// The fold's symbol, in the JIT table.
+/// The fold's DEVICE symbol, in the JIT table.
 ///
-/// `attn::attn_score_fold_heads` is `families::attn::ATTN_SCORE_FOLD_SIGS`'
-/// only row and `table::attn`'s row of the same name — one string, resolved
-/// through `unit_of` rather than declared here, so a rename in that crate is
-/// a refusal here and not a silent miss.
+/// **`_dev`, and the suffix is the whole of what changed here.** This read
+/// `attn::attn_score_fold_heads` — one string that was the device row's name,
+/// `table::attn`'s row's name and `dsl::cuda::attn_score_fold_heads`'s stated
+/// symbol all at once. §60.6 splits those, and the split had never been
+/// applied to this root: `crate::x::attn::ATTN_SCORE_FOLD_HEADS` is the
+/// contract on the TRACE symbol now, and a contract symbol may never also be
+/// a unit row's symbol — `execution::a_walk_is_only_a_walk` and
+/// `migration_status`' `refused_set()` both read that invariant.
+///
+/// Still resolved through `unit_of` rather than declared over there, so a
+/// rename in that crate is a refusal here and not a silent miss. The unit is
+/// `kernels_cuda_new::x::attn::attention_flashinfer`.
 #[cfg(feature = "_cuda")]
-const FOLD_SYMBOL: &str = "attn::attn_score_fold_heads";
+const FOLD_SYMBOL: &str = "attn::attn_score_fold_heads_dev";
 
 /// The decode normalize's symbol — `ATTN_SCORE_POST_SIGS[0]`.
 #[cfg(feature = "_cuda")]

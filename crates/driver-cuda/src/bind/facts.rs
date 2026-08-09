@@ -41,7 +41,7 @@
 //! The zero-is-absence conventions did not go anywhere — they are written
 //! into the bodies below, each beside the field it decides.
 
-#![cfg(feature = "bridge")]
+#![cfg(feature = "_cuda")]
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -221,6 +221,76 @@ impl Facts for Fire<'_> {
     fn w_off_d(&self) -> Option<*const u32> {
         let p = self.attn?.w_off_d;
         (!p.is_null()).then_some(p)
+    }
+
+    /// The destination the fused QKV kernel writes Q into.
+    ///
+    /// **Null-checked, and the row says it should not be** — this is the one
+    /// place in the family where the row grammar and the producer disagree,
+    /// and the producer wins because the DEVICE breaks the tie.
+    ///
+    /// | | says |
+    /// |---|---|
+    /// | producer (`fire/launch.rs:3248`) | `q_pin.and_then(…).unwrap_or(null_mut())` — **can be absent** |
+    /// | row (`table/attn.rs`) | plain `Source::Attn("q_out")` — **asserts present** |
+    /// | device (`qkv_fused.cuh:177`) | `dst = q_out + …` — **no null test** |
+    ///
+    /// `w_page_d` and `w_off_d` two methods up are `Source::AttnNonZero` in
+    /// `kv_paged`'s rows and PLAIN `Source::Attn` here, and
+    /// `qkv_fused.cuh:182` null-tests both — so the grammar is not a reliable
+    /// discriminator on this symbol in either direction.
+    ///
+    /// What decides it is that `q_out` is the one pointer in that argument
+    /// list the kernel does **not** test. A fire whose statement pins no
+    /// query buffer produced a null here and the device stored through it
+    /// unconditionally. That is not a state the row was describing; it is a
+    /// state the row was wrong about.
+    ///
+    /// # The rule this corrects
+    ///
+    /// The discriminator as I gave it was *"`Source::AttnNonZero` admits a
+    /// null, plain `Source::Attn` asserts presence, and an `Option` on the
+    /// second invents a state the row denies."* That is right whenever the
+    /// row and the producer agree.
+    ///
+    /// **When they disagree, the producer is the fact and the row is a
+    /// claim.** A row cannot make a pointer non-null; it can only be believed
+    /// or checked, and the device text says which. Applied to `lse_out` an
+    /// hour before this landed, the same rule correctly refused an `Option`
+    /// — because there the producer agreed with the row.
+    fn q_out(&self) -> Option<*mut c_void> {
+        let p = self.attn?.q_out;
+        (!p.is_null()).then_some(p)
+    }
+
+    /// The sliding-window span this fire attends.
+    ///
+    /// `super::window_of` verbatim -- statement parameter, then the per-layer
+    /// vector, then the fire default. **Answered rather than handed over as
+    /// its three inputs**, because the driver already makes this decision
+    /// once per launch and two callers deriving it differently is the class
+    /// this port keeps finding.
+    fn window_left(&self) -> Option<i32> {
+        Some(super::window_of(
+            self.spec,
+            self.attn?,
+            u32::try_from(self.layer_index()).unwrap_or(0),
+        ))
+    }
+
+    /// The attention logit soft cap.
+    fn logits_soft_cap(&self) -> Option<f32> {
+        Some(self.attn?.logits_soft_cap)
+    }
+
+    /// The LSE scratch the decode dispatch writes.
+    ///
+    /// **Not null-checked**, unlike `w_page_d` two methods up: that row's
+    /// grammar is `Source::AttnNonZero` and admits a null; this one is plain
+    /// `Source::Attn` and asserts presence. Returning `None` here would
+    /// invent a state the row denies.
+    fn lse_out(&self) -> Option<*mut f32> {
+        Some(self.attn?.lse_out_d)
     }
 
     /// gpt-oss's clamped-GLU ceiling.

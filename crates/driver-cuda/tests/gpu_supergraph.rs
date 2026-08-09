@@ -19,7 +19,7 @@
 //!
 //! Skipped when no device is present.
 
-#![cfg(all(feature = "_cuda", feature = "bridge"))]
+#![cfg(feature = "_cuda")]
 
 mod common;
 

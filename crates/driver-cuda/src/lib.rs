@@ -223,7 +223,7 @@ pub mod program;
 /// take that route. Qwen3-VL's still crosses `abi` at one more place —
 /// FlashInfer's prefill dispatch, which north star §5 step 8 retires. Its
 /// only consumer, [`serve`], is gated on `abi`, which implies `bridge`.
-#[cfg(all(feature = "_cuda", feature = "bridge"))]
+#[cfg(feature = "_cuda")]
 pub mod tower;
 
 /// The door. create / load / launch / transfer / close.

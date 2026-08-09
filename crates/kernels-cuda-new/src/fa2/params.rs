@@ -575,8 +575,13 @@ const _: () = assert!(offset_of!(DecodeScoreParams, score_indptr) == 232);
 /// **`score_window` is not `window_left`.** The launcher refuses `window == 0`
 /// and `window_left` is `-1` on a family that attends its whole context, so
 /// the same number reads as "no window" to one field and "invalid" to the
-/// other — `table::attn`'s `flashinfer_prefill_capture` row says so from its
-/// side.
+/// other. `table::attn`'s `flashinfer_prefill_capture` row said so from its
+/// side, sourcing the two fields from `Source::AttnNonZero("score_window")`
+/// and `Source::AttnWindow` — two different `Source`s for two different
+/// questions. That row is deleted (the symbol is a driver op now) and
+/// `bind::fa2_prefill_capture` keeps the distinction where the row had it:
+/// a zero `score_window` is a refusal there, and the window is
+/// `bind::window_of`'s answer, never the same value.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct PrefillScoreParams {

@@ -594,6 +594,26 @@ pub trait Facts {
     fn w_off_d(&self) -> Option<*const u32> {
         None
     }
+    /// The destination the fused QKV kernel writes Q into.
+    ///
+    /// `None` when the fire's statement pinned no query buffer. The device
+    /// does not null-test this pointer, so absence must be refused here
+    /// rather than passed on.
+    fn q_out(&self) -> Option<*mut c_void> {
+        None
+    }
+    /// The sliding-window span this fire attends, in rows.
+    fn window_left(&self) -> Option<i32> {
+        None
+    }
+    /// The attention logit soft cap, `0` for none.
+    fn logits_soft_cap(&self) -> Option<f32> {
+        None
+    }
+    /// The LSE scratch the decode dispatch writes.
+    fn lse_out(&self) -> Option<*mut f32> {
+        None
+    }
     /// The fire's per-request plan arrays.
     fn plan(&self) -> Option<Plan> {
         None
@@ -897,6 +917,68 @@ impl<'a> Cx<'a> {
     query!(
         /// Per-row offset-in-page for the append. [`Cx::w_page_d`]'s pair.
         w_off_d -> *const u32, "the append's per-row page offset"
+    );
+    query!(
+        /// The destination the fused QKV kernel writes Q into.
+        ///
+        /// **The one query in this family whose `Option` contradicts its
+        /// row.** `table/attn.rs` sources it plain `Source::Attn("q_out")`,
+        /// which asserts presence; the producer at `fire/launch.rs:3248`
+        /// ends `.unwrap_or(core::ptr::null_mut())`, which does not.
+        ///
+        /// The device breaks the tie: `qkv_fused.cuh:177` is
+        /// `dst = q_out + …` with **no null test**, while `:182` null-tests
+        /// `w_page`/`w_off` two arguments along. So a fire pinning no query
+        /// buffer stored through null unconditionally, and that is not a
+        /// state the row was describing — it is a state the row was wrong
+        /// about.
+        ///
+        /// The rule, corrected: the row grammar decides **while the row and
+        /// the producer agree**. When they disagree the producer is the fact
+        /// and the row is a claim, because a row cannot make a pointer
+        /// non-null. See `Facts::q_out`.
+        q_out -> *mut c_void, "the fused QKV kernel's query destination"
+    );
+    query!(
+        /// The sliding-window span this fire attends, in rows.
+        ///
+        /// **A three-tier decision, answered.** `bind::window_of` resolves it
+        /// as *statement parameter → per-layer vector → fire default*, and
+        /// the driver already makes that decision once per launch. Handing
+        /// back the three inputs would be a predicate every caller
+        /// re-derives, which is [`Cx::kv_layer`]'s `has_envelopes` argument
+        /// in a second place.
+        ///
+        /// Wanted by `attn::split_qkv_bf16_devwin`, which is the other edge
+        /// of the driver-op discriminator: it needs **no driver resource**
+        /// and still cannot bind from `arg_in`/`arg_out` alone, because those
+        /// are pre-windowed by `resolve_arg_windowed` and this kernel windows
+        /// again from device memory.
+        window_left -> i32, "the fire's sliding-window span"
+    );
+    query!(
+        /// The attention logit soft cap, `0` for none.
+        ///
+        /// **Not [`Cx::final_logit_softcap`] — same word, different fact.**
+        /// That one is the SAMPLER's cap on the final logits and its row
+        /// grammar is `Source::CtxNonZero`; this is the ATTENTION score cap
+        /// that `attention_naive_paged` takes as an operand, and its row
+        /// grammar is plain `Source::Ctx`. Two facts that share a noun and
+        /// disagree about zero is exactly the shape §3.2 is about.
+        logits_soft_cap -> f32, "the attention logit soft cap"
+    );
+    query!(
+        /// The LSE scratch the decode dispatch writes.
+        ///
+        /// **Not null-checked, and that is deliberate.** [`Cx::w_page_d`] is
+        /// checked because its row grammar is `Source::AttnNonZero` — a row
+        /// that TESTS absence, so a null is a state the row admits. This one
+        /// is plain `Source::Attn`, a row that ASSERTS presence, and an
+        /// `Option` here would invent a state the row denies.
+        ///
+        /// The two look identical at the `Facts` impl and are not; the row
+        /// grammar is the discriminator and it is one word apart.
+        lse_out -> *mut f32, "the decode's LSE scratch"
     );
     query!(
         /// The fire's per-request plan arrays.

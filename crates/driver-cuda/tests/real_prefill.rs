@@ -13,7 +13,7 @@
 //! grid at logit magnitude ~13 is 0.0625. The top-5 values span 0.375, so
 //! the tolerance still discriminates real drift from rounding.
 
-#![cfg(all(feature = "_cuda", feature = "bridge"))]
+#![cfg(feature = "_cuda")]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

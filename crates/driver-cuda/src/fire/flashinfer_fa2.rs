@@ -252,8 +252,9 @@ impl core::fmt::Display for Decline {
 /// That file states its own consumers — *"Consumed twice … C++ … CMake"* —
 /// and both are gone. `csrc/CMakeLists.txt` is DELETED, and the C++ side is
 /// `kernels_manifest.hpp`, whose only includers are
-/// `kernels-cuda-new/csrc/src/attn/attention_flashinfer_common.cuh` (zero
-/// includers of its own) and a `#include` line inside
+/// `kernels-cuda-new/spec/attention_flashinfer_common.cuh` (zero
+/// includers of its own, which is why it is in `spec/` and not in `csrc/`)
+/// and a `#include` line inside
 /// `driver-cuda/tests/hf_config_dump/generate.py`'s template, whose output
 /// `.cpp` is not on disk and has no build. It is not swept into the
 /// generated production shim either: `kernels-cuda/build.rs::includes()`

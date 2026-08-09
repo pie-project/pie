@@ -139,13 +139,13 @@
 //
 // # Every include below resolves, and NO TEST CHECKS THAT
 //
-// `csrc/vendor/xqa/` exists now: fifteen files, the transitive closure of
-// upstream `xqa/mha.cu`'s quoted includes, 272 KB, carried automatically
+// `csrc/src/attn/xqa/` exists now: fifteen files, the transitive closure of
+// upstream `xqa/mha.cu`'s quoted includes, 275 KB, carried automatically
 // because `carried.rs` walks the directory -- *"the directory IS the set"*.
-// They are carried as `xqa/mha.cuh`, `xqa/utils.cuh` and so on. Only the
-// first of those names differs from upstream's, and only because this crate
-// holds no `.cu`; see the include below for the check that made the rename
-// safe.
+// They are carried as `attn/xqa/mha.cuh`, `attn/xqa/utils.cuh` and so on --
+// each one its path relative to `csrc/src`. Only the last component of the
+// first differs from upstream's, and only because this crate holds no `.cu`;
+// see the include below for the check that made the rename safe.
 //
 // **The reachability gate does not cover this file.**
 // `tests/layers.rs::every_include_reachable_from_a_unit_resolves` walks
@@ -165,9 +165,9 @@
 //
 // # Measured through the real name resolution, not a simulation
 //
-// The numbers above were re-taken against `csrc/vendor/xqa/` as it now
-// stands, with `csrc/{src,shim,vendor}` rooted so that NVRTC resolves the
-// same literal names the carried set answers, and with the tree's own
+// The numbers above were re-taken against the XQA tree as it then stood,
+// with `csrc/{src,shim,vendor}` rooted so that NVRTC resolves the same
+// literal names the carried set answers, and with the tree's own
 // numerics contract (`--fmad=false --prec-div=true --prec-sqrt=true`,
 // `runtime::nvrtc::options`) on the command line. All five non-Hopper members
 // are rc = 0, and `pie_xqa_smem_size` is 79,488 in every one of them.
@@ -224,8 +224,8 @@
 // `kernels-cuda-new` holds no translation units -- 120 `.cuh` and no `.cu` --
 // because that extension IS the device/host line this crate is drawing: a
 // `.cu` is something nvcc compiles ahead of time, a `.cuh` is device text
-// carried into NVRTC. So the vendored copy is `csrc/vendor/xqa/mha.cuh` and
-// this directive names it, where `attn/attention_xqa_gqa2.cu:35` wrote
+// carried into NVRTC. So our copy is `csrc/src/attn/xqa/mha.cuh` and this
+// directive names it, where `attn/attention_xqa_gqa2.cu:35` wrote
 // `#include <xqa/mha.cu>`.
 //
 // The rename costs nothing because there is nothing to impersonate.
@@ -233,7 +233,7 @@
 // exists so that a header we do not own can be answered under the spelling
 // its includer writes (`new-horizon.md` §13.4) -- and here the includer is
 // this file, which is ours. Checked before renaming: **no file under
-// `csrc/vendor/xqa/` includes a `.cu` by name**, across all fifteen. The
+// `csrc/src/attn/xqa/` includes a `.cu` by name**, across all fifteen. The
 // only source that ever wrote `<xqa/mha.cu>` is the archive's six `.cu`
 // files, which this port replaces.
 //
@@ -242,10 +242,21 @@
 // `attn/attention_xqa_gqa8_sm90.cu:37`, and if any upstream header reaches a
 // `.cu` or `.cpp` by name then the spelling is upstream's and the decision is
 // a different one.
+// THE TWO BRACKET STYLES BELOW ARE NOT A TYPO. NVRTC treats `<...>` and
+// `"..."` identically -- both are matched literally against `includeNames[]`,
+// measured -- so the choice is free as far as a compile goes, and this tree
+// spends it on saying whether the file EXISTS. `source.rs::quoted_includes`
+// reads only the quoted form, so `reachable()` and
+// `every_device_include_resolves` follow a quoted spelling and skip an angled
+// one. `attn/xqa/mha.cuh` is carried and is quoted, which puts the whole
+// fifteen-file XQA closure under the static walk. `attn/xqa/mha_sm90.cuh` is
+// deliberately NOT carried (see above) and stays angled, because a walk that
+// followed it would report a missing header for a branch this build never
+// takes.
 #if USE_SM90_MHA
-#include <xqa/mha_sm90.cuh>
+#include <attn/xqa/mha_sm90.cuh>
 #else
-#include <xqa/mha.cuh>
+#include "attn/xqa/mha.cuh"
 #endif
 
 // `configureKernel`'s readable half. See the header comment: upstream's

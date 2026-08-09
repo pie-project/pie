@@ -529,15 +529,32 @@ fn the_stated_quant_layout_and_gemm_rows_describe_their_launchers() {
 
 /// The same proof at family scale: all fifty `attn` rows, ~700 operands.
 ///
-/// `rope` was twelve rows of scalars and buffers. `attn` is what the ABI
-/// actually has to survive: views passed BY VALUE, plan caches passed as
+/// **`table::attn::KERNELS` IS EMPTY AND THIS TEST HAS NO INPUT LEFT.** All
+/// forty-one rows crossed into `kernels_cuda_new::x::attn` under §5 step 5,
+/// the last being `attn::qkv_decode_qk_norm_rope_write_kv_bf16`, and a
+/// contract states no `operands` — so `emit_c_shim` has nothing to emit for
+/// this family by construction rather than by omission. The early return is
+/// explicit because a shim generated from zero rows compiles trivially, and
+/// a proof that passes because its subject is gone should say which.
+///
+/// This is the ROW WORLD's test and it retires with the row interpreters in
+/// north star step 6. Left in place, not deleted, for the reason
+/// `table::attn` itself is: it is one of two consumers keeping that module
+/// declared, and step 6 should retire the pair together.
+///
+/// `rope` was twelve rows of scalars and buffers. `attn` was what the ABI
+/// actually had to survive: views passed BY VALUE, plan caches passed as
 /// `const&` to a type the header never defines, a `cublasHandle_t` where a
 /// stream would be, and both halves of every const/mut pointer pair. If the
-/// vocabulary in `kernels::Ty` were short of any of that, this would not
-/// compile — which is the point of running it as one shim rather than fifty.
+/// vocabulary in `kernels::Ty` had been short of any of that, this would not
+/// have compiled — which was the point of running it as one shim rather than
+/// fifty.
 #[test]
 fn every_attn_row_states_its_launcher_exactly() {
     let table = kernels_cuda_new::table::attn::KERNELS;
+    if table.is_empty() {
+        return;
+    }
     let stated = table.iter().filter(|k| !k.operands.is_empty()).count();
     assert_eq!(
         stated,
@@ -805,10 +822,27 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         declared.len()
     );
 
+    // ACCOUNTED-FOR, NOT "HAS A ROW". `table::attn::KERNELS` is empty — the
+    // family crossed — so the row-world predicate this used to be would call
+    // every declared launcher undecided. The question the test asks is
+    // unchanged (*is this declaration accounted for anywhere, or is it a
+    // launcher nobody decided about*); what changed is where the answer
+    // lives. Three registries, and the union is a strict superset of the old
+    // predicate:
+    //
+    //   `unit::unit_of`      a JIT-hosted device row, which is what a
+    //                        crossed launcher becomes
+    //   `table::KERNELS`     `ROW_TABLES ++ x::SIGS`, so both a surviving row
+    //                        and a `contract!`-derived one
+    //   `ends_with("::{n}")` the cross-family case this always had: a
+    //                        launcher declared in `attn/` whose symbol is
+    //                        another family's
     let has_row = |n: &str| {
-        kernels_cuda_new::table::attn::KERNELS
-            .iter()
-            .any(|k| k.symbol == format!("attn::{n}") || k.symbol.ends_with(&format!("::{n}")))
+        let sym = format!("attn::{n}");
+        kernels_cuda_new::unit::unit_of(&sym).is_some()
+            || kernels_cuda_new::table::KERNELS
+                .iter()
+                .any(|k| k.symbol == sym || k.symbol.ends_with(&format!("::{n}")))
     };
     let undecided: Vec<&String> = declared
         .iter()
@@ -1568,15 +1602,19 @@ fn records() -> Vec<Record> {
         // The Rust `bind::abi::YarnOriginalParams` stays, and its remaining
         // user is `bind::abi::ffi` — which is `#[cfg(feature = "bridge")]`,
         // so the mirror retires on exactly the schedule these headers do.
-        // `fire/mla_paged.rs` does NOT use it: that file's `YarnOriginal` is
-        // its own type and the only mention of this one is in a doc comment
-        // at `:102`, describing the C++ signature the row used to have.
+        // `fire/mla_paged.rs` DID NOT use it, and that file is now deleted:
+        // `attn::mla_prepare_bf16` crossed into fn-world, its host program is
+        // `kernels_cuda_new::x::attn::mla_prepare_bf16`, and its `Option`
+        // parameter is `x::Yarn` -- the same five fields, spelled once for
+        // the whole crate instead of once per driver module.
         //
         // `kernels::Ty::YarnOriginalParams` still spells
         // `"const ::pie_cuda_driver::kernels::attn::YarnOriginalParams*"` for
-        // the shim. It is inert, not broken: the row is `RUST_SERVED`, so
-        // `emit_c_shim` drops the entry before that string is ever written.
-        // It would become a shim compile error the moment the row came back.
+        // the shim. It is inert, not broken, and the reason has CHANGED: it
+        // used to be that the row was `RUST_SERVED` so `emit_c_shim` dropped
+        // the entry; now there is no row at all, and nothing in `table::attn`
+        // names this `Ty`. It would become a shim compile error the moment a
+        // row that names it came back.
     ]
 }
 

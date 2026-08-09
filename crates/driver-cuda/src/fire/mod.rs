@@ -161,21 +161,28 @@ pub mod attn_score;
 /// `dsl::cuda` wrappers. Both needed §60.6's symbol split first: the device
 /// rows carried the same strings as the table rows, and §52.11 forbids
 /// walking a symbol a unit hosts.
-pub mod attention_naive;
-/// `attn/dsa_indexer.cu`'s three launchers, in Rust — the whole file.
-/// DeepSeek sparse attention's indexer. One needed only §60.6's symbol split,
-/// one needed a device row that did not exist (its block is
-/// `round_up(n_heads, 32)`, a statement parameter no `Dims` carries), and the
-/// third — the causal top-k mask, whose row is FULLY SOURCED — needed the
-/// split so a live dispatch could move off the C shim.
-pub mod dsa_indexer;
+// `attention_naive` DELETED -- the MTP pair crossed into
+// `kernels_cuda_new::x::attn` and refuses on `slot_ids`, which only
+// `Cx::gdn` reaches. `attn/attention_naive.cuh` is
+// `x::attn::attention_naive`'s unit, declaring the two of its five
+// `__global__`s that have a host program.
+// `dsa_indexer` CROSSED WHOLE into `kernels_cuda_new::x::attn`. It held
+// `attn/dsa_indexer.cu`'s three launchers and `bind::service`'s three entry
+// points were its only consumer, so the module went with them rather than
+// being left as a body nothing calls. The block width `round_up(n_heads, 32)`
+// -- the reason one of the three never had a device row -- is
+// `x::attn::dsa_indexer::q_rope_block` now, next to the unit whose kernel
+// reads it.
 /// `attn/dsv4_compress.cu`'s three surviving launchers, in Rust — the whole
 /// file. Nine went in earlier passes and a tenth,
 /// `combine_attn_outputs_bf16`, has crossed into fn-world as
 /// `kernels_cuda_new::x::attn`'s `COMBINE_ATTN_OUTPUTS`; it is the only one
 /// of the four whose every value came out of the statement. The three that
 /// remain needed §60.6's symbol split and nothing else.
-pub mod dsv4_compress;
+// `dsv4_compress` DELETED -- all four host programs crossed into
+// `kernels_cuda_new::x::attn`, `combine_attn_outputs_bf16` bound and the
+// other three `none:` on the compression ratio. `attn/dsv4_compress.cuh` is
+// `x::attn::dsv4_compress`'s unit and holds all five kernels.
 /// `gemm/gemm.cpp`'s HOST PROGRAM, in Rust — **zero `__global__`, zero
 /// `<<<>>>`, 138 cuBLAS/cuBLASLt calls**. Not a kernel file and never was: a
 /// shape ladder, a cuBLASLt plan cache, a private-stream autotuner and an
@@ -332,7 +339,11 @@ pub mod lora;
 /// `execution::RUST_SERVED`, both reached through `bind::service`. The third
 /// function that file held, `write_mla_to_pages_bf16`, had an empty consumer
 /// set on all five channels and is deleted rather than ported.
-pub mod mla_paged;
+// `mla_paged` DELETED -- both host programs crossed into
+// `kernels_cuda_new::x::attn` and refuse on `Cx::mla_layer`.
+// `attn/mla_paged.cuh` is `x::attn::mla_paged`'s unit and holds both kernels;
+// `YarnOriginal` dissolved into `x::Yarn` and `MlaDecline` into
+// `Refusal::Empty`.
 /// `attention_mla_naive.cuh`'s two launchers, in Rust — the scalar
 /// flash-softmax MLA kernel and the tensor-core one, plus the shape predicate
 /// that chooses between them and the head-group wave-target search.
@@ -398,34 +409,57 @@ pub mod mla_naive;
 /// cannot start without this call.
 pub mod moe_ptrs;
 
+/// `moe::moe_grouped_gemm_bf16` — the aligned MoE leg's two grouped GEMMs,
+/// and `x::moe`'s THIRD driver op. One symbol with two implementations: the
+/// WMMA kernel inside `x::moe::supported`'s rectangle, and the batched cuBLAS
+/// call outside it, over the arrays `moe_ptrs` built. It is a driver op
+/// because the second implementation needs the cuBLAS handle and those
+/// arrays, and because `bind/mod.rs`'s "a refusal is not a fallthrough" makes
+/// a bind that declines `K = 2048` the final answer rather than the first
+/// half of a choice.
+///
+/// Gated on `_cuda` rather than carrying per-item gates: every item in it
+/// calls the device, so the module is the unit.
+#[cfg(feature = "_cuda")]
+pub mod moe_grouped;
+
 /// `attn/page_compact.cu`'s one launcher, in Rust — the whole file. Two
 /// launches on one stream, the second reading the `scratch_counts` buffer the
 /// first fills; `execution::COMPOSED` has stated that pair since the split
 /// and what was missing was the host. `RUST_SERVED` takes the row.
-pub mod page_compact;
-/// `attn/qkv_fused.cu`'s fused decode epilogue, in Rust — the whole file,
-/// which is DELETED, and the LAST `attn` dispatch to fall. One launcher over
-/// four kernels and eight instantiations: `head_dim` picks the warp form at
-/// 64, 128 or 256 and falls THROUGH to the block form otherwise, and
-/// `rope_table != nullptr` picks the `USE_ROPE_TABLE` arm inside whichever it
-/// picked. No `Specialisation` can state that, because the fallthrough
-/// changes the `LaunchRule` from `WarpPackedHeads` to `RowsPackedHeadsNarrow`
-/// and `Specialisation::agrees` forbids an arm that changes the rule;
-/// `families/attn.rs` had written the refusal and added that lifting it would
-/// not help, *because `head_dim == 64 | 128 | 256` is still unspellable*. A
-/// host program spells it. Four device rows were written here for the
-/// `_d64`/`_d256` warp expansions the unit never had — the absence
-/// `qkv_fused.cu`'s own header named as what blocked its port.
-/// `Execution::Walk` with `Control::Switch`, in `execution::RUST_SERVED`, and
-/// its row is FULLY SOURCED, so this one moves a LIVE dispatch off the shim.
-pub mod qkv_fused;
+// `page_compact` DELETED -- `compact_page_csr` crossed into
+// `kernels_cuda_new::x::attn`, both launches in order with both refusals
+// hoisted ahead of the first. `attn/page_compact.cuh` is
+// `x::attn::page_compact`'s unit, written for that crossing.
+// `qkv_fused` DELETED -- `attn::qkv_decode_qk_norm_rope_write_kv_bf16` crossed
+// into `kernels_cuda_new::x::attn` as `QKV_DECODE_FUSED`, and it was THE LAST
+// ROW IN `ROW_TABLES`.
+//
+// It was the whole launcher here, and the last `attn` dispatch to fall: one
+// program over four kernels and eight instantiations, `head_dim` picking the
+// warp form at 64, 128 or 256 and falling THROUGH to the block form
+// otherwise, `rope_table != nullptr` picking the `USE_ROPE_TABLE` arm inside
+// whichever it picked. No `Specialisation` can state that, because the
+// fallthrough changes the `LaunchRule` from `WarpPackedHeads` to
+// `RowsPackedHeadsNarrow` and `Specialisation::agrees` forbids an arm that
+// changes the rule; `families/attn.rs` had written the refusal and added that
+// lifting it would not help, *because `head_dim == 64 | 128 | 256` is still
+// unspellable*. **A host program spells it**, and that is the whole of what
+// §5 step 5 is.
+//
+// This module survived the body's move for exactly one commit as the cast
+// from the generated dispatch's `*const c_void` to the types the `unit!`
+// declares. The `bind!` arm resolves those from `Cx` directly, so the
+// generated dispatch is gone, `bind::service`'s entry point is gone, and a
+// cast with no caller is not a seam. **Name the driver resource or it is a
+// move** — there was none to name, and `_ctx: &DispatchCtx` went unread from
+// the day it was written.
 pub mod page_mask;
 pub mod recordings;
-/// `attn/split_packed.cu`'s one surviving launcher, in Rust — the whole file.
-/// `families/attn.rs` argued at length that no `LaunchRule` may state this
-/// geometry; every clause of that argument is answered by a host rather than
-/// by a rule, which is what a driver-owned `Launch` is.
-pub mod split_packed;
+// `split_packed` DELETED. `attn::split_qkv_bf16_devwin` crossed into
+// fn-world with a real bind, so its host program is
+// `kernels_cuda_new::x::attn::split_qkv_bf16_devwin` and the module that
+// held it had nothing else in it.
 pub mod scratch;
 pub mod sideband_arena;
 pub mod stage_hooks;

@@ -8,7 +8,7 @@
 //!
 //! # Why this exists
 //!
-//! `kernel_mha` (`csrc/vendor/xqa/mha.cuh:2801`) takes
+//! `kernel_mha` (`csrc/src/attn/xqa/mha.cuh:2804`) takes
 //! `KVCacheList<usePagedKVCache> const cacheList` **by value** — forty bytes
 //! of pointers and a count, in the middle of its parameter list. Every other
 //! XQA parameter is a scalar or a pointer and crosses as one `u64` cell;
@@ -155,7 +155,7 @@ pub use crate::x::abi::DevicePtr;
 
 /// `KVCacheList<true>` — XQA's paged KV cache descriptor, passed by value.
 ///
-/// Mirrors `csrc/vendor/xqa/mhaUtils.cuh:241-257` under
+/// Mirrors `csrc/src/attn/xqa/mhaUtils.cuh:241-257` under
 /// `ENABLE_4BIT_KV_CACHE == 0`. Nothing here may be dereferenced on the host:
 /// every field is a device address or a device-side count.
 ///
@@ -633,7 +633,7 @@ pub const XQA_GQA8_P32: Unit = Unit {
 /// `CUtensorMapDataType_enum` for `xqa/tensorMap.h` to declare against, and
 /// the archive unit compiled `<xqa/tensorMap.cpp>` — HOST code driving
 /// `cuTensorMapEncodeTiled`, a second and larger port than `launchMHA` was.
-/// `csrc/vendor/xqa/` deliberately does not carry `mha_sm90.cu` or
+/// `csrc/src/attn/xqa/` deliberately does not carry `mha_sm90.cu` or
 /// `tensorMap.{h,cpp}` for the same reason.
 ///
 /// **The consequence, stated so it is not discovered.**

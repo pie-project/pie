@@ -61,7 +61,7 @@ pub use alloc::{
     write_raw_span,
 };
 pub use device::{COMPILED_MAJOR, Device};
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 pub use graph::{Cond, SupergraphBuilder};
 pub use graph::{ConditionalIf, Graph, GraphExec};
 pub use graph::{
